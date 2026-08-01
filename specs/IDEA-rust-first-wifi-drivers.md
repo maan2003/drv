@@ -135,3 +135,9 @@ interface, while the no-WASI component contract would remain available for C or
 otherwise untrusted imported drivers. That architectural change should be made
 only after a Rust hardware-protocol slice demonstrates that native porting is
 less complex than maintaining a C compatibility layer.
+
+The first physical slice should use a development kernel broker with supervised
+handoff to and from the normal Wi-Fi driver. It must run and persist reports
+locally because remote connectivity disappears during each experimental test.
+This backend accelerates BCM bring-up without changing the production goal of a
+complete group assignment through the safe hardware crate.

@@ -13,11 +13,25 @@ The production safe hardware backend owns and assigns the complete group. Wi-Fi
 and Bluetooth remain independent driver and service modules above that shared
 hardware lifecycle; their delivery APIs must not encode the group layout.
 
-During incremental Bluetooth testing only, the normal kernel drivers may retain
-group 10: `hci_bcm4377` owns PCI, DMA, firmware, and reset while the experimental
-host stack takes exclusive userspace control through an HCI user channel. This
-keeps host Wi-Fi available but is a test adapter, not the production hardware
+## Development handoff
+
+Wi-Fi is the first hardware priority. During incremental testing, a small kernel
+broker may bind only `0000:01:00.0` in place of `brcmfmac`, retain kernel
+ownership of the shared DART domain, and expose bounded PCI, DMA, interrupt, and
+reset operations to the safe Rust driver. `hci_bcm4377` can remain bound to the
+Bluetooth function. This is a development backend, not the production hardware
 architecture.
+
+Handoff is transactional and supervised locally. A test job quiesces and
+unbinds `brcmfmac`, binds the development broker, runs with a hard deadline,
+persists its complete report locally, revokes DMA and interrupts, resets when
+safe, rebinds `brcmfmac`, and waits for normal connectivity. Process failure,
+timeout, or a lost remote session must enter the same restoration path. Reports
+are uploaded only after the management connection returns, so test correctness
+does not depend on the experimental Wi-Fi path.
+
+Bluetooth host-stack work may similarly use the existing `hci_bcm4377`
+transport and an exclusive HCI user channel, but it is secondary to Wi-Fi.
 
 The assigned connectivity device, its firmware, and its availability are
 outside the protection boundary.
@@ -31,4 +45,5 @@ workqueues, or other Linux abstractions.
 The physical feasibility milestone is experimental rather than documentary:
 assign group 10 together, attach a DART-backed iommufd IOAS, map only private
 DMA arenas, exercise interrupt and reset behavior, and restore both displaced
-host drivers. HCI user-channel tests can proceed before this milestone.
+host drivers. Development-broker tests can exercise Wi-Fi firmware and protocol
+behavior before this production-path milestone.
