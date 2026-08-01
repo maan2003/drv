@@ -16,8 +16,17 @@ paths=(
   src/connectivity/lib/packet-formats
   src/connectivity/network/lib/diagnostics-traits
   src/connectivity/network/lib/explicit
+  src/media/audio/drivers/testing
+  src/media/audio/drivers/virtual-audio
+  src/media/audio/lib/clock
+  src/media/audio/lib/processing
+  src/media/audio/lib/timeline
+  src/media/audio/services/device_registry
+  src/media/audio/services/mixer
   src/lib/network/packet
   src/lib/replace-with
+  sdk/fidl/fuchsia.audio
+  sdk/fidl/fuchsia.audio.effects
   sdk/fidl/fuchsia.bluetooth
   sdk/fidl/fuchsia.bluetooth.a2dp
   sdk/fidl/fuchsia.bluetooth.bredr
@@ -29,6 +38,8 @@ paths=(
   sdk/fidl/fuchsia.bluetooth.le
   sdk/fidl/fuchsia.bluetooth.sys
   sdk/fidl/fuchsia.bluetooth.test
+  sdk/fidl/fuchsia.hardware.audio
+  sdk/fidl/fuchsia.hardware.audio.signalprocessing
   sdk/fidl/fuchsia.hardware.bluetooth
 )
 
