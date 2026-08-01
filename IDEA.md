@@ -1,10 +1,9 @@
 # drv: Isolated Userspace Wi-Fi Drivers
 
 ## Goal
-
-Run the complete Wi-Fi device stack outside the Linux kernel without a VM.
-Hardware, controller, policy, and network components run in sandboxed Wasm;
-a native broker provides VFIO and limits DMA to dedicated untrusted memory.
+Run complete device stacks outside the kernel without a VM. Sandboxed Wasm runs
+hardware, policy, and service components; a host broker limits device DMA.
+Preserve APIs used by unprivileged applications, not replaceable system plumbing.
 
 The first target is BCM4387C2 FullMAC PCIe Wi-Fi in the 13-inch M2 MacBook Air
 (`t8112-j413`) running Asahi Linux. Firmware implements most 802.11 MAC behavior;
@@ -14,9 +13,9 @@ userspace handles initialization, DMA rings, `msgbuf`, commands, and frames.
 
 ```text
 applications
-    |
-typed network capability API
-    |
+    | stable application APIs/protocols
+compatibility services and libraries
+    | project-owned component interfaces
 sandboxed IP/transport stack
     | versioned component interface
 sandboxed Wi-Fi control and policy
@@ -50,11 +49,15 @@ Handles and offsets cross IPC boundaries; native pointers do not. Packet copying
 is preferred until correctness and isolation are established. Zero-copy shared
 rings can be evaluated later without changing the security model.
 
-Interfaces between driver, controller, protocol stack, and applications are
-project-owned, versioned component interfaces. Linux boundaries such as
-`cfg80211`, HCI sockets, ALSA, or TAP are optional adapters, not architecture.
-Existing projects such as iwd, BlueZ, and PipeWire may be forked behind these
-interfaces when their Linux assumptions obstruct isolation.
+Internal interfaces are project-owned, versioned component contracts. Preserve
+application surfaces such as Wayland, PipeWire clients, Mesa GL/Vulkan, BlueZ
+application APIs where required, and eventually socket behavior. Linux system
+boundaries such as `cfg80211`, `nl80211`, kernel HCI, ALSA, and TAP are optional
+host adapters. Implementations such as iwd, wpa_supplicant, BlueZ, and PipeWire
+may be forked or replaced while retaining the application contracts that matter.
+
+Portable components never see Linux FDs, ioctls, kernel types, or VFIO. A host
+broker implements the hardware ABI for Linux, FreeBSD, Redox, or another kernel.
 
 ## Scope
 
@@ -65,6 +68,7 @@ Initially included:
   but will not be driven when IOMMU grouping requires ownership of both;
 - firmware loading, RX/TX, scanning, association, and key management;
 - a minimal userspace network stack and application-facing capability API;
+- compatibility for ordinary unprivileged applications as the stack matures;
 - TAP only as an optional bring-up and compatibility adapter;
 - process sandboxing, Wasm limits, watchdogs, and deterministic restart.
 
@@ -72,7 +76,7 @@ Initially excluded:
 
 - SDIO and USB transports;
 - SoftMAC devices;
-- transparent POSIX socket compatibility;
+- complete POSIX socket compatibility during the first Wi-Fi milestone;
 - Bluetooth, audio, display, and GPU service domains;
 - generic Linux kernel-module compatibility;
 - transparent support for every `cfg80211`/`nl80211` feature;
