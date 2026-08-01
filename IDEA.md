@@ -91,7 +91,7 @@ Initially excluded:
 5. Exchange copied Ethernet frames through a temporary TAP diagnostic adapter.
 6. Add scan, association, authentication, and key-management control.
 7. Move driver and control logic into separate no-WASI Wasm components.
-8. Add a userspace network stack and typed application capability API.
+8. Add the userspace stack and typed API described in [NETWORK.md](NETWORK.md).
 9. Split runtimes and VFIO broker into separately sandboxed processes.
 10. Add trace replay, fuzzing, fault injection, recovery, and reset tests.
 
