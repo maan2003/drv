@@ -49,8 +49,10 @@ Wi-Fi and Bluetooth share one physical connectivity device on the M2 target but
 should remain separate software delivery units. The Bluetooth service receives
 only its typed function capability and should coexist with the normal Wi-Fi
 driver during development when its DART stream, interrupts, power, and reset can
-be controlled independently. If stock VFIO cannot split their IOMMU group, a
-function-specific kernel broker may provide that narrower authority instead.
+be controlled independently. On `m2sh`, both PCI functions are in IOMMU group
+10, so stock VFIO cannot provide this split. Initial host-stack development can
+keep `hci_bcm4377` bound and use an exclusive Linux HCI user channel; a later
+function-specific kernel broker may provide narrower hardware authority.
 Firmware remains untrusted and may DMA only into dedicated mapped arenas.
 
 ## Application and system interfaces
