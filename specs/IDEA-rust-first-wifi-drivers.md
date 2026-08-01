@@ -28,17 +28,43 @@ The Rust driver would preserve hardware knowledge rather than Linux structure:
 network policy and Fuchsia-derived SME/MLME/security
         -> safe Rust firmware protocol and device state machines
         -> typed command/event and TX/RX rings
-        -> bounded native hardware broker
+        -> safe hardware capability crate
+        -> VFIO/iommufd or another private backend
         -> IOMMU and device
 ```
 
-The broker remains responsible for VFIO or another host device API, IOMMU
-mappings, BAR mappings, interrupt descriptors, reset, cache maintenance, and
-resource quotas. Driver code receives typed regions, DMA handles and offsets,
-interrupt notifications, firmware artifacts, and lifecycle operations rather
-than native pointers or ambient host authority. Unavoidable unsafe Rust should
-be small, locally owned, and audited; packet and descriptor parsing should use
-checked representations.
+For a trusted Rust driver, the hardware layer may be an in-process crate rather
+than a separate broker service. Its private backend remains responsible for
+VFIO or another host device API, IOMMU mappings, BAR mappings, interrupt
+descriptors, reset, cache maintenance, and resource quotas. Driver code receives
+typed regions, DMA handles and offsets, interrupt notifications, firmware
+artifacts, and lifecycle operations rather than native pointers or ambient host
+authority. Unavoidable unsafe Rust should be small, locally owned, and audited;
+packet and descriptor parsing should use checked representations.
+
+### Safe Rust is the privilege boundary
+
+The driver-facing hardware API must be a dedicated crate whose public API makes
+violating host-isolation invariants impossible without unsafe Rust. Driver crates
+should be `no_std` plus `alloc`, use `#![forbid(unsafe_code)]`, and have audited
+transitive dependencies. They must not depend on the backend crate, libc, an
+async runtime with ambient I/O, or APIs that expose raw host descriptors,
+pointers, physical addresses, arbitrary IOVAs, unrestricted mappings, or
+unbounded MMIO.
+
+The implementation crate may contain the small amount of unsafe Rust required
+for VFIO ioctls, memory mappings, volatile access, and interrupt integration,
+but exposes only safe capability types. Those types are unforgeable, tied to one
+device generation, bounded to assigned regions and DMA arenas, and revoke their
+mappings on drop or reset. A driver can still wedge or damage its assigned
+device through logically wrong commands; Rust safety separates authority and
+memory access, not hardware-protocol correctness.
+
+This follows Asterinas's framekernel principle: safe code can be privileged in
+the sense that it controls a device, while the API prevents that privilege from
+escaping into unrelated memory or host resources. Imported C, unaudited Rust,
+and other untrusted implementations still require the stronger Wasm or process
+broker boundary.
 
 ### Adopt the OSTD DMA model
 
@@ -54,13 +80,13 @@ rather than inventing an unrelated API. Preserve its important distinctions:
 - typed views over descriptor and MMIO memory instead of raw pointers.
 
 This is an adoption of the abstraction, not a direct dependency on OSTD's
-kernel implementation. The safe driver API should wrap broker capabilities,
+kernel implementation. The safe driver API should wrap hardware capabilities,
 with the deterministic model, Linux VFIO/iommufd, and a possible future
 Asterinas host implementing the same resource operations. Each backend retains
 ownership of page allocation, IOMMU mappings, cache maintenance, revocation,
-and unsafe host mechanics. The process boundary also requires project-specific
-generation checks, quotas, and copied access; those constraints must not be
-weakened merely to achieve source compatibility with OSTD.
+and unsafe host mechanics. Project-specific generation checks, quotas, and
+bounded access must not be weakened merely to achieve source compatibility with
+OSTD.
 
 ## Hardware targets
 
