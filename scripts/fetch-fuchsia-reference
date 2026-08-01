@@ -4,7 +4,10 @@ set -euo pipefail
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
 root="reference/fuchsia-$commit"
 
+mkdir -p reference
+
 paths=(
+  src/connectivity/bluetooth
   src/connectivity/network/netstack3
   src/connectivity/wlan
   src/connectivity/lib/net-types
@@ -15,6 +18,18 @@ paths=(
   src/connectivity/network/lib/explicit
   src/lib/network/packet
   src/lib/replace-with
+  sdk/fidl/fuchsia.bluetooth
+  sdk/fidl/fuchsia.bluetooth.a2dp
+  sdk/fidl/fuchsia.bluetooth.bredr
+  sdk/fidl/fuchsia.bluetooth.fastpair
+  sdk/fidl/fuchsia.bluetooth.gatt
+  sdk/fidl/fuchsia.bluetooth.gatt2
+  sdk/fidl/fuchsia.bluetooth.hfp
+  sdk/fidl/fuchsia.bluetooth.host
+  sdk/fidl/fuchsia.bluetooth.le
+  sdk/fidl/fuchsia.bluetooth.sys
+  sdk/fidl/fuchsia.bluetooth.test
+  sdk/fidl/fuchsia.hardware.bluetooth
 )
 
 for path in "${paths[@]}"; do
@@ -34,3 +49,22 @@ for path in "${paths[@]}"; do
 done
 
 printf '%s\n' "$commit" >"$root/COMMIT"
+
+# Fuchsia's core Sapphire host stack moved to Pigweed and is consumed as a
+# prebuilt by fuchsia.git. Keep its source beside the Fuchsia integration and
+# Rust profile layers.
+pigweed_commit=c14c119c51a82f6e044f81b7dad0a322091d4121
+pigweed_archive="reference/pigweed-pw_bluetooth_sapphire-$pigweed_commit.tar.gz"
+pigweed_root="reference/pigweed-$pigweed_commit/pw_bluetooth_sapphire"
+
+if [[ ! -f "$pigweed_archive" ]]; then
+  curl -fL --retry 3 \
+    "https://pigweed.googlesource.com/pigweed/pigweed/+archive/$pigweed_commit/pw_bluetooth_sapphire.tar.gz" \
+    -o "$pigweed_archive"
+fi
+
+sha256sum "$pigweed_archive" >"$pigweed_archive.sha256"
+rm -rf "$pigweed_root"
+mkdir -p "$pigweed_root"
+tar -xzf "$pigweed_archive" -C "$pigweed_root"
+printf '%s\n' "$pigweed_commit" >"$(dirname "$pigweed_root")/COMMIT"
