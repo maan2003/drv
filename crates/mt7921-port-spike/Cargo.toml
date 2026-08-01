@@ -1,0 +1,9 @@
+[package]
+name = "mt7921-port-spike"
+description = "Exploratory, hardware-independent mt76/mt7921 format ports"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
