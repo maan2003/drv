@@ -26,7 +26,8 @@ Physical tests calibrate rather than merely confirm models. The x86_64 AMD host
 test device. Its Wi-Fi and Bluetooth hardware is also the first target for
 proving that one safe Rust service can be developed and deployed while the
 other normal host service remains available. Scheduled `m2sh` tests then cover
-BCM4387 firmware, discovery, association or pairing, traffic, function
-isolation, coordinated reset where required, and restoration of displaced host
-drivers. This architecture satisfies
+Bluetooth host behavior through the temporary kernel HCI adapter, followed by
+complete group-10 assignment for BCM4387 firmware, discovery, association or
+pairing, traffic, reset, and restoration of both displaced host drivers. This
+architecture satisfies
 [REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).

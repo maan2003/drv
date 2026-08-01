@@ -46,14 +46,14 @@ described by [IDEA-rust-first-wifi-drivers](IDEA-rust-first-wifi-drivers.md),
 with VFIO/iommufd on the initial Linux host.
 
 Wi-Fi and Bluetooth share one physical connectivity device on the M2 target but
-should remain separate software delivery units. The Bluetooth service receives
-only its typed function capability and should coexist with the normal Wi-Fi
-driver during development when its DART stream, interrupts, power, and reset can
-be controlled independently. On `m2sh`, both PCI functions are in IOMMU group
-10, so stock VFIO cannot provide this split. Initial host-stack development can
-keep `hci_bcm4377` bound and use an exclusive Linux HCI user channel; a later
-function-specific kernel broker may provide narrower hardware authority.
-Firmware remains untrusted and may DMA only into dedicated mapped arenas.
+remain separate software delivery units. Their APIs do not expose or depend on
+the physical IOMMU grouping, while the production safe hardware backend owns
+their shared lifecycle. On `m2sh`, both PCI functions are in IOMMU group 10, so
+the production VFIO backend assigns them together. Initial Bluetooth host-stack
+testing can keep `hci_bcm4377` bound and use an exclusive Linux HCI user channel
+without replacing the active Wi-Fi driver. That adapter is only a testing
+workaround. Firmware remains untrusted and may DMA only into dedicated mapped
+arenas in the production backend.
 
 ## Application and system interfaces
 
