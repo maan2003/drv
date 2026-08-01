@@ -2,9 +2,10 @@
 
 ## Objective
 
-A buggy or compromised Wi-Fi driver, including one exploited by hostile network
-traffic or device firmware messages, must not compromise the Linux kernel, other
-processes, other devices, or unrelated CPU memory.
+A buggy or compromised component anywhere in the Wi-Fi device, control, or
+network stack, including one exploited by hostile traffic or firmware messages,
+must not compromise the Linux kernel, applications, other devices, or unrelated
+CPU memory.
 
 The assigned Wi-Fi device and its availability are not protected from the
 driver. The driver is allowed to fully control, reset, misconfigure, or render
@@ -18,10 +19,10 @@ Trusted components are:
 - Linux VFIO, iommufd, IPC, process-isolation, and memory-management paths;
 - the native VFIO broker and its protocol validation;
 - the Wasm runtime's sandbox implementation;
-- packet/control consumers for validating data received from the driver.
+- the small application-facing capability gateway and its validation.
 
-The Wasm driver, Wi-Fi firmware, assigned device, DMA arena, network input, and
-all driver-produced messages are untrusted.
+The Wasm driver, imported or forked protocol stacks, Wi-Fi firmware, assigned
+device, DMA arena, network input, and all device-stack messages are untrusted.
 
 ## Required Invariants
 
@@ -38,13 +39,16 @@ all driver-produced messages are untrusted.
 - Every native boundary validates handles, integer overflow, offsets, lengths,
   alignment, BAR bounds, message types, and state transitions.
 - Native pointers and file descriptors are never exposed to Wasm.
-- Consumers treat packet lengths, firmware events, and ring metadata as hostile.
+- Every component treats adjacent component output as hostile.
+- Application capabilities expose bounded typed operations, not raw component
+  memory, controller handles, packets, or device resources.
 
 ## Isolation Layers
 
-The Wasm driver runs without WASI, filesystem access, sockets, or ambient host
-capabilities. It receives only the device-specific host ABI, bounded memory,
-and bounded execution using fuel or epoch interruption.
+Each stack component runs without general WASI, filesystem access, host sockets,
+or ambient capabilities. It receives a narrow typed ABI, bounded memory, and
+bounded execution using fuel or epoch interruption. Components with different
+responsibilities do not share a Wasm instance.
 
 The Wasm runtime runs in a separate unprivileged worker process. A runtime escape
 therefore reaches only a seccomp-filtered process with broker IPC, not VFIO.
@@ -57,8 +61,8 @@ IPC required by the design. After initialization it exposes no general DMA-map
 operation. It does not decide whether device commands are semantically safe.
 
 The IOMMU is the final boundary against malicious DMA from either driver or
-firmware. DMA buffers are untrusted and preferably copied across the network
-service boundary. Shared zero-copy memory must never contain trusted state.
+firmware. DMA buffers are untrusted and preferably copied at the hardware-driver
+boundary. Shared zero-copy memory must never contain trusted state.
 
 ## Expected Failure Behavior
 
