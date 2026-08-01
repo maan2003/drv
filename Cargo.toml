@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/harness", "crates/mt7921-port-spike", "crates/probe"]
+members = ["crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt7921-port-spike", "crates/probe"]
 resolver = "3"
 
 [workspace.package]

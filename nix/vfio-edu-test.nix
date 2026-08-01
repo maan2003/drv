@@ -2,6 +2,7 @@
   stdenv,
   testers,
   writeText,
+  rustPlatform,
 }:
 
 let
@@ -137,6 +138,15 @@ let
       install -Dm755 vfio-iommufd-probe $out/bin/vfio-iommufd-probe
     '';
   };
+  safeVfioEdu = rustPlatform.buildRustPackage {
+    pname = "safe-vfio-edu";
+    version = "0.1.0";
+    # `builtins.path` includes new workspace members before the jj commit exists.
+    src = builtins.path { path = ../.; name = "drv-source"; };
+    cargoLock.lockFile = ../Cargo.lock;
+    cargoBuildFlags = [ "-p" "drv-hardware-backends" "--bin" "vfio_edu" ];
+    cargoTestFlags = [ "-p" "drv-hardware-backends" ];
+  };
 in
 testers.runNixOSTest {
   name = "vfio-edu";
@@ -154,6 +164,7 @@ testers.runNixOSTest {
     environment.systemPackages = [
       pkgs.pciutils
       vfioProbe
+      safeVfioEdu
     ];
 
     virtualisation.memorySize = 1024;
@@ -208,6 +219,9 @@ testers.runNixOSTest {
         ).strip()
         machine.succeed(f"test -c /dev/vfio/devices/{cdev}")
         machine.succeed(f"vfio-iommufd-probe /dev/vfio/devices/{cdev}")
+
+    with subtest("safe Rust capability API drives QEMU edu through VFIO/iommufd"):
+        machine.succeed(f"vfio_edu /dev/vfio/devices/{cdev}")
 
     with subtest("VFIO ownership can be torn down and restored"):
         machine.succeed(f"echo {bdf} > /sys/bus/pci/drivers/vfio-pci/unbind")

@@ -283,6 +283,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-hardware"
+version = "0.1.0"
+
+[[package]]
+name = "drv-hardware-backends"
+version = "0.1.0"
+dependencies = [
+ "drv-hardware",
+]
+
+[[package]]
 name = "drv-harness"
 version = "0.1.0"
 dependencies = [
