@@ -21,7 +21,9 @@ Cuttlefish's virtio `mac80211_hwsim`, wmediumd, and OpenWRT are optional peers f
 scan and authentication behavior. They model SoftMAC radio behavior and cannot
 validate BCM FullMAC firmware, PCIe rings, `msgbuf`, DMA, or reset.
 
-Physical tests calibrate rather than merely confirm models. `new-plastic` covers
-generic physical VFIO and recovery; scheduled `m2sh` tests cover BCM firmware,
-scan, association, traffic, reset, and normal-driver restoration. This
-architecture satisfies [REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
+Physical tests calibrate rather than merely confirm models. The x86_64 AMD host
+`new-plastic` is the primary generic physical VFIO, deployment, and recovery
+test device. Scheduled `m2sh` tests cover the indivisible BCM4387 Wi-Fi and
+Bluetooth deployment: firmware, discovery, association or pairing, traffic,
+shared reset, and restoration of both normal host drivers. This architecture
+satisfies [REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).

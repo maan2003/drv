@@ -45,11 +45,12 @@ command, event, ACL, SCO, power, and reset. It would use the safe hardware crate
 described by [IDEA-rust-first-wifi-drivers](IDEA-rust-first-wifi-drivers.md),
 with VFIO/iommufd on the initial Linux host.
 
-Wi-Fi and Bluetooth are companion functions on the M2 target. When Linux places
-them in the same IOMMU group, both functions must be detached and recovered
-together, while each protocol service receives only its typed function
-capability. Firmware remains untrusted and may DMA only into dedicated mapped
-arenas.
+Wi-Fi and Bluetooth are one indivisible deployment and recovery unit on the M2
+target, regardless of their presentation as separate PCI functions. Both are
+detached, assigned, reset, and restored together, while each protocol service
+receives only its typed function capability. Software bring-up may focus on one
+protocol, but a production deployment cannot return the other function to the
+host. Firmware remains untrusted and may DMA only into dedicated mapped arenas.
 
 ## Application and system interfaces
 
