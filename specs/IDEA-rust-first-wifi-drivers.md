@@ -40,6 +40,28 @@ than native pointers or ambient host authority. Unavoidable unsafe Rust should
 be small, locally owned, and audited; packet and descriptor parsing should use
 checked representations.
 
+### Adopt the OSTD DMA model
+
+The driver-facing DMA abstraction should start from Asterinas OSTD's design,
+described in the [Asterinas fit spike](../crates/asterinas-fit-spike/README.md),
+rather than inventing an unrelated API. Preserve its important distinctions:
+
+- coherent buffers versus streaming buffers that require explicit range sync;
+- sealed `ToDevice`, `FromDevice`, and `FromAndToDevice` direction types;
+- device addresses distinct from CPU offsets and addresses;
+- zero-initialized allocation by default, bounds-checked access, owned mapping
+  lifetimes, and automatic unmapping on drop; and
+- typed views over descriptor and MMIO memory instead of raw pointers.
+
+This is an adoption of the abstraction, not a direct dependency on OSTD's
+kernel implementation. The safe driver API should wrap broker capabilities,
+with the deterministic model, Linux VFIO/iommufd, and a possible future
+Asterinas host implementing the same resource operations. Each backend retains
+ownership of page allocation, IOMMU mappings, cache maintenance, revocation,
+and unsafe host mechanics. The process boundary also requires project-specific
+generation checks, quotas, and copied access; those constraints must not be
+weakened merely to achieve source compatibility with OSTD.
+
 ## Hardware targets
 
 For BCM4387C2 FullMAC, the Rust port would use Asahi/Linux `brcmfmac` and

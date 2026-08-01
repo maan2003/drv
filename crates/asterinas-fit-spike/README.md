@@ -55,10 +55,14 @@ OSTD and the safe virtio drivers demonstrate several patterns relevant to
 - safe PCI BAR, MSI-X, interrupt, and callback APIs; and
 - `#![deny(unsafe_code)]` across drivers and the network component.
 
-These designs can inform the native broker and Rust Wi-Fi driver APIs. Pulling
-OSTD in as a Linux-userspace dependency would not help: its APIs assume an
-OSTD-based kernel, global machine ownership, interrupt contexts, and its own
-memory manager.
+These designs should be the baseline for the native broker and Rust Wi-Fi
+driver APIs. In particular, this project should preserve the coherent/streaming
+split, direction types, explicit range synchronization, typed device addresses,
+owned mapping lifetimes, and typed memory views. VFIO/iommufd can implement that
+contract today; the deterministic broker and a future Asterinas host can be
+alternative backends. Pulling OSTD in as a Linux-userspace dependency would not
+help: its implementation assumes an OSTD-based kernel, global machine
+ownership, interrupt contexts, and its own memory manager.
 
 ### Linux application testing
 
@@ -110,13 +114,19 @@ isolated behind a separately accepted boundary.
 ## Assessment
 
 Asterinas should remain a reference rather than a dependency or host kernel for
-the current project. Its highest-value contributions are:
+the current milestone, but it is a strategic architectural upstream rather than
+a disposable code sample. Its highest-value contributions are:
 
 1. patterns for safe DMA, MMIO, PCI, and interrupt APIs for Rust drivers;
 2. a concrete Linux socket syscall and FD compatibility implementation; and
 3. socket, epoll, syscall, and real-application compatibility tests.
 
-A far-future experiment could replace Asterinas's smoltcp backend with
-Netstack3 on x86-64, proving Linux ABI applications over Netstack3 without a
-Linux kernel. It would not advance the immediate M2 Wi-Fi milestone and should
-not displace the smaller Linux-hosted `BindingsCtx` and VFIO work.
+Long term, an Asterinas backend—or Asterinas itself as the host kernel—could
+unify these safe hardware abstractions with Linux ABI compatibility. That path
+becomes credible if Asterinas gains ARM64/Apple platform support, private
+per-device IOMMU domains, and a service isolation model that satisfies this
+project's threat model. A separate experiment could replace its smoltcp backend
+with Netstack3 on x86-64, proving Linux ABI applications over Netstack3 without
+a Linux kernel. Neither experiment advances the immediate M2 Wi-Fi milestone,
+so they should not displace the smaller Linux-hosted `BindingsCtx` and VFIO
+work.
