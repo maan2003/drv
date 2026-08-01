@@ -3,8 +3,11 @@
 ## Status
 
 The in-memory broker runs the production Wasm probe through BAR programming,
-device DMA, interrupt, bounds failure, reset, and stale-handle checks. QEMU,
-virtual Wi-Fi, native VFIO, and physical suites remain unimplemented.
+device DMA, interrupt, bounds failure, reset, and stale-handle checks. Virtual
+Wi-Fi, native broker, and physical suites remain unimplemented. A QEMU
+VM suite covers `edu` enumeration, IOMMU grouping, exclusive `vfio-pci`
+binding, the iommufd device interface, region and IRQ discovery, DMA mapping,
+teardown, and clean shutdown.
 
 The production Wasm binary runs unchanged against deterministic and native
 brokers. The deterministic model owns virtual time and scripted BAR, DMA,

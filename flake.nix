@@ -3,7 +3,8 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { nixpkgs, ... }:
+  outputs =
+    { nixpkgs, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "aarch64-linux"
@@ -11,6 +12,10 @@
       ];
     in
     {
+      checks.x86_64-linux.vfio-edu =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
+          { };
+
       devShells = forAllSystems (
         system:
         let

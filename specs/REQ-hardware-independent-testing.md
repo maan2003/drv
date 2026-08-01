@@ -3,7 +3,8 @@
 ## Status
 
 The deterministic component path covers BAR bounds, DMA bounds and mutation,
-interrupt delivery, reset, and handle revocation. Broader fault, network, VM,
+interrupt delivery, reset, and handle revocation. A QEMU `edu` suite covers
+native VFIO/IOMMU mechanics without physical hardware. Broader fault, network,
 and physical suites remain unimplemented.
 
 Source: project owner. Strength: mandatory development requirement.
