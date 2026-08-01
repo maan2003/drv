@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit=1e1219e3fac944c9a906aea9646939746b6062b3
+root="reference/fuchsia-$commit"
+
+paths=(
+  src/connectivity/network/netstack3
+  src/connectivity/wlan
+  src/connectivity/lib/net-types
+  src/connectivity/lib/net-declare
+  src/connectivity/lib/internet-checksum
+  src/connectivity/lib/packet-formats
+  src/connectivity/network/lib/diagnostics-traits
+  src/connectivity/network/lib/explicit
+  src/lib/network/packet
+  src/lib/replace-with
+)
+
+for path in "${paths[@]}"; do
+  name=${path//\//_}
+  archive="reference/fuchsia-${name}-${commit}.tar.gz"
+
+  if [[ ! -f "$archive" ]]; then
+    curl -fL --retry 3 \
+      "https://fuchsia.googlesource.com/fuchsia/+archive/$commit/$path.tar.gz" \
+      -o "$archive"
+  fi
+
+  sha256sum "$archive" >"$archive.sha256"
+  rm -rf "$root/$path"
+  mkdir -p "$root/$path"
+  tar -xzf "$archive" -C "$root/$path"
+done
+
+printf '%s\n' "$commit" >"$root/COMMIT"
