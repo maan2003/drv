@@ -26,7 +26,8 @@ all driver-produced messages are untrusted.
 ## Required Invariants
 
 - VFIO no-IOMMU mode is never supported.
-- The device must be in a viable, isolated IOMMU group with interrupt remapping.
+- The Wi-Fi function and any companion functions in its IOMMU group must be
+  exclusively claimed; all are considered assigned hardware.
 - Only the broker holds VFIO device and iommufd descriptors.
 - The broker creates all IOMMU mappings; the worker cannot request arbitrary
   virtual-address mappings.

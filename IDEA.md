@@ -7,10 +7,11 @@ A ported driver runs as WebAssembly, while a small native broker provides access
 to one PCIe Wi-Fi device through VFIO. The IOMMU limits device DMA to dedicated,
 untrusted packet memory.
 
-The first target is a Broadcom FullMAC PCIe device supported by Linux
-`brcmfmac`. FullMAC is attractive because firmware implements most 802.11 MAC
-behavior; the userspace driver primarily handles device initialization, DMA
-rings, the `msgbuf` protocol, firmware commands/events, and Ethernet frames.
+The first target is the BCM4387C2 FullMAC PCIe Wi-Fi function in the 13-inch M2
+MacBook Air (`t8112-j413`) running Asahi Linux. FullMAC is attractive because
+firmware implements most 802.11 MAC behavior; the userspace driver primarily
+handles initialization, DMA rings, `msgbuf`, firmware commands/events, and
+Ethernet frames.
 
 ## Architecture
 
@@ -56,7 +57,8 @@ rings can be evaluated later without changing the security model.
 Initially included:
 
 - PCIe FullMAC Wi-Fi only;
-- one device and one driver instance;
+- one M2 Air Wi-Fi function; its companion Bluetooth function may be claimed
+  but will not be driven when IOMMU grouping requires ownership of both;
 - firmware loading, RX/TX, scanning, association, and key management;
 - TAP integration so existing Linux applications continue using normal sockets;
 - process sandboxing, Wasm limits, watchdogs, and deterministic restart.

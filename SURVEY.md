@@ -8,11 +8,15 @@ project dependencies or vendored code.
 | Reference | Version | Archive SHA-256 |
 |---|---:|---|
 | Linux mainline | 7.2-rc5 | `8be5bf245c5bc89927f15a9f575c04869c25a8d511d8b810ecd8a67e5b0dd51e` |
+| Linux stable baseline | 7.1.5 | `22a0196b3cbcdf34dc27b77561f4d040585fd3447edc9ab3531a1ac79e3041e7` |
+| Asahi Linux `asahi` | `e8efe09d4f37` | `f06b95f68982ac9cc5948276b779c31de9d20a391b8178e8504e0c1c0cd24eea` |
 | rust-vmm/vfio | vfio-ioctls 0.8.0 | `217a00c6bef441eff38621d387111e135eaad3f4ec23ff6b9d7417ab7e5fee5b` |
 
 Sources:
 
 - <https://git.kernel.org/torvalds/t/linux-7.2-rc5.tar.gz>
+- <https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.5.tar.xz>
+- <https://github.com/AsahiLinux/linux/archive/e8efe09d4f378992c890d181d65e2ed8d8cb1194.tar.gz>
 - <https://github.com/rust-vmm/vfio/archive/refs/tags/vfio-ioctls-v0.8.0.tar.gz>
 
 ## Linux Wi-Fi Reference
