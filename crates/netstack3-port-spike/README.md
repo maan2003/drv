@@ -90,3 +90,76 @@ is a Cargo build of the pinned production core and dependency closure, followed
 by the smallest host bindings that drive a pure-IP peer, timers, and one TCP
 socket. That will measure integration work without prematurely committing the
 architecture specification.
+
+## Project activity and deployment
+
+Netstack3 is an active production project, not an abandoned portability
+experiment. A Gerrit search performed on 2026-08-01 found:
+
+- 27 merged changes with subjects explicitly tagged `[netstack3]` since
+  2026-07-01, authored by five engineers;
+- 97 such changes since 2026-05-01; and
+- 244 such changes since 2025-08-01.
+
+The July work included TCP RTT sampling and timestamps, TCP conntrack
+refactoring, hard bounds on TCP and fragment data structures, raw socket
+features, packet capture, power integration, and UDP `IP_PKTINFO`. These are
+substantive protocol, hardening, performance, and product-integration changes.
+The broader Gerrit text search also finds changes in Starnix, netdevice, netcfg,
+conformance tests, and mDNS that integrate with Netstack3.
+
+Fuchsia F27 release notes planned the product migration immediately after its
+rollout. F28 through F30 release notes describe continuing Netstack3 production
+features and fixes, including eBPF filtering, socket diagnostics, TCP memory and
+RFC work, shutdown behavior, and Starnix integration. A 2024 report described a
+pre-production fleet of 60 devices; in July 2026 former project lead Joshua
+Liebow-Feeser publicly stated that it was running on millions of devices, with a
+substantially lower crash rate and memory use than Netstack2.
+
+Sources:
+
+- [Fuchsia Gerrit Netstack3 activity](https://fuchsia-review.googlesource.com/q/project:fuchsia+status:merged+after:2026-07-01+netstack3)
+- [F27 release notes](https://fuchsia.dev/whats-new/release-notes/f27)
+- [F28 release notes](https://fuchsia.dev/whats-new/release-notes/f28)
+- [F29 release notes](https://fuchsia.dev/whats-new/release-notes/f29)
+- [F30 release notes](https://fuchsia.dev/whats-new/release-notes/f30)
+- [2024 deployment report](https://lwn.net/Articles/995814/)
+- [2026 deployment update](https://www.reddit.com/r/rust/comments/1v83fmx/safety_in_an_unsafe_world_rustconf_2024_talk_blog/)
+
+## Other-platform use found
+
+No official or production non-Fuchsia bindings implementation was found. The
+core/bindings design document still says Fuchsia's top-level `netstack3` crate
+is the only bindings implementation.
+
+Two independent experiments are relevant:
+
+- [`aatifsyed/fuschia-netstack-hacking`](https://github.com/aatifsyed/fuschia-netstack-hacking)
+  extracted foundational packet and network-type crates into a Cargo workspace.
+  It was active from 2021 to early 2024, but did not bind the complete stack.
+- [`hkalbasi/netstack_example`](https://github.com/hkalbasi/netstack_example)
+  copied generated Cargo manifests and implemented about 16 KB of host bindings.
+  It creates an Ethernet device, installs an IPv4 route, and initiates a TCP
+  connection outside Fuchsia. It is useful proof that the boundary works, but it
+  is a single 2025 commit with absolute paths into the author's Fuchsia checkout
+  and many unimplemented handlers, not a usable port. The repository declares no
+  license, so its bindings must not be copied into this project.
+
+Starnix is also relevant but is not another-kernel port of the core. It runs
+unmodified Linux binaries over Zircon and translates their socket operations to
+Fuchsia networking. It validates the socket-provider approach for Linux ABI
+applications, not Netstack3 running as Linux's native stack.
+
+## Why it was made portable
+
+There is no public evidence that Google planned Netstack3 for Android, Linux, or
+another kernel. Fuchsia's published rationale says the opposite: it created
+Netstack3 because the previously reused gVisor stack was owned by a team with
+different requirements, while Fuchsia needed real-device operation, routing,
+and dynamic configuration under its own control.
+
+The documented reasons for the core/bindings split are deterministic fake-world
+testing, early input validation, Cargo development on ordinary host machines,
+and keeping platform execution and IPC out of protocol logic. Portability is a
+real architectural property and makes our port credible, but an unannounced
+Google cross-OS plan should not be part of the adoption case.
