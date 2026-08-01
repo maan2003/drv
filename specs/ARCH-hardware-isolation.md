@@ -2,8 +2,9 @@
 
 ## Status
 
-The proposed boundary is not implemented yet. The first slice will define its
-WIT contract and deterministic broker before native VFIO integration.
+The WIT contract and deterministic broker implement injected device, allowlisted
+region, copied DMA, interrupt, monotonic-time, reset, and generation semantics.
+Artifacts, native VFIO, and separate-process containment are not implemented.
 
 An untrusted no-WASI component receives one injected device capability and
 cannot enumerate host devices. Subordinate region, DMA, interrupt, and artifact

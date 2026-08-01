@@ -22,10 +22,12 @@
               cargo
               cargo-component
               clippy
+              lld
               pkg-config
               rustc
               rustfmt
               wasmtime
+              wasm-tools
 
               # Required by bindgen-based crates that consume Linux VFIO headers.
               linuxHeaders

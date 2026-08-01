@@ -2,8 +2,9 @@
 
 ## Status
 
-No harness layer is implemented yet. The in-memory broker and Wasm contract test
-are the first slice; QEMU, virtual Wi-Fi, native VFIO, and physical suites follow.
+The in-memory broker runs the production Wasm probe through BAR programming,
+device DMA, interrupt, bounds failure, reset, and stale-handle checks. QEMU,
+virtual Wi-Fi, native VFIO, and physical suites remain unimplemented.
 
 The production Wasm binary runs unchanged against deterministic and native
 brokers. The deterministic model owns virtual time and scripted BAR, DMA,

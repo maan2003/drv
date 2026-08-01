@@ -2,8 +2,8 @@
 
 ## Status
 
-The development environment and design constraints exist; no runtime component
-or broker is implemented yet. The first slice targets the hardware interface.
+One no-WASI probe component runs against the deterministic broker through the
+project WIT contract. Native VFIO and Wi-Fi behavior are not implemented.
 
 The system moves complete device stacks out of the host kernel without placing
 them in a VM. Its dependency direction is:
