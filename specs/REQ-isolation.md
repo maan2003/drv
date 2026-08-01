@@ -12,11 +12,14 @@ must not compromise the host kernel, applications, unrelated CPU memory, other
 devices, IOMMU configuration, or persistent storage. Every component treats
 adjacent output as hostile.
 
-No-IOMMU operation is forbidden. The complete IOMMU group is exclusively
-assigned, only dedicated backend-owned arenas are mapped, and native boundaries
-validate handles, arithmetic, ranges, alignment, state, and quotas. Wasm receives
-no ambient WASI, native pointer, host descriptor, arbitrary mapping operation, or
-raw device capability through an application interface.
+No-IOMMU operation is forbidden. A raw VFIO path exclusively assigns its
+complete IOMMU group. A narrower kernel-owned backend may expose one function
+while retaining sibling host drivers only when the kernel continues to enforce
+independent DMA and resource ownership. In either case, only dedicated
+backend-owned arenas are mapped, and native boundaries validate handles,
+arithmetic, ranges, alignment, state, and quotas. Wasm receives no ambient WASI,
+native pointer, host descriptor, arbitrary mapping operation, or raw device
+capability through an application interface.
 
 A native Rust driver may use language safety as its privilege boundary. In that
 model, the driver and its driver-facing dependencies forbid unsafe Rust and

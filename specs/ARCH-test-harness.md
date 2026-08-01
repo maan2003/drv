@@ -23,7 +23,10 @@ validate BCM FullMAC firmware, PCIe rings, `msgbuf`, DMA, or reset.
 
 Physical tests calibrate rather than merely confirm models. The x86_64 AMD host
 `new-plastic` is the primary generic physical VFIO, deployment, and recovery
-test device. Scheduled `m2sh` tests cover the indivisible BCM4387 Wi-Fi and
-Bluetooth deployment: firmware, discovery, association or pairing, traffic,
-shared reset, and restoration of both normal host drivers. This architecture
-satisfies [REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
+test device. Its Wi-Fi and Bluetooth hardware is also the first target for
+proving that one safe Rust service can be developed and deployed while the
+other normal host service remains available. Scheduled `m2sh` tests then cover
+BCM4387 firmware, discovery, association or pairing, traffic, function
+isolation, coordinated reset where required, and restoration of displaced host
+drivers. This architecture satisfies
+[REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
