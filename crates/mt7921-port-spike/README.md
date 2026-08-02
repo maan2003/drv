@@ -162,6 +162,11 @@ drains 64-bit counters, explicitly disables the vector, and repeats disable in
 `Drop`. Its Linux UAPI layout is tested, but it cannot yet be invoked physically
 or unmask a device source.
 
+`--install-disable-vfio-irq` exposes only the source-disabled lifecycle check:
+select one eventfd-capable VFIO vector, install it, require its nonblocking
+counter to remain empty while the device mask is zero, explicitly disable it,
+and VFIO-reset. It never writes the device interrupt mask or enables DMA.
+
 `teardown_pinned_dma` makes reset ordering explicit for the future active path:
 mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
 function reset is issued while every IOVA remains pinned regardless of the poll

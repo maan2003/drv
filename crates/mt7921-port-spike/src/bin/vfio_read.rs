@@ -5,13 +5,14 @@ use mt7921_port_spike::{
     DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
-    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
-    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
-    acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, select_vfio_irq, stage_disabled_firmware_chunk,
+    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, IrqLifecycle,
+    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
+    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent,
+    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind,
+    ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
+    acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, select_vfio_irq,
+    stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -223,6 +224,7 @@ fn run() -> Result<(), String> {
         Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
         Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
         Some("--inventory-vfio-irqs") => Operation::InventoryVfioIrqs,
+        Some("--install-disable-vfio-irq") => Operation::InstallDisableVfioIrq,
         Some("--run-one-shot-fwdl") => {
             return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
         }
@@ -302,34 +304,34 @@ fn run() -> Result<(), String> {
         ),
     )?;
     let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
-    if operation == Operation::InventoryVfioIrqs {
-        let mut capabilities = Vec::new();
-        for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
-            .into_iter()
-            .enumerate()
-        {
-            let mut irq = IrqInfo {
-                argsz: size::<IrqInfo>(),
-                index: index as u32,
-                ..Default::default()
-            };
-            ioctl_mut(
-                device.as_raw_fd(),
-                VFIO_DEVICE_GET_IRQ_INFO,
-                &mut irq,
-                "query VFIO IRQ",
-            )?;
-            let capability = PciIrqCapability {
-                kind,
-                count: irq.count,
-                eventfd: irq.flags & 1 != 0,
-            };
+    if matches!(
+        operation,
+        Operation::InventoryVfioIrqs | Operation::InstallDisableVfioIrq
+    ) {
+        let capabilities = vfio_irq_capabilities(&device)?;
+        for capability in &capabilities {
             println!("{{\"vfio_irq_capability\":\"{capability:?}\"}}");
-            capabilities.push(capability);
         }
         let selected = select_vfio_irq(&capabilities)
             .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
         println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+        if operation == Operation::InstallDisableVfioIrq {
+            let lifecycle = IrqLifecycle::Uninstalled
+                .install(selected)
+                .map_err(|error| format!("install IRQ lifecycle: {error:?}"))?;
+            let mut irq = VfioIrq::install(&device, selected)?;
+            println!("{{\"vfio_irq_event\":\"eventfd_installed\"}}");
+            if irq.try_read()?.is_some() {
+                return Err("unexpected IRQ before device source enable".into());
+            }
+            irq.disable()?;
+            lifecycle
+                .disable()
+                .map_err(|error| format!("disable IRQ lifecycle: {error:?}"))?;
+            println!("{{\"vfio_irq_event\":\"eventfd_empty_and_disabled\"}}");
+            reset_vfio_device(&device)?;
+            println!("{{\"vfio_irq_event\":\"vfio_device_reset_completed\"}}");
+        }
     }
     if acquire {
         let mut transport = VfioOwnership {
@@ -536,6 +538,7 @@ fn run() -> Result<(), String> {
         Operation::ProgramDisabledFwdlRing
             | Operation::MaskAckDisabledFwdl
             | Operation::StageDisabledFirmwareDescriptor
+            | Operation::InstallDisableVfioIrq
     ) {
         let mcu = read(ReadRegister::McuCommand)?;
         let interrupt = read(ReadRegister::HostInterruptStatus)?;
@@ -1004,6 +1007,32 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
     }
 }
 
+fn vfio_irq_capabilities(device: &File) -> Result<Vec<PciIrqCapability>, String> {
+    let mut capabilities = Vec::new();
+    for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
+        .into_iter()
+        .enumerate()
+    {
+        let mut irq = IrqInfo {
+            argsz: size::<IrqInfo>(),
+            index: index as u32,
+            ..Default::default()
+        };
+        ioctl_mut(
+            device.as_raw_fd(),
+            VFIO_DEVICE_GET_IRQ_INFO,
+            &mut irq,
+            "query VFIO IRQ",
+        )?;
+        capabilities.push(PciIrqCapability {
+            kind,
+            count: irq.count,
+            eventfd: irq.flags & 1 != 0,
+        });
+    }
+    Ok(capabilities)
+}
+
 fn reset_vfio_device(device: &File) -> Result<(), String> {
     let mut info = DeviceInfo {
         argsz: size::<DeviceInfo>(),
@@ -1089,6 +1118,7 @@ enum Operation {
     MaskAckDisabledFwdl,
     StageDisabledFirmwareDescriptor,
     InventoryVfioIrqs,
+    InstallDisableVfioIrq,
 }
 
 struct VfioDynamicL1<'a> {
