@@ -1644,6 +1644,122 @@ pub fn prepare_mcu_rx_ring(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McuRxRegisters {
+    pub descriptor_base: u32,
+    pub descriptor_count: u32,
+    pub cpu_index: u32,
+    pub dma_index: u32,
+}
+
+pub trait DisabledMcuRxTransport {
+    type Error;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
+    fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error>;
+    fn write_initial(
+        &mut self,
+        descriptor_base: u32,
+        descriptor_count: u32,
+    ) -> Result<(), Self::Error>;
+    fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledMcuRxEvent {
+    Snapshot(McuRxRegisters),
+    DescriptorFence,
+    Programmed(McuRxRegisters),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisabledMcuRxError<E> {
+    InvalidArena,
+    ActiveState {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    DirtyRing(McuRxRegisters),
+    Transport(E),
+    Readback(McuRxRegisters),
+}
+
+/// Program the pre-firmware MCU response ring without enabling RX DMA.
+pub fn program_disabled_mcu_rx_ring<T, F>(
+    transport: &mut T,
+    ring_iova: u64,
+    mut event: F,
+) -> Result<McuRxRegisters, DisabledMcuRxError<T::Error>>
+where
+    T: DisabledMcuRxTransport,
+    F: FnMut(DisabledMcuRxEvent),
+{
+    if ring_iova % 4096 != 0
+        || ring_iova
+            .checked_add(4095)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(DisabledMcuRxError::InvalidArena);
+    }
+    let global_config = transport
+        .read_global_config()
+        .map_err(DisabledMcuRxError::Transport)?;
+    let interrupt_enable = transport
+        .read_interrupt_enable()
+        .map_err(DisabledMcuRxError::Transport)?;
+    if global_config & 0xf != 0 || interrupt_enable != 0 {
+        return Err(DisabledMcuRxError::ActiveState {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    let snapshot = transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?;
+    event(DisabledMcuRxEvent::Snapshot(snapshot));
+    if snapshot.cpu_index != snapshot.dma_index {
+        return Err(DisabledMcuRxError::DirtyRing(snapshot));
+    }
+    let initial = McuRxRegisters {
+        descriptor_base: ring_iova as u32,
+        descriptor_count: MT7921_MCU_RX_RING_COUNT as u32,
+        cpu_index: 0,
+        dma_index: 0,
+    };
+    transport
+        .write_initial(initial.descriptor_base, initial.descriptor_count)
+        .map_err(DisabledMcuRxError::Transport)?;
+    if transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?
+        != initial
+    {
+        return Err(DisabledMcuRxError::Readback(
+            transport
+                .read_registers()
+                .map_err(DisabledMcuRxError::Transport)?,
+        ));
+    }
+    transport.release_fence();
+    event(DisabledMcuRxEvent::DescriptorFence);
+    transport
+        .publish_cpu_index((MT7921_MCU_RX_RING_COUNT - 1) as u32)
+        .map_err(DisabledMcuRxError::Transport)?;
+    let expected = McuRxRegisters {
+        cpu_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
+        ..initial
+    };
+    let actual = transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?;
+    if actual != expected {
+        return Err(DisabledMcuRxError::Readback(actual));
+    }
+    event(DisabledMcuRxEvent::Programmed(actual));
+    Ok(actual)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxRingState {
     pub descriptor_base: u32,
     pub descriptor_count: u32,
@@ -3184,6 +3300,92 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct FakeMcuRx {
+        global: u32,
+        interrupts: u32,
+        registers: McuRxRegisters,
+        writes: Vec<&'static str>,
+    }
+    impl DisabledMcuRxTransport for FakeMcuRx {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.global)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.interrupts)
+        }
+        fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error> {
+            Ok(self.registers)
+        }
+        fn write_initial(
+            &mut self,
+            descriptor_base: u32,
+            descriptor_count: u32,
+        ) -> Result<(), Self::Error> {
+            self.writes.push("initial");
+            self.registers = McuRxRegisters {
+                descriptor_base,
+                descriptor_count,
+                cpu_index: 0,
+                dma_index: 0,
+            };
+            Ok(())
+        }
+        fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error> {
+            self.writes.push("publish");
+            self.registers.cpu_index = cpu_index;
+            Ok(())
+        }
+        fn release_fence(&mut self) {
+            self.writes.push("fence");
+        }
+    }
+
+    #[test]
+    fn disabled_mcu_rx_resets_both_indices_before_publish() {
+        let mut transport = FakeMcuRx {
+            global: 0x1010_b870,
+            interrupts: 0,
+            registers: McuRxRegisters {
+                descriptor_base: 0x8000_0000,
+                descriptor_count: 8,
+                cpu_index: 3,
+                dma_index: 3,
+            },
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            program_disabled_mcu_rx_ring(&mut transport, 0x0100_3000, |_| {}),
+            Ok(McuRxRegisters {
+                descriptor_base: 0x0100_3000,
+                descriptor_count: 8,
+                cpu_index: 7,
+                dma_index: 0,
+            })
+        );
+        assert_eq!(transport.writes, ["initial", "fence", "publish"]);
+    }
+
+    #[test]
+    fn disabled_mcu_rx_rejects_dirty_ring_without_writes() {
+        let mut transport = FakeMcuRx {
+            global: 0x1010_b870,
+            interrupts: 0,
+            registers: McuRxRegisters {
+                descriptor_base: 0,
+                descriptor_count: 8,
+                cpu_index: 1,
+                dma_index: 0,
+            },
+            writes: Vec::new(),
+        };
+        assert!(matches!(
+            program_disabled_mcu_rx_ring(&mut transport, 0x0100_3000, |_| {}),
+            Err(DisabledMcuRxError::DirtyRing(_))
+        ));
+        assert!(transport.writes.is_empty());
     }
 
     #[test]

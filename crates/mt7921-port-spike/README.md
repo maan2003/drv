@@ -136,6 +136,10 @@ backing. `prepare_mcu_rx_ring` separately builds Linux's eight-entry,
 2048-byte-buffer pre-firmware response queue with seven device-owned buffers
 and one empty slot, using a distinct aligned low-32-bit ring page and 16 KiB
 buffer mapping. It rejects overlapping or out-of-range arenas.
+`program_disabled_mcu_rx_ring` requires that old ring zero is idle, writes its
+owned base/count with both CPU and DMA indices zero, verifies that state, then
+publishes the seven receive buffers only after a release fence. RX DMA and its
+interrupt remain disabled; the physical adapter is still pending.
 
 `--prepare-owned-global-tx-rings` is the inactive physical adapter for this
 preflight. It maps three separate low-32-bit pages filled entirely with
