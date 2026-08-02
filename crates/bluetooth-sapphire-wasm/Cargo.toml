@@ -1,0 +1,13 @@
+[package]
+name = "bluetooth-sapphire-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2.189"
+wasmtime = { version = "47.0.2", default-features = false, features = [
+  "cranelift",
+  "runtime",
+  "std",
+] }

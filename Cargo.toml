@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bluetooth-hci-broker", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe"]
+members = ["crates/bluetooth-hci-broker", "crates/bluetooth-sapphire-wasm", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe"]
 resolver = "3"
 
 [workspace.package]
