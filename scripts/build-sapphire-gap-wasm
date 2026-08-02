@@ -44,9 +44,11 @@ source, tool_repo, python = map(Path, sys.argv[1:4])
 gtest_arg = sys.argv[4]
 (source / "wasi_test_args.h").write_text(
     "#pragma once\n\n"
-    + "static const char* const drv_gtest_args[] = {\n"
-    + "    \"gap_test\",\n"
-    + ((f"    {json.dumps(gtest_arg)},\n") if gtest_arg else "")
+    + "static char drv_gtest_arg_0[] = \"gap_test\";\n"
+    + ((f"static char drv_gtest_arg_1[] = {json.dumps(gtest_arg)};\n") if gtest_arg else "")
+    + "static char* drv_gtest_args[] = {\n"
+    + "    drv_gtest_arg_0,\n"
+    + (("    drv_gtest_arg_1,\n") if gtest_arg else "")
     + "};\n"
     + "static const size_t drv_gtest_arg_count = "
     + ("2;\n" if gtest_arg else "1;\n")

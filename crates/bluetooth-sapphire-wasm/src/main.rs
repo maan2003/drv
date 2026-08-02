@@ -28,6 +28,7 @@ const LOG: u8 = 3;
 const EXIT: u8 = 4;
 const CLOCK: u8 = 5;
 const RESULT: u8 = 6;
+const PROGRESS: u8 = 7;
 const ACK: u8 = 128;
 
 struct TestHost {
@@ -155,14 +156,17 @@ fn receive_module(socket: &UnixDatagram) -> io::Result<Vec<u8>> {
 
 fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
     let bytes = receive_module(&socket)?;
+    send_packet(&socket, PROGRESS, b"module-received")?;
     let mut config = Config::new();
     config
+        .strategy(wasmtime::Strategy::Winch)
         .consume_fuel(true)
         .epoch_interruption(true)
         .memory_init_cow(false);
     let engine = Engine::new(&config)?;
     let module = Module::from_binary(&engine, &bytes)?;
     require_test_imports(&module)?;
+    send_packet(&socket, PROGRESS, b"module-compiled-imports-valid")?;
 
     let mut linker = Linker::<TestHost>::new(&engine);
     linker.func_wrap(
@@ -211,7 +215,12 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
         },
     )?;
 
-    let mut store = Store::new(&engine, TestHost { ipc: socket });
+    let mut store = Store::new(
+        &engine,
+        TestHost {
+            ipc: Arc::clone(&socket),
+        },
+    );
     store.set_fuel(TEST_FUEL)?;
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
@@ -221,12 +230,14 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
         deadline_engine.increment_epoch();
     });
     let instance = linker.instantiate(&mut store, &module)?;
+    send_packet(&socket, PROGRESS, b"instance-created")?;
     instance
         .get_typed_func::<(), ()>(&mut store, "_initialize")?
         .call(&mut store, ())?;
+    send_packet(&socket, PROGRESS, b"initialized-entering-main")?;
     instance
-        .get_typed_func::<(i32, i32), i32>(&mut store, "__main_argc_argv")?
-        .call(&mut store, (0, 0))
+        .get_typed_func::<(), i32>(&mut store, "drv_test_entry")?
+        .call(&mut store, ())
 }
 
 fn set_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> io::Result<()> {
@@ -308,10 +319,16 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
     let started = Instant::now();
     let mut log = Vec::new();
     let mut now_nanoseconds = 0_u64;
+    let mut clock_requests = 0_u64;
     let status = loop {
         if started.elapsed() > TEST_TIMEOUT {
             child.kill()?;
-            return Err("Sapphire worker timed out".into());
+            let child_status = child.wait()?;
+            return Err(format!(
+                "Sapphire worker timed out ({child_status}, {clock_requests} clock requests)\n{}",
+                String::from_utf8_lossy(&log)
+            )
+            .into());
         }
         match receive_packet(&supervisor) {
             Ok((LOG, payload)) if payload.len() >= 4 => {
@@ -325,7 +342,13 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
             Ok((CLOCK, payload)) if payload.is_empty() => {
                 let now = now_nanoseconds;
                 now_nanoseconds = now.saturating_add(1_000_000);
+                clock_requests += 1;
                 send_packet(&supervisor, ACK, &now.to_le_bytes())?;
+            }
+            Ok((PROGRESS, payload)) if payload.len() <= 64 && payload.is_ascii() => {
+                log.extend_from_slice(b"[worker: ");
+                log.extend_from_slice(&payload);
+                log.extend_from_slice(b"]\n");
             }
             Ok((EXIT, payload)) if payload.len() == 4 => {
                 send_packet(&supervisor, ACK, &[])?;
@@ -349,7 +372,11 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
                 ) =>
             {
                 if let Some(status) = child.try_wait()? {
-                    return Err(format!("Sapphire worker exited early: {status}").into());
+                    return Err(format!(
+                        "Sapphire worker exited early: {status}\n{}",
+                        String::from_utf8_lossy(&log)
+                    )
+                    .into());
                 }
             }
             Err(error) => return Err(error.into()),
@@ -363,6 +390,10 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
         )
         .into());
     }
+    log.extend_from_slice(
+        format!("[supervisor: {clock_requests} clock requests, final={now_nanoseconds}ns]\n")
+            .as_bytes(),
+    );
     Ok(String::from_utf8_lossy(&log).into_owned())
 }
 
@@ -402,4 +433,57 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     print!("{}", run_supervisor(module)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOOP_MODULE: &[u8] = b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0\x03\x02\x01\0\x07\x07\x01\x03run\0\0\x0a\x09\x01\x07\0\x03\x40\x0c\0\x0b\x0b";
+
+    #[test]
+    fn fuel_interrupts_guest_execution() {
+        let mut config = Config::new();
+        config
+            .strategy(wasmtime::Strategy::Winch)
+            .consume_fuel(true);
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::from_binary(&engine, LOOP_MODULE).unwrap();
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(1_000).unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        assert!(
+            instance
+                .get_typed_func::<(), ()>(&mut store, "run")
+                .unwrap()
+                .call(&mut store, ())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn epoch_interrupts_guest_execution() {
+        let mut config = Config::new();
+        config
+            .strategy(wasmtime::Strategy::Winch)
+            .epoch_interruption(true);
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::from_binary(&engine, LOOP_MODULE).unwrap();
+        let mut store = Store::new(&engine, ());
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+        let deadline_engine = engine.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            deadline_engine.increment_epoch();
+        });
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        assert!(
+            instance
+                .get_typed_func::<(), ()>(&mut store, "run")
+                .unwrap()
+                .call(&mut store, ())
+                .is_err()
+        );
+    }
 }

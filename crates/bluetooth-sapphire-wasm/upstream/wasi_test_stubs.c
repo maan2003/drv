@@ -16,6 +16,12 @@ extern void drv_test_log(uint32_t fd, const uint8_t* bytes, uint32_t length);
 __attribute__((import_module("drv:test"), import_name("exit")))
 extern void drv_test_exit(uint32_t status);
 
+extern int main(int argc, char** argv);
+
+__attribute__((export_name("drv_test_entry"))) int drv_test_entry(void) {
+  return main(drv_gtest_arg_count, drv_gtest_args);
+}
+
 __wasi_errno_t __imported_wasi_snapshot_preview1_args_get(uint8_t** argv,
                                                           uint8_t* buffer) {
   for (size_t i = 0; i < drv_gtest_arg_count; ++i) {

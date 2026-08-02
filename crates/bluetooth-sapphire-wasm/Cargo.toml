@@ -10,4 +10,5 @@ wasmtime = { version = "47.0.2", default-features = false, features = [
   "cranelift",
   "runtime",
   "std",
+  "winch",
 ] }
