@@ -3,9 +3,10 @@
 
 use mt7921_port_spike::{
     DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, acquire_driver_ownership,
-    read_dynamic_identity_status,
+    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, OwnershipError, OwnershipEvent,
+    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, TopOwnershipError,
+    TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
+    acquire_top_driver_ownership, read_dynamic_identity_status,
 };
 use std::{
     cell::Cell,
@@ -86,6 +87,7 @@ fn run() -> Result<(), String> {
         None => Operation::ReadFixed,
         Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
         Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
+        Some("--acquire-top-ownership") => Operation::AcquireTopOwnership,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
@@ -170,33 +172,70 @@ fn run() -> Result<(), String> {
             },
         )?;
     }
-    if operation == Operation::ReadDynamicIdentity {
+    if matches!(
+        operation,
+        Operation::ReadDynamicIdentity | Operation::AcquireTopOwnership
+    ) {
         let selector = ReadPage::map(&device, &info, 0xfe000, true)?;
-        let window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, false)?;
-        let mut transport = VfioDynamicL1 {
-            selector: &selector,
-            window: &window,
-            saved: Cell::new(None),
-        };
-        let status = read_dynamic_identity_status(&mut transport, log_dynamic_l1_event).map_err(
-            |error| match error {
-                DynamicL1Error::Transport(error) => error,
-                DynamicL1Error::SelectorMismatch { expected_base, raw } => format!(
-                    "dynamic L1 selector mismatch: expected {expected_base:#06x}, read {raw:#010x}"
-                ),
-                DynamicL1Error::Restore(error) => format!("restore dynamic L1 selector: {error}"),
-            },
+        let window = ReadPage::map(
+            &device,
+            &info,
+            MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+            operation == Operation::AcquireTopOwnership,
         )?;
-        if status.chip_id != 0x7961 {
-            return Err(format!(
-                "dynamic chip ID is {:#x}, expected 0x7961",
-                status.chip_id
-            ));
+        if operation == Operation::ReadDynamicIdentity {
+            let mut transport = VfioDynamicL1 {
+                selector: &selector,
+                window: &window,
+                saved: Cell::new(None),
+            };
+            let status = read_dynamic_identity_status(&mut transport, log_dynamic_l1_event)
+                .map_err(|error| match error {
+                    DynamicL1Error::Transport(error) => error,
+                    DynamicL1Error::SelectorMismatch { expected_base, raw } => format!(
+                        "dynamic L1 selector mismatch: expected {expected_base:#06x}, read {raw:#010x}"
+                    ),
+                    DynamicL1Error::Restore(error) => {
+                        format!("restore dynamic L1 selector: {error}")
+                    }
+                })?;
+            if status.chip_id != 0x7961 {
+                return Err(format!(
+                    "dynamic chip ID is {:#x}, expected 0x7961",
+                    status.chip_id
+                ));
+            }
+            println!(
+                "{{\"dynamic_identity\":{{\"chip_id\":\"{:#010x}\",\"revision\":\"{:#010x}\",\"hardware_bound\":\"{:#010x}\",\"top_low_power_control\":\"{:#010x}\"}}}}",
+                status.chip_id,
+                status.revision,
+                status.hardware_bound,
+                status.top_low_power_control
+            );
+        } else {
+            let mut transport = VfioTopOwnership {
+                selector: &selector,
+                window: &window,
+                start: Instant::now(),
+                saved: Cell::new(None),
+            };
+            acquire_top_driver_ownership(&mut transport, log_top_ownership_event).map_err(
+                |error| match error {
+                    TopOwnershipError::Transport(error) => error,
+                    TopOwnershipError::ClockOverflow => "MT_TOP ownership clock overflow".into(),
+                    TopOwnershipError::SelectorMismatch(raw) => {
+                        format!("MT_TOP selector mismatch {raw:#010x}")
+                    }
+                    TopOwnershipError::UnexpectedState(raw) => {
+                        format!("unexpected MT_TOP ownership state {raw:#010x}")
+                    }
+                    TopOwnershipError::Timeout => "MT_TOP driver ownership timed out".into(),
+                    TopOwnershipError::Restore(error) => {
+                        format!("restore MT_TOP selector: {error}")
+                    }
+                },
+            )?;
         }
-        println!(
-            "{{\"dynamic_identity\":{{\"chip_id\":\"{:#010x}\",\"revision\":\"{:#010x}\",\"hardware_bound\":\"{:#010x}\",\"top_low_power_control\":\"{:#010x}\"}}}}",
-            status.chip_id, status.revision, status.hardware_bound, status.top_low_power_control
-        );
     }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
@@ -338,6 +377,20 @@ impl ReadPage {
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
+    fn write_top_driver_own(&self) -> Result<(), String> {
+        let offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x10;
+        let within = offset - self.bar_page;
+        if self.bar_page != MT_HIF_REMAP_WINDOW_BAR_OFFSET || within + 4 > PAGE {
+            return Err("MT_TOP driver-own write escaped immutable allowlist".into());
+        }
+        unsafe {
+            std::ptr::write_volatile(
+                self.ptr.as_ptr().add(within).cast::<u32>(),
+                MT_TOP_LPCR_HOST_DRV_OWN,
+            )
+        };
+        Ok(())
+    }
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -414,6 +467,7 @@ enum Operation {
     ReadFixed,
     AcquireDriverOwnership,
     ReadDynamicIdentity,
+    AcquireTopOwnership,
 }
 
 struct VfioDynamicL1<'a> {
@@ -474,6 +528,76 @@ fn log_dynamic_l1_event(event: DynamicL1Event) {
         ),
         DynamicL1Event::SelectorRestored { raw } => {
             println!("{{\"dynamic_l1_event\":\"selector_restored\",\"raw\":\"{raw:#010x}\"}}")
+        }
+    }
+}
+
+struct VfioTopOwnership<'a> {
+    selector: &'a ReadPage,
+    window: &'a ReadPage,
+    start: Instant,
+    saved: Cell<Option<u32>>,
+}
+impl TopOwnershipTransport for VfioTopOwnership<'_> {
+    type Error = String;
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    fn read_selector(&mut self) -> Result<u32, Self::Error> {
+        let value = self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+        if self.saved.get().is_none() {
+            self.saved.set(Some(value));
+        }
+        Ok(value)
+    }
+    fn write_selector(&mut self, value: u32) -> Result<(), Self::Error> {
+        if value & 0xffff != 0x1806 && Some(value) != self.saved.get() {
+            return Err(format!("MT_TOP selector {value:#010x} escaped allowlist"));
+        }
+        self.selector.write_remap_selector(value)
+    }
+    fn write_top_driver_own(&mut self) -> Result<(), Self::Error> {
+        self.window.write_top_driver_own()
+    }
+    fn read_top_low_power_control(&mut self) -> Result<u32, Self::Error> {
+        if self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff != 0x1806 {
+            return Err("MT_TOP read attempted without 0x1806 selector".into());
+        }
+        self.window.read(MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x10)
+    }
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
+fn log_top_ownership_event(event: TopOwnershipEvent) {
+    match event {
+        TopOwnershipEvent::SelectorSaved { raw } => {
+            println!("{{\"top_ownership_event\":\"selector_saved\",\"raw\":\"{raw:#010x}\"}}")
+        }
+        TopOwnershipEvent::SelectorWritten { raw } => {
+            println!("{{\"top_ownership_event\":\"selector_written\",\"raw\":\"{raw:#010x}\"}}")
+        }
+        TopOwnershipEvent::SelectorVerified { raw } => {
+            println!("{{\"top_ownership_event\":\"selector_verified\",\"raw\":\"{raw:#010x}\"}}")
+        }
+        TopOwnershipEvent::DriverOwnWritten { at_ms } => println!(
+            "{{\"top_ownership_event\":\"driver_own_written\",\"at_ms\":{at_ms},\"value\":\"{MT_TOP_LPCR_HOST_DRV_OWN:#010x}\"}}"
+        ),
+        TopOwnershipEvent::StatusRead { at_ms, raw } => println!(
+            "{{\"top_ownership_event\":\"status_read\",\"at_ms\":{at_ms},\"raw\":\"{raw:#010x}\"}}"
+        ),
+        TopOwnershipEvent::Acquired { at_ms } => {
+            println!("{{\"top_ownership_event\":\"driver_ownership_acquired\",\"at_ms\":{at_ms}}}")
+        }
+        TopOwnershipEvent::UnexpectedState { at_ms, raw } => println!(
+            "{{\"top_ownership_event\":\"unexpected_state\",\"at_ms\":{at_ms},\"raw\":\"{raw:#010x}\"}}"
+        ),
+        TopOwnershipEvent::TimedOut { at_ms } => {
+            println!("{{\"top_ownership_event\":\"timed_out\",\"at_ms\":{at_ms}}}")
+        }
+        TopOwnershipEvent::SelectorRestored { raw } => {
+            println!("{{\"top_ownership_event\":\"selector_restored\",\"raw\":\"{raw:#010x}\"}}")
         }
     }
 }

@@ -69,6 +69,12 @@ posted selector write, reads only the enum-selected offsets through a separate
 read-only window mapping, and restores the original selector on success or
 failure. This mode cannot write the dynamic window or request MT_TOP ownership.
 
+`--acquire-top-ownership` separately ports pinned Linux
+`mt7921e_driver_own`. It selects only `MT_TOP_LPCR_HOST_BAND0`, writes only
+`MT_TOP_LPCR_HOST_DRV_OWN`, and polls `MT_TOP_LPCR_HOST_FW_OWN` clear with a
+500 ms hard deadline and 1 ms ticks. Command-bit readback is rejected, every
+transition is logged, and the saved remap selector is restored on every exit.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

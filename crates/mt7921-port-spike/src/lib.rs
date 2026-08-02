@@ -1036,6 +1036,117 @@ where
     Ok(value)
 }
 
+pub const MT_TOP_LPCR_HOST_FW_OWN: u32 = 1 << 0;
+pub const MT_TOP_LPCR_HOST_DRV_OWN: u32 = 1 << 1;
+pub const TOP_DRIVER_OWN_DEADLINE_MS: u64 = 500;
+
+pub trait TopOwnershipTransport {
+    type Error;
+    fn now_ms(&self) -> u64;
+    fn read_selector(&mut self) -> Result<u32, Self::Error>;
+    fn write_selector(&mut self, value: u32) -> Result<(), Self::Error>;
+    fn write_top_driver_own(&mut self) -> Result<(), Self::Error>;
+    fn read_top_low_power_control(&mut self) -> Result<u32, Self::Error>;
+    fn sleep_ms(&mut self, milliseconds: u64);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopOwnershipEvent {
+    SelectorSaved { raw: u32 },
+    SelectorWritten { raw: u32 },
+    SelectorVerified { raw: u32 },
+    DriverOwnWritten { at_ms: u64 },
+    StatusRead { at_ms: u64, raw: u32 },
+    Acquired { at_ms: u64 },
+    UnexpectedState { at_ms: u64, raw: u32 },
+    TimedOut { at_ms: u64 },
+    SelectorRestored { raw: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TopOwnershipError<E> {
+    Transport(E),
+    ClockOverflow,
+    SelectorMismatch(u32),
+    UnexpectedState(u32),
+    Timeout,
+    Restore(E),
+}
+
+/// Port pinned Linux `mt7921e_driver_own` with mandatory remap restoration.
+pub fn acquire_top_driver_ownership<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<(), TopOwnershipError<T::Error>>
+where
+    T: TopOwnershipTransport,
+    F: FnMut(TopOwnershipEvent),
+{
+    let saved = transport
+        .read_selector()
+        .map_err(TopOwnershipError::Transport)?;
+    event(TopOwnershipEvent::SelectorSaved { raw: saved });
+    let start = transport.now_ms();
+    let deadline = start
+        .checked_add(TOP_DRIVER_OWN_DEADLINE_MS)
+        .ok_or(TopOwnershipError::ClockOverflow)?;
+    let operation = (|| {
+        let selected = (saved & !MT_HIF_REMAP_L1_MASK) | 0x1806;
+        transport
+            .write_selector(selected)
+            .map_err(TopOwnershipError::Transport)?;
+        event(TopOwnershipEvent::SelectorWritten { raw: selected });
+        let verified = transport
+            .read_selector()
+            .map_err(TopOwnershipError::Transport)?;
+        event(TopOwnershipEvent::SelectorVerified { raw: verified });
+        if verified & MT_HIF_REMAP_L1_MASK != 0x1806 {
+            return Err(TopOwnershipError::SelectorMismatch(verified));
+        }
+        transport
+            .write_top_driver_own()
+            .map_err(TopOwnershipError::Transport)?;
+        event(TopOwnershipEvent::DriverOwnWritten {
+            at_ms: transport.now_ms().saturating_sub(start),
+        });
+        loop {
+            let raw = transport
+                .read_top_low_power_control()
+                .map_err(TopOwnershipError::Transport)?;
+            let now = transport.now_ms();
+            event(TopOwnershipEvent::StatusRead {
+                at_ms: now.saturating_sub(start),
+                raw,
+            });
+            if raw & MT_TOP_LPCR_HOST_DRV_OWN != 0 {
+                event(TopOwnershipEvent::UnexpectedState {
+                    at_ms: now.saturating_sub(start),
+                    raw,
+                });
+                return Err(TopOwnershipError::UnexpectedState(raw));
+            }
+            if raw & MT_TOP_LPCR_HOST_FW_OWN == 0 {
+                event(TopOwnershipEvent::Acquired {
+                    at_ms: now.saturating_sub(start),
+                });
+                return Ok(());
+            }
+            if now >= deadline {
+                event(TopOwnershipEvent::TimedOut {
+                    at_ms: now.saturating_sub(start),
+                });
+                return Err(TopOwnershipError::Timeout);
+            }
+            transport.sleep_ms(DRIVER_OWN_POLL_MS.min(deadline - now));
+        }
+    })();
+    if let Err(error) = transport.write_selector(saved) {
+        return Err(TopOwnershipError::Restore(error));
+    }
+    event(TopOwnershipEvent::SelectorRestored { raw: saved });
+    operation
+}
+
 impl ReadOnlyStatus {
     pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
         Self {
@@ -1418,6 +1529,96 @@ mod tests {
             events.last(),
             Some(&DynamicL1Event::SelectorRestored { raw: 0x55aa_4321 })
         );
+    }
+
+    struct FakeTopOwn {
+        now: u64,
+        selector: u32,
+        status: u32,
+        clear_after_ms: Option<u64>,
+        writes: Vec<u32>,
+    }
+    impl TopOwnershipTransport for FakeTopOwn {
+        type Error = ();
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn read_selector(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.selector)
+        }
+        fn write_selector(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.selector = value;
+            self.writes.push(value);
+            Ok(())
+        }
+        fn write_top_driver_own(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn read_top_low_power_control(&mut self) -> Result<u32, Self::Error> {
+            if self
+                .clear_after_ms
+                .is_some_and(|deadline| self.now >= deadline)
+            {
+                self.status &= !MT_TOP_LPCR_HOST_FW_OWN;
+            }
+            Ok(self.status)
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+    }
+
+    #[test]
+    fn top_ownership_succeeds_and_restores_selector() {
+        let mut transport = FakeTopOwn {
+            now: 0,
+            selector: 0xaaaa_5555,
+            status: MT_TOP_LPCR_HOST_FW_OWN,
+            clear_after_ms: Some(2),
+            writes: Vec::new(),
+        };
+        let mut events = Vec::new();
+        acquire_top_driver_ownership(&mut transport, |event| events.push(event)).unwrap();
+        assert_eq!(transport.now, 2);
+        assert_eq!(transport.selector, 0xaaaa_5555);
+        assert_eq!(transport.writes, [0xaaaa_1806, 0xaaaa_5555]);
+        assert_eq!(
+            events.last(),
+            Some(&TopOwnershipEvent::SelectorRestored { raw: 0xaaaa_5555 })
+        );
+    }
+
+    #[test]
+    fn top_ownership_times_out_and_restores_selector() {
+        let mut transport = FakeTopOwn {
+            now: 0,
+            selector: 0x1234_5678,
+            status: MT_TOP_LPCR_HOST_FW_OWN,
+            clear_after_ms: None,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            acquire_top_driver_ownership(&mut transport, |_| {}),
+            Err(TopOwnershipError::Timeout)
+        );
+        assert_eq!(transport.now, TOP_DRIVER_OWN_DEADLINE_MS);
+        assert_eq!(transport.selector, 0x1234_5678);
+    }
+
+    #[test]
+    fn top_ownership_rejects_driver_command_readback_and_restores() {
+        let mut transport = FakeTopOwn {
+            now: 0,
+            selector: 0,
+            status: MT_TOP_LPCR_HOST_DRV_OWN,
+            clear_after_ms: None,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            acquire_top_driver_ownership(&mut transport, |_| {}),
+            Err(TopOwnershipError::UnexpectedState(MT_TOP_LPCR_HOST_DRV_OWN))
+        );
+        assert_eq!(transport.selector, 0);
     }
 
     #[test]
