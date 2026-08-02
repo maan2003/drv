@@ -82,8 +82,19 @@ enable bits and the complete host interrupt-enable register are zero. It then
 temporarily programs only firmware-download ring 16's descriptor base, count,
 and CPU index; verifies readback including the untouched DMA index; restores
 the original ring registers; explicitly unmaps the complete arena; and emits
-an event for every step. It cannot write WFDMA enable, interrupt, or DMA-index
-registers.
+an event for every step. Restoring those visible resources did not make the
+kernel fallback usable in the first physical run, despite a successful script
+and supervisor restoration; the machine required a cold power cycle. The mode
+therefore now requires VFIO reset capability and issues `VFIO_DEVICE_RESET`
+after arena unmap and before returning the function to the supervisor. It
+cannot write WFDMA enable, interrupt, or DMA-index registers. Any repeat must
+run through the externally renewed `wifi-driver-lab-remote` reboot watchdog.
+
+`reset_wfsys` also ports the device-specific recovery sequence from pinned
+Linux `mt792x_wfsys_reset`: clear `WFSYS_SW_RST_B`, hold for 50 ms, set it, and
+poll `WFSYS_SW_INIT_DONE` for at most 500 ms. No physical adapter for address
+`0x18000140` is admitted yet; deterministic success and timeout behavior must
+precede that additional dynamic-L1 write surface.
 
 ## Verified against pinned Linux 7.2-rc5 source
 

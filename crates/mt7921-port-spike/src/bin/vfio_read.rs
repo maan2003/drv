@@ -21,7 +21,9 @@ use std::{
 
 const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
+const VFIO_DEVICE_GET_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 8);
+const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
 const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
@@ -37,6 +39,7 @@ const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
+const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
 
 #[repr(C)]
@@ -63,6 +66,16 @@ struct RegionInfo {
     cap_offset: u32,
     size: u64,
     offset: u64,
+}
+#[repr(C)]
+#[derive(Default)]
+struct DeviceInfo {
+    argsz: u32,
+    flags: u32,
+    num_regions: u32,
+    num_irqs: u32,
+    cap_offset: u32,
+    pad: u32,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -298,6 +311,8 @@ fn run() -> Result<(), String> {
         println!(
             "{{\"fwdl_ring_event\":\"arena_unmapped\",\"iova\":\"0x01000000\",\"bytes\":4096}}"
         );
+        reset_vfio_device(&device)?;
+        println!("{{\"fwdl_ring_event\":\"vfio_device_reset_completed\"}}");
     }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
@@ -307,27 +322,29 @@ fn run() -> Result<(), String> {
         };
         page.read(register.bar_offset())
     };
-    let mcu = read(ReadRegister::McuCommand)?;
-    let interrupt = read(ReadRegister::HostInterruptStatus)?;
-    let wfdma_config = read(ReadRegister::WfdmaGlobalConfig)?;
-    let low_power = read(ReadRegister::ConnOnLowPowerControl)?;
-    let conn_misc = read(ReadRegister::ConnOnMisc)?;
-    let status = ReadOnlyStatus::decode(conn_misc, low_power, wfdma_config);
-    println!(
-        "{{\"pci_bdf\":\"{bdf}\",\"vendor_device\":\"14c3:7961\",\"subsystem\":\"1a3b:4680\",\"registers\":{{\"{}\":\"{mcu:#010x}\",\"{}\":\"{interrupt:#010x}\",\"{}\":\"{wfdma_config:#010x}\",\"{}\":\"{low_power:#010x}\",\"{}\":\"{conn_misc:#010x}\"}},\"status\":{{\"firmware_powered\":{},\"firmware_n9_ready\":{},\"firmware_owns_device\":{},\"tx_dma_enabled\":{},\"tx_dma_busy\":{},\"rx_dma_enabled\":{},\"rx_dma_busy\":{}}}}}",
-        ReadRegister::McuCommand.name(),
-        ReadRegister::HostInterruptStatus.name(),
-        ReadRegister::WfdmaGlobalConfig.name(),
-        ReadRegister::ConnOnLowPowerControl.name(),
-        ReadRegister::ConnOnMisc.name(),
-        status.firmware_powered,
-        status.firmware_n9_ready,
-        status.firmware_owns_device,
-        status.tx_dma_enabled,
-        status.tx_dma_busy,
-        status.rx_dma_enabled,
-        status.rx_dma_busy,
-    );
+    if operation != Operation::ProgramDisabledFwdlRing {
+        let mcu = read(ReadRegister::McuCommand)?;
+        let interrupt = read(ReadRegister::HostInterruptStatus)?;
+        let wfdma_config = read(ReadRegister::WfdmaGlobalConfig)?;
+        let low_power = read(ReadRegister::ConnOnLowPowerControl)?;
+        let conn_misc = read(ReadRegister::ConnOnMisc)?;
+        let status = ReadOnlyStatus::decode(conn_misc, low_power, wfdma_config);
+        println!(
+            "{{\"pci_bdf\":\"{bdf}\",\"vendor_device\":\"14c3:7961\",\"subsystem\":\"1a3b:4680\",\"registers\":{{\"{}\":\"{mcu:#010x}\",\"{}\":\"{interrupt:#010x}\",\"{}\":\"{wfdma_config:#010x}\",\"{}\":\"{low_power:#010x}\",\"{}\":\"{conn_misc:#010x}\"}},\"status\":{{\"firmware_powered\":{},\"firmware_n9_ready\":{},\"firmware_owns_device\":{},\"tx_dma_enabled\":{},\"tx_dma_busy\":{},\"rx_dma_enabled\":{},\"rx_dma_busy\":{}}}}}",
+            ReadRegister::McuCommand.name(),
+            ReadRegister::HostInterruptStatus.name(),
+            ReadRegister::WfdmaGlobalConfig.name(),
+            ReadRegister::ConnOnLowPowerControl.name(),
+            ReadRegister::ConnOnMisc.name(),
+            status.firmware_powered,
+            status.firmware_n9_ready,
+            status.firmware_owns_device,
+            status.tx_dma_enabled,
+            status.tx_dma_busy,
+            status.rx_dma_enabled,
+            status.rx_dma_busy,
+        );
+    }
     drop(wfdma);
     drop(conn);
     drop(device);
@@ -591,6 +608,29 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
     } else {
         Ok(())
     }
+}
+
+fn reset_vfio_device(device: &File) -> Result<(), String> {
+    let mut info = DeviceInfo {
+        argsz: size::<DeviceInfo>(),
+        ..Default::default()
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_GET_INFO,
+        &mut info,
+        "query VFIO reset capability",
+    )?;
+    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+        return Err("VFIO device does not advertise reset support".into());
+    }
+    if unsafe { ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET) } < 0 {
+        return Err(format!(
+            "VFIO device reset: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 struct VfioOwnership<'a> {

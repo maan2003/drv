@@ -1323,6 +1323,100 @@ fn read_fwdl_registers<T: DisabledFwdlRingTransport>(
     })
 }
 
+pub const WFSYS_SW_RST_B: u32 = 1 << 0;
+pub const WFSYS_SW_INIT_DONE: u32 = 1 << 4;
+pub const WFSYS_ASSERT_MS: u64 = 50;
+pub const WFSYS_READY_DEADLINE_MS: u64 = 500;
+
+pub trait WfsysResetTransport {
+    type Error;
+    fn now_ms(&self) -> u64;
+    fn read_reset_control(&mut self) -> Result<u32, Self::Error>;
+    fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error>;
+    fn sleep_ms(&mut self, milliseconds: u64);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WfsysResetEvent {
+    Snapshot { raw: u32 },
+    Asserted { raw: u32, at_ms: u64 },
+    Released { raw: u32, at_ms: u64 },
+    StatusRead { raw: u32, at_ms: u64 },
+    Ready { raw: u32, at_ms: u64 },
+    TimedOut { raw: u32, at_ms: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WfsysResetError<E> {
+    Transport(E),
+    ClockOverflow,
+    Timeout,
+}
+
+/// Port pinned Linux `mt792x_wfsys_reset` without its kernel runtime.
+///
+/// The concrete MT7921 target is physical address 0x18000140 and therefore
+/// requires the same bounded dynamic-L1 mechanism before a physical adapter is
+/// admitted. This portable state machine only owns the exact bit sequence and
+/// deadlines; it cannot select or access any register itself.
+pub fn reset_wfsys<T, F>(transport: &mut T, mut event: F) -> Result<(), WfsysResetError<T::Error>>
+where
+    T: WfsysResetTransport,
+    F: FnMut(WfsysResetEvent),
+{
+    let start = transport.now_ms();
+    let initial = transport
+        .read_reset_control()
+        .map_err(WfsysResetError::Transport)?;
+    event(WfsysResetEvent::Snapshot { raw: initial });
+    let asserted = initial & !WFSYS_SW_RST_B;
+    transport
+        .write_reset_control(asserted)
+        .map_err(WfsysResetError::Transport)?;
+    event(WfsysResetEvent::Asserted {
+        raw: asserted,
+        at_ms: 0,
+    });
+    transport.sleep_ms(WFSYS_ASSERT_MS);
+    let released = asserted | WFSYS_SW_RST_B;
+    transport
+        .write_reset_control(released)
+        .map_err(WfsysResetError::Transport)?;
+    event(WfsysResetEvent::Released {
+        raw: released,
+        at_ms: transport.now_ms().saturating_sub(start),
+    });
+    let deadline = transport
+        .now_ms()
+        .checked_add(WFSYS_READY_DEADLINE_MS)
+        .ok_or(WfsysResetError::ClockOverflow)?;
+    loop {
+        let raw = transport
+            .read_reset_control()
+            .map_err(WfsysResetError::Transport)?;
+        let now = transport.now_ms();
+        event(WfsysResetEvent::StatusRead {
+            raw,
+            at_ms: now.saturating_sub(start),
+        });
+        if raw & WFSYS_SW_INIT_DONE != 0 {
+            event(WfsysResetEvent::Ready {
+                raw,
+                at_ms: now.saturating_sub(start),
+            });
+            return Ok(());
+        }
+        if now >= deadline {
+            event(WfsysResetEvent::TimedOut {
+                raw,
+                at_ms: now.saturating_sub(start),
+            });
+            return Err(WfsysResetError::Timeout);
+        }
+        transport.sleep_ms(DRIVER_OWN_POLL_MS.min(deadline - now));
+    }
+}
+
 impl ReadOnlyStatus {
     pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
         Self {
@@ -1888,6 +1982,77 @@ mod tests {
         ));
         // The fake corrupts reads only; stored register values are restored.
         assert_eq!(transport.ring, snapshot);
+    }
+
+    struct FakeWfsys {
+        now: u64,
+        raw: u32,
+        ready_at: Option<u64>,
+        writes: Vec<u32>,
+    }
+    impl WfsysResetTransport for FakeWfsys {
+        type Error = ();
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+            if self.ready_at.is_some_and(|ready| self.now >= ready) {
+                self.raw |= WFSYS_SW_INIT_DONE;
+            }
+            Ok(self.raw)
+        }
+        fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.raw = value;
+            self.writes.push(value);
+            Ok(())
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+    }
+
+    #[test]
+    fn wfsys_reset_matches_linux_assert_release_and_ready_poll() {
+        let mut transport = FakeWfsys {
+            now: 10,
+            raw: 0x101,
+            ready_at: Some(62),
+            writes: Vec::new(),
+        };
+        let mut events = Vec::new();
+        reset_wfsys(&mut transport, |event| events.push(event)).unwrap();
+        assert_eq!(transport.writes, [0x100, 0x101]);
+        assert_eq!(transport.now, 62);
+        assert_eq!(
+            events.last(),
+            Some(&WfsysResetEvent::Ready {
+                raw: 0x111,
+                at_ms: 52
+            })
+        );
+    }
+
+    #[test]
+    fn wfsys_reset_has_bounded_ready_timeout() {
+        let mut transport = FakeWfsys {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            ready_at: None,
+            writes: Vec::new(),
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            reset_wfsys(&mut transport, |event| events.push(event)),
+            Err(WfsysResetError::Timeout)
+        );
+        assert_eq!(transport.now, WFSYS_ASSERT_MS + WFSYS_READY_DEADLINE_MS);
+        assert_eq!(
+            events.last(),
+            Some(&WfsysResetEvent::TimedOut {
+                raw: WFSYS_SW_RST_B,
+                at_ms: WFSYS_ASSERT_MS + WFSYS_READY_DEADLINE_MS
+            })
+        );
     }
 
     #[test]
