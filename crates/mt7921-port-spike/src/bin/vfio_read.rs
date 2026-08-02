@@ -5,21 +5,25 @@ use mt7921_port_spike::{
     DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
+    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, GlobalTxRingError,
+    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, Patch, ReadOnlyStatus, ReadRegister, TopOwnershipError,
-    TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
-    acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, stage_disabled_firmware_chunk,
+    PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState,
+    acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
+    prepare_global_tx_rings, program_disabled_fwdl_ring, read_dynamic_identity_status,
+    select_vfio_irq, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
     env,
     fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, RawFd},
     process::Command,
     ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -27,6 +31,8 @@ const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
 const VFIO_DEVICE_GET_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 8);
+const VFIO_DEVICE_GET_IRQ_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 9);
+const VFIO_DEVICE_SET_IRQS: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 10);
 const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
@@ -45,6 +51,15 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
+const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
+const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
+const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
+const EFD_CLOEXEC: i32 = 0x80000;
+const EFD_NONBLOCK: i32 = 0x800;
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIG_ERR: usize = usize::MAX;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
 
@@ -85,6 +100,29 @@ struct DeviceInfo {
 }
 #[repr(C)]
 #[derive(Default)]
+struct IrqInfo {
+    argsz: u32,
+    flags: u32,
+    index: u32,
+    count: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IrqSetHeader {
+    argsz: u32,
+    flags: u32,
+    index: u32,
+    start: u32,
+    count: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IrqSetEventfd {
+    header: IrqSetHeader,
+    eventfd: i32,
+}
+#[repr(C)]
+#[derive(Default)]
 struct IoasAlloc {
     size: u32,
     flags: u32,
@@ -120,6 +158,55 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn eventfd(initval: u32, flags: i32) -> i32;
+    fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+    fn close(fd: i32) -> i32;
+    fn signal(number: i32, handler: usize) -> usize;
+}
+
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_stop(_: i32) {
+    STOP_REQUESTED.store(true, Ordering::Release);
+}
+
+#[allow(dead_code)]
+struct ActiveSignalGuard {
+    previous: [(i32, usize); 3],
+}
+#[allow(dead_code)]
+impl ActiveSignalGuard {
+    fn install() -> Result<Self, String> {
+        STOP_REQUESTED.store(false, Ordering::Release);
+        let mut previous = [(0, 0); 3];
+        for (slot, number) in previous.iter_mut().zip([SIGHUP, SIGINT, SIGTERM]) {
+            let handler = unsafe { signal(number, request_stop as *const () as usize) };
+            if handler == SIG_ERR {
+                for (installed_number, installed_handler) in
+                    previous.iter().copied().take_while(|entry| entry.0 != 0)
+                {
+                    unsafe { signal(installed_number, installed_handler) };
+                }
+                return Err(format!(
+                    "install active-DMA signal handler: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            *slot = (number, handler);
+        }
+        Ok(Self { previous })
+    }
+    fn stop_requested(&self) -> bool {
+        STOP_REQUESTED.load(Ordering::Acquire)
+    }
+}
+impl Drop for ActiveSignalGuard {
+    fn drop(&mut self) {
+        for (number, handler) in self.previous {
+            unsafe { signal(number, handler) };
+        }
+        STOP_REQUESTED.store(false, Ordering::Release);
+    }
 }
 
 fn main() {
@@ -138,6 +225,12 @@ fn run() -> Result<(), String> {
         Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
         Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
         Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
+        Some("--inventory-vfio-irqs") => Operation::InventoryVfioIrqs,
+        Some("--install-disable-vfio-irq") => Operation::InstallDisableVfioIrq,
+        Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
+        Some("--run-one-shot-fwdl") => {
+            return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
+        }
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
@@ -213,7 +306,41 @@ fn run() -> Result<(), String> {
             Operation::ProgramDisabledFwdlRing | Operation::MaskAckDisabledFwdl
         ),
     )?;
+    let pcie_mac = if operation == Operation::PrepareOwnedGlobalTxRings {
+        Some(ReadPage::map(&device, &info, 0x10000, true)?)
+    } else {
+        None
+    };
     let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
+    if matches!(
+        operation,
+        Operation::InventoryVfioIrqs | Operation::InstallDisableVfioIrq
+    ) {
+        let capabilities = vfio_irq_capabilities(&device)?;
+        for capability in &capabilities {
+            println!("{{\"vfio_irq_capability\":\"{capability:?}\"}}");
+        }
+        let selected = select_vfio_irq(&capabilities)
+            .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+        println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+        if operation == Operation::InstallDisableVfioIrq {
+            let lifecycle = IrqLifecycle::Uninstalled
+                .install(selected)
+                .map_err(|error| format!("install IRQ lifecycle: {error:?}"))?;
+            let mut irq = VfioIrq::install(&device, selected)?;
+            println!("{{\"vfio_irq_event\":\"eventfd_installed\"}}");
+            if irq.try_read()?.is_some() {
+                return Err("unexpected IRQ before device source enable".into());
+            }
+            irq.disable()?;
+            lifecycle
+                .disable()
+                .map_err(|error| format!("disable IRQ lifecycle: {error:?}"))?;
+            println!("{{\"vfio_irq_event\":\"eventfd_empty_and_disabled\"}}");
+            reset_vfio_device(&device)?;
+            println!("{{\"vfio_irq_event\":\"vfio_device_reset_completed\"}}");
+        }
+    }
     if acquire {
         let mut transport = VfioOwnership {
             page: &conn,
@@ -406,6 +533,87 @@ fn run() -> Result<(), String> {
         reset?;
         println!("{{\"fwdl_stage_event\":\"arenas_unmapped_and_vfio_device_reset\"}}");
     }
+    if operation == Operation::PrepareOwnedGlobalTxRings {
+        verify_pci_dma_disabled(&bdf)?;
+        if info.size < 0x100000 {
+            return Err(format!("BAR0 is too small: {:#x}", info.size));
+        }
+        let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
+        let mac_irq = pcie_mac.read(0x10188)?;
+        if mac_irq == u32::MAX {
+            return Err("PCIe MAC interrupt gate returned all ones".into());
+        }
+        set_lab_safety("MUTATED")?;
+        disable_pci_intx(&bdf)?;
+        pcie_mac.write_pcie_mac_interrupt_enable_zero()?;
+        if pcie_mac.read(0x10188)? != 0 {
+            return Err(format!(
+                "PCIe MAC interrupt gate did not clear from {mac_irq:#010x}"
+            ));
+        }
+        let mut guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        let mut fwdl = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
+        let mut mcu = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
+        guard.initialize_descriptor_page()?;
+        fwdl.initialize_descriptor_page()?;
+        mcu.initialize_descriptor_page()?;
+        let operation = {
+            let mut transport = VfioGlobalTxRings { page: &wfdma };
+            prepare_global_tx_rings(
+                &mut transport,
+                guard.iova,
+                fwdl.iova,
+                mcu.iova,
+                log_global_tx_ring_event,
+            )
+            .map_err(|error| match error {
+                GlobalTxRingError::InvalidArena => "invalid owned TX arena".into(),
+                GlobalTxRingError::ActiveState {
+                    global_config,
+                    interrupt_enable,
+                } => format!(
+                    "refused active state global={global_config:#010x} interrupts={interrupt_enable:#010x}"
+                ),
+                GlobalTxRingError::InvalidMmio => "invalid all-ones TX ring MMIO".into(),
+                GlobalTxRingError::DirtyRing { index, state } => {
+                    format!("TX ring {index} is not idle: {state:?}")
+                }
+                GlobalTxRingError::Transport(error) => error,
+                GlobalTxRingError::Readback { index, state } => {
+                    format!("TX ring {index} ownership readback mismatch: {state:?}")
+                }
+            })
+        };
+        verify_pci_dma_disabled(&bdf)?;
+        let global = wfdma.read(0xd4208)?;
+        let host_irq = wfdma.read(0xd4204)?;
+        let mac_irq = pcie_mac.read(0x10188)?;
+        if global & 0xf != 0 || host_irq != 0 || mac_irq != 0 {
+            return Err(format!(
+                "post-program gates unsafe global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x}"
+            ));
+        }
+        reset_vfio_device(&device)?;
+        println!("{{\"global_tx_ring_event\":\"vfio_device_reset_while_pinned\"}}");
+        verify_pci_dma_disabled(&bdf)?;
+        let reset_global = wfdma.read(0xd4208)?;
+        let reset_host_irq = wfdma.read(0xd4204)?;
+        let reset_mac_irq = pcie_mac.read(0x10188)?;
+        if reset_global & 0xf != 0 || reset_host_irq != 0 || reset_mac_irq != 0 {
+            return Err(format!(
+                "post-reset gates unsafe global={reset_global:#010x} host_irq={reset_host_irq:#010x} mac_irq={reset_mac_irq:#010x}"
+            ));
+        }
+        set_lab_safety("SAFE")?;
+        let guard_unmap = guard.teardown();
+        let fwdl_unmap = fwdl.teardown();
+        let mcu_unmap = mcu.teardown();
+        guard_unmap?;
+        fwdl_unmap?;
+        mcu_unmap?;
+        println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
+        operation?;
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -418,7 +626,9 @@ fn run() -> Result<(), String> {
         operation,
         Operation::ProgramDisabledFwdlRing
             | Operation::MaskAckDisabledFwdl
+            | Operation::PrepareOwnedGlobalTxRings
             | Operation::StageDisabledFirmwareDescriptor
+            | Operation::InstallDisableVfioIrq
     ) {
         let mcu = read(ReadRegister::McuCommand)?;
         let interrupt = read(ReadRegister::HostInterruptStatus)?;
@@ -468,6 +678,77 @@ fn verify_pci_identity(bdf: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn verify_pci_dma_disabled(bdf: &str) -> Result<(), String> {
+    let path = format!("/sys/bus/pci/devices/{bdf}/config");
+    let mut file = File::open(&path).map_err(|error| format!("open PCI config: {error}"))?;
+    let mut config = [0u8; 256];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut config))
+        .map_err(|error| format!("read PCI config: {error}"))?;
+    let command = u16::from_le_bytes(config[4..6].try_into().expect("fixed field"));
+    if command & (1 << 1) == 0 || command & (1 << 2) != 0 {
+        return Err(format!(
+            "PCI command requires MSE=1 BME=0, read {command:#06x}"
+        ));
+    }
+    let mut capability = usize::from(config[0x34] & !3);
+    let mut power_state = None;
+    for _ in 0..48 {
+        if capability < 0x40 || capability + 6 > config.len() {
+            break;
+        }
+        if config[capability] == 1 {
+            power_state = Some(
+                u16::from_le_bytes(
+                    config[capability + 4..capability + 6]
+                        .try_into()
+                        .expect("fixed field"),
+                ) & 3,
+            );
+            break;
+        }
+        capability = usize::from(config[capability + 1] & !3);
+    }
+    if power_state != Some(0) {
+        return Err(format!("PCI device is not in D0: {power_state:?}"));
+    }
+    Ok(())
+}
+
+fn disable_pci_intx(bdf: &str) -> Result<(), String> {
+    let path = format!("/sys/bus/pci/devices/{bdf}/config");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open PCI config for INTx disable: {error}"))?;
+    let mut raw = [0u8; 2];
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("read PCI command for INTx disable: {error}"))?;
+    let command = u16::from_le_bytes(raw) | (1 << 10);
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&command.to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::Start(4)))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("write PCI INTx disable: {error}"))?;
+    let readback = u16::from_le_bytes(raw);
+    if readback & (1 << 10) == 0 {
+        return Err(format!("PCI INTx disable did not latch: {readback:#06x}"));
+    }
+    Ok(())
+}
+
+fn set_lab_safety(value: &str) -> Result<(), String> {
+    if !matches!(value, "SAFE" | "MUTATED") {
+        return Err("invalid lab safety state".into());
+    }
+    let path = env::var("DRV_LAB_SAFETY_STATE")
+        .map_err(|_| "DRV_LAB_SAFETY_STATE is required for mutating operations")?;
+    std::fs::write(&path, format!("{value}\n"))
+        .map_err(|error| format!("write lab safety state {path}: {error}"))
 }
 
 struct Ioas<'a> {
@@ -543,6 +824,16 @@ impl<'a> DmaArena<'a> {
         }
         unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
         for offset in (0..MT7921_FWDL_RING_BYTES).step_by(16) {
+            unsafe {
+                std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
+            };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn initialize_descriptor_page(&mut self) -> Result<(), String> {
+        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        for offset in (0..self.len).step_by(16) {
             unsafe {
                 std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
             };
@@ -662,6 +953,105 @@ impl Drop for Ioas<'_> {
     }
 }
 
+#[allow(dead_code)]
+struct VfioIrq {
+    device_fd: RawFd,
+    event_fd: RawFd,
+    index: u32,
+    installed: bool,
+}
+#[allow(dead_code)]
+impl VfioIrq {
+    fn install(device: &File, capability: PciIrqCapability) -> Result<Self, String> {
+        if capability.count == 0 || !capability.eventfd {
+            return Err("refused non-eventfd VFIO interrupt".into());
+        }
+        let index = match capability.kind {
+            PciIrqKind::Intx => 0,
+            PciIrqKind::Msi => 1,
+            PciIrqKind::Msix => 2,
+        };
+        let event_fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+        if event_fd < 0 {
+            return Err(format!(
+                "create IRQ eventfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut set = IrqSetEventfd {
+            header: IrqSetHeader {
+                argsz: size::<IrqSetEventfd>(),
+                flags: VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                index,
+                start: 0,
+                count: 1,
+            },
+            eventfd: event_fd,
+        };
+        if let Err(error) = ioctl_mut(
+            device.as_raw_fd(),
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "install VFIO IRQ eventfd",
+        ) {
+            unsafe { close(event_fd) };
+            return Err(error);
+        }
+        Ok(Self {
+            device_fd: device.as_raw_fd(),
+            event_fd,
+            index,
+            installed: true,
+        })
+    }
+    fn try_read(&self) -> Result<Option<u64>, String> {
+        let mut counter = 0u64;
+        let result = unsafe {
+            read(
+                self.event_fd,
+                (&mut counter as *mut u64).cast::<u8>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if result == std::mem::size_of::<u64>() as isize {
+            Ok(Some(counter))
+        } else if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "read IRQ eventfd: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+    fn disable(&mut self) -> Result<(), String> {
+        if !self.installed {
+            return Ok(());
+        }
+        let mut set = IrqSetHeader {
+            argsz: size::<IrqSetHeader>(),
+            flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+            index: self.index,
+            start: 0,
+            count: 0,
+        };
+        ioctl_mut(
+            self.device_fd,
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "disable VFIO IRQ eventfd",
+        )?;
+        self.installed = false;
+        Ok(())
+    }
+}
+impl Drop for VfioIrq {
+    fn drop(&mut self) {
+        let _ = self.disable();
+        unsafe { close(self.event_fd) };
+    }
+}
+
 struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
@@ -740,6 +1130,14 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn write_pcie_mac_interrupt_enable_zero(&self) -> Result<(), String> {
+        if self.bar_page != 0x10000 {
+            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
+        }
+        let within = 0x10188 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), 0) };
+        Ok(())
+    }
     fn write_fwdl_ring(&self, register: DisabledFwdlWrite, value: u32) -> Result<(), String> {
         let offset = match register {
             DisabledFwdlWrite::DescriptorBase => 0xd4400,
@@ -750,6 +1148,33 @@ impl ReadPage {
         if self.bar_page != 0xd4000 || within + 4 > PAGE {
             return Err("firmware ring write escaped immutable allowlist".into());
         }
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    fn write_tx_ring_slot(
+        &self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || index >= 18 {
+            return Err("global TX ring write escaped slot allowlist".into());
+        }
+        for (word, value) in [descriptor_base, descriptor_count, cpu_index]
+            .into_iter()
+            .enumerate()
+        {
+            let within = 0x300 + index * 0x10 + word * 4;
+            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        }
+        Ok(())
+    }
+    fn reset_all_tx_indices(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || value != u32::MAX {
+            return Err("DTX reset escaped all-rings-only allowlist".into());
+        }
+        let within = 0xd420c - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
@@ -786,6 +1211,32 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
     } else {
         Ok(())
     }
+}
+
+fn vfio_irq_capabilities(device: &File) -> Result<Vec<PciIrqCapability>, String> {
+    let mut capabilities = Vec::new();
+    for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
+        .into_iter()
+        .enumerate()
+    {
+        let mut irq = IrqInfo {
+            argsz: size::<IrqInfo>(),
+            index: index as u32,
+            ..Default::default()
+        };
+        ioctl_mut(
+            device.as_raw_fd(),
+            VFIO_DEVICE_GET_IRQ_INFO,
+            &mut irq,
+            "query VFIO IRQ",
+        )?;
+        capabilities.push(PciIrqCapability {
+            kind,
+            count: irq.count,
+            eventfd: irq.flags & 1 != 0,
+        });
+    }
+    Ok(capabilities)
 }
 
 fn reset_vfio_device(device: &File) -> Result<(), String> {
@@ -872,6 +1323,9 @@ enum Operation {
     ProgramDisabledFwdlRing,
     MaskAckDisabledFwdl,
     StageDisabledFirmwareDescriptor,
+    InventoryVfioIrqs,
+    InstallDisableVfioIrq,
+    PrepareOwnedGlobalTxRings,
 }
 
 struct VfioDynamicL1<'a> {
@@ -1026,6 +1480,48 @@ fn log_disabled_fwdl_event(event: DisabledFwdlEvent) {
     println!("{{\"fwdl_ring_event\":\"{event:?}\"}}")
 }
 
+struct VfioGlobalTxRings<'a> {
+    page: &'a ReadPage,
+}
+impl GlobalTxRingTransport for VfioGlobalTxRings<'_> {
+    type Error = String;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4208)
+    }
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4204)
+    }
+    fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error> {
+        if index >= 18 {
+            return Err("TX ring read escaped slot allowlist".into());
+        }
+        let base = 0xd4300 + index * 0x10;
+        Ok(TxRingState {
+            descriptor_base: self.page.read(base)?,
+            descriptor_count: self.page.read(base + 4)?,
+            cpu_index: self.page.read(base + 8)?,
+            dma_index: self.page.read(base + 12)?,
+        })
+    }
+    fn write_tx_ring(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), Self::Error> {
+        self.page
+            .write_tx_ring_slot(index, descriptor_base, descriptor_count, cpu_index)
+    }
+    fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.page.reset_all_tx_indices(value)
+    }
+}
+
+fn log_global_tx_ring_event(event: GlobalTxRingEvent) {
+    println!("{{\"global_tx_ring_event\":\"{event:?}\"}}")
+}
+
 struct VfioFwdlInterrupt<'a> {
     page: &'a ReadPage,
 }
@@ -1068,4 +1564,28 @@ fn decompress_patch() -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfio_irq_payload_matches_linux_uapi_layout() {
+        assert_eq!(std::mem::size_of::<IrqSetHeader>(), 20);
+        assert_eq!(std::mem::size_of::<IrqSetEventfd>(), 24);
+        assert_eq!(
+            VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+            0x24
+        );
+        assert_eq!(VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER, 0x21);
+    }
+
+    #[test]
+    fn active_signal_handler_requests_bounded_cleanup() {
+        STOP_REQUESTED.store(false, Ordering::Release);
+        request_stop(SIGTERM);
+        assert!(STOP_REQUESTED.load(Ordering::Acquire));
+        STOP_REQUESTED.store(false, Ordering::Release);
+    }
 }

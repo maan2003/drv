@@ -113,6 +113,82 @@ zeroed, both mappings are explicitly removed, and VFIO reset is mandatory.
 No ring register, producer index, DMA-enable bit, interrupt mask, or MCU command
 is written, so the device cannot observe the staged descriptor.
 
+`--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
+global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
+and that raw patch scatter is invalid until the MCU has accepted patch
+semaphore and `PATCH_START` commands. Active DMA therefore remains unavailable
+until the backend owns or guards every TX ring, resets and verifies every DMA
+index, installs a VFIO IRQ before unmasking it, implements the MCU command/RX
+response path, and keeps every mapping pinned through quiescence and function
+reset. The rejected command cannot map DMA or write MMIO.
+
+`prepare_global_tx_rings` is the deterministic replacement preflight. While TX
+DMA and all host interrupts remain disabled, it inventories all 18 hardware TX
+ring slots, rejects invalid MMIO or any `CIDX != DIDX`, verifies MT7921 ring
+16's pinned-Linux prefetch value `0x03400004`, and replaces every non-target
+base with one pinned guard page while assigning separate pinned backing to ring
+16. Only after every base/count/CPU index is owned does it issue Linux's global
+DTX-index reset and require every DIDX to read zero. Old kernel DMA bases are
+never restored. This currently has a fake transport only and cannot touch the
+physical adapter.
+Ring 17 now receives its own 256-descriptor MCU-command page rather than guard
+backing. `prepare_mcu_rx_ring` separately builds Linux's eight-entry,
+2048-byte-buffer pre-firmware response queue with seven device-owned buffers
+and one empty slot, using a distinct aligned low-32-bit ring page and 16 KiB
+buffer mapping. It rejects overlapping or out-of-range arenas.
+`program_disabled_mcu_rx_ring` requires that old ring zero is idle, writes its
+owned base/count with both CPU and DMA indices zero, verifies that state, then
+publishes the seven receive buffers only after a release fence. RX DMA and its
+interrupt remain disabled; the physical adapter is still pending.
+
+`--prepare-owned-global-tx-rings` is the inactive physical adapter for this
+preflight. It maps three separate low-32-bit pages filled entirely with
+CPU-owned reset descriptors, applies and verifies all 18 ring slots plus the
+global DTX reset while DMA and interrupts remain disabled, VFIO-resets while
+all pages are still pinned, and only then unmaps them. It cannot enable DMA,
+publish a producer index, install an IRQ, or send an MCU command.
+
+`encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
+and request bodies for patch-semaphore acquisition, `PATCH_START`, and
+`TARGET_ADDRESS_LEN`. It rejects sequence zero/outside the four-bit firmware
+range, an empty download, and a patch-start address other than MT7961's
+`0x00900000`. Encoding these commands is not permission to send them: an owned
+MCU TX ring, RX response ring, parsed matching response, VFIO IRQ, and safe
+reset-while-pinned teardown must all exist first.
+`parse_download_response` bounds the fixed 36-byte Connac2 MCU RX header and
+matches the four-bit command sequence before exposing event identifiers; it is
+the first pure parser needed by the future owned RX response ring.
+
+`--inventory-vfio-irqs` queries the standard VFIO INTx, MSI, and MSI-X
+capabilities without installing or triggering one, rejects modes without
+eventfd support, and reports the preferred MSI-X/MSI/INTx choice. Device
+interrupt unmasking remains unavailable until that chosen vector is actually
+installed and exercised by the deterministic completion path.
+`IrqLifecycle` prevents the device source from being enabled before an
+eventfd-capable VFIO vector is installed, rejects a zero eventfd counter, and
+requires explicit disable after an observed completion. The native backend now
+has an unexposed `VfioIrq` owner which creates a nonblocking close-on-exec
+eventfd, installs exactly one selected vector with `VFIO_DEVICE_SET_IRQS`,
+drains 64-bit counters, explicitly disables the vector, and repeats disable in
+`Drop`. Its Linux UAPI layout is tested, but it cannot yet be invoked physically
+or unmask a device source.
+
+`--install-disable-vfio-irq` exposes only the source-disabled lifecycle check:
+select one eventfd-capable VFIO vector, install it, require its nonblocking
+counter to remain empty while the device mask is zero, explicitly disable it,
+and VFIO-reset. It never writes the device interrupt mask or enables DMA.
+
+`teardown_pinned_dma` makes reset ordering explicit for the future active path:
+mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
+function reset is issued while every IOVA remains pinned regardless of the poll
+result. Mappings are released only after reset succeeds. A reset failure never
+calls unmap, so the external reboot watchdog remains the containment boundary.
+The native backend now has an unexposed active-operation signal guard for
+SIGHUP, SIGINT, and SIGTERM which performs only an atomic cancellation request
+in the handler and restores previous handlers on drop. The future physical
+control loop must check that request and enter `teardown_pinned_dma`; until it
+does, active DMA remains rejected.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

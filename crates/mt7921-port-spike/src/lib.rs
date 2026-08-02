@@ -32,6 +32,7 @@ pub struct DmaSegment {
 pub enum DescriptorError {
     IovaAbove32Bits,
     SegmentTooLong,
+    InvalidArena,
 }
 
 /// The four little-endian words of `struct mt76_desc`.
@@ -73,6 +74,17 @@ impl DmaDescriptor {
             ctrl,
             buf1,
             info,
+        })
+    }
+
+    /// Encode one device-owned RX buffer as `mt76_dma_add_rx_buf` does.
+    pub fn rx(buffer: DmaSegment) -> Result<Self, DescriptorError> {
+        validate_segment(buffer)?;
+        Ok(Self {
+            buf0: buffer.iova as u32,
+            ctrl: u32::from(buffer.len) << DMA_CTL_SD_LEN0_SHIFT,
+            buf1: 0,
+            info: 0,
         })
     }
 
@@ -1579,6 +1591,665 @@ impl FirmwareCompletionTracker {
     }
 }
 
+pub const MT7921_TX_RING_SLOTS: usize = 18;
+pub const MT7921_FWDL_RING_INDEX: usize = 16;
+pub const MT7921_MCU_TX_RING_INDEX: usize = 17;
+pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
+pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
+pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
+pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McuRxRing {
+    pub descriptors: [DmaDescriptor; MT7921_MCU_RX_RING_COUNT],
+    pub producer_index: u32,
+}
+
+/// Build Linux's eight-entry pre-firmware MCU response ring while retaining
+/// one empty descriptor so producer and consumer indices cannot alias full.
+pub fn prepare_mcu_rx_ring(
+    ring_iova: u64,
+    buffers_iova: u64,
+) -> Result<McuRxRing, DescriptorError> {
+    let buffers_bytes = MT7921_MCU_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES;
+    if ring_iova % 4096 != 0
+        || buffers_iova % 4096 != 0
+        || ring_iova
+            .checked_add(4095)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || buffers_iova
+            .checked_add(buffers_bytes as u64 - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || (ring_iova <= buffers_iova + buffers_bytes as u64 - 1
+            && buffers_iova <= ring_iova + 4095)
+    {
+        return Err(DescriptorError::InvalidArena);
+    }
+    let mut descriptors = [DmaDescriptor::reset(); MT7921_MCU_RX_RING_COUNT];
+    for (index, descriptor) in descriptors
+        .iter_mut()
+        .enumerate()
+        .take(MT7921_MCU_RX_RING_COUNT - 1)
+    {
+        *descriptor = DmaDescriptor::rx(DmaSegment {
+            iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
+            len: MT7921_MCU_RX_BUFFER_BYTES as u16,
+        })?;
+    }
+    Ok(McuRxRing {
+        descriptors,
+        producer_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McuRxRegisters {
+    pub descriptor_base: u32,
+    pub descriptor_count: u32,
+    pub cpu_index: u32,
+    pub dma_index: u32,
+}
+
+pub trait DisabledMcuRxTransport {
+    type Error;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
+    fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error>;
+    fn write_initial(
+        &mut self,
+        descriptor_base: u32,
+        descriptor_count: u32,
+    ) -> Result<(), Self::Error>;
+    fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledMcuRxEvent {
+    Snapshot(McuRxRegisters),
+    DescriptorFence,
+    Programmed(McuRxRegisters),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisabledMcuRxError<E> {
+    InvalidArena,
+    ActiveState {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    DirtyRing(McuRxRegisters),
+    Transport(E),
+    Readback(McuRxRegisters),
+}
+
+/// Program the pre-firmware MCU response ring without enabling RX DMA.
+pub fn program_disabled_mcu_rx_ring<T, F>(
+    transport: &mut T,
+    ring_iova: u64,
+    mut event: F,
+) -> Result<McuRxRegisters, DisabledMcuRxError<T::Error>>
+where
+    T: DisabledMcuRxTransport,
+    F: FnMut(DisabledMcuRxEvent),
+{
+    if ring_iova % 4096 != 0
+        || ring_iova
+            .checked_add(4095)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(DisabledMcuRxError::InvalidArena);
+    }
+    let global_config = transport
+        .read_global_config()
+        .map_err(DisabledMcuRxError::Transport)?;
+    let interrupt_enable = transport
+        .read_interrupt_enable()
+        .map_err(DisabledMcuRxError::Transport)?;
+    if global_config & 0xf != 0 || interrupt_enable != 0 {
+        return Err(DisabledMcuRxError::ActiveState {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    let snapshot = transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?;
+    event(DisabledMcuRxEvent::Snapshot(snapshot));
+    if snapshot.cpu_index != snapshot.dma_index {
+        return Err(DisabledMcuRxError::DirtyRing(snapshot));
+    }
+    let initial = McuRxRegisters {
+        descriptor_base: ring_iova as u32,
+        descriptor_count: MT7921_MCU_RX_RING_COUNT as u32,
+        cpu_index: 0,
+        dma_index: 0,
+    };
+    transport
+        .write_initial(initial.descriptor_base, initial.descriptor_count)
+        .map_err(DisabledMcuRxError::Transport)?;
+    if transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?
+        != initial
+    {
+        return Err(DisabledMcuRxError::Readback(
+            transport
+                .read_registers()
+                .map_err(DisabledMcuRxError::Transport)?,
+        ));
+    }
+    transport.release_fence();
+    event(DisabledMcuRxEvent::DescriptorFence);
+    transport
+        .publish_cpu_index((MT7921_MCU_RX_RING_COUNT - 1) as u32)
+        .map_err(DisabledMcuRxError::Transport)?;
+    let expected = McuRxRegisters {
+        cpu_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
+        ..initial
+    };
+    let actual = transport
+        .read_registers()
+        .map_err(DisabledMcuRxError::Transport)?;
+    if actual != expected {
+        return Err(DisabledMcuRxError::Readback(actual));
+    }
+    event(DisabledMcuRxEvent::Programmed(actual));
+    Ok(actual)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxRingState {
+    pub descriptor_base: u32,
+    pub descriptor_count: u32,
+    pub cpu_index: u32,
+    pub dma_index: u32,
+}
+
+pub trait GlobalTxRingTransport {
+    type Error;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
+    fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error>;
+    fn write_tx_ring(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), Self::Error>;
+    fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlobalTxRingEvent {
+    Snapshot { index: usize, state: TxRingState },
+    RingOwned { index: usize, descriptor_base: u32 },
+    IndicesReset,
+    RingVerified { index: usize, state: TxRingState },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GlobalTxRingError<E> {
+    InvalidArena,
+    ActiveState {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    InvalidMmio,
+    DirtyRing {
+        index: usize,
+        state: TxRingState,
+    },
+    Transport(E),
+    Readback {
+        index: usize,
+        state: TxRingState,
+    },
+}
+
+/// Replace every globally enabled TX ring with owned, pinned backing.
+///
+/// TX DMA remains disabled throughout this transition. All eighteen hardware
+/// ring slots are inspected, must be idle, and are then pointed either at the
+/// target firmware ring or a page-sized guard ring. Linux's all-ring DTX reset
+/// is issued only after every base/count/CPU index is safe, then every DIDX is
+/// required to read zero. Old kernel DMA bases are deliberately not restored.
+pub fn prepare_global_tx_rings<T, F>(
+    transport: &mut T,
+    guard_iova: u64,
+    fwdl_iova: u64,
+    mcu_iova: u64,
+    mut event: F,
+) -> Result<[TxRingState; MT7921_TX_RING_SLOTS], GlobalTxRingError<T::Error>>
+where
+    T: GlobalTxRingTransport,
+    F: FnMut(GlobalTxRingEvent),
+{
+    let page_end = |iova: u64| {
+        (iova % 4096 == 0)
+            .then(|| iova.checked_add(4095))
+            .flatten()
+            .filter(|end| *end <= u64::from(u32::MAX))
+    };
+    let Some(guard_end) = page_end(guard_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    let Some(fwdl_end) = page_end(fwdl_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    let Some(mcu_end) = page_end(mcu_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    if (guard_iova <= fwdl_end && fwdl_iova <= guard_end)
+        || (guard_iova <= mcu_end && mcu_iova <= guard_end)
+        || (fwdl_iova <= mcu_end && mcu_iova <= fwdl_end)
+    {
+        return Err(GlobalTxRingError::InvalidArena);
+    }
+    let global_config = transport
+        .read_global_config()
+        .map_err(GlobalTxRingError::Transport)?;
+    let interrupt_enable = transport
+        .read_interrupt_enable()
+        .map_err(GlobalTxRingError::Transport)?;
+    if global_config == u32::MAX || interrupt_enable == u32::MAX {
+        return Err(GlobalTxRingError::InvalidMmio);
+    }
+    if global_config & 0xf != 0 || interrupt_enable != 0 {
+        return Err(GlobalTxRingError::ActiveState {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    for index in 0..MT7921_TX_RING_SLOTS {
+        let state = transport
+            .read_tx_ring(index)
+            .map_err(GlobalTxRingError::Transport)?;
+        if [
+            state.descriptor_base,
+            state.descriptor_count,
+            state.cpu_index,
+            state.dma_index,
+        ]
+        .contains(&u32::MAX)
+        {
+            return Err(GlobalTxRingError::InvalidMmio);
+        }
+        event(GlobalTxRingEvent::Snapshot { index, state });
+        if state.cpu_index != 0 || state.dma_index != 0 {
+            return Err(GlobalTxRingError::DirtyRing { index, state });
+        }
+    }
+    for index in 0..MT7921_TX_RING_SLOTS {
+        let descriptor_base = if index == MT7921_FWDL_RING_INDEX {
+            fwdl_iova as u32
+        } else if index == MT7921_MCU_TX_RING_INDEX {
+            mcu_iova as u32
+        } else {
+            guard_iova as u32
+        };
+        let descriptor_count = if index == MT7921_MCU_TX_RING_INDEX {
+            MT7921_MCU_TX_RING_COUNT
+        } else {
+            MT7921_FWDL_RING_COUNT
+        };
+        transport
+            .write_tx_ring(index, descriptor_base, descriptor_count, 0)
+            .map_err(GlobalTxRingError::Transport)?;
+        event(GlobalTxRingEvent::RingOwned {
+            index,
+            descriptor_base,
+        });
+    }
+    transport
+        .reset_tx_indices(MT7921_RESET_ALL_TX_INDICES)
+        .map_err(GlobalTxRingError::Transport)?;
+    event(GlobalTxRingEvent::IndicesReset);
+    let mut owned = [TxRingState {
+        descriptor_base: 0,
+        descriptor_count: 0,
+        cpu_index: 0,
+        dma_index: 0,
+    }; MT7921_TX_RING_SLOTS];
+    for (index, state) in owned.iter_mut().enumerate() {
+        *state = transport
+            .read_tx_ring(index)
+            .map_err(GlobalTxRingError::Transport)?;
+        let expected_base = if index == MT7921_FWDL_RING_INDEX {
+            fwdl_iova as u32
+        } else if index == MT7921_MCU_TX_RING_INDEX {
+            mcu_iova as u32
+        } else {
+            guard_iova as u32
+        };
+        let expected_count = if index == MT7921_MCU_TX_RING_INDEX {
+            MT7921_MCU_TX_RING_COUNT
+        } else {
+            MT7921_FWDL_RING_COUNT
+        };
+        if *state
+            != (TxRingState {
+                descriptor_base: expected_base,
+                descriptor_count: expected_count,
+                cpu_index: 0,
+                dma_index: 0,
+            })
+        {
+            return Err(GlobalTxRingError::Readback {
+                index,
+                state: *state,
+            });
+        }
+        event(GlobalTxRingEvent::RingVerified {
+            index,
+            state: *state,
+        });
+    }
+    Ok(owned)
+}
+
+pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
+pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
+pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadCommand {
+    PatchSemaphoreGet,
+    PatchStart {
+        address: u32,
+        length: u32,
+        mode: u32,
+    },
+    TargetAddressLength {
+        address: u32,
+        length: u32,
+        mode: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadCommandError {
+    InvalidSequence,
+    InvalidLength,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadResponse {
+    pub length: u16,
+    pub packet_type: u16,
+    pub event_id: u8,
+    pub sequence: u8,
+    pub option: u8,
+    pub extended_event_id: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadResponseError {
+    Truncated,
+    InvalidLength,
+    SequenceMismatch { expected: u8, actual: u8 },
+}
+
+/// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
+pub fn parse_download_response(
+    bytes: &[u8],
+    expected_sequence: u8,
+) -> Result<DownloadResponse, DownloadResponseError> {
+    let header = bytes.get(..36).ok_or(DownloadResponseError::Truncated)?;
+    let length = u16::from_le_bytes(header[24..26].try_into().expect("fixed field"));
+    if usize::from(length) > bytes.len() || length < 12 {
+        return Err(DownloadResponseError::InvalidLength);
+    }
+    let sequence = header[29];
+    if sequence != expected_sequence {
+        return Err(DownloadResponseError::SequenceMismatch {
+            expected: expected_sequence,
+            actual: sequence,
+        });
+    }
+    Ok(DownloadResponse {
+        length,
+        packet_type: u16::from_le_bytes(header[26..28].try_into().expect("fixed field")),
+        event_id: header[28],
+        sequence,
+        option: header[30],
+        extended_event_id: header[32],
+    })
+}
+
+/// Encode the non-scatter MCU command which must precede firmware DMA.
+///
+/// This is the exact legacy Connac2 long command header produced by pinned
+/// Linux `mt76_connac2_mcu_fill_message`, followed by the little-endian request
+/// payload used by patch semaphore or download initialization.
+pub fn encode_download_command(
+    command: DownloadCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, DownloadCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(DownloadCommandError::InvalidSequence);
+    }
+    let (cid, payload): (u8, Vec<u8>) = match command {
+        DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchStart {
+            address,
+            length,
+            mode,
+        } => {
+            if address != 0x0090_0000 || length == 0 {
+                return Err(DownloadCommandError::InvalidLength);
+            }
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&address.to_le_bytes());
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&mode.to_le_bytes());
+            (0x05, payload)
+        }
+        DownloadCommand::TargetAddressLength {
+            address,
+            length,
+            mode,
+        } => {
+            if length == 0 {
+                return Err(DownloadCommandError::InvalidLength);
+            }
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&address.to_le_bytes());
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&mode.to_le_bytes());
+            (0x01, payload)
+        }
+    };
+    let total = CONNAC2_MCU_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[36] = cid;
+    bytes[37] = 0xa0;
+    bytes[38] = 3;
+    bytes[39] = sequence;
+    bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciIrqKind {
+    Intx,
+    Msi,
+    Msix,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciIrqCapability {
+    pub kind: PciIrqKind,
+    pub count: u32,
+    pub eventfd: bool,
+}
+
+/// Select the same interrupt preference used by PCI drivers without admitting
+/// an interrupt source which cannot be drained through an installed eventfd.
+pub fn select_vfio_irq(capabilities: &[PciIrqCapability]) -> Option<PciIrqCapability> {
+    [PciIrqKind::Msix, PciIrqKind::Msi, PciIrqKind::Intx]
+        .into_iter()
+        .find_map(|kind| {
+            capabilities.iter().copied().find(|capability| {
+                capability.kind == kind && capability.count != 0 && capability.eventfd
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqLifecycle {
+    Uninstalled,
+    EventfdInstalled(PciIrqCapability),
+    DeviceSourceEnabled(PciIrqCapability),
+    EventObserved(PciIrqCapability),
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqLifecycleError {
+    InvalidTransition,
+    EmptyEvent,
+}
+
+impl IrqLifecycle {
+    pub fn install(self, capability: PciIrqCapability) -> Result<Self, IrqLifecycleError> {
+        if self != Self::Uninstalled || capability.count == 0 || !capability.eventfd {
+            return Err(IrqLifecycleError::InvalidTransition);
+        }
+        Ok(Self::EventfdInstalled(capability))
+    }
+
+    pub fn enable_device_source(self) -> Result<Self, IrqLifecycleError> {
+        match self {
+            Self::EventfdInstalled(capability) => Ok(Self::DeviceSourceEnabled(capability)),
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub fn observe_event(self, counter: u64) -> Result<Self, IrqLifecycleError> {
+        if counter == 0 {
+            return Err(IrqLifecycleError::EmptyEvent);
+        }
+        match self {
+            Self::DeviceSourceEnabled(capability) => Ok(Self::EventObserved(capability)),
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub fn disable(self) -> Result<Self, IrqLifecycleError> {
+        match self {
+            Self::EventfdInstalled(_) | Self::DeviceSourceEnabled(_) | Self::EventObserved(_) => {
+                Ok(Self::Disabled)
+            }
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub const fn may_unmask_device(self) -> bool {
+        matches!(self, Self::EventfdInstalled(_))
+    }
+}
+
+pub const PINNED_DMA_QUIESCE_MS: u64 = 100;
+
+pub trait PinnedDmaTeardownTransport {
+    type Error;
+    fn now_ms(&self) -> u64;
+    fn mask_device_interrupts(&mut self) -> Result<(), Self::Error>;
+    fn disable_tx_dma(&mut self) -> Result<(), Self::Error>;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn sleep_ms(&mut self, milliseconds: u64);
+    fn reset_vfio_device(&mut self) -> Result<(), Self::Error>;
+    fn unmap_all(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinnedDmaTeardownEvent {
+    InterruptsMasked,
+    TxDmaDisabled,
+    DmaQuiesced,
+    DmaBusyTimedOut { raw: u32 },
+    DeviceReset,
+    MappingsReleased,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PinnedDmaTeardownError<E> {
+    Cleanup(E),
+    Reset(E),
+    Unmap(E),
+    BusyTimedOut(u32),
+}
+
+/// Revoke active DMA without ever exposing an unmapped IOVA to the device.
+///
+/// A function reset is mandatory while every mapping remains pinned, even if
+/// TX busy clears normally. If busy never clears, reset is the only transition
+/// which permits unmapping. A failed reset returns without calling `unmap_all`,
+/// leaving the process and external reboot watchdog as the final containment.
+pub fn teardown_pinned_dma<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<(), PinnedDmaTeardownError<T::Error>>
+where
+    T: PinnedDmaTeardownTransport,
+    F: FnMut(PinnedDmaTeardownEvent),
+{
+    let mut cleanup_error = None;
+    match transport.mask_device_interrupts() {
+        Ok(()) => event(PinnedDmaTeardownEvent::InterruptsMasked),
+        Err(error) => cleanup_error = Some(error),
+    }
+    match transport.disable_tx_dma() {
+        Ok(()) => event(PinnedDmaTeardownEvent::TxDmaDisabled),
+        Err(error) if cleanup_error.is_none() => cleanup_error = Some(error),
+        Err(_) => {}
+    }
+    let deadline = transport.now_ms().saturating_add(PINNED_DMA_QUIESCE_MS);
+    let mut busy_timeout = None;
+    loop {
+        match transport.read_global_config() {
+            Ok(raw) if raw & (1 << 1) == 0 => {
+                event(PinnedDmaTeardownEvent::DmaQuiesced);
+                break;
+            }
+            Ok(raw) if transport.now_ms() >= deadline => {
+                busy_timeout = Some(raw);
+                event(PinnedDmaTeardownEvent::DmaBusyTimedOut { raw });
+                break;
+            }
+            Ok(_) => transport.sleep_ms(1),
+            Err(error) => {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(error);
+                }
+                break;
+            }
+        }
+    }
+    transport
+        .reset_vfio_device()
+        .map_err(PinnedDmaTeardownError::Reset)?;
+    event(PinnedDmaTeardownEvent::DeviceReset);
+    transport
+        .unmap_all()
+        .map_err(PinnedDmaTeardownError::Unmap)?;
+    event(PinnedDmaTeardownEvent::MappingsReleased);
+    if let Some(error) = cleanup_error {
+        return Err(PinnedDmaTeardownError::Cleanup(error));
+    }
+    if let Some(raw) = busy_timeout {
+        return Err(PinnedDmaTeardownError::BusyTimedOut(raw));
+    }
+    Ok(())
+}
+
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
 pub const WFSYS_SW_INIT_DONE: u32 = 1 << 4;
 pub const WFSYS_ASSERT_MS: u64 = 50;
@@ -2552,6 +3223,437 @@ mod tests {
         assert_eq!(tracker.observe(4, 121), Some(FirmwareCompletion::Complete));
     }
 
+    struct FakeGlobalTx {
+        global: u32,
+        interrupts: u32,
+        rings: [TxRingState; MT7921_TX_RING_SLOTS],
+        writes: Vec<(usize, u32)>,
+        resets: Vec<u32>,
+    }
+    impl FakeGlobalTx {
+        fn new() -> Self {
+            let mut rings = [TxRingState {
+                descriptor_base: 0,
+                descriptor_count: 128,
+                cpu_index: 0,
+                dma_index: 0,
+            }; MT7921_TX_RING_SLOTS];
+            for (index, ring) in rings.iter_mut().enumerate() {
+                ring.descriptor_base = 0x8000_0000 + index as u32 * 0x1000;
+            }
+            Self {
+                global: 0x1010_b870,
+                interrupts: 0,
+                rings,
+                writes: Vec::new(),
+                resets: Vec::new(),
+            }
+        }
+    }
+    impl GlobalTxRingTransport for FakeGlobalTx {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.global)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.interrupts)
+        }
+        fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error> {
+            Ok(self.rings[index])
+        }
+        fn write_tx_ring(
+            &mut self,
+            index: usize,
+            descriptor_base: u32,
+            descriptor_count: u32,
+            cpu_index: u32,
+        ) -> Result<(), Self::Error> {
+            self.writes.push((index, descriptor_base));
+            self.rings[index].descriptor_base = descriptor_base;
+            self.rings[index].descriptor_count = descriptor_count;
+            self.rings[index].cpu_index = cpu_index;
+            Ok(())
+        }
+        fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.resets.push(value);
+            for ring in &mut self.rings {
+                ring.dma_index = 0;
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeMcuRx {
+        global: u32,
+        interrupts: u32,
+        registers: McuRxRegisters,
+        writes: Vec<&'static str>,
+    }
+    impl DisabledMcuRxTransport for FakeMcuRx {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.global)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.interrupts)
+        }
+        fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error> {
+            Ok(self.registers)
+        }
+        fn write_initial(
+            &mut self,
+            descriptor_base: u32,
+            descriptor_count: u32,
+        ) -> Result<(), Self::Error> {
+            self.writes.push("initial");
+            self.registers = McuRxRegisters {
+                descriptor_base,
+                descriptor_count,
+                cpu_index: 0,
+                dma_index: 0,
+            };
+            Ok(())
+        }
+        fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error> {
+            self.writes.push("publish");
+            self.registers.cpu_index = cpu_index;
+            Ok(())
+        }
+        fn release_fence(&mut self) {
+            self.writes.push("fence");
+        }
+    }
+
+    #[test]
+    fn disabled_mcu_rx_resets_both_indices_before_publish() {
+        let mut transport = FakeMcuRx {
+            global: 0x1010_b870,
+            interrupts: 0,
+            registers: McuRxRegisters {
+                descriptor_base: 0x8000_0000,
+                descriptor_count: 8,
+                cpu_index: 3,
+                dma_index: 3,
+            },
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            program_disabled_mcu_rx_ring(&mut transport, 0x0100_3000, |_| {}),
+            Ok(McuRxRegisters {
+                descriptor_base: 0x0100_3000,
+                descriptor_count: 8,
+                cpu_index: 7,
+                dma_index: 0,
+            })
+        );
+        assert_eq!(transport.writes, ["initial", "fence", "publish"]);
+    }
+
+    #[test]
+    fn disabled_mcu_rx_rejects_dirty_ring_without_writes() {
+        let mut transport = FakeMcuRx {
+            global: 0x1010_b870,
+            interrupts: 0,
+            registers: McuRxRegisters {
+                descriptor_base: 0,
+                descriptor_count: 8,
+                cpu_index: 1,
+                dma_index: 0,
+            },
+            writes: Vec::new(),
+        };
+        assert!(matches!(
+            program_disabled_mcu_rx_ring(&mut transport, 0x0100_3000, |_| {}),
+            Err(DisabledMcuRxError::DirtyRing(_))
+        ));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn global_tx_preparation_owns_all_eighteen_rings_before_index_reset() {
+        let mut transport = FakeGlobalTx::new();
+        let mut events = Vec::new();
+        let owned = prepare_global_tx_rings(
+            &mut transport,
+            0x0100_0000,
+            0x0100_1000,
+            0x0100_2000,
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(transport.writes.len(), MT7921_TX_RING_SLOTS);
+        assert_eq!(transport.resets, [MT7921_RESET_ALL_TX_INDICES]);
+        for (index, state) in owned.into_iter().enumerate() {
+            assert_eq!(
+                state.descriptor_base,
+                if index == MT7921_FWDL_RING_INDEX {
+                    0x0100_1000
+                } else if index == MT7921_MCU_TX_RING_INDEX {
+                    0x0100_2000
+                } else {
+                    0x0100_0000
+                }
+            );
+            assert_eq!(
+                state.descriptor_count,
+                if index == MT7921_MCU_TX_RING_INDEX {
+                    MT7921_MCU_TX_RING_COUNT
+                } else {
+                    MT7921_FWDL_RING_COUNT
+                }
+            );
+            assert_eq!(state.cpu_index, 0);
+            assert_eq!(state.dma_index, 0);
+        }
+        assert!(matches!(
+            events.last(),
+            Some(GlobalTxRingEvent::RingVerified { index: 17, .. })
+        ));
+    }
+
+    #[test]
+    fn global_tx_preparation_rejects_dirty_mmio_and_arenas_before_writes() {
+        let mut dirty = FakeGlobalTx::new();
+        dirty.rings[7].cpu_index += 1;
+        assert!(matches!(
+            prepare_global_tx_rings(&mut dirty, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
+            Err(GlobalTxRingError::DirtyRing { index: 7, .. })
+        ));
+        assert!(dirty.writes.is_empty());
+
+        let mut overlap = FakeGlobalTx::new();
+        assert_eq!(
+            prepare_global_tx_rings(&mut overlap, 0x0100_0000, 0x0100_0000, 0x0100_2000, |_| {}),
+            Err(GlobalTxRingError::InvalidArena)
+        );
+        assert!(overlap.writes.is_empty());
+    }
+
+    #[test]
+    fn encodes_connac2_patch_protocol_before_scatter_dma() {
+        let semaphore = encode_download_command(DownloadCommand::PatchSemaphoreGet, 1).unwrap();
+        assert_eq!(semaphore.len(), PATCH_SEMAPHORE_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(semaphore[0..4].try_into().unwrap()),
+            0x4100_0044
+        );
+        assert_eq!(
+            u32::from_le_bytes(semaphore[4..8].try_into().unwrap()),
+            0x8001_0000
+        );
+        assert_eq!(&semaphore[32..34], &36u16.to_le_bytes());
+        assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
+        assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
+
+        let patch = encode_download_command(
+            DownloadCommand::PatchStart {
+                address: 0x0090_0000,
+                length: 0x0001_6780,
+                mode: 1 << 31,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(patch.len(), PATCH_START_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(patch[0..4].try_into().unwrap()),
+            0x4100_004c
+        );
+        assert_eq!(&patch[36..40], &[0x05, 0xa0, 3, 2]);
+        assert_eq!(&patch[64..68], &0x0090_0000u32.to_le_bytes());
+        assert_eq!(&patch[68..72], &0x0001_6780u32.to_le_bytes());
+        assert_eq!(&patch[72..76], &(1u32 << 31).to_le_bytes());
+        assert_eq!(
+            encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
+            Err(DownloadCommandError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn parses_bounded_connac2_download_responses_by_sequence() {
+        let mut bytes = [0u8; 40];
+        bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        bytes[28] = 4;
+        bytes[29] = 7;
+        bytes[30] = 1;
+        bytes[32] = 2;
+        assert_eq!(
+            parse_download_response(&bytes, 7),
+            Ok(DownloadResponse {
+                length: 36,
+                packet_type: 0xa0,
+                event_id: 4,
+                sequence: 7,
+                option: 1,
+                extended_event_id: 2,
+            })
+        );
+        assert_eq!(
+            parse_download_response(&bytes, 6),
+            Err(DownloadResponseError::SequenceMismatch {
+                expected: 6,
+                actual: 7
+            })
+        );
+        assert_eq!(
+            parse_download_response(&bytes[..35], 7),
+            Err(DownloadResponseError::Truncated)
+        );
+        bytes[24..26].copy_from_slice(&41u16.to_le_bytes());
+        assert_eq!(
+            parse_download_response(&bytes, 7),
+            Err(DownloadResponseError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn vfio_irq_selection_requires_eventfd_and_prefers_msix() {
+        let capabilities = [
+            PciIrqCapability {
+                kind: PciIrqKind::Intx,
+                count: 1,
+                eventfd: true,
+            },
+            PciIrqCapability {
+                kind: PciIrqKind::Msi,
+                count: 1,
+                eventfd: false,
+            },
+            PciIrqCapability {
+                kind: PciIrqKind::Msix,
+                count: 8,
+                eventfd: true,
+            },
+        ];
+        assert_eq!(select_vfio_irq(&capabilities), Some(capabilities[2]));
+        assert_eq!(
+            select_vfio_irq(&[PciIrqCapability {
+                kind: PciIrqKind::Msi,
+                count: 1,
+                eventfd: false,
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn irq_lifecycle_cannot_unmask_before_eventfd_install() {
+        let capability = PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 1,
+            eventfd: true,
+        };
+        assert!(!IrqLifecycle::Uninstalled.may_unmask_device());
+        assert_eq!(
+            IrqLifecycle::Uninstalled.enable_device_source(),
+            Err(IrqLifecycleError::InvalidTransition)
+        );
+        let installed = IrqLifecycle::Uninstalled.install(capability).unwrap();
+        assert!(installed.may_unmask_device());
+        let enabled = installed.enable_device_source().unwrap();
+        assert_eq!(enabled.observe_event(0), Err(IrqLifecycleError::EmptyEvent));
+        let observed = enabled.observe_event(1).unwrap();
+        assert_eq!(observed.disable(), Ok(IrqLifecycle::Disabled));
+    }
+
+    struct FakePinnedTeardown {
+        now: u64,
+        busy_until: Option<u64>,
+        reset_fails: bool,
+        calls: Vec<&'static str>,
+    }
+    impl PinnedDmaTeardownTransport for FakePinnedTeardown {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn mask_device_interrupts(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("mask");
+            Ok(())
+        }
+        fn disable_tx_dma(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("disable");
+            Ok(())
+        }
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            self.calls.push("read");
+            Ok(if self.busy_until.is_none_or(|until| self.now < until) {
+                1 << 1
+            } else {
+                0
+            })
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+        fn reset_vfio_device(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("reset");
+            if self.reset_fails {
+                Err("reset failed")
+            } else {
+                Ok(())
+            }
+        }
+        fn unmap_all(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("unmap");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pinned_dma_teardown_resets_before_unmapping_after_quiescence() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: Some(2),
+            reset_fails: false,
+            calls: Vec::new(),
+        };
+        teardown_pinned_dma(&mut transport, |_| {}).unwrap();
+        let reset = transport
+            .calls
+            .iter()
+            .position(|call| *call == "reset")
+            .unwrap();
+        let unmap = transport
+            .calls
+            .iter()
+            .position(|call| *call == "unmap")
+            .unwrap();
+        assert!(reset < unmap);
+    }
+
+    #[test]
+    fn pinned_dma_busy_timeout_resets_before_release() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: None,
+            reset_fails: false,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            teardown_pinned_dma(&mut transport, |_| {}),
+            Err(PinnedDmaTeardownError::BusyTimedOut(1 << 1))
+        );
+        assert_eq!(transport.calls.last_chunk::<2>(), Some(&["reset", "unmap"]));
+    }
+
+    #[test]
+    fn pinned_dma_reset_failure_never_unmaps() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: None,
+            reset_fails: true,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            teardown_pinned_dma(&mut transport, |_| {}),
+            Err(PinnedDmaTeardownError::Reset("reset failed"))
+        );
+        assert_eq!(transport.calls.last(), Some(&"reset"));
+        assert!(!transport.calls.contains(&"unmap"));
+    }
+
     #[test]
     fn encodes_single_and_paired_dma_segments_like_mt76() {
         let one = DmaDescriptor::tx(
@@ -2582,6 +3684,28 @@ mod tests {
         assert_eq!(two.ctrl, (64 << 16) | 1500 | (1 << 14));
         assert_eq!(two.buf1, 0x2000);
         assert_eq!(DmaDescriptor::reset().ctrl, 1 << 31);
+    }
+
+    #[test]
+    fn builds_owned_mcu_rx_ring_with_one_empty_slot() {
+        let ring = prepare_mcu_rx_ring(0x0100_3000, 0x0100_4000).unwrap();
+        assert_eq!(ring.producer_index, 7);
+        for (index, descriptor) in ring.descriptors[..7].iter().enumerate() {
+            assert_eq!(
+                *descriptor,
+                DmaDescriptor {
+                    buf0: 0x0100_4000 + index as u32 * 2048,
+                    ctrl: 2048 << 16,
+                    buf1: 0,
+                    info: 0,
+                }
+            );
+        }
+        assert_eq!(ring.descriptors[7], DmaDescriptor::reset());
+        assert_eq!(
+            prepare_mcu_rx_ring(0x0100_3000, 0x0100_3000),
+            Err(DescriptorError::InvalidArena)
+        );
     }
 
     #[test]
