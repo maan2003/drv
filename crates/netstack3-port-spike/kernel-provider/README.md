@@ -22,6 +22,12 @@ kernel selftest against the booted device. The check validates a deployable
 kernel closure without switching the host configuration.
 
 NixOS deployments can import the flake's
-`nixosModules.netstack3-kernel-provider` module. It defaults the host to the
-pinned `linuxPackages_6_18`, applies the checked-in patch, and enables the
-provider in the structured kernel configuration.
+`nixosModules.netstack3-kernel-provider` module. Importing is non-invasive:
+`hardware.netstack3KernelProvider.enable` opts into the pinned kernel and patch.
+`services.netstack3Provider.enable` implies that option and additionally runs
+the packaged socketpair supervisor with the required shell-free
+`linkPeer.command`. The daemon does not open the provider device until DHCP
+configuration is fully bound. `nix build
+.#checks.x86_64-linux.netstack3-provider-service` boots the real package with a
+deterministic, non-production link peer and proves that link-up without DHCP
+does not capture kernel sockets and peer loss creates a fresh generation.

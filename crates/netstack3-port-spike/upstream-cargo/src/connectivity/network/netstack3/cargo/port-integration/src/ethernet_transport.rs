@@ -58,6 +58,35 @@ impl SeqpacketEthernet {
                 "Ethernet fd is not SOCK_SEQPACKET",
             ));
         }
+        let mut domain = 0;
+        let mut length = std::mem::size_of_val(&domain) as libc::socklen_t;
+        // SAFETY: the output is an initialized integer and the descriptor is owned.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_DOMAIN,
+                (&mut domain as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || domain != libc::AF_UNIX
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "Ethernet fd is not AF_UNIX",
+            ));
+        }
+        let mut peer = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: the storage and length describe a valid getpeername output buffer.
+        if unsafe { libc::getpeername(fd.as_raw_fd(), peer.as_mut_ptr().cast(), &mut length) } != 0
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "Ethernet fd is not connected",
+            ));
+        }
         Ok(Self {
             socket: UnixDatagram::from(fd),
         })
@@ -210,6 +239,19 @@ mod tests {
     fn send(peer: &UnixDatagram, opcode: u8, payload: &[u8]) {
         let packet = encode(opcode, payload).unwrap();
         assert_eq!(peer.send(&packet).unwrap(), packet.len());
+    }
+
+    #[test]
+    fn unconnected_seqpacket_is_not_an_ethernet_capability() {
+        // SAFETY: socket returns a fresh descriptor on success.
+        let fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0);
+        // SAFETY: ownership of the fresh descriptor moves here.
+        let error = SeqpacketEthernet::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
+            .err()
+            .expect("unconnected socket must be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

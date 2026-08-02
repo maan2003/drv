@@ -86,6 +86,9 @@ only fuchsia-async's deadline wake-up with the Fuchsia-pinned Tokio timer.
 Event identity, concurrent deadline ordering, cancellation, and filtering stay
 in upstream source and are exercised by host integration tests.
 
-Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
-needs the canonical revision. Do not introduce a second revision constant,
-archive convention, workspace, or lockfile for another Fuchsia subsystem.
+`nix/fuchsia-reference.json` is the machine-readable owner of the canonical
+revision, closure paths, special gitlinks, and normalized provider-package
+archive hashes. Both `scripts/fetch-fuchsia-reference` and the Nix daemon package
+consume it directly. Run `scripts/fetch-fuchsia-reference --print-commit` for a
+human-readable revision; do not introduce a second revision constant, archive
+convention, workspace, or lockfile for another Fuchsia subsystem.

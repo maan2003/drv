@@ -2,7 +2,12 @@
 
 ## Status
 
-No compatibility service is implemented in the initial hardware-interface spike.
+The separately tested Linux kernel provider and native Netstack3 daemon now
+implement ordinary remote IPv4/IPv6 UDP and TCP socket operations. Deterministic
+deployment testing covers pre-lease non-capture, link lifecycle, and fail-closed
+restart, but not yet a composed DHCP-bound application flow. Real production
+connectivity still awaits the Wi-Fi Ethernet owner, and the wider application
+compatibility requirement remains incremental.
 
 Source: project owner. Strength: mandatory for the mature system, incremental
 during device bring-up.

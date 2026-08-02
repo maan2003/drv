@@ -191,13 +191,20 @@ The Cargo overlay builds `netstack3-provider-daemon`, which binds the v2 kernel
 device to ProviderDispatcherV2 and NativeSocketProvider. It validates each full
 frame before accepting its multiplexed namespace/client identity, bounds queued
 requests to the kernel queue limit, advances injected monotonic time, and emits
-sequenced events only when readiness changes. Before opening the kernel device,
-it requires a versioned attach and link-up over an inherited connected
+sequenced events only when readiness changes. It first requires a versioned attach and link-up over an inherited connected
 `SOCK_SEQPACKET` Ethernet capability. The attach supplies the validated MAC and
-MTU; the pinned DHCP service owns address, route, and DNS configuration. Run it
-as `netstack3-provider-daemon [DEVICE] ETHERNET_SEQPACKET_FD`; the device
-defaults to `/dev/netstack3-provider`. Link-down, peer loss, malformed frames,
-and transport errors close the provider device so kernel sockets fail closed.
+MTU; the pinned DHCP service then atomically applies address, routes, and DNS.
+Only `DhcpStatus::Bound` opens the nonblocking kernel device. Lease loss,
+link-down, peer loss, malformed frames, and transport errors close the sole
+device descriptor and revoke every provider client so kernel sockets fail
+closed; a later bound lease opens a fresh provider generation.
+
+`netstack3-link-supervisor` creates exactly one bounded `SOCK_SEQPACKET` pair,
+passes fd 3 to the daemon and a required shell-free link-peer command, reaps both
+children, and kills the sibling when either exits. NixOS deployments import
+`nixosModules.netstack3-kernel-provider`, enable `services.netstack3Provider`,
+and set `linkPeer.command`; no AF_PACKET, TAP, or dummy production peer is
+provided. The package is exposed as `packages.<system>.netstack3-provider-daemon`.
 
 The experimental, incompatible version-1 proxy transport has a versioned 40-byte little-endian header and a
 64 KiB payload ceiling. ProviderFramedEndpoint fixes client and namespace

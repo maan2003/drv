@@ -24,6 +24,16 @@
           ./crates/netstack3-port-spike/kernel-provider/check.nix
           { };
 
+      checks.x86_64-linux.netstack3-provider-daemon =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/netstack3-port-spike/provider-package.nix
+          { };
+
+      checks.x86_64-linux.netstack3-provider-service =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/netstack3-port-spike/kernel-provider/service-test.nix
+          { };
+
       checks.x86_64-linux.netstack3-kernel-provider-boot =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
           ./crates/netstack3-port-spike/kernel-provider/boot-test.nix
@@ -37,6 +47,10 @@
           physicalWasmSource = builtins.getEnv "SAPPHIRE_PHYSICAL_WASM_SOURCE";
         in
         rec {
+          netstack3-provider-daemon =
+            pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix
+              { };
+
           hardware-backends = pkgs.rustPlatform.buildRustPackage {
             pname = "drv-hardware-backends";
             version = "0.1.0";

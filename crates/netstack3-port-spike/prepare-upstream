@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-commit=1e1219e3fac944c9a906aea9646939746b6062b3
-closure=netstack3-port-v2-wlan-fidl-ext-1
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
+manifest="$repo/nix/fuchsia-reference.json"
+readarray -t metadata < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+print(manifest["commit"])
+print(manifest["closure"])
+PY
+)
+commit=${metadata[0]}
+closure=${metadata[1]}
 refroot=${DRV_FUCHSIA_REFERENCE_ROOT:-$repo/reference/fuchsia-$commit}
 
 if [[ ! -e "$refroot" ]]; then

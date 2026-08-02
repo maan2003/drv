@@ -1,0 +1,119 @@
+{
+  "commit": "1e1219e3fac944c9a906aea9646939746b6062b3",
+  "closure": "netstack3-port-v2-wlan-fidl-ext-1",
+  "paths": [
+    "src/connectivity/bluetooth",
+    "src/connectivity/network/netstack3",
+    "src/connectivity/network/dhcpv4/client/core",
+    "src/connectivity/network/dhcpv4/protocol",
+    "src/connectivity/network/dns",
+    "src/connectivity/policy/netcfg",
+    "src/connectivity/wlan",
+    "src/lib/mundane",
+    "src/lib/fuchsia-sync",
+    "src/lib/trace/rust",
+    "src/lib/fidl/rust/fidl",
+    "sdk/rust/zx-types",
+    "sdk/rust/zx-status",
+    "sdk/rust/zx",
+    "src/connectivity/lib/net-types",
+    "src/connectivity/lib/net-declare",
+    "src/connectivity/lib/internet-checksum",
+    "src/connectivity/lib/packet-formats",
+    "src/connectivity/network/lib/diagnostics-traits",
+    "src/connectivity/network/lib/explicit",
+    "src/media/audio/drivers/testing",
+    "src/media/audio/drivers/virtual-audio",
+    "src/media/audio/lib/clock",
+    "src/media/audio/lib/processing",
+    "src/media/audio/lib/timeline",
+    "src/media/audio/services/device_registry",
+    "src/media/audio/services/mixer",
+    "src/lib/network/packet",
+    "src/lib/replace-with",
+    "third_party/rust_crates/forks/trust-dns-proto-0.22.0",
+    "third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
+    "third_party/boringssl/rust",
+    "sdk/fidl/fuchsia.audio",
+    "sdk/fidl/fuchsia.audio.effects",
+    "sdk/fidl/fuchsia.bluetooth",
+    "sdk/fidl/fuchsia.bluetooth.a2dp",
+    "sdk/fidl/fuchsia.bluetooth.bredr",
+    "sdk/fidl/fuchsia.bluetooth.fastpair",
+    "sdk/fidl/fuchsia.bluetooth.gatt",
+    "sdk/fidl/fuchsia.bluetooth.gatt2",
+    "sdk/fidl/fuchsia.bluetooth.hfp",
+    "sdk/fidl/fuchsia.bluetooth.host",
+    "sdk/fidl/fuchsia.bluetooth.le",
+    "sdk/fidl/fuchsia.bluetooth.sys",
+    "sdk/fidl/fuchsia.bluetooth.test",
+    "sdk/fidl/fuchsia.hardware.audio",
+    "sdk/fidl/fuchsia.hardware.audio.signalprocessing",
+    "sdk/fidl/fuchsia.hardware.bluetooth",
+    "sdk/fidl/fuchsia.wlan.common",
+    "sdk/fidl/fuchsia.wlan.driver",
+    "sdk/fidl/fuchsia.wlan.ieee80211",
+    "sdk/fidl/fuchsia.wlan.internal",
+    "sdk/fidl/fuchsia.wlan.minstrel",
+    "sdk/fidl/fuchsia.wlan.mlme",
+    "sdk/fidl/fuchsia.wlan.sme",
+    "sdk/fidl/fuchsia.wlan.softmac",
+    "sdk/fidl/fuchsia.wlan.stats"
+  ],
+  "providerArchives": [
+    {
+      "path": "src/connectivity/network/netstack3",
+      "hash": "sha256-htzxY54MBdauPS5fDPthvUb2gH2vBMRzGJNM5tUqc6U="
+    },
+    {
+      "path": "src/connectivity/network/dhcpv4/client/core",
+      "hash": "sha256-U6pagwbUDRhnxbg9hOWQ6dsYcJ5rRd23UNap21MsdPk="
+    },
+    {
+      "path": "src/connectivity/network/dhcpv4/protocol",
+      "hash": "sha256-ZpNTdmd/MCihf+uZyaOgCha59GRMogyEma+8qwt1Em8="
+    },
+    {
+      "path": "src/connectivity/lib/net-types",
+      "hash": "sha256-EQTeAONfc5QlCPRUT92FLu84YDeSEVp6bFgjSeYOLEw="
+    },
+    {
+      "path": "src/connectivity/lib/net-declare",
+      "hash": "sha256-vVPk6QpwR4JtC25+G73tC5AW8YRYow5XRtWMKIBKhWQ="
+    },
+    {
+      "path": "src/connectivity/lib/internet-checksum",
+      "hash": "sha256-GjTO4hcFZ8hMqcsazbSbXvUhP5MdjxKrxIyI+yL/b/o="
+    },
+    {
+      "path": "src/connectivity/lib/packet-formats",
+      "hash": "sha256-OtILq0JFzH6dCIO4sT8skr20f0iJ7PbSiqmCZMr6zYs="
+    },
+    {
+      "path": "src/connectivity/network/lib/diagnostics-traits",
+      "hash": "sha256-9mbiupRAs8i7i3GL+QyfaiVXu4KSAeG7sHaWN7KBnmE="
+    },
+    {
+      "path": "src/connectivity/network/lib/explicit",
+      "hash": "sha256-fNjLAmnaLb8yRErlkXpgxRG1k9m6PY+oHJBx3VRyvkQ="
+    },
+    {
+      "path": "src/lib/network/packet",
+      "hash": "sha256-fNU9frD6T1rKEsYS9Gunxja7wyILJJG2QbMjaJ9/1uQ="
+    },
+    {
+      "path": "src/lib/replace-with",
+      "hash": "sha256-bqELi+WX1YFlCTIf+hYBHuVephWWtKLg74GCGt3OQUU="
+    },
+    {
+      "path": "third_party/rust_crates/forks/trust-dns-proto-0.22.0",
+      "hash": "sha256-OS+ZXO2jaJRbqeT7H0WTCz5UhcOLi8KUWjO4C+9ZS5M="
+    },
+    {
+      "path": "third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
+      "hash": "sha256-gIWaBQ0DZoJNUsdiae4m8vanUcZxi9qEK63ve6PUmjk="
+    }
+  ],
+  "boringsslCommit": "156c7b75ae9b8c3b3f847acf264f17594c3859fb",
+  "pigweedCommit": "c14c119c51a82f6e044f81b7dad0a322091d4121"
+}

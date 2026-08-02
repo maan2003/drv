@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-commit=1e1219e3fac944c9a906aea9646939746b6062b3
-closure=netstack3-port-v2-wlan-fidl-ext-1
+manifest=$(cd "$(dirname "$0")/.." && pwd)/nix/fuchsia-reference.json
+readarray -t metadata < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+print(manifest["commit"])
+print(manifest["closure"])
+print(manifest["boringsslCommit"])
+print(manifest["pigweedCommit"])
+PY
+)
+commit=${metadata[0]}
+closure=${metadata[1]}
+boringssl_commit=${metadata[2]}
+pigweed_commit=${metadata[3]}
 
 if [[ ${1:-} == --print-commit ]]; then
   printf "%s\n" "$commit"
@@ -11,7 +25,6 @@ fi
 cache=${DRV_REFERENCE_CACHE:-reference}
 root=${DRV_FUCHSIA_REFERENCE_ROOT:-reference/fuchsia-$commit}
 root_tmp="$root.tmp.$$"
-pigweed_commit=c14c119c51a82f6e044f81b7dad0a322091d4121
 pigweed_base=${DRV_PIGWEED_REFERENCE_ROOT:-reference/pigweed-$pigweed_commit}
 pigweed_tmp="$pigweed_base.tmp.$$"
 
@@ -29,64 +42,13 @@ mkdir -p "$cache" "$(dirname "$root")" "$root_tmp"
 mkdir -p "$(dirname "$pigweed_base")" "$pigweed_tmp/pw_bluetooth_sapphire"
 trap 'rm -rf "$root_tmp" "$pigweed_tmp"' EXIT
 
-paths=(
-  src/connectivity/bluetooth
-  src/connectivity/network/netstack3
-  src/connectivity/network/dhcpv4/client/core
-  src/connectivity/network/dhcpv4/protocol
-  src/connectivity/network/dns
-  src/connectivity/policy/netcfg
-  src/connectivity/wlan
-  src/lib/mundane
-  src/lib/fuchsia-sync
-  src/lib/trace/rust
-  src/lib/fidl/rust/fidl
-  sdk/rust/zx-types
-  sdk/rust/zx-status
-  sdk/rust/zx
-  src/connectivity/lib/net-types
-  src/connectivity/lib/net-declare
-  src/connectivity/lib/internet-checksum
-  src/connectivity/lib/packet-formats
-  src/connectivity/network/lib/diagnostics-traits
-  src/connectivity/network/lib/explicit
-  src/media/audio/drivers/testing
-  src/media/audio/drivers/virtual-audio
-  src/media/audio/lib/clock
-  src/media/audio/lib/processing
-  src/media/audio/lib/timeline
-  src/media/audio/services/device_registry
-  src/media/audio/services/mixer
-  src/lib/network/packet
-  src/lib/replace-with
-  third_party/rust_crates/forks/trust-dns-proto-0.22.0
-  third_party/rust_crates/forks/trust-dns-resolver-0.22.0
-  third_party/boringssl/rust
-  sdk/fidl/fuchsia.audio
-  sdk/fidl/fuchsia.audio.effects
-  sdk/fidl/fuchsia.bluetooth
-  sdk/fidl/fuchsia.bluetooth.a2dp
-  sdk/fidl/fuchsia.bluetooth.bredr
-  sdk/fidl/fuchsia.bluetooth.fastpair
-  sdk/fidl/fuchsia.bluetooth.gatt
-  sdk/fidl/fuchsia.bluetooth.gatt2
-  sdk/fidl/fuchsia.bluetooth.hfp
-  sdk/fidl/fuchsia.bluetooth.host
-  sdk/fidl/fuchsia.bluetooth.le
-  sdk/fidl/fuchsia.bluetooth.sys
-  sdk/fidl/fuchsia.bluetooth.test
-  sdk/fidl/fuchsia.hardware.audio
-  sdk/fidl/fuchsia.hardware.audio.signalprocessing
-  sdk/fidl/fuchsia.hardware.bluetooth
-  sdk/fidl/fuchsia.wlan.common
-  sdk/fidl/fuchsia.wlan.driver
-  sdk/fidl/fuchsia.wlan.ieee80211
-  sdk/fidl/fuchsia.wlan.internal
-  sdk/fidl/fuchsia.wlan.minstrel
-  sdk/fidl/fuchsia.wlan.mlme
-  sdk/fidl/fuchsia.wlan.sme
-  sdk/fidl/fuchsia.wlan.softmac
-  sdk/fidl/fuchsia.wlan.stats
+readarray -t paths < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+print(*manifest["paths"], sep="\n")
+PY
 )
 
 # Additional pinned paths may be supplied by package overlays. This keeps one
@@ -116,7 +78,6 @@ done
 
 # BoringSSL is a gitlink in fuchsia.git, so fetch the exact revision recorded
 # by the pinned Fuchsia tree separately into its expected checkout path.
-boringssl_commit=156c7b75ae9b8c3b3f847acf264f17594c3859fb
 boringssl_archive="$cache/boringssl-$boringssl_commit.tar.gz"
 boringssl_root="$root_tmp/third_party/boringssl/src"
 

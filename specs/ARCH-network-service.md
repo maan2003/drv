@@ -2,8 +2,12 @@
 
 ## Status
 
-No IP/transport service or socket adapter is implemented. It follows the Wi-Fi
-hardware milestone and remains independently replaceable.
+A native Netstack3 IP/transport service and Linux kernel socket adapter now run
+as a deployment-tested spike against a deterministic Ethernet peer. They remain
+independently replaceable and production external connectivity still awaits the
+Wi-Fi Ethernet owner. The spike currently combines the service and host-adapter
+binding in one daemon, so the mature process-isolation boundary described below
+is not yet complete.
 
 One sandboxed portable service owns externally reachable Ethernet, ARP/NDP, IP,
 fragmentation, ICMP, UDP, TCP, routing, and network policy. Splitting it by DNS

@@ -22,6 +22,7 @@ testers.runNixOSTest {
 
   nodes.machine = { ... }: {
     imports = [ ./module.nix ];
+    hardware.netstack3KernelProvider.enable = true;
     environment.systemPackages = [ providerSelftest ];
     virtualisation.memorySize = 1024;
   };
