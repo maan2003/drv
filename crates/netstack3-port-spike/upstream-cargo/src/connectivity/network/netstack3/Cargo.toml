@@ -4,7 +4,7 @@ members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
-  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/ieee80211",
+  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/ieee80211",
   "../../../lib/mundane",
   "../../../../third_party/boringssl/rust/bssl-sys",
   "../../../../sdk/fidl/fuchsia.wlan.common",
@@ -92,6 +92,7 @@ explicit = { path = "../lib/explicit" }
 packet = { path = "../../../lib/network/packet" }
 replace_with = { path = "../../../lib/replace-with" }
 wlan_bitfield = { package = "wlan-bitfield", path = "../../wlan/lib/bitfield" }
+wlan_fcg_crypto = { package = "wlan-fcg-crypto", path = "../../wlan/lib/fcg-crypto" }
 wlan_statemachine = { package = "wlan-statemachine", path = "../../wlan/lib/statemachine" }
 netstack3_base = { path = "core/base" }
 netstack3_datagram = { path = "core/datagram" }
