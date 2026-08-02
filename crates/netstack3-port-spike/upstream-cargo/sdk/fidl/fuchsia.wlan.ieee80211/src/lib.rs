@@ -10,6 +10,7 @@ pub const HT_CAP_LEN: u8 = 26;
 pub const HT_OP_LEN: u8 = 22;
 pub const VHT_CAP_LEN: u8 = 12;
 pub const VHT_OP_LEN: u8 = 5;
+pub const MAX_KEY_LEN: u8 = 32;
 
 pub type MacAddr = [u8; MAC_ADDR_LEN as usize];
 
@@ -156,6 +157,31 @@ flexible_enum!(WlanPhyType, u32, WlanPhyTypeUnknown, {
     He = 12,
 });
 
+flexible_enum!(CipherSuiteType, u32, CipherSuiteTypeUnknown, {
+    UseGroup = 0,
+    Wep40 = 1,
+    Tkip = 2,
+    Reserved3 = 3,
+    Ccmp128 = 4,
+    Wep104 = 5,
+    BipCmac128 = 6,
+    GroupAddressedNotAllowed = 7,
+    Gcmp128 = 8,
+    Gcmp256 = 9,
+    Ccmp256 = 10,
+    BipGmac128 = 11,
+    BipGmac256 = 12,
+    BipCmac256 = 13,
+    Reserved14To255 = 14,
+});
+
+flexible_enum!(KeyType, u8, KeyTypeUnknown, {
+    Pairwise = 1,
+    Group = 2,
+    Igtk = 3,
+    Peer = 4,
+});
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelNumber {
     pub band: WlanBand,
@@ -206,6 +232,9 @@ mod tests {
         assert_eq!(WlanBand::FiveGhz.into_primitive(), 1);
         assert_eq!(BssType::Personal.into_primitive(), 4);
         assert_eq!(WlanPhyType::He.into_primitive(), 12);
+        assert_eq!(CipherSuiteType::Ccmp128.into_primitive(), 4);
+        assert_eq!(KeyType::Peer.into_primitive(), 4);
+        assert_eq!(MAX_KEY_LEN, 32);
         assert_eq!(ReasonCode::MicFailure.into_primitive(), 14);
         assert_eq!(StatusCode::Success.into_primitive(), 0);
         assert_eq!(StatusCode::AntiCloggingTokenRequired.into_primitive(), 76);
@@ -225,6 +254,8 @@ mod tests {
             Some(ChannelBandwidth::Cbw80P80)
         );
         assert_eq!(ChannelBandwidth::from_primitive(77), None);
+        assert_eq!(CipherSuiteType::from_primitive(15), None);
+        assert_eq!(KeyType::from_primitive(8), None);
         assert_eq!(
             ChannelBandwidth::from_primitive_allow_unknown(77).into_primitive(),
             77

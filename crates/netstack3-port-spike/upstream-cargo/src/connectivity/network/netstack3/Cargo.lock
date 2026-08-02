@@ -651,6 +651,13 @@ name = "fidl-fuchsia-wlan-common"
 version = "0.1.0"
 
 [[package]]
+name = "fidl-fuchsia-wlan-driver"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+]
+
+[[package]]
 name = "fidl-fuchsia-wlan-ieee80211"
 version = "0.1.0"
 

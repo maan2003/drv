@@ -12,6 +12,7 @@ members = [
   "../../../../sdk/rust/zx-types", "../../../../sdk/rust/zx-status", "../../../../sdk/rust/zx",
   "../../../../third_party/boringssl/rust/bssl-sys",
   "../../../../sdk/fidl/fuchsia.wlan.common",
+  "../../../../sdk/fidl/fuchsia.wlan.driver",
   "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
   "../../../../sdk/fidl/fuchsia.wlan.internal",
   "../../../../sdk/fidl/fuchsia.wlan.minstrel",
