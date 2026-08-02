@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use net_types::UnicastAddr;
 use net_types::ethernet::Mac;
-use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Mtu, Subnet};
+use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Ipv6, Ipv6Addr, Mtu, Subnet};
 use net_types::{SpecifiedAddr, ZonedAddr};
 use netstack3_base::socket::ShutdownType;
 use netstack3_base::sync::{DynDebugReferences, RcNotifier};
@@ -36,7 +36,10 @@ use netstack3_core::device::{
 use netstack3_core::device_socket::{
     DeviceSocketMetadata, EthernetHeaderParams, Protocol, TargetDevice,
 };
-use netstack3_core::ip::{IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate};
+use netstack3_core::ip::{
+    IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate, Ipv6DeviceConfigurationUpdate,
+    RouteDiscoveryConfigurationUpdate,
+};
 use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
 use netstack3_core::udp::UdpRemotePort;
 use netstack3_core::{CoreTxMetadata, IpExt, StackState, StackStateBuilder, TimerId};
@@ -904,7 +907,7 @@ impl TcpSocketDestructionContext for NativeBindingsCtx {
     }
 }
 
-/// An opaque IPv4 UDP socket owned by one [`Runtime`].
+/// An opaque UDP socket owned by one [`Runtime`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct UdpSocketHandle(u64);
 
@@ -936,9 +939,15 @@ pub enum RuntimeError {
 }
 
 type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
+type NativeUdpV6 = UdpSocketId<Ipv6, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
 type NativeTcpV4 = TcpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
+type NativeTcpV6 = TcpSocketId<Ipv6, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
 struct RuntimeTcpSocket {
     id: NativeTcpV4,
+    buffers: NativeTcpBuffers,
+}
+struct RuntimeTcpSocketV6 {
+    id: NativeTcpV6,
     buffers: NativeTcpBuffers,
 }
 
@@ -949,10 +958,13 @@ struct RuntimeTcpSocket {
 pub struct Runtime {
     // External strong IDs must be dropped before core's primary resources.
     udp: HashMap<UdpSocketHandle, NativeUdpV4>,
+    udp_v6: HashMap<UdpSocketHandle, NativeUdpV6>,
     tcp: HashMap<TcpSocketHandle, RuntimeTcpSocket>,
+    tcp_v6: HashMap<TcpSocketHandle, RuntimeTcpSocketV6>,
     dhcp_socket: SocketId<NativeBindingsCtx>,
     device: EthernetDeviceId<NativeBindingsCtx>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
+    ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
     stack: StackState<NativeBindingsCtx>,
@@ -961,6 +973,9 @@ pub struct Runtime {
 
 impl Runtime {
     /// Creates and IPv4-enables one Ethernet interface with explicit identity.
+    ///
+    /// IPv6 is enabled when an IPv6 address is first applied, preserving the
+    /// IPv4-only runtime's frame behavior.
     pub fn new(
         queue_capacity: usize,
         entropy: impl IntoIterator<Item = u8>,
@@ -1029,10 +1044,13 @@ impl Runtime {
             );
         Ok(Self {
             udp: HashMap::new(),
+            udp_v6: HashMap::new(),
             tcp: HashMap::new(),
+            tcp_v6: HashMap::new(),
             dhcp_socket,
             device,
             ipv4_address: None,
+            ipv6_address: None,
             dns_servers: [None, None],
             next_socket: 0,
             stack,
@@ -1099,6 +1117,86 @@ impl Runtime {
                 .del_ip_addr(&self.device.clone().into(), address.addr());
         }
         self.dns_servers = [None, None];
+    }
+
+    /// Replaces the IPv6 address and the complete IPv6 main routing table.
+    pub fn apply_ipv6(
+        &mut self,
+        address: [u8; 16],
+        prefix: u8,
+        default_gateway: Option<[u8; 16]>,
+    ) -> Result<(), RuntimeError> {
+        let address = AddrSubnet::new(Ipv6Addr::from_bytes(address), prefix)
+            .map_err(|_| RuntimeError::InvalidAddress)?;
+        let gateway = default_gateway
+            .map(|a| {
+                SpecifiedAddr::new(Ipv6Addr::from_bytes(a)).ok_or(RuntimeError::InvalidAddress)
+            })
+            .transpose()?;
+        self.revoke_ipv6();
+        self.stack
+            .api(&mut self.bindings)
+            .device_ip::<Ipv6>()
+            .update_configuration(
+                &self.device.clone().into(),
+                Ipv6DeviceConfigurationUpdate {
+                    max_router_solicitations: Some(None),
+                    route_discovery_config: RouteDiscoveryConfigurationUpdate {
+                        allow_default_route: Some(false),
+                    },
+                    ip_config: IpDeviceConfigurationUpdate {
+                        ip_enabled: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| RuntimeError::InvalidState)?;
+        self.stack
+            .api(&mut self.bindings)
+            .device_ip::<Ipv6>()
+            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .map_err(|_| RuntimeError::AddressInUse)?;
+
+        let metric = AddableMetric::ExplicitMetric(RawMetric(0));
+        let mut generation = Generation::initial();
+        let mut routes = vec![
+            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+                .resolve_metric(RawMetric(0))
+                .with_generation(generation),
+        ];
+        if let Some(gateway) = gateway {
+            generation = generation.next();
+            routes.push(
+                AddableEntry::with_gateway(
+                    Subnet::new(Ipv6Addr::from_bytes([0; 16]), 0).unwrap(),
+                    self.device.clone().into(),
+                    gateway,
+                    metric,
+                )
+                .resolve_metric(RawMetric(0))
+                .with_generation(generation),
+            );
+        }
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
+        let table = api.main_table_id();
+        api.set_routes(&table, routes);
+        self.ipv6_address = Some(address);
+        Ok(())
+    }
+
+    /// Removes the configured IPv6 address and all IPv6 routes.
+    pub fn revoke_ipv6(&mut self) {
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
+        let table = api.main_table_id();
+        api.set_routes(&table, Vec::new());
+        if let Some(address) = self.ipv6_address.take() {
+            let _ = self
+                .stack
+                .api(&mut self.bindings)
+                .device_ip::<Ipv6>()
+                .del_ip_addr(&self.device.clone().into(), address.addr());
+        }
     }
 
     /// Applies all data-plane parts of an accepted DHCP lease together.
@@ -1234,8 +1332,12 @@ impl Runtime {
         self.bindings.dispatch_due(&self.stack, budget)
     }
 
+    fn socket_count(&self) -> usize {
+        self.udp.len() + self.udp_v6.len() + self.tcp.len() + self.tcp_v6.len()
+    }
+
     pub fn udp_socket(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
-        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = self.stack.api(&mut self.bindings).udp::<Ipv4>().create();
@@ -1299,8 +1401,85 @@ impl Runtime {
         Ok(self.bindings.take_udp(id))
     }
 
+    pub fn udp_socket_ipv6(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
+        if self.socket_count() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let id = self.stack.api(&mut self.bindings).udp::<Ipv6>().create();
+        let handle = UdpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("UDP handle space exhausted");
+        assert!(self.udp_v6.insert(handle, id).is_none());
+        Ok(handle)
+    }
+
+    pub fn udp_bind_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+        address: Option<[u8; 16]>,
+        port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let address = address
+            .map(|a| {
+                SpecifiedAddr::new(Ipv6Addr::from_bytes(a)).ok_or(RuntimeError::InvalidAddress)
+            })
+            .transpose()?
+            .map(|a| ZonedAddr::Unzoned(a).into());
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .listen(id, address, Some(port))
+            .map_err(|_| RuntimeError::AddressInUse)
+    }
+
+    pub fn udp_send_to_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+        remote_address: [u8; 16],
+        remote_port: NonZeroU16,
+        payload: &[u8],
+    ) -> Result<(), RuntimeError> {
+        // 1500-byte Ethernet MTU minus the fixed IPv6 and UDP headers.
+        if payload.len() > 1452 {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let address = SpecifiedAddr::new(Ipv6Addr::from_bytes(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .send_to(
+                id,
+                Some(ZonedAddr::Unzoned(address).into()),
+                UdpRemotePort::Set(remote_port),
+                Buf::new(payload.to_vec(), ..),
+            )
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    pub fn udp_receive_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.take_udp(id))
+    }
+
     pub fn tcp_socket(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
-        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
@@ -1380,7 +1559,7 @@ impl Runtime {
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<TcpSocketHandle, RuntimeError> {
-        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let listener = &self
@@ -1466,6 +1645,201 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
+            .close(socket.id);
+        Ok(())
+    }
+
+    pub fn tcp_socket_ipv6(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
+        if self.socket_count() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let socket_data = NativeTcpSocketData::buffers(BufferSizes {
+            send: self.bindings.tcp_settings.send_buffer.default().get(),
+            receive: self.bindings.tcp_settings.receive_buffer.default().get(),
+        });
+        let buffers = socket_data.client_buffers().unwrap();
+        let id = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .create(socket_data);
+        let handle = TcpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("socket handle space exhausted");
+        assert!(
+            self.tcp_v6
+                .insert(handle, RuntimeTcpSocketV6 { id, buffers })
+                .is_none()
+        );
+        Ok(handle)
+    }
+
+    pub fn tcp_bind_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        address: Option<[u8; 16]>,
+        port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let address = address
+            .map(|a| {
+                SpecifiedAddr::new(Ipv6Addr::from_bytes(a)).ok_or(RuntimeError::InvalidAddress)
+            })
+            .transpose()?
+            .map(ZonedAddr::Unzoned);
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .bind(id, address, Some(port))
+            .map_err(|_| RuntimeError::AddressInUse)
+    }
+
+    pub fn tcp_listen_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        backlog: NonZeroUsize,
+    ) -> Result<(), RuntimeError> {
+        if backlog.get() > self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .listen(id, backlog)
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn tcp_connect_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        remote_address: [u8; 16],
+        remote_port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let address = SpecifiedAddr::new(Ipv6Addr::from_bytes(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .connect(id, Some(ZonedAddr::Unzoned(address)), remote_port)
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    pub fn tcp_accept_ipv6(
+        &mut self,
+        listener: TcpSocketHandle,
+    ) -> Result<TcpSocketHandle, RuntimeError> {
+        if self.socket_count() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let listener = &self
+            .tcp_v6
+            .get(&listener)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let (id, _remote, buffers) = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .accept(listener)
+            .map_err(|_| RuntimeError::WouldBlock)?;
+        let handle = TcpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("socket handle space exhausted");
+        assert!(
+            self.tcp_v6
+                .insert(handle, RuntimeTcpSocketV6 { id, buffers })
+                .is_none()
+        );
+        Ok(handle)
+    }
+
+    pub fn tcp_write_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        payload: &[u8],
+    ) -> Result<usize, RuntimeError> {
+        let socket = self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let written = socket.buffers.write(payload);
+        if written != 0 {
+            self.stack
+                .api(&mut self.bindings)
+                .tcp::<Ipv6>()
+                .do_send(&socket.id);
+        }
+        Ok(written)
+    }
+
+    pub fn tcp_read_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        out: &mut [u8],
+    ) -> Result<usize, RuntimeError> {
+        let socket = self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let read = socket.buffers.read(out);
+        if read != 0 {
+            self.stack
+                .api(&mut self.bindings)
+                .tcp::<Ipv6>()
+                .on_receive_buffer_read(&socket.id);
+        }
+        Ok(read)
+    }
+
+    pub fn tcp_shutdown_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+        how: TcpShutdown,
+    ) -> Result<(), RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let how = match how {
+            TcpShutdown::Send => ShutdownType::Send,
+            TcpShutdown::Receive => ShutdownType::Receive,
+            TcpShutdown::SendAndReceive => ShutdownType::SendAndReceive,
+        };
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .shutdown(id, how)
+            .map(|_| ())
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn tcp_close_ipv6(&mut self, handle: TcpSocketHandle) -> Result<(), RuntimeError> {
+        let socket = self
+            .tcp_v6
+            .remove(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
             .close(socket.id);
         Ok(())
     }
@@ -1607,6 +1981,25 @@ mod tests {
         runtime
     }
 
+    const CLIENT_V6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const SERVER_V6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+    fn runtime_ipv6(
+        id: u64,
+        mac: [u8; 6],
+        address: [u8; 16],
+        prefix: u8,
+        default_gateway: Option<[u8; 16]>,
+    ) -> Runtime {
+        let entropy = (0u8..=255).cycle().take(8192);
+        let mut runtime = Runtime::new(4, entropy, NonZeroU64::new(id).unwrap(), mac, 1500)
+            .expect("valid interface");
+        runtime
+            .apply_ipv6(address, prefix, default_gateway)
+            .expect("valid static IPv6 configuration");
+        runtime
+    }
+
     fn exchange(a: &mut Runtime, b: &mut Runtime) -> usize {
         let mut count = 0;
         while let Some(frame) = a.take_tx() {
@@ -1618,6 +2011,25 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    fn finish_ipv6_dad(a: &mut Runtime, b: &mut Runtime) {
+        for _ in 0..16 {
+            if exchange(a, b) == 0 {
+                break;
+            }
+        }
+        let after_dad = NativeInstant::from_nanos(2_000_000_000);
+        a.set_now(after_dad);
+        b.set_now(after_dad);
+        let _ = a.dispatch_due(64);
+        let _ = b.dispatch_due(64);
+        for _ in 0..16 {
+            if exchange(a, b) == 0 {
+                return;
+            }
+        }
+        panic!("IPv6 DAD traffic did not quiesce");
     }
 
     fn udp_payload(frame: &EthernetFrame) -> &[u8] {
@@ -1883,5 +2295,144 @@ mod tests {
         let replacement = client.tcp_socket().unwrap();
         assert_ne!(replacement, connection);
         client.tcp_close(replacement).unwrap();
+    }
+
+    #[test]
+    fn two_native_runtimes_resolve_ndp_and_exchange_ipv6_udp() {
+        let mut client = runtime_ipv6(21, [0x02, 0, 0, 0, 2, 1], CLIENT_V6, 128, Some(SERVER_V6));
+        let mut server = runtime_ipv6(22, [0x02, 0, 0, 0, 2, 2], SERVER_V6, 64, None);
+        finish_ipv6_dad(&mut client, &mut server);
+
+        let client_socket = client.udp_socket_ipv6().unwrap();
+        let server_socket = server.udp_socket_ipv6().unwrap();
+        client
+            .udp_bind_ipv6(
+                client_socket,
+                Some(CLIENT_V6),
+                NonZeroU16::new(20001).unwrap(),
+            )
+            .unwrap();
+        server
+            .udp_bind_ipv6(
+                server_socket,
+                Some(SERVER_V6),
+                NonZeroU16::new(20002).unwrap(),
+            )
+            .unwrap();
+        client
+            .udp_send_to_ipv6(
+                client_socket,
+                SERVER_V6,
+                NonZeroU16::new(20002).unwrap(),
+                b"bounded native IPv6 UDP",
+            )
+            .unwrap();
+
+        let solicitation = client.take_tx().expect("send starts NDP resolution");
+        assert_eq!(&solicitation.as_bytes()[12..14], &[0x86, 0xdd]);
+        assert_eq!(solicitation.as_bytes()[54], 135);
+        server.receive_frame(solicitation);
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            server.udp_receive_ipv6(server_socket).unwrap().as_deref(),
+            Some(&b"bounded native IPv6 UDP"[..])
+        );
+
+        // IPv4 and IPv6 sockets consume the same four-socket capability.
+        assert!(client.udp_socket().is_ok());
+        assert!(client.tcp_socket_ipv6().is_ok());
+        assert!(client.tcp_socket().is_ok());
+        assert_eq!(client.udp_socket_ipv6(), Err(RuntimeError::SocketLimit));
+
+        client.revoke_ipv6();
+        assert_eq!(
+            client.udp_send_to_ipv6(
+                client_socket,
+                SERVER_V6,
+                NonZeroU16::new(20002).unwrap(),
+                b"no route",
+            ),
+            Err(RuntimeError::SendFailed)
+        );
+    }
+
+    #[test]
+    fn two_native_runtimes_exchange_and_close_ipv6_tcp() {
+        let mut client = runtime_ipv6(31, [0x02, 0, 0, 0, 3, 1], CLIENT_V6, 128, Some(SERVER_V6));
+        let mut server = runtime_ipv6(32, [0x02, 0, 0, 0, 3, 2], SERVER_V6, 64, None);
+        finish_ipv6_dad(&mut client, &mut server);
+        let port = NonZeroU16::new(6060).unwrap();
+        let listener = server.tcp_socket_ipv6().unwrap();
+        server
+            .tcp_bind_ipv6(listener, Some(SERVER_V6), port)
+            .unwrap();
+        server
+            .tcp_listen_ipv6(listener, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+
+        let connection = client.tcp_socket_ipv6().unwrap();
+        client
+            .tcp_connect_ipv6(connection, SERVER_V6, port)
+            .unwrap();
+        let solicitation = client.take_tx().expect("connect starts NDP resolution");
+        assert_eq!(&solicitation.as_bytes()[12..14], &[0x86, 0xdd]);
+        assert_eq!(solicitation.as_bytes()[54], 135);
+        server.receive_frame(solicitation);
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let accepted = server
+            .tcp_accept_ipv6(listener)
+            .expect("IPv6 handshake completed");
+
+        assert_eq!(
+            client
+                .tcp_write_ipv6(connection, b"native IPv6 TCP request")
+                .unwrap(),
+            23
+        );
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let mut request = [0; 32];
+        let n = server.tcp_read_ipv6(accepted, &mut request).unwrap();
+        assert_eq!(&request[..n], b"native IPv6 TCP request");
+
+        assert_eq!(
+            server
+                .tcp_write_ipv6(accepted, b"native IPv6 TCP reply")
+                .unwrap(),
+            21
+        );
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let mut reply = [0; 32];
+        let n = client.tcp_read_ipv6(connection, &mut reply).unwrap();
+        assert_eq!(&reply[..n], b"native IPv6 TCP reply");
+
+        client
+            .tcp_shutdown_ipv6(connection, TcpShutdown::Send)
+            .unwrap();
+        for _ in 0..32 {
+            exchange(&mut client, &mut server);
+        }
+        client.tcp_close_ipv6(connection).unwrap();
+        server.tcp_close_ipv6(accepted).unwrap();
+        server.tcp_close_ipv6(listener).unwrap();
+        assert_eq!(
+            client.tcp_close_ipv6(connection),
+            Err(RuntimeError::UnknownSocket)
+        );
     }
 }

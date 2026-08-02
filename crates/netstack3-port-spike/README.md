@@ -157,20 +157,36 @@ tests run in addition to the five protocol tests above (the older protocol
 fixtures still use upstream's fake context as an oracle).
 
 `Runtime` is the narrow production-facing owner. It creates and enables an
-explicit Ethernet interface, applies/revokes IPv4 addresses, atomically replaces
-on-link/default route sets with `RoutesApi::set_routes`, and exposes bounded opaque
-UDP and TCP handles. Pre-lease DHCP uses a private Netstack3 device socket, so
+explicit Ethernet interface, applies/revokes IPv4 and IPv6 addresses, atomically
+replaces each version's on-link/default route set with `RoutesApi::set_routes`,
+and exposes bounded opaque IPv4 and IPv6 UDP and TCP handles. Pre-lease DHCP uses
+a private Netstack3 device socket, so
 0.0.0.0/broadcast traffic crosses core's FIFO and normal TX backpressure;
 accepted leases install the address, routes and DNS server set. A deterministic
 two-runtime test then resolves DNS over native UDP. Separate native tests prove
-ARP, bidirectional UDP, TCP connect/listen/accept/read/write/shutdown, socket
-quotas, stale handles, and FIN exchange over owned Ethernet frames.
+ARP/NDP, bidirectional IPv4/IPv6 UDP, IPv4/IPv6 TCP
+connect/listen/accept/read/write/shutdown, socket quotas, stale handles, and FIN
+exchange over owned Ethernet frames. The IPv6 tests use two production
+`Runtime` instances rather than Netstack3's fake context.
+
+The exact facade limits are:
+
+- configuration owns at most one explicit address and two explicit routes
+  (on-link plus optional default) per IP version; IPv6 router solicitation and
+  discovered default routes are disabled in favor of that supplied route set;
+- `queue_capacity` bounds each external frame/event/readiness queue, aggregate
+  pending UDP receive datagrams, the shared total of IPv4 and IPv6 UDP/TCP
+  sockets, and each TCP listen backlog;
+- Ethernet MTU is at most 1500 bytes, with owned frames limited to 14–1514
+  bytes;
+- IPv4 and IPv6 UDP payloads are limited to 1472 and 1452 bytes respectively;
+- DHCP/DNS control datagrams are limited to 1232 bytes; and
+- each TCP direction uses a 64 KiB default buffer under Netstack3's configured
+  4 KiB minimum and 4 MiB maximum.
 
 This establishes a usable synchronous native userspace stack without Fuchsia
 platform bindings. The embedding remains responsible for driving time/frame
 polls and DHCP renewal/rebind/expiry and DNS retry/cache policy; the supplied
-lease deadlines and truncation signal make those policies explicit. IPv6 is
-compiled and protocol-tested but the narrow `Runtime` socket facade is
-currently IPv4-only. The final deployment-specific step is implementing the
-existing frame/readiness contract at the Wi-Fi Ethernet boundary. No TAP device
-or MT7921 code is involved.
+lease deadlines and truncation signal make those policies explicit. The final
+deployment-specific step is implementing the existing frame/readiness contract
+at the Wi-Fi Ethernet boundary. No TAP device or MT7921 code is involved.
