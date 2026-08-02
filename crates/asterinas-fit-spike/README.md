@@ -45,6 +45,9 @@ socket behavior tests independent of smoltcp.
 
 ### Safe hardware interfaces
 
+The exact pinned-source comparison and staged convergence plan are in
+[`DMA-COMPARISON.md`](DMA-COMPARISON.md).
+
 OSTD and the safe virtio drivers demonstrate several patterns relevant to
 [`IDEA-rust-first-wifi-drivers`](../../specs/IDEA-rust-first-wifi-drivers.md):
 
@@ -58,7 +61,9 @@ OSTD and the safe virtio drivers demonstrate several patterns relevant to
 These designs should be the baseline for the native broker and Rust Wi-Fi
 driver APIs. In particular, this project should preserve the coherent/streaming
 split, direction types, explicit range synchronization, typed device addresses,
-owned mapping lifetimes, and typed memory views. VFIO/iommufd can implement that
+owned mapping lifetimes, and typed memory views. The pinned x86 OSTD code does
+not yet flush IOTLBs on unmap, so its drop path is lifetime ownership rather
+than proof of immediate revocation. VFIO/iommufd can implement the stronger
 contract today; the deterministic broker and a future Asterinas host can be
 alternative backends. Pulling OSTD in as a Linux-userspace dependency would not
 help: its implementation assumes an OSTD-based kernel, global machine

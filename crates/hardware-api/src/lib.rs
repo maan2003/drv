@@ -56,6 +56,29 @@ pub enum DmaDirection {
     Bidirectional,
 }
 
+/// DMA-visible allocation constraints supplied by a device driver.
+///
+/// The current API exposes each allocation as one contiguous device-address
+/// segment. Backends must reject constraints they cannot guarantee rather than
+/// silently returning an unsuitable mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaConstraints {
+    pub alignment: usize,
+    pub max_device_address: u64,
+    pub max_segment_size: usize,
+    pub max_segments: usize,
+}
+impl DmaConstraints {
+    pub const fn new(alignment: usize) -> Self {
+        Self {
+            alignment,
+            max_device_address: u64::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: usize::MAX,
+        }
+    }
+}
+
 #[doc(hidden)]
 pub trait Backend {
     type Region;
@@ -81,6 +104,21 @@ pub trait Backend {
         direction: DmaDirection,
         coherent: bool,
     ) -> Result<Self::Dma>;
+    fn alloc_dma_constrained(
+        &mut self,
+        size: usize,
+        constraints: DmaConstraints,
+        direction: DmaDirection,
+        coherent: bool,
+    ) -> Result<Self::Dma> {
+        if constraints.max_device_address != u64::MAX
+            || constraints.max_segments == 0
+            || constraints.max_segment_size < size
+        {
+            return Err(Error::Limit);
+        }
+        self.alloc_dma(size, constraints.alignment, direction, coherent)
+    }
     fn dma_read(&mut self, dma: &Self::Dma, range: Range<usize>, out: &mut [u8]) -> Result<()>;
     fn dma_write(&mut self, dma: &Self::Dma, range: Range<usize>, bytes: &[u8]) -> Result<()>;
     fn sync_for_cpu(&mut self, dma: &Self::Dma, range: Range<usize>) -> Result<()>;
@@ -135,16 +173,42 @@ impl<B: Backend> Device<B> {
         size: usize,
         align: usize,
     ) -> Result<CoherentDma<B, D>> {
-        DmaBuffer::allocate(self.shared.clone(), size, align, direction::<D>(), true)
-            .map(CoherentDma)
+        self.alloc_coherent_with_constraints(size, DmaConstraints::new(align))
+    }
+    pub fn alloc_coherent_with_constraints<D: Direction>(
+        &self,
+        size: usize,
+        constraints: DmaConstraints,
+    ) -> Result<CoherentDma<B, D>> {
+        DmaBuffer::allocate(
+            self.shared.clone(),
+            size,
+            constraints,
+            direction::<D>(),
+            true,
+        )
+        .map(CoherentDma)
     }
     pub fn alloc_streaming<D: Direction>(
         &self,
         size: usize,
         align: usize,
     ) -> Result<StreamingDma<B, D>> {
-        DmaBuffer::allocate(self.shared.clone(), size, align, direction::<D>(), false)
-            .map(StreamingDma)
+        self.alloc_streaming_with_constraints(size, DmaConstraints::new(align))
+    }
+    pub fn alloc_streaming_with_constraints<D: Direction>(
+        &self,
+        size: usize,
+        constraints: DmaConstraints,
+    ) -> Result<StreamingDma<B, D>> {
+        DmaBuffer::allocate(
+            self.shared.clone(),
+            size,
+            constraints,
+            direction::<D>(),
+            false,
+        )
+        .map(StreamingDma)
     }
     pub fn open_interrupt(&self, vector: u32) -> Result<Interrupt<B>> {
         let mut b = self.shared.0.borrow_mut();
@@ -262,16 +326,16 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
     fn allocate(
         shared: Shared<B>,
         size: usize,
-        align: usize,
+        constraints: DmaConstraints,
         dir: DmaDirection,
         coherent: bool,
     ) -> Result<Self> {
-        if size == 0 || align == 0 || !align.is_power_of_two() {
+        if size == 0 || constraints.alignment == 0 || !constraints.alignment.is_power_of_two() {
             return Err(Error::Invalid);
         }
         let mut b = shared.0.borrow_mut();
         let generation = b.generation();
-        let token = b.alloc_dma(size, align, dir, coherent)?;
+        let token = b.alloc_dma_constrained(size, constraints, dir, coherent)?;
         drop(b);
         Ok(Self {
             shared,

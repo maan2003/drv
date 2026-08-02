@@ -1,7 +1,7 @@
 //! Audited Linux boundary for the QEMU edu vertical slice.
 #![cfg(target_os = "linux")]
 
-use drv_hardware::{Backend, Device, DmaDirection, Error, IrqEvent, Result};
+use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use drv_hardware_backends::run_edu_sequence;
 use std::{
     fs::{File, OpenOptions},
@@ -301,6 +301,29 @@ impl Backend for LinuxVfio {
             iova: map.iova,
             direction,
         })
+    }
+    fn alloc_dma_constrained(
+        &mut self,
+        size: usize,
+        constraints: DmaConstraints,
+        direction: DmaDirection,
+        coherent: bool,
+    ) -> Result<Dma> {
+        if constraints.alignment == 0 || !constraints.alignment.is_power_of_two() {
+            return Err(Error::Invalid);
+        }
+        let mapped_len = size.next_multiple_of(4096);
+        let last = 0x0100_0000_u64
+            .checked_add(mapped_len as u64 - 1)
+            .ok_or(Error::Limit)?;
+        if constraints.max_segments == 0
+            || constraints.max_segment_size < size
+            || !0x0100_0000_usize.is_multiple_of(constraints.alignment)
+            || last > constraints.max_device_address
+        {
+            return Err(Error::Limit);
+        }
+        self.alloc_dma(size, constraints.alignment, direction, coherent)
     }
     fn dma_read(&mut self, d: &Dma, r: Range<usize>, out: &mut [u8]) -> Result<()> {
         if matches!(d.direction, DmaDirection::ToDevice) {

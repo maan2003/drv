@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use drv_hardware::{Backend, Device, DmaDirection, Error, IrqEvent, Result};
+use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{collections::HashMap, ops::Range};
 
 const FIRST_IOVA: u64 = 0x1000_0000;
@@ -191,6 +191,28 @@ impl Backend for DeterministicBackend {
         self.next += size as u64;
         Ok(id)
     }
+    fn alloc_dma_constrained(
+        &mut self,
+        size: usize,
+        constraints: DmaConstraints,
+        direction: DmaDirection,
+        coherent: bool,
+    ) -> Result<u64> {
+        if constraints.max_segments == 0 || constraints.max_segment_size < size {
+            return Err(Error::Limit);
+        }
+        let mask = constraints.alignment.checked_sub(1).ok_or(Error::Invalid)? as u64;
+        let start = self
+            .next
+            .checked_add(mask)
+            .map(|value| value & !mask)
+            .ok_or(Error::Limit)?;
+        let last = start.checked_add(size as u64 - 1).ok_or(Error::Limit)?;
+        if last > constraints.max_device_address {
+            return Err(Error::Limit);
+        }
+        self.alloc_dma(size, constraints.alignment, direction, coherent)
+    }
     fn dma_read(&mut self, dma: &u64, r: Range<usize>, out: &mut [u8]) -> Result<()> {
         let d = self.dma(dma)?;
         if matches!(d.direction, DmaDirection::ToDevice) {
@@ -344,5 +366,43 @@ mod tests {
         bar.write_device_address(0x88, Some(0x8c), dma.device_address(8).unwrap())
             .unwrap();
         assert_eq!(bar.write_u32(0x98, 1 | 2), Err(Error::OutOfBounds));
+    }
+
+    #[test]
+    fn constrained_dma_enforces_address_alignment_and_segment_limits() {
+        let device = DeterministicBackend::device();
+        let low32 = DmaConstraints {
+            alignment: 4096,
+            max_device_address: u32::MAX.into(),
+            max_segment_size: 4096,
+            max_segments: 1,
+        };
+        let dma = device
+            .alloc_coherent_with_constraints::<drv_hardware::Bidirectional>(4096, low32)
+            .unwrap();
+        assert!(dma.device_address(0).is_ok());
+
+        let below_backend_iova = DmaConstraints {
+            max_device_address: 0x0fff_ffff,
+            ..low32
+        };
+        assert!(matches!(
+            device.alloc_coherent_with_constraints::<drv_hardware::Bidirectional>(
+                4096,
+                below_backend_iova
+            ),
+            Err(Error::Limit)
+        ));
+        let short_segment = DmaConstraints {
+            max_segment_size: 2048,
+            ..low32
+        };
+        assert!(matches!(
+            device.alloc_coherent_with_constraints::<drv_hardware::Bidirectional>(
+                4096,
+                short_segment
+            ),
+            Err(Error::Limit)
+        ));
     }
 }
