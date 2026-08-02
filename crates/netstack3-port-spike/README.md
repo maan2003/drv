@@ -1,165 +1,139 @@
 # Netstack3 host-portability spike
 
-This spike examines whether Fuchsia's Netstack3 can be the native Rust network
-service rather than merely serving as design prior art. It records observations,
-not an architecture decision.
+This spike tests whether Fuchsia's Netstack3 can supply the portable network
+service described by [ARCH-network-service](../../specs/ARCH-network-service.md).
+It is not an adoption decision and it contains no MT7921 or other hardware code.
 
-## Pinned source
+## Reproducible source and license audit
 
-`scripts/fetch-fuchsia-reference` downloads Gitiles archives, without Git
-history, at Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3`.
-The ignored `reference/` tree contains:
+The repository's `scripts/fetch-fuchsia-reference` fetches Gitiles archives at
+Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3`, records each archive's
+SHA-256, and expands the ignored tree under `reference/`. The audit below used
+that mechanism. At this pin:
 
-- `src/connectivity/network/netstack3` and `src/connectivity/wlan`;
-- the Fuchsia-internal libraries in Netstack3 core's production dependency
-  closure; and
-- the original archives and generated SHA-256 files.
+- the Netstack3 archive is 1.57 MiB compressed and 12 MiB expanded;
+- all fetched references are 59 MiB expanded;
+- Netstack3 core contains 163,854 lines of Rust after excluding the separate
+  integration-test, fuzz, and `teststd` trees;
+- the aggregate core crate's own GN-listed production sources are 10,121 lines;
+- Fuchsia's GN-listed production bindings sources are 44,474 lines; and
+- none of the relevant first-party archives contains a `Cargo.toml`.
 
-The archive is BSD-style licensed. License and provenance must remain attached
-to any source later imported into the project.
+Fuchsia source is under the BSD 2-Clause license in the repository-root
+`LICENSE`; individual source headers refer to that file. Gitiles path archives
+do not contain the repository-root license. No Fuchsia code has been copied into
+this crate, so this crate remains `MIT OR Apache-2.0`. Any later source import
+must carry the pinned root BSD license, copyright notices, source pin, and local
+modifications. An archive plus source headers alone is insufficient licensing
+provenance.
 
-## Initial coupling result
+## Smallest portable closure found
 
-Netstack3 has a deliberate functional-core/platform-bindings split. Its own
-`docs/CORE_BINDINGS.md` says that the core is platform-agnostic, that a binary
-supplies bindings, and that core development normally uses Cargo.
+Netstack3 deliberately separates a functional protocol core from platform
+bindings. `docs/CORE_BINDINGS.md` says the core is platform-agnostic and that a
+binary supplies the outside world as trait implementations. Production core
+code has no unconditional Zircon, FIDL IPC, filesystem, or device access.
+Fuchsia tracing has a non-Fuchsia implementation; the `fuchsia_async` and
+Inspect uses found in core are target-gated test code.
 
-The production core is not materially coupled to Zircon or FIDL:
+The useful adoption unit is nevertheless the **aggregate core**, not just its
+Ethernet and ICMP directories. Its production GN target unconditionally depends
+on these protocol crates:
 
-- no production core path imports FIDL or Zircon;
-- `fuchsia_async` occurs in target-gated tests;
-- tracing selects a Fuchsia implementation on Fuchsia and a no-op host
-  implementation elsewhere; and
-- `diagnostics-traits` similarly exposes target-neutral traits and gates its
-  Inspect implementation on `target_os = "fuchsia"`.
+`base`, `datagram`, `device`, `filter`, `hashmap`, `icmp_echo`, `ip`,
+`lock-order`, `macros`, `sync`, `tcp`, `trace`, and `udp`.
 
-The core is split into protocol crates for base types, datagrams, devices,
-filtering/NAT, ICMP echo, IP, TCP, UDP, synchronization, tracing, lock ordering,
-and the aggregate API. Its direct non-third-party dependencies are:
+Together with the aggregate crate that is 14 first-party crates. Their portable
+Fuchsia-library closure includes `net-types` (and proc macro),
+`packet-formats`, `internet-checksum`, `packet`, `diagnostics-traits`,
+`explicit`, and `replace-with`, plus ordinary crates.io dependencies. The `ip`
+crate also declares `net-declare`: production uses only its `net_*` literal
+macros, but `net-declare` unconditionally re-exports generated Fuchsia network
+FIDL types. A host package should depend directly on a separated
+`net-declare-macros`/network-types-only target rather than importing those FIDL
+types.
 
-- `net-types` and its proc macro;
-- `packet-formats`;
-- `packet` and `replace-with`;
-- `diagnostics-traits`;
-- `explicit`; and
-- `net-declare`.
+The required host binding is a concrete context implementing the aggregate
+marker traits over smaller responsibilities: monotonic time and timers,
+randomness, owned packet buffers and device TX, device events, socket buffers
+and readiness, reference-lifetime notifications, filtering metadata, and
+diagnostics. Fuchsia's 44,474-line binding additionally owns FIDL socket,
+route, interface and netdevice services plus Zircon async behavior. That shell
+is not part of the portable closure.
 
-Most are small and target-neutral. `packet-formats` additionally uses the small
-`internet-checksum` library included in the reference subset. `net-declare` is
-the one direct dependency that unconditionally wraps generated
-Fuchsia network FIDL types. Core uses only its `net_types` literal macros, mostly
-in tests, so that dependency can be replaced by the underlying
-`net-declare-macros` crate or split without changing protocol logic.
+## Protocol ownership at the pin
 
-## The real porting boundary
+| Capability | Location |
+| --- | --- |
+| Ethernet and loopback/pure-IP devices | core (`device` and aggregate device API) |
+| IPv4 and IPv6, fragmentation and forwarding | core (`ip`) |
+| ARP | core (`device`) |
+| IPv6 NDP/NUD, DAD, SLAAC and router discovery | core (`ip` device logic) |
+| route tables, rules and multicast routing | core (`ip` and aggregate API) |
+| ICMPv4/ICMPv6 and ICMP echo sockets | core (`ip`, `datagram`, `icmp_echo`) |
+| UDP | core (`udp` plus shared `datagram`) |
+| TCP state machine and socket state | core (`tcp`); POSIX/FIDL descriptors are bindings |
+| DHCPv4 client and address policy | separate Fuchsia service; `main.rs` calls it out as out-of-stack |
+| DNS configuration and name resolution | separate services (`netcfg`/name lookup), not core; Netstack3's DNS watcher deliberately does not serve results |
 
-The obstacle is packaging and bindings, not protocol code:
+DHCP and DNS therefore remain explicit service dependencies even after a core
+port. Importing core alone does not produce a configured interface or resolver.
 
-1. Cargo manifests are generated by `fx gen-cargo`; they are not checked in.
-   We must maintain manifests for the imported crate closure or reproducibly
-   generate equivalent manifests from GN metadata.
-2. A host `BindingsCtx` must implement Netstack3's aggregate context traits.
-   These cover monotonic time and timers, randomness, packet buffers and TX/RX
-   queues, device events, socket buffers and readiness, reference-lifetime
-   notifications, filtering metadata, and diagnostics.
-3. Fuchsia's existing platform shell is about 42,000 lines and contains its
-   FIDL socket, route, interface, netdevice, and Zircon async integration. It is
-   useful reference code, but it is the wrong layer to vendor unchanged.
+## Integration boundary
 
-The trait surface is broad, but it is explicitly designed for another bindings
-implementation. The aggregate `BindingsTypes`, `IpBindingsContext`, and
-`BindingsContext` traits are blanket marker traits over smaller responsibilities,
-so a port can be built incrementally around one concrete context.
+The safe native-Rust data-plane contract is the `EthernetDevice` trait in this
+crate:
 
-## Relevant capabilities and omissions
+```text
+Wi-Fi Ethernet boundary -> owned EthernetFrame -> Netstack3 host binding
+Wi-Fi Ethernet boundary <- owned EthernetFrame <- Netstack3 host binding
+```
 
-- Ethernet, pure-IP, and loopback device models are in core.
-- TCP's state machine and POSIX-oriented socket state are in core; Fuchsia's FD
-  and FIDL behavior is in bindings.
-- Stateful filtering, connection tracking, DNAT, SNAT, and masquerade are in
-  core. This supports the proposed temporary Linux TUN-peer arrangement.
-- DHCPv4 is explicitly an out-of-stack Fuchsia service. A complete deployment
-  therefore needs a separate DHCP client and configuration policy; DNS/name
-  lookup is likewise not supplied merely by importing Netstack3 core.
+`EthernetFrame` owns exactly 14 through 1514 bytes (Ethernet II without FCS,
+initially no VLAN, 1500-byte MTU). Both fake-device queues have an explicit item
+bound and return frame ownership on backpressure. The trait exposes no file,
+path, descriptor, ioctl, TAP handle, hardware handle, clock, executor, or random
+source. Configuration, monotonic timers, entropy and socket readiness must be
+separate injected capabilities when the real context is added. This makes the
+frame edge usable in-process without granting the protocol engine ambient
+hardware or filesystem authority and keeps it compatible with
+[REQ-host-portability](../../specs/REQ-host-portability.md).
 
-## Current assessment
+A Linux TAP adapter may later be placed **outside** this contract for temporary
+first-connectivity testing. It is not the target binding and must not leak a
+file descriptor or Linux type into portable code. The target path is direct
+owned-frame exchange with the Wi-Fi driver's Ethernet boundary.
 
-Adopting the full Netstack3 **protocol core** is plausible. Importing the full
-Fuchsia Netstack3 **binary and platform bindings** is not. The next useful proof
-is a Cargo build of the pinned production core and dependency closure, followed
-by the smallest host bindings that drive a pure-IP peer, timers, and one TCP
-socket. That will measure integration work without prematurely committing the
-architecture specification.
+## Deterministic proof and exact blocker
 
-## Project activity and deployment
+The current executable proof is intentionally a **contract scaffold, not
+Netstack3 execution**. `FakeEthernetDevice` deterministically demonstrates:
 
-Netstack3 is an active production project, not an abandoned portability
-experiment. A Gerrit search performed on 2026-08-01 found:
+- ingress and transmit transfer owned, lossless Ethernet frames in FIFO order;
+- an ARP-EtherType fixture and an IPv4-EtherType fixture remain opaque to the
+  device boundary;
+- short and oversized frames are rejected before crossing it; and
+- bounded queues return ownership rather than allocate without limit or block.
 
-- 27 merged changes with subjects explicitly tagged `[netstack3]` since
-  2026-07-01, authored by five engineers;
-- 97 such changes since 2026-05-01; and
-- 244 such changes since 2025-08-01.
+Run it with:
 
-The July work included TCP RTT sampling and timestamps, TCP conntrack
-refactoring, hard bounds on TCP and fragment data structures, raw socket
-features, packet capture, power integration, and UDP `IP_PKTINFO`. These are
-substantive protocol, hardening, performance, and product-integration changes.
-The broader Gerrit text search also finds changes in Starnix, netdevice, netcfg,
-conformance tests, and mDNS that integrate with Netstack3.
+```sh
+cargo test -p netstack3-port-spike
+```
 
-Fuchsia F27 release notes planned the product migration immediately after its
-rollout. F28 through F30 release notes describe continuing Netstack3 production
-features and fixes, including eBPF filtering, socket diagnostics, TCP memory and
-RFC work, shutdown behavior, and Starnix integration. A 2024 report described a
-pre-production fleet of 60 devices; in July 2026 former project lead Joshua
-Liebow-Feeser publicly stated that it was running on millions of devices, with a
-substantially lower crash rate and memory use than Netstack2.
+An upstream ARP/ICMP proof is blocked before binding implementation: the pinned
+source checks in GN metadata but **zero Cargo manifests** for the 14-crate
+aggregate core and its first-party library closure. Fuchsia normally generates
+Cargo metadata from a configured GN build (`fx gen-cargo`); the path archives do
+not include the generated output. Manually inventing one manifest for only
+`device`/`ip` does not solve this because the supported aggregate target pulls
+all protocol crates, and its fake execution context is exposed through
+`testutils` variants across that same closure. The `net-declare` production edge
+also needs a FIDL-free package split.
 
-Sources:
-
-- [Fuchsia Gerrit Netstack3 activity](https://fuchsia-review.googlesource.com/q/project:fuchsia+status:merged+after:2026-07-01+netstack3)
-- [F27 release notes](https://fuchsia.dev/whats-new/release-notes/f27)
-- [F28 release notes](https://fuchsia.dev/whats-new/release-notes/f28)
-- [F29 release notes](https://fuchsia.dev/whats-new/release-notes/f29)
-- [F30 release notes](https://fuchsia.dev/whats-new/release-notes/f30)
-- [2024 deployment report](https://lwn.net/Articles/995814/)
-- [2026 deployment update](https://www.reddit.com/r/rust/comments/1v83fmx/safety_in_an_unsafe_world_rustconf_2024_talk_blog/)
-
-## Other-platform use found
-
-No official or production non-Fuchsia bindings implementation was found. The
-core/bindings design document still says Fuchsia's top-level `netstack3` crate
-is the only bindings implementation.
-
-Two independent experiments are relevant:
-
-- [`aatifsyed/fuschia-netstack-hacking`](https://github.com/aatifsyed/fuschia-netstack-hacking)
-  extracted foundational packet and network-type crates into a Cargo workspace.
-  It was active from 2021 to early 2024, but did not bind the complete stack.
-- [`hkalbasi/netstack_example`](https://github.com/hkalbasi/netstack_example)
-  copied generated Cargo manifests and implemented about 16 KB of host bindings.
-  It creates an Ethernet device, installs an IPv4 route, and initiates a TCP
-  connection outside Fuchsia. It is useful proof that the boundary works, but it
-  is a single 2025 commit with absolute paths into the author's Fuchsia checkout
-  and many unimplemented handlers, not a usable port. The repository declares no
-  license, so its bindings must not be copied into this project.
-
-Starnix is also relevant but is not another-kernel port of the core. It runs
-unmodified Linux binaries over Zircon and translates their socket operations to
-Fuchsia networking. It validates the socket-provider approach for Linux ABI
-applications, not Netstack3 running as Linux's native stack.
-
-## Why it was made portable
-
-There is no public evidence that Google planned Netstack3 for Android, Linux, or
-another kernel. Fuchsia's published rationale says the opposite: it created
-Netstack3 because the previously reused gVisor stack was owned by a team with
-different requirements, while Fuchsia needed real-device operation, routing,
-and dynamic configuration under its own control.
-
-The documented reasons for the core/bindings split are deterministic fake-world
-testing, early input validation, Cargo development on ordinary host machines,
-and keeping platform execution and IPC out of protocol logic. Portability is a
-real architectural property and makes our port credible, but an unannounced
-Google cross-OS plan should not be part of the adoption case.
+The next evidence gate is reproducible checked-in or generated Cargo metadata
+for the pinned **production** aggregate closure, preserving its feature variants
+and BSD attribution. Only then should this fake device be adapted to Netstack3's
+buffer/TX context and used to prove an actual sequence such as Ethernet ARP
+request -> core processing -> ARP reply, followed by IPv4 ICMP echo. Until that
+test calls upstream core APIs, this spike makes no protocol-support claim.
