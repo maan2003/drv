@@ -8,14 +8,16 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use net_types::UnicastAddr;
-use net_types::ip::{Ip, IpVersion};
+use net_types::ethernet::Mac;
+use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Mtu, Subnet};
+use net_types::{SpecifiedAddr, ZonedAddr};
 use netstack3_base::sync::{DynDebugReferences, RcNotifier};
 use netstack3_base::{
     AddressResolutionFailed, AtomicInstant, ChecksumOffloadResult, DeferredResourceRemovalContext,
@@ -26,9 +28,13 @@ use netstack3_base::{
 };
 use netstack3_core::PendingDatagramSocketError;
 use netstack3_core::device::{
-    DeviceId, EthernetDeviceId, EthernetWeakDeviceId, LoopbackDeviceId, PureIpDeviceId,
-    WeakDeviceId,
+    BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceId, EthernetLinkDevice,
+    EthernetWeakDeviceId, LoopbackDeviceId, MaxEthernetFrameSize, PureIpDeviceId,
+    RecvEthernetFrameMeta, TransmitQueueConfiguration, WeakDeviceId,
 };
+use netstack3_core::ip::{IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate};
+use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
+use netstack3_core::udp::UdpRemotePort;
 use netstack3_core::{CoreTxMetadata, IpExt, StackState, StackStateBuilder, TimerId};
 use netstack3_device::queue::{ReceiveQueueBindingsContext, TransmitQueueBindingsContext};
 use netstack3_device::socket::{
@@ -52,6 +58,7 @@ use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
 };
 use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
+use netstack3_port_spike::EthernetFrame;
 use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_tcp::{
     BufferSizes, ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
@@ -888,6 +895,270 @@ impl TcpSocketDestructionContext for NativeBindingsCtx {
     }
 }
 
+/// An opaque IPv4 UDP socket owned by one [`Runtime`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UdpSocketHandle(u64);
+
+/// Errors at the deliberately small native runtime boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeError {
+    InvalidCapacity,
+    InvalidMac,
+    InvalidMtu,
+    InvalidAddress,
+    AddressInUse,
+    SocketLimit,
+    UnknownSocket,
+    SendFailed,
+}
+
+type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
+
+/// Single-owner facade over one Netstack3 core and one Ethernet interface.
+///
+/// All externally visible queues are bounded by `queue_capacity`. The runtime
+/// has no worker threads: its owner moves frames and drains timers explicitly.
+pub struct Runtime {
+    // External strong IDs must be dropped before core's primary resources.
+    udp: HashMap<UdpSocketHandle, NativeUdpV4>,
+    device: EthernetDeviceId<NativeBindingsCtx>,
+    ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
+    next_socket: u64,
+    stack: StackState<NativeBindingsCtx>,
+    bindings: NativeBindingsCtx,
+}
+
+impl Runtime {
+    /// Creates and IPv4-enables one Ethernet interface with explicit identity.
+    pub fn new(
+        queue_capacity: usize,
+        entropy: impl IntoIterator<Item = u8>,
+        interface_id: NonZeroU64,
+        mac: [u8; 6],
+        mtu: u32,
+    ) -> Result<Self, RuntimeError> {
+        let mac = UnicastAddr::new(Mac::new(mac)).ok_or(RuntimeError::InvalidMac)?;
+        if queue_capacity == 0 {
+            return Err(RuntimeError::InvalidCapacity);
+        }
+        if mtu > 1500 {
+            return Err(RuntimeError::InvalidMtu);
+        }
+        let max_frame_size =
+            MaxEthernetFrameSize::from_mtu(Mtu::new(mtu)).ok_or(RuntimeError::InvalidMtu)?;
+        let mut bindings = NativeBindingsCtx::new(queue_capacity, entropy);
+        let stack = bindings.build_stack();
+        let device = stack
+            .api(&mut bindings)
+            .device::<EthernetLinkDevice>()
+            .add_device(
+                NativeDeviceIdentifier(interface_id),
+                EthernetCreationProperties {
+                    mac,
+                    max_frame_size,
+                    tx_offload_spec: netstack3_base::ChecksumOffloadSpec::none(),
+                },
+                RawMetric(0),
+                NativeDeviceState,
+                netstack3_device::queue::BufVecU8Allocator::default(),
+            );
+        let device_id = device.clone().into();
+        stack
+            .api(&mut bindings)
+            .device_ip::<Ipv4>()
+            .update_configuration(
+                &device_id,
+                Ipv4DeviceConfigurationUpdate {
+                    ip_config: IpDeviceConfigurationUpdate {
+                        ip_enabled: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("new Ethernet device accepts IPv4 enablement");
+        stack
+            .api(&mut bindings)
+            .transmit_queue::<EthernetLinkDevice>()
+            .set_configuration(&device, TransmitQueueConfiguration::Fifo);
+        Ok(Self {
+            udp: HashMap::new(),
+            device,
+            ipv4_address: None,
+            next_socket: 0,
+            stack,
+            bindings,
+        })
+    }
+
+    /// Replaces the IPv4 address and the complete main routing table.
+    pub fn apply_ipv4(
+        &mut self,
+        address: [u8; 4],
+        prefix: u8,
+        default_gateway: Option<[u8; 4]>,
+    ) -> Result<(), RuntimeError> {
+        let address = AddrSubnet::new(Ipv4Addr::new(address), prefix)
+            .map_err(|_| RuntimeError::InvalidAddress)?;
+        let gateway = default_gateway
+            .map(|a| SpecifiedAddr::new(Ipv4Addr::new(a)).ok_or(RuntimeError::InvalidAddress))
+            .transpose()?;
+        self.revoke_ipv4();
+        self.stack
+            .api(&mut self.bindings)
+            .device_ip::<Ipv4>()
+            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .map_err(|_| RuntimeError::AddressInUse)?;
+
+        let metric = AddableMetric::ExplicitMetric(RawMetric(0));
+        let mut generation = Generation::initial();
+        let mut routes = vec![
+            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+                .resolve_metric(RawMetric(0))
+                .with_generation(generation),
+        ];
+        if let Some(gateway) = gateway {
+            generation = generation.next();
+            routes.push(
+                AddableEntry::with_gateway(
+                    Subnet::new(Ipv4Addr::new([0, 0, 0, 0]), 0).unwrap(),
+                    self.device.clone().into(),
+                    gateway,
+                    metric,
+                )
+                .resolve_metric(RawMetric(0))
+                .with_generation(generation),
+            );
+        }
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv4>();
+        let table = api.main_table_id();
+        api.set_routes(&table, routes);
+        self.ipv4_address = Some(address);
+        Ok(())
+    }
+
+    /// Removes the configured IPv4 address and all IPv4 routes.
+    pub fn revoke_ipv4(&mut self) {
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv4>();
+        let table = api.main_table_id();
+        api.set_routes(&table, Vec::new());
+        if let Some(address) = self.ipv4_address.take() {
+            let _ = self
+                .stack
+                .api(&mut self.bindings)
+                .device_ip::<Ipv4>()
+                .del_ip_addr(&self.device.clone().into(), address.addr());
+        }
+    }
+
+    /// Delivers one owned Ethernet frame into core.
+    pub fn receive_frame(&mut self, frame: EthernetFrame) {
+        self.stack
+            .api(&mut self.bindings)
+            .device::<EthernetLinkDevice>()
+            .receive_frame(
+                RecvEthernetFrameMeta {
+                    device_id: self.device.clone(),
+                    parsing_context: netstack3_base::NetworkParsingContext::default(),
+                },
+                Buf::new(frame.into_vec(), ..),
+            );
+    }
+
+    fn service_tx(&mut self, budget: usize) {
+        if budget == 0 || self.bindings.queues.tx.len() >= self.bindings.capacity {
+            return;
+        }
+        let available = (self.bindings.capacity - self.bindings.queues.tx.len()).min(budget);
+        let _ = self
+            .stack
+            .api(&mut self.bindings)
+            .transmit_queue::<EthernetLinkDevice>()
+            .transmit_queued_frames(&self.device, BatchSize::new_saturating(available), &mut ());
+    }
+
+    /// Takes one outbound frame, servicing core's TX queue as capacity opens.
+    pub fn take_tx(&mut self) -> Option<EthernetFrame> {
+        self.service_tx(1);
+        let frame = match self.bindings.take_tx()? {
+            TxFrame::Ethernet(_, bytes) => EthernetFrame::try_from(bytes).ok(),
+            TxFrame::PureIp(_, _) => None,
+        };
+        self.service_tx(1);
+        frame
+    }
+
+    pub fn set_now(&mut self, now: NativeInstant) {
+        self.bindings.set_now(now);
+    }
+
+    pub fn dispatch_due(&mut self, budget: usize) -> usize {
+        self.bindings.dispatch_due(&self.stack, budget)
+    }
+
+    pub fn udp_socket(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
+        if self.udp.len() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let id = self.stack.api(&mut self.bindings).udp::<Ipv4>().create();
+        let handle = UdpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("UDP handle space exhausted");
+        assert!(self.udp.insert(handle, id).is_none());
+        Ok(handle)
+    }
+
+    pub fn udp_bind(
+        &mut self,
+        handle: UdpSocketHandle,
+        address: Option<[u8; 4]>,
+        port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let address = address
+            .map(|a| SpecifiedAddr::new(Ipv4Addr::new(a)).ok_or(RuntimeError::InvalidAddress))
+            .transpose()?
+            .map(|a| ZonedAddr::Unzoned(a).into());
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .listen(id, address, Some(port))
+            .map_err(|_| RuntimeError::AddressInUse)
+    }
+
+    pub fn udp_send_to(
+        &mut self,
+        handle: UdpSocketHandle,
+        remote_address: [u8; 4],
+        remote_port: NonZeroU16,
+        payload: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let address = SpecifiedAddr::new(Ipv4Addr::new(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .send_to(
+                id,
+                Some(ZonedAddr::Unzoned(address).into()),
+                UdpRemotePort::Set(remote_port),
+                Buf::new(payload.to_vec(), ..),
+            )
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    pub fn udp_receive(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.take_udp(id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +1211,93 @@ mod tests {
                 .is_err()
         );
         assert_eq!(ctx.take_event().as_deref(), Some("one"));
+    }
+
+    fn runtime(id: u64, mac: [u8; 6], address: [u8; 4]) -> Runtime {
+        let entropy = (0u8..=255).cycle().take(8192);
+        let mut runtime = Runtime::new(2, entropy, NonZeroU64::new(id).unwrap(), mac, 1500)
+            .expect("valid interface");
+        runtime
+            .apply_ipv4(address, 24, Some([192, 0, 2, 254]))
+            .expect("valid static configuration");
+        runtime
+    }
+
+    fn exchange(a: &mut Runtime, b: &mut Runtime) -> usize {
+        let mut count = 0;
+        while let Some(frame) = a.take_tx() {
+            b.receive_frame(frame);
+            count += 1;
+        }
+        while let Some(frame) = b.take_tx() {
+            a.receive_frame(frame);
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn two_native_runtimes_resolve_arp_and_exchange_udp() {
+        let mut client = runtime(1, [0x02, 0, 0, 0, 0, 1], [192, 0, 2, 1]);
+        let mut server = runtime(2, [0x02, 0, 0, 0, 0, 2], [192, 0, 2, 2]);
+        let client_socket = client.udp_socket().unwrap();
+        let server_socket = server.udp_socket().unwrap();
+        client
+            .udp_bind(
+                client_socket,
+                Some([192, 0, 2, 1]),
+                NonZeroU16::new(10001).unwrap(),
+            )
+            .unwrap();
+        server
+            .udp_bind(
+                server_socket,
+                Some([192, 0, 2, 2]),
+                NonZeroU16::new(10002).unwrap(),
+            )
+            .unwrap();
+
+        client
+            .udp_send_to(
+                client_socket,
+                [192, 0, 2, 2],
+                NonZeroU16::new(10002).unwrap(),
+                b"bounded native UDP",
+            )
+            .unwrap();
+        let arp = client.take_tx().expect("send starts address resolution");
+        assert_eq!(&arp.as_bytes()[12..14], &[0x08, 0x06]);
+        server.receive_frame(arp);
+
+        for _ in 0..16 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            server.udp_receive(server_socket).unwrap().as_deref(),
+            Some(&b"bounded native UDP"[..])
+        );
+
+        server
+            .udp_send_to(
+                server_socket,
+                [192, 0, 2, 1],
+                NonZeroU16::new(10001).unwrap(),
+                b"reply",
+            )
+            .unwrap();
+        for _ in 0..16 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            client.udp_receive(client_socket).unwrap().as_deref(),
+            Some(&b"reply"[..])
+        );
+
+        assert!(client.udp_socket().is_ok());
+        assert_eq!(client.udp_socket(), Err(RuntimeError::SocketLimit));
     }
 }

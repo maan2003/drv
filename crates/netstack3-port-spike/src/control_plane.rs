@@ -58,6 +58,17 @@ pub enum DhcpReply {
 }
 
 impl DhcpOffer {
+    pub fn prefix_len(self) -> Option<u8> {
+        let mask = u32::from(self.subnet_mask?);
+        let prefix = mask.leading_ones();
+        let expected = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        (mask == expected).then_some(prefix as u8)
+    }
+
     /// Returns RFC 2131 lease deadlines, using T1=0.5 and T2=0.875 of the
     /// lease when the server omitted or supplied inconsistent values.
     pub fn timing(self) -> Option<DhcpLeaseTiming> {
@@ -431,6 +442,7 @@ mod tests {
             .unwrap();
         assert_eq!(lease.gateway, Some(gateways[0]));
         assert_eq!(lease.dns_servers[0], Some(dns[0]));
+        assert_eq!(lease.prefix_len(), Some(24));
         assert_eq!(
             lease.timing(),
             Some(DhcpLeaseTiming {
