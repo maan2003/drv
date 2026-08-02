@@ -28,7 +28,7 @@ stdenv.mkDerivation {
     runHook preBuild
     export KBUILD_BUILD_TIMESTAMP=@0
     make defconfig
-    scripts/config --file .config -e NETSTACK3_PROVIDER
+    bash scripts/config --file .config -e NETSTACK3_PROVIDER
     make olddefconfig
     make -j$NIX_BUILD_CORES \
       net/netstack3_provider.o net/ipv4/af_inet.o net/ipv6/af_inet6.o
