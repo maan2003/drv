@@ -1150,6 +1150,7 @@ where
 pub const MT7921_FWDL_RING_COUNT: u32 = 128;
 pub const MT7921_FWDL_RING_BYTES: usize = MT7921_FWDL_RING_COUNT as usize * DMA_DESCRIPTOR_LEN;
 pub const MT7921_INT_TX_DONE_FWDL: u32 = 1 << 26;
+pub const MT7921_FWDL_CHUNK_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisabledFwdlRegister {
@@ -1427,6 +1428,155 @@ where
     }
     event(DisabledInterruptEvent::MaskRestored { value: enable });
     operation
+}
+
+pub trait DisabledFirmwareStageTransport {
+    type Error;
+    fn write_payload(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+    fn write_descriptor(&mut self, descriptor: DmaDescriptor) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+    fn read_descriptor(&mut self) -> Result<DmaDescriptor, Self::Error>;
+    fn reset_descriptor(&mut self) -> Result<(), Self::Error>;
+    fn zero_payload(&mut self, length: usize) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledFirmwareStageEvent {
+    PayloadWritten { bytes: usize, iova: u64 },
+    DescriptorWritten(DmaDescriptor),
+    DescriptorFence,
+    DescriptorVerified(DmaDescriptor),
+    DescriptorReset,
+    PayloadZeroed { bytes: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisabledFirmwareStageError<E> {
+    InvalidPayload,
+    InvalidIova,
+    Descriptor(DescriptorError),
+    Transport(E),
+    DescriptorReadback {
+        expected: DmaDescriptor,
+        actual: DmaDescriptor,
+    },
+    Reset(E),
+}
+
+/// Stage one raw `FW_SCATTER` chunk without publishing a producer index.
+///
+/// Pinned Linux limits PCI firmware chunks to 4096 bytes. `FW_SCATTER` skips
+/// the normal MCU TX header, so the ring descriptor directly names the bounded
+/// artifact payload. Cleanup is mandatory on success and readback failure.
+pub fn stage_disabled_firmware_chunk<T, F>(
+    transport: &mut T,
+    payload_iova: u64,
+    payload: &[u8],
+    mut event: F,
+) -> Result<DmaDescriptor, DisabledFirmwareStageError<T::Error>>
+where
+    T: DisabledFirmwareStageTransport,
+    F: FnMut(DisabledFirmwareStageEvent),
+{
+    if payload.is_empty() || payload.len() > MT7921_FWDL_CHUNK_BYTES {
+        return Err(DisabledFirmwareStageError::InvalidPayload);
+    }
+    if payload_iova
+        .checked_add(payload.len() as u64 - 1)
+        .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(DisabledFirmwareStageError::InvalidIova);
+    }
+    let descriptor = DmaDescriptor::tx(
+        DmaSegment {
+            iova: payload_iova,
+            len: payload.len() as u16,
+        },
+        None,
+        0,
+    )
+    .map_err(DisabledFirmwareStageError::Descriptor)?;
+    let operation = (|| {
+        transport
+            .write_payload(payload)
+            .map_err(DisabledFirmwareStageError::Transport)?;
+        event(DisabledFirmwareStageEvent::PayloadWritten {
+            bytes: payload.len(),
+            iova: payload_iova,
+        });
+        transport
+            .write_descriptor(descriptor)
+            .map_err(DisabledFirmwareStageError::Transport)?;
+        event(DisabledFirmwareStageEvent::DescriptorWritten(descriptor));
+        transport.release_fence();
+        event(DisabledFirmwareStageEvent::DescriptorFence);
+        match transport.read_descriptor() {
+            Ok(actual) if actual == descriptor => {
+                event(DisabledFirmwareStageEvent::DescriptorVerified(actual));
+                Ok(descriptor)
+            }
+            Ok(actual) => Err(DisabledFirmwareStageError::DescriptorReadback {
+                expected: descriptor,
+                actual,
+            }),
+            Err(error) => Err(DisabledFirmwareStageError::Transport(error)),
+        }
+    })();
+    let descriptor_reset = transport.reset_descriptor();
+    if descriptor_reset.is_ok() {
+        event(DisabledFirmwareStageEvent::DescriptorReset);
+    }
+    let payload_zeroed = transport.zero_payload(payload.len());
+    if payload_zeroed.is_ok() {
+        event(DisabledFirmwareStageEvent::PayloadZeroed {
+            bytes: payload.len(),
+        });
+    }
+    descriptor_reset.map_err(DisabledFirmwareStageError::Reset)?;
+    payload_zeroed.map_err(DisabledFirmwareStageError::Reset)?;
+    operation
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareCompletion {
+    Partial { completed: u16, total: u16 },
+    Complete,
+    TimedOut { completed: u16, total: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareCompletionTracker {
+    total: u16,
+    completed: u16,
+    deadline_ms: u64,
+}
+impl FirmwareCompletionTracker {
+    pub fn new(total: u16, start_ms: u64, timeout_ms: u64) -> Option<Self> {
+        Some(Self {
+            total: (total != 0).then_some(total)?,
+            completed: 0,
+            deadline_ms: start_ms.checked_add(timeout_ms)?,
+        })
+    }
+    pub fn observe(&mut self, completed: u16, now_ms: u64) -> Option<FirmwareCompletion> {
+        if completed < self.completed || completed > self.total {
+            return None;
+        }
+        self.completed = completed;
+        if completed == self.total {
+            Some(FirmwareCompletion::Complete)
+        } else if now_ms >= self.deadline_ms {
+            Some(FirmwareCompletion::TimedOut {
+                completed,
+                total: self.total,
+            })
+        } else {
+            Some(FirmwareCompletion::Partial {
+                completed,
+                total: self.total,
+            })
+        }
+    }
 }
 
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
@@ -2254,6 +2404,152 @@ mod tests {
             ))
         );
         assert_eq!(transport.writes.last(), Some(&("enable", 0)));
+    }
+
+    struct FakeFirmwareStage {
+        calls: Vec<&'static str>,
+        descriptor: DmaDescriptor,
+        corrupt_readback: bool,
+        fail_reset: bool,
+    }
+    impl Default for FakeFirmwareStage {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                descriptor: DmaDescriptor::reset(),
+                corrupt_readback: false,
+                fail_reset: false,
+            }
+        }
+    }
+    impl DisabledFirmwareStageTransport for FakeFirmwareStage {
+        type Error = &'static str;
+        fn write_payload(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            self.calls.push("payload");
+            Ok(())
+        }
+        fn write_descriptor(&mut self, descriptor: DmaDescriptor) -> Result<(), Self::Error> {
+            self.calls.push("descriptor");
+            self.descriptor = descriptor;
+            Ok(())
+        }
+        fn release_fence(&mut self) {
+            self.calls.push("fence");
+        }
+        fn read_descriptor(&mut self) -> Result<DmaDescriptor, Self::Error> {
+            self.calls.push("readback");
+            Ok(if self.corrupt_readback {
+                DmaDescriptor::reset()
+            } else {
+                self.descriptor
+            })
+        }
+        fn reset_descriptor(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("reset");
+            if self.fail_reset {
+                return Err("reset failed");
+            }
+            self.descriptor = DmaDescriptor::reset();
+            Ok(())
+        }
+        fn zero_payload(&mut self, _: usize) -> Result<(), Self::Error> {
+            self.calls.push("zero");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stages_one_disabled_firmware_descriptor_then_cleans_it() {
+        let mut transport = FakeFirmwareStage::default();
+        let mut events = Vec::new();
+        let descriptor = stage_disabled_firmware_chunk(
+            &mut transport,
+            0x0100_1000,
+            &[0x5a; MT7921_FWDL_CHUNK_BYTES],
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(descriptor.buf0, 0x0100_1000);
+        assert_eq!(descriptor.ctrl, (4096 << 16) | (1 << 30));
+        assert_eq!(
+            transport.calls,
+            [
+                "payload",
+                "descriptor",
+                "fence",
+                "readback",
+                "reset",
+                "zero"
+            ]
+        );
+        assert_eq!(transport.descriptor, DmaDescriptor::reset());
+        assert_eq!(
+            events.last(),
+            Some(&DisabledFirmwareStageEvent::PayloadZeroed { bytes: 4096 })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_firmware_staging_without_writes() {
+        for (iova, payload) in [
+            (0x1000, &[][..]),
+            (0x1000, &[0u8; MT7921_FWDL_CHUNK_BYTES + 1][..]),
+            (u64::from(u32::MAX), &[0u8; 2][..]),
+        ] {
+            let mut transport = FakeFirmwareStage::default();
+            assert!(stage_disabled_firmware_chunk(&mut transport, iova, payload, |_| {}).is_err());
+            assert!(transport.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn readback_mismatch_still_resets_and_zeros_staged_memory() {
+        let mut transport = FakeFirmwareStage {
+            corrupt_readback: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            stage_disabled_firmware_chunk(&mut transport, 0x1000, b"firmware", |_| {}),
+            Err(DisabledFirmwareStageError::DescriptorReadback { .. })
+        ));
+        assert_eq!(transport.calls.last_chunk::<2>(), Some(&["reset", "zero"]));
+        assert_eq!(transport.descriptor, DmaDescriptor::reset());
+    }
+
+    #[test]
+    fn descriptor_reset_failure_still_zeros_payload() {
+        let mut transport = FakeFirmwareStage {
+            fail_reset: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            stage_disabled_firmware_chunk(&mut transport, 0x1000, b"firmware", |_| {}),
+            Err(DisabledFirmwareStageError::Reset("reset failed"))
+        );
+        assert_eq!(transport.calls.last_chunk::<2>(), Some(&["reset", "zero"]));
+    }
+
+    #[test]
+    fn firmware_completion_tracks_partial_timeout_complete_and_malformed() {
+        assert_eq!(FirmwareCompletionTracker::new(0, 0, 1), None);
+        let mut tracker = FirmwareCompletionTracker::new(4, 100, 20).unwrap();
+        assert_eq!(
+            tracker.observe(2, 110),
+            Some(FirmwareCompletion::Partial {
+                completed: 2,
+                total: 4
+            })
+        );
+        assert_eq!(tracker.observe(1, 111), None);
+        assert_eq!(tracker.observe(5, 111), None);
+        assert_eq!(
+            tracker.observe(2, 120),
+            Some(FirmwareCompletion::TimedOut {
+                completed: 2,
+                total: 4
+            })
+        );
+        assert_eq!(tracker.observe(4, 121), Some(FirmwareCompletion::Complete));
     }
 
     #[test]

@@ -2,20 +2,23 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
+    DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_RING_BYTES,
-    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
-    ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
-    acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
-    program_disabled_fwdl_ring, read_dynamic_identity_status,
+    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
+    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
+    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
+    PCIE_LPCR_HOST_CLR_OWN, Patch, ReadOnlyStatus, ReadRegister, TopOwnershipError,
+    TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
+    acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt, program_disabled_fwdl_ring,
+    read_dynamic_identity_status, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
     env,
     fs::{File, OpenOptions},
     os::fd::{AsRawFd, RawFd},
+    process::Command,
     ptr::NonNull,
     time::Instant,
 };
@@ -42,6 +45,8 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
+const PATCH_PATH: &str =
+    "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
 
 #[repr(C)]
 #[derive(Default)]
@@ -132,6 +137,7 @@ fn run() -> Result<(), String> {
         Some("--acquire-top-ownership") => Operation::AcquireTopOwnership,
         Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
         Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
+        Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
@@ -344,6 +350,62 @@ fn run() -> Result<(), String> {
         reset_vfio_device(&device)?;
         println!("{{\"fwdl_interrupt_event\":\"vfio_device_reset_completed\"}}");
     }
+    if operation == Operation::StageDisabledFirmwareDescriptor {
+        let global = wfdma.read(ReadRegister::WfdmaGlobalConfig.bar_offset())?;
+        let interrupt_enable = wfdma.read(0xd4204)?;
+        if global & 0x5 != 0 || interrupt_enable != 0 {
+            return Err(format!(
+                "refused active WFDMA state global={global:#010x} interrupts={interrupt_enable:#010x}"
+            ));
+        }
+        println!(
+            "{{\"fwdl_stage_event\":\"disabled_state_verified\",\"global_config\":\"{global:#010x}\",\"interrupt_enable\":\"{interrupt_enable:#010x}\"}}"
+        );
+        let patch_bytes = decompress_patch()?;
+        let patch =
+            Patch::parse(&patch_bytes).map_err(|error| format!("patch format: {error:?}"))?;
+        let section = patch.sections().next().ok_or("patch has no section")?;
+        let chunk = section
+            .payload
+            .get(..MT7921_FWDL_CHUNK_BYTES)
+            .ok_or("patch section is smaller than one firmware chunk")?;
+        let mut ring = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        let mut payload = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
+        ring.write_descriptor(DmaDescriptor::reset());
+        let payload_iova = payload.iova;
+        let stage = {
+            let mut transport = VfioDisabledFirmwareStage {
+                ring: &mut ring,
+                payload: &mut payload,
+            };
+            stage_disabled_firmware_chunk(
+                &mut transport,
+                payload_iova,
+                chunk,
+                log_disabled_firmware_stage_event,
+            )
+            .map_err(|error| match error {
+                DisabledFirmwareStageError::InvalidPayload => "invalid firmware chunk".into(),
+                DisabledFirmwareStageError::InvalidIova => "invalid firmware payload IOVA".into(),
+                DisabledFirmwareStageError::Descriptor(error) => {
+                    format!("firmware descriptor: {error:?}")
+                }
+                DisabledFirmwareStageError::Transport(error) => error,
+                DisabledFirmwareStageError::DescriptorReadback { expected, actual } => {
+                    format!("descriptor readback mismatch expected={expected:?} actual={actual:?}")
+                }
+                DisabledFirmwareStageError::Reset(error) => format!("reset staged memory: {error}"),
+            })
+        };
+        let payload_unmap = payload.teardown();
+        let ring_unmap = ring.teardown();
+        let reset = reset_vfio_device(&device);
+        stage?;
+        payload_unmap?;
+        ring_unmap?;
+        reset?;
+        println!("{{\"fwdl_stage_event\":\"arenas_unmapped_and_vfio_device_reset\"}}");
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -354,7 +416,9 @@ fn run() -> Result<(), String> {
     };
     if !matches!(
         operation,
-        Operation::ProgramDisabledFwdlRing | Operation::MaskAckDisabledFwdl
+        Operation::ProgramDisabledFwdlRing
+            | Operation::MaskAckDisabledFwdl
+            | Operation::StageDisabledFirmwareDescriptor
     ) {
         let mcu = read(ReadRegister::McuCommand)?;
         let interrupt = read(ReadRegister::HostInterruptStatus)?;
@@ -486,6 +550,43 @@ impl<'a> DmaArena<'a> {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
     }
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() > self.len {
+            return Err("DMA payload exceeds arena".into());
+        }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr(), bytes.len()) };
+        Ok(())
+    }
+    fn zero_bytes(&mut self, length: usize) -> Result<(), String> {
+        if length > self.len {
+            return Err("DMA zero exceeds arena".into());
+        }
+        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, length) };
+        Ok(())
+    }
+    fn write_descriptor(&mut self, descriptor: DmaDescriptor) {
+        for (index, word) in [
+            descriptor.buf0,
+            descriptor.ctrl,
+            descriptor.buf1,
+            descriptor.info,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().cast::<u32>().add(index), word) };
+        }
+    }
+    fn read_descriptor(&self) -> DmaDescriptor {
+        let word =
+            |index| unsafe { std::ptr::read_volatile(self.ptr.as_ptr().cast::<u32>().add(index)) };
+        DmaDescriptor {
+            buf0: word(0),
+            ctrl: word(1),
+            buf1: word(2),
+            info: word(3),
+        }
+    }
     fn teardown(&mut self) -> Result<(), String> {
         if !self.mapped {
             return Ok(());
@@ -511,6 +612,34 @@ impl<'a> DmaArena<'a> {
         self.mapped = false;
         unsafe { munmap(self.ptr.as_ptr(), self.len) };
         Ok(())
+    }
+}
+
+struct VfioDisabledFirmwareStage<'a, 'b> {
+    ring: &'a mut DmaArena<'b>,
+    payload: &'a mut DmaArena<'b>,
+}
+impl DisabledFirmwareStageTransport for VfioDisabledFirmwareStage<'_, '_> {
+    type Error = String;
+    fn write_payload(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.payload.write_bytes(bytes)
+    }
+    fn write_descriptor(&mut self, descriptor: DmaDescriptor) -> Result<(), Self::Error> {
+        self.ring.write_descriptor(descriptor);
+        Ok(())
+    }
+    fn release_fence(&mut self) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release)
+    }
+    fn read_descriptor(&mut self) -> Result<DmaDescriptor, Self::Error> {
+        Ok(self.ring.read_descriptor())
+    }
+    fn reset_descriptor(&mut self) -> Result<(), Self::Error> {
+        self.ring.write_descriptor(DmaDescriptor::reset());
+        Ok(())
+    }
+    fn zero_payload(&mut self, length: usize) -> Result<(), Self::Error> {
+        self.payload.zero_bytes(length)
     }
 }
 impl Drop for DmaArena<'_> {
@@ -742,6 +871,7 @@ enum Operation {
     AcquireTopOwnership,
     ProgramDisabledFwdlRing,
     MaskAckDisabledFwdl,
+    StageDisabledFirmwareDescriptor,
 }
 
 struct VfioDynamicL1<'a> {
@@ -920,4 +1050,22 @@ impl DisabledFwdlInterruptTransport for VfioFwdlInterrupt<'_> {
 
 fn log_disabled_interrupt_event(event: DisabledInterruptEvent) {
     println!("{{\"fwdl_interrupt_event\":\"{event:?}\"}}")
+}
+
+fn log_disabled_firmware_stage_event(event: DisabledFirmwareStageEvent) {
+    println!("{{\"fwdl_stage_event\":\"{event:?}\"}}")
+}
+
+fn decompress_patch() -> Result<Vec<u8>, String> {
+    let output = Command::new("/run/current-system/sw/bin/zstdcat")
+        .arg(PATCH_PATH)
+        .output()
+        .map_err(|error| format!("run zstdcat for {PATCH_PATH}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "zstdcat {PATCH_PATH}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output.stdout)
 }

@@ -103,6 +103,16 @@ W1C semantics, verifies readback without clearing unrelated sources, restores
 the zero mask, and performs the mandatory VFIO reset. It does not arm a VFIO
 IRQ or enable any device interrupt.
 
+`--stage-disabled-firmware-descriptor` decompresses and bounds-checks the exact
+installed MT7961 ROM patch, maps separate one-page descriptor and payload
+arenas at fixed low-32-bit IOVAs, and stages only its first 4096-byte raw
+`FW_SCATTER` chunk. It first requires TX/RX DMA and every host interrupt to be
+disabled. The payload is copied before a release fence publishes one ring-16
+descriptor, which is read back and then reset to CPU ownership; the payload is
+zeroed, both mappings are explicitly removed, and VFIO reset is mandatory.
+No ring register, producer index, DMA-enable bit, interrupt mask, or MCU command
+is written, so the device cannot observe the staged descriptor.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
