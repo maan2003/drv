@@ -18,7 +18,8 @@
      pub timestamp: zx::MonotonicInstant,
      pub bss_description: BssDescription,
  }
-@@ -339,12 +338,8 @@
+@@ -337,16 +336,12 @@
+     fn from(scan_result: ScanResult) -> fidl_sme::ScanResult {
          let ScanResult {
              compatibility,
 -            #[cfg(target_os = "fuchsia")]
@@ -33,10 +34,8 @@
 -            timestamp_nanos: 0,
              bss_description: bss_description.into(),
          }
-@@ -357,14 +352,20 @@
- 
-     fn try_from(scan_result: fidl_sme::ScanResult) -> Result<ScanResult, Self::Error> {
-         let fidl_sme::ScanResult { compatibility, timestamp_nanos, bss_description } = scan_result;
+     }
+@@ -360,13 +355,18 @@
          Ok(ScanResult {
              compatibility: Compatibility::try_from_fidl(compatibility)
                  .map_err(|_| format_err!("failed to convert FIDL `Compatibility`"))?,
@@ -46,12 +45,17 @@
          })
      }
  }
+-
 +
 +/// VMO persistence is a Fuchsia transport operation and is unavailable on the host.
 +#[cfg(not(target_os = "fuchsia"))]
 +pub fn write_vmo(_results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
 +    Err(format_err!("scan-result VMO persistence is unavailable on the host"))
 +}
++
+ /// Creates a VMO containing FIDL-encoded scan results.
+ #[cfg(target_os = "fuchsia")]
+ pub fn write_vmo(results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
 --- a/src/connectivity/wlan/lib/common/rust/src/lib.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/lib.rs
 @@ -25,7 +25,7 @@
