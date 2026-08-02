@@ -11,6 +11,10 @@ path = "src/lib.rs"
 test = false
 doctest = false
 
+[[test]]
+name = "host-timer"
+path = "host_tests/timer.rs"
+
 [features]
 benchmark = []
 host_test_utils = []
@@ -36,3 +40,4 @@ thiserror.workspace = true
 wlan_bitfield.workspace = true
 zerocopy.workspace = true
 zx = { path = "../../../../../../sdk/rust/zx" }
+tokio.workspace = true

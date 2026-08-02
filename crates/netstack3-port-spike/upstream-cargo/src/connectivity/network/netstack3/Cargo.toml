@@ -91,6 +91,7 @@ syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-t
 synstructure = "=0.13.2"
 thiserror = "=2.0.18"
 test-case = "=3.3.1"
+tokio = { version = "=1.52.3", default-features = false, features = ["rt", "time"] }
 zerocopy = { version = "=0.8.48", features = ["derive", "simd"] }
 net_types = { path = "../../lib/net-types" }
 net_types_macros = { path = "cargo/net-types-macros" }
