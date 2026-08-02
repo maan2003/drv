@@ -1,0 +1,17 @@
+[package]
+name = "wlan-bitfield"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wlan_bitfield"
+path = "src/lib.rs"
+proc-macro = true
+doctest = false
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+synstructure.workspace = true

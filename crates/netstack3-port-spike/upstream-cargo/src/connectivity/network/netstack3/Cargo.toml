@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
+  "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
   "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
@@ -60,6 +61,7 @@ static_assertions = "=1.1.0"
 strum = "=0.28.0"
 strum_macros = "=0.28.0"
 syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
+synstructure = "=0.13.2"
 thiserror = "=2.0.18"
 zerocopy = { version = "=0.8.48", features = ["derive", "simd"] }
 net_types = { path = "../../lib/net-types" }
@@ -72,6 +74,7 @@ diagnostics_traits = { path = "../lib/diagnostics-traits" }
 explicit = { path = "../lib/explicit" }
 packet = { path = "../../../lib/network/packet" }
 replace_with = { path = "../../../lib/replace-with" }
+wlan_bitfield = { package = "wlan-bitfield", path = "../../wlan/lib/bitfield" }
 wlan_statemachine = { package = "wlan-statemachine", path = "../../wlan/lib/statemachine" }
 netstack3_base = { path = "core/base" }
 netstack3_datagram = { path = "core/datagram" }
