@@ -8,10 +8,10 @@ use mt7921_port_spike::{
     DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, Patch, ReadOnlyStatus, ReadRegister, TopOwnershipError,
-    TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
+    PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
     acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, stage_disabled_firmware_chunk,
+    read_dynamic_identity_status, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -27,6 +27,7 @@ const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
 const VFIO_DEVICE_GET_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 8);
+const VFIO_DEVICE_GET_IRQ_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 9);
 const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
@@ -85,6 +86,14 @@ struct DeviceInfo {
 }
 #[repr(C)]
 #[derive(Default)]
+struct IrqInfo {
+    argsz: u32,
+    flags: u32,
+    index: u32,
+    count: u32,
+}
+#[repr(C)]
+#[derive(Default)]
 struct IoasAlloc {
     size: u32,
     flags: u32,
@@ -138,6 +147,7 @@ fn run() -> Result<(), String> {
         Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
         Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
         Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
+        Some("--inventory-vfio-irqs") => Operation::InventoryVfioIrqs,
         Some("--run-one-shot-fwdl") => {
             return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
         }
@@ -217,6 +227,35 @@ fn run() -> Result<(), String> {
         ),
     )?;
     let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
+    if operation == Operation::InventoryVfioIrqs {
+        let mut capabilities = Vec::new();
+        for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
+            .into_iter()
+            .enumerate()
+        {
+            let mut irq = IrqInfo {
+                argsz: size::<IrqInfo>(),
+                index: index as u32,
+                ..Default::default()
+            };
+            ioctl_mut(
+                device.as_raw_fd(),
+                VFIO_DEVICE_GET_IRQ_INFO,
+                &mut irq,
+                "query VFIO IRQ",
+            )?;
+            let capability = PciIrqCapability {
+                kind,
+                count: irq.count,
+                eventfd: irq.flags & 1 != 0,
+            };
+            println!("{{\"vfio_irq_capability\":\"{capability:?}\"}}");
+            capabilities.push(capability);
+        }
+        let selected = select_vfio_irq(&capabilities)
+            .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+        println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+    }
     if acquire {
         let mut transport = VfioOwnership {
             page: &conn,
@@ -875,6 +914,7 @@ enum Operation {
     ProgramDisabledFwdlRing,
     MaskAckDisabledFwdl,
     StageDisabledFirmwareDescriptor,
+    InventoryVfioIrqs,
 }
 
 struct VfioDynamicL1<'a> {

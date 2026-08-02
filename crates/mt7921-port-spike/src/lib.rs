@@ -1848,6 +1848,32 @@ pub fn encode_download_command(
     Ok(bytes)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciIrqKind {
+    Intx,
+    Msi,
+    Msix,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciIrqCapability {
+    pub kind: PciIrqKind,
+    pub count: u32,
+    pub eventfd: bool,
+}
+
+/// Select the same interrupt preference used by PCI drivers without admitting
+/// an interrupt source which cannot be drained through an installed eventfd.
+pub fn select_vfio_irq(capabilities: &[PciIrqCapability]) -> Option<PciIrqCapability> {
+    [PciIrqKind::Msix, PciIrqKind::Msi, PciIrqKind::Intx]
+        .into_iter()
+        .find_map(|kind| {
+            capabilities.iter().copied().find(|capability| {
+                capability.kind == kind && capability.count != 0 && capability.eventfd
+            })
+        })
+}
+
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
 pub const WFSYS_SW_INIT_DONE: u32 = 1 << 4;
 pub const WFSYS_ASSERT_MS: u64 = 50;
@@ -2987,6 +3013,36 @@ mod tests {
         assert_eq!(
             encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
             Err(DownloadCommandError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn vfio_irq_selection_requires_eventfd_and_prefers_msix() {
+        let capabilities = [
+            PciIrqCapability {
+                kind: PciIrqKind::Intx,
+                count: 1,
+                eventfd: true,
+            },
+            PciIrqCapability {
+                kind: PciIrqKind::Msi,
+                count: 1,
+                eventfd: false,
+            },
+            PciIrqCapability {
+                kind: PciIrqKind::Msix,
+                count: 8,
+                eventfd: true,
+            },
+        ];
+        assert_eq!(select_vfio_irq(&capabilities), Some(capabilities[2]));
+        assert_eq!(
+            select_vfio_irq(&[PciIrqCapability {
+                kind: PciIrqKind::Msi,
+                count: 1,
+                eventfd: false,
+            }]),
+            None
         );
     }
 

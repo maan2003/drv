@@ -140,6 +140,12 @@ range, an empty download, and a patch-start address other than MT7961's
 MCU TX ring, RX response ring, parsed matching response, VFIO IRQ, and safe
 reset-while-pinned teardown must all exist first.
 
+`--inventory-vfio-irqs` queries the standard VFIO INTx, MSI, and MSI-X
+capabilities without installing or triggering one, rejects modes without
+eventfd support, and reports the preferred MSI-X/MSI/INTx choice. Device
+interrupt unmasking remains unavailable until that chosen vector is actually
+installed and exercised by the deterministic completion path.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
