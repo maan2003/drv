@@ -7,6 +7,7 @@ pub mod control_plane;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 /// Ethernet II header length, excluding an FCS.
 pub const MIN_FRAME_LEN: usize = 14;
@@ -114,6 +115,27 @@ pub trait StackEthernetEndpoint {
     fn take_transmit(&mut self) -> Option<EthernetFrame>;
 }
 
+/// Time and link hooks used by the single-owner service driver.
+pub trait NetworkServiceEndpoint: StackEthernetEndpoint {
+    /// Runs due protocol/timer work and returns the number of work items done.
+    fn poll_at(&mut self, now: Duration, budget: usize) -> usize;
+
+    fn on_device_event(&mut self, event: EthernetDeviceEvent);
+}
+
+pub trait MonotonicClock {
+    fn now(&self) -> Duration;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DriveReport {
+    pub service_work: usize,
+    pub device_events: usize,
+    pub received: usize,
+    pub transmitted: usize,
+    pub budget_exhausted: bool,
+}
+
 /// Result of one bounded device/stack pump operation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PumpReport {
@@ -202,6 +224,70 @@ where
 
     pub fn into_parts(self) -> (S, D) {
         (self.stack, self.device)
+    }
+}
+
+/// Fair, bounded, single-owner event/time driver. The embedding decides how
+/// this method is woken; the protocol service receives no ambient executor or
+/// clock authority.
+pub struct ServiceDriver<S, D, C> {
+    runner: EthernetRunner<S, D>,
+    clock: C,
+}
+
+impl<S, D, C> ServiceDriver<S, D, C>
+where
+    S: NetworkServiceEndpoint,
+    D: EthernetDevice + EthernetEventSource,
+    C: MonotonicClock,
+{
+    pub const fn new(service: S, device: D, clock: C) -> Self {
+        Self {
+            runner: EthernetRunner::new(service, device),
+            clock,
+        }
+    }
+
+    /// Processes at most `budget` items from each work class.
+    pub fn drive_once(&mut self, budget: usize) -> DriveReport {
+        let mut report = DriveReport {
+            service_work: self.runner.stack_mut().poll_at(self.clock.now(), budget),
+            ..Default::default()
+        };
+
+        for _ in 0..budget {
+            let Some(event) = self.runner.device_mut().take_event() else {
+                break;
+            };
+            self.runner.stack_mut().on_device_event(event);
+            report.device_events += 1;
+        }
+
+        for _ in 0..budget {
+            let pumped = self.runner.pump();
+            report.received += pumped.received;
+            report.transmitted += pumped.transmitted;
+            if pumped == PumpReport::default() || pumped.ingress_blocked || pumped.egress_blocked {
+                break;
+            }
+        }
+        report.budget_exhausted = report.service_work >= budget
+            || report.device_events >= budget
+            || report.received >= budget
+            || report.transmitted >= budget;
+        report
+    }
+
+    pub fn service(&self) -> &S {
+        self.runner.stack()
+    }
+
+    pub fn service_mut(&mut self) -> &mut S {
+        self.runner.stack_mut()
+    }
+
+    pub fn device_mut(&mut self) -> &mut D {
+        self.runner.device_mut()
     }
 }
 
@@ -298,6 +384,8 @@ mod tests {
         accept_ingress: bool,
         received: VecDeque<EthernetFrame>,
         outbound: VecDeque<EthernetFrame>,
+        now: Duration,
+        events: Vec<EthernetDeviceEvent>,
     }
 
     impl StackEthernetEndpoint for TestEndpoint {
@@ -311,6 +399,24 @@ mod tests {
 
         fn take_transmit(&mut self) -> Option<EthernetFrame> {
             self.outbound.pop_front()
+        }
+    }
+
+    impl NetworkServiceEndpoint for TestEndpoint {
+        fn poll_at(&mut self, now: Duration, budget: usize) -> usize {
+            self.now = now;
+            usize::from(budget != 0)
+        }
+
+        fn on_device_event(&mut self, event: EthernetDeviceEvent) {
+            self.events.push(event);
+        }
+    }
+
+    struct TestClock(Duration);
+    impl MonotonicClock for TestClock {
+        fn now(&self) -> Duration {
+            self.0
         }
     }
 
@@ -425,5 +531,30 @@ mod tests {
         );
         assert_eq!(runner.stack().received.front(), Some(&ingress));
         assert_eq!(runner.device_mut().take_transmitted(), Some(outbound));
+    }
+
+    #[test]
+    fn service_driver_bounds_time_events_and_frame_work() {
+        let endpoint = TestEndpoint {
+            accept_ingress: true,
+            outbound: [frame(0x00)].into(),
+            ..Default::default()
+        };
+        let mut device = FakeEthernetDevice::new(2);
+        device.inject(frame(0x06)).unwrap();
+        let mut driver = ServiceDriver::new(endpoint, device, TestClock(Duration::from_secs(9)));
+        let report = driver.drive_once(2);
+        assert_eq!(report.service_work, 1);
+        assert_eq!(report.device_events, 2);
+        assert_eq!(report.received, 1);
+        assert_eq!(report.transmitted, 1);
+        assert_eq!(driver.service().now, Duration::from_secs(9));
+        assert_eq!(
+            driver.service().events,
+            [
+                EthernetDeviceEvent::LinkStateChanged(true),
+                EthernetDeviceEvent::ReceiveReady,
+            ]
+        );
     }
 }
