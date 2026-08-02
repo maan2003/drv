@@ -72,7 +72,7 @@ and hardware validation.
 
 ## Bluetooth integration
 
-The Bluetooth service in [IDEA-bluetooth](IDEA-bluetooth.md) connects A2DP and
+The Bluetooth service in [ARCH-bluetooth](ARCH-bluetooth.md) connects A2DP and
 HFP directly to the native media graph. Bluetooth devices appear as ordinary
 PipeWire-compatible sinks and sources to applications without BlueZ or a
 WirePlumber BlueZ monitor. AVRCP, call state, codec selection, and profile policy

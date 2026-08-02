@@ -25,4 +25,4 @@ compatibility targets. They may use project-native capability APIs and will
 evolve with future application sandboxing.
 
 Potential native replacements are recorded in
-[IDEA-audio](IDEA-audio.md) and [IDEA-bluetooth](IDEA-bluetooth.md).
+[IDEA-audio](IDEA-audio.md) and [ARCH-bluetooth](ARCH-bluetooth.md).
