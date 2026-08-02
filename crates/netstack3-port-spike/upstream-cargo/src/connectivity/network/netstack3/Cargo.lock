@@ -649,6 +649,9 @@ version = "0.1.0"
 [[package]]
 name = "fidl-fuchsia-wlan-common"
 version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+]
 
 [[package]]
 name = "fidl-fuchsia-wlan-driver"
@@ -690,6 +693,7 @@ dependencies = [
 name = "fidl-fuchsia-wlan-sme"
 version = "0.1.0"
 dependencies = [
+ "fidl",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
@@ -3263,6 +3267,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "derivative",
+ "fidl",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
@@ -3365,6 +3370,32 @@ dependencies = [
  "wlan-fcg-crypto",
  "wlan-statemachine",
  "zerocopy",
+]
+
+[[package]]
+name = "wlan-sme"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eapol",
+ "fidl",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fidl-fuchsia-wlan-stats",
+ "fuchsia-inspect",
+ "fuchsia-inspect-contrib",
+ "fuchsia-sync",
+ "futures",
+ "ieee80211",
+ "log",
+ "thiserror 2.0.18",
+ "wlan-common",
+ "wlan-rsn",
+ "wlan-statemachine",
+ "zx",
 ]
 
 [[package]]

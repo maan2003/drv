@@ -13,3 +13,4 @@ path = "src/lib.rs"
 fidl-fuchsia-wlan-common = { path = "../fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-internal = { path = "../fuchsia.wlan.internal" }
+fidl = { path = "../../../src/lib/fidl/rust/fidl" }

@@ -29,6 +29,7 @@ pub mod log {
 
 pub mod nodes {
     use fuchsia_inspect::Node;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     pub struct BoundedListNode {
@@ -45,13 +46,18 @@ pub mod nodes {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
-    pub struct MonotonicTimeProperty(zx::MonotonicInstant);
+    #[derive(Clone, Debug)]
+    pub struct MonotonicTimeProperty(Arc<Mutex<zx::MonotonicInstant>>);
 
     impl MonotonicTimeProperty {
-        pub fn set(&self, _value: zx::MonotonicInstant) {}
+        pub fn set(&self, value: zx::MonotonicInstant) {
+            *self.0.lock().expect("monotonic property lock poisoned") = value;
+        }
+        pub fn set_at(&self, value: zx::MonotonicInstant) {
+            self.set(value);
+        }
         pub fn get(&self) -> zx::MonotonicInstant {
-            self.0
+            *self.0.lock().expect("monotonic property lock poisoned")
         }
     }
 
@@ -69,7 +75,7 @@ pub mod nodes {
             _name: impl AsRef<str>,
             value: zx::MonotonicInstant,
         ) -> MonotonicTimeProperty {
-            MonotonicTimeProperty(value)
+            MonotonicTimeProperty(Arc::new(Mutex::new(value)))
         }
     }
 }
@@ -83,5 +89,8 @@ mod tests {
         let node = fuchsia_inspect::Node::default();
         let value = zx::MonotonicInstant::from_nanos(42);
         assert_eq!(node.create_time_at("time", value).get(), value);
+        let property = node.create_time_at("updated", value);
+        property.set_at(zx::MonotonicInstant::from_nanos(84));
+        assert_eq!(property.get(), zx::MonotonicInstant::from_nanos(84));
     }
 }

@@ -23,6 +23,7 @@ host_test_utils = []
 anyhow.workspace = true
 bytes.workspace = true
 derivative.workspace = true
+fidl = { path = "../../../../../lib/fidl/rust/fidl" }
 fidl-fuchsia-wlan-common = { path = "../../../../../../sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-internal = { path = "../../../../../../sdk/fidl/fuchsia.wlan.internal" }

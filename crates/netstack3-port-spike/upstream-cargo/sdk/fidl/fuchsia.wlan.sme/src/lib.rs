@@ -10,8 +10,21 @@ use fidl_fuchsia_wlan_ieee80211::{
     WlanPhyType,
 };
 use fidl_fuchsia_wlan_internal::{
-    Authentication, ChannelSwitchInfo, Protocol, SignalReportIndication,
+    Authentication, ChannelSwitchInfo, Protocol, SignalReportIndication, WmmStatusResponse,
 };
+
+pub type ClientSmeWmmStatusResult = Result<WmmStatusResponse, i32>;
+
+/// Host boundary for the response token retained by core SME disconnect state.
+/// Fuchsia endpoint construction remains in the feature-gated serving module.
+#[derive(Debug, Default)]
+pub struct ClientSmeDisconnectResponder;
+
+impl ClientSmeDisconnectResponder {
+    pub fn send(self) -> Result<(), fidl::Error> {
+        Err(fidl::Error::TransportUnavailable)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u32)]

@@ -4,7 +4,7 @@
 
 //! Host subset generated from the pinned `fuchsia.wlan.mlme` schema.
 
-use fidl_fuchsia_wlan_common::WlanMacRole;
+use fidl_fuchsia_wlan_common::{ScheduledScanRequest, WlanMacRole};
 use fidl_fuchsia_wlan_ieee80211::{
     BssDescription, BssType, CapabilityInfo, ChannelBandwidth, ChannelNumber, CipherSuiteType,
     HtCapabilities, MacAddr, ReasonCode, Ssid, StatusCode, VhtCapabilities, WlanBand, WlanPhyType,
@@ -92,6 +92,42 @@ pub struct ScanResult {
 pub struct ScanEnd {
     pub txn_id: u64,
     pub code: ScanResultCode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlmeStartScheduledScanRequest {
+    pub txn_id: u64,
+    pub req: ScheduledScanRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MlmeStopScheduledScanRequest {
+    pub txn_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlmeGetScheduledScanEnabledResponse {
+    pub active_txn_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlmeInstallApfPacketFilterRequest {
+    pub program: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlmeReadApfPacketFilterDataResponse {
+    pub memory: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MlmeSetApfPacketFilterEnabledRequest {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MlmeGetApfPacketFilterEnabledResponse {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,6 +622,26 @@ mod tests {
         };
         assert_eq!(info.role, WlanMacRole::Client);
         assert_eq!(info.factory_addr.len(), 6);
+    }
+
+    #[test]
+    fn scheduled_scan_and_apf_payloads_match_schema_shapes() {
+        let request = MlmeStartScheduledScanRequest {
+            txn_id: 7,
+            req: ScheduledScanRequest::default(),
+        };
+        assert_eq!(request.req.scan_plans, None);
+        assert_eq!(
+            MlmeGetScheduledScanEnabledResponse {
+                active_txn_ids: vec![7]
+            }
+            .active_txn_ids,
+            vec![7]
+        );
+        assert_eq!(
+            MlmeReadApfPacketFilterDataResponse { memory: vec![1, 2] }.memory,
+            vec![1, 2]
+        );
     }
 
     #[test]

@@ -1,0 +1,42 @@
+diff --git a/src/connectivity/wlan/lib/sme/src/lib.rs b/src/connectivity/wlan/lib/sme/src/lib.rs
+index 8cc163a..e442b36 100644
+--- a/src/connectivity/wlan/lib/sme/src/lib.rs
++++ b/src/connectivity/wlan/lib/sme/src/lib.rs
+@@ -17,6 +17,7 @@
+ 
+ pub mod ap;
+ pub mod client;
+-pub mod serve;
++#[cfg(feature = "fuchsia-transport")]
++pub mod serve;
+ #[cfg(test)]
+ pub mod test_utils;
+diff --git a/src/connectivity/wlan/lib/sme/src/ap/mod.rs b/src/connectivity/wlan/lib/sme/src/ap/mod.rs
+--- a/src/connectivity/wlan/lib/sme/src/ap/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/ap/mod.rs
+@@ -516,7 +516,7 @@
+         | fidl_ieee80211::WlanPhyType::He => {
+             return Err(StartResult::InvalidArguments(format!("Unsupported PHY type: {phy:?}")));
+         }
+-        fidl_common::WlanPhyTypeUnknown!() => {
++        fidl_ieee80211::WlanPhyTypeUnknown!() => {
+             return Err(StartResult::InvalidArguments(format!("Unknown PHY type: {phy:?}")));
+         }
+     }
+diff --git a/src/connectivity/wlan/lib/sme/src/client/mod.rs b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+--- a/src/connectivity/wlan/lib/sme/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+@@ -382,10 +382,8 @@
+         // Note: For association, we don't have a failure type for timeout, so cannot deduce
+         //       whether an association failure is due to timeout.
+         match self {
+-            ConnectFailure::AuthenticationFailure(failure) => match failure {
+-                fidl_ieee80211::StatusCode::RejectedSequenceTimeout => true,
+-                _ => false,
+-            },
++            ConnectFailure::AuthenticationFailure(failure) =>
++                failure == &fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
+             ConnectFailure::EstablishRsnaFailure(failure) => match failure {
+                 EstablishRsnaFailure {
+                     reason: EstablishRsnaFailureReason::RsnaResponseTimeout(_),
+ 

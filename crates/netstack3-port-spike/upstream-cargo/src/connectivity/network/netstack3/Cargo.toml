@@ -4,7 +4,7 @@ members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
-  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/frame_writer", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn",
+  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/frame_writer", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn", "../../wlan/lib/sme",
   "../../../lib/mundane",
   "../../../lib/fuchsia-sync",
   "../../../lib/diagnostics/inspect/rust", "../../../lib/diagnostics/inspect/contrib/rust",

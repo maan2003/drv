@@ -11,12 +11,14 @@ pub type Vmo = Vec<u8>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidHeader,
+    TransportUnavailable,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidHeader => f.write_str("Invalid header for a FIDL buffer."),
+            Self::TransportUnavailable => f.write_str("FIDL transport is unavailable on the host."),
         }
     }
 }
@@ -32,6 +34,10 @@ mod tests {
         assert_eq!(
             Error::InvalidHeader.to_string(),
             "Invalid header for a FIDL buffer."
+        );
+        assert_eq!(
+            Error::TransportUnavailable.to_string(),
+            "FIDL transport is unavailable on the host."
         );
     }
 }

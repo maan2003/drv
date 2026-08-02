@@ -52,10 +52,11 @@ build metadata compiles it with Fuchsia's generated bindings and compatibility
 wrapper. BoringSSL remains under its upstream Apache-2.0 license.
 
 `wlan-common-host.patch` gates only the Zircon-status conversion at the existing
-platform boundary, marks the already ignored host scan timestamp as consumed,
-and makes its portable fixed-size test buffer available without compiling the
-Fuchsia-only test helpers. The frame, IE, BSS, capability, channel, rate-vector,
-and security algorithms remain byte-for-byte pinned Fuchsia source.
+platform boundary, retains monotonic scan timestamps on host, makes its portable
+fixed-size test buffer available without compiling the Fuchsia-only test helpers,
+and reports scan-result VMO persistence unavailable without Fuchsia transport.
+The frame, IE, BSS, capability, channel, rate-vector, and security algorithms
+remain byte-for-byte pinned Fuchsia source.
 
 The fetch closure also retains Fuchsia's production trace crate at the pin.
 The Cargo `fuchsia-trace` package selects the separately licensed
@@ -68,6 +69,11 @@ sources as references for MLME boundaries. Exact `zx-types` and `zx-status`
 sources are built unchanged. Separately licensed host facades expose only
 status/raw values, monotonic time value semantics, and the FIDL error required by generic responder helpers;
 syscalls, handles, encoding, and transport are not emulated.
+
+The pinned `wlan-sme` AP/client policy and state machines compile directly on
+the host. `wlan-sme-host.patch` excludes only the generated endpoint-serving
+module and two binding-shape compatibility sites. Host responder tokens return
+an explicit transport-unavailable error rather than emulating Fuchsia channels.
 
 The pinned SME uses Fuchsia Inspect only for diagnostics. Separately licensed
 path-shaped host facades retain scalar/string/byte property state and the API

@@ -10,15 +10,48 @@
          FrameWriteError::BadWrite(status.to_string())
 --- a/src/connectivity/wlan/lib/common/rust/src/scan.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/scan.rs
-@@ -357,6 +357,8 @@
+@@ -322,7 +322,6 @@
+     pub compatibility: Compatibility,
+     // Time of the scan result relative to when the system was powered on.
+     // See https://fuchsia.dev/fuchsia-src/concepts/time/language_support?hl=en#monotonic_time
+-    #[cfg(target_os = "fuchsia")]
+     pub timestamp: zx::MonotonicInstant,
+     pub bss_description: BssDescription,
+ }
+@@ -339,12 +338,8 @@
+         let ScanResult {
+             compatibility,
+-            #[cfg(target_os = "fuchsia")]
+             timestamp,
+             bss_description,
+         } = scan_result;
+         fidl_sme::ScanResult {
+             compatibility: compatibility.into_fidl(),
+-            #[cfg(target_os = "fuchsia")]
+             timestamp_nanos: timestamp.into_nanos(),
+-            #[cfg(not(target_os = "fuchsia"))]
+-            timestamp_nanos: 0,
+             bss_description: bss_description.into(),
+         }
+@@ -357,14 +352,20 @@
  
      fn try_from(scan_result: fidl_sme::ScanResult) -> Result<ScanResult, Self::Error> {
          let fidl_sme::ScanResult { compatibility, timestamp_nanos, bss_description } = scan_result;
-+        #[cfg(not(target_os = "fuchsia"))]
-+        let _ = timestamp_nanos;
          Ok(ScanResult {
              compatibility: Compatibility::try_from_fidl(compatibility)
                  .map_err(|_| format_err!("failed to convert FIDL `Compatibility`"))?,
+-            #[cfg(target_os = "fuchsia")]
+             timestamp: zx::MonotonicInstant::from_nanos(timestamp_nanos),
+             bss_description: bss_description.try_into()?,
+         })
+     }
+ }
++
++/// VMO persistence is a Fuchsia transport operation and is unavailable on the host.
++#[cfg(not(target_os = "fuchsia"))]
++pub fn write_vmo(_results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
++    Err(format_err!("scan-result VMO persistence is unavailable on the host"))
++}
 --- a/src/connectivity/wlan/lib/common/rust/src/lib.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/lib.rs
 @@ -25,7 +25,7 @@

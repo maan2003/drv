@@ -4,6 +4,8 @@
 
 //! Host subset generated from the pinned `fuchsia.wlan.common` schema.
 
+use fidl_fuchsia_wlan_ieee80211::{MacAddr, Ssid, WlanBand};
+
 pub const WLAN_TX_VECTOR_IDX_INVALID: u16 = 0;
 pub const MAX_SUPPORTED_PHY_TYPES: u8 = 64;
 pub const MAX_BANDS: u8 = 16;
@@ -121,6 +123,45 @@ pub struct SpectrumManagementSupport {
     pub dfs: Option<DfsFeature>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApfPacketFilterSupport {
+    pub supported: Option<bool>,
+    pub version: Option<i32>,
+    pub max_filter_length: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledScanPlan {
+    pub interval: u32,
+    pub iterations: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BandRssiAdjustment {
+    pub band: WlanBand,
+    pub rssi_adjustment: i8,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduledScanMatchSet {
+    pub ssid: Option<Ssid>,
+    pub bssid: Option<MacAddr>,
+    pub min_rssi_threshold: Option<i8>,
+    pub relative_rssi_threshold: Option<i8>,
+    pub band_rssi_adjustments: Option<Vec<BandRssiAdjustment>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduledScanRequest {
+    pub scan_plans: Option<Vec<ScheduledScanPlan>>,
+    pub ssids: Option<Vec<Ssid>>,
+    pub frequencies: Option<Vec<u32>>,
+    pub min_rssi_threshold: Option<i8>,
+    pub relative_rssi_threshold: Option<i8>,
+    pub band_rssi_adjustments: Option<Vec<BandRssiAdjustment>>,
+    pub match_sets: Option<Vec<ScheduledScanMatchSet>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +195,7 @@ mod tests {
             }
         );
         assert_eq!(MacSublayerSupport::default().device, None);
+        assert_eq!(ScheduledScanRequest::default().scan_plans, None);
+        assert_eq!(ApfPacketFilterSupport::default().supported, None);
     }
 }
