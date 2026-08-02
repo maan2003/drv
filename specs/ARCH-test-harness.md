@@ -3,11 +3,14 @@
 ## Status
 
 The in-memory broker runs the production Wasm probe through BAR programming,
-device DMA, interrupt, bounds failure, reset, and stale-handle checks. Virtual
-Wi-Fi, native broker, and physical suites remain unimplemented. A QEMU
+device DMA, interrupt, bounds failure, reset, and stale-handle checks. A QEMU
 VM suite covers `edu` enumeration, IOMMU grouping, exclusive `vfio-pci`
 binding, the iommufd device interface, region and IRQ discovery, DMA mapping,
-teardown, and clean shutdown.
+teardown, and clean shutdown. The `no-plastic` physical smoke path now covers
+transactional `mt7921e` handoff, VFIO cdev and iommufd attachment, a private
+low-IOVA DMA map/unmap, explicit IOAS teardown, deadline recovery, and automatic
+kernel-driver and iwd restoration without device MMIO. Virtual Wi-Fi and
+device-specific physical Wi-Fi behavior remain unimplemented.
 
 The production Wasm binary runs unchanged against deterministic and native
 brokers. The deterministic model owns virtual time and scripted BAR, DMA,
@@ -22,7 +25,7 @@ scan and authentication behavior. They model SoftMAC radio behavior and cannot
 validate BCM FullMAC firmware, PCIe rings, `msgbuf`, DMA, or reset.
 
 Physical tests calibrate rather than merely confirm models. The x86_64 AMD host
-`new-plastic` is the primary generic physical VFIO, deployment, and recovery
+`no-plastic` is the primary generic physical VFIO, deployment, and recovery
 test device. Its Wi-Fi and Bluetooth hardware is also the first target for
 proving transactional handoff between a normal host driver and a safe Rust
 service while the other host service remains available. Scheduled `m2sh` tests

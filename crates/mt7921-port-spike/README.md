@@ -124,14 +124,17 @@ register windows in `mt7921/pci.c:__mt7921_reg_addr` and
 `mt7921_reg_map_l1` cannot be confirmed until the actual device and BAR policy
 are inventoried.
 
-## Hardware assumptions still unverified
+## Verified no-plastic hardware boundary
 
-No target hardware inventory was used. It remains unknown whether new-plastic
-contains an MT7921/MT7922-family PCI function, which exact PCI/subsystem ID and
-revision it has, whether BAR 0 exposes the Linux register map, which interrupt
-mode/topology works through the intended broker, whether DMA is coherent, and
-whether IOMMU mappings can be placed below 4 GiB. Firmware availability,
-redistribution, board calibration/EEPROM source, RF-kill/wakeup wiring, ASPM
-quirks, reset behavior, and coexistence or IOMMU-group companions also remain
-unknown. Those are inventory or hardware experiments, not facts established by
-this spike.
+`no-plastic` exposes MediaTek `14c3:7961` with subsystem `1a3b:4680` at
+`0000:05:00.0`, normally bound to `mt7921e`. It is the sole member of IOMMU
+group 19 and advertises function-level and bus reset methods. Bluetooth is not
+in that PCI group. The native backend has attached its VFIO cdev to iommufd,
+mapped and unmapped one private page at IOVA `0x0100_0000`, explicitly destroyed
+the IOAS, and returned the function to `mt7921e`; it did not map BARs or arm an
+interrupt. iwd reconnects after each handoff, although the kernel interface name
+advances from `wlan0` to `wlanN` after reprobe.
+
+BAR 0 policy and translation, interrupt topology, DMA coherence, firmware and
+calibration sources, RF-kill/wakeup wiring, ASPM quirks, and device-specific
+reset behavior remain unverified.
