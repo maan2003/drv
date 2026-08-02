@@ -450,3 +450,70 @@ mod tests {
         assert_ne!(empty, vec![1, 7]);
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProviderSocketKindV2 {
+    Udp = 1,
+    Tcp = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProviderShutdownV2 {
+    Read = 1,
+    Write = 2,
+    ReadWrite = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProviderNameV2 {
+    Local = 1,
+    Peer = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ProviderOptionV2 {
+    ReuseAddress = 1,
+    ReusePort = 2,
+    Broadcast = 3,
+    KeepAlive = 4,
+    ReceiveBuffer = 5,
+    SendBuffer = 6,
+    Linger = 7,
+    TcpNoDelay = 8,
+    Ipv6Only = 9,
+    TcpKeepIdle = 10,
+    TcpKeepInterval = 11,
+    TcpKeepCount = 12,
+}
+
+impl TryFrom<u8> for ProviderOptionV2 {
+    type Error = crate::RemoteSocketError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            1 => Self::ReuseAddress,
+            2 => Self::ReusePort,
+            3 => Self::Broadcast,
+            4 => Self::KeepAlive,
+            5 => Self::ReceiveBuffer,
+            6 => Self::SendBuffer,
+            7 => Self::Linger,
+            8 => Self::TcpNoDelay,
+            9 => Self::Ipv6Only,
+            10 => Self::TcpKeepIdle,
+            11 => Self::TcpKeepInterval,
+            12 => Self::TcpKeepCount,
+            _ => return Err(crate::RemoteSocketError::NotSupported),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderReadinessSnapshotV2 {
+    pub sequence: u64,
+    pub readiness: ProviderReadinessV2,
+    pub error: Option<crate::RemoteSocketError>,
+}

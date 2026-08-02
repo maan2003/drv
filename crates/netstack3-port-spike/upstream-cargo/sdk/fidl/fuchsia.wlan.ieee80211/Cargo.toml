@@ -1,5 +1,6 @@
 [package]
 name = "fidl-fuchsia-wlan-ieee80211"
+workspace = "../../../src/connectivity/network/netstack3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

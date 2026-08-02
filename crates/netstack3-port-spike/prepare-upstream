@@ -11,6 +11,7 @@ if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]]; 
 fi
 
 cp -R "$here/upstream-cargo/src" "$refroot/"
+cp -R "$here/upstream-cargo/sdk" "$refroot/"
 cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 
 # Gate the sole Fuchsia-runtime convenience impl in the otherwise portable

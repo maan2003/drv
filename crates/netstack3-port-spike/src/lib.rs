@@ -3,6 +3,7 @@
 //! The crate itself does not link Netstack3. The companion pinned-source Cargo
 //! overlay executes upstream core against these authority-free contracts.
 pub mod provider_dispatch;
+pub mod provider_dispatch_v2;
 pub mod provider_transport;
 pub mod provider_transport_v2;
 
