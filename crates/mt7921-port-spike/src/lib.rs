@@ -32,6 +32,7 @@ pub struct DmaSegment {
 pub enum DescriptorError {
     IovaAbove32Bits,
     SegmentTooLong,
+    InvalidArena,
 }
 
 /// The four little-endian words of `struct mt76_desc`.
@@ -73,6 +74,17 @@ impl DmaDescriptor {
             ctrl,
             buf1,
             info,
+        })
+    }
+
+    /// Encode one device-owned RX buffer as `mt76_dma_add_rx_buf` does.
+    pub fn rx(buffer: DmaSegment) -> Result<Self, DescriptorError> {
+        validate_segment(buffer)?;
+        Ok(Self {
+            buf0: buffer.iova as u32,
+            ctrl: u32::from(buffer.len) << DMA_CTL_SD_LEN0_SHIFT,
+            buf1: 0,
+            info: 0,
         })
     }
 
@@ -1581,8 +1593,55 @@ impl FirmwareCompletionTracker {
 
 pub const MT7921_TX_RING_SLOTS: usize = 18;
 pub const MT7921_FWDL_RING_INDEX: usize = 16;
+pub const MT7921_MCU_TX_RING_INDEX: usize = 17;
+pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
+pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
+pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
 pub const MT7921_FWDL_EXT_CTRL: u32 = 0x0340_0004;
 pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McuRxRing {
+    pub descriptors: [DmaDescriptor; MT7921_MCU_RX_RING_COUNT],
+    pub producer_index: u32,
+}
+
+/// Build Linux's eight-entry pre-firmware MCU response ring while retaining
+/// one empty descriptor so producer and consumer indices cannot alias full.
+pub fn prepare_mcu_rx_ring(
+    ring_iova: u64,
+    buffers_iova: u64,
+) -> Result<McuRxRing, DescriptorError> {
+    let buffers_bytes = MT7921_MCU_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES;
+    if ring_iova % 4096 != 0
+        || buffers_iova % 4096 != 0
+        || ring_iova
+            .checked_add(4095)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || buffers_iova
+            .checked_add(buffers_bytes as u64 - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || (ring_iova <= buffers_iova + buffers_bytes as u64 - 1
+            && buffers_iova <= ring_iova + 4095)
+    {
+        return Err(DescriptorError::InvalidArena);
+    }
+    let mut descriptors = [DmaDescriptor::reset(); MT7921_MCU_RX_RING_COUNT];
+    for (index, descriptor) in descriptors
+        .iter_mut()
+        .enumerate()
+        .take(MT7921_MCU_RX_RING_COUNT - 1)
+    {
+        *descriptor = DmaDescriptor::rx(DmaSegment {
+            iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
+            len: MT7921_MCU_RX_BUFFER_BYTES as u16,
+        })?;
+    }
+    Ok(McuRxRing {
+        descriptors,
+        producer_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxRingState {
@@ -1647,6 +1706,7 @@ pub fn prepare_global_tx_rings<T, F>(
     transport: &mut T,
     guard_iova: u64,
     fwdl_iova: u64,
+    mcu_iova: u64,
     mut event: F,
 ) -> Result<[TxRingState; MT7921_TX_RING_SLOTS], GlobalTxRingError<T::Error>>
 where
@@ -1665,7 +1725,13 @@ where
     let Some(fwdl_end) = page_end(fwdl_iova) else {
         return Err(GlobalTxRingError::InvalidArena);
     };
-    if guard_iova <= fwdl_end && fwdl_iova <= guard_end {
+    let Some(mcu_end) = page_end(mcu_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    if (guard_iova <= fwdl_end && fwdl_iova <= guard_end)
+        || (guard_iova <= mcu_end && mcu_iova <= guard_end)
+        || (fwdl_iova <= mcu_end && mcu_iova <= fwdl_end)
+    {
         return Err(GlobalTxRingError::InvalidArena);
     }
     let global_config = transport
@@ -1714,11 +1780,18 @@ where
     for index in 0..MT7921_TX_RING_SLOTS {
         let descriptor_base = if index == MT7921_FWDL_RING_INDEX {
             fwdl_iova as u32
+        } else if index == MT7921_MCU_TX_RING_INDEX {
+            mcu_iova as u32
         } else {
             guard_iova as u32
         };
+        let descriptor_count = if index == MT7921_MCU_TX_RING_INDEX {
+            MT7921_MCU_TX_RING_COUNT
+        } else {
+            MT7921_FWDL_RING_COUNT
+        };
         transport
-            .write_tx_ring(index, descriptor_base, MT7921_FWDL_RING_COUNT, 0)
+            .write_tx_ring(index, descriptor_base, descriptor_count, 0)
             .map_err(GlobalTxRingError::Transport)?;
         event(GlobalTxRingEvent::RingOwned {
             index,
@@ -1741,13 +1814,20 @@ where
             .map_err(GlobalTxRingError::Transport)?;
         let expected_base = if index == MT7921_FWDL_RING_INDEX {
             fwdl_iova as u32
+        } else if index == MT7921_MCU_TX_RING_INDEX {
+            mcu_iova as u32
         } else {
             guard_iova as u32
+        };
+        let expected_count = if index == MT7921_MCU_TX_RING_INDEX {
+            MT7921_MCU_TX_RING_COUNT
+        } else {
+            MT7921_FWDL_RING_COUNT
         };
         if *state
             != (TxRingState {
                 descriptor_base: expected_base,
-                descriptor_count: MT7921_FWDL_RING_COUNT,
+                descriptor_count: expected_count,
                 cpu_index: 0,
                 dma_index: 0,
             })
@@ -3056,9 +3136,13 @@ mod tests {
     fn global_tx_preparation_owns_all_eighteen_rings_before_index_reset() {
         let mut transport = FakeGlobalTx::new();
         let mut events = Vec::new();
-        let owned = prepare_global_tx_rings(&mut transport, 0x0100_0000, 0x0100_1000, |event| {
-            events.push(event)
-        })
+        let owned = prepare_global_tx_rings(
+            &mut transport,
+            0x0100_0000,
+            0x0100_1000,
+            0x0100_2000,
+            |event| events.push(event),
+        )
         .unwrap();
         assert_eq!(transport.writes.len(), MT7921_TX_RING_SLOTS);
         assert_eq!(transport.resets, [MT7921_RESET_ALL_TX_INDICES]);
@@ -3067,11 +3151,20 @@ mod tests {
                 state.descriptor_base,
                 if index == MT7921_FWDL_RING_INDEX {
                     0x0100_1000
+                } else if index == MT7921_MCU_TX_RING_INDEX {
+                    0x0100_2000
                 } else {
                     0x0100_0000
                 }
             );
-            assert_eq!(state.descriptor_count, MT7921_FWDL_RING_COUNT);
+            assert_eq!(
+                state.descriptor_count,
+                if index == MT7921_MCU_TX_RING_INDEX {
+                    MT7921_MCU_TX_RING_COUNT
+                } else {
+                    MT7921_FWDL_RING_COUNT
+                }
+            );
             assert_eq!(state.cpu_index, 0);
             assert_eq!(state.dma_index, 0);
         }
@@ -3086,7 +3179,7 @@ mod tests {
         let mut dirty = FakeGlobalTx::new();
         dirty.rings[7].cpu_index += 1;
         assert!(matches!(
-            prepare_global_tx_rings(&mut dirty, 0x0100_0000, 0x0100_1000, |_| {}),
+            prepare_global_tx_rings(&mut dirty, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
             Err(GlobalTxRingError::DirtyRing { index: 7, .. })
         ));
         assert!(dirty.writes.is_empty());
@@ -3094,7 +3187,7 @@ mod tests {
         let mut invalid = FakeGlobalTx::new();
         invalid.ext = u32::MAX;
         assert_eq!(
-            prepare_global_tx_rings(&mut invalid, 0x0100_0000, 0x0100_1000, |_| {}),
+            prepare_global_tx_rings(&mut invalid, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
             Err(GlobalTxRingError::InvalidMmio)
         );
         assert!(invalid.writes.is_empty());
@@ -3102,13 +3195,13 @@ mod tests {
         let mut ext = FakeGlobalTx::new();
         ext.ext = 4;
         assert_eq!(
-            prepare_global_tx_rings(&mut ext, 0x0100_0000, 0x0100_1000, |_| {}),
+            prepare_global_tx_rings(&mut ext, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
             Err(GlobalTxRingError::UnexpectedFwdlExtCtrl(4))
         );
 
         let mut overlap = FakeGlobalTx::new();
         assert_eq!(
-            prepare_global_tx_rings(&mut overlap, 0x0100_0000, 0x0100_0000, |_| {}),
+            prepare_global_tx_rings(&mut overlap, 0x0100_0000, 0x0100_0000, 0x0100_2000, |_| {}),
             Err(GlobalTxRingError::InvalidArena)
         );
         assert!(overlap.writes.is_empty());
@@ -3349,6 +3442,28 @@ mod tests {
         assert_eq!(two.ctrl, (64 << 16) | 1500 | (1 << 14));
         assert_eq!(two.buf1, 0x2000);
         assert_eq!(DmaDescriptor::reset().ctrl, 1 << 31);
+    }
+
+    #[test]
+    fn builds_owned_mcu_rx_ring_with_one_empty_slot() {
+        let ring = prepare_mcu_rx_ring(0x0100_3000, 0x0100_4000).unwrap();
+        assert_eq!(ring.producer_index, 7);
+        for (index, descriptor) in ring.descriptors[..7].iter().enumerate() {
+            assert_eq!(
+                *descriptor,
+                DmaDescriptor {
+                    buf0: 0x0100_4000 + index as u32 * 2048,
+                    ctrl: 2048 << 16,
+                    buf1: 0,
+                    info: 0,
+                }
+            );
+        }
+        assert_eq!(ring.descriptors[7], DmaDescriptor::reset());
+        assert_eq!(
+            prepare_mcu_rx_ring(0x0100_3000, 0x0100_3000),
+            Err(DescriptorError::InvalidArena)
+        );
     }
 
     #[test]

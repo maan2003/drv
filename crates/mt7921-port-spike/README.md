@@ -131,6 +131,11 @@ base with one pinned guard page while assigning separate pinned backing to ring
 DTX-index reset and require every DIDX to read zero. Old kernel DMA bases are
 never restored. This currently has a fake transport only and cannot touch the
 physical adapter.
+Ring 17 now receives its own 256-descriptor MCU-command page rather than guard
+backing. `prepare_mcu_rx_ring` separately builds Linux's eight-entry,
+2048-byte-buffer pre-firmware response queue with seven device-owned buffers
+and one empty slot, using a distinct aligned low-32-bit ring page and 16 KiB
+buffer mapping. It rejects overlapping or out-of-range arenas.
 
 `encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
 and request bodies for patch-semaphore acquisition, `PATCH_START`, and
