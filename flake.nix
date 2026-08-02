@@ -16,6 +16,11 @@
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
           { };
 
+      checks.x86_64-linux.netstack3-kernel-provider =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/netstack3-port-spike/kernel-provider/check.nix
+          { };
+
       packages = forAllSystems (
         system:
         let

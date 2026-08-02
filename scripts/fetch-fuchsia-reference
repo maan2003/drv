@@ -2,6 +2,11 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
+
+if [[ ${1:-} == --print-commit ]]; then
+  printf "%s\n" "$commit"
+  exit 0
+fi
 root="reference/fuchsia-$commit"
 
 mkdir -p reference
@@ -48,6 +53,16 @@ paths=(
   sdk/fidl/fuchsia.hardware.audio.signalprocessing
   sdk/fidl/fuchsia.hardware.bluetooth
 )
+
+# Additional pinned paths may be supplied by package overlays. This keeps one
+# project pin/archive/hash convention while avoiding duplicate fetch scripts.
+for path in "$@"; do
+  if [[ -z "$path" || "$path" == /* || "$path" == *..* ]]; then
+    printf "invalid Fuchsia repository path: %s\n" "$path" >&2
+    exit 2
+  fi
+  paths+=("$path")
+done
 
 for path in "${paths[@]}"; do
   name=${path//\//_}

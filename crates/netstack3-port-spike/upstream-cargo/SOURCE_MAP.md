@@ -69,10 +69,11 @@ NativeSocketProvider.
 
 ### Kernel-provider framing
 
-provider_transport.rs is local capability plumbing, not networking logic.
-Its version-1 ABI fixes a 40-byte header, immutable namespace/client identity,
-64 KiB payload limit, bounded FIFOs, and operation numbers corresponding
-one-for-one with RemoteSocketProvider calls. The golden-byte fixture is the
-compatibility oracle for a later kernel provider. Loopback selection is tested
+provider_transport.rs preserves the experimental incompatible v1 framing oracle.
+provider_transport_v2.rs is the kernel-provider contract: it retains the 40-byte
+header, immutable namespace/client identity, 64 KiB payload bound and strict
+version rejection while adding unambiguous POSIX operation results, sequenced
+level readiness, source addresses, EOF/errors and directional shutdown. Golden
+bytes and cross-version rejection are compatibility oracles. Loopback selection is tested
 separately: IPv4 127/8 and IPv6 ::1 stay private; all other destinations select
 Netstack3.

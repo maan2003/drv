@@ -1,6 +1,6 @@
-# Pinned Fuchsia Netstack3 Cargo overlay provenance
+# Shared pinned Fuchsia Cargo overlay provenance
 
-The manifests and build configuration in this directory package unmodified
+The path-preserving manifests and build configuration in this directory package unmodified
 Fuchsia source fetched at commit `1e1219e3fac944c9a906aea9646939746b6062b3` by
 `../../../../scripts/fetch-fuchsia-reference`. Dependency versions and features
 were transcribed from the same commit's GN `BUILD.gn` files and
@@ -24,3 +24,22 @@ DHCP core/protocol and Fuchsia Trust-DNS forks. Their original source and
 license notices are fetched unchanged. Host changes are isolated as reviewable
 patch files; no algorithm, constant, state transition, cache, or retry policy is
 forked into the native adapter.
+
+## Overlay extension contract
+
+This directory is the shared Cargo overlay for portable code at the project
+Fuchsia pin; its location under the Netstack3 spike is historical, not a second
+pin boundary. New WLAN common, SoftMAC MLME, SME, RSN, and EAPOL packages:
+
+1. reuse `scripts/fetch-fuchsia-reference` (the default closure already fetches
+   all of `src/connectivity/wlan`; pass extra repository paths as arguments);
+2. preserve Fuchsia-relative paths below `upstream-cargo/src`;
+3. add members and shared dependency versions to the existing workspace root at
+   `src/connectivity/network/netstack3/Cargo.toml` and its single lockfile;
+4. record production/test source disposition in `SOURCE_MAP.md`; and
+5. isolate host-only build changes as named patches without forking protocol or
+   state-machine behavior.
+
+Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
+needs the canonical revision. Do not introduce a second revision constant,
+archive convention, workspace, or lockfile for another Fuchsia subsystem.
