@@ -44,6 +44,13 @@ on readback. Every write, status sample, retry, terminal success, timeout, or
 unexpected state is emitted as a structured event. No firmware-ownership or
 dynamic L1-remap write is admitted.
 
+The physical MT7961 at `0000:05:00.0` completed this transition on the first
+attempt: writing `PCIE_LPCR_HOST_CLR_OWN` produced a zero status response and
+driver ownership at 0 ms. The bounded run then observed firmware power set,
+N9 readiness clear, and all TX/RX DMA enable/busy bits clear before issuing a
+VFIO function reset. The root-only report is
+`/var/lib/wifi-driver-lab/reports/20260802T170812Z-0000_05_00.0.log`.
+
 ## Inactive WFDMA and firmware prerequisites
 
 `WfdmaRing` ports the inactive mt76 TX-ring invariants without enabling DMA:
@@ -129,8 +136,8 @@ ring slots, rejects invalid MMIO or any `CIDX != DIDX`, verifies MT7921 ring
 base with one pinned guard page while assigning separate pinned backing to ring
 16. Only after every base/count/CPU index is owned does it issue Linux's global
 DTX-index reset and require every DIDX to read zero. Old kernel DMA bases are
-never restored. This currently has a fake transport only and cannot touch the
-physical adapter.
+never restored. Its fake transport remains the exhaustive failure-path model;
+the physical inactive adapter below now covers the successful MMIO path.
 Ring 17 now receives its own 256-descriptor MCU-command page rather than guard
 backing. `prepare_mcu_rx_ring` separately builds Linux's eight-entry,
 2048-byte-buffer pre-firmware response queue with seven device-owned buffers
@@ -147,6 +154,14 @@ CPU-owned reset descriptors, applies and verifies all 18 ring slots plus the
 global DTX reset while DMA and interrupts remain disabled, VFIO-resets while
 all pages are still pinned, and only then unmaps them. It cannot enable DMA,
 publish a producer index, install an IRQ, or send an MCU command.
+
+The original physical attempt faulted because this operation's WFDMA BAR page
+was accidentally mapped read-only before the first ring write. Page access is
+now an explicit per-operation contract, and VFIO READ/WRITE/MMAP region flags
+are checked before `mmap`. A guarded rerun wrote and read back all 18 owned
+rings, reset every DTX index, reset the device while all three IOVAs remained
+pinned, and then unmapped them. The root-only report is
+`/var/lib/wifi-driver-lab/reports/20260802T165342Z-0000_05_00.0.log`.
 
 `encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
 and request bodies for patch-semaphore acquisition, `PATCH_START`, and

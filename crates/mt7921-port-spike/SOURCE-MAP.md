@@ -50,12 +50,12 @@ explicitly marked; the initial majority is `unmapped`.
 | Linux item | Linux file | Rust item | Status | Verification |
 |---|---|---|---|---|
 | `mt792x_dma_prefetch` constants/order | `mt792x_dma.c` | constants intentionally not active | unmapped | physical trace proved zero is a valid pre-init state |
-| `mt792x_dma_enable` DTX ordering subset | `mt792x_dma.c` | `prepare_global_tx_rings` | adapted | 43 unit tests; physical inventory only |
+| `mt792x_dma_enable` DTX ordering subset | `mt792x_dma.c` | `prepare_global_tx_rings` | adapted | 43 unit tests; physical 18-ring ownership/reset/readback trace |
 | `mt76_queue` TX descriptor fields | `mt76.h`, `dma.c` | `TxRingState`, `DmaDescriptor` | adapted, tested | unit fixtures/readback traces |
 | `mt76_connac2_mcu_fill_message` download subset | `mt76_connac_mcu.c` | `encode_download_command` | adapted, tested | pinned-format fixtures |
 | connac2 patch header/sections | `mt76_connac_mcu.h` | `Patch` parser | adapted, tested | malformed/bounded fixtures |
 | `mt792x_wfsys_reset` | `mt7921/pci.c` | `wfsys_reset` | adapted, tested | ordering and timeout tests |
-| driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests |
+| driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests; physical first-attempt CLR_OWN response |
 | PCI interrupt disable (`pci_intx(pdev, 0)`) | Linux PCI core call site | `disable_pci_intx` | adapted, tested | command-bit readback; physical run |
 | kernel DMA allocation/mapping | mt76 DMA/core | `DmaArena` | adapted | iommufd pin/unmap tests; incomplete call graph |
 | IRQ lifecycle/eventfd | mt76 PCI/IRQ paths | `IrqLifecycle`, `VfioIrq` | adapted, tested | state/UAPI tests; incomplete call graph |
@@ -75,6 +75,9 @@ gate is **closed**.
 4. The pinned Fuchsia common/client portable closure and upstream tests must be
    established first. Hardware-returned data then crosses only the narrow trait
    matching Fuchsia SoftMAC semantics; mac80211/cfg80211 is replaced, not ported.
-5. The last physical trace reached all 18 idle TX rings, then userspace received
-   SIGSEGV on the first ownership-write path. Physical writes remain disabled
-   until the complete dependency path and MMIO fault semantics are modeled.
+5. The read-only WFDMA mapping that caused the first ring-ownership write to
+   SIGSEGV is fixed and guarded by operation-permission and VFIO-region tests.
+   A physical trace now owns and verifies all 18 inactive TX rings, resets while
+   IOVAs remain pinned, and restores the kernel driver. Driver ownership also
+   succeeds, but N9 is not ready; active DMA, IRQ unmasking, and MCU commands
+   remain disabled until the owned RX response ring and teardown loop are wired.

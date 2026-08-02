@@ -45,6 +45,9 @@ const IOMMU_MAP_WRITEABLE: u32 = 2;
 const IOMMU_MAP_READABLE: u32 = 4;
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
+const VFIO_REGION_INFO_FLAG_READ: u32 = 1 << 0;
+const VFIO_REGION_INFO_FLAG_WRITE: u32 = 1 << 1;
+const VFIO_REGION_INFO_FLAG_MMAP: u32 = 1 << 2;
 const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
@@ -233,7 +236,6 @@ fn run() -> Result<(), String> {
         }
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
-    let acquire = operation == Operation::AcquireDriverOwnership;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -297,21 +299,13 @@ fn run() -> Result<(), String> {
         "query BAR 0",
     )?;
 
-    let wfdma = ReadPage::map(
-        &device,
-        &info,
-        0xd4000,
-        matches!(
-            operation,
-            Operation::ProgramDisabledFwdlRing | Operation::MaskAckDisabledFwdl
-        ),
-    )?;
+    let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
     let pcie_mac = if operation == Operation::PrepareOwnedGlobalTxRings {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
         None
     };
-    let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
+    let conn = ReadPage::map(&device, &info, 0xe0000, operation.conn_writable())?;
     if matches!(
         operation,
         Operation::InventoryVfioIrqs | Operation::InstallDisableVfioIrq
@@ -341,7 +335,9 @@ fn run() -> Result<(), String> {
             println!("{{\"vfio_irq_event\":\"vfio_device_reset_completed\"}}");
         }
     }
-    if acquire {
+    if operation == Operation::AcquireDriverOwnership {
+        verify_pci_dma_disabled(&bdf)?;
+        set_lab_safety("MUTATED")?;
         let mut transport = VfioOwnership {
             page: &conn,
             start: Instant::now(),
@@ -356,6 +352,14 @@ fn run() -> Result<(), String> {
                 OwnershipError::Timeout => "driver ownership timed out after 500 ms".into(),
             },
         )?;
+        let response = conn.read(ReadRegister::ConnOnLowPowerControl.bar_offset())?;
+        println!(
+            "{{\"ownership_event\":\"device_response_verified\",\"raw\":\"{response:#010x}\"}}"
+        );
+        reset_vfio_device(&device)?;
+        verify_pci_dma_disabled(&bdf)?;
+        set_lab_safety("SAFE")?;
+        println!("{{\"ownership_event\":\"vfio_device_reset_completed\"}}");
     }
     if matches!(
         operation,
@@ -1066,6 +1070,7 @@ impl ReadPage {
         if !bar_page.is_multiple_of(PAGE) || bar_page + PAGE > region.size as usize {
             return Err("allowlisted BAR page is outside BAR 0".into());
         }
+        validate_region_mapping(region, writable)?;
         let ptr = NonNull::new(unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -1194,6 +1199,24 @@ impl ReadPage {
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
+}
+
+fn validate_region_mapping(region: &RegionInfo, writable: bool) -> Result<(), String> {
+    let required = VFIO_REGION_INFO_FLAG_READ
+        | VFIO_REGION_INFO_FLAG_MMAP
+        | if writable {
+            VFIO_REGION_INFO_FLAG_WRITE
+        } else {
+            0
+        };
+    if region.flags & required != required {
+        return Err(format!(
+            "BAR region flags {:#010x} do not permit {} mmap (required {required:#010x})",
+            region.flags,
+            if writable { "writable" } else { "read-only" }
+        ));
+    }
+    Ok(())
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -1326,6 +1349,21 @@ enum Operation {
     InventoryVfioIrqs,
     InstallDisableVfioIrq,
     PrepareOwnedGlobalTxRings,
+}
+
+impl Operation {
+    fn wfdma_writable(self) -> bool {
+        matches!(
+            self,
+            Self::ProgramDisabledFwdlRing
+                | Self::MaskAckDisabledFwdl
+                | Self::PrepareOwnedGlobalTxRings
+        )
+    }
+
+    fn conn_writable(self) -> bool {
+        self == Self::AcquireDriverOwnership
+    }
 }
 
 struct VfioDynamicL1<'a> {
@@ -1587,5 +1625,35 @@ mod tests {
         request_stop(SIGTERM);
         assert!(STOP_REQUESTED.load(Ordering::Acquire));
         STOP_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn every_wfdma_writer_requires_a_writable_mapping() {
+        assert!(Operation::ProgramDisabledFwdlRing.wfdma_writable());
+        assert!(Operation::MaskAckDisabledFwdl.wfdma_writable());
+        assert!(Operation::PrepareOwnedGlobalTxRings.wfdma_writable());
+        assert!(!Operation::ReadFixed.wfdma_writable());
+        assert!(!Operation::AcquireDriverOwnership.wfdma_writable());
+        assert!(!Operation::InventoryVfioIrqs.wfdma_writable());
+        assert!(Operation::AcquireDriverOwnership.conn_writable());
+        assert!(!Operation::ReadFixed.conn_writable());
+        assert!(!Operation::PrepareOwnedGlobalTxRings.conn_writable());
+    }
+
+    #[test]
+    fn vfio_region_capabilities_fail_closed_before_mmap() {
+        let mut region = RegionInfo {
+            flags: VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_MMAP,
+            ..Default::default()
+        };
+        assert!(validate_region_mapping(&region, false).is_ok());
+        assert!(validate_region_mapping(&region, true).is_err());
+
+        region.flags |= VFIO_REGION_INFO_FLAG_WRITE;
+        assert!(validate_region_mapping(&region, true).is_ok());
+
+        region.flags &= !VFIO_REGION_INFO_FLAG_MMAP;
+        assert!(validate_region_mapping(&region, false).is_err());
+        assert!(validate_region_mapping(&region, true).is_err());
     }
 }
