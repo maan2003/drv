@@ -43,14 +43,18 @@ GAP discovery suite. Its WASM import list must match the interfaces in the WIT
 world before it can be connected to the physical HCI broker.
 
 The separate `//:physical_discovery` reactor is the guarded physical slice. It
-uses Sapphire's `Transport` and `LegacyLowEnergyScanner`, accepts only copied
-HCI packets without H4 bytes, and reports only a guest-derived unique-peer
-count. A READY/START handshake validates and instantiates the unprivileged
-worker before the supervisor mutates controller state. The supervisor owns the
-sole Linux HCI user-channel descriptor, allowlists only Reset, event-mask, and
-LE scan commands, imposes the wall deadline, waits for Sapphire's scan-disable
-completion, restores the exact controller flags, and independently reacquires
-the exclusive user channel. Physical mode has no fake fallback or automatic
+uses Sapphire's `Transport`, `LegacyLowEnergyScanner`, `PeerCache`, and
+`LowEnergyDiscoveryManager`, and runs an active upstream discovery session.
+It accepts only copied HCI packets without H4 bytes and reports only a
+guest-derived unique-peer count. The manager's random dependency is a bounded
+project import; the supervisor fulfills at most 4096 bytes per request with
+the kernel secure-random source. A READY/START handshake validates and
+instantiates the unprivileged worker before the supervisor mutates controller
+state. The supervisor owns the sole Linux HCI user-channel descriptor,
+allowlists only Reset, event-mask, and LE scan commands, imposes the wall
+deadline, stops the session, waits for Sapphire's scan-disable completion,
+restores the exact controller flags, and independently reacquires the
+exclusive user channel. Physical mode has no fake fallback or automatic
 worker retry.
 
 The guarded `no-plastic` run completed a six-second LE scan through `hci0`.
@@ -80,6 +84,37 @@ The fault fixtures never open HCI. They cover worker crash/reap, a bounded
 partial-Reset timeout, stale-session IPC rejection, malformed partial HCI
 delivery, and fresh IPC ownership after cleanup. Broker tests separately check
 strict restore-state parsing and closure of the owned channel descriptor.
+
+## Production invocation
+
+The `sapphire-discovery` flake package supplies the pinned reactor and a narrow
+`bluetooth-sapphire-discover` wrapper. Run it as root with absolute paths in
+root-only directories:
+
+```sh
+bluetooth-sapphire-discover \
+  --device 0 --seconds 6 \
+  --report /var/lib/bluetooth-sapphire/discovery.json \
+  --state /run/bluetooth-sapphire/controller.state
+```
+
+The wrapper always adds the explicit discovery-only confirmation. It also
+forwards the operational forms `--probe-user-channel DEVICE` and
+`--restore-controller-state ABSOLUTE`; use the latter from `ExecStopPost` as a
+deadline guard. The runner package installs its baseline unit properties at
+`share/bluetooth-sapphire/systemd.properties`. A service needs
+`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SETUID`, `CAP_SETGID`, and `CAP_KILL`, and
+must allow `AF_UNIX` and `AF_BLUETOOTH`. Do not enable `PrivateNetwork` or
+`PrivateDevices`: either prevents the required Bluetooth user-channel access.
+Keep `RuntimeMaxSec=150s`, `TimeoutStopSec=5s`, `KillMode=control-group`, and a
+root-only runtime directory, with for example:
+
+```ini
+ExecStopPost=bluetooth-sapphire-discover --restore-controller-state /run/bluetooth-sapphire/controller.state
+```
+
+Copy only the mode-0600 redacted report to durable root-only storage. This
+path never writes peer addresses or names; do not persist raw HCI input.
 
 `scripts/build-sapphire-gap-wasm` builds that suite from Pigweed commit
 `c14c119c51a82f6e044f81b7dad0a322091d4121`, fetched by Nix from the upstream

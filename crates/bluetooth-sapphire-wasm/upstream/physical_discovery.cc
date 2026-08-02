@@ -9,6 +9,9 @@
 #include "pw_async/fake_dispatcher.h"
 #include "pw_bluetooth/controller.h"
 #include "pw_bluetooth_sapphire/null_lease_provider.h"
+#include "pw_bluetooth_sapphire/internal/host/common/random.h"
+#include "pw_bluetooth_sapphire/internal/host/gap/low_energy_discovery_manager.h"
+#include "pw_bluetooth_sapphire/internal/host/gap/peer_cache.h"
 #include "pw_bluetooth_sapphire/internal/host/hci/fake_local_address_delegate.h"
 #include "pw_bluetooth_sapphire/internal/host/hci/legacy_low_energy_scanner.h"
 #include "pw_bluetooth_sapphire/internal/host/transport/transport.h"
@@ -16,6 +19,8 @@
 extern "C" __attribute__((import_module(
     "drv:bluetooth-sapphire/controller@0.1.0"), import_name("send"))) uint32_t
 drv_controller_send(uint32_t, const uint8_t*, uint32_t);
+extern "C" __attribute__((import_module("drv:test"), import_name("random"))) int
+drv_secure_random(uint8_t*, uint32_t);
 
 namespace {
 constexpr uint32_t kInitializing = 1;
@@ -90,8 +95,20 @@ class IpcController final : public pw::bluetooth::Controller {
   pw::Callback<void(pw::Status)> error_;
 };
 
-class App final : public bt::hci::LowEnergyScanner::Delegate {
+class ImportedRandom final : public pw::random::RandomGenerator {
  public:
+  void Get(pw::ByteSpan dest) override {
+    PW_CHECK(dest.size() <= UINT32_MAX);
+    PW_CHECK(drv_secure_random(reinterpret_cast<uint8_t*>(dest.data()),
+                               static_cast<uint32_t>(dest.size())) == 0);
+  }
+  void InjectEntropyBits(uint32_t, uint_fast8_t) override {}
+};
+
+class App final {
+ public:
+  App() { bt::set_random_generator(&random_); }
+  ~App() { bt::set_random_generator(nullptr); }
   bool Start() {
     state_ = kInitializing;
     stage_ = kReset;
@@ -101,6 +118,10 @@ class App final : public bt::hci::LowEnergyScanner::Delegate {
     if (state_ == kInitializing && stage_ != 0) return InitEvent(kind, bytes, length);
     if (!controller_ || !controller_->Inject(kind, bytes, length)) return false;
     dispatcher_.RunUntilIdle();
+    if (state_ == kStopping && manager_ && !manager_->discovering() &&
+        scanner_->IsIdle()) {
+      state_ = kStopped;
+    }
     return state_ != kFailed;
   }
   void Advance(uint32_t milliseconds) {
@@ -110,15 +131,14 @@ class App final : public bt::hci::LowEnergyScanner::Delegate {
     }
   }
   void Stop() {
-    if (state_ == kScanning && scanner_ && scanner_->StopScan()) state_ = kStopping;
+    if (state_ == kScanning && session_) {
+      state_ = kStopping;
+      session_->Stop();
+      dispatcher_.RunUntilIdle();
+    }
   }
   uint32_t state() const { return state_; }
   uint32_t peers() const { return peers_.size(); }
-  void OnPeerFound(const std::unordered_set<uint16_t>&,
-                   const bt::hci::LowEnergyScanResult& result) override {
-    peers_.insert(result.address());
-  }
-
  private:
   bool InitEvent(uint32_t kind, const uint8_t* b, size_t n) {
     if (kind != 0 || n < 6 || b[0] != 0x0e || b[1] < 4) return false;
@@ -149,24 +169,36 @@ class App final : public bt::hci::LowEnergyScanner::Delegate {
         &address_, bt::hci::AdvertisingPacketFilter::Config{
                        false, 0, bt::hci::AdvertisingPacketFilter::Config::DeliveryMode::kImmediate},
         transport_->GetWeakPtr(), dispatcher_);
-    scanner_->SetPacketFilters(0, {});
-    scanner_->set_delegate(this);
-    bt::hci::LowEnergyScanner::ScanOptions options{.active = false,
-                                                    .filter_duplicates = true,
-                                                    .period = bt::hci::LowEnergyScanner::kPeriodInfinite};
-    return scanner_->StartScan(options, [this](auto status) {
-      using Status = bt::hci::LowEnergyScanner::ScanStatus;
-      if (status == Status::kPassive) state_ = kScanning;
-      else if (status == Status::kStopped) state_ = kStopped;
-      else if (status == Status::kFailed) state_ = kFailed;
+    auto config = bt::hci::AdvertisingPacketFilter::Config{
+        false,
+        0,
+        bt::hci::AdvertisingPacketFilter::Config::DeliveryMode::kImmediate};
+    manager_ = std::make_unique<bt::gap::LowEnergyDiscoveryManager>(
+        scanner_.get(), &peer_cache_, config, dispatcher_);
+    manager_->set_scan_period(bt::hci::LowEnergyScanner::kPeriodInfinite);
+    manager_->StartDiscovery(/*active=*/true, {}, [this](auto session) {
+      if (!session) {
+        state_ = kFailed;
+        return;
+      }
+      session_ = std::move(session);
+      session_->SetResultCallback([this](const auto& result) {
+        peers_.insert(result.address());
+      });
+      state_ = kScanning;
     });
+    return true;
   }
   pw::async::test::FakeDispatcher dispatcher_;
+  ImportedRandom random_;
   pw::bluetooth_sapphire::NullLeaseProvider lease_;
   bt::hci::FakeLocalAddressDelegate address_{dispatcher_};
+  bt::gap::PeerCache peer_cache_{dispatcher_};
   IpcController* controller_ = nullptr;
   std::unique_ptr<bt::hci::Transport> transport_;
   std::unique_ptr<bt::hci::LegacyLowEnergyScanner> scanner_;
+  std::unique_ptr<bt::gap::LowEnergyDiscoveryManager> manager_;
+  std::unique_ptr<bt::gap::LowEnergyDiscoverySession> session_;
   std::unordered_set<bt::DeviceAddress> peers_;
   uint16_t stage_ = 0;
   uint32_t state_ = 0;

@@ -52,6 +52,7 @@ const PHYSICAL_READY: u8 = 15;
 const PHYSICAL_START: u8 = 16;
 const PHYSICAL_TICK: u8 = 17;
 const PHYSICAL_STATE: u8 = 18;
+const SECURE_RANDOM: u8 = 19;
 const ACK: u8 = 128;
 const CONTROLLER_MODULE: &str = "drv:bluetooth-sapphire/controller@0.1.0";
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -261,6 +262,7 @@ fn require_test_imports(module: &Module) -> wasmtime::Result<()> {
     expected_with_controller.insert((CONTROLLER_MODULE.to_owned(), "send".to_owned()));
     let physical = [
         ("drv:test".to_owned(), "log".to_owned()),
+        ("drv:test".to_owned(), "random".to_owned()),
         (CONTROLLER_MODULE.to_owned(), "send".to_owned()),
     ]
     .into_iter()
@@ -345,6 +347,23 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
             Err(wasmtime::Error::msg(format!(
                 "guest called proc_exit({status})"
             )))
+        },
+    )?;
+    linker.func_wrap(
+        "drv:test",
+        "random",
+        |mut caller: Caller<'_, TestHost>, pointer: i32, length: i32| {
+            let range = checked_range(pointer, length, 4096)?;
+            let reply = request(caller.data_mut(), SECURE_RANDOM, &length.to_le_bytes())?;
+            if reply.len() != range.len() {
+                return Err(wasmtime::Error::msg("invalid secure-random reply"));
+            }
+            guest_memory(&mut caller)?
+                .data_mut(&mut caller)
+                .get_mut(range)
+                .ok_or_else(|| wasmtime::Error::msg("random result is outside guest memory"))?
+                .copy_from_slice(&reply);
+            Ok(0_i32)
         },
     )?;
     linker.func_wrap(
@@ -963,6 +982,43 @@ fn physical_command_allowed(payload: &[u8]) -> Option<(OutboundKind, &[u8])> {
     allowed.then_some((OutboundKind::Command, packet))
 }
 
+fn secure_random(length: usize) -> io::Result<Vec<u8>> {
+    if length > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secure-random request exceeds quota",
+        ));
+    }
+    let mut bytes = vec![0_u8; length];
+    let mut filled = 0;
+    while filled < length {
+        // SAFETY: the remaining slice is writable for exactly the supplied length.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                bytes[filled..].as_mut_ptr(),
+                length - filled,
+                0,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "secure-random source returned no bytes",
+            ));
+        }
+        filled += result as usize;
+    }
+    Ok(bytes)
+}
+
 fn run_physical_supervisor(
     module_path: &Path,
     device: u16,
@@ -1078,6 +1134,15 @@ fn run_physical_supervisor(
                 }
                 let now = wall_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 send_reply(&supervisor, session, request_id, &now.to_le_bytes())?;
+            }
+            Ok((SECURE_RANDOM, payload)) => {
+                let (request_id, payload) = split_request(&payload, session)?;
+                if payload.len() != 4 {
+                    return Err("invalid secure-random request".into());
+                }
+                let length = usize::try_from(i32::from_le_bytes(payload.try_into().unwrap()))
+                    .map_err(|_| "negative secure-random length")?;
+                send_reply(&supervisor, session, request_id, &secure_random(length)?)?;
             }
             Ok((RESULT, payload)) if payload.len() >= 4 => {
                 break i32::from_le_bytes(payload[..4].try_into().unwrap());
@@ -1260,7 +1325,10 @@ fn run_physical_fixture(module_path: &Path) -> Result<String, Box<dyn Error>> {
                 let state = i32::from_le_bytes(payload[8..12].try_into().unwrap());
                 peers = i32::from_le_bytes(payload[12..16].try_into().unwrap());
                 if state == 2 && !advertisement_sent {
-                    let event = [0x3e, 15, 0x02, 1, 0, 0, 1, 2, 3, 4, 5, 6, 3, 2, 1, 6, 0xc4];
+                    let event = [
+                        0x3e, 28, 0x02, 2, 0, 0, 1, 2, 3, 4, 5, 6, 3, 2, 1, 6, 0xc4, 4,
+                        0, 1, 2, 3, 4, 5, 6, 3, 2, 1, 6, 0xc4,
+                    ];
                     pending.push_back(event.to_vec());
                     if !in_flight {
                         let event = pending.pop_front().unwrap();
@@ -1287,6 +1355,17 @@ fn run_physical_fixture(module_path: &Path) -> Result<String, Box<dyn Error>> {
             (CLOCK, payload) => {
                 let (request_id, _) = split_request(&payload, session)?;
                 send_reply(&supervisor, session, request_id, &0_u64.to_le_bytes())?;
+            }
+            (SECURE_RANDOM, payload) => {
+                let (request_id, payload) = split_request(&payload, session)?;
+                if payload.len() != 4 {
+                    return Err("invalid fixture random request".into());
+                }
+                let length = i32::from_le_bytes(payload.try_into().unwrap());
+                if !(0..=4096).contains(&length) {
+                    return Err("fixture random request exceeded quota".into());
+                }
+                send_reply(&supervisor, session, request_id, &vec![0x42; length as usize])?;
             }
             (RESULT, payload) if payload.len() >= 4 => {
                 break (
@@ -1541,6 +1620,16 @@ mod tests {
     use super::*;
 
     const LOOP_MODULE: &[u8] = b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0\x03\x02\x01\0\x07\x07\x01\x03run\0\0\x0a\x09\x01\x07\0\x03\x40\x0c\0\x0b\x0b";
+
+    #[test]
+    fn secure_random_is_bounded() {
+        assert!(secure_random(0).unwrap().is_empty());
+        assert_eq!(secure_random(16).unwrap().len(), 16);
+        assert_eq!(
+            secure_random(4097).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn controller_send_round_trips_over_framed_ipc() {

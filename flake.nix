@@ -36,7 +36,7 @@
           gapWasmSource = builtins.getEnv "SAPPHIRE_GAP_WASM_SOURCE";
           physicalWasmSource = builtins.getEnv "SAPPHIRE_PHYSICAL_WASM_SOURCE";
         in
-        {
+        rec {
           hardware-backends = pkgs.rustPlatform.buildRustPackage {
             pname = "drv-hardware-backends";
             version = "0.1.0";
@@ -138,10 +138,28 @@
                 in
                 ''
                   test "$(${pkgs.coreutils}/bin/sha256sum ${source} | ${pkgs.coreutils}/bin/cut -d ' ' -f 1)" = \
-                    77f50bfc3c390636619d41a819ad6fb4c11f0a865cdccd17f76a7fd88448179c
+                    e8aa718f071332e6b71649857b2e41651dc002d12ae1acbab08482102762358c
                   cp ${source} "$out"
                 ''
             );
+
+          sapphire-discovery = pkgs.writeShellApplication {
+            name = "bluetooth-sapphire-discover";
+            text = ''
+              runner=${bluetooth-sapphire-runner}/bin/bluetooth-sapphire-wasm
+              case ''${1-} in
+                --restore-controller-state|--probe-user-channel)
+                  exec "$runner" "$@"
+                  ;;
+              esac
+              if (( $# != 8 )) || [[ $1 != --device || $3 != --seconds || $5 != --report || $7 != --state ]]; then
+                echo "usage: bluetooth-sapphire-discover --device N --seconds N --report ABSOLUTE --state ABSOLUTE" >&2
+                exit 2
+              fi
+              exec "$runner" --physical-discovery ${sapphire-physical-discovery-wasm} \
+                "$@" --confirm-discovery-only
+            '';
+          };
         }
       );
 

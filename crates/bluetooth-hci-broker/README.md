@@ -20,7 +20,8 @@ bounded `controller.send` lowering into a quota-limited fake controller. The
 explicit physical-discovery path instead keeps the user-channel descriptor in
 the native supervisor, strips H4 before copied inbound delivery, and allows
 only Reset, event-mask, and LE scan commands from Sapphire's transport and
-scanner. ACL, SCO, ISO, pairing, and profiles are rejected in this slice.
+upstream discovery manager/session. ACL, SCO, ISO, pairing, and profiles are
+rejected in this slice.
 
 ## Upstream inventory and provenance
 
@@ -73,7 +74,7 @@ transport, not Sapphire execution, pairing, bonding, profiles, or sandboxing.
 
 The subsequent Sapphire-in-WASM slice also completed a guarded six-second LE
 scan. The native supervisor owned the sole descriptor while the unprivileged
-worker's Sapphire scanner produced a redacted unique-peer count of one and
-cleanly disabled scanning. Exact flags were restored and independent exclusive
-reacquisition succeeded. Peer addresses and names remain only transient HCI
-input and are not written by this path.
+worker's Sapphire discovery manager and active session produced a redacted
+unique-peer count of one and cleanly disabled scanning. Exact flags were
+restored and independent exclusive reacquisition succeeded. Peer addresses and
+names remain only transient HCI input and are not written by this path.
