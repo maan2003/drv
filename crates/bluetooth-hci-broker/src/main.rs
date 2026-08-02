@@ -313,7 +313,7 @@ impl Session {
     }
 
     fn inquire(&mut self, duration: Duration) -> io::Result<()> {
-        let units = ((duration.as_millis() + 1279) / 1280).clamp(1, 0x30) as u8;
+        let units = duration.as_millis().div_ceil(1280).clamp(1, 0x30) as u8;
         // As with scanning, assume the procedure may have started as soon as
         // its command is written, even if the response is malformed or lost.
         self.active.start_inquiry();
