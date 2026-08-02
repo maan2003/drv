@@ -2,7 +2,7 @@
 
 use crate::dns_bridge::{DnsLookupHandle, DnsLookupResult, NativeDnsBridge};
 use crate::socket_provider::NativeSocketProvider;
-use crate::{NativeInstant, Runtime, RuntimeError, UdpSocketHandle};
+use crate::{NativeInstant, NativeIpAddress, Runtime, RuntimeError, UdpSocketHandle};
 use dhcp_client_core::{
     client::{
         AddressAssignmentState, AddressEvent, ClientConfig, DebugLogPrefix, State, Step,
@@ -152,25 +152,30 @@ impl Socket<SocketAddr> for UdpSock {
             .map_err(sock_err)
     }
     async fn recv_from(&self, b: &mut [u8]) -> Result<DatagramInfo<SocketAddr>, SocketError> {
-        poll_fn(|cx| match self.rt.borrow_mut().udp_receive(self.handle) {
-            Ok(Some(p)) => {
-                if p.len() > b.len() {
-                    return Poll::Ready(Err(SocketError::Other(io::Error::other(
-                        "oversize DHCP datagram",
-                    ))));
+        poll_fn(
+            |cx| match self.rt.borrow_mut().udp_receive_msg(self.handle) {
+                Ok(Some(p)) => {
+                    if p.body.len() > b.len() {
+                        return Poll::Ready(Err(SocketError::Other(io::Error::other(
+                            "oversize DHCP datagram",
+                        ))));
+                    }
+                    let NativeIpAddress::V4(address) = p.source.address else {
+                        return Poll::Ready(Err(SocketError::AddrNotAvailable));
+                    };
+                    b[..p.body.len()].copy_from_slice(&p.body);
+                    Poll::Ready(Ok(DatagramInfo {
+                        length: p.body.len(),
+                        address: SocketAddr::from((StdIpv4Addr::from(address), p.source.port)),
+                    }))
                 }
-                b[..p.len()].copy_from_slice(&p);
-                Poll::Ready(Ok(DatagramInfo {
-                    length: p.len(),
-                    address: SocketAddr::from((StdIpv4Addr::UNSPECIFIED, 67)),
-                }))
-            }
-            Ok(None) => {
-                self.wakes.borrow_mut().udp = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(sock_err(e))),
-        })
+                Ok(None) => {
+                    self.wakes.borrow_mut().udp = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                Err(e) => Poll::Ready(Err(sock_err(e))),
+            },
+        )
         .await
     }
 }
@@ -229,6 +234,7 @@ pub struct DhcpService {
     wakes: Rc<RefCell<Wakes>>,
     effects: mpsc::UnboundedReceiver<Effect>,
     address: mpsc::UnboundedSender<AddressEvent<()>>,
+    dhcp_enabled: bool,
     status: DhcpStatus,
 }
 impl DhcpService {
@@ -305,6 +311,7 @@ impl DhcpService {
             wakes,
             effects,
             address,
+            dhcp_enabled: true,
             status: DhcpStatus::Acquiring,
         }
     }
@@ -322,6 +329,28 @@ impl DhcpService {
     }
     pub fn runtime(&self) -> std::cell::Ref<'_, Runtime> {
         self.rt.borrow()
+    }
+    pub fn configure_static(
+        &mut self,
+        address: [u8; 4],
+        prefix: u8,
+        gateway: Option<[u8; 4]>,
+        dns: &[[u8; 4]],
+    ) -> Result<(), RuntimeError> {
+        self.dhcp_enabled = false;
+        let mut servers = [None, None];
+        for (slot, address) in servers.iter_mut().zip(dns) {
+            *slot = Some(StdIpv4Addr::from(*address));
+        }
+        self.rt.borrow_mut().apply_ipv4(address, prefix, gateway)?;
+        self.rt.borrow_mut().set_dns_servers(servers);
+        if self.configure_dns() {
+            self.status = DhcpStatus::Bound;
+            Ok(())
+        } else {
+            self.clear_configuration(DhcpStatus::Failed);
+            Err(RuntimeError::InvalidLease)
+        }
     }
     fn clear_configuration(&mut self, status: DhcpStatus) {
         self.rt.borrow_mut().revoke_ipv4();
@@ -438,8 +467,12 @@ impl NetworkServiceEndpoint for DhcpService {
         }
         self.rt.borrow_mut().set_now(now);
         let n = self.rt.borrow_mut().dispatch_due(budget);
-        self.pool.run_until_stalled();
-        let effects = self.effects();
+        let effects = if self.dhcp_enabled {
+            self.pool.run_until_stalled();
+            self.effects()
+        } else {
+            0
+        };
         let dns = self.dns.pump(&mut self.rt.borrow_mut(), d);
         n + effects + dns
     }
@@ -513,5 +546,35 @@ mod tests {
         let ihl = usize::from(bytes[14] & 0x0f) * 4;
         assert_eq!(&bytes[14 + ihl..14 + ihl + 4], &[0, 68, 0, 67]);
         assert_eq!(service.status(), DhcpStatus::Acquiring);
+    }
+
+    #[test]
+    fn static_configuration_advances_runtime_without_starting_dhcp() {
+        let runtime = Runtime::new(
+            8,
+            [7; 1024],
+            NonZeroU64::new(1).unwrap(),
+            [0x02, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        let mut service = DhcpService::new(
+            runtime,
+            rand::rngs::StdRng::seed_from_u64(7),
+            [0x02, 0, 0, 0, 0, 1],
+        );
+        service
+            .configure_static([192, 0, 2, 10], 24, None, &[[192, 0, 2, 2]])
+            .unwrap();
+
+        service.poll_at(Duration::from_secs(1), 8);
+
+        assert_eq!(service.status(), DhcpStatus::Bound);
+        assert_eq!(service.runtime().ipv4_address(), Some([192, 0, 2, 10]));
+        assert_eq!(
+            service.take_transmit(),
+            None,
+            "static mode emits no DHCP discovery"
+        );
     }
 }

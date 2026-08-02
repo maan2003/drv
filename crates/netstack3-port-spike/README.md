@@ -193,11 +193,16 @@ frame before accepting its multiplexed namespace/client identity, bounds queued
 requests to the kernel queue limit, advances injected monotonic time, and emits
 sequenced events only when readiness changes. It first requires a versioned attach and link-up over an inherited connected
 `SOCK_SEQPACKET` Ethernet capability. The attach supplies the validated MAC and
-MTU; the pinned DHCP service then atomically applies address, routes, and DNS.
-Only `DhcpStatus::Bound` opens the nonblocking kernel device. Lease loss,
-link-down, peer loss, malformed frames, and transport errors close the sole
-device descriptor and revoke every provider client so kernel sockets fail
-closed; a later bound lease opens a fresh provider generation.
+MTU, after which the daemon opens the nonblocking kernel device regardless of
+address state. The pinned DHCP service atomically applies and removes address,
+routes, and DNS without revoking clients; a NixOS static IPv4 option disables
+dependence on DHCP configuration. Offline socket creation, wildcard bind/listen,
+and UDP setup remain available, while remote operations report Netstack3
+reachability errors and never fall back to Linux networking. Link-down removes
+dynamic reachability without closing the socket API. Peer loss, malformed
+transport, provider-device failure, and shutdown terminate the daemon, close the
+sole device descriptor, and revoke every provider client; supervisor restart
+opens a fresh generation after a new attach.
 
 `netstack3-link-supervisor` creates exactly one bounded `SOCK_SEQPACKET` pair,
 passes fd 3 to the daemon and a required shell-free link-peer command, reaps both

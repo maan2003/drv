@@ -65,16 +65,15 @@ level state, not an edge counter.
 
 ## Loopback and wildcard policy
 
-The initial Linux adapter uses **conservative explicit-address policy**. All of
-IPv4 `127/8` and IPv6 `::1` use a hidden Linux kernel socket. Explicit other
-addresses use the provider. An unspecified-address bind (`0.0.0.0` or `::`) is
-rejected with `EOPNOTSUPP` rather than falsely omitting loopback or leaking
-remote traffic to Linux. A future dual-backed wildcard socket must coordinate
-both backends, return one coherent ephemeral port, merge listener/datagram
-readiness, and preserve datagram peer identity before this policy can change.
-Mixed-destination unconnected UDP is classified per `SendMsg`; it therefore
-requires both hidden handles after the first destination and must never migrate
-an existing flow.
+IPv4 `127/8` and IPv6 `::1` use a hidden Linux kernel socket when explicitly
+selected first. Explicit other addresses and unspecified-address binds
+(`0.0.0.0` or `::`) use the provider. Thus wildcard bind/listen remains
+available offline and cannot leak remote traffic to Linux, but it does not also
+listen on private Linux loopback. A future dual-backed wildcard socket would
+need to coordinate both backends, return one coherent ephemeral port, merge
+listener/datagram readiness, and preserve datagram peer identity. Unbound
+unconnected UDP is classified by its first destination and never migrates an
+existing flow between stacks.
 
 ## Pinned Fuchsia semantic source map
 

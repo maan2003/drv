@@ -2,12 +2,16 @@
 
 ## Status
 
-The separately tested Linux kernel provider and native Netstack3 daemon now
-implement ordinary remote IPv4/IPv6 UDP and TCP socket operations. Deterministic
-deployment testing covers pre-lease non-capture, link lifecycle, and fail-closed
-restart, but not yet a composed DHCP-bound application flow. Real production
-connectivity still awaits the Wi-Fi Ethernet owner, and the wider application
-compatibility requirement remains incremental.
+The Linux kernel provider and native Netstack3 daemon implement ordinary remote
+IPv4/IPv6 UDP and TCP socket operations. Deterministic deployment testing covers
+offline socket setup, DHCP-bound UDP/TCP, live sockets across lease
+loss/reacquisition, static IPv4 without a DHCP server, and generation revocation
+on peer transport loss. Wildcard sockets currently select the remote provider
+stack rather than simultaneously listening on private Linux loopback. Real
+production connectivity still awaits the Wi-Fi Ethernet owner. Deferred
+offline UDP connect supports later sends, but peer-filtered receive and
+disconnect after deferred configuration remain incremental, as does the wider
+application compatibility requirement.
 
 Source: project owner. Strength: mandatory for the mature system, incremental
 during device bring-up.

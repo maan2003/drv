@@ -1,14 +1,12 @@
 use netstack3_port_integration::{
     Runtime,
     ethernet_transport::{EthernetAttachment, EthernetInput, SeqpacketEthernet},
-    service::{DhcpService, DhcpStatus},
+    service::DhcpService,
     socket_provider::NativeSocketProvider,
 };
 use netstack3_port_spike::{
     EthernetFrame, NetworkServiceEndpoint as _, SocketClientId, StackEthernetEndpoint as _,
-    provider_dispatch_v2::{
-        ProviderDispatcherV2, RemoteSocketProviderV2 as _, encode_readiness_changed_v2,
-    },
+    provider_dispatch_v2::{ProviderDispatcherV2, encode_readiness_changed_v2},
     provider_transport::{
         MAX_PROVIDER_PAYLOAD, PROVIDER_HEADER_LEN, ProviderIdentity, ProviderNamespaceId,
     },
@@ -20,6 +18,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
+    net::Ipv4Addr,
     num::NonZeroU64,
     os::{
         fd::{FromRawFd as _, OwnedFd, RawFd},
@@ -167,34 +166,56 @@ fn read_request(device: &mut File) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn reconcile_provider(
-    status: DhcpStatus,
-    device: &mut Option<File>,
-    provider: &mut NativeSocketProvider,
-    identities: &mut HashMap<SocketClientId, ProviderNamespaceId>,
-    open: impl FnOnce() -> io::Result<File>,
-) -> io::Result<()> {
-    if status == DhcpStatus::Bound {
-        if device.is_none() {
-            *device = Some(open()?);
-        }
-    } else if device.is_some() {
-        // Close the singleton kernel endpoint before revoking all userspace
-        // clients, so new and live kernel sockets fail closed immediately.
-        drop(device.take());
-        for client in identities.keys().copied().collect::<Vec<_>>() {
-            let _ = provider.close_client(client);
-        }
-        identities.clear();
-    }
-    Ok(())
-}
-
 fn entropy() -> io::Result<(Vec<u8>, [u8; 32])> {
     let mut bytes = vec![0; 8192 + 32];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let seed = bytes.split_off(8192).try_into().unwrap();
     Ok((bytes, seed))
+}
+
+fn static_ipv4() -> io::Result<Option<([u8; 4], u8, Option<[u8; 4]>, Vec<[u8; 4]>)>> {
+    let Some(address) = env::var_os("NETSTACK3_STATIC_IPV4_ADDRESS") else {
+        return Ok(None);
+    };
+    let parse = |name: &str, value: &std::ffi::OsStr| -> io::Result<[u8; 4]> {
+        value
+            .to_str()
+            .ok_or_else(|| invalid_data(format!("{name} is not UTF-8")))?
+            .parse::<Ipv4Addr>()
+            .map(|address| address.octets())
+            .map_err(|error| invalid_data(format!("invalid {name}: {error}")))
+    };
+    let address = parse("NETSTACK3_STATIC_IPV4_ADDRESS", &address)?;
+    let prefix = env::var("NETSTACK3_STATIC_IPV4_PREFIX")
+        .map_err(|_| invalid_data("static IPv4 prefix is required"))?
+        .parse::<u8>()
+        .map_err(|error| invalid_data(format!("invalid static IPv4 prefix: {error}")))?;
+    let gateway = env::var_os("NETSTACK3_STATIC_IPV4_GATEWAY")
+        .map(|value| parse("NETSTACK3_STATIC_IPV4_GATEWAY", &value))
+        .transpose()?;
+    let dns = env::var_os("NETSTACK3_STATIC_IPV4_DNS")
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| invalid_data("static IPv4 DNS is not UTF-8"))?
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .parse::<Ipv4Addr>()
+                        .map(|address| address.octets())
+                        .map_err(|error| invalid_data(format!("invalid static IPv4 DNS: {error}")))
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if prefix > 32 || dns.len() > 2 {
+        return Err(invalid_data(
+            "static IPv4 prefix or DNS server count is out of range",
+        ));
+    }
+    Ok(Some((address, prefix, gateway, dns)))
 }
 
 fn run(
@@ -212,11 +233,18 @@ fn run(
     )
     .map_err(invalid_data)?;
     let mut service = DhcpService::new(runtime, StdRng::from_seed(dhcp_seed), attachment.mac);
+    let static_ipv4 = static_ipv4()?;
+    if let Some((address, prefix, gateway, dns)) = static_ipv4.as_ref() {
+        service
+            .configure_static(*address, *prefix, *gateway, dns)
+            .map_err(invalid_data)?;
+    }
     let mut provider = service.socket_provider();
 
-    // DHCP starts while the kernel provider remains inactive. The provider
-    // becomes reachable only after address, routes, and DNS are all applied.
-    let mut device = None;
+    // Provider ownership follows the live data-plane transport, not IP
+    // configuration. This preserves normal offline socket semantics while
+    // DHCP atomically changes only address, route, and DNS state.
+    let mut device = open_provider(device_path)?;
     let (sender, inputs) = mpsc::sync_channel(QUEUE_CAPACITY);
     let (outbound, frames) = mpsc::sync_channel(QUEUE_CAPACITY);
     let ethernet_reader = ethernet.try_clone()?;
@@ -238,42 +266,35 @@ fn run(
             Ok(Ok(Input::Ethernet(frame))) => service
                 .receive_frame(frame)
                 .map_err(|_| invalid_data("runtime rejected Ethernet frame"))?,
-            Ok(Ok(Input::LinkDown)) => return Ok(()),
+            // Carrier loss changes reachability at the data-plane owner; it
+            // does not discard configured state or revoke provider sockets.
+            Ok(Ok(Input::LinkDown)) => {}
             Ok(Err(error)) => return Err(error),
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {}
         }
         service.poll_at(started.elapsed(), QUEUE_CAPACITY);
-        reconcile_provider(
-            service.status(),
-            &mut device,
-            &mut provider,
-            &mut identities,
-            || open_provider(device_path),
-        )?;
-        if let Some(device) = device.as_mut() {
-            for _ in 0..QUEUE_CAPACITY {
-                let Some(request) = read_request(device)? else {
-                    break;
-                };
-                let (identity, opcode, success, response) = dispatch(&provider, &request)?;
-                match identities.get(&identity.client) {
-                    Some(namespace) if *namespace != identity.namespace => {
-                        return Err(invalid_data("client changed namespace"));
-                    }
-                    Some(_) => {}
-                    None if success && opcode == ProviderOpcodeV2::OpenClient => {
-                        identities.insert(identity.client, identity.namespace);
-                    }
-                    None => {}
+        for _ in 0..QUEUE_CAPACITY {
+            let Some(request) = read_request(&mut device)? else {
+                break;
+            };
+            let (identity, opcode, success, response) = dispatch(&provider, &request)?;
+            match identities.get(&identity.client) {
+                Some(namespace) if *namespace != identity.namespace => {
+                    return Err(invalid_data("client changed namespace"));
                 }
-                device.write_all(&response)?;
-                if success && opcode == ProviderOpcodeV2::CloseClient {
-                    identities.remove(&identity.client);
+                Some(_) => {}
+                None if success && opcode == ProviderOpcodeV2::OpenClient => {
+                    identities.insert(identity.client, identity.namespace);
                 }
+                None => {}
             }
-            write_readiness_events(device, &mut provider, &identities)?;
+            device.write_all(&response)?;
+            if success && opcode == ProviderOpcodeV2::CloseClient {
+                identities.remove(&identity.client);
+            }
         }
+        write_readiness_events(&mut device, &mut provider, &identities)?;
         let next_frame = pending_frame
             .is_none()
             .then(|| service.take_transmit())
@@ -306,16 +327,15 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 as _;
     use netstack3_port_spike::{
         RemoteIpAddress, RemoteIpVersion, SocketClientId,
         provider_transport::{ProviderFrameType, ProviderNamespaceId},
-        provider_transport_v2::{ProviderFrameV2, ProviderSocketAddressV2, ProviderSocketKindV2},
+        provider_transport_v2::{
+            ProviderFrameV2, ProviderNameV2, ProviderSocketAddressV2, ProviderSocketKindV2,
+        },
     };
-    use std::{
-        cell::{Cell, RefCell},
-        num::NonZeroU16,
-        rc::Rc,
-    };
+    use std::{cell::RefCell, num::NonZeroU16, rc::Rc};
 
     #[test]
     fn dispatches_a_device_client_through_the_native_provider() {
@@ -327,7 +347,8 @@ mod tests {
             1500,
         )
         .unwrap();
-        let mut provider = NativeSocketProvider::new(Rc::new(RefCell::new(runtime)));
+        let runtime = Rc::new(RefCell::new(runtime));
+        let mut provider = NativeSocketProvider::new(runtime.clone());
         let endpoint = ProviderFramedEndpointV2::new(
             ProviderIdentity {
                 namespace: ProviderNamespaceId::from_raw(7),
@@ -470,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_ownership_follows_usable_configuration_and_revokes_clients() {
+    fn provider_clients_survive_configuration_changes() {
         let runtime = Runtime::new(
             8,
             [1; 8192],
@@ -479,78 +500,28 @@ mod tests {
             1500,
         )
         .unwrap();
-        let mut provider = NativeSocketProvider::new(Rc::new(RefCell::new(runtime)));
-        let mut device = None;
-        let mut identities = HashMap::new();
-        let opens = Cell::new(0);
-        let open = || {
-            opens.set(opens.get() + 1);
-            File::open("/dev/null")
-        };
-
-        reconcile_provider(
-            DhcpStatus::Acquiring,
-            &mut device,
-            &mut provider,
-            &mut identities,
-            open,
-        )
-        .unwrap();
-        assert!(device.is_none());
-        assert_eq!(
-            opens.get(),
-            0,
-            "link-up without a lease must not capture sockets"
-        );
-
-        reconcile_provider(
-            DhcpStatus::Bound,
-            &mut device,
-            &mut provider,
-            &mut identities,
-            open,
-        )
-        .unwrap();
-        assert!(device.is_some());
-        assert_eq!(opens.get(), 1);
-
+        let runtime = Rc::new(RefCell::new(runtime));
+        let mut provider = NativeSocketProvider::new(runtime.clone());
         let client = SocketClientId::from_raw(19);
         provider.open_client(client, 1).unwrap();
-        provider
+        let socket = provider
             .open_socket(client, ProviderSocketKindV2::Udp, RemoteIpVersion::V4)
             .unwrap();
-        identities.insert(client, ProviderNamespaceId::from_raw(23));
+        provider.bind(socket, None, 0).unwrap();
 
-        reconcile_provider(
-            DhcpStatus::Acquiring,
-            &mut device,
-            &mut provider,
-            &mut identities,
-            open,
-        )
-        .unwrap();
-        assert!(device.is_none());
-        assert!(identities.is_empty());
+        runtime.borrow_mut().revoke_ipv4();
+
         assert!(
-            provider
-                .open_socket(client, ProviderSocketKindV2::Udp, RemoteIpVersion::V4)
-                .is_err(),
-            "lease loss revokes live sockets"
+            provider.get_name(socket, ProviderNameV2::Local).is_ok(),
+            "lease loss preserves the socket"
         );
-
-        reconcile_provider(
-            DhcpStatus::Bound,
-            &mut device,
-            &mut provider,
-            &mut identities,
-            open,
-        )
-        .unwrap();
-        assert!(device.is_some());
-        assert_eq!(
-            opens.get(),
-            2,
-            "configuration recovery opens a new generation"
+        runtime
+            .borrow_mut()
+            .apply_ipv4([192, 0, 2, 10], 24, None)
+            .unwrap();
+        assert!(
+            provider.get_name(socket, ProviderNameV2::Local).is_ok(),
+            "reconfiguration preserves the socket"
         );
     }
 

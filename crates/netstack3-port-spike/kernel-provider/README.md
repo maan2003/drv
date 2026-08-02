@@ -26,8 +26,14 @@ NixOS deployments can import the flake's
 `hardware.netstack3KernelProvider.enable` opts into the pinned kernel and patch.
 `services.netstack3Provider.enable` implies that option and additionally runs
 the packaged socketpair supervisor with the required shell-free
-`linkPeer.command`. The daemon does not open the provider device until DHCP
-configuration is fully bound. `nix build
+`linkPeer.command`. After a valid attach, the daemon owns the provider device
+independently of address configuration. This preserves offline socket creation,
+wildcard bind/listen, and UDP setup; unavailable remote operations return normal
+reachability errors. DHCP lease changes atomically update only addresses,
+routes, and DNS, while `staticIpv4` supplies a DHCP-independent configuration.
+`nix build
 .#checks.x86_64-linux.netstack3-provider-service` boots the real package with a
-deterministic, non-production link peer and proves that link-up without DHCP
-does not capture kernel sockets and peer loss creates a fresh generation.
+deterministic, non-production DHCP/ARP/UDP/TCP peer. It proves pre-DHCP socket
+behavior, an existing socket across acquisition and lease expiry/reacquisition,
+static configuration, remote traffic, and HUP plus a fresh generation only on
+peer transport loss.

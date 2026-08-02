@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use either::Either;
 use net_types::UnicastAddr;
 use net_types::ethernet::Mac;
 use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Ipv6, Ipv6Addr, Mtu, Subnet};
@@ -27,9 +28,9 @@ use netstack3_base::socket::ShutdownType;
 use netstack3_base::sync::{DynDebugReferences, RcNotifier};
 use netstack3_base::{
     AddressResolutionFailed, AtomicInstant, ChecksumOffloadResult, DeferredResourceRemovalContext,
-    EventContext, Instant, InstantBindingsTypes, InstantContext, LinkDevice, MarkDomain,
-    MatcherBindingsTypes, ReferenceNotifiers, RemoveResourceResultWithContext, RngContext,
-    SettingsContext, SocketDiagnosticsSeed, TimerBindingsTypes, TimerContext,
+    EventContext, Instant, InstantBindingsTypes, InstantContext, LinkDevice, LocalAddressError,
+    MarkDomain, MatcherBindingsTypes, ReferenceNotifiers, RemoveResourceResultWithContext,
+    RngContext, SettingsContext, SocketDiagnosticsSeed, TimerBindingsTypes, TimerContext,
     TxMetadataBindingsTypes,
 };
 use netstack3_core::PendingDatagramSocketError;
@@ -71,7 +72,10 @@ use netstack3_ip::nud::{LinkResolutionContext, LinkResolutionNotifier};
 use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
 };
-use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
+use netstack3_ip::{
+    IpRoutingBindingsTypes, MarksBindingsContext,
+    socket::{IpSockCreationError, IpSockSendError},
+};
 const MAX_DHCP_DATAGRAM_LEN: usize = 1232;
 use netstack3_port_spike::{
     EthernetDeviceEvent, EthernetFrame, NetworkConfigurationAdmin, NetworkServiceEndpoint,
@@ -84,8 +88,8 @@ use netstack3_tcp::{
 };
 use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_udp::{
-    ReceiveUdpError, UdpBindingsTypes, UdpPacketMeta, UdpReceiveBindingsContext, UdpSettings,
-    UdpSocketId,
+    ReceiveUdpError, SendToError as UdpSendToError, UdpBindingsTypes, UdpPacketMeta,
+    UdpReceiveBindingsContext, UdpSettings, UdpSocketId,
 };
 use packet::{Buf, BufferMut, FragmentedByteSlice, InnerPacketBuilder, NestableSerializer as _};
 use packet_formats::ethernet::EtherType;
@@ -1024,6 +1028,55 @@ fn map_tcp_connect_error(error: ConnectError) -> RuntimeError {
     }
 }
 
+fn map_udp_connect_error(error: netstack3_datagram::ConnectError) -> RuntimeError {
+    match error {
+        netstack3_datagram::ConnectError::Ip(IpSockCreationError::Route(_)) => {
+            RuntimeError::NetworkUnreachable
+        }
+        netstack3_datagram::ConnectError::CouldNotAllocateLocalPort => RuntimeError::SocketLimit,
+        netstack3_datagram::ConnectError::SockAddrConflict => RuntimeError::AddressInUse,
+        netstack3_datagram::ConnectError::Ip(_)
+        | netstack3_datagram::ConnectError::Zone(_)
+        | netstack3_datagram::ConnectError::RemoteUnexpectedlyMapped
+        | netstack3_datagram::ConnectError::RemoteUnexpectedlyNonMapped => {
+            RuntimeError::InvalidAddress
+        }
+    }
+}
+
+fn map_udp_send_to_error(error: Either<LocalAddressError, UdpSendToError>) -> RuntimeError {
+    let error = match error {
+        Either::Left(error) => {
+            return match error {
+                LocalAddressError::AddressInUse => RuntimeError::AddressInUse,
+                LocalAddressError::FailedToAllocateLocalPort => RuntimeError::SocketLimit,
+                LocalAddressError::CannotBindToAddress | LocalAddressError::AddressMismatch => {
+                    RuntimeError::NetworkUnreachable
+                }
+                LocalAddressError::Zone(_) | LocalAddressError::AddressUnexpectedlyMapped => {
+                    RuntimeError::InvalidAddress
+                }
+            };
+        }
+        Either::Right(error) => error,
+    };
+    match error {
+        UdpSendToError::CreateSock(IpSockCreationError::Route(_))
+        | UdpSendToError::Send(IpSockSendError::Unroutable(_)) => RuntimeError::NetworkUnreachable,
+        UdpSendToError::Send(IpSockSendError::Mtu) | UdpSendToError::InvalidLength => {
+            RuntimeError::PayloadTooLarge
+        }
+        UdpSendToError::SendBufferFull => RuntimeError::WouldBlock,
+        UdpSendToError::NotWriteable
+        | UdpSendToError::CreateSock(_)
+        | UdpSendToError::Send(_)
+        | UdpSendToError::Zone(_)
+        | UdpSendToError::RemotePortUnset
+        | UdpSendToError::RemoteUnexpectedlyMapped
+        | UdpSendToError::RemoteUnexpectedlyNonMapped => RuntimeError::InvalidState,
+    }
+}
+
 fn map_tcp_connection_error(error: ConnectionError) -> RuntimeError {
     match error {
         ConnectionError::ConnectionRefused | ConnectionError::PortUnreachable => {
@@ -1528,7 +1581,7 @@ impl Runtime {
                 UdpRemotePort::Set(remote_port),
                 Buf::new(payload.to_vec(), ..),
             )
-            .map_err(|_| RuntimeError::SendFailed)
+            .map_err(map_udp_send_to_error)
     }
 
     pub fn udp_connect(
@@ -1548,7 +1601,7 @@ impl Runtime {
                 Some(ZonedAddr::Unzoned(address)),
                 UdpRemotePort::Set(remote_port),
             )
-            .map_err(|_| RuntimeError::InvalidState)
+            .map_err(map_udp_connect_error)
     }
 
     pub fn udp_send(
@@ -1682,7 +1735,7 @@ impl Runtime {
                 UdpRemotePort::Set(remote_port),
                 Buf::new(payload.to_vec(), ..),
             )
-            .map_err(|_| RuntimeError::SendFailed)
+            .map_err(map_udp_send_to_error)
     }
 
     pub fn udp_connect_ipv6(
@@ -1705,7 +1758,7 @@ impl Runtime {
                 Some(ZonedAddr::Unzoned(address)),
                 UdpRemotePort::Set(remote_port),
             )
-            .map_err(|_| RuntimeError::InvalidState)
+            .map_err(map_udp_connect_error)
     }
 
     pub fn udp_send_ipv6(
@@ -2692,7 +2745,7 @@ mod tests {
                 NonZeroU16::new(20002).unwrap(),
                 b"no route",
             ),
-            Err(RuntimeError::SendFailed)
+            Err(RuntimeError::NetworkUnreachable)
         );
     }
 

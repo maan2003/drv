@@ -38,6 +38,25 @@ in
           attach/link protocol and own the physical or deterministic link.
         '';
       };
+
+      staticIpv4 = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            address = lib.mkOption { type = lib.types.str; };
+            prefix = lib.mkOption { type = lib.types.ints.between 0 32; };
+            gateway = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+            };
+            dns = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+            };
+          };
+        });
+        default = null;
+        description = "Optional static IPv4 configuration; when set, DHCP is disabled.";
+      };
     };
   };
 
@@ -60,12 +79,23 @@ in
           assertion = serviceCfg.linkPeer.command != [ ];
           message = "services.netstack3Provider.linkPeer.command must name a link peer";
         }
+        {
+          assertion = serviceCfg.staticIpv4 == null || lib.length serviceCfg.staticIpv4.dns <= 2;
+          message = "services.netstack3Provider.staticIpv4.dns supports at most two servers";
+        }
       ];
 
       systemd.services.netstack3-provider = {
         description = "Native Netstack3 kernel provider";
         wantedBy = [ "multi-user.target" ];
         after = [ "systemd-udev-settle.service" ];
+        environment = lib.optionalAttrs (serviceCfg.staticIpv4 != null) {
+          NETSTACK3_STATIC_IPV4_ADDRESS = serviceCfg.staticIpv4.address;
+          NETSTACK3_STATIC_IPV4_PREFIX = toString serviceCfg.staticIpv4.prefix;
+          NETSTACK3_STATIC_IPV4_DNS = lib.concatStringsSep "," serviceCfg.staticIpv4.dns;
+        } // lib.optionalAttrs (serviceCfg.staticIpv4 != null && serviceCfg.staticIpv4.gateway != null) {
+          NETSTACK3_STATIC_IPV4_GATEWAY = serviceCfg.staticIpv4.gateway;
+        };
         serviceConfig = {
           ExecStart = utils.escapeSystemdExecArgs serviceCommand;
           Restart = "on-failure";

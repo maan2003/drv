@@ -4,8 +4,8 @@ Subject: [PATCH] net: add Netstack3 userspace socket provider
 Add a built-in, protocol-agnostic socket proxy for userspace Netstack3. The
 proxy preserves explicit 127/8 and ::1 sockets through hidden kernel sockets,
 routes explicit remote TCP/UDP operations over the bounded NS3P v2 ABI, and
-fails closed when the provider is absent. Wildcard bind is conservatively
-rejected until a dual-backed implementation can preserve both ownerships.
+fails closed when the provider is absent. Wildcard bind selects provider
+ownership; explicit private loopback remains in Linux.
 
 Signed-off-by: drv project <devnull@example.invalid>
 ---
@@ -65,7 +65,7 @@ Signed-off-by: drv project <devnull@example.invalid>
 +obj-$(CONFIG_NETSTACK3_PROVIDER) += netstack3_provider.o
 --- /dev/null
 +++ b/net/netstack3_provider.c
-@@ -0,0 +1,1022 @@
+@@ -0,0 +1,1081 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Protocol-agnostic AF_INET/AF_INET6 socket proxy for a userspace Netstack3
@@ -161,6 +161,9 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	u64 handle;
 +	u64 provider_generation;
 +	__poll_t readiness;
++	u64 readiness_sequence;
++	u16 provider_readiness;
++	bool connecting;
 +	struct list_head remote_node;
 +};
 +
@@ -374,6 +377,14 @@ Signed-off-by: drv project <devnull@example.invalid>
 +static int ns3_encode_addr(u8 *out, const struct sockaddr *addr, int len,
 +			   bool optional)
 +{
++	if (optional &&
++	    ((addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in) &&
++	      !((const struct sockaddr_in *)addr)->sin_addr.s_addr) ||
++	     (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6) &&
++	      ipv6_addr_any(&((const struct sockaddr_in6 *)addr)->sin6_addr)))) {
++		out[0] = 0;
++		return 1;
++	}
 +	if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
 +		const struct sockaddr_in *sin = (const void *)addr;
 +		out[0] = 4;
@@ -387,10 +398,6 @@ Signed-off-by: drv project <devnull@example.invalid>
 +		memcpy(out + 1, &sin6->sin6_addr, 16);
 +		put_unaligned_le16(be16_to_cpu(sin6->sin6_port), out + 17);
 +		return 19;
-+	}
-+	if (optional) {
-+		out[0] = 0;
-+		return 1;
 +	}
 +	return -EINVAL;
 +}
@@ -424,12 +431,12 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	size_t response_len = 0;
 +	int n, ret;
 +
-+	/* Wildcard needs simultaneous Linux-loopback and provider ownership. */
-+	if ((addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in) &&
-+	     !((struct sockaddr_in *)addr)->sin_addr.s_addr) ||
-+	    (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6) &&
-+	     ipv6_addr_any(&((struct sockaddr_in6 *)addr)->sin6_addr)))
-+		return -EOPNOTSUPP;
++	/*
++	 * A wildcard bind chooses remote provider ownership. Explicit loopback
++	 * addresses still choose the private Linux backend, but one descriptor
++	 * cannot listen on both independently implemented stacks.
++	 */
++
 +	ret = ns3_select(sock, addr, len);
 +	if (ret)
 +		return ret;
@@ -439,10 +446,33 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	n = ns3_encode_addr(payload + 8, addr, len, true);
 +	if (n < 0)
 +		return n;
++	if (n == 1) {
++		u16 port = addr->sa_family == AF_INET ?
++			be16_to_cpu(((const struct sockaddr_in *)addr)->sin_port) :
++			be16_to_cpu(((const struct sockaddr_in6 *)addr)->sin6_port);
++		put_unaligned_le16(port, payload + 9);
++		n += 2;
++	}
 +	ret = ns3_call(nsk, NS3_BIND,
 +		       payload, 8 + n, &response, &response_len);
 +	if (!ret && response_len != 7 && response_len != 19)
 +		ret = -EPROTO;
++	kfree(response);
++	return ret;
++}
++
++static int ns3_get_error(struct ns3_sock *nsk)
++{
++	u8 payload[8], *response = NULL;
++	size_t response_len = 0;
++	int ret;
++
++	put_unaligned_le64(nsk->handle, payload);
++	ret = ns3_call(nsk, NS3_GET_ERROR, payload, sizeof(payload),
++		       &response, &response_len);
++	if (!ret)
++		ret = response_len == 1 && response[0] ?
++			ns3_error(response[0]) : response_len == 1 ? 0 : -EPROTO;
 +	kfree(response);
 +	return ret;
 +}
@@ -454,6 +484,7 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	u8 *response = NULL;
 +	size_t response_len = 0;
 +	int n, ret;
++	u64 readiness_sequence;
 +
 +	ret = ns3_select(sock, addr, len);
 +	if (ret)
@@ -464,10 +495,31 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	n = ns3_encode_addr(payload + 8, addr, len, false);
 +	if (n < 0)
 +		return n;
++	readiness_sequence = READ_ONCE(nsk->readiness_sequence);
++	if (nsk->type == SOCK_STREAM)
++		WRITE_ONCE(nsk->connecting, true);
 +	ret = ns3_call(nsk, NS3_CONNECT,
 +		       payload, 8 + n, &response, &response_len);
 +	kfree(response);
-+	return ret ?: (response_len ? -EPROTO : 0);
++	if (!ret || ret != -EINPROGRESS) {
++		WRITE_ONCE(nsk->connecting, false);
++		return ret ?: (response_len ? -EPROTO : 0);
++	}
++	if (flags & O_NONBLOCK)
++		return ret;
++	ret = wait_event_interruptible(*sk_sleep(&nsk->sk),
++		(READ_ONCE(nsk->readiness_sequence) != readiness_sequence &&
++		 READ_ONCE(nsk->provider_readiness) & 0xc0) ||
++		!READ_ONCE(ns3_active) ||
++		READ_ONCE(nsk->provider_generation) != READ_ONCE(ns3_generation));
++	if (ret)
++		return ret;
++	if (!READ_ONCE(ns3_active) ||
++	    READ_ONCE(nsk->provider_generation) != READ_ONCE(ns3_generation))
++		return -ENETDOWN;
++	WRITE_ONCE(nsk->connecting, false);
++	return READ_ONCE(nsk->provider_readiness) & 0x80 ?
++		ns3_get_error(nsk) : 0;
 +}
 +
 +static int ns3_listen(struct socket *sock, int backlog)
@@ -698,6 +750,8 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	mutex_lock(&ns3_lock);
 +	mask = ns3_active && nsk->provider_generation == ns3_generation ?
 +		nsk->readiness : EPOLLERR | EPOLLHUP;
++	if (READ_ONCE(nsk->connecting))
++		mask &= ~(EPOLLOUT | EPOLLWRNORM);
 +	mutex_unlock(&ns3_lock);
 +	return mask;
 +}
@@ -955,6 +1009,10 @@ Signed-off-by: drv project <devnull@example.invalid>
 +		    cpu_to_le64(nsk->namespace_id) != h->namespace_id ||
 +		    cpu_to_le64(nsk->client_id) != h->client_id)
 +			continue;
++		nsk->readiness_sequence = get_unaligned_le64(payload);
++		nsk->provider_readiness = get_unaligned_le16(payload + 16);
++		if (nsk->provider_readiness & 0xc0)
++			WRITE_ONCE(nsk->connecting, false);
 +		nsk->readiness = (get_unaligned_le16(payload + 16) & 0x0d ? EPOLLIN | EPOLLRDNORM : 0) |
 +			(get_unaligned_le16(payload + 16) & 0x02 ? EPOLLOUT | EPOLLWRNORM : 0) |
 +			(get_unaligned_le16(payload + 16) & 0xa0 ? EPOLLERR : 0) |
@@ -963,7 +1021,8 @@ Signed-off-by: drv project <devnull@example.invalid>
 +					   nsk->readiness | EPOLLERR | EPOLLHUP);
 +		return 0;
 +	}
-+	return -ENOENT;
++	/* A close can race an already queued readiness notification. */
++	return 0;
 +}
 +
 +static ssize_t ns3_device_write(struct file *file, const char __user *buf,
@@ -1153,7 +1212,7 @@ Signed-off-by: drv project <devnull@example.invalid>
 +include ../lib.mk
 --- /dev/null
 +++ b/tools/testing/selftests/netstack3/provider.c
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,321 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#define _GNU_SOURCE
 +#include <arpa/inet.h>
@@ -1280,8 +1339,14 @@ Signed-off-by: drv project <devnull@example.invalid>
 +			handle = atomic_fetch_add(&next_handle, 1);
 +			respond(h, &handle, 8); break;
 +		case BIND:
-+			/* Return the requested explicit address, including port zero. */
-+			respond(h, p + 8, h->payload_len - 8); break;
++			if (h->payload_len == 11 && p[8] == 0) {
++				result[0] = 4;
++				result[5] = 0x34; result[6] = 0x12;
++				respond(h, result, 7);
++			} else {
++				respond(h, p + 8, h->payload_len - 8);
++			}
++			break;
 +		case CONNECT:
 +			respond(h, NULL, 0);
 +			memcpy(&handle, p, 8);
@@ -1416,12 +1481,12 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	return connected;
 +}
 +
-+static int wildcard_rejected(void)
++static int wildcard_remote(void)
 +{
 +	struct sockaddr_in any = { .sin_family = AF_INET };
-+	int s = socket(AF_INET, SOCK_STREAM, 0), ret = bind(s, (void *)&any, sizeof(any));
++	int s = socket(AF_INET, SOCK_STREAM, 0), ret = bind(s, (void *)&any, sizeof(any)) || listen(s, 1);
 +	close(s);
-+	if (ret != -1 || errno != EOPNOTSUPP) { errno = EPROTO; fail("conservative wildcard policy"); return -1; }
++	if (ret) { fail("remote wildcard bind/listen"); return -1; }
 +	return 0;
 +}
 +
@@ -1447,13 +1512,13 @@ Signed-off-by: drv project <devnull@example.invalid>
 +	loop = loopback6(); printf("%s 3 - IPv6 ::1 remains Linux loopback\n", loop ? "not ok" : "ok");
 +	remote = remote_udp(); printf("%s 4 - UDP connect, peer, empty datagram and fd lifecycle\n", remote ? "not ok" : "ok");
 +	live_tcp = remote_tcp(); printf("%s 5 - TCP bind/listen/accept/connect/shutdown and readiness\n", live_tcp < 0 ? "not ok" : "ok");
-+	remote = wildcard_rejected(); printf("%s 6 - wildcard bind is conservatively rejected\n", remote ? "not ok" : "ok");
++	remote = wildcard_remote(); printf("%s 6 - wildcard bind and listen use provider\n", remote ? "not ok" : "ok");
 +	{ struct header bad = { .magic = MAGIC, .version = 2, .type = EVENT,
 +		.opcode = READY_CHANGED, .reserved = 1 };
 +	  int r = write(provider_fd, &bad, sizeof(bad));
 +	  printf("%s 7 - malformed frame rejected\n", r < 0 && errno == EPROTO ? "ok" : "not ok"); }
 +	printf("%s 8 - provider clients close once after their final socket\n",
-+	       atomic_load(&client_opens) == 3 && atomic_load(&client_closes) == 2 ? "ok" : "not ok");
++	       atomic_load(&client_opens) == 4 && atomic_load(&client_closes) == 3 ? "ok" : "not ok");
 +	atomic_store(&stop_provider, 1);
 +	pthread_cancel(thread); pthread_join(thread, NULL); close(provider_fd);
 +	{ struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.fd = live_tcp }, got;

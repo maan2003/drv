@@ -7,7 +7,10 @@ as a deployment-tested spike against a deterministic Ethernet peer. They remain
 independently replaceable and production external connectivity still awaits the
 Wi-Fi Ethernet owner. The spike currently combines the service and host-adapter
 binding in one daemon, so the mature process-isolation boundary described below
-is not yet complete.
+is not yet complete. Provider availability follows the attached data-plane
+transport rather than DHCP state: address/route/DNS loss changes reachability
+without destroying application sockets, while transport loss revokes the
+generation.
 
 One sandboxed portable service owns externally reachable Ethernet, ARP/NDP, IP,
 fragmentation, ICMP, UDP, TCP, routing, and network policy. Splitting it by DNS

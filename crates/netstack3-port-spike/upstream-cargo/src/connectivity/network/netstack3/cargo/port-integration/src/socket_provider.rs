@@ -910,7 +910,12 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
             self.state.borrow().sockets.get(&handle),
             Some(Socket::Tcp { .. })
         );
-        if result.is_ok() || result == Err(RemoteSocketError::InProgress) {
+        let deferred_udp = !tcp
+            && matches!(
+                result,
+                Err(RemoteSocketError::NetworkUnreachable | RemoteSocketError::HostUnreachable)
+            );
+        if result.is_ok() || result == Err(RemoteSocketError::InProgress) || deferred_udp {
             match self.state.borrow_mut().sockets.get_mut(&handle).unwrap() {
                 Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => {
                     v2.peer = Some(peer);
@@ -920,6 +925,8 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         }
         if tcp && result.is_ok() {
             Err(RemoteSocketError::InProgress)
+        } else if deferred_udp {
+            Ok(())
         } else {
             result
         }

@@ -124,8 +124,14 @@ static void *provider(void *unused)
 			handle = atomic_fetch_add(&next_handle, 1);
 			respond(h, &handle, 8); break;
 		case BIND:
-			/* Return the requested explicit address, including port zero. */
-			respond(h, p + 8, h->payload_len - 8); break;
+			if (h->payload_len == 11 && p[8] == 0) {
+				result[0] = 4;
+				result[5] = 0x34; result[6] = 0x12;
+				respond(h, result, 7);
+			} else {
+				respond(h, p + 8, h->payload_len - 8);
+			}
+			break;
 		case CONNECT:
 			respond(h, NULL, 0);
 			memcpy(&handle, p, 8);
@@ -260,12 +266,12 @@ static int remote_tcp(void)
 	return connected;
 }
 
-static int wildcard_rejected(void)
+static int wildcard_remote(void)
 {
 	struct sockaddr_in any = { .sin_family = AF_INET };
-	int s = socket(AF_INET, SOCK_STREAM, 0), ret = bind(s, (void *)&any, sizeof(any));
+	int s = socket(AF_INET, SOCK_STREAM, 0), ret = bind(s, (void *)&any, sizeof(any)) || listen(s, 1);
 	close(s);
-	if (ret != -1 || errno != EOPNOTSUPP) { errno = EPROTO; fail("conservative wildcard policy"); return -1; }
+	if (ret) { fail("remote wildcard bind/listen"); return -1; }
 	return 0;
 }
 
@@ -291,13 +297,13 @@ int main(void)
 	loop = loopback6(); printf("%s 3 - IPv6 ::1 remains Linux loopback\n", loop ? "not ok" : "ok");
 	remote = remote_udp(); printf("%s 4 - UDP connect, peer, empty datagram and fd lifecycle\n", remote ? "not ok" : "ok");
 	live_tcp = remote_tcp(); printf("%s 5 - TCP bind/listen/accept/connect/shutdown and readiness\n", live_tcp < 0 ? "not ok" : "ok");
-	remote = wildcard_rejected(); printf("%s 6 - wildcard bind is conservatively rejected\n", remote ? "not ok" : "ok");
+	remote = wildcard_remote(); printf("%s 6 - wildcard bind and listen use provider\n", remote ? "not ok" : "ok");
 	{ struct header bad = { .magic = MAGIC, .version = 2, .type = EVENT,
 		.opcode = READY_CHANGED, .reserved = 1 };
 	  int r = write(provider_fd, &bad, sizeof(bad));
 	  printf("%s 7 - malformed frame rejected\n", r < 0 && errno == EPROTO ? "ok" : "not ok"); }
 	printf("%s 8 - provider clients close once after their final socket\n",
-	       atomic_load(&client_opens) == 3 && atomic_load(&client_closes) == 2 ? "ok" : "not ok");
+	       atomic_load(&client_opens) == 4 && atomic_load(&client_closes) == 3 ? "ok" : "not ok");
 	atomic_store(&stop_provider, 1);
 	pthread_cancel(thread); pthread_join(thread, NULL); close(provider_fd);
 	{ struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.fd = live_tcp }, got;
