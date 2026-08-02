@@ -20,12 +20,11 @@ that mechanism. At this pin:
 - none of the relevant first-party archives contains a `Cargo.toml`.
 
 Fuchsia source is under the BSD 2-Clause license in the repository-root
-`LICENSE`; individual source headers refer to that file. Gitiles path archives
-do not contain the repository-root license. No Fuchsia code has been copied into
-this crate, so this crate remains `MIT OR Apache-2.0`. Any later source import
-must carry the pinned root BSD license, copyright notices, source pin, and local
-modifications. An archive plus source headers alone is insufficient licensing
-provenance.
+`LICENSE`; individual source headers refer to that file. The Cargo overlay
+therefore carries the exact pinned root license as `upstream-cargo/LICENSE.fuchsia`
+and records its origin in `upstream-cargo/PROVENANCE.md`. No Fuchsia source is
+copied into this crate; `prepare-upstream` applies packaging metadata to the
+ignored, pinned reference tree.
 
 ## Smallest portable closure found
 
@@ -46,12 +45,12 @@ on these protocol crates:
 Together with the aggregate crate that is 14 first-party crates. Their portable
 Fuchsia-library closure includes `net-types` (and proc macro),
 `packet-formats`, `internet-checksum`, `packet`, `diagnostics-traits`,
-`explicit`, and `replace-with`, plus ordinary crates.io dependencies. The `ip`
-crate also declares `net-declare`: production uses only its `net_*` literal
-macros, but `net-declare` unconditionally re-exports generated Fuchsia network
-FIDL types. A host package should depend directly on a separated
-`net-declare-macros`/network-types-only target rather than importing those FIDL
-types.
+`explicit`, and `replace-with`, plus ordinary crates.io dependencies. The
+checked-in Cargo overlay packages exactly this closure. Its FIDL-free
+`net-declare` facade exposes the literal macros and portable network types used
+by core without importing generated Fuchsia network FIDL types. Versions are
+locked and `core/build.rs` reproduces the aggregate GN target's
+`cfg(no_lock_order)` setting.
 
 The required host binding is a concrete context implementing the aggregate
 marker traits over smaller responsibilities: monotonic time and timers,
@@ -77,7 +76,14 @@ is not part of the portable closure.
 | DNS configuration and name resolution | separate services (`netcfg`/name lookup), not core; Netstack3's DNS watcher deliberately does not serve results |
 
 DHCP and DNS therefore remain explicit service dependencies even after a core
-port. Importing core alone does not produce a configured interface or resolver.
+port. This crate packages sans-I/O adapters for them: `Dhcpv4Client` uses
+`edge-dhcp` for DISCOVER/OFFER/REQUEST/ACK, and `DnsCodec` uses `hickory-proto`
+for A/AAAA exchanges. Both bound all datagrams and open no sockets. A deployment
+binding must send DHCP on UDP 68 -> 67, apply the accepted
+address/route and DNS servers through Netstack3's APIs, and send DNS queries to
+an explicitly configured server on UDP 53. It must also supply entropy, elapsed
+time, retry policy and TCP fallback when required; importing core alone still
+does not configure an interface or provide a resolver service.
 
 ## Integration boundary
 
@@ -104,10 +110,9 @@ first-connectivity testing. It is not the target binding and must not leak a
 file descriptor or Linux type into portable code. The target path is direct
 owned-frame exchange with the Wi-Fi driver's Ethernet boundary.
 
-## Deterministic proof and exact blocker
+## Reproduce the executable proof
 
-The current executable proof is intentionally a **contract scaffold, not
-Netstack3 execution**. `FakeEthernetDevice` deterministically demonstrates:
+`FakeEthernetDevice` deterministically demonstrates:
 
 - ingress and transmit transfer owned, lossless Ethernet frames in FIFO order;
 - an ARP-EtherType fixture and an IPv4-EtherType fixture remain opaque to the
@@ -115,25 +120,35 @@ Netstack3 execution**. `FakeEthernetDevice` deterministically demonstrates:
 - short and oversized frames are rejected before crossing it; and
 - bounded queues return ownership rather than allocate without limit or block.
 
-Run it with:
+The package tests also round-trip DHCPv4 acquisition messages and DNS queries
+without ambient I/O. Run these boundary tests with:
 
 ```sh
 cargo test -p netstack3-port-spike
 ```
 
-An upstream ARP/ICMP proof is blocked before binding implementation: the pinned
-source checks in GN metadata but **zero Cargo manifests** for the 14-crate
-aggregate core and its first-party library closure. Fuchsia normally generates
-Cargo metadata from a configured GN build (`fx gen-cargo`); the path archives do
-not include the generated output. Manually inventing one manifest for only
-`device`/`ip` does not solve this because the supported aggregate target pulls
-all protocol crates, and its fake execution context is exposed through
-`testutils` variants across that same closure. The `net-declare` production edge
-also needs a FIDL-free package split.
+The pinned upstream aggregate core, its `testutils` variant, and the actual
+upstream protocol tests are reproduced with:
 
-The next evidence gate is reproducible checked-in or generated Cargo metadata
-for the pinned **production** aggregate closure, preserving its feature variants
-and BSD attribution. Only then should this fake device be adapted to Netstack3's
-buffer/TX context and used to prove an actual sequence such as Ethernet ARP
-request -> core processing -> ARP reply, followed by IPv4 ICMP echo. Until that
-test calls upstream core APIs, this spike makes no protocol-support claim.
+```sh
+./crates/netstack3-port-spike/prepare-upstream
+```
+
+That command fetches the exact source pin if needed, overlays the checked-in
+Cargo metadata, performs locked production and `testutils` checks, then runs
+five tests through upstream core APIs behind this crate's owned-frame boundary:
+
+- Ethernet ARP resolution, IPv4 route selection, and queued UDP transmission;
+- Ethernet IPv4 ICMP echo request and reply;
+- IPv6 NDP neighbor solicitation/advertisement and UDP transmission; and
+- a real upstream TCP loopback handshake followed by payload receive.
+- DHCPv4 acquisition over bounded Ethernet, application of the accepted
+  address and on-link route to Netstack3, DNS request/response over Netstack3
+  UDP, and a TCP handshake plus payload between two Ethernet-attached stacks.
+
+This establishes that the portable pinned core can compile and execute without
+Fuchsia platform bindings, including post-DHCP application traffic. It does
+**not** finish a production host binding: the tests use upstream's fake bindings
+context, and a native context still must implement
+bounded socket buffers/readiness, timers, entropy, diagnostics, configuration,
+and the direct Wi-Fi frame adapter. No TAP device or MT7921 code is involved.

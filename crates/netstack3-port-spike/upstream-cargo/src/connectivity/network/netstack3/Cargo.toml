@@ -15,6 +15,9 @@ license = "BSD-2-Clause"
 version = "0.1.0"
 
 [workspace.dependencies]
+edge-dhcp = { version = "=0.6.0", default-features = false }
+hickory-proto = { version = "=0.26.0", default-features = false, features = ["std"] }
+rand-core-06 = { package = "rand_core", version = "=0.6.4" }
 
 arc-swap = { version = "=1.9.1", features = ["weak"] }
 arrayvec = "=0.7.6"

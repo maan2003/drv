@@ -6,6 +6,9 @@ version.workspace = true
 publish = false
 
 [dependencies]
+edge-dhcp.workspace = true
+hickory-proto.workspace = true
+rand-core-06.workspace = true
 netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }
 netstack3_core = { path = "../../core", features = ["testutils"] }
 net_types.workspace = true

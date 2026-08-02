@@ -1,7 +1,8 @@
-//! Portable Ethernet boundary scaffold for a future Netstack3 binding.
+//! Portable Ethernet and control-plane boundaries for a Netstack3 binding.
 //!
-//! This crate does **not** execute Netstack3 protocol code. It isolates the
-//! authority-free packet/device contract that a host binding will implement.
+//! The crate itself does not link Netstack3. The companion pinned-source Cargo
+//! overlay executes upstream core against these authority-free contracts.
+pub mod control_plane;
 
 use std::collections::VecDeque;
 use std::error::Error;
