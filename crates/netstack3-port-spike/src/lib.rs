@@ -88,6 +88,21 @@ pub trait EthernetDevice {
     fn transmit(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame>;
 }
 
+/// Edge-triggered notifications needed by a single-owner stack event loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EthernetDeviceEvent {
+    LinkStateChanged(bool),
+    ReceiveReady,
+    TransmitReady,
+}
+
+/// Companion notification channel for [`EthernetDevice`]. A real Wi-Fi
+/// adapter can wake its owner when this source becomes readable; no OS handle
+/// is exposed to the stack itself.
+pub trait EthernetEventSource {
+    fn take_event(&mut self) -> Option<EthernetDeviceEvent>;
+}
+
 /// The frame-only side of a userspace network stack. Implementations enqueue
 /// ingress and dequeue egress without acquiring device, clock, or filesystem
 /// authority.
@@ -197,6 +212,9 @@ pub struct FakeEthernetDevice {
     queue_capacity: usize,
     ingress: VecDeque<EthernetFrame>,
     transmitted: VecDeque<EthernetFrame>,
+    link_event: Option<bool>,
+    receive_ready: bool,
+    transmit_ready: bool,
 }
 
 impl FakeEthernetDevice {
@@ -205,6 +223,9 @@ impl FakeEthernetDevice {
             queue_capacity,
             ingress: VecDeque::with_capacity(queue_capacity),
             transmitted: VecDeque::with_capacity(queue_capacity),
+            link_event: Some(true),
+            receive_ready: false,
+            transmit_ready: false,
         }
     }
 
@@ -215,12 +236,16 @@ impl FakeEthernetDevice {
             return Err(frame);
         }
         self.ingress.push_back(frame);
+        self.receive_ready = true;
         Ok(())
     }
 
     /// Removes the oldest frame emitted by the stack.
     pub fn take_transmitted(&mut self) -> Option<EthernetFrame> {
-        self.transmitted.pop_front()
+        let was_full = self.transmitted.len() == self.queue_capacity;
+        let frame = self.transmitted.pop_front();
+        self.transmit_ready |= was_full && frame.is_some();
+        frame
     }
 
     pub fn pending_ingress(&self) -> usize {
@@ -234,7 +259,9 @@ impl FakeEthernetDevice {
 
 impl EthernetDevice for FakeEthernetDevice {
     fn receive(&mut self) -> Option<EthernetFrame> {
-        self.ingress.pop_front()
+        let frame = self.ingress.pop_front();
+        self.receive_ready = !self.ingress.is_empty();
+        frame
     }
 
     fn transmit(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame> {
@@ -243,6 +270,22 @@ impl EthernetDevice for FakeEthernetDevice {
         }
         self.transmitted.push_back(frame);
         Ok(())
+    }
+}
+
+impl EthernetEventSource for FakeEthernetDevice {
+    fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
+        if let Some(up) = self.link_event.take() {
+            return Some(EthernetDeviceEvent::LinkStateChanged(up));
+        }
+        if core::mem::take(&mut self.receive_ready) {
+            self.receive_ready = !self.ingress.is_empty();
+            return Some(EthernetDeviceEvent::ReceiveReady);
+        }
+        if core::mem::take(&mut self.transmit_ready) {
+            return Some(EthernetDeviceEvent::TransmitReady);
+        }
+        None
     }
 }
 
@@ -328,6 +371,26 @@ mod tests {
         device.transmit(rejected.clone()).unwrap();
         assert_eq!(device.transmit(frame(0x06)), Err(frame(0x06)));
         assert_eq!(device.take_transmitted(), Some(rejected));
+    }
+
+    #[test]
+    fn fake_device_reports_link_rx_and_returned_tx_credit() {
+        let mut device = FakeEthernetDevice::new(1);
+        assert_eq!(
+            device.take_event(),
+            Some(EthernetDeviceEvent::LinkStateChanged(true))
+        );
+        device.inject(frame(0x06)).unwrap();
+        assert_eq!(device.take_event(), Some(EthernetDeviceEvent::ReceiveReady));
+        assert!(device.receive().is_some());
+
+        device.transmit(frame(0x00)).unwrap();
+        assert!(device.take_transmitted().is_some());
+        assert_eq!(
+            device.take_event(),
+            Some(EthernetDeviceEvent::TransmitReady)
+        );
+        assert_eq!(device.take_event(), None);
     }
 
     #[test]
