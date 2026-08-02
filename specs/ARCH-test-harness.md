@@ -11,6 +11,13 @@ transactional `mt7921e` handoff, VFIO cdev and iommufd attachment, a private
 low-IOVA DMA map/unmap, explicit IOAS teardown, deadline recovery, and automatic
 kernel-driver and iwd restoration without device MMIO. Virtual Wi-Fi and
 device-specific physical Wi-Fi behavior remain unimplemented.
+A deterministic Bluetooth transport oracle covers bounded HCI event framing,
+command-credit handling, duplicate discovery reports, malformed discovery
+input, and cleanup planning against pinned Sapphire fixture shapes. The
+`no-plastic` physical oracle covers time-bounded LE scanning and BR/EDR inquiry
+through an exclusive Linux HCI user channel, root-only structured reporting,
+exact initial controller-flag restoration, and post-run exclusive
+reacquisition while Wi-Fi remains active.
 
 The production Wasm binary runs unchanged against deterministic and native
 brokers. The deterministic model owns virtual time and scripted BAR, DMA,
