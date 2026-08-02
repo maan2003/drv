@@ -26,6 +26,15 @@ shape and durable physical evidence can be exercised before the VFIO WFDMA/MCU
 transport exists. Its output proves real RF enumeration but **does not** prove
 userspace firmware initialization, DMA, IRQ, or scan operation.
 
+`mt7921-vfio-read` is the first physical MT7921 transport slice. It validates
+the exact no-plastic PCI and subsystem IDs, attaches the VFIO cdev to a fresh
+iommufd IOAS, and maps only two 4 KiB BAR pages read-only. Calls can read only
+five enum-selected registers: MCU state, host interrupt status, WFDMA global
+configuration, PCIe ownership synchronization, and firmware power/readiness.
+The offsets come from pinned Linux `mt792x_regs.h` and the fixed map in
+`mt7921/pci.c`. It cannot write MMIO, remap arbitrary chip addresses, allocate
+DMA, arm an interrupt, or reset the function.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

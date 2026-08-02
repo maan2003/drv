@@ -437,6 +437,77 @@ pub const fn frequency_to_channel(frequency_mhz: u16) -> u8 {
     }
 }
 
+/// Read-only MT7921 registers admitted by the first physical VFIO slice.
+///
+/// These BAR offsets are either direct PCIe addresses below 1 MiB or pinned
+/// Linux mt7921 fixed-map translations. There is intentionally no generic
+/// physical-address translator or caller-selected BAR offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadRegister {
+    McuCommand,
+    HostInterruptStatus,
+    WfdmaGlobalConfig,
+    ConnOnLowPowerControl,
+    ConnOnMisc,
+}
+
+impl ReadRegister {
+    pub const ALL: [Self; 5] = [
+        Self::McuCommand,
+        Self::HostInterruptStatus,
+        Self::WfdmaGlobalConfig,
+        Self::ConnOnLowPowerControl,
+        Self::ConnOnMisc,
+    ];
+
+    pub const fn bar_offset(self) -> usize {
+        match self {
+            // MT_WFDMA0_BASE (0xd4000) plus register offset.
+            Self::McuCommand => 0xd41f0,
+            Self::HostInterruptStatus => 0xd4200,
+            Self::WfdmaGlobalConfig => 0xd4208,
+            // Linux fixed-map 0x7c060000 -> BAR 0xe0000.
+            Self::ConnOnLowPowerControl => 0xe0010,
+            Self::ConnOnMisc => 0xe00f0,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::McuCommand => "mcu_command",
+            Self::HostInterruptStatus => "host_interrupt_status",
+            Self::WfdmaGlobalConfig => "wfdma_global_config",
+            Self::ConnOnLowPowerControl => "conn_on_low_power_control",
+            Self::ConnOnMisc => "conn_on_misc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadOnlyStatus {
+    pub firmware_powered: bool,
+    pub firmware_n9_ready: bool,
+    pub firmware_owns_device: bool,
+    pub tx_dma_enabled: bool,
+    pub tx_dma_busy: bool,
+    pub rx_dma_enabled: bool,
+    pub rx_dma_busy: bool,
+}
+
+impl ReadOnlyStatus {
+    pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
+        Self {
+            firmware_powered: conn_misc & 1 != 0,
+            firmware_n9_ready: conn_misc & 3 == 3,
+            firmware_owns_device: low_power & 4 != 0,
+            tx_dma_enabled: wfdma_config & 1 != 0,
+            tx_dma_busy: wfdma_config & 2 != 0,
+            rx_dma_enabled: wfdma_config & 4 != 0,
+            rx_dma_busy: wfdma_config & 8 != 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -479,6 +550,38 @@ mod tests {
         assert_eq!(frequency_to_channel(2412), 1);
         assert_eq!(frequency_to_channel(2484), 14);
         assert_eq!(frequency_to_channel(5955), 1);
+    }
+
+    #[test]
+    fn read_only_register_policy_matches_pinned_linux_mt7921_map() {
+        assert_eq!(ReadRegister::McuCommand.bar_offset(), 0xd4000 + 0x1f0);
+        assert_eq!(
+            ReadRegister::HostInterruptStatus.bar_offset(),
+            0xd4000 + 0x200
+        );
+        assert_eq!(
+            ReadRegister::WfdmaGlobalConfig.bar_offset(),
+            0xd4000 + 0x208
+        );
+        assert_eq!(
+            ReadRegister::ConnOnLowPowerControl.bar_offset(),
+            0xe0000 + 0x10
+        );
+        assert_eq!(ReadRegister::ConnOnMisc.bar_offset(), 0xe0000 + 0xf0);
+        assert!(ReadRegister::ALL.windows(2).all(|pair| pair[0] != pair[1]));
+
+        assert_eq!(
+            ReadOnlyStatus::decode(3, 4, 0b1111),
+            ReadOnlyStatus {
+                firmware_powered: true,
+                firmware_n9_ready: true,
+                firmware_owns_device: true,
+                tx_dma_enabled: true,
+                tx_dma_busy: true,
+                rx_dma_enabled: true,
+                rx_dma_busy: true,
+            }
+        );
     }
 
     #[test]

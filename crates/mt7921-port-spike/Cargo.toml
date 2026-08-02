@@ -11,3 +11,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "mt7921-scan"
 path = "src/bin/scan.rs"
+
+[[bin]]
+name = "mt7921-vfio-read"
+path = "src/bin/vfio_read.rs"
