@@ -57,6 +57,12 @@ and makes its portable fixed-size test buffer available without compiling the
 Fuchsia-only test helpers. The frame, IE, BSS, capability, channel, rate-vector,
 and security algorithms remain byte-for-byte pinned Fuchsia source.
 
+The fetch closure also retains Fuchsia's production trace crate at the pin.
+The Cargo `fuchsia-trace` package selects the separately licensed
+`host/src/lib.rs` only on this non-Fuchsia port: it preserves the WLAN-facing
+event API while disabling emission because the Fuchsia trace engine is absent.
+Pinned `wlan-trace` event names and calls remain the production implementation.
+
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
 archive convention, workspace, or lockfile for another Fuchsia subsystem.

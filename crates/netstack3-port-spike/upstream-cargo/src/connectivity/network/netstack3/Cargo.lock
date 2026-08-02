@@ -732,6 +732,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuchsia-trace"
+version = "0.1.0"
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3305,6 +3309,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "wlan-trace"
+version = "0.1.0"
+dependencies = [
+ "fuchsia-trace",
 ]
 
 [[package]]

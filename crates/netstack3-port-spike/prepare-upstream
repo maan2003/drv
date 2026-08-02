@@ -2,7 +2,7 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
-closure=netstack3-port-v2-fuchsia-sync-1
+closure=netstack3-port-v2-wlan-trace-1
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 refroot=${DRV_FUCHSIA_REFERENCE_ROOT:-$repo/reference/fuchsia-$commit}
@@ -16,6 +16,7 @@ if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]] |
    [[ ! -f "$refroot/src/lib/mundane/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/lib/fuchsia-sync/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/connectivity/wlan/lib/fcg-crypto/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/src/lib/trace/rust/src/lib.rs" ]] ||
    [[ ! -f "$refroot/third_party/boringssl/src/include/openssl/base.h" ]]; then
   printf 'incomplete or stale Fuchsia reference: %s\n' "$refroot" >&2
   printf 'materialize a fresh root with DRV_FUCHSIA_REFERENCE_ROOT=<new-path> %s\n' \
@@ -35,6 +36,7 @@ patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/trust
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-common-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-frame-writer-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-rsn-host.patch" || true
+patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-trace-host.patch" || true
 
 manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
 cargo check --locked --manifest-path "$manifest" -p netstack3_core
@@ -44,6 +46,8 @@ cargo check --locked --manifest-path "$manifest" -p dhcp_client_core
 cargo check --locked --manifest-path "$manifest" -p trust-dns-resolver --no-default-features --features testing
 cargo check --locked --manifest-path "$manifest" -p wlan-common
 cargo test --locked --manifest-path "$manifest" -p wlan-frame-writer --lib
+cargo test --locked --manifest-path "$manifest" -p fuchsia-trace --lib
+cargo test --locked --manifest-path "$manifest" -p wlan-trace --lib
 cargo test --locked --manifest-path "$manifest" -p eapol --lib
 cargo test --locked --manifest-path "$manifest" -p mundane --lib hash::tests
 cargo test --locked --manifest-path "$manifest" -p mundane --lib hmac::tests
