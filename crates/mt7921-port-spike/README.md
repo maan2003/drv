@@ -139,6 +139,9 @@ range, an empty download, and a patch-start address other than MT7961's
 `0x00900000`. Encoding these commands is not permission to send them: an owned
 MCU TX ring, RX response ring, parsed matching response, VFIO IRQ, and safe
 reset-while-pinned teardown must all exist first.
+`parse_download_response` bounds the fixed 36-byte Connac2 MCU RX header and
+matches the four-bit command sequence before exposing event identifiers; it is
+the first pure parser needed by the future owned RX response ring.
 
 `--inventory-vfio-irqs` queries the standard VFIO INTx, MSI, and MSI-X
 capabilities without installing or triggering one, rejects modes without
