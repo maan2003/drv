@@ -7,6 +7,7 @@ members = [
   "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/frame_writer", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn",
   "../../../lib/mundane",
   "../../../lib/fuchsia-sync",
+  "../../../lib/diagnostics/inspect/rust", "../../../lib/diagnostics/inspect/contrib/rust",
   "../../../lib/trace/rust",
   "../../../lib/fidl/rust/fidl",
   "../../../../sdk/rust/zx-types", "../../../../sdk/rust/zx-status", "../../../../sdk/rust/zx",

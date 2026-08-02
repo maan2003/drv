@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+/// Host-owned snapshot bytes used at the Inspect/FIDL boundary.
+pub type Vmo = Vec<u8>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidHeader,

@@ -69,6 +69,12 @@ sources are built unchanged. Separately licensed host facades expose only
 status/raw values, monotonic time value semantics, and the FIDL error required by generic responder helpers;
 syscalls, handles, encoding, and transport are not emulated.
 
+The pinned SME uses Fuchsia Inspect only for diagnostics. Separately licensed
+path-shaped host facades retain scalar/string/byte property state and the API
+surface needed by SME, while disabling Fuchsia-specific hierarchy/VMO encoding
+and convenience log emission. SME policy and state transitions remain in the
+pinned WLAN source rather than being copied into the diagnostics boundary.
+
 `wlan-timer-host.patch` retains WLAN common's pinned timer queue and replaces
 only fuchsia-async's deadline wake-up with the Fuchsia-pinned Tokio timer.
 Event identity, concurrent deadline ordering, cancellation, and filtering stay
