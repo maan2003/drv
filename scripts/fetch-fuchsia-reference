@@ -2,7 +2,7 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
-closure=netstack3-port-v2-wlan-trace-1
+closure=netstack3-port-v2-wlan-fidl-ext-1
 
 if [[ ${1:-} == --print-commit ]]; then
   printf "%s\n" "$commit"
@@ -40,6 +40,10 @@ paths=(
   src/lib/mundane
   src/lib/fuchsia-sync
   src/lib/trace/rust
+  src/lib/fidl/rust/fidl
+  sdk/rust/zx-types
+  sdk/rust/zx-status
+  sdk/rust/zx
   src/connectivity/lib/net-types
   src/connectivity/lib/net-declare
   src/connectivity/lib/internet-checksum

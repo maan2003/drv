@@ -311,7 +311,7 @@ dependencies = [
  "cast",
  "clap",
  "csv",
- "itertools",
+ "itertools 0.8.2",
  "lazy_static",
  "libc",
  "num-traits",
@@ -641,6 +641,10 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "fidl"
+version = "0.1.0"
 
 [[package]]
 name = "fidl-fuchsia-wlan-common"
@@ -1123,6 +1127,15 @@ name = "itertools"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f56a2d0bc861f9165be4eb3442afd3c236d8a98afd426f65d92324ae1091a484"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -3244,6 +3257,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-fidl-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fidl",
+ "itertools 0.14.0",
+ "paste",
+ "test-case",
+ "zx",
+]
+
+[[package]]
 name = "wlan-frame-writer"
 version = "0.1.0"
 dependencies = [
@@ -3426,3 +3451,25 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zx"
+version = "0.1.0"
+dependencies = [
+ "zx-status",
+ "zx-types",
+]
+
+[[package]]
+name = "zx-status"
+version = "0.1.0"
+dependencies = [
+ "zx-types",
+]
+
+[[package]]
+name = "zx-types"
+version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]

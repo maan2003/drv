@@ -8,6 +8,8 @@ members = [
   "../../../lib/mundane",
   "../../../lib/fuchsia-sync",
   "../../../lib/trace/rust",
+  "../../../lib/fidl/rust/fidl",
+  "../../../../sdk/rust/zx-types", "../../../../sdk/rust/zx-status", "../../../../sdk/rust/zx",
   "../../../../third_party/boringssl/rust/bssl-sys",
   "../../../../sdk/fidl/fuchsia.wlan.common",
   "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
@@ -15,7 +17,7 @@ members = [
   "../../../../sdk/fidl/fuchsia.wlan.mlme",
   "../../../../sdk/fidl/fuchsia.wlan.sme",
   "../../../../sdk/fidl/fuchsia.wlan.softmac",
-  "../../wlan/lib/frame_writer/macro", "../../wlan/lib/trace",
+  "../../wlan/lib/fidl-ext", "../../wlan/lib/frame_writer/macro", "../../wlan/lib/trace",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
   "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
@@ -59,6 +61,7 @@ futures = "=0.3.32"
 futures-io = "=0.3.32"
 hex = "=0.4.3"
 hmac = "=0.13.0"
+itertools = "=0.14.0"
 log = { version = "=0.4.29", features = ["kv", "std"] }
 lock_api = { version = "=0.4.14", features = ["serde"] }
 lru-cache = "=0.1.2"
@@ -87,6 +90,7 @@ strum_macros = "=0.28.0"
 syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
 synstructure = "=0.13.2"
 thiserror = "=2.0.18"
+test-case = "=3.3.1"
 zerocopy = { version = "=0.8.48", features = ["derive", "simd"] }
 net_types = { path = "../../lib/net-types" }
 net_types_macros = { path = "cargo/net-types-macros" }
@@ -97,6 +101,7 @@ ieee80211 = { path = "../../wlan/lib/ieee80211" }
 mundane = { path = "../../../lib/mundane" }
 fuchsia-sync = { path = "../../../lib/fuchsia-sync" }
 fuchsia-trace = { path = "../../../lib/trace/rust" }
+fidl = { path = "../../../lib/fidl/rust/fidl" }
 packet_formats = { path = "../../lib/packet-formats" }
 diagnostics_traits = { path = "../lib/diagnostics-traits" }
 explicit = { path = "../lib/explicit" }
@@ -104,6 +109,7 @@ packet = { path = "../../../lib/network/packet" }
 replace_with = { path = "../../../lib/replace-with" }
 wlan_bitfield = { package = "wlan-bitfield", path = "../../wlan/lib/bitfield" }
 wlan_fcg_crypto = { package = "wlan-fcg-crypto", path = "../../wlan/lib/fcg-crypto" }
+wlan_fidl_ext = { package = "wlan-fidl-ext", path = "../../wlan/lib/fidl-ext" }
 wlan_frame_writer = { package = "wlan-frame-writer", path = "../../wlan/lib/frame_writer" }
 wlan_rsn = { package = "wlan-rsn", path = "../../wlan/lib/rsn" }
 wlan_statemachine = { package = "wlan-statemachine", path = "../../wlan/lib/statemachine" }

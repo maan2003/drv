@@ -1,0 +1,34 @@
+// Copyright 2026 The drv Authors.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Host error boundary for generic FIDL responder helpers.
+
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    InvalidHeader,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHeader => f.write_str("Invalid header for a FIDL buffer."),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_header_is_reportable() {
+        assert_eq!(
+            Error::InvalidHeader.to_string(),
+            "Invalid header for a FIDL buffer."
+        );
+    }
+}

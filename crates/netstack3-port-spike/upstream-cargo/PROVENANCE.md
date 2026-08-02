@@ -63,6 +63,12 @@ The Cargo `fuchsia-trace` package selects the separately licensed
 event API while disabling emission because the Fuchsia trace engine is absent.
 Pinned `wlan-trace` event names and calls remain the production implementation.
 
+The closure retains the pinned FIDL runtime and Zircon Rust value/runtime
+sources as references for MLME boundaries. Exact `zx-types` and `zx-status`
+sources are built unchanged. Separately licensed host facades expose only
+status/raw values and the FIDL error required by generic responder helpers;
+syscalls, handles, encoding, and transport are not emulated.
+
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
 archive convention, workspace, or lockfile for another Fuchsia subsystem.
