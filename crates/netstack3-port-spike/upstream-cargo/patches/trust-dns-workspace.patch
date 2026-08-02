@@ -1,0 +1,20 @@
+--- a/third_party/rust_crates/forks/trust-dns-proto-0.22.0/Cargo.toml
++++ b/third_party/rust_crates/forks/trust-dns-proto-0.22.0/Cargo.toml
+@@ -12,6 +12,7 @@
+ [package]
+ edition = "2018"
+ name = "trust-dns-proto"
++workspace = "../../../../src/connectivity/network/netstack3"
+ version = "0.22.0"
+ authors = ["Benjamin Fry <benjaminfry@me.com>"]
+ description = """
+--- a/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/Cargo.toml
++++ b/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/Cargo.toml
+@@ -12,6 +12,7 @@
+ [package]
+ edition = "2018"
+ name = "trust-dns-resolver"
++workspace = "../../../../src/connectivity/network/netstack3"
+ version = "0.22.0"
+ authors = ["Benjamin Fry <benjaminfry@me.com>"]
+ description = """

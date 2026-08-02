@@ -16,3 +16,11 @@ experiments is included.
 The overlay models the pinned production and testutils variants. Loom and
 benchmark GN variants are deliberately not mapped because Cargo feature
 unification cannot represent GN's mutually exclusive dependency targets.
+
+## DHCP and DNS production reuse
+
+`SOURCE_MAP.md` records the file/function-level disposition for the pinned
+DHCP core/protocol and Fuchsia Trust-DNS forks. Their original source and
+license notices are fetched unchanged. Host changes are isolated as reviewable
+patch files; no algorithm, constant, state transition, cache, or retry policy is
+forked into the native adapter.

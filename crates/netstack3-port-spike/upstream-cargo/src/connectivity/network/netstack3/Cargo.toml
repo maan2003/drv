@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
+  "../dhcpv4/client/core", "../dhcpv4/protocol",
+  "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
+  "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
   "../../lib/net-types", "../../lib/internet-checksum", "../../lib/packet-formats",
   "../lib/diagnostics-traits", "../lib/explicit", "../../../lib/network/packet",
   "../../../lib/replace-with", "core", "core/base", "core/datagram", "core/device",
@@ -15,26 +18,40 @@ license = "BSD-2-Clause"
 version = "0.1.0"
 
 [workspace.dependencies]
+# Pinned Fuchsia production DHCP/DNS implementations.
 edge-dhcp = { version = "=0.6.0", default-features = false }
 hickory-proto = { version = "=0.26.0", default-features = false, features = ["std"] }
+dhcp_client_core = { path = "../dhcpv4/client/core" }
+dhcp_protocol = { package = "dhcp-protocol", path = "../dhcpv4/protocol" }
+trust-dns-proto = { path = "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0", default-features = false, features = ["testing"] }
+trust-dns-resolver = { path = "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0", default-features = false, features = ["testing"] }
 rand-core-06 = { package = "rand_core", version = "=0.6.4" }
 
 arc-swap = { version = "=1.9.1", features = ["weak"] }
 arrayvec = "=0.7.6"
+anyhow = "=1.0.102"
 assert_matches = "=1.5.0"
+async-trait = "=0.1.89"
 bitflags = { version = "=2.13.0", features = ["std"] }
+bstr = "=1.12.1"
 byteorder = "=1.5.0"
 cfg-if = "=1.0.4"
 criterion = { version = "=0.2.11", default-features = false }
 derivative = { version = "=2.2.0", features = ["use_core"] }
+derive_builder = "=0.20.2"
 either = "=1.15.0"
+futures = "=0.3.32"
+hex = "=0.4.3"
 hmac = "=0.13.0"
 log = { version = "=0.4.29", features = ["kv", "std"] }
 lru-cache = "=0.1.2"
 once_cell = "=1.21.3"
+num-derive = "=0.4.2"
+num-traits = "=0.2.19"
 proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
 quote = "=1.0.45"
 rand = { version = "=0.9.4", features = ["small_rng"] }
+serde = { version = "=1.0.228", features = ["derive"] }
 rand_xorshift = "=0.4.0"
 ref-cast = "=1.0.25"
 sha2 = "=0.11.0"
@@ -70,3 +87,7 @@ netstack3_tcp = { path = "core/tcp" }
 netstack3_trace = { path = "core/trace" }
 teststd = { path = "core/teststd" }
 netstack3_udp = { path = "core/udp" }
+
+[patch.crates-io]
+trust-dns-proto = { path = "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
+trust-dns-resolver = { path = "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }

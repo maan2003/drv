@@ -9,6 +9,8 @@ mkdir -p reference
 paths=(
   src/connectivity/bluetooth
   src/connectivity/network/netstack3
+  src/connectivity/network/dhcpv4/client/core
+  src/connectivity/network/dhcpv4/protocol
   src/connectivity/wlan
   src/connectivity/lib/net-types
   src/connectivity/lib/net-declare
@@ -25,6 +27,8 @@ paths=(
   src/media/audio/services/mixer
   src/lib/network/packet
   src/lib/replace-with
+  third_party/rust_crates/forks/trust-dns-proto-0.22.0
+  third_party/rust_crates/forks/trust-dns-resolver-0.22.0
   sdk/fidl/fuchsia.audio
   sdk/fidl/fuchsia.audio.effects
   sdk/fidl/fuchsia.bluetooth
