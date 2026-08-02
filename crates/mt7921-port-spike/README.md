@@ -120,6 +120,11 @@ zeroed, both mappings are explicitly removed, and VFIO reset is mandatory.
 No ring register, producer index, DMA-enable bit, interrupt mask, or MCU command
 is written, so the device cannot observe the staged descriptor.
 
+The offline patch-protocol slice now derives Linux's Connac2 download mode
+from each parsed section security word and encodes the `PATCH_FINISH_REQ` that
+must follow all scatter chunks. Unknown encryption modes fail closed. These
+helpers are fixture-tested only and are not connected to MMIO or active DMA.
+
 `--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
 and that raw patch scatter is invalid until the MCU has accepted patch

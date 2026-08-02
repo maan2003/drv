@@ -24,7 +24,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, RawFd},
-    process::Command,
+    process::{Command, Stdio},
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -68,6 +68,11 @@ const SIGTERM: i32 = 15;
 const SIG_ERR: usize = usize::MAX;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
+const RAM_PATH: &str = "/run/current-system/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin.zst";
+const PATCH_SHA256: &str = "a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6";
+const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9";
+const PATCH_IMAGE_BYTES: usize = 92_192;
+const RAM_IMAGE_BYTES: usize = 792_036;
 
 #[repr(C)]
 #[derive(Default)]
@@ -789,6 +794,9 @@ fn run() -> Result<(), String> {
                 rx_buffers: &mcu_rx_buffers,
                 rx_tail: 0,
                 rx_head: 7,
+                rx_ring_index: 0,
+                rx_count: 8,
+                irq_bit: 1 << 0,
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -1133,6 +1141,16 @@ struct ActiveMcuIo<'a, 'b> {
     rx_buffers: &'a DmaArena<'b>,
     rx_tail: usize,
     rx_head: usize,
+    rx_ring_index: usize,
+    rx_count: usize,
+    irq_bit: u32,
+}
+
+struct ReceivedMcuResponse {
+    sequence: u8,
+    event_id: u8,
+    length: u16,
+    bytes: Vec<u8>,
 }
 
 impl ActiveMcuIo<'_, '_> {
@@ -1144,7 +1162,10 @@ impl ActiveMcuIo<'_, '_> {
         }
     }
 
-    fn drain_rx(&mut self, expected_sequence: Option<u8>) -> Result<Option<u8>, String> {
+    fn drain_rx(
+        &mut self,
+        expected_sequence: Option<u8>,
+    ) -> Result<Option<ReceivedMcuResponse>, String> {
         let mut matched = None;
         loop {
             let descriptor = self.rx_ring.read_descriptor_at(self.rx_tail);
@@ -1178,20 +1199,23 @@ impl ActiveMcuIo<'_, '_> {
             .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
             self.rx_ring.write_descriptor_at(refill_index, refill);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            self.rx_head = (self.rx_head + 1) % 8;
-            self.wfdma.write_rx_cpu_index(0, self.rx_head as u32)?;
-            self.rx_tail = (self.rx_tail + 1) % 8;
+            self.rx_head = (self.rx_head + 1) % self.rx_count;
+            self.wfdma
+                .write_rx_cpu_index(self.rx_ring_index, self.rx_head as u32)?;
+            self.rx_tail = (self.rx_tail + 1) % self.rx_count;
 
             let (parsed, response) = parsed?;
-            if Some(parsed.sequence) == expected_sequence && parsed.event_id == 0x04 {
-                let result = *response
-                    .get(32)
-                    .ok_or("patch semaphore response omitted result")?;
+            if Some(parsed.sequence) == expected_sequence {
                 println!(
-                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"result\":{result},\"length\":{},\"rx_descriptor\":{completed_index}}}}}",
-                    parsed.sequence, parsed.event_id, parsed.length
+                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
+                    parsed.sequence, parsed.event_id, parsed.length, self.rx_ring_index
                 );
-                matched = Some(result);
+                matched = Some(ReceivedMcuResponse {
+                    sequence: parsed.sequence,
+                    event_id: parsed.event_id,
+                    length: parsed.length,
+                    bytes: response,
+                });
             } else {
                 println!(
                     "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_descriptor\":{completed_index}}}",
@@ -1202,13 +1226,16 @@ impl ActiveMcuIo<'_, '_> {
         Ok(matched)
     }
 
-    fn handle_irq(&mut self, expected_sequence: Option<u8>) -> Result<Option<u8>, String> {
+    fn handle_irq(
+        &mut self,
+        expected_sequence: Option<u8>,
+    ) -> Result<Option<ReceivedMcuResponse>, String> {
         let Some(count) = self.irq.try_read()? else {
             return Ok(None);
         };
         self.wfdma.write_active_wfdma(0xd4204, 0)?;
         let interrupt_status = self.wfdma.read(0xd4200)?;
-        let acknowledged = interrupt_status & (1 << 0);
+        let acknowledged = interrupt_status & self.irq_bit;
         if acknowledged != 0 {
             self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
         }
@@ -1217,7 +1244,7 @@ impl ActiveMcuIo<'_, '_> {
         );
         let matched = self.drain_rx(expected_sequence)?;
         if matched.is_none() {
-            self.wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+            self.wfdma.write_active_wfdma(0xd4204, self.irq_bit)?;
         }
         Ok(matched)
     }
@@ -1248,7 +1275,7 @@ impl ActiveMcuIo<'_, '_> {
         tx_descriptor_index: usize,
     ) -> Result<u8, String> {
         self.cancelled()?;
-        self.wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+        self.wfdma.write_active_wfdma(0xd4204, self.irq_bit)?;
         publish_mcu_command(
             self.wfdma,
             self.tx_ring,
@@ -1260,8 +1287,18 @@ impl ActiveMcuIo<'_, '_> {
         let deadline = Instant::now() + std::time::Duration::from_millis(3000);
         loop {
             self.cancelled()?;
-            if let Some(result) = self.handle_irq(Some(sequence))? {
-                return Ok(result);
+            if let Some(response) = self.handle_irq(Some(sequence))? {
+                if response.event_id != 0x04 {
+                    return Err(format!(
+                        "unexpected patch semaphore event id {:#04x}",
+                        response.event_id
+                    ));
+                }
+                return response
+                    .bytes
+                    .get(32)
+                    .copied()
+                    .ok_or("patch semaphore response omitted result".into());
             }
             if Instant::now() >= deadline {
                 return Err(format!("patch response timed out for sequence {sequence}"));
@@ -1367,10 +1404,22 @@ impl<'a> DmaArena<'a> {
         Ok(())
     }
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > self.len {
+        self.write_bytes_at(0, bytes)
+    }
+    fn write_bytes_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
+        if offset
+            .checked_add(bytes.len())
+            .is_none_or(|end| end > self.len)
+        {
             return Err("DMA payload exceeds arena".into());
         }
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr(), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.ptr.as_ptr().add(offset),
+                bytes.len(),
+            )
+        };
         Ok(())
     }
     fn zero_bytes(&mut self, length: usize) -> Result<(), String> {
@@ -2390,16 +2439,60 @@ fn log_disabled_firmware_stage_event(event: DisabledFirmwareStageEvent) {
 }
 
 fn decompress_patch() -> Result<Vec<u8>, String> {
+    decompress_verified_image(PATCH_PATH, PATCH_SHA256, PATCH_IMAGE_BYTES)
+}
+
+fn decompress_ram() -> Result<Vec<u8>, String> {
+    decompress_verified_image(RAM_PATH, RAM_SHA256, RAM_IMAGE_BYTES)
+}
+
+fn decompress_verified_image(
+    path: &str,
+    expected_sha256: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, String> {
     let output = Command::new("/run/current-system/sw/bin/zstdcat")
-        .arg(PATCH_PATH)
+        .arg(path)
         .output()
-        .map_err(|error| format!("run zstdcat for {PATCH_PATH}: {error}"))?;
+        .map_err(|error| format!("run zstdcat for {path}: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "zstdcat {PATCH_PATH}: {}",
+            "zstdcat {path}: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+    if output.stdout.len() != expected_len {
+        return Err(format!(
+            "decompressed {path} is {} bytes, expected {expected_len}",
+            output.stdout.len()
+        ));
+    }
+    let mut hash = Command::new("/run/current-system/sw/bin/sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start sha256sum for {path}: {error}"))?;
+    hash.stdin
+        .take()
+        .ok_or("sha256sum stdin unavailable")?
+        .write_all(&output.stdout)
+        .map_err(|error| format!("hash {path}: {error}"))?;
+    let hash = hash
+        .wait_with_output()
+        .map_err(|error| format!("wait for sha256sum {path}: {error}"))?;
+    if !hash.status.success() {
+        return Err(format!("sha256sum failed for {path}"));
+    }
+    let actual = String::from_utf8_lossy(&hash.stdout);
+    if actual.split_whitespace().next() != Some(expected_sha256) {
+        return Err(format!(
+            "decompressed {path} SHA-256 mismatch: {}",
+            actual.trim()
+        ));
+    }
+    println!(
+        "{{\"firmware_image_verified\":{{\"path\":\"{path}\",\"bytes\":{expected_len},\"sha256\":\"{expected_sha256}\"}}}}"
+    );
     Ok(output.stdout)
 }
 

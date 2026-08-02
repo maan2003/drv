@@ -2069,12 +2069,50 @@ where
 pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
 pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
 pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+pub const PATCH_FINISH_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
+pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
+pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
+pub const DL_MODE_ENCRYPTION_MODE_SELECT: u32 = 1 << 6;
+pub const DL_MODE_NEED_RESPONSE: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchSecurityError {
+    UnsupportedEncryptionType(u8),
+}
+
+/// Translate a Connac2 patch section's security word into Linux's download
+/// mode. Unknown encryption types fail closed instead of merely being logged.
+pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError> {
+    let mut mode = DL_MODE_NEED_RESPONSE;
+    if security_info == u32::MAX {
+        return Ok(mode);
+    }
+    match (security_info >> 24) as u8 {
+        0 => {}
+        1 => {
+            mode |= DL_MODE_ENCRYPT
+                | ((security_info << 1) & DL_MODE_KEY_INDEX)
+                | DL_MODE_RESET_SECURITY_IV;
+        }
+        2 => {
+            mode |= DL_MODE_ENCRYPT | DL_MODE_ENCRYPTION_MODE_SELECT | DL_MODE_RESET_SECURITY_IV;
+        }
+        encryption_type => {
+            return Err(PatchSecurityError::UnsupportedEncryptionType(
+                encryption_type,
+            ));
+        }
+    }
+    Ok(mode)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
     NicPowerControl,
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
+    PatchFinish,
     PatchStart {
         address: u32,
         length: u32,
@@ -2157,6 +2195,7 @@ pub fn encode_download_command(
         DownloadCommand::NicPowerControl => (0x04, vec![1, 0, 0, 0]),
         DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchSemaphoreRelease => (0x10, 0u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchFinish => (0x07, vec![0; 4]),
         DownloadCommand::PatchStart {
             address,
             length,
@@ -3706,9 +3745,34 @@ mod tests {
         assert_eq!(&patch[64..68], &0x0090_0000u32.to_le_bytes());
         assert_eq!(&patch[68..72], &0x0001_6780u32.to_le_bytes());
         assert_eq!(&patch[72..76], &(1u32 << 31).to_le_bytes());
+        let finish = encode_download_command(DownloadCommand::PatchFinish, 3).unwrap();
+        assert_eq!(finish.len(), PATCH_FINISH_REQUEST_BYTES);
+        assert_eq!(&finish[36..40], &[0x07, 0xa0, 3, 3]);
+        assert_eq!(&finish[64..68], &[0; 4]);
         assert_eq!(
             encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
             Err(DownloadCommandError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn derives_connac2_patch_download_security_mode_fail_closed() {
+        assert_eq!(patch_download_mode(u32::MAX), Ok(DL_MODE_NEED_RESPONSE));
+        assert_eq!(patch_download_mode(0), Ok(DL_MODE_NEED_RESPONSE));
+        assert_eq!(
+            patch_download_mode(0x0100_0002),
+            Ok(DL_MODE_NEED_RESPONSE | DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV | (2 << 1))
+        );
+        assert_eq!(
+            patch_download_mode(0x0200_0000),
+            Ok(DL_MODE_NEED_RESPONSE
+                | DL_MODE_ENCRYPT
+                | DL_MODE_RESET_SECURITY_IV
+                | DL_MODE_ENCRYPTION_MODE_SELECT)
+        );
+        assert_eq!(
+            patch_download_mode(0x0300_0000),
+            Err(PatchSecurityError::UnsupportedEncryptionType(3))
         );
     }
 

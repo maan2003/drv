@@ -1789,7 +1789,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	24	function	mt76_connac_mcu
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	27	struct	__anone60253870208	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	28	member	op	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	36	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	38	function	mt76_connac_mcu_start_patch	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	38	function	mt76_connac_mcu_start_patch	DownloadCommand::PatchFinish	adapted	pinned-format unit fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	40	struct	__anone60253870308	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	41	member	check_crc	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	42	member	reserved	-	unmapped	-
@@ -2120,7 +2120,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2963	prototype	EXPORT_SYMBO
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2966	function	mt76_connac_mcu_send_ram_firmware	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3016	function	mt76_connac2_load_ram	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3081	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3083	function	mt76_connac2_get_data_mode	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3083	function	mt76_connac2_get_data_mode	patch_download_mode	adapted	plain/AES/scramble/fail-closed unit fixtures
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3111	function	mt76_connac2_load_patch	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3194	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3196	function	mt76_connac2_mcu_fill_message	-	unmapped	-
@@ -3167,7 +3167,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1328	enumerator	MCU_CMD_FW_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1329	enumerator	MCU_CMD_INIT_ACCESS_REG	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1330	enumerator	MCU_CMD_NIC_POWER_CTRL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1331	enumerator	MCU_CMD_PATCH_START_REQ	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1332	enumerator	MCU_CMD_PATCH_FINISH_REQ	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1332	enumerator	MCU_CMD_PATCH_FINISH_REQ	DownloadCommand::PatchFinish	adapted	pinned-format unit fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1333	enumerator	MCU_CMD_PATCH_SEM_CONTROL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1334	enumerator	MCU_CMD_WA_PARAM	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1335	enumerator	MCU_CMD_EXT_CID	-	unmapped	-
@@ -3588,7 +3588,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1988	prototype	mt76_connac_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1990	prototype	mt76_connac_mcu_set_rts_thresh	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1991	prototype	mt76_connac_mcu_set_mac_enable	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1993	prototype	mt76_connac_mcu_init_download	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1995	prototype	mt76_connac_mcu_start_patch	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1995	prototype	mt76_connac_mcu_start_patch	DownloadCommand::PatchFinish	adapted	pinned-format unit fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1996	prototype	mt76_connac_mcu_patch_sem_ctrl	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1997	prototype	mt76_connac_mcu_start_firmware	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1999	prototype	mt76_connac_mcu_build_rnr_scan_param	-	unmapped	-
