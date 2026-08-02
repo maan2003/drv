@@ -143,7 +143,7 @@ five tests through upstream core APIs behind this crate's owned-frame boundary:
 
 - Ethernet ARP resolution, IPv4 route selection, and queued UDP transmission;
 - Ethernet IPv4 ICMP echo request and reply;
-- IPv6 NDP neighbor solicitation/advertisement and UDP transmission; and
+- IPv6 NDP neighbor solicitation/advertisement and UDP transmission;
 - a real upstream TCP loopback handshake followed by payload receive; and
 - DHCPv4 acquisition over bounded Ethernet, application of the accepted
   address and on-link route to Netstack3, DNS request/response over Netstack3
@@ -156,9 +156,21 @@ event and UDP queues, TCP buffers/readiness, and device dispatch. Its focused
 tests run in addition to the five protocol tests above (the older protocol
 fixtures still use upstream's fake context as an oracle).
 
-This establishes that the portable pinned core can compile and execute without
-Fuchsia platform bindings, including post-DHCP application traffic. Remaining
-runtime work is explicit: pre-lease DHCP must move behind an internal Netstack3
-device socket, lease updates must use a production route manager, and the
-native context needs the narrow opaque TCP/UDP application facade plus the
-direct Wi-Fi adapter. No TAP device or MT7921 code is involved.
+`Runtime` is the narrow production-facing owner. It creates and enables an
+explicit Ethernet interface, applies/revokes IPv4 addresses, atomically replaces
+on-link/default route sets with `RoutesApi::set_routes`, and exposes bounded opaque
+UDP and TCP handles. Pre-lease DHCP uses a private Netstack3 device socket, so
+0.0.0.0/broadcast traffic crosses core's FIFO and normal TX backpressure;
+accepted leases install the address, routes and DNS server set. A deterministic
+two-runtime test then resolves DNS over native UDP. Separate native tests prove
+ARP, bidirectional UDP, TCP connect/listen/accept/read/write/shutdown, socket
+quotas, stale handles, and FIN exchange over owned Ethernet frames.
+
+This establishes a usable synchronous native userspace stack without Fuchsia
+platform bindings. The embedding remains responsible for driving time/frame
+polls and DHCP renewal/rebind/expiry and DNS retry/cache policy; the supplied
+lease deadlines and truncation signal make those policies explicit. IPv6 is
+compiled and protocol-tested but the narrow `Runtime` socket facade is
+currently IPv4-only. The final deployment-specific step is implementing the
+existing frame/readiness contract at the Wi-Fi Ethernet boundary. No TAP device
+or MT7921 code is involved.

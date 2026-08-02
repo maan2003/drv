@@ -33,6 +33,9 @@ use netstack3_core::device::{
     EthernetWeakDeviceId, LoopbackDeviceId, MaxEthernetFrameSize, PureIpDeviceId,
     RecvEthernetFrameMeta, TransmitQueueConfiguration, WeakDeviceId,
 };
+use netstack3_core::device_socket::{
+    DeviceSocketMetadata, EthernetHeaderParams, Protocol, TargetDevice,
+};
 use netstack3_core::ip::{IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate};
 use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
 use netstack3_core::udp::UdpRemotePort;
@@ -59,7 +62,8 @@ use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
 };
 use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
-use netstack3_port_spike::EthernetFrame;
+use netstack3_port_spike::control_plane::{DhcpOffer, MAX_CONTROL_DATAGRAM_LEN};
+use netstack3_port_spike::{EthernetFrame, StackEthernetEndpoint};
 use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_tcp::{
     BufferSizes, ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
@@ -69,7 +73,11 @@ use netstack3_udp::{
     ReceiveUdpError, UdpBindingsTypes, UdpPacketMeta, UdpReceiveBindingsContext, UdpSettings,
     UdpSocketId,
 };
-use packet::{Buf, BufferMut, FragmentedByteSlice, InnerPacketBuilder};
+use packet::{Buf, BufferMut, FragmentedByteSlice, InnerPacketBuilder, NestableSerializer as _};
+use packet_formats::ethernet::EtherType;
+use packet_formats::ip::{IpProto, Ipv4Proto};
+use packet_formats::ipv4::Ipv4PacketBuilder;
+use packet_formats::udp::UdpPacketBuilder;
 use rand::{CryptoRng, RngCore};
 use zerocopy::SplitByteSlice;
 
@@ -923,6 +931,8 @@ pub enum RuntimeError {
     InvalidState,
     WouldBlock,
     SendFailed,
+    PayloadTooLarge,
+    InvalidLease,
 }
 
 type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
@@ -940,8 +950,10 @@ pub struct Runtime {
     // External strong IDs must be dropped before core's primary resources.
     udp: HashMap<UdpSocketHandle, NativeUdpV4>,
     tcp: HashMap<TcpSocketHandle, RuntimeTcpSocket>,
+    dhcp_socket: SocketId<NativeBindingsCtx>,
     device: EthernetDeviceId<NativeBindingsCtx>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
+    dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
     stack: StackState<NativeBindingsCtx>,
     bindings: NativeBindingsCtx,
@@ -1000,11 +1012,28 @@ impl Runtime {
             .api(&mut bindings)
             .transmit_queue::<EthernetLinkDevice>()
             .set_configuration(&device, TransmitQueueConfiguration::Fifo);
+        let dhcp_socket = stack
+            .api(&mut bindings)
+            .device_socket()
+            .create(Mutex::new(VecDeque::<(
+                WeakDeviceId<NativeBindingsCtx>,
+                Vec<u8>,
+            )>::new()));
+        stack
+            .api(&mut bindings)
+            .device_socket()
+            .set_device_and_protocol(
+                &dhcp_socket,
+                TargetDevice::SpecificDevice(&device_id),
+                Protocol::Specific(NonZeroU16::new(0x0800).unwrap()),
+            );
         Ok(Self {
             udp: HashMap::new(),
             tcp: HashMap::new(),
+            dhcp_socket,
             device,
             ipv4_address: None,
+            dns_servers: [None, None],
             next_socket: 0,
             stack,
             bindings,
@@ -1069,6 +1098,95 @@ impl Runtime {
                 .device_ip::<Ipv4>()
                 .del_ip_addr(&self.device.clone().into(), address.addr());
         }
+        self.dns_servers = [None, None];
+    }
+
+    /// Applies all data-plane parts of an accepted DHCP lease together.
+    pub fn apply_dhcp_lease(&mut self, lease: DhcpOffer) -> Result<(), RuntimeError> {
+        let prefix = lease.prefix_len().ok_or(RuntimeError::InvalidLease)?;
+        self.apply_ipv4(
+            lease.address.octets(),
+            prefix,
+            lease.gateway.map(|address| address.octets()),
+        )?;
+        self.dns_servers = lease.dns_servers;
+        Ok(())
+    }
+
+    pub fn dns_servers(&self) -> [Option<std::net::Ipv4Addr>; 2] {
+        self.dns_servers
+    }
+
+    /// Sends a pre-lease DHCP datagram through core's private device socket.
+    pub fn dhcp_send(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
+        if payload.len() > MAX_CONTROL_DATAGRAM_LEN {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
+        let src = Ipv4Addr::new([0, 0, 0, 0]);
+        let dst = Ipv4Addr::new([255, 255, 255, 255]);
+        let body = Buf::new(payload.to_vec(), ..)
+            .wrap_in(UdpPacketBuilder::new(
+                src,
+                dst,
+                NonZeroU16::new(68),
+                NonZeroU16::new(67).unwrap(),
+            ))
+            .wrap_in(Ipv4PacketBuilder::new(
+                src,
+                dst,
+                64,
+                Ipv4Proto::Proto(IpProto::Udp),
+            ));
+        self.stack
+            .api(&mut self.bindings)
+            .device_socket()
+            .send_frame::<_, EthernetLinkDevice>(
+                &self.dhcp_socket,
+                DeviceSocketMetadata {
+                    device_id: self.device.clone(),
+                    metadata: Some(EthernetHeaderParams {
+                        dest_addr: Mac::new([0xff; 6]),
+                        protocol: EtherType::Ipv4,
+                    }),
+                },
+                body,
+            )
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    /// Takes one DHCP server datagram received by the private device socket.
+    pub fn dhcp_receive(&mut self) -> Option<Vec<u8>> {
+        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+            let Some(ip) = frame.get(14..) else {
+                continue;
+            };
+            if ip.len() < 28 || ip[0] >> 4 != 4 || ip[9] != 17 {
+                continue;
+            }
+            let header_len = usize::from(ip[0] & 0x0f) * 4;
+            let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+            let fragment = u16::from_be_bytes([ip[6], ip[7]]);
+            if header_len < 20
+                || total_len > ip.len()
+                || total_len < header_len + 8
+                || fragment & 0x3fff != 0
+            {
+                continue;
+            }
+            let udp = &ip[header_len..total_len];
+            if udp[..4] != [0, 67, 0, 68] {
+                continue;
+            }
+            let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
+            if !(8..=udp.len()).contains(&udp_len) {
+                continue;
+            }
+            let payload = &udp[8..udp_len];
+            if payload.len() <= MAX_CONTROL_DATAGRAM_LEN {
+                return Some(payload.to_vec());
+            }
+        }
+        None
     }
 
     /// Delivers one owned Ethernet frame into core.
@@ -1155,6 +1273,9 @@ impl Runtime {
         remote_port: NonZeroU16,
         payload: &[u8],
     ) -> Result<(), RuntimeError> {
+        if payload.len() > 1472 {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
         let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
         let address = SpecifiedAddr::new(Ipv4Addr::new(remote_address))
             .ok_or(RuntimeError::InvalidAddress)?;
@@ -1350,10 +1471,82 @@ impl Runtime {
     }
 }
 
+impl StackEthernetEndpoint for Runtime {
+    fn receive_frame(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame> {
+        Runtime::receive_frame(self, frame);
+        Ok(())
+    }
+
+    fn take_transmit(&mut self) -> Option<EthernetFrame> {
+        self.take_tx()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edge_dhcp::{MessageType as DhcpMessageType, Options, Packet};
+    use hickory_proto::op::{Message, OpCode};
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
     use netstack3_base::socket::SocketWritableListener as _;
+    use netstack3_port_spike::control_plane::{Dhcpv4Client, DnsCodec};
+    use packet::Serializer as _;
+
+    #[derive(Clone, Copy)]
+    struct FixedRandom(u32);
+    impl rand_core_06::RngCore for FixedRandom {
+        fn next_u32(&mut self) -> u32 {
+            self.0
+        }
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.next_u32())
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(4) {
+                let bytes = self.next_u32().to_ne_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    fn encode_dhcp(packet: &Packet<'_>) -> Vec<u8> {
+        let mut bytes = [0; MAX_CONTROL_DATAGRAM_LEN];
+        packet.encode(&mut bytes).unwrap().to_vec()
+    }
+
+    fn dhcp_server_frame(payload: &[u8]) -> EthernetFrame {
+        let server_ip = Ipv4Addr::new([192, 0, 2, 1]);
+        let broadcast = Ipv4Addr::new([255, 255, 255, 255]);
+        let bytes = Buf::new(payload.to_vec(), ..)
+            .wrap_in(UdpPacketBuilder::new(
+                server_ip,
+                broadcast,
+                NonZeroU16::new(67),
+                NonZeroU16::new(68).unwrap(),
+            ))
+            .wrap_in(Ipv4PacketBuilder::new(
+                server_ip,
+                broadcast,
+                64,
+                Ipv4Proto::Proto(IpProto::Udp),
+            ))
+            .wrap_in(packet_formats::ethernet::EthernetFrameBuilder::new(
+                Mac::new([0x02, 0, 0, 0, 0, 1]),
+                Mac::new([0xff; 6]),
+                EtherType::Ipv4,
+                packet_formats::ethernet::ETHERNET_MIN_BODY_LEN_NO_TAG,
+            ))
+            .serialize_vec_outer(&mut netstack3_base::NetworkSerializationContext::default())
+            .unwrap()
+            .unwrap_b()
+            .into_inner();
+        EthernetFrame::try_from(bytes).unwrap()
+    }
 
     #[test]
     fn injected_clock_entropy_and_readiness_are_deterministic_and_bounded() {
@@ -1425,6 +1618,134 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    fn udp_payload(frame: &EthernetFrame) -> &[u8] {
+        let bytes = frame.as_bytes();
+        let ip_header_len = usize::from(bytes[14] & 0x0f) * 4;
+        &bytes[14 + ip_header_len + 8..]
+    }
+
+    #[test]
+    fn native_runtime_bootstraps_dhcp_then_resolves_dns_over_udp() {
+        let entropy = (0u8..=255).cycle().take(8192);
+        let mut client = Runtime::new(
+            4,
+            entropy,
+            NonZeroU64::new(10).unwrap(),
+            [0x02, 0, 0, 0, 0, 10],
+            1500,
+        )
+        .unwrap();
+        let mut dhcp = Dhcpv4Client::new(FixedRandom(0x1234_5678), [0x02, 0, 0, 0, 0, 10]);
+        let (discover_tx, discover) = dhcp.discover(0).unwrap();
+        client.dhcp_send(discover.as_bytes()).unwrap();
+        let discover_frame = client.take_tx().unwrap();
+        assert_eq!(&discover_frame.as_bytes()[0..6], &[0xff; 6]);
+        let discover = Packet::decode(udp_payload(&discover_frame)).unwrap();
+
+        let gateways = [std::net::Ipv4Addr::new(192, 0, 2, 1)];
+        let dns = [std::net::Ipv4Addr::new(192, 0, 2, 1)];
+        let mut options = Options::buf();
+        let offer_options = discover.options.reply(
+            DhcpMessageType::Offer,
+            gateways[0],
+            3600,
+            &gateways,
+            Some(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+            &dns,
+            None,
+            &mut options,
+        );
+        let offer = discover.new_reply(Some(std::net::Ipv4Addr::new(192, 0, 2, 10)), offer_options);
+        client.receive_frame(dhcp_server_frame(&encode_dhcp(&offer)));
+        let offer = dhcp
+            .accept_offer(discover_tx, &client.dhcp_receive().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let (request_tx, request) = dhcp.request(1, offer).unwrap();
+        client.dhcp_send(request.as_bytes()).unwrap();
+        let request = client.take_tx().unwrap();
+        let request = Packet::decode(udp_payload(&request)).unwrap();
+        let mut options = Options::buf();
+        let ack_options = request.options.reply(
+            DhcpMessageType::Ack,
+            gateways[0],
+            3600,
+            &gateways,
+            Some(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+            &dns,
+            None,
+            &mut options,
+        );
+        let ack = request.new_reply(Some(offer.address), ack_options);
+        client.receive_frame(dhcp_server_frame(&encode_dhcp(&ack)));
+        let lease = dhcp
+            .accept_ack(request_tx, &client.dhcp_receive().unwrap())
+            .unwrap()
+            .unwrap();
+        client.apply_dhcp_lease(lease).unwrap();
+        assert_eq!(client.dns_servers()[0], Some(dns[0]));
+
+        let mut server = runtime(11, [0x02, 0, 0, 0, 0, 1], [192, 0, 2, 1]);
+        let client_socket = client.udp_socket().unwrap();
+        let server_socket = server.udp_socket().unwrap();
+        client
+            .udp_bind(
+                client_socket,
+                Some([192, 0, 2, 10]),
+                NonZeroU16::new(53000).unwrap(),
+            )
+            .unwrap();
+        server
+            .udp_bind(
+                server_socket,
+                Some([192, 0, 2, 1]),
+                NonZeroU16::new(53).unwrap(),
+            )
+            .unwrap();
+        let query = DnsCodec::query(7, "native.test.", RecordType::A).unwrap();
+        client
+            .udp_send_to(
+                client_socket,
+                [192, 0, 2, 1],
+                NonZeroU16::new(53).unwrap(),
+                query.datagram().as_bytes(),
+            )
+            .unwrap();
+        for _ in 0..16 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let request = server.udp_receive(server_socket).unwrap().unwrap();
+        let request = Message::from_vec(&request).unwrap();
+        let mut response = Message::response(7, OpCode::Query);
+        response.add_query(request.queries[0].clone());
+        response.answers.push(Record::from_rdata(
+            Name::from_ascii("native.test.").unwrap(),
+            60,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        server
+            .udp_send_to(
+                server_socket,
+                [192, 0, 2, 10],
+                NonZeroU16::new(53000).unwrap(),
+                &response.to_vec().unwrap(),
+            )
+            .unwrap();
+        for _ in 0..16 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let response = client.udp_receive(client_socket).unwrap().unwrap();
+        assert_eq!(
+            DnsCodec::response(&query, &response).unwrap(),
+            [std::net::IpAddr::V4(dns[0])]
+        );
     }
 
     #[test]
