@@ -16,6 +16,34 @@
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
           { };
 
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          hardware-backends = pkgs.rustPlatform.buildRustPackage {
+            pname = "drv-hardware-backends";
+            version = "0.1.0";
+            src = builtins.path {
+              path = ./.;
+              name = "drv-source";
+            };
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "drv-hardware-backends"
+              "--bin"
+              "vfio_edu"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "drv-hardware-backends"
+            ];
+          };
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let
