@@ -5,6 +5,7 @@ members = [
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
   "../../wlan/lib/ieee80211", "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
+  "../../wlan/lib/frame_writer/macro",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
   "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",

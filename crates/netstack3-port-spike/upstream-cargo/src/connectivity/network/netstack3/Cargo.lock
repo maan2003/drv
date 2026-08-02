@@ -2924,6 +2924,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-frame-writer-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "wlan-statemachine"
 version = "0.1.0"
 dependencies = [
