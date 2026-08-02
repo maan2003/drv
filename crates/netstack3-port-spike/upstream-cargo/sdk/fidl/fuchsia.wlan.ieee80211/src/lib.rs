@@ -11,8 +11,28 @@ pub const HT_OP_LEN: u8 = 22;
 pub const VHT_CAP_LEN: u8 = 12;
 pub const VHT_OP_LEN: u8 = 5;
 pub const MAX_KEY_LEN: u8 = 32;
+pub const SSID_LIST_MAX: u8 = 84;
+pub const MAX_UNIQUE_CHANNEL_NUMBERS: u16 = 256;
+pub const MAX_MGMT_FRAME_MAC_HEADER_BYTE_LEN: u8 = 28;
+pub const MAX_VHT_MPDU_BYTE_LEN_2: u16 = 11_454;
+pub const MAX_SUPPORTED_BASIC_RATES: u8 = 12;
 
 pub type MacAddr = [u8; MAC_ADDR_LEN as usize];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CSsid {
+    pub len: u8,
+    pub data: [u8; MAX_SSID_BYTE_LEN as usize],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum WlanAccessCategory {
+    Background = 1,
+    BestEffort = 2,
+    Video = 3,
+    Voice = 4,
+}
 
 macro_rules! flexible_enum {
     ($name:ident, $raw:ty, $unknown:ident, {$($variant:ident = $value:expr),+ $(,)?}) => {
@@ -235,6 +255,18 @@ mod tests {
         assert_eq!(CipherSuiteType::Ccmp128.into_primitive(), 4);
         assert_eq!(KeyType::Peer.into_primitive(), 4);
         assert_eq!(MAX_KEY_LEN, 32);
+        assert_eq!(MAX_UNIQUE_CHANNEL_NUMBERS, 256);
+        assert_eq!(MAX_VHT_MPDU_BYTE_LEN_2, 11_454);
+        assert_eq!(WlanAccessCategory::Voice as u32, 4);
+        assert_eq!(
+            CSsid {
+                len: 0,
+                data: [0; 32]
+            }
+            .data
+            .len(),
+            32
+        );
         assert_eq!(ReasonCode::MicFailure.into_primitive(), 14);
         assert_eq!(StatusCode::Success.into_primitive(), 0);
         assert_eq!(StatusCode::AntiCloggingTokenRequired.into_primitive(), 76);

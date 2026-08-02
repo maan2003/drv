@@ -5,6 +5,8 @@
 //! Host subset generated from the pinned `fuchsia.wlan.common` schema.
 
 pub const WLAN_TX_VECTOR_IDX_INVALID: u16 = 0;
+pub const MAX_SUPPORTED_PHY_TYPES: u8 = 64;
+pub const MAX_BANDS: u8 = 16;
 
 macro_rules! flexible_enum {
     ($name:ident, $raw:ty, {$($variant:ident = $value:expr),+ $(,)?}) => {
@@ -119,6 +121,8 @@ mod tests {
     #[test]
     fn schema_values_match_pinned_fidl() {
         assert_eq!(WLAN_TX_VECTOR_IDX_INVALID, 0);
+        assert_eq!(MAX_SUPPORTED_PHY_TYPES, 64);
+        assert_eq!(MAX_BANDS, 16);
         assert_eq!(WlanMacRole::Mesh.into_primitive(), 3);
         assert_eq!(DataPlaneType::GenericNetworkDevice.into_primitive(), 2);
         assert_eq!(MacImplementationType::Fullmac.into_primitive(), 2);

@@ -11,4 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 bitflags.workspace = true
+fidl-fuchsia-wlan-common = { path = "../fuchsia.wlan.common" }
+fidl-fuchsia-wlan-driver = { path = "../fuchsia.wlan.driver" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../fuchsia.wlan.ieee80211" }

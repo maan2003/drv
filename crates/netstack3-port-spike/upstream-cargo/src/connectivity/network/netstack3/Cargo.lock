@@ -694,6 +694,8 @@ name = "fidl-fuchsia-wlan-softmac"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
 ]
 
