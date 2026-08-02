@@ -99,8 +99,11 @@ Wi-Fi Ethernet boundary <- owned EthernetFrame <- Netstack3 host binding
 initially no VLAN, 1500-byte MTU). Both fake-device queues have an explicit item
 bound and return frame ownership on backpressure. The trait exposes no file,
 path, descriptor, ioctl, TAP handle, hardware handle, clock, executor, or random
-source. Configuration, monotonic timers, entropy and socket readiness must be
-separate injected capabilities when the real context is added. This makes the
+source. Configuration, monotonic timers, entropy and socket readiness are
+separate injected capabilities. `EthernetEventSource` adds link, receive-ready,
+and returned-transmit-credit events without exposing an OS handle, while
+`EthernetRunner` retains at most one frame in each direction during
+backpressure. This makes the
 frame edge usable in-process without granting the protocol engine ambient
 hardware or filesystem authority and keeps it compatible with
 [REQ-host-portability](../../specs/REQ-host-portability.md).
@@ -141,14 +144,21 @@ five tests through upstream core APIs behind this crate's owned-frame boundary:
 - Ethernet ARP resolution, IPv4 route selection, and queued UDP transmission;
 - Ethernet IPv4 ICMP echo request and reply;
 - IPv6 NDP neighbor solicitation/advertisement and UDP transmission; and
-- a real upstream TCP loopback handshake followed by payload receive.
+- a real upstream TCP loopback handshake followed by payload receive; and
 - DHCPv4 acquisition over bounded Ethernet, application of the accepted
   address and on-link route to Netstack3, DNS request/response over Netstack3
   UDP, and a TCP handshake plus payload between two Ethernet-attached stacks.
 
+The overlay also builds `NativeBindingsCtx` against production core with its
+`testutils` feature disabled. This standalone context supplies injected time and
+entropy, budgeted timers, non-panicking reference notifiers, bounded frame,
+event and UDP queues, TCP buffers/readiness, and device dispatch. Its focused
+tests run in addition to the five protocol tests above (the older protocol
+fixtures still use upstream's fake context as an oracle).
+
 This establishes that the portable pinned core can compile and execute without
-Fuchsia platform bindings, including post-DHCP application traffic. It does
-**not** finish a production host binding: the tests use upstream's fake bindings
-context, and a native context still must implement
-bounded socket buffers/readiness, timers, entropy, diagnostics, configuration,
-and the direct Wi-Fi frame adapter. No TAP device or MT7921 code is involved.
+Fuchsia platform bindings, including post-DHCP application traffic. Remaining
+runtime work is explicit: pre-lease DHCP must move behind an internal Netstack3
+device socket, lease updates must use a production route manager, and the
+native context needs the narrow opaque TCP/UDP application facade plus the
+direct Wi-Fi adapter. No TAP device or MT7921 code is involved.
