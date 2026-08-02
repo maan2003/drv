@@ -155,8 +155,12 @@ interrupt unmasking remains unavailable until that chosen vector is actually
 installed and exercised by the deterministic completion path.
 `IrqLifecycle` prevents the device source from being enabled before an
 eventfd-capable VFIO vector is installed, rejects a zero eventfd counter, and
-requires explicit disable after an observed completion. It is deterministic
-only; the native eventfd/`VFIO_DEVICE_SET_IRQS` owner is still pending.
+requires explicit disable after an observed completion. The native backend now
+has an unexposed `VfioIrq` owner which creates a nonblocking close-on-exec
+eventfd, installs exactly one selected vector with `VFIO_DEVICE_SET_IRQS`,
+drains 64-bit counters, explicitly disables the vector, and repeats disable in
+`Drop`. Its Linux UAPI layout is tested, but it cannot yet be invoked physically
+or unmask a device source.
 
 `teardown_pinned_dma` makes reset ordering explicit for the future active path:
 mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO

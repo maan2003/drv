@@ -28,6 +28,7 @@ const VFIO_BASE: u64 = 100;
 const VFIO_DEVICE_GET_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 7);
 const VFIO_DEVICE_GET_REGION_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 8);
 const VFIO_DEVICE_GET_IRQ_INFO: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 9);
+const VFIO_DEVICE_SET_IRQS: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 10);
 const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
@@ -46,6 +47,11 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
+const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
+const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
+const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
+const EFD_CLOEXEC: i32 = 0x80000;
+const EFD_NONBLOCK: i32 = 0x800;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
 
@@ -94,6 +100,21 @@ struct IrqInfo {
 }
 #[repr(C)]
 #[derive(Default)]
+struct IrqSetHeader {
+    argsz: u32,
+    flags: u32,
+    index: u32,
+    start: u32,
+    count: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IrqSetEventfd {
+    header: IrqSetHeader,
+    eventfd: i32,
+}
+#[repr(C)]
+#[derive(Default)]
 struct IoasAlloc {
     size: u32,
     flags: u32,
@@ -129,6 +150,9 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn eventfd(initval: u32, flags: i32) -> i32;
+    fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+    fn close(fd: i32) -> i32;
 }
 
 fn main() {
@@ -704,6 +728,105 @@ impl Drop for Ioas<'_> {
     }
 }
 
+#[allow(dead_code)]
+struct VfioIrq {
+    device_fd: RawFd,
+    event_fd: RawFd,
+    index: u32,
+    installed: bool,
+}
+#[allow(dead_code)]
+impl VfioIrq {
+    fn install(device: &File, capability: PciIrqCapability) -> Result<Self, String> {
+        if capability.count == 0 || !capability.eventfd {
+            return Err("refused non-eventfd VFIO interrupt".into());
+        }
+        let index = match capability.kind {
+            PciIrqKind::Intx => 0,
+            PciIrqKind::Msi => 1,
+            PciIrqKind::Msix => 2,
+        };
+        let event_fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+        if event_fd < 0 {
+            return Err(format!(
+                "create IRQ eventfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut set = IrqSetEventfd {
+            header: IrqSetHeader {
+                argsz: size::<IrqSetEventfd>(),
+                flags: VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                index,
+                start: 0,
+                count: 1,
+            },
+            eventfd: event_fd,
+        };
+        if let Err(error) = ioctl_mut(
+            device.as_raw_fd(),
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "install VFIO IRQ eventfd",
+        ) {
+            unsafe { close(event_fd) };
+            return Err(error);
+        }
+        Ok(Self {
+            device_fd: device.as_raw_fd(),
+            event_fd,
+            index,
+            installed: true,
+        })
+    }
+    fn try_read(&self) -> Result<Option<u64>, String> {
+        let mut counter = 0u64;
+        let result = unsafe {
+            read(
+                self.event_fd,
+                (&mut counter as *mut u64).cast::<u8>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if result == std::mem::size_of::<u64>() as isize {
+            Ok(Some(counter))
+        } else if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "read IRQ eventfd: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+    fn disable(&mut self) -> Result<(), String> {
+        if !self.installed {
+            return Ok(());
+        }
+        let mut set = IrqSetHeader {
+            argsz: size::<IrqSetHeader>(),
+            flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+            index: self.index,
+            start: 0,
+            count: 0,
+        };
+        ioctl_mut(
+            self.device_fd,
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "disable VFIO IRQ eventfd",
+        )?;
+        self.installed = false;
+        Ok(())
+    }
+}
+impl Drop for VfioIrq {
+    fn drop(&mut self) {
+        let _ = self.disable();
+        unsafe { close(self.event_fd) };
+    }
+}
+
 struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
@@ -1111,4 +1234,20 @@ fn decompress_patch() -> Result<Vec<u8>, String> {
         ));
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfio_irq_payload_matches_linux_uapi_layout() {
+        assert_eq!(std::mem::size_of::<IrqSetHeader>(), 20);
+        assert_eq!(std::mem::size_of::<IrqSetEventfd>(), 24);
+        assert_eq!(
+            VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+            0x24
+        );
+        assert_eq!(VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER, 0x21);
+    }
 }
