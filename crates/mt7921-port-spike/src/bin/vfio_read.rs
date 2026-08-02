@@ -19,7 +19,7 @@ use std::{
     cell::Cell,
     env,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, RawFd},
     process::Command,
     ptr::NonNull,
@@ -307,7 +307,7 @@ fn run() -> Result<(), String> {
         ),
     )?;
     let pcie_mac = if operation == Operation::PrepareOwnedGlobalTxRings {
-        Some(ReadPage::map(&device, &info, 0x10000, false)?)
+        Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
         None
     };
@@ -539,17 +539,24 @@ fn run() -> Result<(), String> {
             return Err(format!("BAR0 is too small: {:#x}", info.size));
         }
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
-        if pcie_mac.read(0x10188)? != 0 {
-            return Err("PCIe MAC interrupt gate is not zero".into());
+        let mac_irq = pcie_mac.read(0x10188)?;
+        if mac_irq == u32::MAX {
+            return Err("PCIe MAC interrupt gate returned all ones".into());
         }
-        disable_vfio_irq_index(&device, 0)?;
+        set_lab_safety("MUTATED")?;
+        disable_pci_intx(&bdf)?;
+        pcie_mac.write_pcie_mac_interrupt_enable_zero()?;
+        if pcie_mac.read(0x10188)? != 0 {
+            return Err(format!(
+                "PCIe MAC interrupt gate did not clear from {mac_irq:#010x}"
+            ));
+        }
         let mut guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
         let mut fwdl = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
         let mut mcu = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
         guard.initialize_descriptor_page()?;
         fwdl.initialize_descriptor_page()?;
         mcu.initialize_descriptor_page()?;
-        set_lab_safety("MUTATED")?;
         let operation = {
             let mut transport = VfioGlobalTxRings { page: &wfdma };
             prepare_global_tx_rings(
@@ -570,12 +577,6 @@ fn run() -> Result<(), String> {
                 GlobalTxRingError::InvalidMmio => "invalid all-ones TX ring MMIO".into(),
                 GlobalTxRingError::DirtyRing { index, state } => {
                     format!("TX ring {index} is not idle: {state:?}")
-                }
-                GlobalTxRingError::UnexpectedFwdlExtCtrl(raw) => {
-                    format!("unexpected ring16 EXT_CTRL {raw:#010x}")
-                }
-                GlobalTxRingError::UnexpectedMcuExtCtrl(raw) => {
-                    format!("unexpected ring17 EXT_CTRL {raw:#010x}")
                 }
                 GlobalTxRingError::Transport(error) => error,
                 GlobalTxRingError::Readback { index, state } => {
@@ -712,6 +713,30 @@ fn verify_pci_dma_disabled(bdf: &str) -> Result<(), String> {
     }
     if power_state != Some(0) {
         return Err(format!("PCI device is not in D0: {power_state:?}"));
+    }
+    Ok(())
+}
+
+fn disable_pci_intx(bdf: &str) -> Result<(), String> {
+    let path = format!("/sys/bus/pci/devices/{bdf}/config");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open PCI config for INTx disable: {error}"))?;
+    let mut raw = [0u8; 2];
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("read PCI command for INTx disable: {error}"))?;
+    let command = u16::from_le_bytes(raw) | (1 << 10);
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&command.to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::Start(4)))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("write PCI INTx disable: {error}"))?;
+    let readback = u16::from_le_bytes(raw);
+    if readback & (1 << 10) == 0 {
+        return Err(format!("PCI INTx disable did not latch: {readback:#06x}"));
     }
     Ok(())
 }
@@ -1105,6 +1130,14 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn write_pcie_mac_interrupt_enable_zero(&self) -> Result<(), String> {
+        if self.bar_page != 0x10000 {
+            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
+        }
+        let within = 0x10188 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), 0) };
+        Ok(())
+    }
     fn write_fwdl_ring(&self, register: DisabledFwdlWrite, value: u32) -> Result<(), String> {
         let offset = match register {
             DisabledFwdlWrite::DescriptorBase => 0xd4400,
@@ -1204,22 +1237,6 @@ fn vfio_irq_capabilities(device: &File) -> Result<Vec<PciIrqCapability>, String>
         });
     }
     Ok(capabilities)
-}
-
-fn disable_vfio_irq_index(device: &File, index: u32) -> Result<(), String> {
-    let mut set = IrqSetHeader {
-        argsz: size::<IrqSetHeader>(),
-        flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
-        index,
-        start: 0,
-        count: 0,
-    };
-    ioctl_mut(
-        device.as_raw_fd(),
-        VFIO_DEVICE_SET_IRQS,
-        &mut set,
-        "disable VFIO IRQ index",
-    )
 }
 
 fn reset_vfio_device(device: &File) -> Result<(), String> {
@@ -1485,12 +1502,6 @@ impl GlobalTxRingTransport for VfioGlobalTxRings<'_> {
             cpu_index: self.page.read(base + 8)?,
             dma_index: self.page.read(base + 12)?,
         })
-    }
-    fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
-        self.page.read(0xd4640)
-    }
-    fn read_mcu_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
-        self.page.read(0xd4644)
     }
     fn write_tx_ring(
         &mut self,

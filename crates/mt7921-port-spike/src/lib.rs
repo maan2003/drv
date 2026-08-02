@@ -1597,8 +1597,6 @@ pub const MT7921_MCU_TX_RING_INDEX: usize = 17;
 pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
 pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
 pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
-pub const MT7921_FWDL_EXT_CTRL: u32 = 0x0340_0004;
-pub const MT7921_MCU_TX_EXT_CTRL: u32 = 0x0380_0004;
 pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1773,8 +1771,6 @@ pub trait GlobalTxRingTransport {
     fn read_global_config(&mut self) -> Result<u32, Self::Error>;
     fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
     fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error>;
-    fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error>;
-    fn read_mcu_ext_ctrl(&mut self) -> Result<u32, Self::Error>;
     fn write_tx_ring(
         &mut self,
         index: usize,
@@ -1805,8 +1801,6 @@ pub enum GlobalTxRingError<E> {
         index: usize,
         state: TxRingState,
     },
-    UnexpectedFwdlExtCtrl(u32),
-    UnexpectedMcuExtCtrl(u32),
     Transport(E),
     Readback {
         index: usize,
@@ -1867,24 +1861,6 @@ where
             global_config,
             interrupt_enable,
         });
-    }
-    let ext = transport
-        .read_fwdl_ext_ctrl()
-        .map_err(GlobalTxRingError::Transport)?;
-    if ext == u32::MAX {
-        return Err(GlobalTxRingError::InvalidMmio);
-    }
-    if ext != MT7921_FWDL_EXT_CTRL {
-        return Err(GlobalTxRingError::UnexpectedFwdlExtCtrl(ext));
-    }
-    let ext = transport
-        .read_mcu_ext_ctrl()
-        .map_err(GlobalTxRingError::Transport)?;
-    if ext == u32::MAX {
-        return Err(GlobalTxRingError::InvalidMmio);
-    }
-    if ext != MT7921_MCU_TX_EXT_CTRL {
-        return Err(GlobalTxRingError::UnexpectedMcuExtCtrl(ext));
     }
     for index in 0..MT7921_TX_RING_SLOTS {
         let state = transport
@@ -3250,8 +3226,6 @@ mod tests {
     struct FakeGlobalTx {
         global: u32,
         interrupts: u32,
-        ext: u32,
-        mcu_ext: u32,
         rings: [TxRingState; MT7921_TX_RING_SLOTS],
         writes: Vec<(usize, u32)>,
         resets: Vec<u32>,
@@ -3270,8 +3244,6 @@ mod tests {
             Self {
                 global: 0x1010_b870,
                 interrupts: 0,
-                ext: MT7921_FWDL_EXT_CTRL,
-                mcu_ext: MT7921_MCU_TX_EXT_CTRL,
                 rings,
                 writes: Vec::new(),
                 resets: Vec::new(),
@@ -3288,12 +3260,6 @@ mod tests {
         }
         fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error> {
             Ok(self.rings[index])
-        }
-        fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
-            Ok(self.ext)
-        }
-        fn read_mcu_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
-            Ok(self.mcu_ext)
         }
         fn write_tx_ring(
             &mut self,
@@ -3446,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn global_tx_preparation_rejects_dirty_mmio_ext_and_arenas_before_writes() {
+    fn global_tx_preparation_rejects_dirty_mmio_and_arenas_before_writes() {
         let mut dirty = FakeGlobalTx::new();
         dirty.rings[7].cpu_index += 1;
         assert!(matches!(
@@ -3454,21 +3420,6 @@ mod tests {
             Err(GlobalTxRingError::DirtyRing { index: 7, .. })
         ));
         assert!(dirty.writes.is_empty());
-
-        let mut invalid = FakeGlobalTx::new();
-        invalid.ext = u32::MAX;
-        assert_eq!(
-            prepare_global_tx_rings(&mut invalid, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
-            Err(GlobalTxRingError::InvalidMmio)
-        );
-        assert!(invalid.writes.is_empty());
-
-        let mut ext = FakeGlobalTx::new();
-        ext.ext = 4;
-        assert_eq!(
-            prepare_global_tx_rings(&mut ext, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
-            Err(GlobalTxRingError::UnexpectedFwdlExtCtrl(4))
-        );
 
         let mut overlap = FakeGlobalTx::new();
         assert_eq!(
