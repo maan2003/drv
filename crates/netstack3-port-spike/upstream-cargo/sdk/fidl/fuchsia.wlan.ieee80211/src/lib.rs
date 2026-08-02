@@ -106,6 +106,20 @@ pub struct VhtOperation {
     pub bytes: [u8; VHT_OP_LEN as usize],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BssDescription {
+    pub bssid: MacAddr,
+    pub bss_type: BssType,
+    pub beacon_period: u16,
+    pub capability_info: u16,
+    pub ies: Vec<u8>,
+    pub primary: ChannelNumber,
+    pub bandwidth: ChannelBandwidth,
+    pub vht_secondary_80_channel: ChannelNumber,
+    pub rssi_dbm: i8,
+    pub snr_db: i8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +130,7 @@ mod tests {
         assert_eq!(WlanBand::FiveGhz.into_primitive(), 1);
         assert_eq!(BssType::Personal.into_primitive(), 4);
         assert_eq!(WlanPhyType::He.into_primitive(), 12);
+        assert_eq!(std::mem::size_of::<MacAddr>(), MAC_ADDR_LEN as usize);
         assert_eq!(
             HtCapabilities { bytes: [0; 26] }.bytes.len(),
             HT_CAP_LEN as usize

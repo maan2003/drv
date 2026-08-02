@@ -8,6 +8,7 @@ members = [
   "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
   "../../../../sdk/fidl/fuchsia.wlan.internal",
   "../../../../sdk/fidl/fuchsia.wlan.mlme",
+  "../../../../sdk/fidl/fuchsia.wlan.sme",
   "../../../../sdk/fidl/fuchsia.wlan.softmac",
   "../../wlan/lib/frame_writer/macro",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
