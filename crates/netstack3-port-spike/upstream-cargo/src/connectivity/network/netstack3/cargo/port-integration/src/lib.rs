@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 pub mod dns_bridge;
+pub mod ethernet_transport;
 pub mod service;
 pub mod socket_provider;
 

@@ -1337,6 +1337,7 @@ dependencies = [
  "diagnostics_traits",
  "futures",
  "futures-io",
+ "libc",
  "net_declare",
  "net_types",
  "netstack3-port-spike",

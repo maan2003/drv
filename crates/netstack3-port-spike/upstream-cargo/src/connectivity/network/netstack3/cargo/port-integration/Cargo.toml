@@ -12,6 +12,7 @@ dhcp_protocol.workspace = true
 diagnostics_traits.workspace = true
 futures.workspace = true
 futures-io.workspace = true
+libc.workspace = true
 trust-dns-proto.workspace = true
 trust-dns-resolver.workspace = true
 netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }

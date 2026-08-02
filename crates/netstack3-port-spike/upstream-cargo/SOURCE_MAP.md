@@ -102,5 +102,9 @@ Netstack3.
 multiplexed identity before dispatch, and routes requests through
 ProviderDispatcherV2 and NativeSocketProvider. Its bounded reader channel also
 drives monotonic Netstack3 time and emits only changed, sequenced readiness
-snapshots. Ethernet frames and interface configuration remain separate
-deployment capabilities rather than being granted through the provider device.
+snapshots. `ethernet_transport.rs` adapts an inherited connected
+`SOCK_SEQPACKET` capability to versioned attach, link, and owned Ethernet-frame
+messages with bounded queues and one retained transmit frame under backpressure.
+The daemon does not open the provider device until attach and link-up complete;
+DhcpService, rather than the frame peer or application provider, owns address,
+route, and DNS configuration.
