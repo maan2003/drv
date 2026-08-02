@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use edge_dhcp::{DhcpOption, MessageType as DhcpMessageType, Options, Packet, Settings, client};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -375,34 +375,434 @@ impl DnsCodec {
     }
 
     pub fn response(query: &DnsQuery, bytes: &[u8]) -> Result<Vec<IpAddr>, ControlPlaneError> {
-        ensure_bounded(bytes)?;
-        let message =
-            Message::from_vec(bytes).map_err(|error| ControlPlaneError::Dns(error.to_string()))?;
-        if message.metadata.id != query.transaction_id
-            || message.metadata.message_type != MessageType::Response
-            || message.queries.as_slice()
-                != [Query::query(query.name.clone(), query.record_type)].as_slice()
-        {
-            return Err(ControlPlaneError::DnsTransactionMismatch);
-        }
-        if message.metadata.response_code != ResponseCode::NoError {
-            return Err(ControlPlaneError::DnsResponse(
-                message.metadata.response_code,
-            ));
-        }
-        if message.metadata.truncation {
-            return Err(ControlPlaneError::DnsTruncated);
-        }
-        Ok(message
-            .answers
-            .iter()
-            .filter_map(|record| match &record.data {
-                RData::A(address) => Some(IpAddr::V4(address.0)),
-                RData::AAAA(address) => Some(IpAddr::V6(address.0)),
-                _ => None,
-            })
-            .collect())
+        let message = validated_dns_response(query, bytes, MAX_CONTROL_DATAGRAM_LEN)?;
+        Ok(dns_addresses(&message))
     }
+}
+
+fn validated_dns_response(
+    query: &DnsQuery,
+    bytes: &[u8],
+    maximum_len: usize,
+) -> Result<Message, ControlPlaneError> {
+    if bytes.len() > maximum_len {
+        return Err(ControlPlaneError::DatagramTooLarge { len: bytes.len() });
+    }
+    let message =
+        Message::from_vec(bytes).map_err(|error| ControlPlaneError::Dns(error.to_string()))?;
+    if message.metadata.id != query.transaction_id
+        || message.metadata.message_type != MessageType::Response
+        || message.queries.as_slice()
+            != [Query::query(query.name.clone(), query.record_type)].as_slice()
+    {
+        return Err(ControlPlaneError::DnsTransactionMismatch);
+    }
+    if message.metadata.response_code != ResponseCode::NoError {
+        return Err(ControlPlaneError::DnsResponse(
+            message.metadata.response_code,
+        ));
+    }
+    if message.metadata.truncation {
+        return Err(ControlPlaneError::DnsTruncated);
+    }
+    Ok(message)
+}
+
+fn dns_addresses(message: &Message) -> Vec<IpAddr> {
+    message
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::A(address) => Some(IpAddr::V4(address.0)),
+            RData::AAAA(address) => Some(IpAddr::V6(address.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dns_addresses_for_type(message: &Message, record_type: RecordType) -> Vec<IpAddr> {
+    dns_addresses(message)
+        .into_iter()
+        .filter(|address| {
+            matches!(
+                (address, record_type),
+                (IpAddr::V4(_), RecordType::A) | (IpAddr::V6(_), RecordType::AAAA)
+            )
+        })
+        .collect()
+}
+
+/// Hard lifecycle bounds. Responses beyond [`MAX_DNS_CACHE_ADDRESSES`] are
+/// accepted, but only the first addresses are retained and returned.
+pub const MAX_DNS_SERVERS: usize = 4;
+pub const MAX_OUTSTANDING_DNS_QUERIES: usize = 8;
+pub const MAX_DNS_CACHE_ENTRIES: usize = 32;
+pub const MAX_DNS_CACHE_ADDRESSES: usize = 16;
+pub const MAX_DNS_TCP_MESSAGE_LEN: usize = u16::MAX as usize;
+
+/// The two endpoints of a connected DNS transport. Keeping both endpoints in
+/// every transmission and response prevents a packet received by another
+/// local socket or from another configured server from completing a query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DnsAssociation {
+    pub source: SocketAddr,
+    pub server: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DnsResolverConfig {
+    pub timeout_millis: u64,
+    /// Additional transmissions to one server before moving to the next.
+    pub retries_per_server: u8,
+}
+
+impl Default for DnsResolverConfig {
+    fn default() -> Self {
+        Self {
+            timeout_millis: 1_000,
+            retries_per_server: 1,
+        }
+    }
+}
+
+/// A transport operation emitted by [`DnsResolver`]. TCP payloads are DNS
+/// messages without the two-byte stream length prefix; framing stays with the
+/// caller that owns the stream.
+#[derive(Clone, Debug)]
+pub struct DnsRequest {
+    lookup_id: u64,
+    association: DnsAssociation,
+    transport: DnsTransport,
+    query: DnsQuery,
+}
+
+impl DnsRequest {
+    pub fn lookup_id(&self) -> u64 {
+        self.lookup_id
+    }
+
+    pub fn association(&self) -> DnsAssociation {
+        self.association
+    }
+
+    pub fn transport(&self) -> DnsTransport {
+        self.transport
+    }
+
+    pub fn query(&self) -> &DnsQuery {
+        &self.query
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum DnsResolverEvent {
+    Transmit(DnsRequest),
+    Answer {
+        lookup_id: u64,
+        addresses: Vec<IpAddr>,
+    },
+    Failed {
+        lookup_id: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PendingDnsQuery {
+    lookup_id: u64,
+    name: Name,
+    record_type: RecordType,
+    query: DnsQuery,
+    server_index: usize,
+    transport: DnsTransport,
+    transmissions_on_server: u16,
+    deadline_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DnsCacheEntry {
+    name: Name,
+    record_type: RecordType,
+    addresses: Vec<IpAddr>,
+    expires_at_millis: u64,
+    inserted_at_millis: u64,
+}
+
+/// A bounded, sans-I/O DNS query lifecycle. The caller supplies monotonic time,
+/// transaction-ID entropy, configured connected endpoints, and all transport.
+pub struct DnsResolver<R> {
+    random: R,
+    associations: Vec<DnsAssociation>,
+    config: DnsResolverConfig,
+    outstanding: Vec<PendingDnsQuery>,
+    cache: Vec<DnsCacheEntry>,
+    next_lookup_id: u64,
+}
+
+impl<R: RngCore> DnsResolver<R> {
+    pub fn new(
+        random: R,
+        associations: &[DnsAssociation],
+        config: DnsResolverConfig,
+    ) -> Result<Self, ControlPlaneError> {
+        if associations.is_empty() {
+            return Err(ControlPlaneError::NoDnsServers);
+        }
+        if associations.len() > MAX_DNS_SERVERS {
+            return Err(ControlPlaneError::TooManyDnsServers {
+                len: associations.len(),
+            });
+        }
+        if config.timeout_millis == 0 {
+            return Err(ControlPlaneError::InvalidDnsResolverConfig);
+        }
+        Ok(Self {
+            random,
+            associations: associations.to_vec(),
+            config,
+            outstanding: Vec::new(),
+            cache: Vec::new(),
+            next_lookup_id: 0,
+        })
+    }
+
+    pub fn outstanding_len(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Starts a lookup or returns a non-expired cached answer. `now_millis`
+    /// comes from the caller's monotonic clock.
+    pub fn lookup(
+        &mut self,
+        now_millis: u64,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<DnsResolverEvent, ControlPlaneError> {
+        if !matches!(record_type, RecordType::A | RecordType::AAAA) {
+            return Err(ControlPlaneError::UnsupportedDnsRecord);
+        }
+        let name =
+            Name::from_ascii(name).map_err(|error| ControlPlaneError::Dns(error.to_string()))?;
+        self.expire_cache(now_millis);
+        let lookup_id = self.allocate_lookup_id();
+        if let Some(entry) = self
+            .cache
+            .iter()
+            .find(|entry| entry.name == name && entry.record_type == record_type)
+        {
+            return Ok(DnsResolverEvent::Answer {
+                lookup_id,
+                addresses: entry.addresses.clone(),
+            });
+        }
+        if self.outstanding.len() == MAX_OUTSTANDING_DNS_QUERIES {
+            return Err(ControlPlaneError::TooManyDnsQueries);
+        }
+        let transaction_id = self.next_transaction_id(None);
+        let query = DnsCodec::query(transaction_id, &name.to_ascii(), record_type)?;
+        let pending = PendingDnsQuery {
+            lookup_id,
+            name,
+            record_type,
+            query,
+            server_index: 0,
+            transport: DnsTransport::Udp,
+            transmissions_on_server: 1,
+            deadline_millis: now_millis.saturating_add(self.config.timeout_millis),
+        };
+        let request = self.request_for(&pending);
+        self.outstanding.push(pending);
+        Ok(DnsResolverEvent::Transmit(request))
+    }
+
+    /// Accepts an unframed DNS response from a specific connected transport.
+    /// Responses not associated with the current server, source, transport,
+    /// and transaction are ignored.
+    pub fn receive(
+        &mut self,
+        now_millis: u64,
+        association: DnsAssociation,
+        transport: DnsTransport,
+        bytes: &[u8],
+    ) -> Result<Option<DnsResolverEvent>, ControlPlaneError> {
+        let Some(transaction_id) = bytes
+            .get(..2)
+            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+            .map(u16::from_be_bytes)
+        else {
+            return Ok(None);
+        };
+        let Some(index) = self.outstanding.iter().position(|pending| {
+            pending.query.transaction_id == transaction_id
+                && self.associations[pending.server_index] == association
+                && pending.transport == transport
+        }) else {
+            return Ok(None);
+        };
+
+        let maximum_len = match transport {
+            DnsTransport::Udp => MAX_CONTROL_DATAGRAM_LEN,
+            DnsTransport::Tcp => MAX_DNS_TCP_MESSAGE_LEN,
+        };
+        match validated_dns_response(&self.outstanding[index].query, bytes, maximum_len) {
+            Err(ControlPlaneError::DnsTruncated) if transport == DnsTransport::Udp => {
+                let pending = &mut self.outstanding[index];
+                pending.transport = DnsTransport::Tcp;
+                pending.transmissions_on_server = 1;
+                pending.deadline_millis = now_millis.saturating_add(self.config.timeout_millis);
+                let request = self.request_for(&self.outstanding[index]);
+                Ok(Some(DnsResolverEvent::Transmit(request)))
+            }
+            Err(error) => Err(error),
+            Ok(message) => {
+                let pending = self.outstanding.remove(index);
+                let mut addresses = dns_addresses_for_type(&message, pending.record_type);
+                addresses.truncate(MAX_DNS_CACHE_ADDRESSES);
+                if let Some(ttl) = dns_ttl(&message, pending.record_type)
+                    && ttl != 0
+                    && !addresses.is_empty()
+                {
+                    self.insert_cache(
+                        now_millis,
+                        pending.name,
+                        pending.record_type,
+                        addresses.clone(),
+                        ttl,
+                    );
+                }
+                Ok(Some(DnsResolverEvent::Answer {
+                    lookup_id: pending.lookup_id,
+                    addresses,
+                }))
+            }
+        }
+    }
+
+    /// Advances expired queries by one retry/failover step each. Exhausted
+    /// queries emit `Failed` and release their outstanding-query slot.
+    pub fn poll_timeouts(
+        &mut self,
+        now_millis: u64,
+    ) -> Result<Vec<DnsResolverEvent>, ControlPlaneError> {
+        self.expire_cache(now_millis);
+        let mut events = Vec::new();
+        let mut index = 0;
+        while index < self.outstanding.len() {
+            if now_millis < self.outstanding[index].deadline_millis {
+                index += 1;
+                continue;
+            }
+            let retry_limit = u16::from(self.config.retries_per_server) + 1;
+            if self.outstanding[index].transmissions_on_server >= retry_limit {
+                if self.outstanding[index].server_index + 1 == self.associations.len() {
+                    let pending = self.outstanding.remove(index);
+                    events.push(DnsResolverEvent::Failed {
+                        lookup_id: pending.lookup_id,
+                    });
+                    continue;
+                }
+                self.outstanding[index].server_index += 1;
+                self.outstanding[index].transport = DnsTransport::Udp;
+                self.outstanding[index].transmissions_on_server = 0;
+            }
+
+            let lookup_id = self.outstanding[index].lookup_id;
+            let transaction_id = self.next_transaction_id(Some(lookup_id));
+            let name = self.outstanding[index].name.to_ascii();
+            let record_type = self.outstanding[index].record_type;
+            let query = DnsCodec::query(transaction_id, &name, record_type)?;
+            let pending = &mut self.outstanding[index];
+            pending.query = query;
+            pending.transmissions_on_server += 1;
+            pending.deadline_millis = now_millis.saturating_add(self.config.timeout_millis);
+            let request = self.request_for(&self.outstanding[index]);
+            events.push(DnsResolverEvent::Transmit(request));
+            index += 1;
+        }
+        Ok(events)
+    }
+
+    fn allocate_lookup_id(&mut self) -> u64 {
+        let id = self.next_lookup_id;
+        self.next_lookup_id = self.next_lookup_id.wrapping_add(1);
+        id
+    }
+
+    fn next_transaction_id(&mut self, exclude_lookup_id: Option<u64>) -> u16 {
+        let mut candidate = self.random.next_u32() as u16;
+        while self.outstanding.iter().any(|pending| {
+            Some(pending.lookup_id) != exclude_lookup_id
+                && pending.query.transaction_id == candidate
+        }) {
+            candidate = candidate.wrapping_add(1);
+        }
+        candidate
+    }
+
+    fn request_for(&self, pending: &PendingDnsQuery) -> DnsRequest {
+        DnsRequest {
+            lookup_id: pending.lookup_id,
+            association: self.associations[pending.server_index],
+            transport: pending.transport,
+            query: pending.query.clone(),
+        }
+    }
+
+    fn expire_cache(&mut self, now_millis: u64) {
+        self.cache
+            .retain(|entry| now_millis < entry.expires_at_millis);
+    }
+
+    fn insert_cache(
+        &mut self,
+        now_millis: u64,
+        name: Name,
+        record_type: RecordType,
+        addresses: Vec<IpAddr>,
+        ttl_seconds: u32,
+    ) {
+        self.expire_cache(now_millis);
+        self.cache
+            .retain(|entry| entry.name != name || entry.record_type != record_type);
+        if self.cache.len() == MAX_DNS_CACHE_ENTRIES {
+            let oldest = self
+                .cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.inserted_at_millis)
+                .map(|(index, _)| index)
+                .expect("a full cache has an oldest entry");
+            self.cache.remove(oldest);
+        }
+        self.cache.push(DnsCacheEntry {
+            name,
+            record_type,
+            addresses,
+            expires_at_millis: now_millis
+                .saturating_add(u64::from(ttl_seconds).saturating_mul(1_000)),
+            inserted_at_millis: now_millis,
+        });
+    }
+}
+
+fn dns_ttl(message: &Message, record_type: RecordType) -> Option<u32> {
+    message
+        .answers
+        .iter()
+        .filter_map(|record| match (&record.data, record_type) {
+            (RData::A(_), RecordType::A) | (RData::AAAA(_), RecordType::AAAA) => Some(record.ttl),
+            _ => None,
+        })
+        .min()
 }
 
 #[derive(Debug)]
@@ -415,6 +815,10 @@ pub enum ControlPlaneError {
     DnsResponse(ResponseCode),
     DnsTruncated,
     UnsupportedDnsRecord,
+    NoDnsServers,
+    TooManyDnsServers { len: usize },
+    TooManyDnsQueries,
+    InvalidDnsResolverConfig,
 }
 
 impl fmt::Display for ControlPlaneError {
@@ -428,6 +832,20 @@ impl fmt::Display for ControlPlaneError {
             Self::DnsResponse(code) => write!(f, "DNS server returned {code:?}"),
             Self::DnsTruncated => write!(f, "DNS response requires TCP fallback"),
             Self::UnsupportedDnsRecord => write!(f, "only A and AAAA queries are supported"),
+            Self::NoDnsServers => write!(f, "at least one DNS server is required"),
+            Self::TooManyDnsServers { len } => {
+                write!(
+                    f,
+                    "{len} DNS servers exceed the {MAX_DNS_SERVERS}-server limit"
+                )
+            }
+            Self::TooManyDnsQueries => write!(
+                f,
+                "DNS queries exceed the {MAX_OUTSTANDING_DNS_QUERIES}-query limit"
+            ),
+            Self::InvalidDnsResolverConfig => {
+                write!(f, "DNS resolver timeout must be non-zero")
+            }
         }
     }
 }
@@ -447,6 +865,29 @@ mod tests {
     impl rand_core_06::RngCore for FixedRandom {
         fn next_u32(&mut self) -> u32 {
             self.0
+        }
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.next_u32())
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(4) {
+                let bytes = self.next_u32().to_ne_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    struct IncrementingRandom(u32);
+
+    impl rand_core_06::RngCore for IncrementingRandom {
+        fn next_u32(&mut self) -> u32 {
+            let value = self.0;
+            self.0 = self.0.wrapping_add(1);
+            value
         }
         fn next_u64(&mut self) -> u64 {
             u64::from(self.next_u32())
@@ -608,5 +1049,215 @@ mod tests {
             DnsCodec::response(&query, &response.to_vec().unwrap()),
             Err(ControlPlaneError::DnsTruncated)
         ));
+    }
+
+    fn dns_association(host: u8, source_port: u16) -> DnsAssociation {
+        DnsAssociation {
+            source: SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), source_port)),
+            server: SocketAddr::from((Ipv4Addr::new(192, 0, 2, host), 53)),
+        }
+    }
+
+    fn transmission(event: DnsResolverEvent) -> DnsRequest {
+        match event {
+            DnsResolverEvent::Transmit(request) => request,
+            other => panic!("expected transmission, got {other:?}"),
+        }
+    }
+
+    fn dns_response(request: &DnsRequest, ttl: u32, address: Ipv4Addr, truncated: bool) -> Vec<u8> {
+        let request_message = Message::from_vec(request.query().datagram().as_bytes()).unwrap();
+        let mut response = Message::response(request.query().transaction_id(), OpCode::Query);
+        response.add_query(request_message.queries[0].clone());
+        response.metadata.truncation = truncated;
+        if !truncated {
+            response.answers.push(Record::from_rdata(
+                request_message.queries[0].name.clone(),
+                ttl,
+                RData::A(A(address)),
+            ));
+        }
+        response.to_vec().unwrap()
+    }
+
+    #[test]
+    fn dns_resolver_retries_then_fails_over_with_new_injected_ids() {
+        let servers = [dns_association(53, 53000), dns_association(54, 53001)];
+        let mut resolver = DnsResolver::new(
+            IncrementingRandom(0x1234_5678),
+            &servers,
+            DnsResolverConfig {
+                timeout_millis: 100,
+                retries_per_server: 1,
+            },
+        )
+        .unwrap();
+
+        let first = transmission(resolver.lookup(0, "retry.test.", RecordType::A).unwrap());
+        assert_eq!(first.query().transaction_id(), 0x5678);
+        assert_eq!(first.association(), servers[0]);
+        assert!(resolver.poll_timeouts(99).unwrap().is_empty());
+
+        let retry = transmission(resolver.poll_timeouts(100).unwrap().remove(0));
+        assert_eq!(retry.association(), servers[0]);
+        assert_eq!(retry.query().transaction_id(), 0x5679);
+
+        let failover = transmission(resolver.poll_timeouts(200).unwrap().remove(0));
+        assert_eq!(failover.association(), servers[1]);
+        assert_eq!(failover.transport(), DnsTransport::Udp);
+        assert!(
+            resolver
+                .receive(
+                    201,
+                    servers[0],
+                    DnsTransport::Udp,
+                    &dns_response(&failover, 60, Ipv4Addr::new(203, 0, 113, 7), false),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let answer = resolver
+            .receive(
+                202,
+                servers[1],
+                DnsTransport::Udp,
+                &dns_response(&failover, 60, Ipv4Addr::new(203, 0, 113, 7), false),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            answer,
+            DnsResolverEvent::Answer { addresses, .. }
+                if addresses == [IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]
+        ));
+        assert_eq!(resolver.outstanding_len(), 0);
+    }
+
+    #[test]
+    fn dns_resolver_expires_ttl_cache_at_the_deadline() {
+        let server = dns_association(53, 53000);
+        let mut resolver =
+            DnsResolver::new(FixedRandom(7), &[server], DnsResolverConfig::default()).unwrap();
+        let request = transmission(resolver.lookup(0, "cache.test.", RecordType::A).unwrap());
+        resolver
+            .receive(
+                10,
+                server,
+                DnsTransport::Udp,
+                &dns_response(&request, 2, Ipv4Addr::new(192, 0, 2, 99), false),
+            )
+            .unwrap();
+        assert_eq!(resolver.cache_len(), 1);
+        assert!(matches!(
+            resolver
+                .lookup(2_009, "cache.test.", RecordType::A)
+                .unwrap(),
+            DnsResolverEvent::Answer { .. }
+        ));
+        assert!(matches!(
+            resolver
+                .lookup(2_010, "cache.test.", RecordType::A)
+                .unwrap(),
+            DnsResolverEvent::Transmit(_)
+        ));
+        assert_eq!(resolver.cache_len(), 0);
+    }
+
+    #[test]
+    fn dns_resolver_uses_tcp_after_truncation_and_recovers() {
+        let server = dns_association(53, 53000);
+        let mut resolver =
+            DnsResolver::new(FixedRandom(11), &[server], DnsResolverConfig::default()).unwrap();
+        let udp = transmission(
+            resolver
+                .lookup(0, "truncated.test.", RecordType::A)
+                .unwrap(),
+        );
+        let tcp = transmission(
+            resolver
+                .receive(
+                    1,
+                    server,
+                    DnsTransport::Udp,
+                    &dns_response(&udp, 0, Ipv4Addr::UNSPECIFIED, true),
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(tcp.transport(), DnsTransport::Tcp);
+        assert_eq!(tcp.association(), server);
+        assert_eq!(tcp.lookup_id(), udp.lookup_id());
+        assert_eq!(resolver.outstanding_len(), 1);
+
+        // Once TCP fallback is active, a late UDP answer cannot complete it.
+        assert!(
+            resolver
+                .receive(
+                    2,
+                    server,
+                    DnsTransport::Udp,
+                    &dns_response(&udp, 60, Ipv4Addr::new(192, 0, 2, 44), false),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let answer = resolver
+            .receive(
+                3,
+                server,
+                DnsTransport::Tcp,
+                &dns_response(&tcp, 60, Ipv4Addr::new(192, 0, 2, 44), false),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(answer, DnsResolverEvent::Answer { .. }));
+        assert_eq!(resolver.outstanding_len(), 0);
+        assert!(matches!(
+            resolver
+                .lookup(4, "truncated.test.", RecordType::A)
+                .unwrap(),
+            DnsResolverEvent::Answer { .. }
+        ));
+    }
+
+    #[test]
+    fn dns_resolver_enforces_outstanding_and_cache_bounds() {
+        let server = dns_association(53, 53000);
+        let mut resolver =
+            DnsResolver::new(FixedRandom(17), &[server], DnsResolverConfig::default()).unwrap();
+        for index in 0..MAX_OUTSTANDING_DNS_QUERIES {
+            let request = transmission(
+                resolver
+                    .lookup(0, &format!("outstanding-{index}.test."), RecordType::A)
+                    .unwrap(),
+            );
+            assert_eq!(request.query().transaction_id(), 17 + index as u16);
+        }
+        assert!(matches!(
+            resolver.lookup(0, "one-too-many.test.", RecordType::A),
+            Err(ControlPlaneError::TooManyDnsQueries)
+        ));
+
+        // Use a fresh resolver to fill one more cache entry than can be kept.
+        let mut resolver =
+            DnsResolver::new(FixedRandom(23), &[server], DnsResolverConfig::default()).unwrap();
+        for index in 0..=MAX_DNS_CACHE_ENTRIES {
+            let request = transmission(
+                resolver
+                    .lookup(index as u64, &format!("cache-{index}.test."), RecordType::A)
+                    .unwrap(),
+            );
+            resolver
+                .receive(
+                    index as u64,
+                    server,
+                    DnsTransport::Udp,
+                    &dns_response(&request, 60, Ipv4Addr::new(192, 0, 2, 1), false),
+                )
+                .unwrap();
+            assert!(resolver.cache_len() <= MAX_DNS_CACHE_ENTRIES);
+        }
+        assert_eq!(resolver.cache_len(), MAX_DNS_CACHE_ENTRIES);
     }
 }
