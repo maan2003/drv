@@ -64,7 +64,15 @@ impl Protocol {
     pub const Wpa3Enterprise: Self = Self(7);
     pub const Owe: Self = Self(8);
 
-    pub const fn from_primitive(value: u32) -> Self {
+    pub const fn from_primitive(value: u32) -> Option<Self> {
+        if value >= 1 && value <= 8 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn from_primitive_allow_unknown(value: u32) -> Self {
         Self(value)
     }
 
@@ -92,7 +100,12 @@ mod tests {
         assert_eq!(Protocol::Open.into_primitive(), 1);
         assert_eq!(Protocol::Wpa3Enterprise.into_primitive(), 7);
         assert_eq!(Protocol::Owe.into_primitive(), 8);
-        assert_eq!(Protocol::from_primitive(44).into_primitive(), 44);
+        assert_eq!(Protocol::from_primitive(8), Some(Protocol::Owe));
+        assert_eq!(Protocol::from_primitive(44), None);
+        assert_eq!(
+            Protocol::from_primitive_allow_unknown(44).into_primitive(),
+            44
+        );
     }
 
     #[test]

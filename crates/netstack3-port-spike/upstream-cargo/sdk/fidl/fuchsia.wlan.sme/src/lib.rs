@@ -27,7 +27,7 @@ pub enum Protection {
     OpenOweTransition = 13,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisjointSecurityProtocol {
     pub protocol: Protocol,
     pub role: WlanMacRole,

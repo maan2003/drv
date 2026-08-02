@@ -18,6 +18,7 @@ cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 # upstream DHCP core. The source and minimal host patch remain separate.
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/dhcp-client-core-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/trust-dns-workspace.patch" || true
+patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-common-host.patch" || true
 
 manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
 cargo check --locked --manifest-path "$manifest" -p netstack3_core
@@ -25,5 +26,6 @@ cargo check --locked --manifest-path "$manifest" -p netstack3-port-integration
 cargo check --locked --manifest-path "$manifest" -p dhcp-protocol
 cargo check --locked --manifest-path "$manifest" -p dhcp_client_core
 cargo check --locked --manifest-path "$manifest" -p trust-dns-resolver --no-default-features --features testing
+cargo check --locked --manifest-path "$manifest" -p wlan-common
 cargo check --locked --manifest-path "$manifest" -p netstack3_core --features testutils
 cargo test --locked --manifest-path "$manifest" -p netstack3-port-integration --tests

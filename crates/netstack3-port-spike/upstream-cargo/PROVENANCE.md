@@ -45,6 +45,11 @@ by these packages. Host bindings must be generated or represented by narrow
 path-shaped compatibility crates from those pinned schemas; they must not copy
 policy or invent a second protocol definition.
 
+`wlan-common-host.patch` gates only the Zircon-status conversion at the existing
+platform boundary and marks the already ignored host scan timestamp as consumed.
+The frame, IE, BSS, capability, channel, rate-vector, and security algorithms
+remain byte-for-byte pinned Fuchsia source.
+
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
 archive convention, workspace, or lockfile for another Fuchsia subsystem.

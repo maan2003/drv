@@ -23,7 +23,14 @@ macro_rules! flexible_enum {
         impl $name {
             $(pub const $variant: Self = Self($value);)+
 
-            pub const fn from_primitive(value: $raw) -> Self {
+            pub const fn from_primitive(value: $raw) -> Option<Self> {
+                $(if value == $value {
+                    return Some(Self::$variant);
+                })+
+                None
+            }
+
+            pub const fn from_primitive_allow_unknown(value: $raw) -> Self {
                 Self(value)
             }
 
@@ -41,6 +48,67 @@ macro_rules! flexible_enum {
             () => { _ };
         }
     };
+}
+
+macro_rules! flexible_code {
+    ($name:ident, $valid:expr) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[repr(transparent)]
+        pub struct $name(u16);
+
+        impl $name {
+            pub const fn from_primitive(value: u16) -> Option<Self> {
+                if ($valid)(value) {
+                    Some(Self(value))
+                } else {
+                    None
+                }
+            }
+
+            pub const fn from_primitive_allow_unknown(value: u16) -> Self {
+                Self(value)
+            }
+
+            pub const fn into_primitive(self) -> u16 {
+                self.0
+            }
+
+            pub const fn unknown() -> Self {
+                Self(u16::MAX)
+            }
+        }
+    };
+}
+
+const fn valid_reason_code(value: u16) -> bool {
+    matches!(value, 1..=39 | 45..=66 | 128..=130)
+}
+
+const fn valid_status_code(value: u16) -> bool {
+    matches!(
+        value,
+        0..=3
+            | 5..=7
+            | 10..=19
+            | 22..=25
+            | 27..=35
+            | 37..=65
+            | 67..=68
+            | 72..=89
+            | 92..=113
+            | 116..=123
+            | 125..=126
+            | 128..=129
+            | 256..=260
+    )
+}
+
+flexible_code!(ReasonCode, valid_reason_code);
+flexible_code!(StatusCode, valid_status_code);
+
+#[allow(non_upper_case_globals)]
+impl StatusCode {
+    pub const RefusedReasonUnspecified: Self = Self(1);
 }
 
 flexible_enum!(ChannelBandwidth, u32, ChannelBandwidthUnknown, {
@@ -140,6 +208,23 @@ mod tests {
     #[test]
     fn flexible_unknown_round_trips() {
         assert_eq!(WlanBand::unknown().into_primitive(), u8::MAX);
-        assert_eq!(ChannelBandwidth::from_primitive(77).into_primitive(), 77);
+        assert_eq!(
+            ChannelBandwidth::from_primitive(6),
+            Some(ChannelBandwidth::Cbw80P80)
+        );
+        assert_eq!(ChannelBandwidth::from_primitive(77), None);
+        assert_eq!(
+            ChannelBandwidth::from_primitive_allow_unknown(77).into_primitive(),
+            77
+        );
+        assert_eq!(ReasonCode::from_primitive(40), None);
+        assert_eq!(
+            ReasonCode::from_primitive(128).unwrap().into_primitive(),
+            128
+        );
+        assert_eq!(
+            StatusCode::from_primitive(260).unwrap().into_primitive(),
+            260
+        );
     }
 }

@@ -16,7 +16,14 @@ macro_rules! flexible_enum {
         impl $name {
             $(pub const $variant: Self = Self($value);)+
 
-            pub const fn from_primitive(value: $raw) -> Self {
+            pub const fn from_primitive(value: $raw) -> Option<Self> {
+                $(if value == $value {
+                    return Some(Self::$variant);
+                })+
+                None
+            }
+
+            pub const fn from_primitive_allow_unknown(value: $raw) -> Self {
                 Self(value)
             }
 
@@ -119,7 +126,12 @@ mod tests {
 
     #[test]
     fn flexible_unknown_and_table_defaults_match_binding_contract() {
-        assert_eq!(WlanMacRole::from_primitive(44).into_primitive(), 44);
+        assert_eq!(WlanMacRole::from_primitive(3), Some(WlanMacRole::Mesh));
+        assert_eq!(WlanMacRole::from_primitive(44), None);
+        assert_eq!(
+            WlanMacRole::from_primitive_allow_unknown(44).into_primitive(),
+            44
+        );
         assert_eq!(DataPlaneType::unknown().into_primitive(), u8::MAX);
         assert_eq!(
             SecuritySupport::default(),
