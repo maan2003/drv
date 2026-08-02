@@ -1874,6 +1874,100 @@ pub fn select_vfio_irq(capabilities: &[PciIrqCapability]) -> Option<PciIrqCapabi
         })
 }
 
+pub const PINNED_DMA_QUIESCE_MS: u64 = 100;
+
+pub trait PinnedDmaTeardownTransport {
+    type Error;
+    fn now_ms(&self) -> u64;
+    fn mask_device_interrupts(&mut self) -> Result<(), Self::Error>;
+    fn disable_tx_dma(&mut self) -> Result<(), Self::Error>;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn sleep_ms(&mut self, milliseconds: u64);
+    fn reset_vfio_device(&mut self) -> Result<(), Self::Error>;
+    fn unmap_all(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinnedDmaTeardownEvent {
+    InterruptsMasked,
+    TxDmaDisabled,
+    DmaQuiesced,
+    DmaBusyTimedOut { raw: u32 },
+    DeviceReset,
+    MappingsReleased,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PinnedDmaTeardownError<E> {
+    Cleanup(E),
+    Reset(E),
+    Unmap(E),
+    BusyTimedOut(u32),
+}
+
+/// Revoke active DMA without ever exposing an unmapped IOVA to the device.
+///
+/// A function reset is mandatory while every mapping remains pinned, even if
+/// TX busy clears normally. If busy never clears, reset is the only transition
+/// which permits unmapping. A failed reset returns without calling `unmap_all`,
+/// leaving the process and external reboot watchdog as the final containment.
+pub fn teardown_pinned_dma<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<(), PinnedDmaTeardownError<T::Error>>
+where
+    T: PinnedDmaTeardownTransport,
+    F: FnMut(PinnedDmaTeardownEvent),
+{
+    let mut cleanup_error = None;
+    match transport.mask_device_interrupts() {
+        Ok(()) => event(PinnedDmaTeardownEvent::InterruptsMasked),
+        Err(error) => cleanup_error = Some(error),
+    }
+    match transport.disable_tx_dma() {
+        Ok(()) => event(PinnedDmaTeardownEvent::TxDmaDisabled),
+        Err(error) if cleanup_error.is_none() => cleanup_error = Some(error),
+        Err(_) => {}
+    }
+    let deadline = transport.now_ms().saturating_add(PINNED_DMA_QUIESCE_MS);
+    let mut busy_timeout = None;
+    loop {
+        match transport.read_global_config() {
+            Ok(raw) if raw & (1 << 1) == 0 => {
+                event(PinnedDmaTeardownEvent::DmaQuiesced);
+                break;
+            }
+            Ok(raw) if transport.now_ms() >= deadline => {
+                busy_timeout = Some(raw);
+                event(PinnedDmaTeardownEvent::DmaBusyTimedOut { raw });
+                break;
+            }
+            Ok(_) => transport.sleep_ms(1),
+            Err(error) => {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(error);
+                }
+                break;
+            }
+        }
+    }
+    transport
+        .reset_vfio_device()
+        .map_err(PinnedDmaTeardownError::Reset)?;
+    event(PinnedDmaTeardownEvent::DeviceReset);
+    transport
+        .unmap_all()
+        .map_err(PinnedDmaTeardownError::Unmap)?;
+    event(PinnedDmaTeardownEvent::MappingsReleased);
+    if let Some(error) = cleanup_error {
+        return Err(PinnedDmaTeardownError::Cleanup(error));
+    }
+    if let Some(raw) = busy_timeout {
+        return Err(PinnedDmaTeardownError::BusyTimedOut(raw));
+    }
+    Ok(())
+}
+
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
 pub const WFSYS_SW_INIT_DONE: u32 = 1 << 4;
 pub const WFSYS_ASSERT_MS: u64 = 50;
@@ -3044,6 +3138,103 @@ mod tests {
             }]),
             None
         );
+    }
+
+    struct FakePinnedTeardown {
+        now: u64,
+        busy_until: Option<u64>,
+        reset_fails: bool,
+        calls: Vec<&'static str>,
+    }
+    impl PinnedDmaTeardownTransport for FakePinnedTeardown {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn mask_device_interrupts(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("mask");
+            Ok(())
+        }
+        fn disable_tx_dma(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("disable");
+            Ok(())
+        }
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            self.calls.push("read");
+            Ok(if self.busy_until.is_none_or(|until| self.now < until) {
+                1 << 1
+            } else {
+                0
+            })
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+        fn reset_vfio_device(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("reset");
+            if self.reset_fails {
+                Err("reset failed")
+            } else {
+                Ok(())
+            }
+        }
+        fn unmap_all(&mut self) -> Result<(), Self::Error> {
+            self.calls.push("unmap");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pinned_dma_teardown_resets_before_unmapping_after_quiescence() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: Some(2),
+            reset_fails: false,
+            calls: Vec::new(),
+        };
+        teardown_pinned_dma(&mut transport, |_| {}).unwrap();
+        let reset = transport
+            .calls
+            .iter()
+            .position(|call| *call == "reset")
+            .unwrap();
+        let unmap = transport
+            .calls
+            .iter()
+            .position(|call| *call == "unmap")
+            .unwrap();
+        assert!(reset < unmap);
+    }
+
+    #[test]
+    fn pinned_dma_busy_timeout_resets_before_release() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: None,
+            reset_fails: false,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            teardown_pinned_dma(&mut transport, |_| {}),
+            Err(PinnedDmaTeardownError::BusyTimedOut(1 << 1))
+        );
+        assert_eq!(transport.calls.last_chunk::<2>(), Some(&["reset", "unmap"]));
+    }
+
+    #[test]
+    fn pinned_dma_reset_failure_never_unmaps() {
+        let mut transport = FakePinnedTeardown {
+            now: 0,
+            busy_until: None,
+            reset_fails: true,
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            teardown_pinned_dma(&mut transport, |_| {}),
+            Err(PinnedDmaTeardownError::Reset("reset failed"))
+        );
+        assert_eq!(transport.calls.last(), Some(&"reset"));
+        assert!(!transport.calls.contains(&"unmap"));
     }
 
     #[test]

@@ -146,6 +146,14 @@ eventfd support, and reports the preferred MSI-X/MSI/INTx choice. Device
 interrupt unmasking remains unavailable until that chosen vector is actually
 installed and exercised by the deterministic completion path.
 
+`teardown_pinned_dma` makes reset ordering explicit for the future active path:
+mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
+function reset is issued while every IOVA remains pinned regardless of the poll
+result. Mappings are released only after reset succeeds. A reset failure never
+calls unmap, so the external reboot watchdog remains the containment boundary.
+Signal handling and a physical transport still need to enforce this same model
+before active DMA can be admitted.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
