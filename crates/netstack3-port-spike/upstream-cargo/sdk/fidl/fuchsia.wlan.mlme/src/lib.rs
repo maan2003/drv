@@ -9,7 +9,9 @@ use fidl_fuchsia_wlan_ieee80211::{
     BssDescription, BssType, CapabilityInfo, ChannelBandwidth, ChannelNumber, CipherSuiteType,
     HtCapabilities, MacAddr, ReasonCode, Ssid, StatusCode, VhtCapabilities, WlanBand, WlanPhyType,
 };
-use fidl_fuchsia_wlan_internal::OwePublicKey;
+use fidl_fuchsia_wlan_internal::{
+    ChannelSwitchInfo, OwePublicKey, SignalReportIndication, WmmStatusResponse,
+};
 use fidl_fuchsia_wlan_minstrel::{Peer, Peers};
 use fidl_fuchsia_wlan_stats::{IfaceHistogramStats, IfaceStats};
 
@@ -123,6 +125,38 @@ pub struct ConnectConfirm {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReconnectRequest {
     pub peer_sta_address: MacAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoamRequest {
+    pub selected_bss: BssDescription,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoamConfirm {
+    pub selected_bssid: MacAddr,
+    pub status_code: StatusCode,
+    pub original_association_maintained: bool,
+    pub target_bss_authenticated: bool,
+    pub association_id: u16,
+    pub association_ies: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoamStartIndication {
+    pub selected_bssid: MacAddr,
+    pub selected_bss: BssDescription,
+    pub original_association_maintained: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoamResultIndication {
+    pub selected_bssid: MacAddr,
+    pub status_code: StatusCode,
+    pub original_association_maintained: bool,
+    pub target_bss_authenticated: bool,
+    pub association_id: u16,
+    pub association_ies: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,6 +439,11 @@ pub struct PmkInfo {
     pub pmkid: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedFrameResult {
+    pub frame: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SaeHandshakeIndication {
     pub peer_sta_address: MacAddr,
@@ -414,6 +453,89 @@ pub struct SaeHandshakeIndication {
 pub struct SaeHandshakeResponse {
     pub peer_sta_address: MacAddr,
     pub status_code: StatusCode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MlmeEvent {
+    OnScanResult {
+        result: ScanResult,
+    },
+    OnScanEnd {
+        end: ScanEnd,
+    },
+    ConnectConf {
+        resp: ConnectConfirm,
+    },
+    RoamConf {
+        conf: RoamConfirm,
+    },
+    RoamStartInd {
+        ind: RoamStartIndication,
+    },
+    RoamResultInd {
+        ind: RoamResultIndication,
+    },
+    AuthenticateInd {
+        ind: AuthenticateIndication,
+    },
+    DeauthenticateConf {
+        resp: DeauthenticateConfirm,
+    },
+    DeauthenticateInd {
+        ind: DeauthenticateIndication,
+    },
+    AssociateInd {
+        ind: AssociateIndication,
+    },
+    DisassociateConf {
+        resp: DisassociateConfirm,
+    },
+    DisassociateInd {
+        ind: DisassociateIndication,
+    },
+    StartConf {
+        resp: StartConfirm,
+    },
+    StopConf {
+        resp: StopConfirm,
+    },
+    SetKeysConf {
+        conf: SetKeysConfirm,
+    },
+    EapolConf {
+        resp: EapolConfirm,
+    },
+    SignalReport {
+        ind: SignalReportIndication,
+    },
+    EapolInd {
+        ind: EapolIndication,
+    },
+    RelayCapturedFrame {
+        result: CapturedFrameResult,
+    },
+    OnChannelSwitched {
+        info: ChannelSwitchInfo,
+    },
+    OnPmkAvailable {
+        info: PmkInfo,
+    },
+    OnSaeHandshakeInd {
+        ind: SaeHandshakeIndication,
+    },
+    OnSaeFrameRx {
+        frame: SaeFrame,
+    },
+    OnWmmStatusResp {
+        status: i32,
+        resp: WmmStatusResponse,
+    },
+    OnScheduledScanMatchesAvailable {
+        txn_id: u64,
+    },
+    OnScheduledScanStoppedByFirmware {
+        txn_id: u64,
+    },
 }
 
 #[cfg(test)]
@@ -538,5 +660,28 @@ mod tests {
             },
         };
         assert_eq!(response.peers.addrs[0], [2; 6]);
+    }
+
+    #[test]
+    fn event_envelope_preserves_variant_and_payload() {
+        let event = MlmeEvent::SignalReport {
+            ind: SignalReportIndication {
+                rssi_dbm: -42,
+                snr_db: 27,
+            },
+        };
+        assert_eq!(
+            event,
+            MlmeEvent::SignalReport {
+                ind: SignalReportIndication {
+                    rssi_dbm: -42,
+                    snr_db: 27
+                }
+            }
+        );
+        assert_eq!(
+            MlmeEvent::OnScheduledScanMatchesAvailable { txn_id: 9 },
+            MlmeEvent::OnScheduledScanMatchesAvailable { txn_id: 9 }
+        );
     }
 }

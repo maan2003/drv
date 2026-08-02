@@ -9,6 +9,24 @@ use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber};
 pub const MAX_ASSOC_BASIC_RATES: u8 = 14;
 pub const COUNTRY_CODE_LEN: u32 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WmmAcParams {
+    pub ecw_min: u8,
+    pub ecw_max: u8,
+    pub aifsn: u8,
+    pub txop_limit: u16,
+    pub acm: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WmmStatusResponse {
+    pub apsd: bool,
+    pub ac_be_params: WmmAcParams,
+    pub ac_bk_params: WmmAcParams,
+    pub ac_vi_params: WmmAcParams,
+    pub ac_vo_params: WmmAcParams,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwePublicKey {
     pub group: u16,
