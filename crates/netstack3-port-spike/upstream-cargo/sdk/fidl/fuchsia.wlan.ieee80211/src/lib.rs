@@ -11,6 +11,8 @@ pub const HT_OP_LEN: u8 = 22;
 pub const VHT_CAP_LEN: u8 = 12;
 pub const VHT_OP_LEN: u8 = 5;
 
+pub type MacAddr = [u8; MAC_ADDR_LEN as usize];
+
 macro_rules! flexible_enum {
     ($name:ident, $raw:ty, $unknown:ident, {$($variant:ident = $value:expr),+ $(,)?}) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
