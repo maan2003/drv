@@ -15,3 +15,7 @@ path = "src/bin/scan.rs"
 [[bin]]
 name = "mt7921-vfio-read"
 path = "src/bin/vfio_read.rs"
+
+[[bin]]
+name = "mt7921-firmware-inspect"
+path = "src/bin/firmware_inspect.rs"

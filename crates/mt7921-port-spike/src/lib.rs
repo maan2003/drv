@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
@@ -110,6 +110,166 @@ impl DmaDescriptor {
         bytes[15] = info[3];
         bytes
     }
+
+    pub const fn is_dma_done(self) -> bool {
+        self.ctrl & DMA_CTL_DMA_DONE != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingAllocation {
+    pub id: u64,
+    pub iova: u64,
+    pub len: usize,
+}
+
+pub trait Low32RingMemory {
+    type Error;
+    fn allocate_low32(&mut self, size: usize, align: usize) -> Result<RingAllocation, Self::Error>;
+    fn free(&mut self, allocation: RingAllocation);
+}
+
+pub trait RingPublisher {
+    type Error;
+    fn write_descriptor(
+        &mut self,
+        index: u16,
+        descriptor: DmaDescriptor,
+    ) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+    fn publish_producer(&mut self, index: u16) -> Result<(), Self::Error>;
+    fn acquire_fence(&mut self);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RingError<E> {
+    InvalidCount,
+    Allocation(E),
+    AllocationTooSmall,
+    AllocationAbove32Bits,
+    Full,
+    Descriptor(DescriptorError),
+    Publish(E),
+}
+
+/// Inactive MT7921 WFDMA TX ring model ported from pinned Linux mt76 `dma.c`.
+///
+/// Allocation is constrained to addresses representable by the MT7921 PCI
+/// 32-bit DMA mask. Descriptors start CPU-owned (`DMA_DONE`), enqueue clears
+/// that bit, and producer publication follows a release fence like
+/// `mt76_dma_kick_queue`. Reclaim advances only from the consumer tail after a
+/// device completion and acquire fence. This type has no MMIO enable method.
+pub struct WfdmaRing {
+    allocation: RingAllocation,
+    descriptors: Vec<DmaDescriptor>,
+    producer: u16,
+    consumer: u16,
+    queued: u16,
+}
+
+impl WfdmaRing {
+    pub fn allocate<M: Low32RingMemory>(
+        memory: &mut M,
+        count: u16,
+    ) -> Result<Self, RingError<M::Error>> {
+        if count < 2 {
+            return Err(RingError::InvalidCount);
+        }
+        let size = usize::from(count)
+            .checked_mul(DMA_DESCRIPTOR_LEN)
+            .ok_or(RingError::InvalidCount)?;
+        let allocation = memory
+            .allocate_low32(size, DMA_DESCRIPTOR_LEN)
+            .map_err(RingError::Allocation)?;
+        if allocation.len < size {
+            memory.free(allocation);
+            return Err(RingError::AllocationTooSmall);
+        }
+        let end = allocation
+            .iova
+            .checked_add(size as u64 - 1)
+            .filter(|end| *end <= u64::from(u32::MAX));
+        if allocation.iova % DMA_DESCRIPTOR_LEN as u64 != 0 || end.is_none() {
+            memory.free(allocation);
+            return Err(RingError::AllocationAbove32Bits);
+        }
+        Ok(Self {
+            allocation,
+            descriptors: vec![DmaDescriptor::reset(); usize::from(count)],
+            producer: 0,
+            consumer: 0,
+            queued: 0,
+        })
+    }
+
+    pub const fn allocation(&self) -> RingAllocation {
+        self.allocation
+    }
+    pub const fn producer(&self) -> u16 {
+        self.producer
+    }
+    pub const fn consumer(&self) -> u16 {
+        self.consumer
+    }
+    pub const fn queued(&self) -> u16 {
+        self.queued
+    }
+
+    pub fn enqueue<P: RingPublisher>(
+        &mut self,
+        publisher: &mut P,
+        first: DmaSegment,
+        second: Option<DmaSegment>,
+        info: u32,
+    ) -> Result<u16, RingError<P::Error>> {
+        if usize::from(self.queued) == self.descriptors.len() {
+            return Err(RingError::Full);
+        }
+        let index = self.producer;
+        let descriptor = DmaDescriptor::tx(first, second, info).map_err(RingError::Descriptor)?;
+        publisher
+            .write_descriptor(index, descriptor)
+            .map_err(RingError::Publish)?;
+        publisher.release_fence();
+        let next = (usize::from(index) + 1) % self.descriptors.len();
+        publisher
+            .publish_producer(next as u16)
+            .map_err(RingError::Publish)?;
+        self.descriptors[usize::from(index)] = descriptor;
+        self.producer = next as u16;
+        self.queued += 1;
+        Ok(index)
+    }
+
+    /// Model the device's DMA_DONE write for deterministic tests/backends.
+    pub fn complete(&mut self, index: u16) -> bool {
+        let Some(descriptor) = self.descriptors.get_mut(usize::from(index)) else {
+            return false;
+        };
+        descriptor.ctrl |= DMA_CTL_DMA_DONE;
+        true
+    }
+
+    pub fn reclaim_one<P: RingPublisher>(&mut self, publisher: &mut P) -> Option<u16> {
+        if self.queued == 0 {
+            return None;
+        }
+        let index = self.consumer;
+        if !self.descriptors[usize::from(index)].is_dma_done() {
+            return None;
+        }
+        publisher.acquire_fence();
+        self.descriptors[usize::from(index)] = DmaDescriptor::reset();
+        self.consumer = ((usize::from(index) + 1) % self.descriptors.len()) as u16;
+        self.queued -= 1;
+        Some(index)
+    }
+
+    pub fn teardown<M: Low32RingMemory>(mut self, memory: &mut M) {
+        self.descriptors.fill(DmaDescriptor::reset());
+        self.queued = 0;
+        memory.free(self.allocation);
+    }
 }
 
 fn validate_segment(segment: DmaSegment) -> Result<(), DescriptorError> {
@@ -126,6 +286,8 @@ pub const FW_TRAILER_LEN: usize = 36;
 pub const FW_REGION_LEN: usize = 40;
 pub const FW_FEATURE_NON_DL: u8 = 1 << 6;
 pub const FW_TYPE_CLC: u8 = 2;
+pub const PATCH_HEADER_LEN: usize = 96;
+pub const PATCH_SECTION_LEN: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirmwareError {
@@ -133,6 +295,127 @@ pub enum FirmwareError {
     RegionTableTooLarge,
     PayloadLengthOverflow,
     PayloadOverlapsMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchError {
+    MissingHeader,
+    RegionTableTooLarge,
+    UnsupportedSectionType,
+    PayloadOutOfBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatchHeader<'a> {
+    pub build_date: &'a [u8; 16],
+    pub platform: &'a [u8; 4],
+    pub hardware_software_version: u32,
+    pub patch_version: u32,
+    pub checksum: u16,
+    pub descriptor_patch_version: u32,
+    pub subsystem: u32,
+    pub feature: u32,
+    pub crc: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatchSection<'a> {
+    pub address: u32,
+    pub security_info: u32,
+    pub payload: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Patch<'a> {
+    bytes: &'a [u8],
+    region_count: u32,
+    pub header: PatchHeader<'a>,
+}
+
+impl<'a> Patch<'a> {
+    /// Parse `mt76_connac2_patch_hdr` and `mt76_connac2_patch_sec` exactly as
+    /// pinned Linux `mt76_connac2_load_patch` consumes their big-endian fields.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, PatchError> {
+        let header = bytes
+            .get(..PATCH_HEADER_LEN)
+            .ok_or(PatchError::MissingHeader)?;
+        let region_count = be_u32(&header[44..48]);
+        let table_len = (region_count as usize)
+            .checked_mul(PATCH_SECTION_LEN)
+            .and_then(|length| PATCH_HEADER_LEN.checked_add(length))
+            .ok_or(PatchError::RegionTableTooLarge)?;
+        if table_len > bytes.len() {
+            return Err(PatchError::RegionTableTooLarge);
+        }
+        for index in 0..region_count as usize {
+            let start = PATCH_HEADER_LEN + index * PATCH_SECTION_LEN;
+            let section = &bytes[start..start + PATCH_SECTION_LEN];
+            if be_u32(&section[0..4]) & 0xffff != 2 {
+                return Err(PatchError::UnsupportedSectionType);
+            }
+            let offset = be_u32(&section[4..8]) as usize;
+            let length = be_u32(&section[16..20]) as usize;
+            let end = offset
+                .checked_add(length)
+                .ok_or(PatchError::PayloadOutOfBounds)?;
+            if offset < table_len || end > bytes.len() {
+                return Err(PatchError::PayloadOutOfBounds);
+            }
+        }
+        Ok(Self {
+            bytes,
+            region_count,
+            header: PatchHeader {
+                build_date: header[0..16].try_into().expect("fixed field"),
+                platform: header[16..20].try_into().expect("fixed field"),
+                hardware_software_version: be_u32(&header[20..24]),
+                patch_version: be_u32(&header[24..28]),
+                checksum: u16::from_be_bytes(header[28..30].try_into().expect("fixed field")),
+                descriptor_patch_version: be_u32(&header[32..36]),
+                subsystem: be_u32(&header[36..40]),
+                feature: be_u32(&header[40..44]),
+                crc: be_u32(&header[48..52]),
+            },
+        })
+    }
+
+    pub const fn region_count(&self) -> u32 {
+        self.region_count
+    }
+
+    pub fn sections(&self) -> PatchSections<'a> {
+        PatchSections {
+            patch: *self,
+            index: 0,
+        }
+    }
+}
+
+pub struct PatchSections<'a> {
+    patch: Patch<'a>,
+    index: usize,
+}
+impl<'a> Iterator for PatchSections<'a> {
+    type Item = PatchSection<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.patch.region_count as usize {
+            return None;
+        }
+        let start = PATCH_HEADER_LEN + self.index * PATCH_SECTION_LEN;
+        let section = &self.patch.bytes[start..start + PATCH_SECTION_LEN];
+        self.index += 1;
+        let offset = be_u32(&section[4..8]) as usize;
+        let length = be_u32(&section[16..20]) as usize;
+        Some(PatchSection {
+            address: be_u32(&section[12..16]),
+            security_info: be_u32(&section[20..24]),
+            payload: &self.patch.bytes[offset..offset + length],
+        })
+    }
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("four-byte field"))
 }
 
 /// Parsed `struct mt76_connac2_fw_trailer` fields used by the Linux loader.
@@ -795,6 +1078,137 @@ mod tests {
                 at_ms: 0,
                 raw: PCIE_LPCR_HOST_CLR_OWN
             })
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeMemory {
+        allocation: Option<RingAllocation>,
+        freed: Vec<RingAllocation>,
+    }
+    impl Low32RingMemory for FakeMemory {
+        type Error = ();
+        fn allocate_low32(&mut self, size: usize, _: usize) -> Result<RingAllocation, Self::Error> {
+            Ok(self.allocation.unwrap_or(RingAllocation {
+                id: 1,
+                iova: 0x1000_0000,
+                len: size,
+            }))
+        }
+        fn free(&mut self, allocation: RingAllocation) {
+            self.freed.push(allocation);
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublishEvent {
+        Descriptor(u16),
+        Release,
+        Producer(u16),
+        Acquire,
+    }
+    #[derive(Default)]
+    struct FakePublisher(Vec<PublishEvent>);
+    impl RingPublisher for FakePublisher {
+        type Error = ();
+        fn write_descriptor(&mut self, index: u16, _: DmaDescriptor) -> Result<(), Self::Error> {
+            self.0.push(PublishEvent::Descriptor(index));
+            Ok(())
+        }
+        fn release_fence(&mut self) {
+            self.0.push(PublishEvent::Release)
+        }
+        fn publish_producer(&mut self, index: u16) -> Result<(), Self::Error> {
+            self.0.push(PublishEvent::Producer(index));
+            Ok(())
+        }
+        fn acquire_fence(&mut self) {
+            self.0.push(PublishEvent::Acquire)
+        }
+    }
+
+    #[test]
+    fn inactive_wfdma_ring_orders_publish_reclaim_and_teardown() {
+        let mut memory = FakeMemory::default();
+        let mut ring = WfdmaRing::allocate(&mut memory, 2).unwrap();
+        assert_eq!(ring.allocation().iova, 0x1000_0000);
+        let mut publisher = FakePublisher::default();
+        assert_eq!(
+            ring.enqueue(
+                &mut publisher,
+                DmaSegment {
+                    iova: 0x2000_0000,
+                    len: 64
+                },
+                None,
+                7,
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            publisher.0,
+            [
+                PublishEvent::Descriptor(0),
+                PublishEvent::Release,
+                PublishEvent::Producer(1)
+            ]
+        );
+        assert_eq!(ring.reclaim_one(&mut publisher), None);
+        assert!(ring.complete(0));
+        assert_eq!(ring.reclaim_one(&mut publisher), Some(0));
+        assert_eq!(publisher.0.last(), Some(&PublishEvent::Acquire));
+        ring.teardown(&mut memory);
+        assert_eq!(memory.freed.len(), 1);
+    }
+
+    #[test]
+    fn inactive_wfdma_ring_rejects_high_or_wrapping_allocations() {
+        let mut memory = FakeMemory {
+            allocation: Some(RingAllocation {
+                id: 2,
+                iova: 0xffff_fff0,
+                len: 32,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            WfdmaRing::allocate(&mut memory, 2),
+            Err(RingError::AllocationAbove32Bits)
+        ));
+        assert_eq!(memory.freed.len(), 1);
+    }
+
+    fn patch_image(section_type: u32, offset: u32, length: u32) -> Vec<u8> {
+        let mut bytes = vec![0; PATCH_HEADER_LEN + PATCH_SECTION_LEN + length as usize];
+        bytes[0..16].copy_from_slice(b"20260101-120000\0");
+        bytes[16..20].copy_from_slice(b"ALPS");
+        bytes[20..24].copy_from_slice(&0x8a10_8a10u32.to_be_bytes());
+        bytes[44..48].copy_from_slice(&1u32.to_be_bytes());
+        let section = PATCH_HEADER_LEN;
+        bytes[section..section + 4].copy_from_slice(&section_type.to_be_bytes());
+        bytes[section + 4..section + 8].copy_from_slice(&offset.to_be_bytes());
+        bytes[section + 12..section + 16].copy_from_slice(&0x0090_0000u32.to_be_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&length.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn parses_connac2_patch_header_and_bounded_sections() {
+        let bytes = patch_image(0x0004_0002, 160, 4);
+        let patch = Patch::parse(&bytes).unwrap();
+        assert_eq!(patch.header.platform, b"ALPS");
+        assert_eq!(patch.header.hardware_software_version, 0x8a10_8a10);
+        assert_eq!(patch.region_count(), 1);
+        let section = patch.sections().next().unwrap();
+        assert_eq!(section.address, 0x0090_0000);
+        assert_eq!(section.payload.len(), 4);
+
+        assert_eq!(
+            Patch::parse(&patch_image(1, 160, 4)),
+            Err(PatchError::UnsupportedSectionType)
+        );
+        assert_eq!(
+            Patch::parse(&patch_image(2, 200, 4)),
+            Err(PatchError::PayloadOutOfBounds)
         );
     }
 

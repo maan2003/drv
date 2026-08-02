@@ -44,6 +44,23 @@ on readback. Every write, status sample, retry, terminal success, timeout, or
 unexpected state is emitted as a structured event. No firmware-ownership or
 dynamic L1-remap write is admitted.
 
+## Inactive WFDMA and firmware prerequisites
+
+`WfdmaRing` ports the inactive mt76 TX-ring invariants without enabling DMA:
+descriptor storage must be aligned and wholly below 4 GiB, reset descriptors
+are CPU-owned via `DMA_DONE`, enqueue writes a device-owned descriptor before a
+release fence and producer-index publication, reclaim requires device
+completion and an acquire fence, indices wrap within the allocation, and
+teardown resets descriptors before releasing the allocation. The model has no
+register or DMA-enable operation.
+
+`Patch` adds bounds-checked parsing of the big-endian Connac2 patch header and
+section table consumed by pinned Linux `mt76_connac2_load_patch`.
+`mt7921-firmware-inspect` reads and decompresses only the exact installed
+MT7961 patch/RAM artifact names, validates their target metadata and every
+payload bound, and emits structured metadata. It does not retain, map for DMA,
+or send firmware bytes.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
