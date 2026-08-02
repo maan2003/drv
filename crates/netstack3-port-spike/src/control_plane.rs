@@ -231,6 +231,9 @@ impl DnsCodec {
                 message.metadata.response_code,
             ));
         }
+        if message.metadata.truncation {
+            return Err(ControlPlaneError::DnsTruncated);
+        }
         Ok(message
             .answers
             .iter()
@@ -251,6 +254,7 @@ pub enum ControlPlaneError {
     Dns(String),
     DnsTransactionMismatch,
     DnsResponse(ResponseCode),
+    DnsTruncated,
     UnsupportedDnsRecord,
 }
 
@@ -263,6 +267,7 @@ impl fmt::Display for ControlPlaneError {
             Self::Dns(error) => write!(f, "DNS packet error: {error}"),
             Self::DnsTransactionMismatch => write!(f, "DNS response does not match the query"),
             Self::DnsResponse(code) => write!(f, "DNS server returned {code:?}"),
+            Self::DnsTruncated => write!(f, "DNS response requires TCP fallback"),
             Self::UnsupportedDnsRecord => write!(f, "only A and AAAA queries are supported"),
         }
     }
@@ -395,6 +400,11 @@ mod tests {
         assert!(matches!(
             DnsCodec::response(&query, &vec![0; MAX_CONTROL_DATAGRAM_LEN + 1]),
             Err(ControlPlaneError::DatagramTooLarge { .. })
+        ));
+        response.metadata.truncation = true;
+        assert!(matches!(
+            DnsCodec::response(&query, &response.to_vec().unwrap()),
+            Err(ControlPlaneError::DnsTruncated)
         ));
     }
 }
