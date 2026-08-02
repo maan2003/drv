@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
+  "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
   "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
@@ -71,6 +72,7 @@ diagnostics_traits = { path = "../lib/diagnostics-traits" }
 explicit = { path = "../lib/explicit" }
 packet = { path = "../../../lib/network/packet" }
 replace_with = { path = "../../../lib/replace-with" }
+wlan_statemachine = { package = "wlan-statemachine", path = "../../wlan/lib/statemachine" }
 netstack3_base = { path = "core/base" }
 netstack3_datagram = { path = "core/datagram" }
 netstack3_device = { path = "core/device" }

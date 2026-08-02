@@ -1,0 +1,16 @@
+[package]
+name = "wlan-statemachine-macro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wlan_statemachine_macro"
+path = "src/lib.rs"
+proc-macro = true
+doctest = false
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

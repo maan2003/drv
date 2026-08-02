@@ -1,0 +1,13 @@
+[package]
+name = "wlan-statemachine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wlan_statemachine"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+wlan-statemachine-macro = { path = "macro" }
