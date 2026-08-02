@@ -1063,7 +1063,7 @@ impl ReadPage {
         bar_page: usize,
         writable: bool,
     ) -> Result<Self, String> {
-        if bar_page % PAGE != 0 || bar_page + PAGE > region.size as usize {
+        if !bar_page.is_multiple_of(PAGE) || bar_page + PAGE > region.size as usize {
             return Err("allowlisted BAR page is outside BAR 0".into());
         }
         let ptr = NonNull::new(unsafe {

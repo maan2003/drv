@@ -1256,7 +1256,7 @@ where
     T: DisabledFwdlRingTransport,
     F: FnMut(DisabledFwdlEvent),
 {
-    if arena_iova % 4096 != 0
+    if !arena_iova.is_multiple_of(4096)
         || arena_iova
             .checked_add(MT7921_FWDL_RING_BYTES as u64 - 1)
             .is_none_or(|end| end > u64::from(u32::MAX))
@@ -1612,16 +1612,15 @@ pub fn prepare_mcu_rx_ring(
     buffers_iova: u64,
 ) -> Result<McuRxRing, DescriptorError> {
     let buffers_bytes = MT7921_MCU_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES;
-    if ring_iova % 4096 != 0
-        || buffers_iova % 4096 != 0
+    if !ring_iova.is_multiple_of(4096)
+        || !buffers_iova.is_multiple_of(4096)
         || ring_iova
             .checked_add(4095)
             .is_none_or(|end| end > u64::from(u32::MAX))
         || buffers_iova
             .checked_add(buffers_bytes as u64 - 1)
             .is_none_or(|end| end > u64::from(u32::MAX))
-        || (ring_iova <= buffers_iova + buffers_bytes as u64 - 1
-            && buffers_iova <= ring_iova + 4095)
+        || (ring_iova < buffers_iova + buffers_bytes as u64 && buffers_iova <= ring_iova + 4095)
     {
         return Err(DescriptorError::InvalidArena);
     }
@@ -1693,7 +1692,7 @@ where
     T: DisabledMcuRxTransport,
     F: FnMut(DisabledMcuRxEvent),
 {
-    if ring_iova % 4096 != 0
+    if !ring_iova.is_multiple_of(4096)
         || ring_iova
             .checked_add(4095)
             .is_none_or(|end| end > u64::from(u32::MAX))
@@ -1827,7 +1826,7 @@ where
     F: FnMut(GlobalTxRingEvent),
 {
     let page_end = |iova: u64| {
-        (iova % 4096 == 0)
+        iova.is_multiple_of(4096)
             .then(|| iova.checked_add(4095))
             .flatten()
             .filter(|end| *end <= u64::from(u32::MAX))
