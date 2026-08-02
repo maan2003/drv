@@ -187,7 +187,7 @@ one already-bounded Netstack3 datagram, while TCP readiness reads the upstream
 bindings buffer limits. Interface/route/DNS administration is a separate
 NetworkConfigurationAdmin capability. Packet-filter administration is a separate PacketFilterAdmin capability and is intentionally not granted by the application provider. NativeFilterRules carries the pinned netstack3_filter Routines types directly into FilterApi set_filter_state, without a second rule language or translator.
 
-The planned proxy transport has a versioned 40-byte little-endian header and a
+The experimental, incompatible version-1 proxy transport has a versioned 40-byte little-endian header and a
 64 KiB payload ceiling. ProviderFramedEndpoint fixes client and namespace
 identity at construction and rejects mismatched identities on decode.
 ProviderAbiHarness supplies bounded request/response FIFOs plus golden-byte,

@@ -1,4 +1,4 @@
-//! Stable bounded framing for a later host-kernel socket provider.
+//! Experimental provider ABI v1 framing. V1 is incompatible with transparent POSIX sockets; use `provider_transport_v2` for the kernel provider.
 //!
 //! This transport carries capability requests only. It contains no TCP/IP,
 //! socket state, fd table, or loopback implementation.

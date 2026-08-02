@@ -4,6 +4,7 @@
 //! overlay executes upstream core against these authority-free contracts.
 pub mod provider_dispatch;
 pub mod provider_transport;
+pub mod provider_transport_v2;
 
 use std::collections::VecDeque;
 use std::error::Error;
