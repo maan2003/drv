@@ -2,6 +2,7 @@
 //!
 //! The crate itself does not link Netstack3. The companion pinned-source Cargo
 //! overlay executes upstream core against these authority-free contracts.
+pub mod provider_transport;
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -727,6 +728,6 @@ pub trait NetworkConfigurationAdmin {
 /// Separate privileged filter authority. The portable socket provider does not
 /// imply permission to change ingress, egress, or socket-operation filters.
 pub trait PacketFilterAdmin {
-    type Rule;
-    fn replace_rules(&mut self, rules: &[Self::Rule]) -> Result<(), RemoteSocketError>;
+    type Rules;
+    fn replace_rules(&mut self, rules: Self::Rules) -> Result<(), RemoteSocketError>;
 }

@@ -56,3 +56,23 @@ adds only non-reused capability IDs, per-client quotas, revocation, and bounded
 readiness staging around the production Runtime handles. Configuration and
 filter administration are separate traits and cannot be reached through an
 application socket capability.
+
+### Filter and configuration administration
+
+NativeFilterRules exposes the pinned netstack3_filter Routines types without
+translation. Runtime implements PacketFilterAdmin by calling the pinned
+FilterApi set_filter_state in netstack3/core/filter/src/api.rs, preserving its
+cycle validation, hook ordering, NAT activation, matcher and action semantics.
+Runtime configuration continues to call production device and RoutesApi
+operations; the separate admin traits are not implemented by
+NativeSocketProvider.
+
+### Kernel-provider framing
+
+provider_transport.rs is local capability plumbing, not networking logic.
+Its version-1 ABI fixes a 40-byte header, immutable namespace/client identity,
+64 KiB payload limit, bounded FIFOs, and operation numbers corresponding
+one-for-one with RemoteSocketProvider calls. The golden-byte fixture is the
+compatibility oracle for a later kernel provider. Loopback selection is tested
+separately: IPv4 127/8 and IPv6 ::1 stay private; all other destinations select
+Netstack3.

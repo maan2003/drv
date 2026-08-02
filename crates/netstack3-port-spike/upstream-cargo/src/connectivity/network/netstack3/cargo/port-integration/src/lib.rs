@@ -55,6 +55,7 @@ use netstack3_device::{
     DeviceBufferBindingsTypes, DeviceClassMatcher, DeviceIdAndNameMatcher,
     DeviceLayerEventDispatcher, DeviceLayerStateTypes, DeviceSendFrameError,
 };
+use netstack3_filter::Routines;
 use netstack3_filter::{
     FilterIpExt, FilterIpPacket, Marks, SocketEgressFilterResult, SocketInfo,
     SocketIngressFilterResult,
@@ -72,7 +73,7 @@ use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
 const MAX_DHCP_DATAGRAM_LEN: usize = 1232;
 use netstack3_port_spike::{
     EthernetDeviceEvent, EthernetFrame, NetworkConfigurationAdmin, NetworkServiceEndpoint,
-    StackEthernetEndpoint,
+    PacketFilterAdmin, RemoteSocketError, StackEthernetEndpoint,
 };
 use netstack3_tcp::{
     AcceptError, BindError, BufferSizes, ConnectError, ConnectionError, ListenError,
@@ -2039,6 +2040,19 @@ mod tests {
     use netstack3_base::socket::SocketWritableListener as _;
 
     #[test]
+    fn privileged_filter_admin_installs_upstream_empty_routines() {
+        let mut runtime = Runtime::new(
+            2,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(99).unwrap(),
+            [2, 0, 0, 0, 0, 99],
+            1500,
+        )
+        .unwrap();
+        PacketFilterAdmin::replace_rules(&mut runtime, NativeFilterRules::default()).unwrap();
+    }
+
+    #[test]
     fn injected_clock_entropy_and_readiness_are_deterministic_and_bounded() {
         let mut ctx = NativeBindingsCtx::new(1, 0u8..16);
         assert_eq!(ctx.now(), NativeInstant::ZERO);
@@ -2422,6 +2436,35 @@ mod tests {
             client.tcp_close_ipv6(connection),
             Err(RuntimeError::UnknownSocket)
         );
+    }
+}
+
+/// Direct production Netstack3 filter state. No native rule language or
+/// translation layer is introduced.
+pub struct NativeFilterRules {
+    pub ipv4: Routines<Ipv4, NativeBindingsCtx, ()>,
+    pub ipv6: Routines<Ipv6, NativeBindingsCtx, ()>,
+}
+
+impl Default for NativeFilterRules {
+    fn default() -> Self {
+        Self {
+            ipv4: Default::default(),
+            ipv6: Default::default(),
+        }
+    }
+}
+
+impl PacketFilterAdmin for Runtime {
+    type Rules = NativeFilterRules;
+
+    fn replace_rules(&mut self, rules: Self::Rules) -> Result<(), RemoteSocketError> {
+        let NativeFilterRules { ipv4, ipv6 } = rules;
+        self.stack
+            .api(&mut self.bindings)
+            .filter()
+            .set_filter_state(ipv4, ipv6)
+            .map_err(|_| RemoteSocketError::InvalidState)
     }
 }
 
