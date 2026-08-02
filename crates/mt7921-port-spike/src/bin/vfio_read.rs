@@ -20,6 +20,7 @@ use std::{
     os::fd::{AsRawFd, RawFd},
     process::Command,
     ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -52,6 +53,10 @@ const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 const EFD_CLOEXEC: i32 = 0x80000;
 const EFD_NONBLOCK: i32 = 0x800;
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIG_ERR: usize = usize::MAX;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
 
@@ -153,6 +158,52 @@ unsafe extern "C" {
     fn eventfd(initval: u32, flags: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
     fn close(fd: i32) -> i32;
+    fn signal(number: i32, handler: usize) -> usize;
+}
+
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_stop(_: i32) {
+    STOP_REQUESTED.store(true, Ordering::Release);
+}
+
+#[allow(dead_code)]
+struct ActiveSignalGuard {
+    previous: [(i32, usize); 3],
+}
+#[allow(dead_code)]
+impl ActiveSignalGuard {
+    fn install() -> Result<Self, String> {
+        STOP_REQUESTED.store(false, Ordering::Release);
+        let mut previous = [(0, 0); 3];
+        for (slot, number) in previous.iter_mut().zip([SIGHUP, SIGINT, SIGTERM]) {
+            let handler = unsafe { signal(number, request_stop as *const () as usize) };
+            if handler == SIG_ERR {
+                for (installed_number, installed_handler) in
+                    previous.iter().copied().take_while(|entry| entry.0 != 0)
+                {
+                    unsafe { signal(installed_number, installed_handler) };
+                }
+                return Err(format!(
+                    "install active-DMA signal handler: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            *slot = (number, handler);
+        }
+        Ok(Self { previous })
+    }
+    fn stop_requested(&self) -> bool {
+        STOP_REQUESTED.load(Ordering::Acquire)
+    }
+}
+impl Drop for ActiveSignalGuard {
+    fn drop(&mut self) {
+        for (number, handler) in self.previous {
+            unsafe { signal(number, handler) };
+        }
+        STOP_REQUESTED.store(false, Ordering::Release);
+    }
 }
 
 fn main() {
@@ -1249,5 +1300,13 @@ mod tests {
             0x24
         );
         assert_eq!(VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER, 0x21);
+    }
+
+    #[test]
+    fn active_signal_handler_requests_bounded_cleanup() {
+        STOP_REQUESTED.store(false, Ordering::Release);
+        request_stop(SIGTERM);
+        assert!(STOP_REQUESTED.load(Ordering::Acquire));
+        STOP_REQUESTED.store(false, Ordering::Release);
     }
 }

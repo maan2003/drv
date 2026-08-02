@@ -167,8 +167,11 @@ mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
 function reset is issued while every IOVA remains pinned regardless of the poll
 result. Mappings are released only after reset succeeds. A reset failure never
 calls unmap, so the external reboot watchdog remains the containment boundary.
-Signal handling and a physical transport still need to enforce this same model
-before active DMA can be admitted.
+The native backend now has an unexposed active-operation signal guard for
+SIGHUP, SIGINT, and SIGTERM which performs only an atomic cancellation request
+in the handler and restores previous handlers on drop. The future physical
+control loop must check that request and enter `teardown_pinned_dma`; until it
+does, active DMA remains rejected.
 
 ## Verified against pinned Linux 7.2-rc5 source
 
