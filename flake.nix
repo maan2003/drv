@@ -12,6 +12,9 @@
       ];
     in
     {
+      nixosModules.netstack3-kernel-provider =
+        import ./crates/netstack3-port-spike/kernel-provider/module.nix;
+
       checks.x86_64-linux.vfio-edu =
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
           { };
@@ -19,6 +22,11 @@
       checks.x86_64-linux.netstack3-kernel-provider =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
           ./crates/netstack3-port-spike/kernel-provider/check.nix
+          { };
+
+      checks.x86_64-linux.netstack3-kernel-provider-boot =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/netstack3-port-spike/kernel-provider/boot-test.nix
           { };
 
       packages = forAllSystems (

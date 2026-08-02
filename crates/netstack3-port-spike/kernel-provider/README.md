@@ -12,5 +12,16 @@ Target provenance is the deployed `new-plastic` NixOS configuration (formerly
 - flat source hash: `sha256-NxL8Hsg55NqsmBF2yFGJEuj0UmUKrt/kOB2kQZYTpDE=`
   (Nix base32 `0cd42fb4390x73jdzbhacm9g9s0ji58whxhik2ndmr1rr0ggq4ip`).
 
-[ABI_V2.md](ABI_V2.md) is the contract the kernel patch will implement. No
+[ABI_V2.md](ABI_V2.md) is the contract implemented by the kernel patch. No
 patched kernel is deployed or switched by this directory.
+
+`nix build .#checks.x86_64-linux.netstack3-kernel-provider-boot` boots the
+exact pinned Linux 6.18.40 kernel with the patch and `NETSTACK3_PROVIDER=y` in
+a NixOS VM. It requires `/dev/netstack3-provider` to exist and runs the complete
+kernel selftest against the booted device. The check validates a deployable
+kernel closure without switching the host configuration.
+
+NixOS deployments can import the flake's
+`nixosModules.netstack3-kernel-provider` module. It defaults the host to the
+pinned `linuxPackages_6_18`, applies the checked-in patch, and enables the
+provider in the structured kernel configuration.
