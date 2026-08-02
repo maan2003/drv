@@ -22,3 +22,16 @@ project capabilities.
 The first executable target is the pinned upstream Sapphire fake-controller
 GAP discovery suite. Its WASM import list must match the interfaces in the WIT
 world before it can be connected to the physical HCI broker.
+
+`scripts/build-sapphire-gap-wasm` builds that suite from Pigweed commit
+`c14c119c51a82f6e044f81b7dad0a322091d4121`, fetched by Nix from the upstream
+Pigweed Gitiles archive with a fixed content hash. Pigweed and Sapphire retain
+their upstream license notices. The script keeps Sapphire sources and tests
+unchanged; its narrow build-platform patches select the Nix WASI toolchain,
+replace unavailable host tool downloads, and provide the explicit bounded test
+logging and exit imports in `upstream/wasi_test_stubs.c`.
+
+Set `SAPPHIRE_GTEST_ARG` when building to bake one bounded GoogleTest argument
+into a diagnostic artifact, for example `--gtest_list_tests` or
+`--gtest_filter=AdapterTest.*`. This does not grant the guest ambient process
+arguments; the generated test-only header contains the sole explicit value.
