@@ -3240,6 +3240,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-frame-writer"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+ "ieee80211",
+ "wlan-common",
+ "wlan-frame-writer-macro",
+ "zerocopy",
+]
+
+[[package]]
 name = "wlan-frame-writer-macro"
 version = "0.1.0"
 dependencies = [

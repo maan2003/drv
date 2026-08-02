@@ -107,6 +107,11 @@ flexible_code!(ReasonCode, valid_reason_code);
 flexible_code!(StatusCode, valid_status_code);
 
 #[allow(non_upper_case_globals)]
+impl ReasonCode {
+    pub const MicFailure: Self = Self(14);
+}
+
+#[allow(non_upper_case_globals)]
 impl StatusCode {
     pub const Success: Self = Self(0);
     pub const RefusedReasonUnspecified: Self = Self(1);
@@ -201,6 +206,7 @@ mod tests {
         assert_eq!(WlanBand::FiveGhz.into_primitive(), 1);
         assert_eq!(BssType::Personal.into_primitive(), 4);
         assert_eq!(WlanPhyType::He.into_primitive(), 12);
+        assert_eq!(ReasonCode::MicFailure.into_primitive(), 14);
         assert_eq!(StatusCode::Success.into_primitive(), 0);
         assert_eq!(StatusCode::AntiCloggingTokenRequired.into_primitive(), 76);
         assert_eq!(StatusCode::SaeHashToElement.into_primitive(), 126);

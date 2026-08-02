@@ -33,6 +33,7 @@ cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/dhcp-client-core-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/trust-dns-workspace.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-common-host.patch" || true
+patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-frame-writer-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-rsn-host.patch" || true
 
 manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
@@ -42,6 +43,7 @@ cargo check --locked --manifest-path "$manifest" -p dhcp-protocol
 cargo check --locked --manifest-path "$manifest" -p dhcp_client_core
 cargo check --locked --manifest-path "$manifest" -p trust-dns-resolver --no-default-features --features testing
 cargo check --locked --manifest-path "$manifest" -p wlan-common
+cargo test --locked --manifest-path "$manifest" -p wlan-frame-writer --lib
 cargo test --locked --manifest-path "$manifest" -p eapol --lib
 cargo test --locked --manifest-path "$manifest" -p mundane --lib hash::tests
 cargo test --locked --manifest-path "$manifest" -p mundane --lib hmac::tests

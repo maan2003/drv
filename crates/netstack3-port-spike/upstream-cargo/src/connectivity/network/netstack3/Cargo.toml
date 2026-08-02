@@ -4,7 +4,7 @@ members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
-  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn",
+  "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/frame_writer", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn",
   "../../../lib/mundane",
   "../../../lib/fuchsia-sync",
   "../../../../third_party/boringssl/rust/bssl-sys",
@@ -102,6 +102,7 @@ packet = { path = "../../../lib/network/packet" }
 replace_with = { path = "../../../lib/replace-with" }
 wlan_bitfield = { package = "wlan-bitfield", path = "../../wlan/lib/bitfield" }
 wlan_fcg_crypto = { package = "wlan-fcg-crypto", path = "../../wlan/lib/fcg-crypto" }
+wlan_frame_writer = { package = "wlan-frame-writer", path = "../../wlan/lib/frame_writer" }
 wlan_rsn = { package = "wlan-rsn", path = "../../wlan/lib/rsn" }
 wlan_statemachine = { package = "wlan-statemachine", path = "../../wlan/lib/statemachine" }
 netstack3_base = { path = "core/base" }

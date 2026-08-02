@@ -1,0 +1,40 @@
+--- a/src/connectivity/wlan/lib/frame_writer/src/lib.rs
++++ b/src/connectivity/wlan/lib/frame_writer/src/lib.rs
+@@ -7,6 +7,7 @@
+     append_frame_to, write_frame, write_frame_to_vec, write_frame_with_fixed_slice,
+ };
+ 
++#[cfg(target_os = "fuchsia")]
+ pub use fdf::Arena as __Arena;
+ pub use {wlan_common as __wlan_common, zerocopy as __zerocopy};
+ 
+--- a/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs
++++ b/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs
+@@ -298,18 +298,26 @@
+ pub fn process_with_default_source(input: TokenStream) -> TokenStream {
+     let macro_args = parse_macro_input!(input as DefaultSourceMacroArgs);
+     let buf_tokens = quote!(
++        #[cfg(target_os = "fuchsia")]
+         let arena = wlan_frame_writer::__Arena::new();
++        #[cfg(target_os = "fuchsia")]
+         let mut buffer = arena.insert_default_slice::<u8>(frame_len);
++        #[cfg(not(target_os = "fuchsia"))]
++        let mut buffer = vec![0u8; frame_len];
+         let mut w = BufferWriter::new(&mut buffer[..]);
+     );
+     let return_buf_tokens = quote!(
+         if w.bytes_appended() != frame_len {
+             return Err(FrameWriteError::BadWrite(
+                 format!("bytes_appended does not match frame length: {} != {}",
+                     w.bytes_appended(), frame_len)
+             ));
+         }
++        #[cfg(target_os = "fuchsia")]
++        let buffer = arena.make_static(buffer);
++        #[cfg(not(target_os = "fuchsia"))]
++        let buffer = buffer;
+-        Ok(arena.make_static(buffer))
++        Ok(buffer)
+     );
+     process_write_definitions(macro_args.write_defs, buf_tokens, return_buf_tokens, false)
+ }
