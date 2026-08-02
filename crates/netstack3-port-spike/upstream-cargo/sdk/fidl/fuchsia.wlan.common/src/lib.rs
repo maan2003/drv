@@ -8,6 +8,13 @@ pub const WLAN_TX_VECTOR_IDX_INVALID: u16 = 0;
 pub const MAX_SUPPORTED_PHY_TYPES: u8 = 64;
 pub const MAX_BANDS: u8 = 16;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ScanType {
+    Active = 1,
+    Passive = 2,
+}
+
 macro_rules! flexible_enum {
     ($name:ident, $raw:ty, {$($variant:ident = $value:expr),+ $(,)?}) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -123,6 +130,7 @@ mod tests {
         assert_eq!(WLAN_TX_VECTOR_IDX_INVALID, 0);
         assert_eq!(MAX_SUPPORTED_PHY_TYPES, 64);
         assert_eq!(MAX_BANDS, 16);
+        assert_eq!(ScanType::Passive as u32, 2);
         assert_eq!(WlanMacRole::Mesh.into_primitive(), 3);
         assert_eq!(DataPlaneType::GenericNetworkDevice.into_primitive(), 2);
         assert_eq!(MacImplementationType::Fullmac.into_primitive(), 2);
