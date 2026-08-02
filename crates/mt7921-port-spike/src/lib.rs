@@ -6,6 +6,10 @@
 //! correspondence and the boundary deliberately left out are documented in
 //! the crate README.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
 const DMA_MAX_SEGMENT_LEN: u16 = 0x3fff;
@@ -269,12 +273,213 @@ fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("four-byte field"))
 }
 
+/// Portable scan result at the Fuchsia MLME/SME boundary.
+///
+/// This deliberately contains no FIDL types. `from_beacon` follows pinned
+/// Fuchsia `construct_bss_description`: it walks beacon/probe-response IEs,
+/// prefers the advertised DSSS channel, and retains capability information.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccessPoint {
+    pub bssid: [u8; 6],
+    pub ssid: Vec<u8>,
+    pub frequency_mhz: u16,
+    pub channel: u8,
+    pub signal_dbm: i16,
+    pub capability_info: u16,
+    pub security: Security,
+    pub ht: bool,
+    pub vht: bool,
+    pub he: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Security {
+    Open,
+    Wep,
+    Wpa1,
+    Wpa2Personal,
+    Wpa2Enterprise,
+    Wpa3Personal,
+    Wpa3Enterprise,
+    Owe,
+    UnknownProtected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdvertisementError {
+    TruncatedElement,
+    SsidTooLong,
+    InvalidRsn,
+}
+
+impl AccessPoint {
+    pub fn from_beacon(
+        bssid: [u8; 6],
+        capability_info: u16,
+        ies: &[u8],
+        frequency_mhz: u16,
+        signal_dbm: i16,
+    ) -> Result<Self, AdvertisementError> {
+        let mut ssid = Vec::new();
+        let mut dsss_channel = None;
+        let mut security = None;
+        let mut ht = false;
+        let mut vht = false;
+        let mut he = false;
+        let mut offset = 0;
+        while offset < ies.len() {
+            if ies.len() - offset < 2 {
+                return Err(AdvertisementError::TruncatedElement);
+            }
+            let id = ies[offset];
+            let len = usize::from(ies[offset + 1]);
+            offset += 2;
+            let end = offset
+                .checked_add(len)
+                .ok_or(AdvertisementError::TruncatedElement)?;
+            let body = ies
+                .get(offset..end)
+                .ok_or(AdvertisementError::TruncatedElement)?;
+            offset = end;
+            match id {
+                0 if body.len() <= 32 => ssid.extend_from_slice(body),
+                0 => return Err(AdvertisementError::SsidTooLong),
+                3 if body.len() == 1 => dsss_channel = Some(body[0]),
+                45 | 61 => ht = true,
+                191 | 192 => vht = true,
+                48 => security = Some(parse_rsn(body)?),
+                221 if body.starts_with(&[0x00, 0x50, 0xf2, 0x01]) && security.is_none() => {
+                    security = Some(Security::Wpa1)
+                }
+                255 if body.first() == Some(&35) || body.first() == Some(&36) => he = true,
+                _ => {}
+            }
+        }
+        let privacy = capability_info & 0x0010 != 0;
+        Ok(Self {
+            bssid,
+            ssid,
+            frequency_mhz,
+            channel: dsss_channel.unwrap_or_else(|| frequency_to_channel(frequency_mhz)),
+            signal_dbm,
+            capability_info,
+            security: security.unwrap_or(if privacy {
+                Security::Wep
+            } else {
+                Security::Open
+            }),
+            ht,
+            vht,
+            he,
+        })
+    }
+}
+
+fn parse_rsn(body: &[u8]) -> Result<Security, AdvertisementError> {
+    // version(2), group suite(4), pairwise count/list, AKM count/list
+    if body.len() < 8 || u16::from_le_bytes([body[0], body[1]]) != 1 {
+        return Err(AdvertisementError::InvalidRsn);
+    }
+    let pairwise_count = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let akm_count_at = 8usize
+        .checked_add(
+            pairwise_count
+                .checked_mul(4)
+                .ok_or(AdvertisementError::InvalidRsn)?,
+        )
+        .ok_or(AdvertisementError::InvalidRsn)?;
+    let akm_count_bytes = body
+        .get(akm_count_at..akm_count_at + 2)
+        .ok_or(AdvertisementError::InvalidRsn)?;
+    let akm_count = u16::from_le_bytes([akm_count_bytes[0], akm_count_bytes[1]]) as usize;
+    let mut enterprise = false;
+    let mut personal = false;
+    let mut sae = false;
+    let mut owe = false;
+    let mut suite_at = akm_count_at + 2;
+    for _ in 0..akm_count {
+        let suite = body
+            .get(suite_at..suite_at + 4)
+            .ok_or(AdvertisementError::InvalidRsn)?;
+        suite_at += 4;
+        if suite[..3] != [0x00, 0x0f, 0xac] {
+            continue;
+        }
+        match suite[3] {
+            1 | 3 | 5 => enterprise = true,
+            2 | 4 | 6 => personal = true,
+            8 | 9 => sae = true,
+            12 | 13 => return Ok(Security::Wpa3Enterprise),
+            18 => owe = true,
+            _ => {}
+        }
+    }
+    Ok(if owe {
+        Security::Owe
+    } else if sae {
+        Security::Wpa3Personal
+    } else if personal {
+        Security::Wpa2Personal
+    } else if enterprise {
+        Security::Wpa2Enterprise
+    } else {
+        Security::UnknownProtected
+    })
+}
+
+pub const fn frequency_to_channel(frequency_mhz: u16) -> u8 {
+    match frequency_mhz {
+        2484 => 14,
+        2412..=2472 => ((frequency_mhz - 2407) / 5) as u8,
+        5000..=5895 => ((frequency_mhz - 5000) / 5) as u8,
+        5955..=7115 => ((frequency_mhz - 5950) / 5) as u8,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
     use super::*;
     use std::vec;
+
+    #[test]
+    fn ports_fuchsia_beacon_conversion_fixture() {
+        // SSID, rates, DSSS channel and RSNE copied from pinned Fuchsia
+        // mlme/rust/src/client/convert_beacon.rs::beacon_frame_ies.
+        let ies = [
+            0x00, 0x08, b'f', b'o', b'o', b'-', b's', b's', b'i', b'd', 0x01, 0x04, 0xb0, 0x48,
+            0x60, 0x6c, 0x03, 0x01, 140, 0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01,
+            0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x01, 0x28, 0x00, 0x2d,
+            0x01, 0x00, 0xbf, 0x01, 0x00,
+        ];
+        let ap = AccessPoint::from_beacon([0x33; 6], 0x1111, &ies, 5700, -40).unwrap();
+        assert_eq!(ap.ssid.as_slice(), b"foo-ssid");
+        assert_eq!(ap.channel, 140);
+        assert_eq!(ap.security, Security::Wpa2Enterprise);
+        assert!(ap.ht && ap.vht);
+    }
+
+    #[test]
+    fn rejects_truncated_ies_and_classifies_modern_akms() {
+        assert_eq!(
+            AccessPoint::from_beacon([0; 6], 0, &[0, 3, b'a'], 2412, -1),
+            Err(AdvertisementError::TruncatedElement)
+        );
+        let sae = [
+            0x30, 0x12, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8,
+        ];
+        assert_eq!(
+            AccessPoint::from_beacon([0; 6], 0x10, &sae, 5955, -30)
+                .unwrap()
+                .security,
+            Security::Wpa3Personal
+        );
+        assert_eq!(frequency_to_channel(2412), 1);
+        assert_eq!(frequency_to_channel(2484), 14);
+        assert_eq!(frequency_to_channel(5955), 1);
+    }
 
     #[test]
     fn encodes_single_and_paired_dma_segments_like_mt76() {

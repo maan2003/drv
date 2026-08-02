@@ -1,4 +1,4 @@
-# MT7921/MT7922 port spike (not a driver)
+# MT7921/MT7922 port spike (not yet a driver)
 
 This crate is an exploratory port of two hardware-independent format seams from
 Linux mt76: the 16-byte DMA descriptor construction and the Connac2 RAM firmware
@@ -8,6 +8,23 @@ of source-corresponding code compile while exposing what the current hardware
 broker cannot yet express.
 
 The BCM4387C2 first target in `specs/ARCH-asahi-wifi-target.md` is unchanged.
+
+It also contains the first portable SoftMAC seam: `AccessPoint::from_beacon`
+ports the behavior of pinned Fuchsia's
+`mlme/rust/src/client/convert_beacon.rs::construct_bss_description` without its
+FIDL types. It consumes raw beacon/probe-response information elements and
+produces the BSSID, SSID, channel, signal, capabilities and security summary
+needed by the host. Its main fixture is copied from Fuchsia's corresponding
+test. Security AKM classification follows the suite handling in Fuchsia WLAN
+common/SME protection code. Fuchsia sources are BSD-3-Clause licensed; the
+ported implementation was rewritten against the pinned source rather than
+copied with component-runtime dependencies.
+
+The `mt7921-scan` binary is an explicitly temporary Linux SoftMAC adapter. It
+converts `iw scan` text into newline-delimited JSON so the portable result
+shape and durable physical evidence can be exercised before the VFIO WFDMA/MCU
+transport exists. Its output proves real RF enumeration but **does not** prove
+userspace firmware initialization, DMA, IRQ, or scan operation.
 
 ## Verified against pinned Linux 7.2-rc5 source
 
