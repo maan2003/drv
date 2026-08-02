@@ -6,6 +6,7 @@ members = [
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
   "../../wlan/lib/ieee80211", "../../../../sdk/fidl/fuchsia.wlan.common",
   "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
+  "../../../../sdk/fidl/fuchsia.wlan.internal",
   "../../../../sdk/fidl/fuchsia.wlan.softmac",
   "../../wlan/lib/frame_writer/macro",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
