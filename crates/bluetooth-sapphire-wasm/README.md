@@ -70,7 +70,16 @@ SAPPHIRE_BAZEL_TARGET=//:physical_discovery \
   nix develop --command scripts/build-sapphire-gap-wasm
 cargo run -p bluetooth-sapphire-wasm -- --physical-fixture \
   target/sapphire-gap-wasm/pigweed/bazel-bin/physical_discovery
+for fault in worker-crash timeout malformed-ipc partial-hci; do
+  cargo run -p bluetooth-sapphire-wasm -- --physical-fault-fixture "$fault" \
+    target/sapphire-gap-wasm/pigweed/bazel-bin/physical_discovery
+done
 ```
+
+The fault fixtures never open HCI. They cover worker crash/reap, a bounded
+partial-Reset timeout, stale-session IPC rejection, malformed partial HCI
+delivery, and fresh IPC ownership after cleanup. Broker tests separately check
+strict restore-state parsing and closure of the owned channel descriptor.
 
 `scripts/build-sapphire-gap-wasm` builds that suite from Pigweed commit
 `c14c119c51a82f6e044f81b7dad0a322091d4121`, fetched by Nix from the upstream

@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bluetooth_hci_broker::{
-    H4_EVENT, InboundKind, MAX_OUTBOUND_HCI_PACKET, OutboundKind, PhysicalHci, decode_event,
+    H4_EVENT, InboundKind, MAX_OUTBOUND_HCI_PACKET, OutboundKind, PhysicalHci,
     probe_exclusive_user_channel, restore_saved_controller_state, validate_inbound,
     validate_outbound,
 };
@@ -48,7 +48,6 @@ const CONTROLLER_INBOUND_ACK: u8 = 10;
 const CONTROLLER_DRAIN: u8 = 11;
 const CONTROLLER_DRAIN_DONE: u8 = 12;
 const CONTROLLER_STOP: u8 = 13;
-const DISCOVERY_RESULT: u8 = 14;
 const PHYSICAL_READY: u8 = 15;
 const PHYSICAL_START: u8 = 16;
 const PHYSICAL_TICK: u8 = 17;
@@ -425,7 +424,6 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
     let status = instance
         .get_typed_func::<(), i32>(&mut store, "drv_test_entry")?
         .call(&mut store, ())?;
-    let mut stopping = false;
     loop {
         if store.data().inbound.is_empty() {
             send_packet(&socket, CONTROLLER_DRAIN, &session.to_le_bytes())?;
@@ -437,18 +435,6 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
                             "invalid controller packet while draining",
                         ));
                     }
-                }
-                CONTROLLER_STOP if payload == session.to_le_bytes() && !stopping => {
-                    let count = instance
-                        .get_typed_func::<(), i32>(&mut store, "drv_controller_stop")?
-                        .call(&mut store, ())?;
-                    if !(0..=MAX_INBOUND_PACKETS as i32).contains(&count) {
-                        return Err(wasmtime::Error::msg("invalid discovery result count"));
-                    }
-                    let mut result = session.to_le_bytes().to_vec();
-                    result.extend_from_slice(&(count as u32).to_le_bytes());
-                    send_packet(&socket, DISCOVERY_RESULT, &result)?;
-                    stopping = true;
                 }
                 CONTROLLER_DRAIN_DONE if payload == session.to_le_bytes() => break,
                 _ => return Err(wasmtime::Error::msg("invalid controller drain reply")),
@@ -789,170 +775,7 @@ fn schedule_inbound(
     Ok(())
 }
 
-struct PhysicalBroker<'a> {
-    hci: &'a mut PhysicalHci,
-    duration: Duration,
-    packets: usize,
-    bytes: usize,
-    next_sequence: u32,
-    inbound_bytes: usize,
-    inbound: VecDeque<InboundPacket>,
-    in_flight: Option<(u32, usize)>,
-    scan_started: Option<Instant>,
-    stop_sent: bool,
-    disable_sent: bool,
-    disable_complete: bool,
-    discovery_count: Option<u32>,
-}
-
-impl<'a> PhysicalBroker<'a> {
-    #[allow(dead_code)]
-    fn new(hci: &'a mut PhysicalHci, duration: Duration) -> Self {
-        Self {
-            hci,
-            duration,
-            packets: 0,
-            bytes: 0,
-            next_sequence: 0,
-            inbound_bytes: 0,
-            inbound: VecDeque::new(),
-            in_flight: None,
-            scan_started: None,
-            stop_sent: false,
-            disable_sent: false,
-            disable_complete: false,
-            discovery_count: None,
-        }
-    }
-
-    fn send(&mut self, payload: &[u8]) -> ControllerSend {
-        let Some((&kind, packet)) = payload.split_first() else {
-            return ControllerSend { status: 1 };
-        };
-        let kind = match kind {
-            0 => OutboundKind::Command,
-            1 => OutboundKind::Acl,
-            2 => OutboundKind::Sco,
-            3 => OutboundKind::Iso,
-            _ => return ControllerSend { status: 1 },
-        };
-        if self.packets >= MAX_CONTROLLER_PACKETS
-            || self.bytes.saturating_add(packet.len()) > MAX_CONTROLLER_BYTES
-        {
-            return ControllerSend { status: 2 };
-        }
-        if self.hci.send(kind, packet).is_err() {
-            return ControllerSend { status: 1 };
-        }
-        if kind == OutboundKind::Command && packet.len() >= 5 {
-            let opcode = u16::from_le_bytes([packet[0], packet[1]]);
-            if opcode == 0x200c && packet[3] == 1 {
-                self.scan_started.get_or_insert_with(Instant::now);
-            } else if opcode == 0x200c && packet[3] == 0 {
-                self.disable_sent = true;
-            }
-        }
-        self.packets += 1;
-        self.bytes += packet.len();
-        ControllerSend { status: 0 }
-    }
-
-    fn acknowledge(&mut self, sequence: u32) -> bool {
-        let Some((expected, bytes)) = self.in_flight else {
-            return false;
-        };
-        if sequence != expected {
-            return false;
-        }
-        self.in_flight = None;
-        self.inbound_bytes -= bytes;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        true
-    }
-
-    fn schedule(&mut self, socket: &UnixDatagram, session: u64) -> io::Result<bool> {
-        if self.in_flight.is_some() {
-            return Ok(true);
-        }
-        let Some(packet) = self.inbound.pop_front() else {
-            return Ok(false);
-        };
-        let mut payload = Vec::with_capacity(packet.bytes.len() + 13);
-        payload.extend_from_slice(&session.to_le_bytes());
-        payload.extend_from_slice(&self.next_sequence.to_le_bytes());
-        payload.push(packet.kind);
-        payload.extend_from_slice(&packet.bytes);
-        send_packet(socket, CONTROLLER_INBOUND, &payload)?;
-        self.in_flight = Some((self.next_sequence, packet.bytes.len()));
-        Ok(true)
-    }
-
-    fn drain(&mut self, socket: &UnixDatagram, session: u64, started: Instant) -> io::Result<()> {
-        if self.schedule(socket, session)? {
-            return Ok(());
-        }
-        if self.stop_sent && self.disable_sent && self.disable_complete {
-            return send_packet(socket, CONTROLLER_DRAIN_DONE, &session.to_le_bytes());
-        }
-        let scan_deadline = self
-            .scan_started
-            .map(|time| time + self.duration)
-            .unwrap_or(started + Duration::from_secs(10));
-        if !self.stop_sent && Instant::now() >= scan_deadline {
-            self.stop_sent = true;
-            return send_packet(socket, CONTROLLER_STOP, &session.to_le_bytes());
-        }
-        let deadline = if self.stop_sent {
-            Instant::now() + Duration::from_secs(3)
-        } else {
-            scan_deadline
-        };
-        match self.hci.receive(deadline) {
-            Ok((kind, bytes)) => {
-                if kind == InboundKind::Event {
-                    let event = decode_event(&bytes)?;
-                    if event.code == 0x0e
-                        && event.parameters.len() >= 4
-                        && u16::from_le_bytes([event.parameters[1], event.parameters[2]]) == 0x200c
-                        && self.disable_sent
-                    {
-                        self.disable_complete = event.parameters[3] == 0;
-                    }
-                }
-                if self.inbound.len() >= MAX_INBOUND_PACKETS
-                    || self.inbound_bytes.saturating_add(bytes.len()) > MAX_INBOUND_BYTES
-                {
-                    return Err(io::Error::other("physical inbound queue exceeded quota"));
-                }
-                let kind = match kind {
-                    InboundKind::Event => 0,
-                    InboundKind::Acl => 1,
-                    InboundKind::Sco => 2,
-                    InboundKind::Iso => 3,
-                };
-                self.inbound_bytes += bytes.len();
-                self.inbound.push_back(InboundPacket {
-                    sequence: 0,
-                    kind,
-                    bytes,
-                });
-                self.schedule(socket, session)?;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::TimedOut && !self.stop_sent => {
-                self.stop_sent = true;
-                send_packet(socket, CONTROLLER_STOP, &session.to_le_bytes())
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-fn run_supervisor_attempt(
-    module: &[u8],
-    generation: u8,
-    mut physical: Option<&mut PhysicalBroker<'_>>,
-) -> Result<(String, Option<u32>), Box<dyn Error>> {
+fn run_supervisor_attempt(module: &[u8], generation: u8) -> Result<String, Box<dyn Error>> {
     let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let (supervisor, worker) = UnixDatagram::pair()?;
     supervisor.set_read_timeout(Some(TEST_TIMEOUT))?;
@@ -1014,27 +837,16 @@ fn run_supervisor_attempt(
             }
             Ok((CONTROLLER_SEND, payload)) => {
                 let (request_id, payload) = split_request(&payload, session)?;
-                let sent = if let Some(physical) = physical.as_deref_mut() {
-                    physical.send(payload)
-                } else {
-                    controller.send(payload)
-                };
+                let sent = controller.send(payload);
                 send_reply(&supervisor, session, request_id, &[sent.status])?;
-                if physical.is_none() {
-                    schedule_inbound(&supervisor, session, &mut controller)?;
-                }
+                schedule_inbound(&supervisor, session, &mut controller)?;
             }
             Ok((CONTROLLER_INBOUND_ACK, payload)) => {
                 if payload.len() != 13
                     || u64::from_le_bytes(payload[..8].try_into().unwrap()) != session
                     || payload[12] != 0
-                    || !(if let Some(physical) = physical.as_deref_mut() {
-                        physical.acknowledge(u32::from_le_bytes(payload[8..12].try_into().unwrap()))
-                    } else {
-                        controller.acknowledge_inbound(u32::from_le_bytes(
-                            payload[8..12].try_into().unwrap(),
-                        ))
-                    })
+                    || !controller
+                        .acknowledge_inbound(u32::from_le_bytes(payload[8..12].try_into().unwrap()))
                 {
                     return Err("invalid controller delivery completion".into());
                 }
@@ -1043,23 +855,11 @@ fn run_supervisor_attempt(
                 if payload != session.to_le_bytes() {
                     return Err("controller drain belongs to another session".into());
                 }
-                if let Some(physical) = physical.as_deref_mut() {
-                    physical.drain(&supervisor, session, started)?;
-                } else if controller.in_flight.is_none() && controller.inbound.is_empty() {
+                if controller.in_flight.is_none() && controller.inbound.is_empty() {
                     send_packet(&supervisor, CONTROLLER_DRAIN_DONE, &session.to_le_bytes())?;
                 } else {
                     schedule_inbound(&supervisor, session, &mut controller)?;
                 }
-            }
-            Ok((DISCOVERY_RESULT, payload)) => {
-                let Some(physical) = physical.as_deref_mut() else {
-                    return Err("unexpected discovery result".into());
-                };
-                if payload.len() != 12 || payload[..8] != session.to_le_bytes() {
-                    return Err("invalid discovery result".into());
-                }
-                physical.discovery_count =
-                    Some(u32::from_le_bytes(payload[8..12].try_into().unwrap()));
             }
             Ok((EXIT, payload)) => {
                 let (request_id, payload) = split_request(&payload, session)?;
@@ -1106,19 +906,14 @@ fn run_supervisor_attempt(
         )
         .into());
     }
-    let (packets, bytes, discovery_count) = physical
-        .as_deref()
-        .map_or((controller.packets, controller.bytes, None), |physical| {
-            (physical.packets, physical.bytes, physical.discovery_count)
-        });
     log.extend_from_slice(
         format!(
             "[supervisor: {clock_requests} clock requests, final={now_nanoseconds}ns; {} controller packets, {} bytes]\n",
-            packets, bytes
+            controller.packets, controller.bytes
         )
         .as_bytes(),
     );
-    Ok((String::from_utf8_lossy(&log).into_owned(), discovery_count))
+    Ok(String::from_utf8_lossy(&log).into_owned())
 }
 
 fn retry_worker<T>(mut attempt: impl FnMut(u8) -> Result<T, String>) -> Result<T, String> {
@@ -1137,9 +932,7 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
         return Err("module exceeds bound".into());
     }
     retry_worker(|generation| {
-        run_supervisor_attempt(&module, generation, None)
-            .map(|outcome| outcome.0)
-            .map_err(|error| error.to_string())
+        run_supervisor_attempt(&module, generation).map_err(|error| error.to_string())
     })
     .map_err(Into::into)
 }
@@ -1514,6 +1307,127 @@ fn run_physical_fixture(module_path: &Path) -> Result<String, Box<dyn Error>> {
     Ok("physical Sapphire fixture passed: SCANNING -> peer_count=1 -> STOPPED\n".to_owned())
 }
 
+fn run_physical_fault_fixture(module_path: &Path, fault: &str) -> Result<String, Box<dyn Error>> {
+    let module = fs::read(module_path)?;
+    let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let (supervisor, worker) = UnixDatagram::pair()?;
+    supervisor.set_read_timeout(Some(TEST_TIMEOUT))?;
+    let mut child = WorkerGuard::new(spawn_worker(&worker, false)?);
+    drop(worker);
+    let mut header = session.to_le_bytes().to_vec();
+    header.extend_from_slice(&(module.len() as u64).to_le_bytes());
+    send_packet(&supervisor, MODULE_LENGTH, &header)?;
+    for chunk in module.chunks(MAX_PACKET_BYTES - 1) {
+        send_packet(&supervisor, MODULE_CHUNK, chunk)?;
+    }
+    loop {
+        match receive_packet(&supervisor)? {
+            (PROGRESS, _) => {}
+            (PHYSICAL_READY, payload) if payload == session.to_le_bytes() => break,
+            packet => return Err(format!("fault fixture READY failed: {packet:?}").into()),
+        }
+    }
+    if fault == "worker-crash" {
+        child.kill()?;
+        let status = child.wait()?;
+        if status.success() {
+            return Err("crashed worker exited successfully".into());
+        }
+        let (_left, _right) = UnixDatagram::pair()?;
+        return Ok("worker-crash contained and IPC ownership reacquired\n".to_owned());
+    }
+
+    send_packet(&supervisor, PHYSICAL_START, &session.to_le_bytes())?;
+    supervisor.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let (request_id, reset) = loop {
+        match receive_packet(&supervisor)? {
+            (CONTROLLER_SEND, payload) => {
+                let (request_id, payload) = split_request(&payload, session)?;
+                let (_, packet) = physical_command_allowed(payload)
+                    .ok_or("fault fixture received disallowed Reset")?;
+                if u16::from_le_bytes(packet[..2].try_into().unwrap()) != 0x0c03 {
+                    return Err("fault fixture did not begin with Reset".into());
+                }
+                break (request_id, packet.to_vec());
+            }
+            (PHYSICAL_STATE, _) | (PROGRESS, _) => {}
+            packet => return Err(format!("unexpected fault fixture packet: {packet:?}").into()),
+        }
+    };
+    send_reply(&supervisor, session, request_id, &[0])?;
+
+    if fault == "timeout" {
+        supervisor.set_read_timeout(Some(Duration::from_millis(50)))?;
+        loop {
+            match receive_packet(&supervisor) {
+                Ok((PHYSICAL_STATE, _)) => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                result => return Err(format!("unexpected timeout result: {result:?}").into()),
+            }
+        }
+        child.kill()?;
+        child.wait()?;
+        return Ok("partial Reset timeout bounded and worker reaped\n".to_owned());
+    }
+
+    let mut delivery = (if fault == "malformed-ipc" {
+        session.wrapping_add(1)
+    } else {
+        session
+    })
+    .to_le_bytes()
+    .to_vec();
+    delivery.extend_from_slice(&0_u32.to_le_bytes());
+    delivery.push(0);
+    delivery.extend_from_slice(&[0x0e, 4, 1, reset[0], reset[1], 0]);
+    send_packet(&supervisor, CONTROLLER_INBOUND, &delivery)?;
+
+    let mut malformed_sent = fault == "malformed-ipc";
+    let result_status = loop {
+        match receive_packet(&supervisor)? {
+            (PHYSICAL_STATE, _) | (PROGRESS, _) => {}
+            (CONTROLLER_SEND, payload) if fault == "partial-hci" => {
+                let (request_id, _) = split_request(&payload, session)?;
+                send_reply(&supervisor, session, request_id, &[0])?;
+            }
+            (CONTROLLER_INBOUND_ACK, payload) if fault == "partial-hci" && !malformed_sent => {
+                if payload.len() != 13 || payload[12] != 0 {
+                    return Err("valid Reset was not acknowledged".into());
+                }
+                let mut malformed = session.to_le_bytes().to_vec();
+                malformed.extend_from_slice(&1_u32.to_le_bytes());
+                malformed.push(0);
+                malformed.extend_from_slice(&[0x0e, 4]);
+                send_packet(&supervisor, CONTROLLER_INBOUND, &malformed)?;
+                malformed_sent = true;
+            }
+            (RESULT, payload) if payload.len() >= 4 => {
+                break i32::from_le_bytes(payload[..4].try_into().unwrap());
+            }
+            (LOG, payload) => {
+                let (request_id, _) = split_request(&payload, session)?;
+                send_reply(&supervisor, session, request_id, &[])?;
+            }
+            packet => return Err(format!("unexpected fault completion: {packet:?}").into()),
+        }
+    };
+    let child_status = child.wait()?;
+    if result_status == 0 || child_status.success() || !malformed_sent {
+        return Err("fault fixture was not contained".into());
+    }
+    let (_left, _right) = UnixDatagram::pair()?;
+    Ok(format!(
+        "{fault} rejected, worker reaped, and IPC ownership reacquired\n"
+    ))
+}
+
 fn worker_main() -> Result<(), Box<dyn Error>> {
     // SAFETY: The supervisor installs the connected socket at this fixed fd and
     // transfers ownership to the worker across exec.
@@ -1563,6 +1477,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("usage: bluetooth-sapphire-wasm --physical-fixture MODULE".into());
         }
         print!("{}", run_physical_fixture(Path::new(&raw[1]))?);
+        return Ok(());
+    }
+    if raw.first().map(String::as_str) == Some("--physical-fault-fixture") {
+        if raw.len() != 3
+            || !matches!(
+                raw[1].as_str(),
+                "worker-crash" | "timeout" | "malformed-ipc" | "partial-hci"
+            )
+        {
+            return Err("usage: bluetooth-sapphire-wasm --physical-fault-fixture worker-crash|timeout|malformed-ipc|partial-hci MODULE".into());
+        }
+        print!(
+            "{}",
+            run_physical_fault_fixture(Path::new(&raw[2]), &raw[1])?
+        );
         return Ok(());
     }
     if raw.first().map(String::as_str) == Some("--physical-discovery") {
@@ -1869,6 +1798,35 @@ mod tests {
             .is_err()
         );
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn physical_allowlist_is_discovery_only() {
+        let allowed = [
+            vec![0, 0x03, 0x0c, 0],
+            vec![
+                0, 0x01, 0x0c, 8, 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d,
+            ],
+            vec![0, 0x01, 0x20, 8, 0x1f, 0, 0, 0, 0, 0, 0, 0],
+            vec![0, 0x0b, 0x20, 7, 0, 0x10, 0, 0x10, 0, 0, 0],
+            vec![0, 0x0c, 0x20, 2, 1, 1],
+            vec![0, 0x0c, 0x20, 2, 0, 0],
+        ];
+        for command in allowed {
+            assert!(physical_command_allowed(&command).is_some(), "{command:?}");
+        }
+
+        let rejected = [
+            vec![1, 1, 0, 0, 0],
+            vec![0, 0x0d, 0x20, 0],
+            vec![0, 0x0b, 0x20, 7, 0, 0x10, 0, 0x11, 0, 0, 0],
+            vec![0, 0x0b, 0x20, 7, 0, 0, 0, 0, 0, 0],
+            vec![0, 0x0c, 0x20, 2, 1, 0],
+            vec![0, 0x03, 0x0c, 1, 0],
+        ];
+        for command in rejected {
+            assert!(physical_command_allowed(&command).is_none(), "{command:?}");
+        }
     }
 
     #[test]

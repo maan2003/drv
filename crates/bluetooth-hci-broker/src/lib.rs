@@ -419,6 +419,32 @@ mod physical {
         Ok(fd)
     }
 
+    fn close_channel(channel: &mut Option<OwnedFd>) {
+        channel.take();
+    }
+
+    fn parse_saved_controller_state(text: &str) -> io::Result<(u16, u32)> {
+        let mut lines = text.lines();
+        let device = lines
+            .next()
+            .and_then(|line| line.strip_prefix("device="))
+            .ok_or_else(|| invalid("invalid saved controller state"))?
+            .parse::<u16>()
+            .map_err(|_| invalid("invalid saved controller device"))?;
+        let flags = u32::from_str_radix(
+            lines
+                .next()
+                .and_then(|line| line.strip_prefix("flags="))
+                .ok_or_else(|| invalid("invalid saved controller state"))?,
+            16,
+        )
+        .map_err(|_| invalid("invalid saved controller flags"))?;
+        if lines.next().is_some() {
+            return Err(invalid("trailing saved controller state"));
+        }
+        Ok((device, flags))
+    }
+
     /// Exclusive, native-only Linux HCI user-channel ownership with exact flag restoration.
     pub struct PhysicalHci {
         control: OwnedFd,
@@ -555,7 +581,7 @@ mod physical {
 
         pub fn restore(&mut self) -> io::Result<()> {
             self.cleanup_scan();
-            self.channel.take();
+            close_channel(&mut self.channel);
             restore_exact(&self.control, self.device, self.initial_flags)?;
             self.restored = true;
             Ok(())
@@ -621,7 +647,7 @@ mod physical {
         fn drop(&mut self) {
             if !self.restored {
                 self.cleanup_scan();
-                self.channel.take();
+                close_channel(&mut self.channel);
                 let _ = restore_exact(&self.control, self.device, self.initial_flags);
             }
         }
@@ -640,26 +666,51 @@ mod physical {
 
     pub fn restore_saved_controller_state(path: &Path) -> io::Result<()> {
         let text = std::fs::read_to_string(path)?;
-        let mut lines = text.lines();
-        let device = lines
-            .next()
-            .and_then(|line| line.strip_prefix("device="))
-            .ok_or_else(|| invalid("invalid saved controller state"))?
-            .parse::<u16>()
-            .map_err(|_| invalid("invalid saved controller device"))?;
-        let flags = u32::from_str_radix(
-            lines
-                .next()
-                .and_then(|line| line.strip_prefix("flags="))
-                .ok_or_else(|| invalid("invalid saved controller state"))?,
-            16,
-        )
-        .map_err(|_| invalid("invalid saved controller flags"))?;
-        if lines.next().is_some() {
-            return Err(invalid("trailing saved controller state"));
-        }
+        let (device, flags) = parse_saved_controller_state(&text)?;
         let control = raw_socket(false)?;
         restore_exact(&control, device, flags)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        #[test]
+        fn saved_state_parser_is_exact() {
+            assert_eq!(
+                parse_saved_controller_state("device=0\nflags=00000000\n").unwrap(),
+                (0, 0)
+            );
+            assert_eq!(
+                parse_saved_controller_state("device=12\nflags=deadbeef\n").unwrap(),
+                (12, 0xdead_beef)
+            );
+            for malformed in [
+                "",
+                "device=0\n",
+                "device=x\nflags=0\n",
+                "device=0\nflags=x\n",
+                "device=0\nflags=0\ntrailing\n",
+            ] {
+                assert!(parse_saved_controller_state(malformed).is_err());
+            }
+        }
+
+        #[test]
+        fn cleanup_closes_owned_channel_descriptor() {
+            let (socket, _peer) = UnixDatagram::pair().unwrap();
+            let raw = socket.into_raw_fd();
+            // SAFETY: ownership of the descriptor transfers once into OwnedFd.
+            let mut channel = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            close_channel(&mut channel);
+            assert!(channel.is_none());
+            let mut byte = 0_u8;
+            // SAFETY: the invalid raw descriptor is used only to verify EBADF.
+            assert_eq!(unsafe { read(raw, (&mut byte as *mut u8).cast(), 1) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(9));
+        }
     }
 }
 
