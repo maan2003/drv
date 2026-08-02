@@ -513,6 +513,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eapol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_matches",
+ "log",
+ "thiserror 2.0.18",
+ "wlan-bitfield",
+ "wlan-common",
+ "zerocopy",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
