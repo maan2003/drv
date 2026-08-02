@@ -122,6 +122,24 @@ index, installs a VFIO IRQ before unmasking it, implements the MCU command/RX
 response path, and keeps every mapping pinned through quiescence and function
 reset. The rejected command cannot map DMA or write MMIO.
 
+`prepare_global_tx_rings` is the deterministic replacement preflight. While TX
+DMA and all host interrupts remain disabled, it inventories all 18 hardware TX
+ring slots, rejects invalid MMIO or any `CIDX != DIDX`, verifies MT7921 ring
+16's pinned-Linux prefetch value `0x03400004`, and replaces every non-target
+base with one pinned guard page while assigning separate pinned backing to ring
+16. Only after every base/count/CPU index is owned does it issue Linux's global
+DTX-index reset and require every DIDX to read zero. Old kernel DMA bases are
+never restored. This currently has a fake transport only and cannot touch the
+physical adapter.
+
+`encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
+and request bodies for patch-semaphore acquisition, `PATCH_START`, and
+`TARGET_ADDRESS_LEN`. It rejects sequence zero/outside the four-bit firmware
+range, an empty download, and a patch-start address other than MT7961's
+`0x00900000`. Encoding these commands is not permission to send them: an owned
+MCU TX ring, RX response ring, parsed matching response, VFIO IRQ, and safe
+reset-while-pinned teardown must all exist first.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

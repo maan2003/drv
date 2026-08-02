@@ -1579,6 +1579,275 @@ impl FirmwareCompletionTracker {
     }
 }
 
+pub const MT7921_TX_RING_SLOTS: usize = 18;
+pub const MT7921_FWDL_RING_INDEX: usize = 16;
+pub const MT7921_FWDL_EXT_CTRL: u32 = 0x0340_0004;
+pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxRingState {
+    pub descriptor_base: u32,
+    pub descriptor_count: u32,
+    pub cpu_index: u32,
+    pub dma_index: u32,
+}
+
+pub trait GlobalTxRingTransport {
+    type Error;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
+    fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error>;
+    fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error>;
+    fn write_tx_ring(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), Self::Error>;
+    fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlobalTxRingEvent {
+    Snapshot { index: usize, state: TxRingState },
+    RingOwned { index: usize, descriptor_base: u32 },
+    IndicesReset,
+    RingVerified { index: usize, state: TxRingState },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GlobalTxRingError<E> {
+    InvalidArena,
+    ActiveState {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    InvalidMmio,
+    DirtyRing {
+        index: usize,
+        state: TxRingState,
+    },
+    UnexpectedFwdlExtCtrl(u32),
+    Transport(E),
+    Readback {
+        index: usize,
+        state: TxRingState,
+    },
+}
+
+/// Replace every globally enabled TX ring with owned, pinned backing.
+///
+/// TX DMA remains disabled throughout this transition. All eighteen hardware
+/// ring slots are inspected, must be idle, and are then pointed either at the
+/// target firmware ring or a page-sized guard ring. Linux's all-ring DTX reset
+/// is issued only after every base/count/CPU index is safe, then every DIDX is
+/// required to read zero. Old kernel DMA bases are deliberately not restored.
+pub fn prepare_global_tx_rings<T, F>(
+    transport: &mut T,
+    guard_iova: u64,
+    fwdl_iova: u64,
+    mut event: F,
+) -> Result<[TxRingState; MT7921_TX_RING_SLOTS], GlobalTxRingError<T::Error>>
+where
+    T: GlobalTxRingTransport,
+    F: FnMut(GlobalTxRingEvent),
+{
+    let page_end = |iova: u64| {
+        (iova % 4096 == 0)
+            .then(|| iova.checked_add(4095))
+            .flatten()
+            .filter(|end| *end <= u64::from(u32::MAX))
+    };
+    let Some(guard_end) = page_end(guard_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    let Some(fwdl_end) = page_end(fwdl_iova) else {
+        return Err(GlobalTxRingError::InvalidArena);
+    };
+    if guard_iova <= fwdl_end && fwdl_iova <= guard_end {
+        return Err(GlobalTxRingError::InvalidArena);
+    }
+    let global_config = transport
+        .read_global_config()
+        .map_err(GlobalTxRingError::Transport)?;
+    let interrupt_enable = transport
+        .read_interrupt_enable()
+        .map_err(GlobalTxRingError::Transport)?;
+    if global_config == u32::MAX || interrupt_enable == u32::MAX {
+        return Err(GlobalTxRingError::InvalidMmio);
+    }
+    if global_config & 0xf != 0 || interrupt_enable != 0 {
+        return Err(GlobalTxRingError::ActiveState {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    let ext = transport
+        .read_fwdl_ext_ctrl()
+        .map_err(GlobalTxRingError::Transport)?;
+    if ext == u32::MAX {
+        return Err(GlobalTxRingError::InvalidMmio);
+    }
+    if ext != MT7921_FWDL_EXT_CTRL {
+        return Err(GlobalTxRingError::UnexpectedFwdlExtCtrl(ext));
+    }
+    for index in 0..MT7921_TX_RING_SLOTS {
+        let state = transport
+            .read_tx_ring(index)
+            .map_err(GlobalTxRingError::Transport)?;
+        if [
+            state.descriptor_base,
+            state.descriptor_count,
+            state.cpu_index,
+            state.dma_index,
+        ]
+        .contains(&u32::MAX)
+        {
+            return Err(GlobalTxRingError::InvalidMmio);
+        }
+        event(GlobalTxRingEvent::Snapshot { index, state });
+        if state.cpu_index != state.dma_index {
+            return Err(GlobalTxRingError::DirtyRing { index, state });
+        }
+    }
+    for index in 0..MT7921_TX_RING_SLOTS {
+        let descriptor_base = if index == MT7921_FWDL_RING_INDEX {
+            fwdl_iova as u32
+        } else {
+            guard_iova as u32
+        };
+        transport
+            .write_tx_ring(index, descriptor_base, MT7921_FWDL_RING_COUNT, 0)
+            .map_err(GlobalTxRingError::Transport)?;
+        event(GlobalTxRingEvent::RingOwned {
+            index,
+            descriptor_base,
+        });
+    }
+    transport
+        .reset_tx_indices(MT7921_RESET_ALL_TX_INDICES)
+        .map_err(GlobalTxRingError::Transport)?;
+    event(GlobalTxRingEvent::IndicesReset);
+    let mut owned = [TxRingState {
+        descriptor_base: 0,
+        descriptor_count: 0,
+        cpu_index: 0,
+        dma_index: 0,
+    }; MT7921_TX_RING_SLOTS];
+    for (index, state) in owned.iter_mut().enumerate() {
+        *state = transport
+            .read_tx_ring(index)
+            .map_err(GlobalTxRingError::Transport)?;
+        let expected_base = if index == MT7921_FWDL_RING_INDEX {
+            fwdl_iova as u32
+        } else {
+            guard_iova as u32
+        };
+        if *state
+            != (TxRingState {
+                descriptor_base: expected_base,
+                descriptor_count: MT7921_FWDL_RING_COUNT,
+                cpu_index: 0,
+                dma_index: 0,
+            })
+        {
+            return Err(GlobalTxRingError::Readback {
+                index,
+                state: *state,
+            });
+        }
+        event(GlobalTxRingEvent::RingVerified {
+            index,
+            state: *state,
+        });
+    }
+    Ok(owned)
+}
+
+pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
+pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
+pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadCommand {
+    PatchSemaphoreGet,
+    PatchStart {
+        address: u32,
+        length: u32,
+        mode: u32,
+    },
+    TargetAddressLength {
+        address: u32,
+        length: u32,
+        mode: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadCommandError {
+    InvalidSequence,
+    InvalidLength,
+}
+
+/// Encode the non-scatter MCU command which must precede firmware DMA.
+///
+/// This is the exact legacy Connac2 long command header produced by pinned
+/// Linux `mt76_connac2_mcu_fill_message`, followed by the little-endian request
+/// payload used by patch semaphore or download initialization.
+pub fn encode_download_command(
+    command: DownloadCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, DownloadCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(DownloadCommandError::InvalidSequence);
+    }
+    let (cid, payload): (u8, Vec<u8>) = match command {
+        DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchStart {
+            address,
+            length,
+            mode,
+        } => {
+            if address != 0x0090_0000 || length == 0 {
+                return Err(DownloadCommandError::InvalidLength);
+            }
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&address.to_le_bytes());
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&mode.to_le_bytes());
+            (0x05, payload)
+        }
+        DownloadCommand::TargetAddressLength {
+            address,
+            length,
+            mode,
+        } => {
+            if length == 0 {
+                return Err(DownloadCommandError::InvalidLength);
+            }
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&address.to_le_bytes());
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(&mode.to_le_bytes());
+            (0x01, payload)
+        }
+    };
+    let total = CONNAC2_MCU_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[36] = cid;
+    bytes[37] = 0xa0;
+    bytes[38] = 3;
+    bytes[39] = sequence;
+    bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
+    Ok(bytes)
+}
+
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
 pub const WFSYS_SW_INIT_DONE: u32 = 1 << 4;
 pub const WFSYS_ASSERT_MS: u64 = 50;
@@ -2550,6 +2819,175 @@ mod tests {
             })
         );
         assert_eq!(tracker.observe(4, 121), Some(FirmwareCompletion::Complete));
+    }
+
+    struct FakeGlobalTx {
+        global: u32,
+        interrupts: u32,
+        ext: u32,
+        rings: [TxRingState; MT7921_TX_RING_SLOTS],
+        writes: Vec<(usize, u32)>,
+        resets: Vec<u32>,
+    }
+    impl FakeGlobalTx {
+        fn new() -> Self {
+            let mut rings = [TxRingState {
+                descriptor_base: 0,
+                descriptor_count: 128,
+                cpu_index: 0,
+                dma_index: 0,
+            }; MT7921_TX_RING_SLOTS];
+            for (index, ring) in rings.iter_mut().enumerate() {
+                ring.descriptor_base = 0x8000_0000 + index as u32 * 0x1000;
+                ring.cpu_index = index as u32;
+                ring.dma_index = index as u32;
+            }
+            Self {
+                global: 0x1010_b870,
+                interrupts: 0,
+                ext: MT7921_FWDL_EXT_CTRL,
+                rings,
+                writes: Vec::new(),
+                resets: Vec::new(),
+            }
+        }
+    }
+    impl GlobalTxRingTransport for FakeGlobalTx {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.global)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.interrupts)
+        }
+        fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error> {
+            Ok(self.rings[index])
+        }
+        fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.ext)
+        }
+        fn write_tx_ring(
+            &mut self,
+            index: usize,
+            descriptor_base: u32,
+            descriptor_count: u32,
+            cpu_index: u32,
+        ) -> Result<(), Self::Error> {
+            self.writes.push((index, descriptor_base));
+            self.rings[index].descriptor_base = descriptor_base;
+            self.rings[index].descriptor_count = descriptor_count;
+            self.rings[index].cpu_index = cpu_index;
+            Ok(())
+        }
+        fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.resets.push(value);
+            for ring in &mut self.rings {
+                ring.dma_index = 0;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn global_tx_preparation_owns_all_eighteen_rings_before_index_reset() {
+        let mut transport = FakeGlobalTx::new();
+        let mut events = Vec::new();
+        let owned = prepare_global_tx_rings(&mut transport, 0x0100_0000, 0x0100_1000, |event| {
+            events.push(event)
+        })
+        .unwrap();
+        assert_eq!(transport.writes.len(), MT7921_TX_RING_SLOTS);
+        assert_eq!(transport.resets, [MT7921_RESET_ALL_TX_INDICES]);
+        for (index, state) in owned.into_iter().enumerate() {
+            assert_eq!(
+                state.descriptor_base,
+                if index == MT7921_FWDL_RING_INDEX {
+                    0x0100_1000
+                } else {
+                    0x0100_0000
+                }
+            );
+            assert_eq!(state.descriptor_count, MT7921_FWDL_RING_COUNT);
+            assert_eq!(state.cpu_index, 0);
+            assert_eq!(state.dma_index, 0);
+        }
+        assert!(matches!(
+            events.last(),
+            Some(GlobalTxRingEvent::RingVerified { index: 17, .. })
+        ));
+    }
+
+    #[test]
+    fn global_tx_preparation_rejects_dirty_mmio_ext_and_arenas_before_writes() {
+        let mut dirty = FakeGlobalTx::new();
+        dirty.rings[7].cpu_index += 1;
+        assert!(matches!(
+            prepare_global_tx_rings(&mut dirty, 0x0100_0000, 0x0100_1000, |_| {}),
+            Err(GlobalTxRingError::DirtyRing { index: 7, .. })
+        ));
+        assert!(dirty.writes.is_empty());
+
+        let mut invalid = FakeGlobalTx::new();
+        invalid.ext = u32::MAX;
+        assert_eq!(
+            prepare_global_tx_rings(&mut invalid, 0x0100_0000, 0x0100_1000, |_| {}),
+            Err(GlobalTxRingError::InvalidMmio)
+        );
+        assert!(invalid.writes.is_empty());
+
+        let mut ext = FakeGlobalTx::new();
+        ext.ext = 4;
+        assert_eq!(
+            prepare_global_tx_rings(&mut ext, 0x0100_0000, 0x0100_1000, |_| {}),
+            Err(GlobalTxRingError::UnexpectedFwdlExtCtrl(4))
+        );
+
+        let mut overlap = FakeGlobalTx::new();
+        assert_eq!(
+            prepare_global_tx_rings(&mut overlap, 0x0100_0000, 0x0100_0000, |_| {}),
+            Err(GlobalTxRingError::InvalidArena)
+        );
+        assert!(overlap.writes.is_empty());
+    }
+
+    #[test]
+    fn encodes_connac2_patch_protocol_before_scatter_dma() {
+        let semaphore = encode_download_command(DownloadCommand::PatchSemaphoreGet, 1).unwrap();
+        assert_eq!(semaphore.len(), PATCH_SEMAPHORE_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(semaphore[0..4].try_into().unwrap()),
+            0x4100_0044
+        );
+        assert_eq!(
+            u32::from_le_bytes(semaphore[4..8].try_into().unwrap()),
+            0x8001_0000
+        );
+        assert_eq!(&semaphore[32..34], &36u16.to_le_bytes());
+        assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
+        assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
+
+        let patch = encode_download_command(
+            DownloadCommand::PatchStart {
+                address: 0x0090_0000,
+                length: 0x0001_6780,
+                mode: 1 << 31,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(patch.len(), PATCH_START_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(patch[0..4].try_into().unwrap()),
+            0x4100_004c
+        );
+        assert_eq!(&patch[36..40], &[0x05, 0xa0, 3, 2]);
+        assert_eq!(&patch[64..68], &0x0090_0000u32.to_le_bytes());
+        assert_eq!(&patch[68..72], &0x0001_6780u32.to_le_bytes());
+        assert_eq!(&patch[72..76], &(1u32 << 31).to_le_bytes());
+        assert_eq!(
+            encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
+            Err(DownloadCommandError::InvalidSequence)
+        );
     }
 
     #[test]
