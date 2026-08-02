@@ -1901,7 +1901,7 @@ where
             return Err(GlobalTxRingError::InvalidMmio);
         }
         event(GlobalTxRingEvent::Snapshot { index, state });
-        if state.cpu_index != state.dma_index {
+        if state.cpu_index != 0 || state.dma_index != 0 {
             return Err(GlobalTxRingError::DirtyRing { index, state });
         }
     }
@@ -3266,8 +3266,6 @@ mod tests {
             }; MT7921_TX_RING_SLOTS];
             for (index, ring) in rings.iter_mut().enumerate() {
                 ring.descriptor_base = 0x8000_0000 + index as u32 * 0x1000;
-                ring.cpu_index = index as u32;
-                ring.dma_index = index as u32;
             }
             Self {
                 global: 0x1010_b870,
