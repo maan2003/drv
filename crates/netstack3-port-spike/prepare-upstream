@@ -56,7 +56,9 @@ cargo test --locked --manifest-path "$manifest" -p zx --lib
 cargo test --locked --manifest-path "$manifest" -p fidl --lib
 cargo test --locked --manifest-path "$manifest" -p wlan-fidl-ext --lib
 cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-driver --lib
+cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-internal --lib
 cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-minstrel --lib
+cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-mlme --lib
 cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-softmac --lib
 cargo test --locked --manifest-path "$manifest" -p fidl-fuchsia-wlan-stats --lib
 cargo test --locked --manifest-path "$manifest" -p fuchsia-trace --lib

@@ -4,6 +4,30 @@
 
 //! Host subset generated from the pinned `fuchsia.wlan.internal` schema.
 
+use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber};
+
+pub const MAX_ASSOC_BASIC_RATES: u8 = 14;
+pub const COUNTRY_CODE_LEN: u32 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwePublicKey {
+    pub group: u16,
+    pub key: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalReportIndication {
+    pub rssi_dbm: i8,
+    pub snr_db: i8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelSwitchInfo {
+    pub new_primary_channel: ChannelNumber,
+    pub bandwidth: ChannelBandwidth,
+    pub vht_secondary_80_channel: ChannelNumber,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WepCredentials {
     pub key: Vec<u8>,

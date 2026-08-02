@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 fidl-fuchsia-wlan-common = { path = "../fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-minstrel = { path = "../fuchsia.wlan.minstrel" }
+fidl-fuchsia-wlan-stats = { path = "../fuchsia.wlan.stats" }

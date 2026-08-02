@@ -8,3 +8,6 @@ license.workspace = true
 [lib]
 name = "fidl_fuchsia_wlan_internal"
 path = "src/lib.rs"
+
+[dependencies]
+fidl-fuchsia-wlan-ieee80211 = { path = "../fuchsia.wlan.ieee80211" }

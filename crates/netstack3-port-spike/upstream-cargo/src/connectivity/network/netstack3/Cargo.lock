@@ -664,6 +664,9 @@ version = "0.1.0"
 [[package]]
 name = "fidl-fuchsia-wlan-internal"
 version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+]
 
 [[package]]
 name = "fidl-fuchsia-wlan-minstrel"
@@ -678,6 +681,9 @@ version = "0.1.0"
 dependencies = [
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-minstrel",
+ "fidl-fuchsia-wlan-stats",
 ]
 
 [[package]]

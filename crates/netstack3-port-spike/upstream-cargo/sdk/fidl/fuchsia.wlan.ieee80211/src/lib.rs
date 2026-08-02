@@ -18,6 +18,8 @@ pub const MAX_VHT_MPDU_BYTE_LEN_2: u16 = 11_454;
 pub const MAX_SUPPORTED_BASIC_RATES: u8 = 12;
 
 pub type MacAddr = [u8; MAC_ADDR_LEN as usize];
+pub type Ssid = Vec<u8>;
+pub type CapabilityInfo = u16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CSsid {
