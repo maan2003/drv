@@ -1597,6 +1597,7 @@ pub const MT7921_MCU_TX_RING_INDEX: usize = 17;
 pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
 pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
 pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
+pub const MT7921_RX_RING_SLOTS: usize = 8;
 pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1654,25 +1655,36 @@ pub trait DisabledMcuRxTransport {
     fn read_global_config(&mut self) -> Result<u32, Self::Error>;
     fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
     fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error>;
+    fn read_registers_at(&mut self, index: usize) -> Result<McuRxRegisters, Self::Error>;
     fn write_initial(
         &mut self,
         descriptor_base: u32,
         descriptor_count: u32,
     ) -> Result<(), Self::Error>;
     fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error>;
+    fn write_ring_initial(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+    ) -> Result<(), Self::Error>;
+    fn publish_ring_cpu_index(&mut self, index: usize, cpu_index: u32) -> Result<(), Self::Error>;
     fn release_fence(&mut self);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisabledMcuRxEvent {
     Snapshot(McuRxRegisters),
+    SnapshotAt { index: usize, state: McuRxRegisters },
     DescriptorFence,
     Programmed(McuRxRegisters),
+    ProgrammedAt { index: usize, state: McuRxRegisters },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisabledMcuRxError<E> {
     InvalidArena,
+    InvalidMmio,
     ActiveState {
         global_config: u32,
         interrupt_enable: u32,
@@ -1755,6 +1767,112 @@ where
     }
     event(DisabledMcuRxEvent::Programmed(actual));
     Ok(actual)
+}
+
+/// Replace every MT7921 RX ring slot with owned backing while RX DMA is off.
+///
+/// Ring zero receives the seven-buffer MCU response queue. All other slots
+/// point at a CPU-owned guard page with equal producer and consumer indices,
+/// so globally enabling RX DMA cannot follow stale kernel mappings.
+pub fn prepare_global_rx_rings<T, F>(
+    transport: &mut T,
+    guard_iova: u64,
+    mcu_ring_iova: u64,
+    mut event: F,
+) -> Result<[McuRxRegisters; MT7921_RX_RING_SLOTS], DisabledMcuRxError<T::Error>>
+where
+    T: DisabledMcuRxTransport,
+    F: FnMut(DisabledMcuRxEvent),
+{
+    let valid_page = |iova: u64| {
+        iova.is_multiple_of(4096)
+            && iova
+                .checked_add(4095)
+                .is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    if !valid_page(guard_iova)
+        || !valid_page(mcu_ring_iova)
+        || guard_iova.abs_diff(mcu_ring_iova) < 4096
+    {
+        return Err(DisabledMcuRxError::InvalidArena);
+    }
+    let global_config = transport
+        .read_global_config()
+        .map_err(DisabledMcuRxError::Transport)?;
+    let interrupt_enable = transport
+        .read_interrupt_enable()
+        .map_err(DisabledMcuRxError::Transport)?;
+    if global_config & 0xf != 0 || interrupt_enable != 0 {
+        return Err(DisabledMcuRxError::ActiveState {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    let mut owned = [McuRxRegisters {
+        descriptor_base: 0,
+        descriptor_count: 0,
+        cpu_index: 0,
+        dma_index: 0,
+    }; MT7921_RX_RING_SLOTS];
+    for index in 0..MT7921_RX_RING_SLOTS {
+        let snapshot = transport
+            .read_registers_at(index)
+            .map_err(DisabledMcuRxError::Transport)?;
+        event(DisabledMcuRxEvent::SnapshotAt {
+            index,
+            state: snapshot,
+        });
+        if [
+            snapshot.descriptor_base,
+            snapshot.descriptor_count,
+            snapshot.cpu_index,
+            snapshot.dma_index,
+        ]
+        .contains(&u32::MAX)
+        {
+            return Err(DisabledMcuRxError::InvalidMmio);
+        }
+        if snapshot.cpu_index != snapshot.dma_index {
+            return Err(DisabledMcuRxError::DirtyRing(snapshot));
+        }
+    }
+    for (index, expected) in owned.iter_mut().enumerate() {
+        *expected = McuRxRegisters {
+            descriptor_base: if index == 0 {
+                mcu_ring_iova as u32
+            } else {
+                guard_iova as u32
+            },
+            descriptor_count: MT7921_MCU_RX_RING_COUNT as u32,
+            cpu_index: if index == 0 {
+                (MT7921_MCU_RX_RING_COUNT - 1) as u32
+            } else {
+                0
+            },
+            dma_index: 0,
+        };
+        transport
+            .write_ring_initial(index, expected.descriptor_base, expected.descriptor_count)
+            .map_err(DisabledMcuRxError::Transport)?;
+    }
+    transport.release_fence();
+    event(DisabledMcuRxEvent::DescriptorFence);
+    for (index, expected) in owned.iter().enumerate() {
+        transport
+            .publish_ring_cpu_index(index, expected.cpu_index)
+            .map_err(DisabledMcuRxError::Transport)?;
+        let actual = transport
+            .read_registers_at(index)
+            .map_err(DisabledMcuRxError::Transport)?;
+        if actual != *expected {
+            return Err(DisabledMcuRxError::Readback(actual));
+        }
+        event(DisabledMcuRxEvent::ProgrammedAt {
+            index,
+            state: actual,
+        });
+    }
+    Ok(owned)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1954,7 +2072,9 @@ pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
+    NicPowerControl,
     PatchSemaphoreGet,
+    PatchSemaphoreRelease,
     PatchStart {
         address: u32,
         length: u32,
@@ -1997,7 +2117,11 @@ pub fn parse_download_response(
 ) -> Result<DownloadResponse, DownloadResponseError> {
     let header = bytes.get(..36).ok_or(DownloadResponseError::Truncated)?;
     let length = u16::from_le_bytes(header[24..26].try_into().expect("fixed field"));
-    if usize::from(length) > bytes.len() || length < 12 {
+    if 24usize
+        .checked_add(usize::from(length))
+        .is_none_or(|end| end > bytes.len())
+        || length < 12
+    {
         return Err(DownloadResponseError::InvalidLength);
     }
     let sequence = header[29];
@@ -2030,7 +2154,9 @@ pub fn encode_download_command(
         return Err(DownloadCommandError::InvalidSequence);
     }
     let (cid, payload): (u8, Vec<u8>) = match command {
+        DownloadCommand::NicPowerControl => (0x04, vec![1, 0, 0, 0]),
         DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchSemaphoreRelease => (0x10, 0u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchStart {
             address,
             length,
@@ -2161,7 +2287,7 @@ pub trait PinnedDmaTeardownTransport {
     type Error;
     fn now_ms(&self) -> u64;
     fn mask_device_interrupts(&mut self) -> Result<(), Self::Error>;
-    fn disable_tx_dma(&mut self) -> Result<(), Self::Error>;
+    fn disable_dma(&mut self) -> Result<(), Self::Error>;
     fn read_global_config(&mut self) -> Result<u32, Self::Error>;
     fn sleep_ms(&mut self, milliseconds: u64);
     fn reset_vfio_device(&mut self) -> Result<(), Self::Error>;
@@ -2171,7 +2297,7 @@ pub trait PinnedDmaTeardownTransport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinnedDmaTeardownEvent {
     InterruptsMasked,
-    TxDmaDisabled,
+    DmaDisabled,
     DmaQuiesced,
     DmaBusyTimedOut { raw: u32 },
     DeviceReset,
@@ -2205,8 +2331,8 @@ where
         Ok(()) => event(PinnedDmaTeardownEvent::InterruptsMasked),
         Err(error) => cleanup_error = Some(error),
     }
-    match transport.disable_tx_dma() {
-        Ok(()) => event(PinnedDmaTeardownEvent::TxDmaDisabled),
+    match transport.disable_dma() {
+        Ok(()) => event(PinnedDmaTeardownEvent::DmaDisabled),
         Err(error) if cleanup_error.is_none() => cleanup_error = Some(error),
         Err(_) => {}
     }
@@ -2214,7 +2340,7 @@ where
     let mut busy_timeout = None;
     loop {
         match transport.read_global_config() {
-            Ok(raw) if raw & (1 << 1) == 0 => {
+            Ok(raw) if raw & ((1 << 1) | (1 << 3)) == 0 => {
                 event(PinnedDmaTeardownEvent::DmaQuiesced);
                 break;
             }
@@ -3299,6 +3425,12 @@ mod tests {
         fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error> {
             Ok(self.registers)
         }
+        fn read_registers_at(&mut self, index: usize) -> Result<McuRxRegisters, Self::Error> {
+            if index != 0 {
+                return Err(());
+            }
+            Ok(self.registers)
+        }
         fn write_initial(
             &mut self,
             descriptor_base: u32,
@@ -3317,6 +3449,27 @@ mod tests {
             self.writes.push("publish");
             self.registers.cpu_index = cpu_index;
             Ok(())
+        }
+        fn write_ring_initial(
+            &mut self,
+            index: usize,
+            descriptor_base: u32,
+            descriptor_count: u32,
+        ) -> Result<(), Self::Error> {
+            if index != 0 {
+                return Err(());
+            }
+            self.write_initial(descriptor_base, descriptor_count)
+        }
+        fn publish_ring_cpu_index(
+            &mut self,
+            index: usize,
+            cpu_index: u32,
+        ) -> Result<(), Self::Error> {
+            if index != 0 {
+                return Err(());
+            }
+            self.publish_cpu_index(cpu_index)
         }
         fn release_fence(&mut self) {
             self.writes.push("fence");
@@ -3366,6 +3519,91 @@ mod tests {
             Err(DisabledMcuRxError::DirtyRing(_))
         ));
         assert!(transport.writes.is_empty());
+    }
+
+    struct FakeGlobalRx {
+        rings: [McuRxRegisters; MT7921_RX_RING_SLOTS],
+        writes: Vec<(usize, u32)>,
+    }
+    impl DisabledMcuRxTransport for FakeGlobalRx {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(0x5020_b870)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(0)
+        }
+        fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error> {
+            Ok(self.rings[0])
+        }
+        fn read_registers_at(&mut self, index: usize) -> Result<McuRxRegisters, Self::Error> {
+            Ok(self.rings[index])
+        }
+        fn write_initial(
+            &mut self,
+            descriptor_base: u32,
+            descriptor_count: u32,
+        ) -> Result<(), Self::Error> {
+            self.write_ring_initial(0, descriptor_base, descriptor_count)
+        }
+        fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error> {
+            self.publish_ring_cpu_index(0, cpu_index)
+        }
+        fn write_ring_initial(
+            &mut self,
+            index: usize,
+            descriptor_base: u32,
+            descriptor_count: u32,
+        ) -> Result<(), Self::Error> {
+            self.rings[index] = McuRxRegisters {
+                descriptor_base,
+                descriptor_count,
+                cpu_index: 0,
+                dma_index: 0,
+            };
+            self.writes.push((index, 0));
+            Ok(())
+        }
+        fn publish_ring_cpu_index(
+            &mut self,
+            index: usize,
+            cpu_index: u32,
+        ) -> Result<(), Self::Error> {
+            self.rings[index].cpu_index = cpu_index;
+            self.writes.push((index, cpu_index));
+            Ok(())
+        }
+        fn release_fence(&mut self) {}
+    }
+
+    #[test]
+    fn global_rx_preparation_owns_all_eight_slots_before_publish() {
+        let empty = McuRxRegisters {
+            descriptor_base: 0,
+            descriptor_count: 0,
+            cpu_index: 0,
+            dma_index: 0,
+        };
+        let mut transport = FakeGlobalRx {
+            rings: [empty; MT7921_RX_RING_SLOTS],
+            writes: Vec::new(),
+        };
+        let owned =
+            prepare_global_rx_rings(&mut transport, 0x0100_3000, 0x0100_4000, |_| {}).unwrap();
+        assert_eq!(owned[0].descriptor_base, 0x0100_4000);
+        assert_eq!(owned[0].cpu_index, 7);
+        assert!(
+            owned[1..]
+                .iter()
+                .all(|ring| ring.descriptor_base == 0x0100_3000)
+        );
+        assert!(owned[1..].iter().all(|ring| ring.cpu_index == 0));
+        assert_eq!(transport.writes.len(), MT7921_RX_RING_SLOTS * 2);
+        assert!(
+            transport.writes[..MT7921_RX_RING_SLOTS]
+                .iter()
+                .all(|(_, cpu_index)| *cpu_index == 0)
+        );
     }
 
     #[test]
@@ -3443,6 +3681,12 @@ mod tests {
         assert_eq!(&semaphore[32..34], &36u16.to_le_bytes());
         assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
         assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
+        let release = encode_download_command(DownloadCommand::PatchSemaphoreRelease, 2).unwrap();
+        assert_eq!(&release[36..40], &[0x10, 0xa0, 3, 2]);
+        assert_eq!(&release[64..68], &0u32.to_le_bytes());
+        let power = encode_download_command(DownloadCommand::NicPowerControl, 3).unwrap();
+        assert_eq!(&power[36..40], &[0x04, 0xa0, 3, 3]);
+        assert_eq!(&power[64..68], &[1, 0, 0, 0]);
 
         let patch = encode_download_command(
             DownloadCommand::PatchStart {
@@ -3471,7 +3715,7 @@ mod tests {
     #[test]
     fn parses_bounded_connac2_download_responses_by_sequence() {
         let mut bytes = [0u8; 40];
-        bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
+        bytes[24..26].copy_from_slice(&12u16.to_le_bytes());
         bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
         bytes[28] = 4;
         bytes[29] = 7;
@@ -3480,7 +3724,7 @@ mod tests {
         assert_eq!(
             parse_download_response(&bytes, 7),
             Ok(DownloadResponse {
-                length: 36,
+                length: 12,
                 packet_type: 0xa0,
                 event_id: 4,
                 sequence: 7,
@@ -3571,14 +3815,14 @@ mod tests {
             self.calls.push("mask");
             Ok(())
         }
-        fn disable_tx_dma(&mut self) -> Result<(), Self::Error> {
+        fn disable_dma(&mut self) -> Result<(), Self::Error> {
             self.calls.push("disable");
             Ok(())
         }
         fn read_global_config(&mut self) -> Result<u32, Self::Error> {
             self.calls.push("read");
             Ok(if self.busy_until.is_none_or(|until| self.now < until) {
-                1 << 1
+                (1 << 1) | (1 << 3)
             } else {
                 0
             })
@@ -3632,7 +3876,7 @@ mod tests {
         };
         assert_eq!(
             teardown_pinned_dma(&mut transport, |_| {}),
-            Err(PinnedDmaTeardownError::BusyTimedOut(1 << 1))
+            Err(PinnedDmaTeardownError::BusyTimedOut((1 << 1) | (1 << 3)))
         );
         assert_eq!(transport.calls.last_chunk::<2>(), Some(&["reset", "unmap"]));
     }

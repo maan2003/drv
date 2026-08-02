@@ -50,15 +50,15 @@ explicitly marked; the initial majority is `unmapped`.
 | Linux item | Linux file | Rust item | Status | Verification |
 |---|---|---|---|---|
 | `mt792x_dma_prefetch` constants/order | `mt792x_dma.c` | constants intentionally not active | unmapped | physical trace proved zero is a valid pre-init state |
-| `mt792x_dma_enable` DTX ordering subset | `mt792x_dma.c` | `prepare_global_tx_rings` | adapted | 43 unit tests; physical 18-ring ownership/reset/readback trace |
+| `mt792x_dma_enable` ring/IRQ ordering subset | `mt792x_dma.c` | `prepare_global_{tx,rx}_rings`, active boot-ROM adapter | adapted | 44 unit tests; physical RX0 MSI/three-response trace |
 | `mt76_queue` TX descriptor fields | `mt76.h`, `dma.c` | `TxRingState`, `DmaDescriptor` | adapted, tested | unit fixtures/readback traces |
 | `mt76_connac2_mcu_fill_message` download subset | `mt76_connac_mcu.c` | `encode_download_command` | adapted, tested | pinned-format fixtures |
 | connac2 patch header/sections | `mt76_connac_mcu.h` | `Patch` parser | adapted, tested | malformed/bounded fixtures |
-| `mt792x_wfsys_reset` | `mt7921/pci.c` | `wfsys_reset` | adapted, tested | ordering and timeout tests |
+| `mt792x_wfsys_reset` | `mt7921/pci.c` | `reset_wfsys`, dynamic-L1 adapter | adapted, tested | ordering/timeout tests; physical ready at 57 ms |
 | driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests; physical first-attempt CLR_OWN response |
 | PCI interrupt disable (`pci_intx(pdev, 0)`) | Linux PCI core call site | `disable_pci_intx` | adapted, tested | command-bit readback; physical run |
 | kernel DMA allocation/mapping | mt76 DMA/core | `DmaArena` | adapted | iommufd pin/unmap tests; incomplete call graph |
-| IRQ lifecycle/eventfd | mt76 PCI/IRQ paths | `IrqLifecycle`, `VfioIrq` | adapted, tested | state/UAPI tests; incomplete call graph |
+| IRQ lifecycle/eventfd | mt76 PCI/IRQ paths | `IrqLifecycle`, `VfioIrq` | adapted, tested | state/UAPI tests; physical source-masked MSI RX0 trace |
 
 This table is not yet exhaustive. The next inventory pass must list every
 function, struct/union/enum, macro/constant, and global in every scoped file,
@@ -79,5 +79,10 @@ gate is **closed**.
    SIGSEGV is fixed and guarded by operation-permission and VFIO-region tests.
    A physical trace now owns and verifies all 18 inactive TX rings, resets while
    IOVAs remain pinned, and restores the kernel driver. Driver ownership also
-   succeeds, but N9 is not ready; active DMA, IRQ unmasking, and MCU commands
-   remain disabled until the owned RX response ring and teardown loop are wired.
+   succeeds, but N9 is not ready. The bounded boot-ROM path now owns all eight
+   RX slots, installs MSI/MSI-X before unmasking RX0, sends only NIC power and
+   patch-semaphore commands, conditionally releases the semaphore, and disables
+   both DMA directions before reset-while-pinned. The physical trace drained
+   NIC-power event 3, received patch GET result 2, and received release result
+   3 before a healthy kernel/iwd/network restore. NIC capability remains
+   blocked on full firmware/N9 startup.

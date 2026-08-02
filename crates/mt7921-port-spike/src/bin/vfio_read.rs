@@ -5,15 +5,18 @@ use mt7921_port_spike::{
     DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, GlobalTxRingError,
-    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
+    DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
+    DynamicL1Error, DynamicL1Event, DynamicL1Transport, GlobalTxRingError, GlobalTxRingEvent,
+    GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
-    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
+    MT7921_FWDL_RING_BYTES, McuRxRegisters, OwnershipError, OwnershipEvent, OwnershipTransport,
     PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
-    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState,
-    acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
-    prepare_global_tx_rings, program_disabled_fwdl_ring, read_dynamic_identity_status,
-    select_vfio_irq, stage_disabled_firmware_chunk,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
+    WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    encode_download_command, mask_ack_disabled_fwdl_interrupt, parse_download_response,
+    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
+    stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -231,6 +234,7 @@ fn run() -> Result<(), String> {
         Some("--inventory-vfio-irqs") => Operation::InventoryVfioIrqs,
         Some("--install-disable-vfio-irq") => Operation::InstallDisableVfioIrq,
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
+        Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => {
             return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
         }
@@ -300,7 +304,10 @@ fn run() -> Result<(), String> {
     )?;
 
     let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
-    let pcie_mac = if operation == Operation::PrepareOwnedGlobalTxRings {
+    let pcie_mac = if matches!(
+        operation,
+        Operation::PrepareOwnedGlobalTxRings | Operation::QueryPatchSemaphore
+    ) {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
         None
@@ -618,6 +625,292 @@ fn run() -> Result<(), String> {
         println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
         operation?;
     }
+    if operation == Operation::QueryPatchSemaphore {
+        verify_pci_dma_disabled(&bdf)?;
+        let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
+        let selected = select_vfio_irq(&vfio_irq_capabilities(&device)?)
+            .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+        if selected.kind == PciIrqKind::Intx {
+            return Err("active MCU transaction requires MSI or MSI-X, not level INTx".into());
+        }
+        verify_vfio_reset_supported(&device)?;
+        println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+        let selector_page = ReadPage::map(&device, &info, 0xfe000, true)?;
+        let dynamic_window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, true)?;
+        let swdef = ReadPage::map(&device, &info, 0x9f000, true)?;
+        let dmashdl = ReadPage::map(&device, &info, 0xd6000, true)?;
+
+        let mut tx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        let mut fwdl_ring = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
+        let mut mcu_tx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
+        let mut rx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_3000)?;
+        let mut mcu_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_4000)?;
+        let mut mcu_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_5000, 4 * PAGE)?;
+        let mut command_payload = DmaArena::map(&iommu, ioas.id, 0x0100_9000)?;
+        tx_guard.initialize_descriptor_page()?;
+        fwdl_ring.initialize_descriptor_page()?;
+        mcu_tx_ring.initialize_descriptor_page()?;
+        rx_guard.initialize_descriptor_page()?;
+        mcu_rx_ring.initialize_descriptor_page()?;
+        mcu_rx_buffers.zero_bytes(4 * PAGE)?;
+        command_payload.zero_bytes(PAGE)?;
+        let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
+            .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
+        for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
+            mcu_rx_ring.write_descriptor_at(index, descriptor);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+
+        let signal = ActiveSignalGuard::install()?;
+        set_lab_safety("MUTATED")?;
+        let mut irq = None;
+        let active = (|| -> Result<(), String> {
+            disable_pci_intx(&bdf)?;
+            pcie_mac.write_pcie_mac_interrupt_enable_zero()?;
+            let mut ownership = VfioOwnership {
+                page: &conn,
+                start: Instant::now(),
+            };
+            acquire_driver_ownership(&mut ownership, log_ownership_event)
+                .map_err(|error| format!("acquire ownership for MCU transaction: {error:?}"))?;
+            let saved_selector = selector_page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+            let mut wfsys = VfioWfsysReset {
+                selector: &selector_page,
+                window: &dynamic_window,
+                start: Instant::now(),
+                saved: saved_selector,
+            };
+            let wfsys_result = reset_wfsys(&mut wfsys, log_wfsys_reset_event)
+                .map_err(|error| format!("reset WFSYS: {error:?}"));
+            let restore_result = wfsys.restore();
+            wfsys_result?;
+            restore_result?;
+
+            let initial_global = wfdma.read(0xd4208)?;
+            if initial_global == u32::MAX {
+                return Err("WFDMA global configuration returned all ones".into());
+            }
+            let disabled = initial_global
+                & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+            wfdma.write_active_wfdma(0xd4208, disabled)?;
+            let disable_deadline = Instant::now() + std::time::Duration::from_millis(100);
+            while wfdma.read(0xd4208)? & ((1 << 1) | (1 << 3)) != 0 {
+                if Instant::now() >= disable_deadline {
+                    return Err("WFDMA did not quiesce before ring ownership".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let global_ext = wfdma.read(0xd42b0)?;
+            if global_ext == u32::MAX {
+                return Err("WFDMA extended configuration returned all ones".into());
+            }
+            wfdma.write_active_wfdma(0xd42b0, global_ext & !(1 << 6))?;
+            dmashdl.enable_dmashdl_bypass()?;
+            let reset = wfdma.read(0xd4100)?;
+            if reset == u32::MAX {
+                return Err("WFDMA reset control returned all ones".into());
+            }
+            wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
+            wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
+            {
+                let mut transport = VfioGlobalTxRings { page: &wfdma };
+                prepare_global_tx_rings(
+                    &mut transport,
+                    tx_guard.iova,
+                    fwdl_ring.iova,
+                    mcu_tx_ring.iova,
+                    log_global_tx_ring_event,
+                )
+                .map_err(|error| format!("own global TX rings: {error:?}"))?;
+            }
+            {
+                let mut transport = VfioGlobalRxRings { page: &wfdma };
+                prepare_global_rx_rings(
+                    &mut transport,
+                    rx_guard.iova,
+                    mcu_rx_ring.iova,
+                    log_global_rx_ring_event,
+                )
+                .map_err(|error| format!("own global RX rings: {error:?}"))?;
+            }
+            let installed = VfioIrq::install(&device, selected)?;
+            if installed.try_read()?.is_some() {
+                return Err("unexpected IRQ before device source enable".into());
+            }
+            irq = Some(installed);
+            println!("{{\"active_mcu_event\":\"vfio_irq_installed\"}}");
+            if wfdma.read(0xd4200)? != 0 {
+                return Err(format!(
+                    "refused nonzero interrupt status before activation: {:#010x}",
+                    wfdma.read(0xd4200)?
+                ));
+            }
+            wfdma.write_active_wfdma(0xd42f0, 0)?;
+            wfdma.write_active_wfdma(0xd4680, 4)?;
+            wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
+            wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
+            wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
+            set_pci_bus_master(&bdf, true)?;
+            let global = wfdma.read(0xd4208)?
+                | (1 << 0)
+                | (1 << 2)
+                | (3 << 4)
+                | (1 << 6)
+                | (1 << 11)
+                | (1 << 12)
+                | (1 << 13)
+                | (1 << 15)
+                | (1 << 21)
+                | (1 << 28)
+                | (1 << 30);
+            pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
+            wfdma.write_active_wfdma(0xd4208, global)?;
+            wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+            println!(
+                "{{\"active_mcu_event\":\"dma_and_response_irq_enabled\",\"global\":\"{global:#010x}\"}}"
+            );
+            let mut top = VfioTopOwnership {
+                selector: &selector_page,
+                window: &dynamic_window,
+                start: Instant::now(),
+                saved: Cell::new(None),
+            };
+            acquire_top_driver_ownership(&mut top, log_top_ownership_event)
+                .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
+            pcie_mac.disable_pcie_l0s()?;
+            swdef.write_swdef_normal()?;
+            let mut mcu_io = ActiveMcuIo {
+                wfdma: &wfdma,
+                irq: irq.as_ref().expect("IRQ installed"),
+                signal: &signal,
+                tx_ring: &mut mcu_tx_ring,
+                payload: &mut command_payload,
+                rx_ring: &mut mcu_rx_ring,
+                rx_buffers: &mcu_rx_buffers,
+                rx_tail: 0,
+                rx_head: 7,
+            };
+            mcu_io.cancelled()?;
+            publish_mcu_command(
+                mcu_io.wfdma,
+                mcu_io.tx_ring,
+                mcu_io.payload,
+                DownloadCommand::NicPowerControl,
+                1,
+                0,
+            )?;
+            mcu_io.wait_tx_consumed(1)?;
+            let ready_deadline = Instant::now() + std::time::Duration::from_millis(1000);
+            loop {
+                mcu_io.cancelled()?;
+                let _ = mcu_io.handle_irq(None)?;
+                let firmware_state = conn.read(0xe00f0)? & 0x7;
+                if firmware_state == 1 {
+                    println!("{{\"active_mcu_event\":\"firmware_download_ready\"}}");
+                    break;
+                }
+                if Instant::now() >= ready_deadline {
+                    return Err(format!(
+                        "boot firmware did not enter download-ready state: {firmware_state}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let get_result =
+                mcu_io.send_patch_semaphore(DownloadCommand::PatchSemaphoreGet, 2, 1)?;
+            match get_result {
+                1 => println!("{{\"patch_semaphore\":\"patch_already_downloaded\"}}"),
+                2 => {
+                    let release_result = mcu_io.send_patch_semaphore(
+                        DownloadCommand::PatchSemaphoreRelease,
+                        3,
+                        2,
+                    )?;
+                    if release_result != 3 {
+                        return Err(format!(
+                            "patch semaphore release returned {release_result}, expected 3"
+                        ));
+                    }
+                    println!("{{\"patch_semaphore\":\"acquired_and_released\"}}");
+                }
+                result => {
+                    return Err(format!("patch semaphore GET returned failure {result}"));
+                }
+            }
+            Ok(())
+        })();
+
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = pcie_mac.write_pcie_mac_interrupt_enable_zero() {
+            cleanup_errors.push(error);
+        }
+        if let Err(error) = wfdma.write_active_wfdma(0xd4204, 0) {
+            cleanup_errors.push(error);
+        }
+        match wfdma.read(0xd4208) {
+            Ok(u32::MAX) => cleanup_errors
+                .push("WFDMA global configuration returned all ones during cleanup".into()),
+            Ok(global) => {
+                let disabled =
+                    global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+                if let Err(error) = wfdma.write_active_wfdma(0xd4208, disabled) {
+                    cleanup_errors.push(error);
+                }
+            }
+            Err(error) => cleanup_errors.push(error),
+        }
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match wfdma.read(0xd4208) {
+                Ok(global) if global & 0xa == 0 => break,
+                Ok(global) if Instant::now() >= deadline => {
+                    cleanup_errors.push(format!("DMA busy during teardown: {global:#010x}"));
+                    break;
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) => {
+                    cleanup_errors.push(error);
+                    break;
+                }
+            }
+        }
+        if let Err(error) = set_pci_bus_master(&bdf, false) {
+            cleanup_errors.push(error);
+        }
+        if let Some(mut installed) = irq
+            && let Err(error) = installed.disable()
+        {
+            cleanup_errors.push(error);
+        }
+        let reset = reset_vfio_device(&device);
+        if let Err(error) = reset {
+            eprintln!(
+                "mt7921-vfio-read: reset while pinned failed; retaining device and every IOVA for watchdog reboot: active={active:?} cleanup={cleanup_errors:?} reset={error}"
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+        println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
+        verify_pci_dma_disabled(&bdf)?;
+        set_lab_safety("SAFE")?;
+        for arena in [
+            &mut command_payload,
+            &mut mcu_rx_buffers,
+            &mut mcu_rx_ring,
+            &mut rx_guard,
+            &mut mcu_tx_ring,
+            &mut fwdl_ring,
+            &mut tx_guard,
+        ] {
+            arena.teardown()?;
+        }
+        println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
+        active?;
+        if !cleanup_errors.is_empty() {
+            return Err(format!("active MCU cleanup failed: {cleanup_errors:?}"));
+        }
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -745,6 +1038,42 @@ fn disable_pci_intx(bdf: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn set_pci_bus_master(bdf: &str, enabled: bool) -> Result<(), String> {
+    let path = format!("/sys/bus/pci/devices/{bdf}/config");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open PCI config for bus mastering: {error}"))?;
+    let mut raw = [0u8; 2];
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("read PCI command for bus mastering: {error}"))?;
+    let mut command = u16::from_le_bytes(raw) | (1 << 1) | (1 << 10);
+    if enabled {
+        command |= 1 << 2;
+    } else {
+        command &= !(1 << 2);
+    }
+    file.seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&command.to_le_bytes()))
+        .and_then(|_| file.seek(SeekFrom::Start(4)))
+        .and_then(|_| file.read_exact(&mut raw))
+        .map_err(|error| format!("write PCI bus mastering: {error}"))?;
+    let readback = u16::from_le_bytes(raw);
+    let expected = (1 << 1) | (u16::from(enabled) << 2) | (1 << 10);
+    if readback & ((1 << 1) | (1 << 2) | (1 << 10)) != expected {
+        return Err(format!(
+            "PCI command bus-master transition did not latch: {readback:#06x}"
+        ));
+    }
+    println!(
+        "{{\"active_mcu_event\":\"pci_bus_master_{}\",\"command\":\"{readback:#06x}\"}}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
 fn set_lab_safety(value: &str) -> Result<(), String> {
     if !matches!(value, "SAFE" | "MUTATED") {
         return Err("invalid lab safety state".into());
@@ -753,6 +1082,193 @@ fn set_lab_safety(value: &str) -> Result<(), String> {
         .map_err(|_| "DRV_LAB_SAFETY_STATE is required for mutating operations")?;
     std::fs::write(&path, format!("{value}\n"))
         .map_err(|error| format!("write lab safety state {path}: {error}"))
+}
+
+fn publish_mcu_command(
+    wfdma: &ReadPage,
+    tx_ring: &mut DmaArena<'_>,
+    payload: &mut DmaArena<'_>,
+    command: DownloadCommand,
+    sequence: u8,
+    descriptor_index: usize,
+) -> Result<(), String> {
+    let bytes = encode_download_command(command, sequence)
+        .map_err(|error| format!("encode MCU command: {error:?}"))?;
+    let payload_offset = descriptor_index * 256;
+    if payload_offset + bytes.len() > payload.len {
+        return Err("MCU command payload arena exhausted".into());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            payload.ptr.as_ptr().add(payload_offset),
+            bytes.len(),
+        )
+    };
+    let descriptor = DmaDescriptor::tx(
+        DmaSegment {
+            iova: payload.iova + payload_offset as u64,
+            len: bytes.len() as u16,
+        },
+        None,
+        0,
+    )
+    .map_err(|error| format!("encode MCU command DMA descriptor: {error:?}"))?;
+    tx_ring.write_descriptor_at(descriptor_index, descriptor);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    wfdma.write_active_wfdma(0xd4418, (descriptor_index + 1) as u32)?;
+    println!(
+        "{{\"active_mcu_event\":\"command_published\",\"sequence\":{sequence},\"tx_descriptor\":{descriptor_index}}}"
+    );
+    Ok(())
+}
+
+struct ActiveMcuIo<'a, 'b> {
+    wfdma: &'a ReadPage,
+    irq: &'a VfioIrq,
+    signal: &'a ActiveSignalGuard,
+    tx_ring: &'a mut DmaArena<'b>,
+    payload: &'a mut DmaArena<'b>,
+    rx_ring: &'a mut DmaArena<'b>,
+    rx_buffers: &'a DmaArena<'b>,
+    rx_tail: usize,
+    rx_head: usize,
+}
+
+impl ActiveMcuIo<'_, '_> {
+    fn cancelled(&self) -> Result<(), String> {
+        if self.signal.stop_requested() {
+            Err("active MCU transaction cancelled by signal".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn drain_rx(&mut self, expected_sequence: Option<u8>) -> Result<Option<u8>, String> {
+        let mut matched = None;
+        loop {
+            let descriptor = self.rx_ring.read_descriptor_at(self.rx_tail);
+            if !descriptor.is_dma_done() {
+                break;
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let completed_index = self.rx_tail;
+            let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
+            let parsed = if descriptor.ctrl & (1 << 30) == 0 {
+                Err("fragmented MCU RX descriptor is unsupported".into())
+            } else if !(36..=2048).contains(&response_len) {
+                Err(format!(
+                    "invalid MCU response descriptor length {response_len}"
+                ))
+            } else {
+                let response = self
+                    .rx_buffers
+                    .read_bytes(completed_index * 2048, response_len)?;
+                let actual_sequence = response[29];
+                parse_download_response(&response, actual_sequence)
+                    .map(|parsed| (parsed, response))
+                    .map_err(|error| format!("parse MCU response: {error:?}"))
+            };
+
+            let refill_index = self.rx_head;
+            let refill = DmaDescriptor::rx(DmaSegment {
+                iova: self.rx_buffers.iova + (refill_index * 2048) as u64,
+                len: 2048,
+            })
+            .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
+            self.rx_ring.write_descriptor_at(refill_index, refill);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            self.rx_head = (self.rx_head + 1) % 8;
+            self.wfdma.write_rx_cpu_index(0, self.rx_head as u32)?;
+            self.rx_tail = (self.rx_tail + 1) % 8;
+
+            let (parsed, response) = parsed?;
+            if Some(parsed.sequence) == expected_sequence && parsed.event_id == 0x04 {
+                let result = *response
+                    .get(32)
+                    .ok_or("patch semaphore response omitted result")?;
+                println!(
+                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"result\":{result},\"length\":{},\"rx_descriptor\":{completed_index}}}}}",
+                    parsed.sequence, parsed.event_id, parsed.length
+                );
+                matched = Some(result);
+            } else {
+                println!(
+                    "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_descriptor\":{completed_index}}}",
+                    parsed.sequence, parsed.event_id
+                );
+            }
+        }
+        Ok(matched)
+    }
+
+    fn handle_irq(&mut self, expected_sequence: Option<u8>) -> Result<Option<u8>, String> {
+        let Some(count) = self.irq.try_read()? else {
+            return Ok(None);
+        };
+        self.wfdma.write_active_wfdma(0xd4204, 0)?;
+        let interrupt_status = self.wfdma.read(0xd4200)?;
+        let acknowledged = interrupt_status & (1 << 0);
+        if acknowledged != 0 {
+            self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
+        }
+        println!(
+            "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
+        );
+        let matched = self.drain_rx(expected_sequence)?;
+        if matched.is_none() {
+            self.wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+        }
+        Ok(matched)
+    }
+
+    fn wait_tx_consumed(&mut self, expected_dma_index: u32) -> Result<(), String> {
+        let deadline = Instant::now() + std::time::Duration::from_millis(1000);
+        loop {
+            self.cancelled()?;
+            if self.handle_irq(None)?.is_some() {
+                return Err("unexpected patch response while waiting for NIC power".into());
+            }
+            if self.wfdma.read(0xd441c)? >= expected_dma_index {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "MCU TX descriptor was not consumed: expected DIDX {expected_dma_index}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn send_patch_semaphore(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        tx_descriptor_index: usize,
+    ) -> Result<u8, String> {
+        self.cancelled()?;
+        self.wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+        publish_mcu_command(
+            self.wfdma,
+            self.tx_ring,
+            self.payload,
+            command,
+            sequence,
+            tx_descriptor_index,
+        )?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(3000);
+        loop {
+            self.cancelled()?;
+            if let Some(result) = self.handle_irq(Some(sequence))? {
+                return Ok(result);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("patch response timed out for sequence {sequence}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 struct Ioas<'a> {
@@ -770,7 +1286,12 @@ struct DmaArena<'a> {
 }
 impl<'a> DmaArena<'a> {
     fn map(iommu: &'a File, ioas: u32, iova: u64) -> Result<Self, String> {
-        let len = PAGE;
+        Self::map_len(iommu, ioas, iova, PAGE)
+    }
+    fn map_len(iommu: &'a File, ioas: u32, iova: u64, len: usize) -> Result<Self, String> {
+        if len == 0 || !len.is_multiple_of(PAGE) || !iova.is_multiple_of(PAGE as u64) {
+            return Err("DMA arena length and IOVA must be page aligned".into());
+        }
         let ptr = NonNull::new(unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -860,6 +1381,11 @@ impl<'a> DmaArena<'a> {
         Ok(())
     }
     fn write_descriptor(&mut self, descriptor: DmaDescriptor) {
+        self.write_descriptor_at(0, descriptor)
+    }
+    fn write_descriptor_at(&mut self, index: usize, descriptor: DmaDescriptor) {
+        let offset = index * 16;
+        assert!(offset + 16 <= self.len);
         for (index, word) in [
             descriptor.buf0,
             descriptor.ctrl,
@@ -869,18 +1395,44 @@ impl<'a> DmaArena<'a> {
         .into_iter()
         .enumerate()
         {
-            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().cast::<u32>().add(index), word) };
+            unsafe {
+                std::ptr::write_volatile(
+                    self.ptr.as_ptr().add(offset).cast::<u32>().add(index),
+                    word,
+                )
+            };
         }
     }
     fn read_descriptor(&self) -> DmaDescriptor {
-        let word =
-            |index| unsafe { std::ptr::read_volatile(self.ptr.as_ptr().cast::<u32>().add(index)) };
+        self.read_descriptor_at(0)
+    }
+    fn read_descriptor_at(&self, descriptor_index: usize) -> DmaDescriptor {
+        let offset = descriptor_index * 16;
+        assert!(offset + 16 <= self.len);
+        let word = |index| unsafe {
+            std::ptr::read_volatile(self.ptr.as_ptr().add(offset).cast::<u32>().add(index))
+        };
         DmaDescriptor {
             buf0: word(0),
             ctrl: word(1),
             buf1: word(2),
             info: word(3),
         }
+    }
+    fn read_bytes(&self, offset: usize, length: usize) -> Result<Vec<u8>, String> {
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= self.len)
+            .ok_or("DMA read escaped arena")?;
+        let mut bytes = vec![0; length];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.ptr.as_ptr().add(offset),
+                bytes.as_mut_ptr(),
+                end - offset,
+            )
+        };
+        Ok(bytes)
     }
     fn teardown(&mut self) -> Result<(), String> {
         if !self.mapped {
@@ -1135,12 +1687,82 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn read_dynamic_window(&self, offset: usize) -> Result<u32, String> {
+        if self.bar_page != MT_HIF_REMAP_WINDOW_BAR_OFFSET
+            || offset < self.bar_page
+            || offset + 4 > self.bar_page + PAGE
+        {
+            return Err("dynamic window read escaped immutable page".into());
+        }
+        self.read(offset)
+    }
+    fn write_dynamic_window(&self, offset: usize, value: u32) -> Result<(), String> {
+        if self.bar_page != MT_HIF_REMAP_WINDOW_BAR_OFFSET
+            || offset != MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x140
+        {
+            return Err("WFSYS reset write escaped immutable target".into());
+        }
+        let within = offset - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
     fn write_pcie_mac_interrupt_enable_zero(&self) -> Result<(), String> {
+        self.write_pcie_mac_interrupt_enable(0)
+    }
+    fn write_pcie_mac_interrupt_enable(&self, value: u32) -> Result<(), String> {
         if self.bar_page != 0x10000 {
             return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
         }
+        if value != 0 && value != 0xff {
+            return Err("PCIe MAC interrupt value escaped allowlist".into());
+        }
         let within = 0x10188 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    fn disable_pcie_l0s(&self) -> Result<(), String> {
+        if self.bar_page != 0x10000 {
+            return Err("PCIe PM write escaped immutable allowlist".into());
+        }
+        let offset = 0x10194;
+        let raw = self.read(offset)?;
+        if raw == u32::MAX {
+            return Err("PCIe PM returned all ones".into());
+        }
+        let value = raw | (1 << 8);
+        let within = offset - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        if self.read(offset)? & (1 << 8) == 0 {
+            return Err("PCIe L0s disable did not latch".into());
+        }
+        Ok(())
+    }
+    fn write_swdef_normal(&self) -> Result<(), String> {
+        if self.bar_page != 0x9f000 {
+            return Err("SWDEF write escaped immutable allowlist".into());
+        }
+        let within = 0x9f23c - self.bar_page;
+        if self.read(0x9f23c)? == u32::MAX {
+            return Err("SWDEF mode returned all ones".into());
+        }
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), 0) };
+        if self.read(0x9f23c)? != 0 {
+            return Err("SWDEF normal mode did not latch".into());
+        }
+        Ok(())
+    }
+    fn enable_dmashdl_bypass(&self) -> Result<(), String> {
+        if self.bar_page != 0xd6000 {
+            return Err("DMASHDL write escaped immutable allowlist".into());
+        }
+        let offset = 0xd6004;
+        let raw = self.read(offset)?;
+        if raw == u32::MAX {
+            return Err("DMASHDL control returned all ones".into());
+        }
+        let value = raw | (1 << 28);
+        let within = offset - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
     fn write_fwdl_ring(&self, register: DisabledFwdlWrite, value: u32) -> Result<(), String> {
@@ -1196,6 +1818,60 @@ impl ReadPage {
             return Err("interrupt acknowledgement escaped FWDL-only allowlist".into());
         }
         let within = 0xd4200 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    fn write_rx_ring_slot(
+        &self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+        dma_index: u32,
+    ) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || index >= 8 {
+            return Err("global RX ring write escaped slot allowlist".into());
+        }
+        for (word, value) in [descriptor_base, descriptor_count, cpu_index, dma_index]
+            .into_iter()
+            .enumerate()
+        {
+            let within = 0x500 + index * 0x10 + word * 4;
+            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        }
+        Ok(())
+    }
+    fn write_rx_cpu_index(&self, index: usize, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || index >= 8 || value >= 8 {
+            return Err("RX producer write escaped slot allowlist".into());
+        }
+        let within = 0x500 + index * 0x10 + 8;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    fn write_active_wfdma(&self, offset: usize, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 {
+            return Err("active WFDMA write escaped BAR page".into());
+        }
+        match offset {
+            0xd4200 if value & !((1 << 0) | (1 << 27)) == 0 => {}
+            0xd4204 if value == 0 || value == (1 << 0) || value == ((1 << 0) | (1 << 27)) => {}
+            0xd4208 => {}
+            0xd4100 => {}
+            0xd42b0 => {}
+            0xd42f0 if value == 0 => {}
+            0xd4680 if value == 4 => {}
+            0xd4690 if value == 0x00c0_0004 => {}
+            0xd4640 if value == 0x0340_0004 => {}
+            0xd4644 if value == 0x0380_0004 => {}
+            0xd4418 if value <= 3 => {}
+            _ => {
+                return Err(format!(
+                    "active WFDMA write {offset:#x}={value:#x} escaped allowlist"
+                ));
+            }
+        }
+        let within = offset - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
@@ -1262,7 +1938,7 @@ fn vfio_irq_capabilities(device: &File) -> Result<Vec<PciIrqCapability>, String>
     Ok(capabilities)
 }
 
-fn reset_vfio_device(device: &File) -> Result<(), String> {
+fn verify_vfio_reset_supported(device: &File) -> Result<(), String> {
     let mut info = DeviceInfo {
         argsz: size::<DeviceInfo>(),
         ..Default::default()
@@ -1276,6 +1952,11 @@ fn reset_vfio_device(device: &File) -> Result<(), String> {
     if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
         return Err("VFIO device does not advertise reset support".into());
     }
+    Ok(())
+}
+
+fn reset_vfio_device(device: &File) -> Result<(), String> {
+    verify_vfio_reset_supported(device)?;
     if unsafe { ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET) } < 0 {
         return Err(format!(
             "VFIO device reset: {}",
@@ -1349,6 +2030,7 @@ enum Operation {
     InventoryVfioIrqs,
     InstallDisableVfioIrq,
     PrepareOwnedGlobalTxRings,
+    QueryPatchSemaphore,
 }
 
 impl Operation {
@@ -1358,11 +2040,15 @@ impl Operation {
             Self::ProgramDisabledFwdlRing
                 | Self::MaskAckDisabledFwdl
                 | Self::PrepareOwnedGlobalTxRings
+                | Self::QueryPatchSemaphore
         )
     }
 
     fn conn_writable(self) -> bool {
-        self == Self::AcquireDriverOwnership
+        matches!(
+            self,
+            Self::AcquireDriverOwnership | Self::QueryPatchSemaphore
+        )
     }
 }
 
@@ -1382,7 +2068,7 @@ impl DynamicL1Transport for VfioDynamicL1<'_> {
     }
     fn write_selector(&mut self, value: u32) -> Result<(), Self::Error> {
         let low = value & 0xffff;
-        if low != 0x7001 && low != 0x1806 && Some(value) != self.saved.get() {
+        if low != 0x7001 && low != 0x1800 && low != 0x1806 && Some(value) != self.saved.get() {
             return Err(format!(
                 "selector value {value:#010x} escaped target allowlist"
             ));
@@ -1464,6 +2150,55 @@ impl TopOwnershipTransport for VfioTopOwnership<'_> {
     fn sleep_ms(&mut self, milliseconds: u64) {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds));
     }
+}
+
+struct VfioWfsysReset<'a> {
+    selector: &'a ReadPage,
+    window: &'a ReadPage,
+    start: Instant,
+    saved: u32,
+}
+impl VfioWfsysReset<'_> {
+    fn select(&self) -> Result<(), String> {
+        self.selector
+            .write_remap_selector((self.saved & !0xffff) | 0x1800)?;
+        let raw = self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+        if raw & 0xffff != 0x1800 {
+            return Err(format!("WFSYS selector did not latch: {raw:#010x}"));
+        }
+        Ok(())
+    }
+    fn restore(&self) -> Result<(), String> {
+        self.selector.write_remap_selector(self.saved)
+    }
+}
+impl WfsysResetTransport for VfioWfsysReset<'_> {
+    type Error = String;
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+        self.select()?;
+        let raw = self
+            .window
+            .read_dynamic_window(MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x140)?;
+        if raw == u32::MAX {
+            return Err("WFSYS reset control returned all ones".into());
+        }
+        Ok(raw)
+    }
+    fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.select()?;
+        self.window
+            .write_dynamic_window(MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x140, value)
+    }
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
+fn log_wfsys_reset_event(event: WfsysResetEvent) {
+    println!("{{\"wfsys_reset_event\":\"{event:?}\"}}")
 }
 
 fn log_top_ownership_event(event: TopOwnershipEvent) {
@@ -1560,6 +2295,70 @@ fn log_global_tx_ring_event(event: GlobalTxRingEvent) {
     println!("{{\"global_tx_ring_event\":\"{event:?}\"}}")
 }
 
+struct VfioGlobalRxRings<'a> {
+    page: &'a ReadPage,
+}
+impl DisabledMcuRxTransport for VfioGlobalRxRings<'_> {
+    type Error = String;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4208)
+    }
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4204)
+    }
+    fn read_registers(&mut self) -> Result<McuRxRegisters, Self::Error> {
+        self.read_registers_at(0)
+    }
+    fn read_registers_at(&mut self, index: usize) -> Result<McuRxRegisters, Self::Error> {
+        if index >= 8 {
+            return Err("RX ring read escaped slot allowlist".into());
+        }
+        let base = 0xd4500 + index * 0x10;
+        Ok(McuRxRegisters {
+            descriptor_base: self.page.read(base)?,
+            descriptor_count: self.page.read(base + 4)?,
+            cpu_index: self.page.read(base + 8)?,
+            dma_index: self.page.read(base + 12)?,
+        })
+    }
+    fn write_initial(
+        &mut self,
+        descriptor_base: u32,
+        descriptor_count: u32,
+    ) -> Result<(), Self::Error> {
+        self.write_ring_initial(0, descriptor_base, descriptor_count)
+    }
+    fn publish_cpu_index(&mut self, cpu_index: u32) -> Result<(), Self::Error> {
+        self.publish_ring_cpu_index(0, cpu_index)
+    }
+    fn write_ring_initial(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+    ) -> Result<(), Self::Error> {
+        self.page
+            .write_rx_ring_slot(index, descriptor_base, descriptor_count, 0, 0)
+    }
+    fn publish_ring_cpu_index(&mut self, index: usize, cpu_index: u32) -> Result<(), Self::Error> {
+        let state = self.read_registers_at(index)?;
+        self.page.write_rx_ring_slot(
+            index,
+            state.descriptor_base,
+            state.descriptor_count,
+            cpu_index,
+            state.dma_index,
+        )
+    }
+    fn release_fence(&mut self) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release)
+    }
+}
+
+fn log_global_rx_ring_event(event: DisabledMcuRxEvent) {
+    println!("{{\"global_rx_ring_event\":\"{event:?}\"}}")
+}
+
 struct VfioFwdlInterrupt<'a> {
     page: &'a ReadPage,
 }
@@ -1632,10 +2431,12 @@ mod tests {
         assert!(Operation::ProgramDisabledFwdlRing.wfdma_writable());
         assert!(Operation::MaskAckDisabledFwdl.wfdma_writable());
         assert!(Operation::PrepareOwnedGlobalTxRings.wfdma_writable());
+        assert!(Operation::QueryPatchSemaphore.wfdma_writable());
         assert!(!Operation::ReadFixed.wfdma_writable());
         assert!(!Operation::AcquireDriverOwnership.wfdma_writable());
         assert!(!Operation::InventoryVfioIrqs.wfdma_writable());
         assert!(Operation::AcquireDriverOwnership.conn_writable());
+        assert!(Operation::QueryPatchSemaphore.conn_writable());
         assert!(!Operation::ReadFixed.conn_writable());
         assert!(!Operation::PrepareOwnedGlobalTxRings.conn_writable());
     }

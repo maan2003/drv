@@ -174,6 +174,32 @@ reset-while-pinned teardown must all exist first.
 matches the four-bit command sequence before exposing event identifiers; it is
 the first pure parser needed by the future owned RX response ring.
 
+`--query-patch-semaphore` is the first bounded active boot-ROM transaction.
+It retains all mappings in one operation, replaces all 18 TX and all eight RX
+ring slots with pinned userspace backing, and gives RX ring zero seven distinct
+2 KiB response buffers. Before DMA it performs the pinned Linux conn-on
+ownership and WFSYS reset sequences, installs an eventfd-backed MSI/MSI-X
+vector while sources remain masked, disables L0s, acquires MT_TOP ownership,
+and selects normal firmware mode. It then enables only RX0 completion, sends
+`NIC_POWER_CTRL`, requires firmware-download state, and sends
+`PATCH_SEM_CONTROL(GET)`. A response is accepted only from a completed RX
+descriptor with a matching sequence and patch-semaphore event ID. Result 2 is
+immediately followed by a matched semaphore release; result 1 needs no
+release. Every exit masks both interrupt gates, disables and polls both DMA
+directions, disables PCI bus mastering, resets through VFIO while all IOVAs
+remain pinned, and only then unmaps. This operation does not scatter firmware
+or claim N9/NIC capability readiness.
+
+The guarded physical run completed this boot-ROM boundary through a VFIO MSI
+vector. WFSYS became ready at 57 ms; the `NIC_POWER_CTRL` response (sequence 1,
+event 3) was drained as unrelated; patch semaphore GET returned result 2 on
+sequence 2; and the mandatory release returned result 3 on sequence 3. Each
+response arrived through RX descriptors 0, 1, and 2 respectively with an
+eventfd count, and the run disabled PCI bus mastering, reset while all mappings
+remained pinned, and restored `mt7921e`, iwd, network reachability, and SSH.
+N9 remained deliberately not ready. The root-only durable report is
+`/var/lib/wifi-driver-lab/reports/20260802T174640Z-0000_05_00.0.log`.
+
 `--inventory-vfio-irqs` queries the standard VFIO INTx, MSI, and MSI-X
 capabilities without installing or triggering one, rejects modes without
 eventfd support, and reports the preferred MSI-X/MSI/INTx choice. Device
