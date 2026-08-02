@@ -2,11 +2,13 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
-    DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, OwnershipError, OwnershipEvent,
-    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, TopOwnershipError,
-    TopOwnershipEvent, TopOwnershipTransport, acquire_driver_ownership,
-    acquire_top_driver_ownership, read_dynamic_identity_status,
+    DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlRegister, DisabledFwdlRingTransport,
+    DisabledFwdlWrite, DynamicL1Error, DynamicL1Event, DynamicL1Transport,
+    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
+    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
+    PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
+    TopOwnershipTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    program_disabled_fwdl_ring, read_dynamic_identity_status,
 };
 use std::{
     cell::Cell,
@@ -24,9 +26,16 @@ const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
 const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
 const IOMMU_IOAS_ALLOC: u64 = (VFIO_TYPE << 8) | 0x81;
+const IOMMU_IOAS_MAP: u64 = (VFIO_TYPE << 8) | 0x85;
+const IOMMU_IOAS_UNMAP: u64 = (VFIO_TYPE << 8) | 0x86;
+const IOMMU_MAP_FIXED: u32 = 1;
+const IOMMU_MAP_WRITEABLE: u32 = 2;
+const IOMMU_MAP_READABLE: u32 = 4;
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
 const PAGE: usize = 4096;
 
@@ -68,6 +77,25 @@ struct Destroy {
     size: u32,
     id: u32,
 }
+#[repr(C)]
+#[derive(Default)]
+struct IoasMap {
+    size: u32,
+    flags: u32,
+    ioas_id: u32,
+    _pad: u32,
+    user_va: u64,
+    length: u64,
+    iova: u64,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IoasUnmap {
+    size: u32,
+    ioas_id: u32,
+    iova: u64,
+    length: u64,
+}
 
 unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
@@ -88,6 +116,7 @@ fn run() -> Result<(), String> {
         Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
         Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
         Some("--acquire-top-ownership") => Operation::AcquireTopOwnership,
+        Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
@@ -154,7 +183,12 @@ fn run() -> Result<(), String> {
         "query BAR 0",
     )?;
 
-    let wfdma = ReadPage::map(&device, &info, 0xd4000, false)?;
+    let wfdma = ReadPage::map(
+        &device,
+        &info,
+        0xd4000,
+        operation == Operation::ProgramDisabledFwdlRing,
+    )?;
     let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
     if acquire {
         let mut transport = VfioOwnership {
@@ -237,6 +271,34 @@ fn run() -> Result<(), String> {
             )?;
         }
     }
+    if operation == Operation::ProgramDisabledFwdlRing {
+        let mut arena = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        arena.initialize_fwdl_descriptors()?;
+        println!(
+            "{{\"fwdl_ring_event\":\"arena_initialized\",\"iova\":\"{:#010x}\",\"mapped_bytes\":{},\"descriptor_bytes\":{}}}",
+            arena.iova, arena.len, MT7921_FWDL_RING_BYTES
+        );
+        let mut transport = VfioFwdlRing { page: &wfdma };
+        program_disabled_fwdl_ring(&mut transport, arena.iova, log_disabled_fwdl_event)
+            .map_err(|error| match error {
+                DisabledFwdlError::InvalidArena => "invalid firmware ring arena".into(),
+                DisabledFwdlError::DmaOrInterruptActive {
+                    global_config,
+                    interrupt_enable,
+                } => format!(
+                    "refused active WFDMA state global={global_config:#010x} interrupts={interrupt_enable:#010x}"
+                ),
+                DisabledFwdlError::Transport(error) => error,
+                DisabledFwdlError::Readback { expected, actual } => {
+                    format!("firmware ring readback mismatch expected={expected:?} actual={actual:?}")
+                }
+                DisabledFwdlError::Restore(error) => format!("restore firmware ring: {error}"),
+            })?;
+        arena.teardown()?;
+        println!(
+            "{{\"fwdl_ring_event\":\"arena_unmapped\",\"iova\":\"0x01000000\",\"bytes\":4096}}"
+        );
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -297,6 +359,114 @@ fn verify_pci_identity(bdf: &str) -> Result<(), String> {
 struct Ioas<'a> {
     fd: &'a File,
     id: u32,
+}
+
+struct DmaArena<'a> {
+    iommu: &'a File,
+    ioas: u32,
+    ptr: NonNull<u8>,
+    len: usize,
+    iova: u64,
+    mapped: bool,
+}
+impl<'a> DmaArena<'a> {
+    fn map(iommu: &'a File, ioas: u32, iova: u64) -> Result<Self, String> {
+        let len = PAGE;
+        let ptr = NonNull::new(unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        })
+        .filter(|pointer| pointer.as_ptr() as isize != -1)
+        .ok_or_else(|| format!("allocate DMA arena: {}", std::io::Error::last_os_error()))?;
+        let mut map = IoasMap {
+            size: size::<IoasMap>(),
+            flags: IOMMU_MAP_FIXED | IOMMU_MAP_READABLE | IOMMU_MAP_WRITEABLE,
+            ioas_id: ioas,
+            user_va: ptr.as_ptr() as u64,
+            length: len as u64,
+            iova,
+            ..Default::default()
+        };
+        if let Err(error) = ioctl_mut(iommu.as_raw_fd(), IOMMU_IOAS_MAP, &mut map, "map DMA arena")
+        {
+            unsafe { munmap(ptr.as_ptr(), len) };
+            return Err(error);
+        }
+        if map.iova != iova || map.iova + len as u64 - 1 > u64::from(u32::MAX) {
+            let mut unmap = IoasUnmap {
+                size: size::<IoasUnmap>(),
+                ioas_id: ioas,
+                iova: map.iova,
+                length: len as u64,
+            };
+            let _ = ioctl_mut(
+                iommu.as_raw_fd(),
+                IOMMU_IOAS_UNMAP,
+                &mut unmap,
+                "unmap invalid arena",
+            );
+            unsafe { munmap(ptr.as_ptr(), len) };
+            return Err("iommufd did not honor low-32-bit fixed IOVA".into());
+        }
+        Ok(Self {
+            iommu,
+            ioas,
+            ptr,
+            len,
+            iova,
+            mapped: true,
+        })
+    }
+    fn initialize_fwdl_descriptors(&mut self) -> Result<(), String> {
+        if MT7921_FWDL_RING_BYTES > self.len {
+            return Err("firmware ring exceeds DMA arena".into());
+        }
+        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        for offset in (0..MT7921_FWDL_RING_BYTES).step_by(16) {
+            unsafe {
+                std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
+            };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn teardown(&mut self) -> Result<(), String> {
+        if !self.mapped {
+            return Ok(());
+        }
+        let mut unmap = IoasUnmap {
+            size: size::<IoasUnmap>(),
+            ioas_id: self.ioas,
+            iova: self.iova,
+            length: self.len as u64,
+        };
+        ioctl_mut(
+            self.iommu.as_raw_fd(),
+            IOMMU_IOAS_UNMAP,
+            &mut unmap,
+            "unmap DMA arena",
+        )?;
+        if unmap.length != self.len as u64 {
+            return Err(format!(
+                "iommufd unmapped {} of {} bytes",
+                unmap.length, self.len
+            ));
+        }
+        self.mapped = false;
+        unsafe { munmap(self.ptr.as_ptr(), self.len) };
+        Ok(())
+    }
+}
+impl Drop for DmaArena<'_> {
+    fn drop(&mut self) {
+        let _ = self.teardown();
+    }
 }
 impl Drop for Ioas<'_> {
     fn drop(&mut self) {
@@ -391,6 +561,19 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn write_fwdl_ring(&self, register: DisabledFwdlWrite, value: u32) -> Result<(), String> {
+        let offset = match register {
+            DisabledFwdlWrite::DescriptorBase => 0xd4400,
+            DisabledFwdlWrite::DescriptorCount => 0xd4404,
+            DisabledFwdlWrite::CpuIndex => 0xd4408,
+        };
+        let within = offset - self.bar_page;
+        if self.bar_page != 0xd4000 || within + 4 > PAGE {
+            return Err("firmware ring write escaped immutable allowlist".into());
+        }
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -468,6 +651,7 @@ enum Operation {
     AcquireDriverOwnership,
     ReadDynamicIdentity,
     AcquireTopOwnership,
+    ProgramDisabledFwdlRing,
 }
 
 struct VfioDynamicL1<'a> {
@@ -600,4 +784,24 @@ fn log_top_ownership_event(event: TopOwnershipEvent) {
             println!("{{\"top_ownership_event\":\"selector_restored\",\"raw\":\"{raw:#010x}\"}}")
         }
     }
+}
+
+struct VfioFwdlRing<'a> {
+    page: &'a ReadPage,
+}
+impl DisabledFwdlRingTransport for VfioFwdlRing<'_> {
+    type Error = String;
+    fn read(&mut self, register: DisabledFwdlRegister) -> Result<u32, Self::Error> {
+        self.page.read(register.bar_offset())
+    }
+    fn write(&mut self, register: DisabledFwdlWrite, value: u32) -> Result<(), Self::Error> {
+        self.page.write_fwdl_ring(register, value)
+    }
+    fn release_fence(&mut self) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release)
+    }
+}
+
+fn log_disabled_fwdl_event(event: DisabledFwdlEvent) {
+    println!("{{\"fwdl_ring_event\":\"{event:?}\"}}")
 }

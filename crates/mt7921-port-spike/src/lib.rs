@@ -1147,6 +1147,182 @@ where
     operation
 }
 
+pub const MT7921_FWDL_RING_COUNT: u32 = 128;
+pub const MT7921_FWDL_RING_BYTES: usize = MT7921_FWDL_RING_COUNT as usize * DMA_DESCRIPTOR_LEN;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledFwdlRegister {
+    HostInterruptEnable,
+    WfdmaGlobalConfig,
+    DescriptorBase,
+    DescriptorCount,
+    CpuIndex,
+    DmaIndex,
+}
+impl DisabledFwdlRegister {
+    pub const fn bar_offset(self) -> usize {
+        match self {
+            Self::HostInterruptEnable => 0xd4204,
+            Self::WfdmaGlobalConfig => 0xd4208,
+            // MT_TX_RING_BASE 0xd4300 + MT7921_TXQ_FWDL(16) * 0x10.
+            Self::DescriptorBase => 0xd4400,
+            Self::DescriptorCount => 0xd4404,
+            Self::CpuIndex => 0xd4408,
+            Self::DmaIndex => 0xd440c,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledFwdlWrite {
+    DescriptorBase,
+    DescriptorCount,
+    CpuIndex,
+}
+
+pub trait DisabledFwdlRingTransport {
+    type Error;
+    fn read(&mut self, register: DisabledFwdlRegister) -> Result<u32, Self::Error>;
+    fn write(&mut self, register: DisabledFwdlWrite, value: u32) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FwdlRingRegisters {
+    pub descriptor_base: u32,
+    pub descriptor_count: u32,
+    pub cpu_index: u32,
+    pub dma_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledFwdlEvent {
+    DisabledVerified {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    Snapshot(FwdlRingRegisters),
+    DescriptorFence,
+    RegisterWritten {
+        register: DisabledFwdlWrite,
+        value: u32,
+    },
+    Programmed(FwdlRingRegisters),
+    Restored(FwdlRingRegisters),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisabledFwdlError<E> {
+    InvalidArena,
+    DmaOrInterruptActive {
+        global_config: u32,
+        interrupt_enable: u32,
+    },
+    Transport(E),
+    Readback {
+        expected: FwdlRingRegisters,
+        actual: FwdlRingRegisters,
+    },
+    Restore(E),
+}
+
+/// Temporarily program the inactive MT7921 firmware-download TX ring.
+///
+/// The transaction refuses to run unless TX/RX DMA-enable bits and every host
+/// interrupt-enable bit are clear. Descriptor initialization must precede the
+/// release fence supplied here. Only base/count/CPU index are written; the
+/// device DMA index, WFDMA configuration, and interrupt registers are never
+/// written. Original values are restored before return.
+pub fn program_disabled_fwdl_ring<T, F>(
+    transport: &mut T,
+    arena_iova: u64,
+    mut event: F,
+) -> Result<FwdlRingRegisters, DisabledFwdlError<T::Error>>
+where
+    T: DisabledFwdlRingTransport,
+    F: FnMut(DisabledFwdlEvent),
+{
+    if arena_iova % 4096 != 0
+        || arena_iova
+            .checked_add(MT7921_FWDL_RING_BYTES as u64 - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+    {
+        return Err(DisabledFwdlError::InvalidArena);
+    }
+    let interrupt_enable = transport
+        .read(DisabledFwdlRegister::HostInterruptEnable)
+        .map_err(DisabledFwdlError::Transport)?;
+    let global_config = transport
+        .read(DisabledFwdlRegister::WfdmaGlobalConfig)
+        .map_err(DisabledFwdlError::Transport)?;
+    if interrupt_enable != 0 || global_config & 0x5 != 0 {
+        return Err(DisabledFwdlError::DmaOrInterruptActive {
+            global_config,
+            interrupt_enable,
+        });
+    }
+    event(DisabledFwdlEvent::DisabledVerified {
+        global_config,
+        interrupt_enable,
+    });
+    let snapshot = read_fwdl_registers(transport).map_err(DisabledFwdlError::Transport)?;
+    event(DisabledFwdlEvent::Snapshot(snapshot));
+    transport.release_fence();
+    event(DisabledFwdlEvent::DescriptorFence);
+    let expected = FwdlRingRegisters {
+        descriptor_base: arena_iova as u32,
+        descriptor_count: MT7921_FWDL_RING_COUNT,
+        cpu_index: 0,
+        dma_index: snapshot.dma_index,
+    };
+    let operation = (|| {
+        for (register, value) in [
+            (DisabledFwdlWrite::DescriptorBase, expected.descriptor_base),
+            (
+                DisabledFwdlWrite::DescriptorCount,
+                expected.descriptor_count,
+            ),
+            (DisabledFwdlWrite::CpuIndex, expected.cpu_index),
+        ] {
+            transport
+                .write(register, value)
+                .map_err(DisabledFwdlError::Transport)?;
+            event(DisabledFwdlEvent::RegisterWritten { register, value });
+        }
+        let actual = read_fwdl_registers(transport).map_err(DisabledFwdlError::Transport)?;
+        if actual != expected {
+            return Err(DisabledFwdlError::Readback { expected, actual });
+        }
+        event(DisabledFwdlEvent::Programmed(actual));
+        Ok(actual)
+    })();
+    for (register, value) in [
+        (DisabledFwdlWrite::CpuIndex, snapshot.cpu_index),
+        (
+            DisabledFwdlWrite::DescriptorCount,
+            snapshot.descriptor_count,
+        ),
+        (DisabledFwdlWrite::DescriptorBase, snapshot.descriptor_base),
+    ] {
+        if let Err(error) = transport.write(register, value) {
+            return Err(DisabledFwdlError::Restore(error));
+        }
+    }
+    event(DisabledFwdlEvent::Restored(snapshot));
+    operation
+}
+
+fn read_fwdl_registers<T: DisabledFwdlRingTransport>(
+    transport: &mut T,
+) -> Result<FwdlRingRegisters, T::Error> {
+    Ok(FwdlRingRegisters {
+        descriptor_base: transport.read(DisabledFwdlRegister::DescriptorBase)?,
+        descriptor_count: transport.read(DisabledFwdlRegister::DescriptorCount)?,
+        cpu_index: transport.read(DisabledFwdlRegister::CpuIndex)?,
+        dma_index: transport.read(DisabledFwdlRegister::DmaIndex)?,
+    })
+}
+
 impl ReadOnlyStatus {
     pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
         Self {
@@ -1619,6 +1795,99 @@ mod tests {
             Err(TopOwnershipError::UnexpectedState(MT_TOP_LPCR_HOST_DRV_OWN))
         );
         assert_eq!(transport.selector, 0);
+    }
+
+    struct FakeFwdl {
+        interrupt_enable: u32,
+        global_config: u32,
+        ring: FwdlRingRegisters,
+        corrupt_count: bool,
+        events: Vec<PublishEvent>,
+        writes: Vec<(DisabledFwdlWrite, u32)>,
+    }
+    impl DisabledFwdlRingTransport for FakeFwdl {
+        type Error = ();
+        fn read(&mut self, register: DisabledFwdlRegister) -> Result<u32, Self::Error> {
+            Ok(match register {
+                DisabledFwdlRegister::HostInterruptEnable => self.interrupt_enable,
+                DisabledFwdlRegister::WfdmaGlobalConfig => self.global_config,
+                DisabledFwdlRegister::DescriptorBase => self.ring.descriptor_base,
+                DisabledFwdlRegister::DescriptorCount => {
+                    self.ring.descriptor_count
+                        + u32::from(self.corrupt_count && self.ring.descriptor_count == 128)
+                }
+                DisabledFwdlRegister::CpuIndex => self.ring.cpu_index,
+                DisabledFwdlRegister::DmaIndex => self.ring.dma_index,
+            })
+        }
+        fn write(&mut self, register: DisabledFwdlWrite, value: u32) -> Result<(), Self::Error> {
+            self.writes.push((register, value));
+            match register {
+                DisabledFwdlWrite::DescriptorBase => self.ring.descriptor_base = value,
+                DisabledFwdlWrite::DescriptorCount => self.ring.descriptor_count = value,
+                DisabledFwdlWrite::CpuIndex => self.ring.cpu_index = value,
+            }
+            Ok(())
+        }
+        fn release_fence(&mut self) {
+            self.events.push(PublishEvent::Release)
+        }
+    }
+
+    fn fake_fwdl() -> FakeFwdl {
+        FakeFwdl {
+            interrupt_enable: 0,
+            global_config: 0x1010_b870,
+            ring: FwdlRingRegisters {
+                descriptor_base: 0xaaaa_0000,
+                descriptor_count: 7,
+                cpu_index: 3,
+                dma_index: 3,
+            },
+            corrupt_count: false,
+            events: Vec::new(),
+            writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disabled_fwdl_ring_programs_after_fence_and_restores() {
+        let mut transport = fake_fwdl();
+        let snapshot = transport.ring;
+        let mut events = Vec::new();
+        let programmed =
+            program_disabled_fwdl_ring(&mut transport, 0x0100_0000, |event| events.push(event))
+                .unwrap();
+        assert_eq!(programmed.descriptor_base, 0x0100_0000);
+        assert_eq!(programmed.descriptor_count, 128);
+        assert_eq!(transport.ring, snapshot);
+        assert_eq!(transport.events, [PublishEvent::Release]);
+        assert_eq!(events[2], DisabledFwdlEvent::DescriptorFence);
+        assert_eq!(events.last(), Some(&DisabledFwdlEvent::Restored(snapshot)));
+    }
+
+    #[test]
+    fn disabled_fwdl_ring_rejects_active_dma_or_interrupts_without_writes() {
+        let mut transport = fake_fwdl();
+        transport.interrupt_enable = 1;
+        assert!(matches!(
+            program_disabled_fwdl_ring(&mut transport, 0x0100_0000, |_| {}),
+            Err(DisabledFwdlError::DmaOrInterruptActive { .. })
+        ));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn disabled_fwdl_ring_restores_after_readback_mismatch() {
+        let mut transport = fake_fwdl();
+        let snapshot = transport.ring;
+        transport.corrupt_count = true;
+        assert!(matches!(
+            program_disabled_fwdl_ring(&mut transport, 0x0100_0000, |_| {}),
+            Err(DisabledFwdlError::Readback { .. })
+        ));
+        // The fake corrupts reads only; stored register values are restored.
+        assert_eq!(transport.ring, snapshot);
     }
 
     #[test]

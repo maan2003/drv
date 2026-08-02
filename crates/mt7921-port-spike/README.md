@@ -75,6 +75,16 @@ failure. This mode cannot write the dynamic window or request MT_TOP ownership.
 500 ms hard deadline and 1 ms ticks. Command-bit readback is rejected, every
 transition is logged, and the saved remap selector is restored on every exit.
 
+`--program-disabled-fwdl-ring` allocates one anonymous page, maps it through
+iommufd at fixed low-32-bit IOVA `0x01000000`, initializes the first 128
+descriptors to CPU-owned `DMA_DONE`, and refuses to continue unless WFDMA TX/RX
+enable bits and the complete host interrupt-enable register are zero. It then
+temporarily programs only firmware-download ring 16's descriptor base, count,
+and CPU index; verifies readback including the untouched DMA index; restores
+the original ring registers; explicitly unmaps the complete arena; and emits
+an event for every step. It cannot write WFDMA enable, interrupt, or DMA-index
+registers.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
