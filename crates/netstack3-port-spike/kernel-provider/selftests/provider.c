@@ -19,6 +19,7 @@
 #define RESPONSE 2
 #define EVENT 3
 #define OPEN_CLIENT 1
+#define CLOSE_CLIENT 2
 #define OPEN_SOCKET 3
 #define BIND 4
 #define CONNECT 5
@@ -40,7 +41,8 @@ struct __attribute__((packed)) header {
 };
 
 static int provider_fd;
-static atomic_int requests, closes, failures, stop_provider, shutdowns;
+static atomic_int requests, closes, client_opens, client_closes, failures;
+static atomic_int stop_provider, shutdowns;
 static atomic_ullong next_handle = 40;
 
 static void fail(const char *what)
@@ -114,7 +116,10 @@ static void *provider(void *unused)
 		atomic_fetch_add(&requests, 1);
 		switch (h->opcode) {
 		case OPEN_CLIENT:
-			respond(h, NULL, 0); break;
+			atomic_fetch_add(&client_opens, 1); respond(h, NULL, 0); break;
+		case CLOSE_CLIENT:
+			if (h->payload_len) { errno = EPROTO; fail("close client payload"); }
+			atomic_fetch_add(&client_closes, 1); respond(h, NULL, 0); break;
 		case OPEN_SOCKET:
 			handle = atomic_fetch_add(&next_handle, 1);
 			respond(h, &handle, 8); break;
@@ -268,7 +273,7 @@ int main(void)
 {
 	pthread_t thread;
 	int remote, loop, live_tcp;
-	printf("TAP version 13\n1..10\n");
+	printf("TAP version 13\n1..11\n");
 	provider_fd = open(DEV, O_RDWR | O_CLOEXEC);
 	if (provider_fd < 0) { fail("open provider device"); return 1; }
 	if (pthread_create(&thread, NULL, provider, NULL)) { fail("provider thread"); return 1; }
@@ -281,18 +286,20 @@ int main(void)
 		.opcode = READY_CHANGED, .reserved = 1 };
 	  int r = write(provider_fd, &bad, sizeof(bad));
 	  printf("%s 6 - malformed frame rejected\n", r < 0 && errno == EPROTO ? "ok" : "not ok"); }
+	printf("%s 7 - provider clients close once after their final socket\n",
+	       atomic_load(&client_opens) == 3 && atomic_load(&client_closes) == 2 ? "ok" : "not ok");
 	atomic_store(&stop_provider, 1);
 	pthread_cancel(thread); pthread_join(thread, NULL); close(provider_fd);
 	{ struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.fd = live_tcp }, got;
 	  int ep = epoll_create1(EPOLL_CLOEXEC); epoll_ctl(ep, EPOLL_CTL_ADD, live_tcp, &ev);
 	  int r = epoll_wait(ep, &got, 1, 1000);
-	  printf("%s 7 - daemon death wakes epoll with HUP/ERR\n", r == 1 && (got.events & (EPOLLHUP | EPOLLERR)) ? "ok" : "not ok");
+	  printf("%s 8 - daemon death wakes epoll with HUP/ERR\n", r == 1 && (got.events & (EPOLLHUP | EPOLLERR)) ? "ok" : "not ok");
 	  close(ep); close(live_tcp); }
 	{ struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9) };
 	  int s = socket(AF_INET, SOCK_STREAM, 0), saved; inet_pton(AF_INET, "192.0.2.1", &a.sin_addr);
 	  int r = connect(s, (void *)&a, sizeof(a)); saved = errno; close(s);
-	  printf("%s 8 - provider absence fails remote closed\n", r < 0 && saved == ENETDOWN ? "ok" : "not ok"); }
-	printf("%s 9 - immutable namespace/client identity validated\n", atomic_load(&failures) ? "not ok" : "ok");
-	printf("%s 10 - directional shutdown reached provider\n", atomic_load(&shutdowns) ? "ok" : "not ok");
+	  printf("%s 9 - provider absence fails remote closed\n", r < 0 && saved == ENETDOWN ? "ok" : "not ok"); }
+	printf("%s 10 - immutable namespace/client identity validated\n", atomic_load(&failures) ? "not ok" : "ok");
+	printf("%s 11 - directional shutdown reached provider\n", atomic_load(&shutdowns) ? "ok" : "not ok");
 	return atomic_load(&failures) ? 1 : 0;
 }
