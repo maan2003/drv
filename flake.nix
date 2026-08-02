@@ -109,7 +109,7 @@
               in
               ''
                 test "$(${pkgs.coreutils}/bin/sha256sum ${source} | ${pkgs.coreutils}/bin/cut -d ' ' -f 1)" = \
-                  3c0a536414c20d13725f888b0c5573be7c9446d8d58865e5e82c0ae01c45119d
+                  c988088b7e30d5c1ce2795d3b61d89700d2a252ff3750b75d2f0c6f3c857b93f
                 cp ${source} "$out"
               ''
           );

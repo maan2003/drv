@@ -16,10 +16,29 @@ extern void drv_test_log(uint32_t fd, const uint8_t* bytes, uint32_t length);
 __attribute__((import_module("drv:test"), import_name("exit")))
 extern void drv_test_exit(uint32_t status);
 
+__attribute__((import_module("drv:bluetooth-sapphire/controller@0.1.0"),
+               import_name("send")))
+extern uint32_t drv_controller_send(uint32_t kind,
+                                    const uint8_t* bytes,
+                                    uint32_t length);
+
 extern int main(int argc, char** argv);
 
 __attribute__((export_name("drv_test_entry"))) int drv_test_entry(void) {
+  static const uint8_t reset_command[] = {0x03, 0x0c, 0x00};
+  uint32_t status = drv_controller_send(0, reset_command, sizeof(reset_command));
+  if (status != 0) {
+    return (int)status;
+  }
   return main(drv_gtest_arg_count, drv_gtest_args);
+}
+
+__attribute__((export_name("drv_controller_packet"))) int
+drv_controller_packet(uint32_t kind, const uint8_t* bytes, uint32_t length) {
+  static const uint8_t reset_complete[] = {0x04, 0x0e, 0x04, 0x01,
+                                           0x03, 0x0c, 0x00};
+  return kind != 0 || length != sizeof(reset_complete) ||
+         memcmp(bytes, reset_complete, sizeof(reset_complete)) != 0;
 }
 
 __wasi_errno_t __imported_wasi_snapshot_preview1_args_get(uint8_t** argv,

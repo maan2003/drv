@@ -24,6 +24,19 @@ framed process socket. It validates command, ACL, SCO, and ISO length fields in
 the native broker crate and enforces packet-count and byte quotas. The current
 implementation terminates at a deterministic fake controller and owns no HCI
 descriptor; physical transport attachment remains a separate guarded step.
+Every worker generation has a fresh session identity. Calls and replies carry
+monotonic correlation IDs, while event, ACL, SCO, and ISO deliveries share one
+bounded FIFO and sequence space. The worker queues deliveries received during
+a host import and invokes the guest callback only after the current WASM entry
+returns, so Wasmtime is never re-entered from an import. Stop-and-wait delivery,
+explicit completion, and response priority provide backpressure without packet
+reordering or nested `Store` access.
+
+An abnormal worker result is killed/reaped and restarted once with a new
+socket, session, controller, queues, and correlation state. Old deliveries are
+never replayed into the replacement session. The GAP test runtime performs one
+fake Reset command/Command Complete exchange through this real process boundary
+before entering the otherwise unchanged upstream suite.
 
 The first executable target is the pinned upstream Sapphire fake-controller
 GAP discovery suite. Its WASM import list must match the interfaces in the WIT

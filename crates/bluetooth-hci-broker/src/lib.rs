@@ -13,6 +13,14 @@ pub enum OutboundKind {
     Iso,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundKind {
+    Event,
+    Acl,
+    Sco,
+    Iso,
+}
+
 pub fn validate_outbound(kind: OutboundKind, packet: &[u8]) -> io::Result<()> {
     if packet.len() > MAX_OUTBOUND_HCI_PACKET {
         return Err(invalid("outbound HCI packet exceeds boundary"));
@@ -38,6 +46,15 @@ pub fn validate_outbound(kind: OutboundKind, packet: &[u8]) -> io::Result<()> {
         return Err(invalid("malformed outbound HCI packet length"));
     }
     Ok(())
+}
+
+pub fn validate_inbound(kind: InboundKind, packet: &[u8]) -> io::Result<()> {
+    match kind {
+        InboundKind::Event => decode_event(packet).map(|_| ()),
+        InboundKind::Acl => validate_outbound(OutboundKind::Acl, packet),
+        InboundKind::Sco => validate_outbound(OutboundKind::Sco, packet),
+        InboundKind::Iso => validate_outbound(OutboundKind::Iso, packet),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,6 +348,15 @@ mod tests {
         assert!(
             validate_outbound(OutboundKind::Iso, &vec![0; MAX_OUTBOUND_HCI_PACKET + 1]).is_err()
         );
+    }
+
+    #[test]
+    fn validates_all_inbound_transport_frames() {
+        validate_inbound(InboundKind::Event, &[H4_EVENT, 0x0e, 4, 1, 3, 0x0c, 0]).unwrap();
+        validate_inbound(InboundKind::Acl, &[1, 0, 2, 0, 0xaa, 0xbb]).unwrap();
+        validate_inbound(InboundKind::Sco, &[1, 0, 1, 0xaa]).unwrap();
+        validate_inbound(InboundKind::Iso, &[1, 0, 2, 0, 0xaa, 0xbb]).unwrap();
+        assert!(validate_inbound(InboundKind::Event, &[H4_EVENT, 0x0e, 4]).is_err());
     }
 
     #[test]
