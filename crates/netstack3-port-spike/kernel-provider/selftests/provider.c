@@ -273,33 +273,43 @@ int main(void)
 {
 	pthread_t thread;
 	int remote, loop, live_tcp;
-	printf("TAP version 13\n1..11\n");
-	provider_fd = open(DEV, O_RDWR | O_CLOEXEC);
+	char byte;
+	int flags;
+	printf("TAP version 13\n1..12\n");
+	provider_fd = open(DEV, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	if (provider_fd < 0) { fail("open provider device"); return 1; }
+	flags = fcntl(provider_fd, F_GETFL);
+	remote = read(provider_fd, &byte, sizeof(byte));
+	printf("%s 1 - empty nonblocking provider read returns EAGAIN\n",
+	       remote < 0 && errno == EAGAIN ? "ok" : "not ok");
+	if (remote >= 0 || errno != EAGAIN || flags < 0 ||
+	    fcntl(provider_fd, F_SETFL, flags & ~O_NONBLOCK)) {
+		errno = EPROTO; fail("nonblocking provider read"); return 1;
+	}
 	if (pthread_create(&thread, NULL, provider, NULL)) { fail("provider thread"); return 1; }
-	loop = loopback4(); printf("%s 1 - all IPv4 127/8 remains Linux loopback\n", loop ? "not ok" : "ok");
-	loop = loopback6(); printf("%s 2 - IPv6 ::1 remains Linux loopback\n", loop ? "not ok" : "ok");
-	remote = remote_udp(); printf("%s 3 - UDP connect, peer, empty datagram and fd lifecycle\n", remote ? "not ok" : "ok");
-	live_tcp = remote_tcp(); printf("%s 4 - TCP bind/listen/accept/connect/shutdown and readiness\n", live_tcp < 0 ? "not ok" : "ok");
-	remote = wildcard_rejected(); printf("%s 5 - wildcard bind is conservatively rejected\n", remote ? "not ok" : "ok");
+	loop = loopback4(); printf("%s 2 - all IPv4 127/8 remains Linux loopback\n", loop ? "not ok" : "ok");
+	loop = loopback6(); printf("%s 3 - IPv6 ::1 remains Linux loopback\n", loop ? "not ok" : "ok");
+	remote = remote_udp(); printf("%s 4 - UDP connect, peer, empty datagram and fd lifecycle\n", remote ? "not ok" : "ok");
+	live_tcp = remote_tcp(); printf("%s 5 - TCP bind/listen/accept/connect/shutdown and readiness\n", live_tcp < 0 ? "not ok" : "ok");
+	remote = wildcard_rejected(); printf("%s 6 - wildcard bind is conservatively rejected\n", remote ? "not ok" : "ok");
 	{ struct header bad = { .magic = MAGIC, .version = 2, .type = EVENT,
 		.opcode = READY_CHANGED, .reserved = 1 };
 	  int r = write(provider_fd, &bad, sizeof(bad));
-	  printf("%s 6 - malformed frame rejected\n", r < 0 && errno == EPROTO ? "ok" : "not ok"); }
-	printf("%s 7 - provider clients close once after their final socket\n",
+	  printf("%s 7 - malformed frame rejected\n", r < 0 && errno == EPROTO ? "ok" : "not ok"); }
+	printf("%s 8 - provider clients close once after their final socket\n",
 	       atomic_load(&client_opens) == 3 && atomic_load(&client_closes) == 2 ? "ok" : "not ok");
 	atomic_store(&stop_provider, 1);
 	pthread_cancel(thread); pthread_join(thread, NULL); close(provider_fd);
 	{ struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT, .data.fd = live_tcp }, got;
 	  int ep = epoll_create1(EPOLL_CLOEXEC); epoll_ctl(ep, EPOLL_CTL_ADD, live_tcp, &ev);
 	  int r = epoll_wait(ep, &got, 1, 1000);
-	  printf("%s 8 - daemon death wakes epoll with HUP/ERR\n", r == 1 && (got.events & (EPOLLHUP | EPOLLERR)) ? "ok" : "not ok");
+	  printf("%s 9 - daemon death wakes epoll with HUP/ERR\n", r == 1 && (got.events & (EPOLLHUP | EPOLLERR)) ? "ok" : "not ok");
 	  close(ep); close(live_tcp); }
 	{ struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9) };
 	  int s = socket(AF_INET, SOCK_STREAM, 0), saved; inet_pton(AF_INET, "192.0.2.1", &a.sin_addr);
 	  int r = connect(s, (void *)&a, sizeof(a)); saved = errno; close(s);
-	  printf("%s 9 - provider absence fails remote closed\n", r < 0 && saved == ENETDOWN ? "ok" : "not ok"); }
-	printf("%s 10 - immutable namespace/client identity validated\n", atomic_load(&failures) ? "not ok" : "ok");
-	printf("%s 11 - directional shutdown reached provider\n", atomic_load(&shutdowns) ? "ok" : "not ok");
+	  printf("%s 10 - provider absence fails remote closed\n", r < 0 && saved == ENETDOWN ? "ok" : "not ok"); }
+	printf("%s 11 - immutable namespace/client identity validated\n", atomic_load(&failures) ? "not ok" : "ok");
+	printf("%s 12 - directional shutdown reached provider\n", atomic_load(&shutdowns) ? "ok" : "not ok");
 	return atomic_load(&failures) ? 1 : 0;
 }

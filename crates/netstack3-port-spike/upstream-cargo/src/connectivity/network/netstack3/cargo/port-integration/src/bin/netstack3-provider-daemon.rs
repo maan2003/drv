@@ -1,12 +1,14 @@
 use netstack3_port_integration::{
     Runtime,
     ethernet_transport::{EthernetAttachment, EthernetInput, SeqpacketEthernet},
-    service::DhcpService,
+    service::{DhcpService, DhcpStatus},
     socket_provider::NativeSocketProvider,
 };
 use netstack3_port_spike::{
     EthernetFrame, NetworkServiceEndpoint as _, SocketClientId, StackEthernetEndpoint as _,
-    provider_dispatch_v2::{ProviderDispatcherV2, encode_readiness_changed_v2},
+    provider_dispatch_v2::{
+        ProviderDispatcherV2, RemoteSocketProviderV2 as _, encode_readiness_changed_v2,
+    },
     provider_transport::{
         MAX_PROVIDER_PAYLOAD, PROVIDER_HEADER_LEN, ProviderIdentity, ProviderNamespaceId,
     },
@@ -19,7 +21,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     num::NonZeroU64,
-    os::fd::{FromRawFd as _, OwnedFd, RawFd},
+    os::{
+        fd::{FromRawFd as _, OwnedFd, RawFd},
+        unix::fs::OpenOptionsExt as _,
+    },
     path::Path,
     sync::mpsc::{self, RecvTimeoutError, TrySendError},
     thread,
@@ -32,7 +37,6 @@ const QUEUE_CAPACITY: usize = 128;
 const TICK: Duration = Duration::from_millis(10);
 
 enum Input {
-    Request(Vec<u8>),
     Ethernet(EthernetFrame),
     LinkDown,
 }
@@ -61,27 +65,6 @@ fn dispatch(
         .first()
         == Some(&0);
     Ok((identity, opcode, success, response))
-}
-
-fn read_requests(mut device: File, sender: mpsc::SyncSender<io::Result<Input>>) {
-    loop {
-        let mut frame = vec![0; FRAME_LEN];
-        let result = loop {
-            match device.read(&mut frame) {
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Ok(0) => return,
-                Ok(length) => {
-                    frame.truncate(length);
-                    break Ok(Input::Request(frame));
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        let failed = result.is_err();
-        if sender.send(result).is_err() || failed {
-            return;
-        }
-    }
 }
 
 fn read_ethernet(ethernet: SeqpacketEthernet, sender: mpsc::SyncSender<io::Result<Input>>) {
@@ -155,6 +138,58 @@ fn write_readiness_events(
     Ok(())
 }
 
+fn open_provider(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+fn read_request(device: &mut File) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = vec![0; FRAME_LEN];
+    loop {
+        match device.read(&mut frame) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "kernel provider closed",
+                ));
+            }
+            Ok(length) => {
+                frame.truncate(length);
+                return Ok(Some(frame));
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn reconcile_provider(
+    status: DhcpStatus,
+    device: &mut Option<File>,
+    provider: &mut NativeSocketProvider,
+    identities: &mut HashMap<SocketClientId, ProviderNamespaceId>,
+    open: impl FnOnce() -> io::Result<File>,
+) -> io::Result<()> {
+    if status == DhcpStatus::Bound {
+        if device.is_none() {
+            *device = Some(open()?);
+        }
+    } else if device.is_some() {
+        // Close the singleton kernel endpoint before revoking all userspace
+        // clients, so new and live kernel sockets fail closed immediately.
+        drop(device.take());
+        for client in identities.keys().copied().collect::<Vec<_>>() {
+            let _ = provider.close_client(client);
+        }
+        identities.clear();
+    }
+    Ok(())
+}
+
 fn entropy() -> io::Result<(Vec<u8>, [u8; 32])> {
     let mut bytes = vec![0; 8192 + 32];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -179,21 +214,13 @@ fn run(
     let mut service = DhcpService::new(runtime, StdRng::from_seed(dhcp_seed), attachment.mac);
     let mut provider = service.socket_provider();
 
-    // Open the kernel provider only after the Ethernet capability is attached
-    // and link-up was acknowledged, so remote sockets never enter a black hole.
-    let mut device = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device_path)?;
-    let reader = device.try_clone()?;
+    // DHCP starts while the kernel provider remains inactive. The provider
+    // becomes reachable only after address, routes, and DNS are all applied.
+    let mut device = None;
     let (sender, inputs) = mpsc::sync_channel(QUEUE_CAPACITY);
     let (outbound, frames) = mpsc::sync_channel(QUEUE_CAPACITY);
     let ethernet_reader = ethernet.try_clone()?;
     let ethernet_writer = ethernet;
-    thread::spawn({
-        let sender = sender.clone();
-        move || read_requests(reader, sender)
-    });
     thread::spawn({
         let sender = sender.clone();
         move || read_ethernet(ethernet_reader, sender)
@@ -208,7 +235,27 @@ fn run(
 
     loop {
         match inputs.recv_timeout(TICK) {
-            Ok(Ok(Input::Request(request))) => {
+            Ok(Ok(Input::Ethernet(frame))) => service
+                .receive_frame(frame)
+                .map_err(|_| invalid_data("runtime rejected Ethernet frame"))?,
+            Ok(Ok(Input::LinkDown)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        service.poll_at(started.elapsed(), QUEUE_CAPACITY);
+        reconcile_provider(
+            service.status(),
+            &mut device,
+            &mut provider,
+            &mut identities,
+            || open_provider(device_path),
+        )?;
+        if let Some(device) = device.as_mut() {
+            for _ in 0..QUEUE_CAPACITY {
+                let Some(request) = read_request(device)? else {
+                    break;
+                };
                 let (identity, opcode, success, response) = dispatch(&provider, &request)?;
                 match identities.get(&identity.client) {
                     Some(namespace) if *namespace != identity.namespace => {
@@ -225,21 +272,13 @@ fn run(
                     identities.remove(&identity.client);
                 }
             }
-            Ok(Ok(Input::Ethernet(frame))) => service
-                .receive_frame(frame)
-                .map_err(|_| invalid_data("runtime rejected Ethernet frame"))?,
-            Ok(Ok(Input::LinkDown)) => return Ok(()),
-            Ok(Err(error)) => return Err(error),
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-            Err(RecvTimeoutError::Timeout) => {}
+            write_readiness_events(device, &mut provider, &identities)?;
         }
-        service.poll_at(started.elapsed(), QUEUE_CAPACITY);
         let next_frame = pending_frame
             .is_none()
             .then(|| service.take_transmit())
             .flatten();
         queue_ethernet_frame(&outbound, &mut pending_frame, next_frame)?;
-        write_readiness_events(&mut device, &mut provider, &identities)?;
     }
 }
 
@@ -256,7 +295,7 @@ fn main() -> io::Result<()> {
     };
     let ethernet_fd: RawFd = ethernet_fd.parse().map_err(invalid_data)?;
     if ethernet_fd <= libc::STDERR_FILENO {
-        return Err(invalid_data("Ethernet fd must not be stdio"));
+        return Err(invalid_data("Ethernet fd must be above stdio"));
     }
     // SAFETY: the CLI contract transfers one owned descriptor to this process.
     let ethernet = SeqpacketEthernet::from_owned_fd(unsafe { OwnedFd::from_raw_fd(ethernet_fd) })?;
@@ -269,11 +308,14 @@ mod tests {
     use super::*;
     use netstack3_port_spike::{
         RemoteIpAddress, RemoteIpVersion, SocketClientId,
-        provider_dispatch_v2::RemoteSocketProviderV2 as _,
         provider_transport::{ProviderFrameType, ProviderNamespaceId},
         provider_transport_v2::{ProviderFrameV2, ProviderSocketAddressV2, ProviderSocketKindV2},
     };
-    use std::{cell::RefCell, num::NonZeroU16, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        num::NonZeroU16,
+        rc::Rc,
+    };
 
     #[test]
     fn dispatches_a_device_client_through_the_native_provider() {
@@ -424,6 +466,91 @@ mod tests {
         assert_eq!(
             server.udp_receive(server_socket).unwrap().as_deref(),
             Some(&b"provider Ethernet"[..])
+        );
+    }
+
+    #[test]
+    fn provider_ownership_follows_usable_configuration_and_revokes_clients() {
+        let runtime = Runtime::new(
+            8,
+            [1; 8192],
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        let mut provider = NativeSocketProvider::new(Rc::new(RefCell::new(runtime)));
+        let mut device = None;
+        let mut identities = HashMap::new();
+        let opens = Cell::new(0);
+        let open = || {
+            opens.set(opens.get() + 1);
+            File::open("/dev/null")
+        };
+
+        reconcile_provider(
+            DhcpStatus::Acquiring,
+            &mut device,
+            &mut provider,
+            &mut identities,
+            open,
+        )
+        .unwrap();
+        assert!(device.is_none());
+        assert_eq!(
+            opens.get(),
+            0,
+            "link-up without a lease must not capture sockets"
+        );
+
+        reconcile_provider(
+            DhcpStatus::Bound,
+            &mut device,
+            &mut provider,
+            &mut identities,
+            open,
+        )
+        .unwrap();
+        assert!(device.is_some());
+        assert_eq!(opens.get(), 1);
+
+        let client = SocketClientId::from_raw(19);
+        provider.open_client(client, 1).unwrap();
+        provider
+            .open_socket(client, ProviderSocketKindV2::Udp, RemoteIpVersion::V4)
+            .unwrap();
+        identities.insert(client, ProviderNamespaceId::from_raw(23));
+
+        reconcile_provider(
+            DhcpStatus::Acquiring,
+            &mut device,
+            &mut provider,
+            &mut identities,
+            open,
+        )
+        .unwrap();
+        assert!(device.is_none());
+        assert!(identities.is_empty());
+        assert!(
+            provider
+                .open_socket(client, ProviderSocketKindV2::Udp, RemoteIpVersion::V4)
+                .is_err(),
+            "lease loss revokes live sockets"
+        );
+
+        reconcile_provider(
+            DhcpStatus::Bound,
+            &mut device,
+            &mut provider,
+            &mut identities,
+            open,
+        )
+        .unwrap();
+        assert!(device.is_some());
+        assert_eq!(
+            opens.get(),
+            2,
+            "configuration recovery opens a new generation"
         );
     }
 

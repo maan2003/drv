@@ -36,8 +36,8 @@ testers.runNixOSTest {
 
     with subtest("booted provider ABI passes its complete kernel selftest"):
         output = machine.succeed("netstack3-provider-selftest")
-        assert "1..11" in output, output
+        assert "1..12" in output, output
         assert "not ok" not in output, output
-        assert "ok 11 - directional shutdown reached provider" in output, output
+        assert "ok 12 - directional shutdown reached provider" in output, output
   '';
 }

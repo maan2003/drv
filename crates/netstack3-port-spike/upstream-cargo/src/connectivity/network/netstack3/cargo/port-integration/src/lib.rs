@@ -66,6 +66,7 @@ use netstack3_icmp_echo::{
     IcmpEchoBindingsContext, IcmpEchoBindingsTypes, IcmpEchoSettings, IcmpSocketId,
     ReceiveIcmpEchoError,
 };
+use netstack3_ip::device::IidSecret;
 use netstack3_ip::nud::{LinkResolutionContext, LinkResolutionNotifier};
 use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
@@ -343,7 +344,10 @@ impl NativeBindingsCtx {
         packet
     }
     pub fn build_stack(&mut self) -> StackState<Self> {
-        StackStateBuilder::default().build_with_ctx(self)
+        let secret = IidSecret::new_random(&mut self.entropy);
+        let mut builder = StackStateBuilder::default();
+        builder.ipv6_builder().slaac_stable_secret_key(secret);
+        builder.build_with_ctx(self)
     }
     fn push_bounded<T>(capacity: usize, queue: &mut VecDeque<T>, item: T) -> Result<(), T> {
         if queue.len() >= capacity {

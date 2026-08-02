@@ -323,57 +323,57 @@ impl DhcpService {
     pub fn runtime(&self) -> std::cell::Ref<'_, Runtime> {
         self.rt.borrow()
     }
+    fn clear_configuration(&mut self, status: DhcpStatus) {
+        self.rt.borrow_mut().revoke_ipv4();
+        self.dns.clear();
+        self.status = status;
+    }
+    fn configure_dns(&mut self) -> bool {
+        let servers: Vec<_> = self
+            .rt
+            .borrow()
+            .dns_servers()
+            .into_iter()
+            .flatten()
+            .map(IpAddr::V4)
+            .collect();
+        self.dns.configure(&servers).is_ok()
+    }
     fn effects(&mut self) -> usize {
         let mut n = 0;
         while let Ok(e) = self.effects.try_recv() {
             n += 1;
             match e {
                 Effect::Transition(TransitionEffect::DropLease { .. }) => {
-                    self.rt.borrow_mut().revoke_ipv4();
-                    self.dns.clear();
-                    self.status = DhcpStatus::Acquiring
+                    self.clear_configuration(DhcpStatus::Acquiring);
                 }
                 Effect::Transition(TransitionEffect::HandleNewLease(l)) => {
-                    self.status = if apply_lease(
+                    let applied = apply_lease(
                         &mut self.rt.borrow_mut(),
                         l.ip_address.get().ipv4_bytes(),
                         &l.parameters,
                     )
-                    .is_ok()
-                    {
+                    .is_ok();
+                    if applied && self.configure_dns() {
                         let _ = self
                             .address
                             .unbounded_send(AddressEvent::AssignmentStateChanged(
                                 AddressAssignmentState::Assigned,
                             ));
-                        let servers: Vec<_> = self
-                            .rt
-                            .borrow()
-                            .dns_servers()
-                            .into_iter()
-                            .flatten()
-                            .map(IpAddr::V4)
-                            .collect();
-                        let _ = self.dns.configure(&servers);
-                        DhcpStatus::Bound
+                        self.status = DhcpStatus::Bound;
                     } else {
-                        DhcpStatus::Failed
+                        self.clear_configuration(DhcpStatus::Failed);
                     }
                 }
                 Effect::Transition(TransitionEffect::HandleRenewedLease(l)) => {
                     apply_dns(&mut self.rt.borrow_mut(), &l.parameters);
-                    let servers: Vec<_> = self
-                        .rt
-                        .borrow()
-                        .dns_servers()
-                        .into_iter()
-                        .flatten()
-                        .map(IpAddr::V4)
-                        .collect();
-                    let _ = self.dns.configure(&servers);
-                    self.status = DhcpStatus::Bound
+                    if self.configure_dns() {
+                        self.status = DhcpStatus::Bound;
+                    } else {
+                        self.clear_configuration(DhcpStatus::Failed);
+                    }
                 }
-                Effect::Failed => self.status = DhcpStatus::Failed,
+                Effect::Failed => self.clear_configuration(DhcpStatus::Failed),
             }
         }
         n
@@ -454,6 +454,41 @@ impl NetworkServiceEndpoint for DhcpService {
 mod tests {
     use super::*;
     use rand::SeedableRng as _;
+
+    #[test]
+    fn failed_configuration_atomically_revokes_address_routes_and_dns() {
+        let runtime = Runtime::new(
+            8,
+            [7; 1024],
+            NonZeroU64::new(1).unwrap(),
+            [0x02, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        let mut service = DhcpService::new(
+            runtime,
+            rand::rngs::StdRng::seed_from_u64(7),
+            [0x02, 0, 0, 0, 0, 1],
+        );
+        service
+            .rt
+            .borrow_mut()
+            .apply_ipv4([192, 0, 2, 10], 24, Some([192, 0, 2, 1]))
+            .unwrap();
+        service
+            .rt
+            .borrow_mut()
+            .set_dns_servers([Some(StdIpv4Addr::new(192, 0, 2, 53)), None]);
+        assert!(service.configure_dns());
+        service.status = DhcpStatus::Bound;
+
+        service.clear_configuration(DhcpStatus::Failed);
+
+        assert_eq!(service.status(), DhcpStatus::Failed);
+        assert_eq!(service.runtime().ipv4_address(), None);
+        assert_eq!(service.runtime().dns_servers(), [None, None]);
+        assert!(service.dns.resolver().is_none());
+    }
 
     #[test]
     fn upstream_client_emits_discover_through_native_packet_adapter() {
