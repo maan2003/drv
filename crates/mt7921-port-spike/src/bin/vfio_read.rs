@@ -2,12 +2,13 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
-    DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlRegister, DisabledFwdlRingTransport,
-    DisabledFwdlWrite, DynamicL1Error, DynamicL1Event, DynamicL1Transport,
-    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
-    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
-    TopOwnershipTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
+    DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
+    DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
+    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_RING_BYTES,
+    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
+    ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
+    acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
     program_disabled_fwdl_ring, read_dynamic_identity_status,
 };
 use std::{
@@ -130,6 +131,7 @@ fn run() -> Result<(), String> {
         Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
         Some("--acquire-top-ownership") => Operation::AcquireTopOwnership,
         Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
+        Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
@@ -200,7 +202,10 @@ fn run() -> Result<(), String> {
         &device,
         &info,
         0xd4000,
-        operation == Operation::ProgramDisabledFwdlRing,
+        matches!(
+            operation,
+            Operation::ProgramDisabledFwdlRing | Operation::MaskAckDisabledFwdl
+        ),
     )?;
     let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
     if acquire {
@@ -314,6 +319,31 @@ fn run() -> Result<(), String> {
         reset_vfio_device(&device)?;
         println!("{{\"fwdl_ring_event\":\"vfio_device_reset_completed\"}}");
     }
+    if operation == Operation::MaskAckDisabledFwdl {
+        let mut transport = VfioFwdlInterrupt { page: &wfdma };
+        mask_ack_disabled_fwdl_interrupt(&mut transport, log_disabled_interrupt_event).map_err(
+            |error| match error {
+                DisabledInterruptError::DmaActive(raw) => {
+                    format!("refused active WFDMA state {raw:#010x}")
+                }
+                DisabledInterruptError::InterruptsEnabled(raw) => {
+                    format!("refused enabled interrupt mask {raw:#010x}")
+                }
+                DisabledInterruptError::Transport(error) => error,
+                DisabledInterruptError::MaskReadback(raw) => {
+                    format!("interrupt mask did not clear: {raw:#010x}")
+                }
+                DisabledInterruptError::AckDidNotClear(raw) => {
+                    format!("firmware-download interrupt did not clear: {raw:#010x}")
+                }
+                DisabledInterruptError::Restore(error) => {
+                    format!("restore interrupt mask: {error}")
+                }
+            },
+        )?;
+        reset_vfio_device(&device)?;
+        println!("{{\"fwdl_interrupt_event\":\"vfio_device_reset_completed\"}}");
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -322,7 +352,10 @@ fn run() -> Result<(), String> {
         };
         page.read(register.bar_offset())
     };
-    if operation != Operation::ProgramDisabledFwdlRing {
+    if !matches!(
+        operation,
+        Operation::ProgramDisabledFwdlRing | Operation::MaskAckDisabledFwdl
+    ) {
         let mcu = read(ReadRegister::McuCommand)?;
         let interrupt = read(ReadRegister::HostInterruptStatus)?;
         let wfdma_config = read(ReadRegister::WfdmaGlobalConfig)?;
@@ -591,6 +624,22 @@ impl ReadPage {
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
+    fn write_fwdl_interrupt_enable(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || value != 0 {
+            return Err("interrupt-mask write escaped zero-only allowlist".into());
+        }
+        let within = 0xd4204 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    fn acknowledge_fwdl_interrupt(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || value & !(1 << 26) != 0 {
+            return Err("interrupt acknowledgement escaped FWDL-only allowlist".into());
+        }
+        let within = 0xd4200 - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -692,6 +741,7 @@ enum Operation {
     ReadDynamicIdentity,
     AcquireTopOwnership,
     ProgramDisabledFwdlRing,
+    MaskAckDisabledFwdl,
 }
 
 struct VfioDynamicL1<'a> {
@@ -844,4 +894,30 @@ impl DisabledFwdlRingTransport for VfioFwdlRing<'_> {
 
 fn log_disabled_fwdl_event(event: DisabledFwdlEvent) {
     println!("{{\"fwdl_ring_event\":\"{event:?}\"}}")
+}
+
+struct VfioFwdlInterrupt<'a> {
+    page: &'a ReadPage,
+}
+impl DisabledFwdlInterruptTransport for VfioFwdlInterrupt<'_> {
+    type Error = String;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4208)
+    }
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4204)
+    }
+    fn write_interrupt_enable(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.page.write_fwdl_interrupt_enable(value)
+    }
+    fn read_interrupt_status(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4200)
+    }
+    fn acknowledge_interrupt_status(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.page.acknowledge_fwdl_interrupt(value)
+    }
+}
+
+fn log_disabled_interrupt_event(event: DisabledInterruptEvent) {
+    println!("{{\"fwdl_interrupt_event\":\"{event:?}\"}}")
 }

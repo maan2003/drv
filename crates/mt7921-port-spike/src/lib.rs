@@ -1149,6 +1149,7 @@ where
 
 pub const MT7921_FWDL_RING_COUNT: u32 = 128;
 pub const MT7921_FWDL_RING_BYTES: usize = MT7921_FWDL_RING_COUNT as usize * DMA_DESCRIPTOR_LEN;
+pub const MT7921_INT_TX_DONE_FWDL: u32 = 1 << 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisabledFwdlRegister {
@@ -1321,6 +1322,111 @@ fn read_fwdl_registers<T: DisabledFwdlRingTransport>(
         cpu_index: transport.read(DisabledFwdlRegister::CpuIndex)?,
         dma_index: transport.read(DisabledFwdlRegister::DmaIndex)?,
     })
+}
+
+pub trait DisabledFwdlInterruptTransport {
+    type Error;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error>;
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error>;
+    fn write_interrupt_enable(&mut self, value: u32) -> Result<(), Self::Error>;
+    fn read_interrupt_status(&mut self) -> Result<u32, Self::Error>;
+    fn acknowledge_interrupt_status(&mut self, value: u32) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisabledInterruptEvent {
+    Snapshot {
+        global_config: u32,
+        enable: u32,
+        status: u32,
+    },
+    Masked,
+    Acknowledged {
+        value: u32,
+    },
+    Readback {
+        status: u32,
+    },
+    MaskRestored {
+        value: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisabledInterruptError<E> {
+    DmaActive(u32),
+    InterruptsEnabled(u32),
+    Transport(E),
+    MaskReadback(u32),
+    AckDidNotClear(u32),
+    Restore(E),
+}
+
+/// Port the firmware-download subset of pinned Linux `mt792x_irq_tasklet`.
+///
+/// The physical slice starts with a zero host mask, writes that same zero mask,
+/// and acknowledges only TX ring 16's W1C status bit. No unrelated pending bit
+/// is acknowledged and no interrupt source is enabled or armed.
+pub fn mask_ack_disabled_fwdl_interrupt<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<u32, DisabledInterruptError<T::Error>>
+where
+    T: DisabledFwdlInterruptTransport,
+    F: FnMut(DisabledInterruptEvent),
+{
+    let global_config = transport
+        .read_global_config()
+        .map_err(DisabledInterruptError::Transport)?;
+    if global_config & 0x5 != 0 {
+        return Err(DisabledInterruptError::DmaActive(global_config));
+    }
+    let enable = transport
+        .read_interrupt_enable()
+        .map_err(DisabledInterruptError::Transport)?;
+    if enable != 0 {
+        return Err(DisabledInterruptError::InterruptsEnabled(enable));
+    }
+    let status = transport
+        .read_interrupt_status()
+        .map_err(DisabledInterruptError::Transport)?;
+    event(DisabledInterruptEvent::Snapshot {
+        global_config,
+        enable,
+        status,
+    });
+    transport
+        .write_interrupt_enable(0)
+        .map_err(DisabledInterruptError::Transport)?;
+    event(DisabledInterruptEvent::Masked);
+    let operation = (|| {
+        let mask_readback = transport
+            .read_interrupt_enable()
+            .map_err(DisabledInterruptError::Transport)?;
+        if mask_readback != 0 {
+            return Err(DisabledInterruptError::MaskReadback(mask_readback));
+        }
+        let acknowledged = status & MT7921_INT_TX_DONE_FWDL;
+        transport
+            .acknowledge_interrupt_status(acknowledged)
+            .map_err(DisabledInterruptError::Transport)?;
+        event(DisabledInterruptEvent::Acknowledged {
+            value: acknowledged,
+        });
+        let readback = transport
+            .read_interrupt_status()
+            .map_err(DisabledInterruptError::Transport)?;
+        event(DisabledInterruptEvent::Readback { status: readback });
+        if readback & acknowledged != 0 {
+            return Err(DisabledInterruptError::AckDidNotClear(readback));
+        }
+        Ok(readback)
+    })();
+    if let Err(error) = transport.write_interrupt_enable(enable) {
+        return Err(DisabledInterruptError::Restore(error));
+    }
+    event(DisabledInterruptEvent::MaskRestored { value: enable });
+    operation
 }
 
 pub const WFSYS_SW_RST_B: u32 = 1 << 0;
@@ -2053,6 +2159,101 @@ mod tests {
                 at_ms: WFSYS_ASSERT_MS + WFSYS_READY_DEADLINE_MS
             })
         );
+    }
+
+    struct FakeInterrupt {
+        global: u32,
+        enable: u32,
+        status: u32,
+        stuck: bool,
+        writes: Vec<(&'static str, u32)>,
+    }
+    impl DisabledFwdlInterruptTransport for FakeInterrupt {
+        type Error = ();
+        fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.global)
+        }
+        fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.enable)
+        }
+        fn write_interrupt_enable(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.enable = value;
+            self.writes.push(("enable", value));
+            Ok(())
+        }
+        fn read_interrupt_status(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.status)
+        }
+        fn acknowledge_interrupt_status(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.writes.push(("ack", value));
+            if !self.stuck {
+                self.status &= !value;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn disabled_interrupt_acknowledges_only_fwdl_and_restores_mask() {
+        let mut transport = FakeInterrupt {
+            global: 0x1010_b870,
+            enable: 0,
+            status: MT7921_INT_TX_DONE_FWDL | 0x20,
+            stuck: false,
+            writes: Vec::new(),
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            mask_ack_disabled_fwdl_interrupt(&mut transport, |event| events.push(event)),
+            Ok(0x20)
+        );
+        assert_eq!(
+            transport.writes,
+            [
+                ("enable", 0),
+                ("ack", MT7921_INT_TX_DONE_FWDL),
+                ("enable", 0)
+            ]
+        );
+        assert_eq!(transport.status, 0x20);
+        assert_eq!(
+            events.last(),
+            Some(&DisabledInterruptEvent::MaskRestored { value: 0 })
+        );
+    }
+
+    #[test]
+    fn disabled_interrupt_rejects_active_state_without_writes() {
+        let mut transport = FakeInterrupt {
+            global: 1,
+            enable: 0,
+            status: 0,
+            stuck: false,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            mask_ack_disabled_fwdl_interrupt(&mut transport, |_| {}),
+            Err(DisabledInterruptError::DmaActive(1))
+        );
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn disabled_interrupt_reports_stuck_w1c_and_restores_mask() {
+        let mut transport = FakeInterrupt {
+            global: 0,
+            enable: 0,
+            status: MT7921_INT_TX_DONE_FWDL,
+            stuck: true,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            mask_ack_disabled_fwdl_interrupt(&mut transport, |_| {}),
+            Err(DisabledInterruptError::AckDidNotClear(
+                MT7921_INT_TX_DONE_FWDL
+            ))
+        );
+        assert_eq!(transport.writes.last(), Some(&("enable", 0)));
     }
 
     #[test]

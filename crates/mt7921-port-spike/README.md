@@ -96,6 +96,13 @@ poll `WFSYS_SW_INIT_DONE` for at most 500 ms. No physical adapter for address
 `0x18000140` is admitted yet; deterministic success and timeout behavior must
 precede that additional dynamic-L1 write surface.
 
+`--mask-ack-disabled-fwdl` ports the ring-16 subset of pinned Linux interrupt
+handling. It refuses active DMA or a nonzero host mask, snapshots status,
+writes only the zero mask, acknowledges only `HOST_TX_DONE_INT_STS16` using
+W1C semantics, verifies readback without clearing unrelated sources, restores
+the zero mask, and performs the mandatory VFIO reset. It does not arm a VFIO
+IRQ or enable any device interrupt.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to
