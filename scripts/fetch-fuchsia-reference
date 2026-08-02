@@ -2,14 +2,32 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
+closure=netstack3-port-v2-fuchsia-sync-1
 
 if [[ ${1:-} == --print-commit ]]; then
   printf "%s\n" "$commit"
   exit 0
 fi
-root="reference/fuchsia-$commit"
+cache=${DRV_REFERENCE_CACHE:-reference}
+root=${DRV_FUCHSIA_REFERENCE_ROOT:-reference/fuchsia-$commit}
+root_tmp="$root.tmp.$$"
+pigweed_commit=c14c119c51a82f6e044f81b7dad0a322091d4121
+pigweed_base=${DRV_PIGWEED_REFERENCE_ROOT:-reference/pigweed-$pigweed_commit}
+pigweed_tmp="$pigweed_base.tmp.$$"
 
-mkdir -p reference
+if [[ -e "$root" || -e "$root_tmp" ]]; then
+  printf 'refusing to replace existing Fuchsia reference: %s\n' "$root" >&2
+  printf 'choose a new DRV_FUCHSIA_REFERENCE_ROOT path\n' >&2
+  exit 2
+fi
+if [[ -e "$pigweed_base" || -e "$pigweed_tmp" ]]; then
+  printf 'refusing to replace existing Pigweed reference: %s\n' "$pigweed_base" >&2
+  printf 'choose a new DRV_PIGWEED_REFERENCE_ROOT path\n' >&2
+  exit 2
+fi
+mkdir -p "$cache" "$(dirname "$root")" "$root_tmp"
+mkdir -p "$(dirname "$pigweed_base")" "$pigweed_tmp/pw_bluetooth_sapphire"
+trap 'rm -rf "$root_tmp" "$pigweed_tmp"' EXIT
 
 paths=(
   src/connectivity/bluetooth
@@ -78,7 +96,7 @@ done
 
 for path in "${paths[@]}"; do
   name=${path//\//_}
-  archive="reference/fuchsia-${name}-${commit}.tar.gz"
+  archive="$cache/fuchsia-${name}-${commit}.tar.gz"
 
   if [[ ! -f "$archive" ]]; then
     curl -fL --retry 3 \
@@ -87,16 +105,15 @@ for path in "${paths[@]}"; do
   fi
 
   sha256sum "$archive" >"$archive.sha256"
-  rm -rf "$root/$path"
-  mkdir -p "$root/$path"
-  tar -xzf "$archive" -C "$root/$path"
+  mkdir -p "$root_tmp/$path"
+  tar -xzf "$archive" -C "$root_tmp/$path"
 done
 
 # BoringSSL is a gitlink in fuchsia.git, so fetch the exact revision recorded
 # by the pinned Fuchsia tree separately into its expected checkout path.
 boringssl_commit=156c7b75ae9b8c3b3f847acf264f17594c3859fb
-boringssl_archive="reference/boringssl-$boringssl_commit.tar.gz"
-boringssl_root="$root/third_party/boringssl/src"
+boringssl_archive="$cache/boringssl-$boringssl_commit.tar.gz"
+boringssl_root="$root_tmp/third_party/boringssl/src"
 
 if [[ ! -f "$boringssl_archive" ]]; then
   curl -fL --retry 3 \
@@ -105,19 +122,18 @@ if [[ ! -f "$boringssl_archive" ]]; then
 fi
 
 sha256sum "$boringssl_archive" >"$boringssl_archive.sha256"
-rm -rf "$boringssl_root"
 mkdir -p "$boringssl_root"
 tar -xzf "$boringssl_archive" -C "$boringssl_root"
-printf '%s\n' "$boringssl_commit" >"$root/third_party/boringssl/COMMIT"
+printf '%s\n' "$boringssl_commit" >"$root_tmp/third_party/boringssl/COMMIT"
 
-printf '%s\n' "$commit" >"$root/COMMIT"
+printf '%s\n' "$commit" >"$root_tmp/COMMIT"
+printf '%s\n' "$closure" >"$root_tmp/.drv-source-closure"
+mv "$root_tmp" "$root"
 
 # Fuchsia's core Sapphire host stack moved to Pigweed and is consumed as a
 # prebuilt by fuchsia.git. Keep its source beside the Fuchsia integration and
 # Rust profile layers.
-pigweed_commit=c14c119c51a82f6e044f81b7dad0a322091d4121
-pigweed_archive="reference/pigweed-pw_bluetooth_sapphire-$pigweed_commit.tar.gz"
-pigweed_root="reference/pigweed-$pigweed_commit/pw_bluetooth_sapphire"
+pigweed_archive="$cache/pigweed-pw_bluetooth_sapphire-$pigweed_commit.tar.gz"
 
 if [[ ! -f "$pigweed_archive" ]]; then
   curl -fL --retry 3 \
@@ -126,7 +142,7 @@ if [[ ! -f "$pigweed_archive" ]]; then
 fi
 
 sha256sum "$pigweed_archive" >"$pigweed_archive.sha256"
-rm -rf "$pigweed_root"
-mkdir -p "$pigweed_root"
-tar -xzf "$pigweed_archive" -C "$pigweed_root"
-printf '%s\n' "$pigweed_commit" >"$(dirname "$pigweed_root")/COMMIT"
+tar -xzf "$pigweed_archive" -C "$pigweed_tmp/pw_bluetooth_sapphire"
+printf '%s\n' "$pigweed_commit" >"$pigweed_tmp/COMMIT"
+mv "$pigweed_tmp" "$pigweed_base"
+trap - EXIT

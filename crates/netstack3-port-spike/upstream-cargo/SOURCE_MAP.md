@@ -92,3 +92,10 @@ level readiness, source addresses, EOF/errors and directional shutdown. Golden
 bytes and cross-version rejection are compatibility oracles. Loopback selection is tested
 separately: IPv4 127/8 and IPv6 ::1 stay private; all other destinations select
 Netstack3.
+
+`netstack3-provider-daemon` opens `/dev/netstack3-provider`, validates each
+multiplexed identity before dispatch, and routes requests through
+ProviderDispatcherV2 and NativeSocketProvider. Its bounded reader channel also
+drives monotonic Netstack3 time and emits only changed, sequenced readiness
+snapshots. Ethernet frames and interface configuration remain separate
+deployment capabilities rather than being granted through the provider device.

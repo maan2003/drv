@@ -89,6 +89,34 @@ impl ProviderFramedEndpointV2 {
         self.identity
     }
 
+    /// Constructs the identity-fixed endpoint for one frame received from a
+    /// multiplexed provider device. The complete frame is validated before
+    /// the header identity is accepted.
+    pub fn from_received_frame(
+        bytes: &[u8],
+        max_payload: usize,
+    ) -> Result<Self, ProviderFrameError> {
+        if bytes.len() < PROVIDER_HEADER_LEN {
+            return Err(ProviderFrameError::Truncated);
+        }
+        let u64_at = |offset| {
+            u64::from_le_bytes(
+                bytes[offset..offset + 8]
+                    .try_into()
+                    .expect("header length checked"),
+            )
+        };
+        let endpoint = Self::new(
+            ProviderIdentity {
+                namespace: crate::provider_transport::ProviderNamespaceId::from_raw(u64_at(12)),
+                client: crate::SocketClientId::from_raw(u64_at(20)),
+            },
+            max_payload,
+        )?;
+        endpoint.decode(bytes)?;
+        Ok(endpoint)
+    }
+
     pub fn encode(&self, frame: &ProviderFrameV2) -> Result<Vec<u8>, ProviderFrameError> {
         if frame.payload.len() > self.max_payload {
             return Err(ProviderFrameError::PayloadTooLarge);

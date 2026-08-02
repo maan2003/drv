@@ -187,10 +187,20 @@ one already-bounded Netstack3 datagram, while TCP readiness reads the upstream
 bindings buffer limits. Interface/route/DNS administration is a separate
 NetworkConfigurationAdmin capability. Packet-filter administration is a separate PacketFilterAdmin capability and is intentionally not granted by the application provider. NativeFilterRules carries the pinned netstack3_filter Routines types directly into FilterApi set_filter_state, without a second rule language or translator.
 
+The Cargo overlay builds `netstack3-provider-daemon`, which binds the v2 kernel
+device to ProviderDispatcherV2 and NativeSocketProvider. It validates each full
+frame before accepting its multiplexed namespace/client identity, bounds queued
+requests to the kernel queue limit, advances injected monotonic time, and emits
+sequenced events only when readiness changes. Run it as
+`netstack3-provider-daemon [DEVICE] MAC`; the device defaults to
+`/dev/netstack3-provider`. Ethernet frames and interface configuration remain
+separate deployment wiring, so the standalone daemon starts with an
+unconfigured Netstack3 interface.
+
 The experimental, incompatible version-1 proxy transport has a versioned 40-byte little-endian header and a
 64 KiB payload ceiling. ProviderFramedEndpoint fixes client and namespace
 identity at construction and rejects mismatched identities on decode.
 ProviderAbiHarness supplies bounded request/response FIFOs plus golden-byte,
-malformed-identity, and queue-capacity tests for a later kernel patch.
+malformed-identity, and queue-capacity compatibility tests.
 The version-1 routing rule is explicit: IPv4 127/8 and IPv6 ::1 remain private
 Linux loopback; every other destination is a Netstack3 remote socket.

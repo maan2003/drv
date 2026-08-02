@@ -59,6 +59,8 @@ struct SocketV2 {
     connecting: bool,
     connect_failed: bool,
     sequence: u64,
+    emitted_sequence: u64,
+    last_readiness: Option<(ProviderReadinessV2, Option<RemoteSocketError>)>,
     pending_error: Option<RemoteSocketError>,
 }
 
@@ -95,6 +97,41 @@ impl NativeSocketProvider {
                 sockets: HashMap::new(),
             })),
         }
+    }
+
+    /// Samples all live sockets and returns only readiness states that changed
+    /// since the previous call. The daemon uses this to produce unsolicited
+    /// ABI-v2 readiness events without lossy edge bookkeeping.
+    pub fn take_readiness_changes(
+        &mut self,
+    ) -> Vec<(
+        SocketClientId,
+        RemoteSocketHandle,
+        ProviderReadinessSnapshotV2,
+    )> {
+        let handles: Vec<_> = self.state.borrow().sockets.keys().copied().collect();
+        let mut changes = Vec::new();
+        for handle in handles {
+            let Ok(snapshot) =
+                netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::readiness(
+                    self, handle,
+                )
+            else {
+                continue;
+            };
+            let mut state = self.state.borrow_mut();
+            let Some(socket) = state.sockets.get_mut(&handle) else {
+                continue;
+            };
+            let (client, v2) = match socket {
+                Socket::Udp { client, v2, .. } | Socket::Tcp { client, v2, .. } => (*client, v2),
+            };
+            if v2.emitted_sequence < snapshot.sequence {
+                v2.emitted_sequence = snapshot.sequence;
+                changes.push((client, handle, snapshot));
+            }
+        }
+        changes
     }
 
     fn reserve(&self, client: SocketClientId) -> Result<(), RemoteSocketError> {
@@ -1271,10 +1308,6 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
             Some(Socket::Udp { v2, .. }) | Some(Socket::Tcp { v2, .. }) => v2,
             None => return Err(RemoteSocketError::StaleHandle),
         };
-        v2.sequence = v2
-            .sequence
-            .checked_add(1)
-            .ok_or(RemoteSocketError::ResourceExhausted)?;
         let mut bits = 0;
         if old.readable || v2.read_closed {
             bits |= ProviderReadinessV2::READABLE;
@@ -1300,9 +1333,17 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         if v2.connect_failed {
             bits |= ProviderReadinessV2::CONNECT_FAILED;
         }
+        let current = (ProviderReadinessV2(bits), v2.pending_error);
+        if v2.last_readiness != Some(current) {
+            v2.sequence = v2
+                .sequence
+                .checked_add(1)
+                .ok_or(RemoteSocketError::ResourceExhausted)?;
+            v2.last_readiness = Some(current);
+        }
         Ok(ProviderReadinessSnapshotV2 {
             sequence: v2.sequence,
-            readiness: ProviderReadinessV2(bits),
+            readiness: current.0,
             error: v2.pending_error,
         })
     }
@@ -1481,7 +1522,9 @@ mod tests {
             socket,
         )
         .unwrap();
-        assert!(second.sequence > first.sequence);
+        assert_eq!(second.sequence, first.sequence);
+        assert_eq!(provider.take_readiness_changes(), [(client, socket, first)]);
+        assert!(provider.take_readiness_changes().is_empty());
         assert_eq!(
             netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::set_option(
                 &mut provider,

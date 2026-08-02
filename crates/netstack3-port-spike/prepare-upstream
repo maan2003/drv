@@ -2,12 +2,25 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
+closure=netstack3-port-v2-fuchsia-sync-1
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-refroot="$repo/reference/fuchsia-$commit"
+refroot=${DRV_FUCHSIA_REFERENCE_ROOT:-$repo/reference/fuchsia-$commit}
 
-if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]]; then
-  "$repo/scripts/fetch-fuchsia-reference"
+if [[ ! -e "$refroot" ]]; then
+  DRV_FUCHSIA_REFERENCE_ROOT="$refroot" "$repo/scripts/fetch-fuchsia-reference"
+fi
+if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]] ||
+   [[ ! -f "$refroot/.drv-source-closure" ]] ||
+   [[ $(cat "$refroot/.drv-source-closure") != "$closure" ]] ||
+   [[ ! -f "$refroot/src/lib/mundane/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/src/lib/fuchsia-sync/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/src/connectivity/wlan/lib/fcg-crypto/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/third_party/boringssl/src/include/openssl/base.h" ]]; then
+  printf 'incomplete or stale Fuchsia reference: %s\n' "$refroot" >&2
+  printf 'materialize a fresh root with DRV_FUCHSIA_REFERENCE_ROOT=<new-path> %s\n' \
+    "$repo/scripts/fetch-fuchsia-reference" >&2
+  exit 2
 fi
 
 cp -R "$here/upstream-cargo/src" "$refroot/"

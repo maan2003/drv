@@ -17,6 +17,25 @@ pub struct ProviderAcceptV2 {
     pub peer: ProviderSocketAddressV2,
 }
 
+/// Encodes an unsolicited readiness notification for a device-multiplexed
+/// client. Events use request ID zero because they do not match a request.
+pub fn encode_readiness_changed_v2(
+    endpoint: &ProviderFramedEndpointV2,
+    handle: RemoteSocketHandle,
+    snapshot: ProviderReadinessSnapshotV2,
+) -> Result<Vec<u8>, ProviderFrameError> {
+    let mut payload = snapshot.sequence.to_le_bytes().to_vec();
+    payload.extend(handle.into_raw().to_le_bytes());
+    payload.extend(snapshot.readiness.0.to_le_bytes());
+    payload.push(snapshot.error.map(error_code).unwrap_or(0));
+    endpoint.encode(&ProviderFrameV2 {
+        frame_type: ProviderFrameType::ReadinessEvent,
+        opcode: ProviderOpcodeV2::ReadinessChanged,
+        request_id: 0,
+        payload,
+    })
+}
+
 /// Complete semantic surface consumed by the Linux v2 proxy. Implementations
 /// adapt these operations to Netstack3; fd tables and errno remain host-side.
 pub trait RemoteSocketProviderV2 {
