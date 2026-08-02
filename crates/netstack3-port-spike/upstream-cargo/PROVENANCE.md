@@ -66,7 +66,7 @@ Pinned `wlan-trace` event names and calls remain the production implementation.
 The closure retains the pinned FIDL runtime and Zircon Rust value/runtime
 sources as references for MLME boundaries. Exact `zx-types` and `zx-status`
 sources are built unchanged. Separately licensed host facades expose only
-status/raw values and the FIDL error required by generic responder helpers;
+status/raw values, monotonic time value semantics, and the FIDL error required by generic responder helpers;
 syscalls, handles, encoding, and transport are not emulated.
 
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool

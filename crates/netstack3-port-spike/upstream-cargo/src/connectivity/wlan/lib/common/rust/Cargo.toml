@@ -35,3 +35,4 @@ static_assertions.workspace = true
 thiserror.workspace = true
 wlan_bitfield.workspace = true
 zerocopy.workspace = true
+zx = { path = "../../../../../../sdk/rust/zx" }

@@ -30,6 +30,18 @@
  pub mod test_utils;
  pub mod tim;
  pub mod time;
+--- a/src/connectivity/wlan/lib/common/rust/src/time.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/time.rs
+@@ -26,9 +26,7 @@
+     Hash,
+ )]
+ pub struct TimeUnit(pub u16);
+ 
+-#[cfg(target_os = "fuchsia")]
+-#[cfg(target_os = "fuchsia")]
+ impl From<TimeUnit> for zx::MonotonicDuration {
+     fn from(tu: TimeUnit) -> zx::MonotonicDuration {
+         zx::MonotonicDuration::from_micros(tu.into_micros())
 --- a/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
 @@ -3,16 +3,23 @@
