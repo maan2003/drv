@@ -5,14 +5,15 @@ use mt7921_port_spike::{
     DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, IrqLifecycle,
-    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
-    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent,
-    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind,
-    ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
+    DmaDescriptor, DynamicL1Error, DynamicL1Event, DynamicL1Transport, GlobalTxRingError,
+    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
+    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
+    MT7921_FWDL_RING_BYTES, OwnershipError, OwnershipEvent, OwnershipTransport,
+    PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState,
     acquire_driver_ownership, acquire_top_driver_ownership, mask_ack_disabled_fwdl_interrupt,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    prepare_global_tx_rings, program_disabled_fwdl_ring, read_dynamic_identity_status,
+    select_vfio_irq, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -225,6 +226,7 @@ fn run() -> Result<(), String> {
         Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
         Some("--inventory-vfio-irqs") => Operation::InventoryVfioIrqs,
         Some("--install-disable-vfio-irq") => Operation::InstallDisableVfioIrq,
+        Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--run-one-shot-fwdl") => {
             return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
         }
@@ -525,6 +527,54 @@ fn run() -> Result<(), String> {
         reset?;
         println!("{{\"fwdl_stage_event\":\"arenas_unmapped_and_vfio_device_reset\"}}");
     }
+    if operation == Operation::PrepareOwnedGlobalTxRings {
+        let mut guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        let mut fwdl = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
+        let mut mcu = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
+        guard.initialize_descriptor_page()?;
+        fwdl.initialize_descriptor_page()?;
+        mcu.initialize_descriptor_page()?;
+        let operation = {
+            let mut transport = VfioGlobalTxRings { page: &wfdma };
+            prepare_global_tx_rings(
+                &mut transport,
+                guard.iova,
+                fwdl.iova,
+                mcu.iova,
+                log_global_tx_ring_event,
+            )
+            .map_err(|error| match error {
+                GlobalTxRingError::InvalidArena => "invalid owned TX arena".into(),
+                GlobalTxRingError::ActiveState {
+                    global_config,
+                    interrupt_enable,
+                } => format!(
+                    "refused active state global={global_config:#010x} interrupts={interrupt_enable:#010x}"
+                ),
+                GlobalTxRingError::InvalidMmio => "invalid all-ones TX ring MMIO".into(),
+                GlobalTxRingError::DirtyRing { index, state } => {
+                    format!("TX ring {index} is not idle: {state:?}")
+                }
+                GlobalTxRingError::UnexpectedFwdlExtCtrl(raw) => {
+                    format!("unexpected ring16 EXT_CTRL {raw:#010x}")
+                }
+                GlobalTxRingError::Transport(error) => error,
+                GlobalTxRingError::Readback { index, state } => {
+                    format!("TX ring {index} ownership readback mismatch: {state:?}")
+                }
+            })
+        };
+        reset_vfio_device(&device)?;
+        println!("{{\"global_tx_ring_event\":\"vfio_device_reset_while_pinned\"}}");
+        let guard_unmap = guard.teardown();
+        let fwdl_unmap = fwdl.teardown();
+        let mcu_unmap = mcu.teardown();
+        guard_unmap?;
+        fwdl_unmap?;
+        mcu_unmap?;
+        println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
+        operation?;
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -537,6 +587,7 @@ fn run() -> Result<(), String> {
         operation,
         Operation::ProgramDisabledFwdlRing
             | Operation::MaskAckDisabledFwdl
+            | Operation::PrepareOwnedGlobalTxRings
             | Operation::StageDisabledFirmwareDescriptor
             | Operation::InstallDisableVfioIrq
     ) {
@@ -663,6 +714,16 @@ impl<'a> DmaArena<'a> {
         }
         unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
         for offset in (0..MT7921_FWDL_RING_BYTES).step_by(16) {
+            unsafe {
+                std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
+            };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn initialize_descriptor_page(&mut self) -> Result<(), String> {
+        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        for offset in (0..self.len).step_by(16) {
             unsafe {
                 std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
             };
@@ -972,6 +1033,33 @@ impl ReadPage {
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
+    fn write_tx_ring_slot(
+        &self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || index >= 18 {
+            return Err("global TX ring write escaped slot allowlist".into());
+        }
+        for (word, value) in [descriptor_base, descriptor_count, cpu_index]
+            .into_iter()
+            .enumerate()
+        {
+            let within = 0x300 + index * 0x10 + word * 4;
+            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        }
+        Ok(())
+    }
+    fn reset_all_tx_indices(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || value != u32::MAX {
+            return Err("DTX reset escaped all-rings-only allowlist".into());
+        }
+        let within = 0xd420c - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
     fn write_fwdl_interrupt_enable(&self, value: u32) -> Result<(), String> {
         if self.bar_page != 0xd4000 || value != 0 {
             return Err("interrupt-mask write escaped zero-only allowlist".into());
@@ -1119,6 +1207,7 @@ enum Operation {
     StageDisabledFirmwareDescriptor,
     InventoryVfioIrqs,
     InstallDisableVfioIrq,
+    PrepareOwnedGlobalTxRings,
 }
 
 struct VfioDynamicL1<'a> {
@@ -1271,6 +1360,51 @@ impl DisabledFwdlRingTransport for VfioFwdlRing<'_> {
 
 fn log_disabled_fwdl_event(event: DisabledFwdlEvent) {
     println!("{{\"fwdl_ring_event\":\"{event:?}\"}}")
+}
+
+struct VfioGlobalTxRings<'a> {
+    page: &'a ReadPage,
+}
+impl GlobalTxRingTransport for VfioGlobalTxRings<'_> {
+    type Error = String;
+    fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4208)
+    }
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4204)
+    }
+    fn read_tx_ring(&mut self, index: usize) -> Result<TxRingState, Self::Error> {
+        if index >= 18 {
+            return Err("TX ring read escaped slot allowlist".into());
+        }
+        let base = 0xd4300 + index * 0x10;
+        Ok(TxRingState {
+            descriptor_base: self.page.read(base)?,
+            descriptor_count: self.page.read(base + 4)?,
+            cpu_index: self.page.read(base + 8)?,
+            dma_index: self.page.read(base + 12)?,
+        })
+    }
+    fn read_fwdl_ext_ctrl(&mut self) -> Result<u32, Self::Error> {
+        self.page.read(0xd4640)
+    }
+    fn write_tx_ring(
+        &mut self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+    ) -> Result<(), Self::Error> {
+        self.page
+            .write_tx_ring_slot(index, descriptor_base, descriptor_count, cpu_index)
+    }
+    fn reset_tx_indices(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.page.reset_all_tx_indices(value)
+    }
+}
+
+fn log_global_tx_ring_event(event: GlobalTxRingEvent) {
+    println!("{{\"global_tx_ring_event\":\"{event:?}\"}}")
 }
 
 struct VfioFwdlInterrupt<'a> {

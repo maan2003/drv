@@ -137,6 +137,13 @@ backing. `prepare_mcu_rx_ring` separately builds Linux's eight-entry,
 and one empty slot, using a distinct aligned low-32-bit ring page and 16 KiB
 buffer mapping. It rejects overlapping or out-of-range arenas.
 
+`--prepare-owned-global-tx-rings` is the inactive physical adapter for this
+preflight. It maps three separate low-32-bit pages filled entirely with
+CPU-owned reset descriptors, applies and verifies all 18 ring slots plus the
+global DTX reset while DMA and interrupts remain disabled, VFIO-resets while
+all pages are still pinned, and only then unmaps them. It cannot enable DMA,
+publish a producer index, install an IRQ, or send an MCU command.
+
 `encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
 and request bodies for patch-semaphore acquisition, `PATCH_START`, and
 `TARGET_ADDRESS_LEN`. It rejects sequence zero/outside the four-bit firmware
