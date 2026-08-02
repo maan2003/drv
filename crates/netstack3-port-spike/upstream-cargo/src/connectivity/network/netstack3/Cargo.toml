@@ -17,6 +17,7 @@ members = [
   "../../../../sdk/fidl/fuchsia.wlan.mlme",
   "../../../../sdk/fidl/fuchsia.wlan.sme",
   "../../../../sdk/fidl/fuchsia.wlan.softmac",
+  "../../../../sdk/fidl/fuchsia.wlan.stats",
   "../../wlan/lib/fidl-ext", "../../wlan/lib/frame_writer/macro", "../../wlan/lib/trace",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
