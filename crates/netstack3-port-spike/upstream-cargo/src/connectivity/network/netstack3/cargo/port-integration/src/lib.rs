@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
-use std::num::{NonZeroU16, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use net_types::UnicastAddr;
 use net_types::ethernet::Mac;
 use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Mtu, Subnet};
 use net_types::{SpecifiedAddr, ZonedAddr};
+use netstack3_base::socket::ShutdownType;
 use netstack3_base::sync::{DynDebugReferences, RcNotifier};
 use netstack3_base::{
     AddressResolutionFailed, AtomicInstant, ChecksumOffloadResult, DeferredResourceRemovalContext,
@@ -62,7 +63,7 @@ use netstack3_port_spike::EthernetFrame;
 use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_tcp::{
     BufferSizes, ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
-    TcpSocketDiagnostics,
+    TcpSocketDiagnostics, TcpSocketId,
 };
 use netstack3_udp::{
     ReceiveUdpError, UdpBindingsTypes, UdpPacketMeta, UdpReceiveBindingsContext, UdpSettings,
@@ -899,6 +900,16 @@ impl TcpSocketDestructionContext for NativeBindingsCtx {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct UdpSocketHandle(u64);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TcpSocketHandle(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcpShutdown {
+    Send,
+    Receive,
+    SendAndReceive,
+}
+
 /// Errors at the deliberately small native runtime boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
@@ -909,10 +920,17 @@ pub enum RuntimeError {
     AddressInUse,
     SocketLimit,
     UnknownSocket,
+    InvalidState,
+    WouldBlock,
     SendFailed,
 }
 
 type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
+type NativeTcpV4 = TcpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
+struct RuntimeTcpSocket {
+    id: NativeTcpV4,
+    buffers: NativeTcpBuffers,
+}
 
 /// Single-owner facade over one Netstack3 core and one Ethernet interface.
 ///
@@ -921,6 +939,7 @@ type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBind
 pub struct Runtime {
     // External strong IDs must be dropped before core's primary resources.
     udp: HashMap<UdpSocketHandle, NativeUdpV4>,
+    tcp: HashMap<TcpSocketHandle, RuntimeTcpSocket>,
     device: EthernetDeviceId<NativeBindingsCtx>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     next_socket: u64,
@@ -983,6 +1002,7 @@ impl Runtime {
             .set_configuration(&device, TransmitQueueConfiguration::Fifo);
         Ok(Self {
             udp: HashMap::new(),
+            tcp: HashMap::new(),
             device,
             ipv4_address: None,
             next_socket: 0,
@@ -1097,7 +1117,7 @@ impl Runtime {
     }
 
     pub fn udp_socket(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
-        if self.udp.len() >= self.bindings.capacity {
+        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = self.stack.api(&mut self.bindings).udp::<Ipv4>().create();
@@ -1156,6 +1176,177 @@ impl Runtime {
     ) -> Result<Option<Vec<u8>>, RuntimeError> {
         let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id))
+    }
+
+    pub fn tcp_socket(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
+        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let socket_data = NativeTcpSocketData::buffers(BufferSizes {
+            send: self.bindings.tcp_settings.send_buffer.default().get(),
+            receive: self.bindings.tcp_settings.receive_buffer.default().get(),
+        });
+        let buffers = socket_data.client_buffers().unwrap();
+        let id = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .create(socket_data);
+        let handle = TcpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("socket handle space exhausted");
+        assert!(
+            self.tcp
+                .insert(handle, RuntimeTcpSocket { id, buffers })
+                .is_none()
+        );
+        Ok(handle)
+    }
+
+    pub fn tcp_bind(
+        &mut self,
+        handle: TcpSocketHandle,
+        address: Option<[u8; 4]>,
+        port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        let address = address
+            .map(|a| SpecifiedAddr::new(Ipv4Addr::new(a)).ok_or(RuntimeError::InvalidAddress))
+            .transpose()?
+            .map(ZonedAddr::Unzoned);
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .bind(id, address, Some(port))
+            .map_err(|_| RuntimeError::AddressInUse)
+    }
+
+    pub fn tcp_listen(
+        &mut self,
+        handle: TcpSocketHandle,
+        backlog: NonZeroUsize,
+    ) -> Result<(), RuntimeError> {
+        if backlog.get() > self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .listen(id, backlog)
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn tcp_connect(
+        &mut self,
+        handle: TcpSocketHandle,
+        remote_address: [u8; 4],
+        remote_port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        let address = SpecifiedAddr::new(Ipv4Addr::new(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .connect(id, Some(ZonedAddr::Unzoned(address)), remote_port)
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    pub fn tcp_accept(
+        &mut self,
+        listener: TcpSocketHandle,
+    ) -> Result<TcpSocketHandle, RuntimeError> {
+        if self.udp.len() + self.tcp.len() >= self.bindings.capacity {
+            return Err(RuntimeError::SocketLimit);
+        }
+        let listener = &self
+            .tcp
+            .get(&listener)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let (id, _remote, buffers) = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .accept(listener)
+            .map_err(|_| RuntimeError::WouldBlock)?;
+        let handle = TcpSocketHandle(self.next_socket);
+        self.next_socket = self
+            .next_socket
+            .checked_add(1)
+            .expect("socket handle space exhausted");
+        assert!(
+            self.tcp
+                .insert(handle, RuntimeTcpSocket { id, buffers })
+                .is_none()
+        );
+        Ok(handle)
+    }
+
+    pub fn tcp_write(
+        &mut self,
+        handle: TcpSocketHandle,
+        payload: &[u8],
+    ) -> Result<usize, RuntimeError> {
+        let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let written = socket.buffers.write(payload);
+        if written != 0 {
+            self.stack
+                .api(&mut self.bindings)
+                .tcp::<Ipv4>()
+                .do_send(&socket.id);
+        }
+        Ok(written)
+    }
+
+    pub fn tcp_read(
+        &mut self,
+        handle: TcpSocketHandle,
+        out: &mut [u8],
+    ) -> Result<usize, RuntimeError> {
+        let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let read = socket.buffers.read(out);
+        if read != 0 {
+            self.stack
+                .api(&mut self.bindings)
+                .tcp::<Ipv4>()
+                .on_receive_buffer_read(&socket.id);
+        }
+        Ok(read)
+    }
+
+    pub fn tcp_shutdown(
+        &mut self,
+        handle: TcpSocketHandle,
+        how: TcpShutdown,
+    ) -> Result<(), RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        let how = match how {
+            TcpShutdown::Send => ShutdownType::Send,
+            TcpShutdown::Receive => ShutdownType::Receive,
+            TcpShutdown::SendAndReceive => ShutdownType::SendAndReceive,
+        };
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .shutdown(id, how)
+            .map(|_| ())
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn tcp_close(&mut self, handle: TcpSocketHandle) -> Result<(), RuntimeError> {
+        let socket = self
+            .tcp
+            .remove(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .close(socket.id);
+        Ok(())
     }
 }
 
@@ -1299,5 +1490,77 @@ mod tests {
 
         assert!(client.udp_socket().is_ok());
         assert_eq!(client.udp_socket(), Err(RuntimeError::SocketLimit));
+    }
+    #[test]
+    fn two_native_runtimes_resolve_arp_and_exchange_tcp() {
+        let mut client = runtime(11, [0x02, 0, 0, 0, 1, 1], [192, 0, 2, 11]);
+        let mut server = runtime(12, [0x02, 0, 0, 0, 1, 2], [192, 0, 2, 12]);
+        let port = NonZeroU16::new(4040).unwrap();
+        let listener = server.tcp_socket().unwrap();
+        server
+            .tcp_bind(listener, Some([192, 0, 2, 12]), port)
+            .unwrap();
+        server
+            .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+
+        let connection = client.tcp_socket().unwrap();
+        client
+            .tcp_connect(connection, [192, 0, 2, 12], port)
+            .unwrap();
+        let arp = client.take_tx().expect("connect starts address resolution");
+        assert_eq!(&arp.as_bytes()[12..14], &[0x08, 0x06]);
+        server.receive_frame(arp);
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let accepted = server.tcp_accept(listener).expect("handshake completed");
+        assert_eq!(server.tcp_socket(), Err(RuntimeError::SocketLimit));
+
+        assert_eq!(
+            client.tcp_write(connection, b"native TCP request").unwrap(),
+            18
+        );
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let mut request = [0; 32];
+        let n = server.tcp_read(accepted, &mut request).unwrap();
+        assert_eq!(&request[..n], b"native TCP request");
+
+        assert_eq!(server.tcp_write(accepted, b"native TCP reply").unwrap(), 16);
+        for _ in 0..32 {
+            if exchange(&mut client, &mut server) == 0 {
+                break;
+            }
+        }
+        let mut reply = [0; 32];
+        let n = client.tcp_read(connection, &mut reply).unwrap();
+        assert_eq!(&reply[..n], b"native TCP reply");
+
+        client.tcp_shutdown(connection, TcpShutdown::Send).unwrap();
+        let mut close_frames = 0;
+        for _ in 0..32 {
+            close_frames += exchange(&mut client, &mut server);
+        }
+        assert!(close_frames > 0, "shutdown emitted and acknowledged FIN");
+        server.tcp_shutdown(accepted, TcpShutdown::Send).unwrap();
+        for _ in 0..32 {
+            exchange(&mut client, &mut server);
+        }
+        client.tcp_close(connection).unwrap();
+        server.tcp_close(accepted).unwrap();
+        server.tcp_close(listener).unwrap();
+        assert_eq!(
+            client.tcp_close(connection),
+            Err(RuntimeError::UnknownSocket)
+        );
+        let replacement = client.tcp_socket().unwrap();
+        assert_ne!(replacement, connection);
+        client.tcp_close(replacement).unwrap();
     }
 }
