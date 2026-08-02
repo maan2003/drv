@@ -90,7 +90,7 @@ Wi-Fi Ethernet boundary <- owned EthernetFrame <- Netstack3 host binding
 `EthernetFrame` owns exactly 14 through 1514 bytes (Ethernet II without FCS,
 initially no VLAN, 1500-byte MTU). Both fake-device queues have an explicit item
 bound and return frame ownership on backpressure. The trait exposes no file,
-path, descriptor, ioctl, TAP handle, hardware handle, clock, executor, or random
+path, descriptor, ioctl, hardware handle, clock, executor, or random
 source. Configuration, monotonic timers, entropy and socket readiness are
 separate injected capabilities. `EthernetEventSource` adds link, receive-ready,
 and returned-transmit-credit events without exposing an OS handle, while
@@ -99,11 +99,6 @@ backpressure. This makes the
 frame edge usable in-process without granting the protocol engine ambient
 hardware or filesystem authority and keeps it compatible with
 [REQ-host-portability](../../specs/REQ-host-portability.md).
-
-A Linux TAP adapter may later be placed **outside** this contract for temporary
-first-connectivity testing. It is not the target binding and must not leak a
-file descriptor or Linux type into portable code. The target path is direct
-owned-frame exchange with the Wi-Fi driver's Ethernet boundary.
 
 ## Reproduce the executable proof
 
@@ -115,8 +110,7 @@ owned-frame exchange with the Wi-Fi driver's Ethernet boundary.
 - short and oversized frames are rejected before crossing it; and
 - bounded queues return ownership rather than allocate without limit or block.
 
-The package tests also round-trip DHCPv4 acquisition messages and DNS queries
-without ambient I/O. Run these boundary tests with:
+The package tests drive the pinned Fuchsia DHCP client and Trust-DNS resolver through production Netstack3 without ambient I/O. Run these boundary tests with:
 
 ```sh
 cargo test -p netstack3-port-spike
@@ -176,9 +170,22 @@ The exact facade limits are:
 - each TCP direction uses a 64 KiB default buffer under Netstack3's configured
   4 KiB minimum and 4 MiB maximum.
 
-This establishes a usable synchronous native userspace stack without Fuchsia
-platform bindings. The embedding remains responsible for driving time/frame
-polls and DHCP renewal/rebind/expiry and DNS retry/cache policy; the supplied
-lease deadlines and truncation signal make those policies explicit. The final
-deployment-specific step is implementing the existing frame/readiness contract
-at the Wi-Fi Ethernet boundary. No TAP device or MT7921 code is involved.
+This establishes a usable synchronous native userspace stack. The embedding drives bounded time/frame polls; DHCP renewal/rebind/expiry and DNS retry/cache/TCP fallback execute in their pinned upstream state machines. The remaining deployment-specific step is implementing the existing frame/readiness contract at the Wi-Fi Ethernet boundary.
+
+## Production host socket boundary
+
+RemoteSocketProvider is the authority-free application boundary intended for
+a Linux kernel proxy. It exposes only Netstack3-backed remote IPv4/IPv6 UDP and
+TCP operations. Private Linux loopback traffic remains outside this provider.
+Each proxy client receives a non-reused capability ID and explicit socket
+quota; closing the client revokes every handle. Closed IDs remain stale rather
+than aliasing a later socket.
+
+NativeSocketProvider maps those operations directly to production Netstack3
+UDP/TCP APIs. It adds no transport state machine. UDP readiness stages at most
+one already-bounded Netstack3 datagram, while TCP readiness reads the upstream
+bindings buffer limits. Interface/route/DNS administration is a separate
+NetworkConfigurationAdmin capability. Packet-filter administration is a
+separate PacketFilterAdmin capability and is intentionally not granted by the
+application provider; the current runtime retains the pinned pass-all
+socket-filter binding until the upstream rule model is packaged.

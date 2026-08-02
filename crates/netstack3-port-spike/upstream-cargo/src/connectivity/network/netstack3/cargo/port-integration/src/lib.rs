@@ -5,8 +5,9 @@
 
 #![recursion_limit = "256"]
 
-pub mod service;
 pub mod dns_bridge;
+pub mod service;
+pub mod socket_provider;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -70,13 +71,15 @@ use netstack3_ip::raw::{
 use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
 const MAX_DHCP_DATAGRAM_LEN: usize = 1232;
 use netstack3_port_spike::{
-    EthernetDeviceEvent, EthernetFrame, NetworkServiceEndpoint, StackEthernetEndpoint,
+    EthernetDeviceEvent, EthernetFrame, NetworkConfigurationAdmin, NetworkServiceEndpoint,
+    StackEthernetEndpoint,
 };
-use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_tcp::{
-    BufferSizes, ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
+    AcceptError, BindError, BufferSizes, ConnectError, ConnectionError, ListenError,
+    ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
     TcpSocketDiagnostics, TcpSocketId,
 };
+use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_udp::{
     ReceiveUdpError, UdpBindingsTypes, UdpPacketMeta, UdpReceiveBindingsContext, UdpSettings,
     UdpSocketId,
@@ -940,7 +943,61 @@ pub enum RuntimeError {
     WouldBlock,
     SendFailed,
     PayloadTooLarge,
+    NetworkUnreachable,
+    HostUnreachable,
+    ConnectionRefused,
+    ConnectionPending,
+    AlreadyConnected,
+    TimedOut,
+    PermissionDenied,
+    NotSupported,
     InvalidLease,
+}
+
+fn map_tcp_accept_error(error: AcceptError) -> RuntimeError {
+    match error {
+        AcceptError::WouldBlock => RuntimeError::WouldBlock,
+        AcceptError::NotSupported => RuntimeError::NotSupported,
+    }
+}
+
+fn map_tcp_bind_error(error: BindError) -> RuntimeError {
+    match error {
+        BindError::AlreadyBound => RuntimeError::InvalidState,
+        BindError::LocalAddressError(_) => RuntimeError::AddressInUse,
+    }
+}
+
+fn map_tcp_listen_error(error: ListenError) -> RuntimeError {
+    match error {
+        ListenError::ListenerExists => RuntimeError::AddressInUse,
+        ListenError::NotSupported => RuntimeError::NotSupported,
+    }
+}
+
+fn map_tcp_connect_error(error: ConnectError) -> RuntimeError {
+    match error {
+        ConnectError::NoPort => RuntimeError::SocketLimit,
+        ConnectError::NoRoute => RuntimeError::NetworkUnreachable,
+        ConnectError::Zone(_) => RuntimeError::InvalidAddress,
+        ConnectError::ConnectionExists => RuntimeError::AddressInUse,
+        ConnectError::Listener => RuntimeError::NotSupported,
+        ConnectError::Pending => RuntimeError::ConnectionPending,
+        ConnectError::Completed => RuntimeError::AlreadyConnected,
+        ConnectError::Aborted => RuntimeError::ConnectionRefused,
+        ConnectError::ConnectionError(error) => match error {
+            ConnectionError::ConnectionRefused | ConnectionError::PortUnreachable => {
+                RuntimeError::ConnectionRefused
+            }
+            ConnectionError::NetworkUnreachable => RuntimeError::NetworkUnreachable,
+            ConnectionError::HostUnreachable | ConnectionError::DestinationHostDown => {
+                RuntimeError::HostUnreachable
+            }
+            ConnectionError::TimedOut => RuntimeError::TimedOut,
+            ConnectionError::PermissionDenied => RuntimeError::PermissionDenied,
+            _ => RuntimeError::SendFailed,
+        },
+    }
 }
 
 type NativeUdpV4 = UdpSocketId<Ipv4, WeakDeviceId<NativeBindingsCtx>, NativeBindingsCtx>;
@@ -1204,7 +1261,9 @@ impl Runtime {
         }
     }
 
-    pub fn set_dns_servers(&mut self, servers: [Option<std::net::Ipv4Addr>; 2]) { self.dns_servers = servers; }
+    pub fn set_dns_servers(&mut self, servers: [Option<std::net::Ipv4Addr>; 2]) {
+        self.dns_servers = servers;
+    }
 
     pub fn dns_servers(&self) -> [Option<std::net::Ipv4Addr>; 2] {
         self.dns_servers
@@ -1235,7 +1294,9 @@ impl Runtime {
     /// Takes one full IPv4 packet for the upstream DHCP core AF_PACKET adapter.
     pub fn dhcp_packet_receive(&mut self) -> Option<Vec<u8>> {
         while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
-            let Some(packet) = frame.get(14..) else { continue };
+            let Some(packet) = frame.get(14..) else {
+                continue;
+            };
             if packet.len() >= 20 && packet[0] >> 4 == 4 {
                 return Some(packet.to_vec());
             }
@@ -1466,7 +1527,10 @@ impl Runtime {
     }
 
     pub fn udp_close(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
-        let id = self.udp.remove(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let id = self
+            .udp
+            .remove(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
         drop(self.stack.api(&mut self.bindings).udp::<Ipv4>().close(id));
         Ok(())
     }
@@ -1599,7 +1663,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
             .bind(id, address, Some(port))
-            .map_err(|_| RuntimeError::AddressInUse)
+            .map_err(map_tcp_bind_error)
     }
 
     pub fn tcp_listen(
@@ -1615,7 +1679,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
             .listen(id, backlog)
-            .map_err(|_| RuntimeError::InvalidState)
+            .map_err(map_tcp_listen_error)
     }
 
     pub fn tcp_connect(
@@ -1631,7 +1695,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
             .connect(id, Some(ZonedAddr::Unzoned(address)), remote_port)
-            .map_err(|_| RuntimeError::SendFailed)
+            .map_err(map_tcp_connect_error)
     }
 
     pub fn tcp_accept(
@@ -1651,7 +1715,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
             .accept(listener)
-            .map_err(|_| RuntimeError::WouldBlock)?;
+            .map_err(map_tcp_accept_error)?;
         let handle = TcpSocketHandle(self.next_socket);
         self.next_socket = self
             .next_socket
@@ -1695,6 +1759,26 @@ impl Runtime {
                 .on_receive_buffer_read(&socket.id);
         }
         Ok(read)
+    }
+
+    pub fn tcp_readiness(&self, handle: TcpSocketHandle) -> Result<(bool, bool), RuntimeError> {
+        let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let receive = socket.buffers.receive.limits();
+        let send = socket.buffers.send.limits();
+        Ok((receive.len != 0, send.len < send.capacity))
+    }
+
+    pub fn tcp_readiness_ipv6(
+        &self,
+        handle: TcpSocketHandle,
+    ) -> Result<(bool, bool), RuntimeError> {
+        let socket = self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let receive = socket.buffers.receive.limits();
+        let send = socket.buffers.send.limits();
+        Ok((receive.len != 0, send.len < send.capacity))
     }
 
     pub fn tcp_shutdown(
@@ -1776,7 +1860,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
             .bind(id, address, Some(port))
-            .map_err(|_| RuntimeError::AddressInUse)
+            .map_err(map_tcp_bind_error)
     }
 
     pub fn tcp_listen_ipv6(
@@ -1796,7 +1880,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
             .listen(id, backlog)
-            .map_err(|_| RuntimeError::InvalidState)
+            .map_err(map_tcp_listen_error)
     }
 
     pub fn tcp_connect_ipv6(
@@ -1816,7 +1900,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
             .connect(id, Some(ZonedAddr::Unzoned(address)), remote_port)
-            .map_err(|_| RuntimeError::SendFailed)
+            .map_err(map_tcp_connect_error)
     }
 
     pub fn tcp_accept_ipv6(
@@ -1836,7 +1920,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
             .accept(listener)
-            .map_err(|_| RuntimeError::WouldBlock)?;
+            .map_err(map_tcp_accept_error)?;
         let handle = TcpSocketHandle(self.next_socket);
         self.next_socket = self
             .next_socket
@@ -2338,5 +2422,15 @@ mod tests {
             client.tcp_close_ipv6(connection),
             Err(RuntimeError::UnknownSocket)
         );
+    }
+}
+
+impl NetworkConfigurationAdmin for Runtime {
+    fn revoke_ipv4(&mut self) {
+        Runtime::revoke_ipv4(self)
+    }
+
+    fn revoke_ipv6(&mut self) {
+        Runtime::revoke_ipv6(self)
     }
 }

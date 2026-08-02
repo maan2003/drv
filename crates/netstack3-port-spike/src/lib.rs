@@ -557,3 +557,176 @@ mod tests {
         );
     }
 }
+
+/// Address family for sockets whose remote traffic is handled by Netstack3.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteIpVersion {
+    V4,
+    V6,
+}
+
+/// An authority-free socket address used by a host proxy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteIpAddress {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteSocketAddress {
+    pub address: RemoteIpAddress,
+    pub port: std::num::NonZeroU16,
+}
+
+/// Per-proxy-client identity. Closing a client revokes all of its handles.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SocketClientId(u64);
+
+impl SocketClientId {
+    #[doc(hidden)]
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+    #[doc(hidden)]
+    pub fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque revocable handle. IDs are never reused, making closed handles stale.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RemoteSocketHandle(u64);
+
+impl RemoteSocketHandle {
+    #[doc(hidden)]
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+    #[doc(hidden)]
+    pub fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemoteSocketReadiness {
+    pub readable: bool,
+    pub writable: bool,
+    pub incoming: bool,
+}
+
+/// Stable errors at the application socket capability boundary.
+///
+/// These intentionally describe semantic conditions instead of leaking Linux
+/// errno values or Fuchsia FIDL error types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSocketError {
+    UnknownClient,
+    QuotaExceeded,
+    StaleHandle,
+    WrongSocketKind,
+    AddressFamilyMismatch,
+    AddressInUse,
+    WouldBlock,
+    InvalidState,
+    PayloadTooLarge,
+    NetworkUnreachable,
+    HostUnreachable,
+    ConnectionRefused,
+    InProgress,
+    AlreadyConnected,
+    TimedOut,
+    PermissionDenied,
+    NotSupported,
+    ResourceExhausted,
+}
+
+/// Application socket authority only. Interface configuration, route
+/// administration, packet filtering, and device ownership are deliberately
+/// absent and remain separate capabilities.
+pub trait RemoteSocketProvider {
+    fn open_client(
+        &mut self,
+        max_sockets: std::num::NonZeroUsize,
+    ) -> Result<SocketClientId, RemoteSocketError>;
+    fn close_client(&mut self, client: SocketClientId) -> Result<(), RemoteSocketError>;
+
+    fn udp_socket(
+        &mut self,
+        client: SocketClientId,
+        version: RemoteIpVersion,
+    ) -> Result<RemoteSocketHandle, RemoteSocketError>;
+    fn udp_bind(
+        &mut self,
+        socket: RemoteSocketHandle,
+        local_address: Option<RemoteIpAddress>,
+        port: std::num::NonZeroU16,
+    ) -> Result<(), RemoteSocketError>;
+    fn udp_send_to(
+        &mut self,
+        socket: RemoteSocketHandle,
+        remote: RemoteSocketAddress,
+        payload: &[u8],
+    ) -> Result<(), RemoteSocketError>;
+    fn udp_receive(
+        &mut self,
+        socket: RemoteSocketHandle,
+    ) -> Result<Option<Vec<u8>>, RemoteSocketError>;
+
+    fn tcp_socket(
+        &mut self,
+        client: SocketClientId,
+        version: RemoteIpVersion,
+    ) -> Result<RemoteSocketHandle, RemoteSocketError>;
+    fn tcp_bind(
+        &mut self,
+        socket: RemoteSocketHandle,
+        local_address: Option<RemoteIpAddress>,
+        port: std::num::NonZeroU16,
+    ) -> Result<(), RemoteSocketError>;
+    fn tcp_connect(
+        &mut self,
+        socket: RemoteSocketHandle,
+        remote: RemoteSocketAddress,
+    ) -> Result<(), RemoteSocketError>;
+    fn tcp_listen(
+        &mut self,
+        socket: RemoteSocketHandle,
+        backlog: std::num::NonZeroUsize,
+    ) -> Result<(), RemoteSocketError>;
+    fn tcp_accept(
+        &mut self,
+        socket: RemoteSocketHandle,
+    ) -> Result<RemoteSocketHandle, RemoteSocketError>;
+    fn tcp_write(
+        &mut self,
+        socket: RemoteSocketHandle,
+        payload: &[u8],
+    ) -> Result<usize, RemoteSocketError>;
+    fn tcp_read(
+        &mut self,
+        socket: RemoteSocketHandle,
+        output: &mut [u8],
+    ) -> Result<usize, RemoteSocketError>;
+    fn tcp_shutdown(&mut self, socket: RemoteSocketHandle) -> Result<(), RemoteSocketError>;
+
+    fn readiness(
+        &mut self,
+        socket: RemoteSocketHandle,
+    ) -> Result<RemoteSocketReadiness, RemoteSocketError>;
+    fn close(&mut self, socket: RemoteSocketHandle) -> Result<(), RemoteSocketError>;
+}
+
+/// Separate privileged configuration authority; never handed to application
+/// socket clients or the Linux kernel proxy.
+pub trait NetworkConfigurationAdmin {
+    fn revoke_ipv4(&mut self);
+    fn revoke_ipv6(&mut self);
+}
+
+/// Separate privileged filter authority. The portable socket provider does not
+/// imply permission to change ingress, egress, or socket-operation filters.
+pub trait PacketFilterAdmin {
+    type Rule;
+    fn replace_rules(&mut self, rules: &[Self::Rule]) -> Result<(), RemoteSocketError>;
+}

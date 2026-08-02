@@ -38,3 +38,21 @@ The former custom control-plane module, its Edge-DHCP/Hickory dependencies, and 
 The bridge queue is bounded to 64 commands and each receive queue to 64
 datagrams. It owns no resolver algorithm: caching, retry, server ordering,
 truncation detection, and TCP fallback execute in the pinned resolver.
+
+### Remote application socket provider mapping
+
+| Native boundary | Pinned Fuchsia semantic source |
+|---|---|
+| nonblocking accept / WouldBlock | netstack3/src/bindings/socket/stream.rs AcceptError to_errno |
+| connect, bind, listen and connection errors | netstack3/src/bindings/socket/stream.rs error mappings |
+| readable/writable edge model | netstack3/src/bindings/socket/event_pair.rs |
+| bounded datagram receive and error delivery | netstack3/src/bindings/socket/queue.rs and datagram.rs |
+| TCP application buffers and readiness | bindings/socket/stream.rs and production ReceiveBuffer / SendBuffer |
+| worker lifetime / handle revocation reference | netstack3/src/bindings/socket/worker.rs |
+
+RemoteSocketProvider deliberately stops before FIDL, Zircon eventpairs, fd
+tables, Linux errno conversion, and socket-option policy. NativeSocketProvider
+adds only non-reused capability IDs, per-client quotas, revocation, and bounded
+readiness staging around the production Runtime handles. Configuration and
+filter administration are separate traits and cannot be reached through an
+application socket capability.
