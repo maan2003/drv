@@ -4,16 +4,24 @@
 //! queue/error semantics, and per-client ownership for a host kernel proxy.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::rc::Rc;
 
 use netstack3_port_spike::{
     RemoteIpAddress, RemoteIpVersion, RemoteSocketAddress, RemoteSocketError, RemoteSocketHandle,
     RemoteSocketProvider, RemoteSocketReadiness, SocketClientId,
+    provider_dispatch_v2::ProviderAcceptV2,
+    provider_transport_v2::{
+        ProviderNameV2, ProviderOptionV2, ProviderReadinessSnapshotV2, ProviderReadinessV2,
+        ProviderRecvMsgV2, ProviderShutdownV2, ProviderSocketAddressV2, ProviderSocketKindV2,
+    },
 };
 
-use crate::{Runtime, RuntimeError, TcpShutdown, TcpSocketHandle, UdpSocketHandle};
+use crate::{
+    NativeIpAddress, NativeSocketAddress, NativeUdpDatagram, Runtime, RuntimeError, TcpShutdown,
+    TcpSocketHandle, UdpSocketHandle,
+};
 
 #[derive(Clone, Copy)]
 enum VersionedUdp {
@@ -31,12 +39,27 @@ enum Socket {
     Udp {
         client: SocketClientId,
         raw: VersionedUdp,
-        staged: Option<Vec<u8>>,
+        staged: Option<NativeUdpDatagram>,
+        v2: SocketV2,
     },
     Tcp {
         client: SocketClientId,
         raw: VersionedTcp,
+        v2: SocketV2,
     },
+}
+
+#[derive(Default)]
+struct SocketV2 {
+    local: Option<ProviderSocketAddressV2>,
+    peer: Option<ProviderSocketAddressV2>,
+    read_closed: bool,
+    write_closed: bool,
+    listening: bool,
+    connecting: bool,
+    connect_failed: bool,
+    sequence: u64,
+    pending_error: Option<RemoteSocketError>,
 }
 
 struct Client {
@@ -47,7 +70,9 @@ struct Client {
 struct State {
     next_client: u64,
     next_socket: u64,
+    next_ephemeral_port: u16,
     clients: HashMap<SocketClientId, Client>,
+    revoked_clients: HashSet<SocketClientId>,
     sockets: HashMap<RemoteSocketHandle, Socket>,
 }
 
@@ -64,7 +89,9 @@ impl NativeSocketProvider {
             state: Rc::new(RefCell::new(State {
                 next_client: 0,
                 next_socket: 0,
+                next_ephemeral_port: 49152,
                 clients: HashMap::new(),
+                revoked_clients: HashSet::new(),
                 sockets: HashMap::new(),
             })),
         }
@@ -148,6 +175,123 @@ impl NativeSocketProvider {
             }
         }
     }
+
+    fn v2(
+        &self,
+        handle: RemoteSocketHandle,
+    ) -> Result<std::cell::Ref<'_, SocketV2>, RemoteSocketError> {
+        std::cell::Ref::filter_map(self.state.borrow(), |state| {
+            state.sockets.get(&handle).map(|socket| match socket {
+                Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => v2,
+            })
+        })
+        .map_err(|_| RemoteSocketError::StaleHandle)
+    }
+
+    fn next_ephemeral_port(&self) -> u16 {
+        let mut state = self.state.borrow_mut();
+        let port = state.next_ephemeral_port;
+        state.next_ephemeral_port = if port == u16::MAX { 49152 } else { port + 1 };
+        port
+    }
+
+    fn unspecified(
+        &self,
+        handle: RemoteSocketHandle,
+        port: u16,
+    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
+        Ok(ProviderSocketAddressV2 {
+            address: match self.state.borrow().sockets.get(&handle) {
+                Some(Socket::Udp {
+                    raw: VersionedUdp::V4(_),
+                    ..
+                })
+                | Some(Socket::Tcp {
+                    raw: VersionedTcp::V4(_),
+                    ..
+                }) => RemoteIpAddress::V4([0; 4]),
+                Some(Socket::Udp {
+                    raw: VersionedUdp::V6(_),
+                    ..
+                })
+                | Some(Socket::Tcp {
+                    raw: VersionedTcp::V6(_),
+                    ..
+                }) => RemoteIpAddress::V6([0; 16]),
+                None => return Err(RemoteSocketError::StaleHandle),
+            },
+            port,
+        })
+    }
+
+    fn refresh_tcp_connection(&self, handle: RemoteSocketHandle) -> Result<(), RemoteSocketError> {
+        let raw = match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Tcp { raw, v2, .. }) => Some((*raw, v2.connecting)),
+            Some(_) => None,
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        let Some((raw, connecting)) = raw else {
+            return Ok(());
+        };
+        let (tcp_state, error) = match raw {
+            VersionedTcp::V4(raw) => {
+                let mut runtime = self.runtime.borrow_mut();
+                let state = runtime.tcp_state(raw).map_err(map_error)?;
+                let error = connecting
+                    .then(|| runtime.tcp_take_socket_error(raw).map_err(map_error))
+                    .transpose()?
+                    .flatten();
+                (state, error)
+            }
+            VersionedTcp::V6(raw) => {
+                let mut runtime = self.runtime.borrow_mut();
+                let state = runtime.tcp_state_ipv6(raw).map_err(map_error)?;
+                let error = connecting
+                    .then(|| runtime.tcp_take_socket_error_ipv6(raw).map_err(map_error))
+                    .transpose()?
+                    .flatten();
+                (state, error)
+            }
+        };
+        let mut state = self.state.borrow_mut();
+        let Socket::Tcp { v2, .. } = state.sockets.get_mut(&handle).expect("socket remains live")
+        else {
+            unreachable!()
+        };
+        use netstack3_base::TcpSocketState;
+        match tcp_state {
+            TcpSocketState::Established => v2.connecting = false,
+            TcpSocketState::CloseWait => {
+                v2.connecting = false;
+                v2.read_closed = true;
+            }
+            TcpSocketState::FinWait1 | TcpSocketState::FinWait2 => v2.write_closed = true,
+            TcpSocketState::Closing
+            | TcpSocketState::LastAck
+            | TcpSocketState::TimeWait
+            | TcpSocketState::Close => {
+                v2.read_closed = true;
+                v2.write_closed = true;
+            }
+            TcpSocketState::SynSent | TcpSocketState::SynRecv | TcpSocketState::Listen => {}
+        }
+        if let Some(error) = error {
+            v2.connecting = false;
+            v2.connect_failed = true;
+            v2.pending_error = Some(map_error(error));
+        }
+        Ok(())
+    }
+}
+
+fn provider_address(address: NativeSocketAddress) -> ProviderSocketAddressV2 {
+    ProviderSocketAddressV2 {
+        address: match address.address {
+            NativeIpAddress::V4(address) => RemoteIpAddress::V4(address),
+            NativeIpAddress::V6(address) => RemoteIpAddress::V6(address),
+        },
+        port: address.port,
+    }
 }
 
 impl RemoteSocketProvider for NativeSocketProvider {
@@ -156,11 +300,16 @@ impl RemoteSocketProvider for NativeSocketProvider {
         max_sockets: NonZeroUsize,
     ) -> Result<SocketClientId, RemoteSocketError> {
         let mut state = self.state.borrow_mut();
-        let id = SocketClientId::from_raw(state.next_client);
-        state.next_client = state
-            .next_client
-            .checked_add(1)
-            .expect("client id exhausted");
+        let id = loop {
+            let id = SocketClientId::from_raw(state.next_client);
+            state.next_client = state
+                .next_client
+                .checked_add(1)
+                .expect("client id exhausted");
+            if !state.clients.contains_key(&id) && !state.revoked_clients.contains(&id) {
+                break id;
+            }
+        };
         state.clients.insert(
             id,
             Client {
@@ -177,6 +326,7 @@ impl RemoteSocketProvider for NativeSocketProvider {
             if state.clients.remove(&client).is_none() {
                 return Err(RemoteSocketError::UnknownClient);
             }
+            state.revoked_clients.insert(client);
             let handles: Vec<_> = state
                 .sockets
                 .iter()
@@ -217,6 +367,7 @@ impl RemoteSocketProvider for NativeSocketProvider {
                 client,
                 raw,
                 staged: None,
+                v2: SocketV2::default(),
             })),
             Err(error) => {
                 self.release(client);
@@ -289,8 +440,8 @@ impl RemoteSocketProvider for NativeSocketProvider {
                 None => return Err(RemoteSocketError::StaleHandle),
             }
         };
-        if staged.is_some() {
-            return Ok(staged);
+        if let Some(staged) = staged {
+            return Ok(Some(staged.body));
         }
         match self.udp(socket)? {
             VersionedUdp::V4(handle) => self
@@ -321,7 +472,11 @@ impl RemoteSocketProvider for NativeSocketProvider {
                 .map(VersionedTcp::V6),
         };
         match result {
-            Ok(raw) => Ok(self.insert(Socket::Tcp { client, raw })),
+            Ok(raw) => Ok(self.insert(Socket::Tcp {
+                client,
+                raw,
+                v2: SocketV2::default(),
+            })),
             Err(error) => {
                 self.release(client);
                 Err(map_error(error))
@@ -404,7 +559,7 @@ impl RemoteSocketProvider for NativeSocketProvider {
         socket: RemoteSocketHandle,
     ) -> Result<RemoteSocketHandle, RemoteSocketError> {
         let (client, raw) = match self.state.borrow().sockets.get(&socket) {
-            Some(Socket::Tcp { client, raw }) => (*client, *raw),
+            Some(Socket::Tcp { client, raw, .. }) => (*client, *raw),
             Some(Socket::Udp { .. }) => return Err(RemoteSocketError::WrongSocketKind),
             None => return Err(RemoteSocketError::StaleHandle),
         };
@@ -422,7 +577,11 @@ impl RemoteSocketProvider for NativeSocketProvider {
                 .map(VersionedTcp::V6),
         };
         match accepted {
-            Ok(raw) => Ok(self.insert(Socket::Tcp { client, raw })),
+            Ok(raw) => Ok(self.insert(Socket::Tcp {
+                client,
+                raw,
+                v2: SocketV2::default(),
+            })),
             Err(error) => {
                 self.release(client);
                 Err(map_error(error))
@@ -512,21 +671,20 @@ impl RemoteSocketProvider for NativeSocketProvider {
                     VersionedUdp::V4(handle) => self
                         .runtime
                         .borrow_mut()
-                        .udp_receive(handle)
+                        .udp_receive_msg(handle)
                         .map_err(map_error)?,
                     VersionedUdp::V6(handle) => self
                         .runtime
                         .borrow_mut()
-                        .udp_receive_ipv6(handle)
+                        .udp_receive_msg_ipv6(handle)
                         .map_err(map_error)?,
                 };
                 let readable = packet.is_some();
-                if let Some(packet) = packet {
-                    if let Some(Socket::Udp { staged, .. }) =
+                if let Some(packet) = packet
+                    && let Some(Socket::Udp { staged, .. }) =
                         self.state.borrow_mut().sockets.get_mut(&socket)
-                    {
-                        *staged = Some(packet);
-                    }
+                {
+                    *staged = Some(packet);
                 }
                 Ok(RemoteSocketReadiness {
                     readable,
@@ -535,22 +693,30 @@ impl RemoteSocketProvider for NativeSocketProvider {
                 })
             }
             EitherSocket::Tcp(raw) => {
-                let (readable, writable) = match raw {
-                    VersionedTcp::V4(handle) => self
-                        .runtime
-                        .borrow()
-                        .tcp_readiness(handle)
-                        .map_err(map_error)?,
-                    VersionedTcp::V6(handle) => self
-                        .runtime
-                        .borrow()
-                        .tcp_readiness_ipv6(handle)
-                        .map_err(map_error)?,
+                let (readable, writable, incoming) = match raw {
+                    VersionedTcp::V4(handle) => {
+                        let runtime = self.runtime.borrow();
+                        let (readable, writable) =
+                            runtime.tcp_readiness(handle).map_err(map_error)?;
+                        let incoming =
+                            runtime.tcp_pending_connections(handle).map_err(map_error)? != 0;
+                        (readable, writable, incoming)
+                    }
+                    VersionedTcp::V6(handle) => {
+                        let runtime = self.runtime.borrow();
+                        let (readable, writable) =
+                            runtime.tcp_readiness_ipv6(handle).map_err(map_error)?;
+                        let incoming = runtime
+                            .tcp_pending_connections_ipv6(handle)
+                            .map_err(map_error)?
+                            != 0;
+                        (readable, writable, incoming)
+                    }
                 };
                 Ok(RemoteSocketReadiness {
                     readable,
                     writable,
-                    incoming: false,
+                    incoming,
                 })
             }
         }
@@ -569,6 +735,580 @@ impl RemoteSocketProvider for NativeSocketProvider {
         self.close_raw(&socket);
         self.release(client);
         Ok(())
+    }
+}
+
+impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for NativeSocketProvider {
+    fn open_client(&mut self, client: SocketClientId, quota: u32) -> Result<(), RemoteSocketError> {
+        let quota = usize::try_from(quota).map_err(|_| RemoteSocketError::ResourceExhausted)?;
+        if quota == 0 {
+            return Err(RemoteSocketError::InvalidState);
+        }
+        let mut state = self.state.borrow_mut();
+        if state.clients.contains_key(&client) || state.revoked_clients.contains(&client) {
+            return Err(RemoteSocketError::InvalidState);
+        }
+        state.clients.insert(client, Client { quota, sockets: 0 });
+        Ok(())
+    }
+
+    fn close_client(&mut self, client: SocketClientId) -> Result<(), RemoteSocketError> {
+        RemoteSocketProvider::close_client(self, client)
+    }
+
+    fn open_socket(
+        &mut self,
+        client: SocketClientId,
+        kind: ProviderSocketKindV2,
+        version: RemoteIpVersion,
+    ) -> Result<RemoteSocketHandle, RemoteSocketError> {
+        match kind {
+            ProviderSocketKindV2::Udp => self.udp_socket(client, version),
+            ProviderSocketKindV2::Tcp => self.tcp_socket(client, version),
+        }
+    }
+
+    fn bind(
+        &mut self,
+        handle: RemoteSocketHandle,
+        local: Option<RemoteIpAddress>,
+        port: u16,
+    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
+        let port = if port == 0 {
+            self.next_ephemeral_port()
+        } else {
+            port
+        };
+        let nonzero = NonZeroU16::new(port).unwrap();
+        let udp = match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Udp { .. }) => true,
+            Some(Socket::Tcp { .. }) => false,
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        if udp {
+            self.udp_bind(handle, local, nonzero)?;
+        } else {
+            self.tcp_bind(handle, local, nonzero)?;
+        }
+        let address = match local {
+            Some(address) => ProviderSocketAddressV2 { address, port },
+            None => self.unspecified(handle, port)?,
+        };
+        match self.state.borrow_mut().sockets.get_mut(&handle).unwrap() {
+            Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => v2.local = Some(address.clone()),
+        }
+        Ok(address)
+    }
+
+    fn connect(
+        &mut self,
+        handle: RemoteSocketHandle,
+        peer: ProviderSocketAddressV2,
+    ) -> Result<(), RemoteSocketError> {
+        let port = NonZeroU16::new(peer.port).ok_or(RemoteSocketError::InvalidState)?;
+        if self.v2(handle)?.local.is_none() {
+            let local = match peer.address {
+                RemoteIpAddress::V4(_) => self
+                    .runtime
+                    .borrow()
+                    .ipv4_address()
+                    .map(RemoteIpAddress::V4),
+                RemoteIpAddress::V6(_) => self
+                    .runtime
+                    .borrow()
+                    .ipv6_address()
+                    .map(RemoteIpAddress::V6),
+            };
+            self.bind(handle, local, 0)?;
+        }
+        let result = match (self.state.borrow().sockets.get(&handle), peer.address) {
+            (
+                Some(Socket::Udp {
+                    raw: VersionedUdp::V4(raw),
+                    ..
+                }),
+                RemoteIpAddress::V4(address),
+            ) => self
+                .runtime
+                .borrow_mut()
+                .udp_connect(*raw, address, port)
+                .map_err(map_error),
+            (
+                Some(Socket::Udp {
+                    raw: VersionedUdp::V6(raw),
+                    ..
+                }),
+                RemoteIpAddress::V6(address),
+            ) => self
+                .runtime
+                .borrow_mut()
+                .udp_connect_ipv6(*raw, address, port)
+                .map_err(map_error),
+            (
+                Some(Socket::Tcp {
+                    raw: VersionedTcp::V4(raw),
+                    ..
+                }),
+                RemoteIpAddress::V4(address),
+            ) => self
+                .runtime
+                .borrow_mut()
+                .tcp_connect(*raw, address, port)
+                .map_err(map_error),
+            (
+                Some(Socket::Tcp {
+                    raw: VersionedTcp::V6(raw),
+                    ..
+                }),
+                RemoteIpAddress::V6(address),
+            ) => self
+                .runtime
+                .borrow_mut()
+                .tcp_connect_ipv6(*raw, address, port)
+                .map_err(map_error),
+            (Some(_), _) => Err(RemoteSocketError::AddressFamilyMismatch),
+            (None, _) => Err(RemoteSocketError::StaleHandle),
+        };
+        let tcp = matches!(
+            self.state.borrow().sockets.get(&handle),
+            Some(Socket::Tcp { .. })
+        );
+        if result.is_ok() || result == Err(RemoteSocketError::InProgress) {
+            match self.state.borrow_mut().sockets.get_mut(&handle).unwrap() {
+                Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => {
+                    v2.peer = Some(peer);
+                    v2.connecting = tcp;
+                }
+            }
+        }
+        if tcp && result.is_ok() {
+            Err(RemoteSocketError::InProgress)
+        } else {
+            result
+        }
+    }
+
+    fn disconnect(
+        &mut self,
+        handle: RemoteSocketHandle,
+    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
+        match self.udp(handle)? {
+            VersionedUdp::V4(raw) => self
+                .runtime
+                .borrow_mut()
+                .udp_disconnect(raw)
+                .map_err(map_error)?,
+            VersionedUdp::V6(raw) => self
+                .runtime
+                .borrow_mut()
+                .udp_disconnect_ipv6(raw)
+                .map_err(map_error)?,
+        }
+        let mut state = self.state.borrow_mut();
+        let Socket::Udp { v2, .. } = state.sockets.get_mut(&handle).unwrap() else {
+            unreachable!()
+        };
+        v2.peer = None;
+        Ok(v2.local.clone().expect("connected socket is bound"))
+    }
+
+    fn listen(
+        &mut self,
+        handle: RemoteSocketHandle,
+        backlog: u32,
+    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
+        if self.v2(handle)?.local.is_none() {
+            self.bind(handle, None, 0)?;
+        }
+        let backlog =
+            NonZeroUsize::new(usize::try_from(backlog).unwrap_or(usize::MAX).max(1)).unwrap();
+        self.tcp_listen(handle, backlog)?;
+        let mut state = self.state.borrow_mut();
+        let Socket::Tcp { v2, .. } = state
+            .sockets
+            .get_mut(&handle)
+            .ok_or(RemoteSocketError::StaleHandle)?
+        else {
+            return Err(RemoteSocketError::WrongSocketKind);
+        };
+        v2.listening = true;
+        Ok(v2.local.clone().unwrap())
+    }
+
+    fn accept(
+        &mut self,
+        handle: RemoteSocketHandle,
+    ) -> Result<ProviderAcceptV2, RemoteSocketError> {
+        let (client, raw) = match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Tcp { client, raw, v2 }) if v2.listening => (*client, *raw),
+            Some(Socket::Tcp { .. }) => return Err(RemoteSocketError::InvalidState),
+            Some(Socket::Udp { .. }) => return Err(RemoteSocketError::WrongSocketKind),
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        self.reserve(client)?;
+        let accepted = match raw {
+            VersionedTcp::V4(raw) => self
+                .runtime
+                .borrow_mut()
+                .tcp_accept_with_peer(raw)
+                .map(|(raw, local, peer)| (VersionedTcp::V4(raw), local, peer)),
+            VersionedTcp::V6(raw) => self
+                .runtime
+                .borrow_mut()
+                .tcp_accept_ipv6_with_peer(raw)
+                .map(|(raw, local, peer)| (VersionedTcp::V6(raw), local, peer)),
+        };
+        match accepted {
+            Ok((raw, local, peer)) => {
+                let local = provider_address(local);
+                let peer = provider_address(peer);
+                let child = self.insert(Socket::Tcp {
+                    client,
+                    raw,
+                    v2: SocketV2 {
+                        local: Some(local.clone()),
+                        peer: Some(peer.clone()),
+                        ..SocketV2::default()
+                    },
+                });
+                Ok(ProviderAcceptV2 {
+                    handle: child,
+                    local,
+                    peer,
+                })
+            }
+            Err(error) => {
+                self.release(client);
+                Err(map_error(error))
+            }
+        }
+    }
+
+    fn send_msg(
+        &mut self,
+        handle: RemoteSocketHandle,
+        flags: u32,
+        peer: Option<ProviderSocketAddressV2>,
+        bytes: &[u8],
+    ) -> Result<usize, RemoteSocketError> {
+        if flags != 0 {
+            return Err(RemoteSocketError::NotSupported);
+        }
+        let tcp = match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Tcp { v2, .. }) => Some((
+                v2.peer.is_some(),
+                v2.connecting,
+                v2.connect_failed,
+                v2.write_closed,
+            )),
+            Some(Socket::Udp { .. }) => None,
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        if let Some((connected, connecting, connect_failed, write_closed)) = tcp {
+            if peer.is_some() {
+                return Err(RemoteSocketError::AlreadyConnected);
+            }
+            if connecting {
+                return Err(RemoteSocketError::InProgress);
+            }
+            if !connected || connect_failed || write_closed {
+                return Err(RemoteSocketError::InvalidState);
+            }
+            return self.tcp_write(handle, bytes);
+        }
+        match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Udp {
+                raw: VersionedUdp::V4(raw),
+                v2,
+                ..
+            }) => match peer.or_else(|| v2.peer.clone()) {
+                Some(ProviderSocketAddressV2 {
+                    address: RemoteIpAddress::V4(address),
+                    port,
+                }) => self
+                    .runtime
+                    .borrow_mut()
+                    .udp_send_to(
+                        *raw,
+                        address,
+                        NonZeroU16::new(port).ok_or(RemoteSocketError::InvalidState)?,
+                        bytes,
+                    )
+                    .map(|()| bytes.len())
+                    .map_err(map_error),
+                Some(_) => Err(RemoteSocketError::AddressFamilyMismatch),
+                None => Err(RemoteSocketError::InvalidState),
+            },
+            Some(Socket::Udp {
+                raw: VersionedUdp::V6(raw),
+                v2,
+                ..
+            }) => match peer.or_else(|| v2.peer.clone()) {
+                Some(ProviderSocketAddressV2 {
+                    address: RemoteIpAddress::V6(address),
+                    port,
+                }) => self
+                    .runtime
+                    .borrow_mut()
+                    .udp_send_to_ipv6(
+                        *raw,
+                        address,
+                        NonZeroU16::new(port).ok_or(RemoteSocketError::InvalidState)?,
+                        bytes,
+                    )
+                    .map(|()| bytes.len())
+                    .map_err(map_error),
+                Some(_) => Err(RemoteSocketError::AddressFamilyMismatch),
+                None => Err(RemoteSocketError::InvalidState),
+            },
+            Some(Socket::Tcp { .. }) => unreachable!(),
+            None => Err(RemoteSocketError::StaleHandle),
+        }
+    }
+
+    fn recv_msg(
+        &mut self,
+        handle: RemoteSocketHandle,
+        max_len: u32,
+        flags: u32,
+    ) -> Result<ProviderRecvMsgV2, RemoteSocketError> {
+        if flags != 0 {
+            return Err(RemoteSocketError::NotSupported);
+        }
+        self.refresh_tcp_connection(handle)?;
+        let max_len = usize::try_from(max_len).map_err(|_| RemoteSocketError::ResourceExhausted)?;
+        let raw = match self.state.borrow_mut().sockets.get_mut(&handle) {
+            Some(Socket::Udp { raw, staged, .. }) => {
+                let packet = if let Some(packet) = staged.take() {
+                    Some(packet)
+                } else {
+                    match raw {
+                        VersionedUdp::V4(raw) => self
+                            .runtime
+                            .borrow_mut()
+                            .udp_receive_msg(*raw)
+                            .map_err(map_error)?,
+                        VersionedUdp::V6(raw) => self
+                            .runtime
+                            .borrow_mut()
+                            .udp_receive_msg_ipv6(*raw)
+                            .map_err(map_error)?,
+                    }
+                }
+                .ok_or(RemoteSocketError::WouldBlock)?;
+                let original_len = u32::try_from(packet.body.len())
+                    .map_err(|_| RemoteSocketError::ResourceExhausted)?;
+                return Ok(ProviderRecvMsgV2 {
+                    source: Some(provider_address(packet.source)),
+                    original_len,
+                    flags: 0,
+                    eof: false,
+                    data: packet.body.into_iter().take(max_len).collect(),
+                });
+            }
+            Some(Socket::Tcp { raw, v2, .. }) => {
+                if v2.connecting {
+                    return Err(RemoteSocketError::InProgress);
+                }
+                if v2.peer.is_none() || v2.connect_failed || v2.listening {
+                    return Err(RemoteSocketError::InvalidState);
+                }
+                (*raw, v2.read_closed)
+            }
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        let mut data =
+            vec![0; max_len.min(netstack3_port_spike::provider_transport::MAX_PROVIDER_PAYLOAD)];
+        let read = match raw.0 {
+            VersionedTcp::V4(raw) => self
+                .runtime
+                .borrow_mut()
+                .tcp_read(raw, &mut data)
+                .map_err(map_error)?,
+            VersionedTcp::V6(raw) => self
+                .runtime
+                .borrow_mut()
+                .tcp_read_ipv6(raw, &mut data)
+                .map_err(map_error)?,
+        };
+        data.truncate(read);
+        if read == 0 && !raw.1 {
+            return Err(RemoteSocketError::WouldBlock);
+        }
+        Ok(ProviderRecvMsgV2 {
+            source: None,
+            original_len: read as u32,
+            flags: 0,
+            eof: read == 0,
+            data,
+        })
+    }
+
+    fn shutdown(
+        &mut self,
+        handle: RemoteSocketHandle,
+        how: ProviderShutdownV2,
+    ) -> Result<(), RemoteSocketError> {
+        let v2 = self.v2(handle)?;
+        if v2.connecting {
+            return Err(RemoteSocketError::InProgress);
+        }
+        if v2.peer.is_none() || v2.connect_failed {
+            return Err(RemoteSocketError::InvalidState);
+        }
+        drop(v2);
+        let how_runtime = match how {
+            ProviderShutdownV2::Read => TcpShutdown::Receive,
+            ProviderShutdownV2::Write => TcpShutdown::Send,
+            ProviderShutdownV2::ReadWrite => TcpShutdown::SendAndReceive,
+        };
+        match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Udp {
+                raw: VersionedUdp::V4(raw),
+                ..
+            }) => self
+                .runtime
+                .borrow_mut()
+                .udp_shutdown(*raw, how_runtime)
+                .map_err(map_error)?,
+            Some(Socket::Udp {
+                raw: VersionedUdp::V6(raw),
+                ..
+            }) => self
+                .runtime
+                .borrow_mut()
+                .udp_shutdown_ipv6(*raw, how_runtime)
+                .map_err(map_error)?,
+            Some(Socket::Tcp {
+                raw: VersionedTcp::V4(raw),
+                ..
+            }) => self
+                .runtime
+                .borrow_mut()
+                .tcp_shutdown(*raw, how_runtime)
+                .map_err(map_error)?,
+            Some(Socket::Tcp {
+                raw: VersionedTcp::V6(raw),
+                ..
+            }) => self
+                .runtime
+                .borrow_mut()
+                .tcp_shutdown_ipv6(*raw, how_runtime)
+                .map_err(map_error)?,
+            None => return Err(RemoteSocketError::StaleHandle),
+        }
+        match self.state.borrow_mut().sockets.get_mut(&handle).unwrap() {
+            Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => {
+                v2.read_closed |= matches!(
+                    how,
+                    ProviderShutdownV2::Read | ProviderShutdownV2::ReadWrite
+                );
+                v2.write_closed |= matches!(
+                    how,
+                    ProviderShutdownV2::Write | ProviderShutdownV2::ReadWrite
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn get_name(
+        &mut self,
+        handle: RemoteSocketHandle,
+        which: ProviderNameV2,
+    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
+        let v2 = self.v2(handle)?;
+        match which {
+            ProviderNameV2::Local => v2
+                .local
+                .clone()
+                .or_else(|| self.unspecified(handle, 0).ok())
+                .ok_or(RemoteSocketError::InvalidState),
+            ProviderNameV2::Peer => v2.peer.clone().ok_or(RemoteSocketError::InvalidState),
+        }
+    }
+
+    fn take_socket_error(
+        &mut self,
+        handle: RemoteSocketHandle,
+    ) -> Result<Option<RemoteSocketError>, RemoteSocketError> {
+        self.refresh_tcp_connection(handle)?;
+        match self.state.borrow_mut().sockets.get_mut(&handle) {
+            Some(Socket::Udp { v2, .. }) | Some(Socket::Tcp { v2, .. }) => {
+                Ok(v2.pending_error.take())
+            }
+            None => Err(RemoteSocketError::StaleHandle),
+        }
+    }
+
+    fn set_option(
+        &mut self,
+        handle: RemoteSocketHandle,
+        _option: ProviderOptionV2,
+        _value: &[u8],
+    ) -> Result<(), RemoteSocketError> {
+        self.v2(handle)?;
+        Err(RemoteSocketError::NotSupported)
+    }
+
+    fn get_option(
+        &mut self,
+        handle: RemoteSocketHandle,
+        _option: ProviderOptionV2,
+    ) -> Result<Vec<u8>, RemoteSocketError> {
+        self.v2(handle)?;
+        Err(RemoteSocketError::NotSupported)
+    }
+
+    fn readiness(
+        &mut self,
+        handle: RemoteSocketHandle,
+    ) -> Result<ProviderReadinessSnapshotV2, RemoteSocketError> {
+        self.refresh_tcp_connection(handle)?;
+        let old = RemoteSocketProvider::readiness(self, handle)?;
+        let mut state = self.state.borrow_mut();
+        let v2 = match state.sockets.get_mut(&handle) {
+            Some(Socket::Udp { v2, .. }) | Some(Socket::Tcp { v2, .. }) => v2,
+            None => return Err(RemoteSocketError::StaleHandle),
+        };
+        v2.sequence = v2
+            .sequence
+            .checked_add(1)
+            .ok_or(RemoteSocketError::ResourceExhausted)?;
+        let mut bits = 0;
+        if old.readable || v2.read_closed {
+            bits |= ProviderReadinessV2::READABLE;
+        }
+        if old.writable {
+            bits |= ProviderReadinessV2::WRITABLE;
+        }
+        if old.incoming {
+            bits |= ProviderReadinessV2::INCOMING;
+        }
+        if v2.read_closed {
+            bits |= ProviderReadinessV2::READ_CLOSED;
+        }
+        if v2.write_closed {
+            bits |= ProviderReadinessV2::WRITE_CLOSED;
+        }
+        if v2.pending_error.is_some() {
+            bits |= ProviderReadinessV2::ERROR;
+        }
+        if v2.peer.is_some() && !v2.connecting && !v2.connect_failed {
+            bits |= ProviderReadinessV2::CONNECTED;
+        }
+        if v2.connect_failed {
+            bits |= ProviderReadinessV2::CONNECT_FAILED;
+        }
+        Ok(ProviderReadinessSnapshotV2 {
+            sequence: v2.sequence,
+            readiness: ProviderReadinessV2(bits),
+            error: v2.pending_error,
+        })
+    }
+
+    fn close(&mut self, handle: RemoteSocketHandle) -> Result<(), RemoteSocketError> {
+        RemoteSocketProvider::close(self, handle)
     }
 }
 
@@ -684,6 +1424,92 @@ mod tests {
                 },
             ),
             Err(RemoteSocketError::NetworkUnreachable)
+        );
+    }
+
+    #[test]
+    fn v2_uses_endpoint_identity_and_reports_actual_ephemeral_bind() {
+        let mut provider = provider();
+        let client = SocketClientId::from_raw(42);
+        netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::open_client(
+            &mut provider,
+            client,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::open_client(
+                &mut provider,
+                client,
+                1
+            ),
+            Err(RemoteSocketError::InvalidState)
+        );
+        let socket =
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::open_socket(
+                &mut provider,
+                client,
+                ProviderSocketKindV2::Udp,
+                RemoteIpVersion::V4,
+            )
+            .unwrap();
+        let local = netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::bind(
+            &mut provider,
+            socket,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(local.address, RemoteIpAddress::V4([0; 4]));
+        assert_ne!(local.port, 0);
+        assert_eq!(
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::get_name(
+                &mut provider,
+                socket,
+                ProviderNameV2::Local,
+            )
+            .unwrap(),
+            local
+        );
+        let first = netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::readiness(
+            &mut provider,
+            socket,
+        )
+        .unwrap();
+        let second = netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::readiness(
+            &mut provider,
+            socket,
+        )
+        .unwrap();
+        assert!(second.sequence > first.sequence);
+        assert_eq!(
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::set_option(
+                &mut provider,
+                socket,
+                ProviderOptionV2::Broadcast,
+                &[1],
+            ),
+            Err(RemoteSocketError::NotSupported)
+        );
+        netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::close_client(
+            &mut provider,
+            client,
+        )
+        .unwrap();
+        assert_eq!(
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::open_client(
+                &mut provider,
+                client,
+                1,
+            ),
+            Err(RemoteSocketError::InvalidState)
+        );
+        assert_eq!(
+            netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2::close(
+                &mut provider,
+                socket
+            ),
+            Err(RemoteSocketError::StaleHandle)
         );
     }
 }

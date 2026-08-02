@@ -21,7 +21,7 @@ use std::time::Duration;
 use net_types::UnicastAddr;
 use net_types::ethernet::Mac;
 use net_types::ip::{AddrSubnet, Ip, IpVersion, Ipv4, Ipv4Addr, Ipv6, Ipv6Addr, Mtu, Subnet};
-use net_types::{SpecifiedAddr, ZonedAddr};
+use net_types::{SpecifiedAddr, Witness, ZonedAddr};
 use netstack3_base::socket::ShutdownType;
 use netstack3_base::sync::{DynDebugReferences, RcNotifier};
 use netstack3_base::{
@@ -207,6 +207,24 @@ pub enum ReadinessEvent {
     TxReady,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeUdpDatagram {
+    pub source: NativeSocketAddress,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeIpAddress {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSocketAddress {
+    pub address: NativeIpAddress,
+    pub port: u16,
+}
+
 #[derive(Debug, Default)]
 struct Queues {
     tx: VecDeque<TxFrame>,
@@ -228,8 +246,8 @@ pub struct NativeBindingsCtx {
     entropy: InjectedEntropy,
     capacity: usize,
     queues: Queues,
-    udp_v4: HashMap<String, VecDeque<Vec<u8>>>,
-    udp_v6: HashMap<String, VecDeque<Vec<u8>>>,
+    udp_v4: HashMap<String, VecDeque<NativeUdpDatagram>>,
+    udp_v6: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_pending: usize,
     tcp_settings: TcpSettings,
     udp_settings: UdpSettings,
@@ -309,7 +327,7 @@ impl NativeBindingsCtx {
     pub fn take_udp<I: IpExt>(
         &mut self,
         id: &UdpSocketId<I, WeakDeviceId<Self>, Self>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<NativeUdpDatagram> {
         let map = if I::VERSION == IpVersion::V4 {
             &mut self.udp_v4
         } else {
@@ -792,7 +810,7 @@ impl<I: IpExt> UdpReceiveBindingsContext<I, DeviceId<Self>> for NativeBindingsCt
         &mut self,
         id: &UdpSocketId<I, WeakDeviceId<Self>, Self>,
         _device: &DeviceId<Self>,
-        _meta: UdpPacketMeta<I>,
+        meta: UdpPacketMeta<I>,
         body: &[u8],
     ) -> Result<(), ReceiveUdpError> {
         if self.udp_pending >= self.capacity {
@@ -804,7 +822,18 @@ impl<I: IpExt> UdpReceiveBindingsContext<I, DeviceId<Self>> for NativeBindingsCt
             &mut self.udp_v6
         };
         let queue = map.entry(format!("{id:?}")).or_default();
-        queue.push_back(body.to_vec());
+        let address = I::map_ip_in(
+            meta.src_ip,
+            |address| NativeIpAddress::V4(address.ipv4_bytes()),
+            |address| NativeIpAddress::V6(address.ipv6_bytes()),
+        );
+        queue.push_back(NativeUdpDatagram {
+            source: NativeSocketAddress {
+                address,
+                port: meta.src_port.map(NonZeroU16::get).unwrap_or(0),
+            },
+            body: body.to_vec(),
+        });
         self.udp_pending += 1;
         Ok(())
     }
@@ -986,18 +1015,22 @@ fn map_tcp_connect_error(error: ConnectError) -> RuntimeError {
         ConnectError::Pending => RuntimeError::ConnectionPending,
         ConnectError::Completed => RuntimeError::AlreadyConnected,
         ConnectError::Aborted => RuntimeError::ConnectionRefused,
-        ConnectError::ConnectionError(error) => match error {
-            ConnectionError::ConnectionRefused | ConnectionError::PortUnreachable => {
-                RuntimeError::ConnectionRefused
-            }
-            ConnectionError::NetworkUnreachable => RuntimeError::NetworkUnreachable,
-            ConnectionError::HostUnreachable | ConnectionError::DestinationHostDown => {
-                RuntimeError::HostUnreachable
-            }
-            ConnectionError::TimedOut => RuntimeError::TimedOut,
-            ConnectionError::PermissionDenied => RuntimeError::PermissionDenied,
-            _ => RuntimeError::SendFailed,
-        },
+        ConnectError::ConnectionError(error) => map_tcp_connection_error(error),
+    }
+}
+
+fn map_tcp_connection_error(error: ConnectionError) -> RuntimeError {
+    match error {
+        ConnectionError::ConnectionRefused | ConnectionError::PortUnreachable => {
+            RuntimeError::ConnectionRefused
+        }
+        ConnectionError::NetworkUnreachable => RuntimeError::NetworkUnreachable,
+        ConnectionError::HostUnreachable | ConnectionError::DestinationHostDown => {
+            RuntimeError::HostUnreachable
+        }
+        ConnectionError::TimedOut => RuntimeError::TimedOut,
+        ConnectionError::PermissionDenied => RuntimeError::PermissionDenied,
+        _ => RuntimeError::SendFailed,
     }
 }
 
@@ -1008,10 +1041,12 @@ type NativeTcpV6 = TcpSocketId<Ipv6, WeakDeviceId<NativeBindingsCtx>, NativeBind
 struct RuntimeTcpSocket {
     id: NativeTcpV4,
     buffers: NativeTcpBuffers,
+    notifier: NativeTcpSocketData,
 }
 struct RuntimeTcpSocketV6 {
     id: NativeTcpV6,
     buffers: NativeTcpBuffers,
+    notifier: NativeTcpSocketData,
 }
 
 /// Single-owner facade over one Netstack3 core and one Ethernet interface.
@@ -1119,6 +1154,14 @@ impl Runtime {
             stack,
             bindings,
         })
+    }
+
+    pub fn ipv4_address(&self) -> Option<[u8; 4]> {
+        self.ipv4_address.map(|address| address.addr().ipv4_bytes())
+    }
+
+    pub fn ipv6_address(&self) -> Option<[u8; 16]> {
+        self.ipv6_address.map(|address| address.addr().ipv6_bytes())
     }
 
     /// Replaces the IPv4 address and the complete main routing table.
@@ -1524,7 +1567,42 @@ impl Runtime {
         handle: UdpSocketHandle,
     ) -> Result<Option<Vec<u8>>, RuntimeError> {
         let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.take_udp(id).map(|packet| packet.body))
+    }
+
+    pub fn udp_receive_msg(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<Option<NativeUdpDatagram>, RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id))
+    }
+
+    pub fn udp_disconnect(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .disconnect(id)
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn udp_shutdown(
+        &mut self,
+        handle: UdpSocketHandle,
+        how: TcpShutdown,
+    ) -> Result<(), RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let how = match how {
+            TcpShutdown::Send => ShutdownType::Send,
+            TcpShutdown::Receive => ShutdownType::Receive,
+            TcpShutdown::SendAndReceive => ShutdownType::SendAndReceive,
+        };
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .shutdown(id, how)
+            .map_err(|_| RuntimeError::InvalidState)
     }
 
     pub fn udp_close(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
@@ -1602,6 +1680,48 @@ impl Runtime {
             .map_err(|_| RuntimeError::SendFailed)
     }
 
+    pub fn udp_connect_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+        remote_address: [u8; 16],
+        remote_port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let address = SpecifiedAddr::new(Ipv6Addr::from_bytes(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .connect(
+                id,
+                Some(ZonedAddr::Unzoned(address)),
+                UdpRemotePort::Set(remote_port),
+            )
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn udp_send_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+        payload: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if payload.len() > 1452 {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .send(id, Buf::new(payload.to_vec(), ..))
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
     pub fn udp_receive_ipv6(
         &mut self,
         handle: UdpSocketHandle,
@@ -1610,7 +1730,51 @@ impl Runtime {
             .udp_v6
             .get(&handle)
             .ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.take_udp(id).map(|packet| packet.body))
+    }
+
+    pub fn udp_receive_msg_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<Option<NativeUdpDatagram>, RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id))
+    }
+
+    pub fn udp_disconnect_ipv6(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .disconnect(id)
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn udp_shutdown_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+        how: TcpShutdown,
+    ) -> Result<(), RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let how = match how {
+            TcpShutdown::Send => ShutdownType::Send,
+            TcpShutdown::Receive => ShutdownType::Receive,
+            TcpShutdown::SendAndReceive => ShutdownType::SendAndReceive,
+        };
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .shutdown(id, how)
+            .map_err(|_| RuntimeError::InvalidState)
     }
 
     pub fn udp_close_ipv6(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
@@ -1631,6 +1795,7 @@ impl Runtime {
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
         });
         let buffers = socket_data.client_buffers().unwrap();
+        let notifier = socket_data.clone();
         let id = self
             .stack
             .api(&mut self.bindings)
@@ -1643,7 +1808,14 @@ impl Runtime {
             .expect("socket handle space exhausted");
         assert!(
             self.tcp
-                .insert(handle, RuntimeTcpSocket { id, buffers })
+                .insert(
+                    handle,
+                    RuntimeTcpSocket {
+                        id,
+                        buffers,
+                        notifier
+                    }
+                )
                 .is_none()
         );
         Ok(handle)
@@ -1703,6 +1875,14 @@ impl Runtime {
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<TcpSocketHandle, RuntimeError> {
+        self.tcp_accept_with_peer(listener)
+            .map(|(handle, _, _)| handle)
+    }
+
+    pub fn tcp_accept_with_peer(
+        &mut self,
+        listener: TcpSocketHandle,
+    ) -> Result<(TcpSocketHandle, NativeSocketAddress, NativeSocketAddress), RuntimeError> {
         if self.socket_count() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
@@ -1711,12 +1891,21 @@ impl Runtime {
             .get(&listener)
             .ok_or(RuntimeError::UnknownSocket)?
             .id;
-        let (id, _remote, buffers) = self
+        let (id, remote, buffers) = self
             .stack
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
+        let local = match self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .get_info(&id)
+        {
+            netstack3_tcp::SocketInfo::Connection(info) => info.local_addr,
+            _ => return Err(RuntimeError::InvalidState),
+        };
         let handle = TcpSocketHandle(self.next_socket);
         self.next_socket = self
             .next_socket
@@ -1724,10 +1913,27 @@ impl Runtime {
             .expect("socket handle space exhausted");
         assert!(
             self.tcp
-                .insert(handle, RuntimeTcpSocket { id, buffers })
+                .insert(
+                    handle,
+                    RuntimeTcpSocket {
+                        id,
+                        buffers,
+                        notifier: NativeTcpSocketData::default()
+                    }
+                )
                 .is_none()
         );
-        Ok(handle)
+        Ok((
+            handle,
+            NativeSocketAddress {
+                address: NativeIpAddress::V4(local.ip.addr().get().ipv4_bytes()),
+                port: local.port.get(),
+            },
+            NativeSocketAddress {
+                address: NativeIpAddress::V4(remote.ip.addr().get().ipv4_bytes()),
+                port: remote.port.get(),
+            },
+        ))
     }
 
     pub fn tcp_write(
@@ -1769,6 +1975,41 @@ impl Runtime {
         Ok((receive.len != 0, send.len < send.capacity))
     }
 
+    pub fn tcp_state(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<netstack3_base::TcpSocketState, RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        Ok(self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .get_tcp_info(id)
+            .state)
+    }
+
+    pub fn tcp_take_socket_error(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        Ok(self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .get_socket_error(id)
+            .map(map_tcp_connection_error))
+    }
+
+    pub fn tcp_pending_connections(&self, handle: TcpSocketHandle) -> Result<usize, RuntimeError> {
+        Ok(self
+            .tcp
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .notifier
+            .pending_connections())
+    }
+
     pub fn tcp_readiness_ipv6(
         &self,
         handle: TcpSocketHandle,
@@ -1780,6 +2021,52 @@ impl Runtime {
         let receive = socket.buffers.receive.limits();
         let send = socket.buffers.send.limits();
         Ok((receive.len != 0, send.len < send.capacity))
+    }
+
+    pub fn tcp_state_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<netstack3_base::TcpSocketState, RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        Ok(self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .get_tcp_info(id)
+            .state)
+    }
+
+    pub fn tcp_take_socket_error_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        Ok(self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .get_socket_error(id)
+            .map(map_tcp_connection_error))
+    }
+
+    pub fn tcp_pending_connections_ipv6(
+        &self,
+        handle: TcpSocketHandle,
+    ) -> Result<usize, RuntimeError> {
+        Ok(self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .notifier
+            .pending_connections())
     }
 
     pub fn tcp_shutdown(
@@ -1822,6 +2109,7 @@ impl Runtime {
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
         });
         let buffers = socket_data.client_buffers().unwrap();
+        let notifier = socket_data.clone();
         let id = self
             .stack
             .api(&mut self.bindings)
@@ -1834,7 +2122,14 @@ impl Runtime {
             .expect("socket handle space exhausted");
         assert!(
             self.tcp_v6
-                .insert(handle, RuntimeTcpSocketV6 { id, buffers })
+                .insert(
+                    handle,
+                    RuntimeTcpSocketV6 {
+                        id,
+                        buffers,
+                        notifier
+                    }
+                )
                 .is_none()
         );
         Ok(handle)
@@ -1908,6 +2203,14 @@ impl Runtime {
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<TcpSocketHandle, RuntimeError> {
+        self.tcp_accept_ipv6_with_peer(listener)
+            .map(|(handle, _, _)| handle)
+    }
+
+    pub fn tcp_accept_ipv6_with_peer(
+        &mut self,
+        listener: TcpSocketHandle,
+    ) -> Result<(TcpSocketHandle, NativeSocketAddress, NativeSocketAddress), RuntimeError> {
         if self.socket_count() >= self.bindings.capacity {
             return Err(RuntimeError::SocketLimit);
         }
@@ -1916,12 +2219,21 @@ impl Runtime {
             .get(&listener)
             .ok_or(RuntimeError::UnknownSocket)?
             .id;
-        let (id, _remote, buffers) = self
+        let (id, remote, buffers) = self
             .stack
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
+        let local = match self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .get_info(&id)
+        {
+            netstack3_tcp::SocketInfo::Connection(info) => info.local_addr,
+            _ => return Err(RuntimeError::InvalidState),
+        };
         let handle = TcpSocketHandle(self.next_socket);
         self.next_socket = self
             .next_socket
@@ -1929,10 +2241,27 @@ impl Runtime {
             .expect("socket handle space exhausted");
         assert!(
             self.tcp_v6
-                .insert(handle, RuntimeTcpSocketV6 { id, buffers })
+                .insert(
+                    handle,
+                    RuntimeTcpSocketV6 {
+                        id,
+                        buffers,
+                        notifier: NativeTcpSocketData::default()
+                    }
+                )
                 .is_none()
         );
-        Ok(handle)
+        Ok((
+            handle,
+            NativeSocketAddress {
+                address: NativeIpAddress::V6(local.ip.addr().get().ipv6_bytes()),
+                port: local.port.get(),
+            },
+            NativeSocketAddress {
+                address: NativeIpAddress::V6(remote.ip.addr().get().ipv6_bytes()),
+                port: remote.port.get(),
+            },
+        ))
     }
 
     pub fn tcp_write_ipv6(

@@ -390,17 +390,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "derivative"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -409,6 +398,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -557,8 +557,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fidl-fuchsia-wlan-common"
+version = "0.1.0"
+
+[[package]]
 name = "fidl-fuchsia-wlan-ieee80211"
 version = "0.1.0"
+
+[[package]]
+name = "fidl-fuchsia-wlan-internal"
+version = "0.1.0"
+
+[[package]]
+name = "fidl-fuchsia-wlan-mlme"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+]
+
+[[package]]
+name = "fidl-fuchsia-wlan-sme"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+]
+
+[[package]]
+name = "fidl-fuchsia-wlan-softmac"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.0",
+ "fidl-fuchsia-wlan-ieee80211",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -909,18 +942,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "ieee80211"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arbitrary",
- "fidl-fuchsia-wlan-ieee80211",
- "hex",
- "thiserror 2.0.18",
- "zerocopy",
-]
-
-[[package]]
 name = "idna"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,6 +971,18 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ieee80211"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "fidl-fuchsia-wlan-ieee80211",
+ "hex",
+ "thiserror 2.0.18",
+ "zerocopy",
 ]
 
 [[package]]
