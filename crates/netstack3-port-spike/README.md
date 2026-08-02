@@ -75,15 +75,7 @@ is not part of the portable closure.
 | DHCPv4 client and address policy | separate Fuchsia service; `main.rs` calls it out as out-of-stack |
 | DNS configuration and name resolution | separate services (`netcfg`/name lookup), not core; Netstack3's DNS watcher deliberately does not serve results |
 
-DHCP and DNS therefore remain explicit service dependencies even after a core
-port. This crate packages sans-I/O adapters for them: `Dhcpv4Client` uses
-`edge-dhcp` for DISCOVER/OFFER/REQUEST/ACK, and `DnsCodec` uses `hickory-proto`
-for A/AAAA exchanges. Both bound all datagrams and open no sockets. A deployment
-binding must send DHCP on UDP 68 -> 67, apply the accepted
-address/route and DNS servers through Netstack3's APIs, and send DNS queries to
-an explicitly configured server on UDP 53. It must also supply entropy, elapsed
-time, retry policy and TCP fallback when required; importing core alone still
-does not configure an interface or provide a resolver service.
+DHCP and DNS therefore remain explicit service dependencies even after a core port. The Cargo overlay now links Fuchsia.s pinned platform-agnostic DHCP client core and protocol directly. Its only native code implements the abstract clock, entropy, AF_PACKET, UDP, and configuration-effect boundaries. Name resolution links Fuchsia.s pinned Trust-DNS 0.22 forks directly; a bounded Send command channel implements their Time, UDP, TCP, and spawning traits against the single-owner Netstack3 runtime. No parallel DHCP codec/lease state machine or DNS cache/retry/fallback implementation remains.
 
 ## Integration boundary
 

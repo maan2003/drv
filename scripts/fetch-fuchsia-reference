@@ -11,6 +11,8 @@ paths=(
   src/connectivity/network/netstack3
   src/connectivity/network/dhcpv4/client/core
   src/connectivity/network/dhcpv4/protocol
+  src/connectivity/network/dns
+  src/connectivity/policy/netcfg
   src/connectivity/wlan
   src/connectivity/lib/net-types
   src/connectivity/lib/net-declare

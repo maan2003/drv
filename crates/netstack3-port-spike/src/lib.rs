@@ -2,7 +2,6 @@
 //!
 //! The crate itself does not link Netstack3. The companion pinned-source Cargo
 //! overlay executes upstream core against these authority-free contracts.
-pub mod control_plane;
 
 use std::collections::VecDeque;
 use std::error::Error;

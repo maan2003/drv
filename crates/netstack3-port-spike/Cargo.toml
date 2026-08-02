@@ -3,8 +3,3 @@ name = "netstack3-port-spike"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
-
-[dependencies]
-edge-dhcp = { version = "=0.6.0", default-features = false }
-hickory-proto = { version = "=0.26.0", default-features = false, features = ["std"] }
-rand-core-06 = { package = "rand_core", version = "=0.6.4" }

@@ -19,13 +19,10 @@ version = "0.1.0"
 
 [workspace.dependencies]
 # Pinned Fuchsia production DHCP/DNS implementations.
-edge-dhcp = { version = "=0.6.0", default-features = false }
-hickory-proto = { version = "=0.26.0", default-features = false, features = ["std"] }
 dhcp_client_core = { path = "../dhcpv4/client/core" }
 dhcp_protocol = { package = "dhcp-protocol", path = "../dhcpv4/protocol" }
 trust-dns-proto = { path = "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0", default-features = false, features = ["testing"] }
 trust-dns-resolver = { path = "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0", default-features = false, features = ["testing"] }
-rand-core-06 = { package = "rand_core", version = "=0.6.4" }
 
 arc-swap = { version = "=1.9.1", features = ["weak"] }
 arrayvec = "=0.7.6"
@@ -41,6 +38,7 @@ derivative = { version = "=2.2.0", features = ["use_core"] }
 derive_builder = "=0.20.2"
 either = "=1.15.0"
 futures = "=0.3.32"
+futures-io = "=0.3.32"
 hex = "=0.4.3"
 hmac = "=0.13.0"
 log = { version = "=0.4.29", features = ["kv", "std"] }
