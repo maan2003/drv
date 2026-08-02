@@ -13,6 +13,7 @@ doctest = false
 
 [features]
 benchmark = []
+host_test_utils = []
 
 [dependencies]
 anyhow.workspace = true

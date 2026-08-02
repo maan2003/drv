@@ -6,8 +6,23 @@
 
 use fidl_fuchsia_wlan_common::WlanMacRole;
 use fidl_fuchsia_wlan_ieee80211::{
-    ChannelNumber, HtCapabilities, MacAddr, VhtCapabilities, WlanBand,
+    ChannelNumber, HtCapabilities, MacAddr, StatusCode, VhtCapabilities, WlanBand,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum EapolResultCode {
+    Success = 0,
+    TransmissionFailure = 1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SaeFrame {
+    pub peer_sta_address: MacAddr,
+    pub status_code: StatusCode,
+    pub seq_num: u16,
+    pub sae_fields: Vec<u8>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BandCapability {
@@ -49,6 +64,19 @@ mod tests {
         };
         assert_eq!(capability.ht_cap.unwrap().bytes.len(), HT_CAP_LEN as usize);
         assert_eq!(capability.primary_channels[0].number, 36);
+    }
+
+    #[test]
+    fn rsn_value_types_match_schema() {
+        assert_eq!(EapolResultCode::Success as u32, 0);
+        assert_eq!(EapolResultCode::TransmissionFailure as u32, 1);
+        let frame = SaeFrame {
+            peer_sta_address: [1, 2, 3, 4, 5, 6],
+            status_code: StatusCode::SaeHashToElement,
+            seq_num: 2,
+            sae_fields: vec![7, 8],
+        };
+        assert_eq!(frame.status_code.into_primitive(), 126);
     }
 
     #[test]

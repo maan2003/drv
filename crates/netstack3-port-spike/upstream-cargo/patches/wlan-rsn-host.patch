@@ -1,0 +1,35 @@
+--- a/src/connectivity/wlan/lib/rsn/src/nonce.rs
++++ b/src/connectivity/wlan/lib/rsn/src/nonce.rs
+@@ -31,7 +31,12 @@
+         // Fuchsia has no support for NTP yet; instead use a regular timestamp.
+         // TODO(https://fxbug.dev/42124853): Use time in NTP format once Fuchsia added support.
+         let mut buf = BytesMut::with_capacity(14);
++        #[cfg(target_os = "fuchsia")]
+         let epoch_nanos = zx::MonotonicInstant::get().into_nanos();
++        #[cfg(not(target_os = "fuchsia"))]
++        let epoch_nanos = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map_or(0, |duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX));
+         buf.put_i64_le(epoch_nanos);
+         buf.put_slice(sta_addr.as_slice());
+         let k = OsRng.unwrap_err().random::<[u8; 32]>();
+--- a/src/connectivity/wlan/lib/rsn/src/integrity/hmac_sha256.rs
++++ b/src/connectivity/wlan/lib/rsn/src/integrity/hmac_sha256.rs
+@@ -74,7 +74,6 @@
+         "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2";
+         "test_case_7"
+     )]
+-    #[fuchsia::test(add_test_attr = false)]
+     fn test_compute(key_hex_str: &str, data_hex_str: &str, expected_hex_str: &str) {
+         let key = Vec::from_hex(key_hex_str).unwrap();
+         let data = Vec::from_hex(data_hex_str).unwrap();
+--- a/src/connectivity/wlan/lib/rsn/src/lib.rs
++++ b/src/connectivity/wlan/lib/rsn/src/lib.rs
+@@ -718,7 +718,6 @@
+         ];
+         "not a valid point on curve"
+     )]
+-    #[fuchsia::test(add_test_attr = false)]
+     fn supplicant_handle_public_key_wrong_key_size(public_key: Vec<u8>) {
+         let mut supplicant = test_util::get_owe_supplicant();
+         let mut update_sink = vec![];

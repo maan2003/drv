@@ -52,9 +52,10 @@ build metadata compiles it with Fuchsia's generated bindings and compatibility
 wrapper. BoringSSL remains under its upstream Apache-2.0 license.
 
 `wlan-common-host.patch` gates only the Zircon-status conversion at the existing
-platform boundary and marks the already ignored host scan timestamp as consumed.
-The frame, IE, BSS, capability, channel, rate-vector, and security algorithms
-remain byte-for-byte pinned Fuchsia source.
+platform boundary, marks the already ignored host scan timestamp as consumed,
+and makes its portable fixed-size test buffer available without compiling the
+Fuchsia-only test helpers. The frame, IE, BSS, capability, channel, rate-vector,
+and security algorithms remain byte-for-byte pinned Fuchsia source.
 
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
