@@ -35,11 +35,12 @@ __attribute__((export_name("drv_test_entry"))) int drv_test_entry(void) {
 
 __attribute__((export_name("drv_controller_packet"))) int
 drv_controller_packet(uint32_t kind, const uint8_t* bytes, uint32_t length) {
-  static const uint8_t reset_complete[] = {0x04, 0x0e, 0x04, 0x01,
+  static const uint8_t reset_complete[] = {0x0e, 0x04, 0x01,
                                            0x03, 0x0c, 0x00};
   return kind != 0 || length != sizeof(reset_complete) ||
          memcmp(bytes, reset_complete, sizeof(reset_complete)) != 0;
 }
+
 
 __wasi_errno_t __imported_wasi_snapshot_preview1_args_get(uint8_t** argv,
                                                           uint8_t* buffer) {

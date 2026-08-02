@@ -6,7 +6,7 @@ work=${1:-"$repo/target/sapphire-gap-wasm"}
 source="$work/pigweed"
 tool_repo="$work/nix-wasi-toolchain"
 output_root="$work/bazel-output"
-target=//pw_bluetooth_sapphire/host/gap:gap_test
+target=${SAPPHIRE_BAZEL_TARGET:-//pw_bluetooth_sapphire/host/gap:gap_test}
 gtest_arg=${SAPPHIRE_GTEST_ARG-}
 
 : "${SAPPHIRE_PIGWEED_ARCHIVE:?run inside nix develop}"
@@ -140,9 +140,26 @@ replacement = marker + '\n        "//:wasi_test_stubs",'
 if marker not in text:
     raise SystemExit("pinned GAP test patch context changed")
 gap.write_text(text.replace(marker, replacement, 1))
+
+sapphire = source / "pw_bluetooth_sapphire/BUILD.bazel"
+text = sapphire.read_text()
+marker = '''cc_library(
+    name = "null_lease_provider",
+    hdrs = [
+'''
+replacement = '''cc_library(
+    name = "null_lease_provider",
+    visibility = ["//visibility:public"],
+    hdrs = [
+'''
+if marker not in text:
+    raise SystemExit("pinned null lease provider context changed")
+sapphire.write_text(text.replace(marker, replacement, 1))
 PY
 
 cp "$repo/crates/bluetooth-sapphire-wasm/upstream/wasi_test_stubs.c" "$source/"
+cp "$repo/crates/bluetooth-sapphire-wasm/upstream/physical_discovery.cc" "$source/"
+cp "$repo/crates/bluetooth-sapphire-wasm/upstream/physical_wasi_stubs.c" "$source/"
 cat >>"$source/BUILD.bazel" <<'EOF'
 
 cc_library(
@@ -150,6 +167,28 @@ cc_library(
     srcs = ["wasi_test_stubs.c"],
     hdrs = ["wasi_test_args.h"],
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "physical_wasi_runtime",
+    testonly = True,
+    srcs = ["physical_wasi_stubs.c"],
+    textual_hdrs = ["wasi_test_args.h", "wasi_test_stubs.c"],
+)
+
+cc_binary(
+    name = "physical_discovery",
+    testonly = True,
+    srcs = ["physical_discovery.cc"],
+    deps = [
+        ":physical_wasi_runtime",
+        "//pw_async:fake_dispatcher",
+        "//pw_bluetooth",
+        "//pw_bluetooth_sapphire:null_lease_provider",
+        "//pw_bluetooth_sapphire/host/hci:hci",
+        "//pw_bluetooth_sapphire/host/hci:testing",
+        "//pw_bluetooth_sapphire/host/transport:transport",
+    ],
 )
 EOF
 
@@ -258,6 +297,7 @@ find "$googletest/googletest/include" "$googletest/googletest/src" -type f \( -n
   -exec sed -i 's/^#ifdef GTEST_HAS_DEATH_TEST$/#if GTEST_HAS_DEATH_TEST/' {} +
 
 bazel "${startup_args[@]}" build "${build_args[@]}" "$target"
-artifact="$source/bazel-bin/pw_bluetooth_sapphire/host/gap/gap_test"
+artifact="$source/bazel-bin/${target#//}"
+artifact=${artifact/:/\/}
 wasm-tools validate "$artifact"
 printf '%s\n' "$artifact"

@@ -42,6 +42,36 @@ The first executable target is the pinned upstream Sapphire fake-controller
 GAP discovery suite. Its WASM import list must match the interfaces in the WIT
 world before it can be connected to the physical HCI broker.
 
+The separate `//:physical_discovery` reactor is the guarded physical slice. It
+uses Sapphire's `Transport` and `LegacyLowEnergyScanner`, accepts only copied
+HCI packets without H4 bytes, and reports only a guest-derived unique-peer
+count. A READY/START handshake validates and instantiates the unprivileged
+worker before the supervisor mutates controller state. The supervisor owns the
+sole Linux HCI user-channel descriptor, allowlists only Reset, event-mask, and
+LE scan commands, imposes the wall deadline, waits for Sapphire's scan-disable
+completion, restores the exact controller flags, and independently reacquires
+the exclusive user channel. Physical mode has no fake fallback or automatic
+worker retry.
+
+The guarded `no-plastic` run completed a six-second LE scan through `hci0`.
+Sapphire reached scanning, produced a guest-derived count of one unique peer,
+issued scan disable, and reached stopped state. No peer identity is committed.
+The controller began and ended down with flags `0x00000000`; both the
+supervisor's post-restore probe and a separate post-run process reacquired the
+exclusive user channel. The durable report was root-owned mode 0600, while
+`mt7921e`, iwd, SSH, the disarmed watchdog, and the lab lock remained healthy.
+This proves discovery only, not pairing, bonding, profiles, audio, or firmware
+control.
+
+Build and exercise the CPU-only exact-HCI fixture with:
+
+```sh
+SAPPHIRE_BAZEL_TARGET=//:physical_discovery \
+  nix develop --command scripts/build-sapphire-gap-wasm
+cargo run -p bluetooth-sapphire-wasm -- --physical-fixture \
+  target/sapphire-gap-wasm/pigweed/bazel-bin/physical_discovery
+```
+
 `scripts/build-sapphire-gap-wasm` builds that suite from Pigweed commit
 `c14c119c51a82f6e044f81b7dad0a322091d4121`, fetched by Nix from the upstream
 Pigweed Gitiles archive with a fixed content hash. Pigweed and Sapphire retain

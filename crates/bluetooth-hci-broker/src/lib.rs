@@ -1,5 +1,12 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const MAX_HCI_PACKET: usize = 260;
 pub const MAX_OUTBOUND_HCI_PACKET: usize = 4096;
@@ -275,6 +282,389 @@ fn advertised_name(mut data: &[u8]) -> Option<String> {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(target_os = "linux")]
+mod physical {
+    use super::*;
+    use std::ffi::{c_int, c_short, c_ulong, c_void};
+
+    const AF_BLUETOOTH: c_int = 31;
+    const BTPROTO_HCI: c_int = 1;
+    const SOCK_RAW: c_int = 3;
+    const SOCK_NONBLOCK: c_int = 0x800;
+    const SOCK_CLOEXEC: c_int = 0x80000;
+    const HCI_CHANNEL_USER: u16 = 1;
+    const HCI_UP: u32 = 1;
+    const HCIDEVUP: c_ulong = 0x4004_48c9;
+    const HCIDEVDOWN: c_ulong = 0x4004_48ca;
+    const HCIGETDEVINFO: c_ulong = 0x8004_48d3;
+    const POLLIN: c_short = 0x001;
+    const POLLERR: c_short = 0x008;
+    const POLLHUP: c_short = 0x010;
+    const POLLNVAL: c_short = 0x020;
+
+    unsafe extern "C" {
+        fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+        fn bind(fd: c_int, address: *const c_void, length: u32) -> c_int;
+        fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+        fn read(fd: c_int, buffer: *mut c_void, length: usize) -> isize;
+        fn write(fd: c_int, buffer: *const c_void, length: usize) -> isize;
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+
+    #[repr(C)]
+    struct SockAddrHci {
+        family: u16,
+        device: u16,
+        channel: u16,
+    }
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct HciDevStats {
+        values: [u32; 10],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct HciDevInfo {
+        device: u16,
+        name: [u8; 8],
+        address: [u8; 6],
+        flags: u32,
+        kind: u8,
+        features: [u8; 8],
+        packet_type: u32,
+        link_policy: u32,
+        link_mode: u32,
+        stats: HciDevStats,
+    }
+
+    fn raw_socket(nonblock: bool) -> io::Result<OwnedFd> {
+        let mut kind = SOCK_RAW | SOCK_CLOEXEC;
+        if nonblock {
+            kind |= SOCK_NONBLOCK;
+        }
+        // SAFETY: socket returns a new descriptor and all arguments are Linux constants.
+        let raw = unsafe { socket(AF_BLUETOOTH, kind, BTPROTO_HCI) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ownership of the newly returned descriptor transfers once.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    fn snapshot(control: &OwnedFd, device: u16) -> io::Result<u32> {
+        let mut info = HciDevInfo {
+            device,
+            ..HciDevInfo::default()
+        };
+        // SAFETY: HCIGETDEVINFO expects a writable hci_dev_info pointer.
+        if unsafe { ioctl(control.as_raw_fd(), HCIGETDEVINFO, &mut info) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.flags)
+    }
+
+    fn set_up(control: &OwnedFd, device: u16, up: bool) -> io::Result<()> {
+        let request = if up { HCIDEVUP } else { HCIDEVDOWN };
+        // SAFETY: HCIDEVUP and HCIDEVDOWN take the controller id by value.
+        if unsafe { ioctl(control.as_raw_fd(), request, i32::from(device)) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn restore_exact(control: &OwnedFd, device: u16, wanted: u32) -> io::Result<()> {
+        if (snapshot(control, device)? & HCI_UP != 0) != (wanted & HCI_UP != 0) {
+            set_up(control, device, wanted & HCI_UP != 0)?;
+        }
+        for _ in 0..50 {
+            if snapshot(control, device)? == wanted {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(io::Error::other(format!(
+            "controller flags did not restore exactly: initial={wanted:#010x}, final={:#010x}",
+            snapshot(control, device)?
+        )))
+    }
+
+    fn open_user_channel(device: u16) -> io::Result<OwnedFd> {
+        let fd = raw_socket(true)?;
+        let address = SockAddrHci {
+            family: AF_BLUETOOTH as u16,
+            device,
+            channel: HCI_CHANNEL_USER,
+        };
+        // SAFETY: address points to a valid sockaddr_hci for the supplied size.
+        if unsafe {
+            bind(
+                fd.as_raw_fd(),
+                (&address as *const SockAddrHci).cast(),
+                std::mem::size_of::<SockAddrHci>() as u32,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
+    }
+
+    /// Exclusive, native-only Linux HCI user-channel ownership with exact flag restoration.
+    pub struct PhysicalHci {
+        control: OwnedFd,
+        channel: Option<OwnedFd>,
+        device: u16,
+        initial_flags: u32,
+        restored: bool,
+    }
+
+    impl PhysicalHci {
+        pub fn prepare(device: u16, state_path: &Path) -> io::Result<Self> {
+            let control = raw_socket(false)?;
+            let initial_flags = snapshot(&control, device)?;
+            let mut state = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(state_path)?;
+            writeln!(state, "device={device}\nflags={initial_flags:08x}")?;
+            state.sync_all()?;
+            if initial_flags & HCI_UP != 0 {
+                set_up(&control, device, false)?;
+                if snapshot(&control, device)? & HCI_UP != 0 {
+                    return Err(io::Error::other("controller remained up after HCIDEVDOWN"));
+                }
+            }
+            let channel = open_user_channel(device).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot open exclusive hci{device} user channel: {error}"),
+                )
+            })?;
+            Ok(Self {
+                control,
+                channel: Some(channel),
+                device,
+                initial_flags,
+                restored: false,
+            })
+        }
+
+        pub fn initial_flags(&self) -> u32 {
+            self.initial_flags
+        }
+
+        pub fn initialize_for_discovery(&self) -> io::Result<()> {
+            self.command(0x0c03, &[])?;
+            self.command(0x0c01, &[0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d])?;
+            self.command(0x2001, &[0x1f, 0, 0, 0, 0, 0, 0, 0])
+        }
+
+        pub fn send(&self, kind: OutboundKind, packet: &[u8]) -> io::Result<()> {
+            validate_outbound(kind, packet)?;
+            let h4 = match kind {
+                OutboundKind::Command => 0x01,
+                OutboundKind::Acl => 0x02,
+                OutboundKind::Sco => 0x03,
+                OutboundKind::Iso => 0x05,
+            };
+            let mut framed = Vec::with_capacity(packet.len() + 1);
+            framed.push(h4);
+            framed.extend_from_slice(packet);
+            self.write_raw(&framed)
+        }
+
+        pub fn receive(&self, deadline: Instant) -> io::Result<(InboundKind, Vec<u8>)> {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HCI deadline expired",
+                ));
+            }
+            let timeout = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+            let fd = self
+                .channel
+                .as_ref()
+                .ok_or_else(|| io::Error::other("HCI closed"))?;
+            let mut pollfd = PollFd {
+                fd: fd.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd points to one initialized entry for the call.
+            let ready = unsafe { poll(&mut pollfd, 1, timeout) };
+            if ready < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if ready == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HCI deadline expired",
+                ));
+            }
+            if pollfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "HCI user channel closed",
+                ));
+            }
+            let mut framed = vec![0; MAX_OUTBOUND_HCI_PACKET + 1];
+            // SAFETY: framed is writable and fd is owned for the call.
+            let length = unsafe { read(fd.as_raw_fd(), framed.as_mut_ptr().cast(), framed.len()) };
+            if length <= 0 {
+                return Err(if length == 0 {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "HCI user channel EOF")
+                } else {
+                    io::Error::last_os_error()
+                });
+            }
+            framed.truncate(length as usize);
+            let (&h4, packet) = framed
+                .split_first()
+                .ok_or_else(|| invalid("empty HCI packet"))?;
+            let (kind, bytes) = match h4 {
+                H4_EVENT => {
+                    validate_inbound(InboundKind::Event, &framed)?;
+                    (InboundKind::Event, packet.to_vec())
+                }
+                0x02 => (InboundKind::Acl, packet.to_vec()),
+                0x03 => (InboundKind::Sco, packet.to_vec()),
+                0x05 => (InboundKind::Iso, packet.to_vec()),
+                _ => return Err(invalid("unsupported inbound H4 packet type")),
+            };
+            if kind != InboundKind::Event {
+                validate_inbound(kind, &bytes)?;
+            }
+            Ok((kind, bytes))
+        }
+
+        pub fn cleanup_scan(&self) {
+            let _ = self.write_raw(&[0x01, 0x0c, 0x20, 0x02, 0x00, 0x01]);
+        }
+
+        pub fn restore(&mut self) -> io::Result<()> {
+            self.cleanup_scan();
+            self.channel.take();
+            restore_exact(&self.control, self.device, self.initial_flags)?;
+            self.restored = true;
+            Ok(())
+        }
+
+        fn write_raw(&self, packet: &[u8]) -> io::Result<()> {
+            let fd = self
+                .channel
+                .as_ref()
+                .ok_or_else(|| io::Error::other("HCI closed"))?;
+            // SAFETY: packet is readable and fd is owned for the call.
+            let written = unsafe { write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
+            if written < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written as usize != packet.len() {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "short HCI write"));
+            }
+            Ok(())
+        }
+
+        fn command(&self, opcode: u16, parameters: &[u8]) -> io::Result<()> {
+            let mut packet = vec![
+                0x01,
+                opcode as u8,
+                (opcode >> 8) as u8,
+                parameters.len() as u8,
+            ];
+            packet.extend_from_slice(parameters);
+            self.write_raw(&packet)?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (kind, bytes) = self.receive(deadline)?;
+                if kind != InboundKind::Event {
+                    continue;
+                }
+                let event = decode_event(&bytes)?;
+                let (completed, status) = match event.code {
+                    0x0e if event.parameters.len() >= 4 => (
+                        u16::from_le_bytes([event.parameters[1], event.parameters[2]]),
+                        event.parameters[3],
+                    ),
+                    0x0f if event.parameters.len() == 4 => (
+                        u16::from_le_bytes([event.parameters[2], event.parameters[3]]),
+                        event.parameters[0],
+                    ),
+                    _ => continue,
+                };
+                if completed == opcode {
+                    return if status == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(format!(
+                            "HCI initialization opcode {opcode:#06x} failed: {status:#04x}"
+                        )))
+                    };
+                }
+            }
+        }
+    }
+
+    impl Drop for PhysicalHci {
+        fn drop(&mut self) {
+            if !self.restored {
+                self.cleanup_scan();
+                self.channel.take();
+                let _ = restore_exact(&self.control, self.device, self.initial_flags);
+            }
+        }
+    }
+
+    pub fn probe_exclusive_user_channel(device: u16) -> io::Result<()> {
+        let control = raw_socket(false)?;
+        let flags = snapshot(&control, device)?;
+        if flags & HCI_UP != 0 {
+            set_up(&control, device, false)?;
+        }
+        let result = open_user_channel(device).map(drop);
+        let restore = restore_exact(&control, device, flags);
+        result.and(restore)
+    }
+
+    pub fn restore_saved_controller_state(path: &Path) -> io::Result<()> {
+        let text = std::fs::read_to_string(path)?;
+        let mut lines = text.lines();
+        let device = lines
+            .next()
+            .and_then(|line| line.strip_prefix("device="))
+            .ok_or_else(|| invalid("invalid saved controller state"))?
+            .parse::<u16>()
+            .map_err(|_| invalid("invalid saved controller device"))?;
+        let flags = u32::from_str_radix(
+            lines
+                .next()
+                .and_then(|line| line.strip_prefix("flags="))
+                .ok_or_else(|| invalid("invalid saved controller state"))?,
+            16,
+        )
+        .map_err(|_| invalid("invalid saved controller flags"))?;
+        if lines.next().is_some() {
+            return Err(invalid("trailing saved controller state"));
+        }
+        let control = raw_socket(false)?;
+        restore_exact(&control, device, flags)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use physical::{PhysicalHci, probe_exclusive_user_channel, restore_saved_controller_state};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupAction {

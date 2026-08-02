@@ -15,13 +15,12 @@ sandboxed Sapphire process <-> bounded HCI packets <-> privileged broker
 ```
 
 Sapphire must not receive the broker's descriptor or any USB, VFIO, firmware,
-filesystem, or unrelated host authority. The WASM supervisor now routes its
-bounded `controller.send` lowering through this crate's command, ACL, SCO, and
-ISO frame validation into a quota-limited fake controller. Attaching
-Sapphire's `bt::hci::Transport` and GAP discovery managers to inbound packet
-delivery remains the next integration step. The deterministic decoder tests
-here cover that boundary; Sapphire's upstream fake-controller discovery tests
-remain the behavior oracle.
+filesystem, or unrelated host authority. The default WASM test path routes its
+bounded `controller.send` lowering into a quota-limited fake controller. The
+explicit physical-discovery path instead keeps the user-channel descriptor in
+the native supervisor, strips H4 before copied inbound delivery, and allows
+only Reset, event-mask, and LE scan commands from Sapphire's transport and
+scanner. ACL, SCO, ISO, pairing, and profiles are rejected in this slice.
 
 ## Upstream inventory and provenance
 
@@ -71,3 +70,10 @@ second exclusive user-channel acquisition succeeded after cleanup, and
 `mt7921e`, iwd, SSH, and the disarmed Wi-Fi watchdog remained available. This
 verifies only bounded nearby-device discovery through the temporary Linux
 transport, not Sapphire execution, pairing, bonding, profiles, or sandboxing.
+
+The subsequent Sapphire-in-WASM slice also completed a guarded six-second LE
+scan. The native supervisor owned the sole descriptor while the unprivileged
+worker's Sapphire scanner produced a redacted unique-peer count of one and
+cleanly disabled scanning. Exact flags were restored and independent exclusive
+reacquisition succeeded. Peer addresses and names remain only transient HCI
+input and are not written by this path.
