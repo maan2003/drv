@@ -1,0 +1,15 @@
+[package]
+name = "netstack3-port-integration"
+edition.workspace = true
+license = "MIT OR Apache-2.0 AND BSD-2-Clause"
+version.workspace = true
+publish = false
+
+[dependencies]
+netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }
+netstack3_core = { path = "../../core", features = ["testutils"] }
+net_types.workspace = true
+net_declare.workspace = true
+netstack3_base.workspace = true
+packet.workspace = true
+packet_formats.workspace = true

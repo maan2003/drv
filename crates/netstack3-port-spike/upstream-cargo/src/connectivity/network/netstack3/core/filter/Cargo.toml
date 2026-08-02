@@ -1,0 +1,21 @@
+[package]
+name = "netstack3_filter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[features]
+instrumented = ["netstack3_base/instrumented"]
+testutils = ["instrumented", "netstack3_base/testutils"]
+[dependencies]
+assert_matches.workspace = true
+derivative.workspace = true
+log.workspace = true
+net_types.workspace = true
+netstack3_base.workspace = true
+netstack3_hashmap.workspace = true
+once_cell.workspace = true
+packet.workspace = true
+packet_formats.workspace = true
+rand.workspace = true
+replace_with.workspace = true
+zerocopy.workspace = true

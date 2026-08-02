@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit=1e1219e3fac944c9a906aea9646939746b6062b3
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+refroot="$repo/reference/fuchsia-$commit"
+
+if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]]; then
+  "$repo/scripts/fetch-fuchsia-reference"
+fi
+
+cp -R "$here/upstream-cargo/src" "$refroot/"
+cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
+
+manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
+cargo check --locked --manifest-path "$manifest" -p netstack3_core
+cargo check --locked --manifest-path "$manifest" -p netstack3_core --features testutils
+cargo test --locked --manifest-path "$manifest" -p netstack3-port-integration --test end_to_end

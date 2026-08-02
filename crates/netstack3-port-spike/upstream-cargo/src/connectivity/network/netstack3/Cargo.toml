@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+  "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
+  "../../lib/net-types", "../../lib/internet-checksum", "../../lib/packet-formats",
+  "../lib/diagnostics-traits", "../lib/explicit", "../../../lib/network/packet",
+  "../../../lib/replace-with", "core", "core/base", "core/datagram", "core/device",
+  "core/filter", "core/hashmap", "core/icmp_echo", "core/ip", "core/lock-order",
+  "core/macros", "core/sync", "core/teststd", "core/tcp", "core/trace", "core/udp",
+]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+version = "0.1.0"
+
+[workspace.dependencies]
+
+arc-swap = { version = "=1.9.1", features = ["weak"] }
+arrayvec = "=0.7.6"
+assert_matches = "=1.5.0"
+bitflags = { version = "=2.13.0", features = ["std"] }
+byteorder = "=1.5.0"
+cfg-if = "=1.0.4"
+criterion = { version = "=0.2.11", default-features = false }
+derivative = { version = "=2.2.0", features = ["use_core"] }
+either = "=1.15.0"
+hmac = "=0.13.0"
+log = { version = "=0.4.29", features = ["kv", "std"] }
+lru-cache = "=0.1.2"
+once_cell = "=1.21.3"
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+quote = "=1.0.45"
+rand = { version = "=0.9.4", features = ["small_rng"] }
+rand_xorshift = "=0.4.0"
+ref-cast = "=1.0.25"
+sha2 = "=0.11.0"
+siphasher = "=1.0.2"
+smallvec = { version = "=1.15.1", features = ["const_generics", "const_new", "union"] }
+static_assertions = "=1.1.0"
+strum = "=0.28.0"
+strum_macros = "=0.28.0"
+syn = { version = "=2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
+thiserror = "=2.0.18"
+zerocopy = { version = "=0.8.48", features = ["derive", "simd"] }
+net_types = { path = "../../lib/net-types" }
+net_types_macros = { path = "cargo/net-types-macros" }
+net_declare = { path = "cargo/net-declare-portable" }
+net_declare_macros = { path = "cargo/net-declare-macros" }
+internet_checksum = { path = "../../lib/internet-checksum" }
+packet_formats = { path = "../../lib/packet-formats" }
+diagnostics_traits = { path = "../lib/diagnostics-traits" }
+explicit = { path = "../lib/explicit" }
+packet = { path = "../../../lib/network/packet" }
+replace_with = { path = "../../../lib/replace-with" }
+netstack3_base = { path = "core/base" }
+netstack3_datagram = { path = "core/datagram" }
+netstack3_device = { path = "core/device" }
+netstack3_filter = { path = "core/filter" }
+netstack3_hashmap = { path = "core/hashmap" }
+netstack3_icmp_echo = { path = "core/icmp_echo" }
+netstack3_ip = { path = "core/ip" }
+lock_order = { path = "core/lock-order" }
+netstack3_macros = { path = "core/macros" }
+netstack3_sync = { path = "core/sync" }
+netstack3_tcp = { path = "core/tcp" }
+netstack3_trace = { path = "core/trace" }
+teststd = { path = "core/teststd" }
+netstack3_udp = { path = "core/udp" }
