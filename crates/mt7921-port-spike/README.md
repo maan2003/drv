@@ -61,6 +61,14 @@ MT7961 patch/RAM artifact names, validates their target metadata and every
 payload bound, and emits structured metadata. It does not retain, map for DMA,
 or send firmware bytes.
 
+`--read-dynamic-identity` admits the minimum dynamic-L1 selector operation used
+by pinned Linux `mt7921_reg_map_l1`, but closes over four read-only targets:
+`MT_HW_CHIPID`, `MT_HW_REV`, `MT_HW_BOUND`, and `MT_TOP_LPCR_HOST_BAND0`.
+It saves the selector, selects only bases `0x7001` and `0x1806`, verifies each
+posted selector write, reads only the enum-selected offsets through a separate
+read-only window mapping, and restores the original selector on success or
+failure. This mode cannot write the dynamic window or request MT_TOP ownership.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

@@ -2,10 +2,13 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
-    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
-    ReadRegister, acquire_driver_ownership,
+    DynamicL1Error, DynamicL1Event, DynamicL1Transport, MT_HIF_REMAP_L1_BAR_OFFSET,
+    MT_HIF_REMAP_WINDOW_BAR_OFFSET, OwnershipError, OwnershipEvent, OwnershipTransport,
+    PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, ReadRegister, acquire_driver_ownership,
+    read_dynamic_identity_status,
 };
 use std::{
+    cell::Cell,
     env,
     fs::{File, OpenOptions},
     os::fd::{AsRawFd, RawFd},
@@ -79,11 +82,13 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let acquire = match env::args().nth(1).as_deref() {
-        None => false,
-        Some("--acquire-driver-ownership") => true,
+    let operation = match env::args().nth(1).as_deref() {
+        None => Operation::ReadFixed,
+        Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
+        Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
+    let acquire = operation == Operation::AcquireDriverOwnership;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -164,6 +169,34 @@ fn run() -> Result<(), String> {
                 OwnershipError::Timeout => "driver ownership timed out after 500 ms".into(),
             },
         )?;
+    }
+    if operation == Operation::ReadDynamicIdentity {
+        let selector = ReadPage::map(&device, &info, 0xfe000, true)?;
+        let window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, false)?;
+        let mut transport = VfioDynamicL1 {
+            selector: &selector,
+            window: &window,
+            saved: Cell::new(None),
+        };
+        let status = read_dynamic_identity_status(&mut transport, log_dynamic_l1_event).map_err(
+            |error| match error {
+                DynamicL1Error::Transport(error) => error,
+                DynamicL1Error::SelectorMismatch { expected_base, raw } => format!(
+                    "dynamic L1 selector mismatch: expected {expected_base:#06x}, read {raw:#010x}"
+                ),
+                DynamicL1Error::Restore(error) => format!("restore dynamic L1 selector: {error}"),
+            },
+        )?;
+        if status.chip_id != 0x7961 {
+            return Err(format!(
+                "dynamic chip ID is {:#x}, expected 0x7961",
+                status.chip_id
+            ));
+        }
+        println!(
+            "{{\"dynamic_identity\":{{\"chip_id\":\"{:#010x}\",\"revision\":\"{:#010x}\",\"hardware_bound\":\"{:#010x}\",\"top_low_power_control\":\"{:#010x}\"}}}}",
+            status.chip_id, status.revision, status.hardware_bound, status.top_low_power_control
+        );
     }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
@@ -297,6 +330,14 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn write_remap_selector(&self, value: u32) -> Result<(), String> {
+        let within = MT_HIF_REMAP_L1_BAR_OFFSET - self.bar_page;
+        if self.bar_page != 0xfe000 || within + 4 > PAGE {
+            return Err("remap selector write escaped immutable allowlist".into());
+        }
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -364,6 +405,75 @@ fn log_ownership_event(event: OwnershipEvent) {
         ),
         OwnershipEvent::TimedOut { at_ms } => {
             println!("{{\"ownership_event\":\"timed_out\",\"at_ms\":{at_ms}}}")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Operation {
+    ReadFixed,
+    AcquireDriverOwnership,
+    ReadDynamicIdentity,
+}
+
+struct VfioDynamicL1<'a> {
+    selector: &'a ReadPage,
+    window: &'a ReadPage,
+    saved: Cell<Option<u32>>,
+}
+impl DynamicL1Transport for VfioDynamicL1<'_> {
+    type Error = String;
+    fn read_selector(&mut self) -> Result<u32, Self::Error> {
+        let value = self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+        if self.saved.get().is_none() {
+            self.saved.set(Some(value));
+        }
+        Ok(value)
+    }
+    fn write_selector(&mut self, value: u32) -> Result<(), Self::Error> {
+        let low = value & 0xffff;
+        if low != 0x7001 && low != 0x1806 && Some(value) != self.saved.get() {
+            return Err(format!(
+                "selector value {value:#010x} escaped target allowlist"
+            ));
+        }
+        self.selector.write_remap_selector(value)
+    }
+    fn read_window(&mut self, offset: u16) -> Result<u32, Self::Error> {
+        match (
+            self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff,
+            offset,
+        ) {
+            (0x7001, 0x0200 | 0x0204 | 0x0020) | (0x1806, 0x0010) => self
+                .window
+                .read(MT_HIF_REMAP_WINDOW_BAR_OFFSET + usize::from(offset)),
+            (base, _) => Err(format!(
+                "dynamic read base {base:#06x} offset {offset:#06x} escaped target allowlist"
+            )),
+        }
+    }
+}
+
+fn log_dynamic_l1_event(event: DynamicL1Event) {
+    match event {
+        DynamicL1Event::SelectorSaved { raw } => {
+            println!("{{\"dynamic_l1_event\":\"selector_saved\",\"raw\":\"{raw:#010x}\"}}")
+        }
+        DynamicL1Event::SelectorWritten { base, raw } => println!(
+            "{{\"dynamic_l1_event\":\"selector_written\",\"base\":\"{base:#06x}\",\"raw\":\"{raw:#010x}\"}}"
+        ),
+        DynamicL1Event::SelectorVerified { base, raw } => println!(
+            "{{\"dynamic_l1_event\":\"selector_verified\",\"base\":\"{base:#06x}\",\"raw\":\"{raw:#010x}\"}}"
+        ),
+        DynamicL1Event::RegisterRead {
+            name,
+            physical,
+            value,
+        } => println!(
+            "{{\"dynamic_l1_event\":\"register_read\",\"name\":\"{name}\",\"physical\":\"{physical:#010x}\",\"value\":\"{value:#010x}\"}}"
+        ),
+        DynamicL1Event::SelectorRestored { raw } => {
+            println!("{{\"dynamic_l1_event\":\"selector_restored\",\"raw\":\"{raw:#010x}\"}}")
         }
     }
 }

@@ -893,6 +893,149 @@ where
     Err(OwnershipError::Timeout)
 }
 
+pub const MT_HIF_REMAP_L1_BAR_OFFSET: usize = 0xfe24c;
+pub const MT_HIF_REMAP_WINDOW_BAR_OFFSET: usize = 0x40000;
+const MT_HIF_REMAP_L1_MASK: u32 = 0xffff;
+
+pub trait DynamicL1Transport {
+    type Error;
+    fn read_selector(&mut self) -> Result<u32, Self::Error>;
+    fn write_selector(&mut self, value: u32) -> Result<(), Self::Error>;
+    fn read_window(&mut self, offset: u16) -> Result<u32, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DynamicL1Event {
+    SelectorSaved {
+        raw: u32,
+    },
+    SelectorWritten {
+        base: u16,
+        raw: u32,
+    },
+    SelectorVerified {
+        base: u16,
+        raw: u32,
+    },
+    RegisterRead {
+        name: &'static str,
+        physical: u32,
+        value: u32,
+    },
+    SelectorRestored {
+        raw: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DynamicL1Error<E> {
+    Transport(E),
+    SelectorMismatch { expected_base: u16, raw: u32 },
+    Restore(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicIdentityStatus {
+    pub chip_id: u32,
+    pub revision: u32,
+    pub hardware_bound: u32,
+    pub top_low_power_control: u32,
+}
+
+/// Execute the first bounded dynamic-L1 transaction used by pinned mt7921.
+///
+/// The physical targets are closed over here rather than accepted from the
+/// caller. The selector is restored on both success and read/select failure.
+pub fn read_dynamic_identity_status<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<DynamicIdentityStatus, DynamicL1Error<T::Error>>
+where
+    T: DynamicL1Transport,
+    F: FnMut(DynamicL1Event),
+{
+    let saved = transport
+        .read_selector()
+        .map_err(DynamicL1Error::Transport)?;
+    event(DynamicL1Event::SelectorSaved { raw: saved });
+    let operation = (|| {
+        select_l1(transport, saved, 0x7001, &mut event)?;
+        let chip_id = read_l1(transport, "chip_id", 0x7001_0200, &mut event)?;
+        let revision = read_l1(transport, "revision", 0x7001_0204, &mut event)?;
+        let hardware_bound = read_l1(transport, "hardware_bound", 0x7001_0020, &mut event)?;
+        select_l1(transport, saved, 0x1806, &mut event)?;
+        let top_low_power_control =
+            read_l1(transport, "top_low_power_control", 0x1806_0010, &mut event)?;
+        Ok(DynamicIdentityStatus {
+            chip_id,
+            revision,
+            hardware_bound,
+            top_low_power_control,
+        })
+    })();
+    if let Err(error) = transport.write_selector(saved) {
+        return Err(DynamicL1Error::Restore(error));
+    }
+    event(DynamicL1Event::SelectorRestored { raw: saved });
+    operation
+}
+
+fn select_l1<T, F>(
+    transport: &mut T,
+    saved: u32,
+    base: u16,
+    event: &mut F,
+) -> Result<(), DynamicL1Error<T::Error>>
+where
+    T: DynamicL1Transport,
+    F: FnMut(DynamicL1Event),
+{
+    let selected = (saved & !MT_HIF_REMAP_L1_MASK) | u32::from(base);
+    transport
+        .write_selector(selected)
+        .map_err(DynamicL1Error::Transport)?;
+    event(DynamicL1Event::SelectorWritten {
+        base,
+        raw: selected,
+    });
+    // Linux reads MT_HIF_REMAP_L1 to push the selector write.
+    let verified = transport
+        .read_selector()
+        .map_err(DynamicL1Error::Transport)?;
+    event(DynamicL1Event::SelectorVerified {
+        base,
+        raw: verified,
+    });
+    if verified & MT_HIF_REMAP_L1_MASK != u32::from(base) {
+        return Err(DynamicL1Error::SelectorMismatch {
+            expected_base: base,
+            raw: verified,
+        });
+    }
+    Ok(())
+}
+
+fn read_l1<T, F>(
+    transport: &mut T,
+    name: &'static str,
+    physical: u32,
+    event: &mut F,
+) -> Result<u32, DynamicL1Error<T::Error>>
+where
+    T: DynamicL1Transport,
+    F: FnMut(DynamicL1Event),
+{
+    let value = transport
+        .read_window(physical as u16)
+        .map_err(DynamicL1Error::Transport)?;
+    event(DynamicL1Event::RegisterRead {
+        name,
+        physical,
+        value,
+    });
+    Ok(value)
+}
+
 impl ReadOnlyStatus {
     pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
         Self {
@@ -1209,6 +1352,71 @@ mod tests {
         assert_eq!(
             Patch::parse(&patch_image(2, 200, 4)),
             Err(PatchError::PayloadOutOfBounds)
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeL1 {
+        selector: u32,
+        writes: Vec<u32>,
+        fail_window: Option<u16>,
+    }
+    impl DynamicL1Transport for FakeL1 {
+        type Error = u16;
+        fn read_selector(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.selector)
+        }
+        fn write_selector(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.selector = value;
+            self.writes.push(value);
+            Ok(())
+        }
+        fn read_window(&mut self, offset: u16) -> Result<u32, Self::Error> {
+            if self.fail_window == Some(offset) {
+                return Err(offset);
+            }
+            Ok((self.selector & 0xffff) << 16 | u32::from(offset))
+        }
+    }
+
+    #[test]
+    fn dynamic_l1_reads_only_fixed_targets_and_restores_selector() {
+        let mut transport = FakeL1 {
+            selector: 0xabcd_1234,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let status =
+            read_dynamic_identity_status(&mut transport, |event| events.push(event)).unwrap();
+        assert_eq!(status.chip_id, 0x7001_0200);
+        assert_eq!(status.revision, 0x7001_0204);
+        assert_eq!(status.hardware_bound, 0x7001_0020);
+        assert_eq!(status.top_low_power_control, 0x1806_0010);
+        assert_eq!(transport.selector, 0xabcd_1234);
+        assert_eq!(transport.writes, [0xabcd_7001, 0xabcd_1806, 0xabcd_1234]);
+        assert_eq!(
+            events.last(),
+            Some(&DynamicL1Event::SelectorRestored { raw: 0xabcd_1234 })
+        );
+    }
+
+    #[test]
+    fn dynamic_l1_restores_selector_after_window_failure() {
+        let mut transport = FakeL1 {
+            selector: 0x55aa_4321,
+            fail_window: Some(0x0204),
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            read_dynamic_identity_status(&mut transport, |event| events.push(event)),
+            Err(DynamicL1Error::Transport(0x0204))
+        );
+        assert_eq!(transport.selector, 0x55aa_4321);
+        assert_eq!(transport.writes.last(), Some(&0x55aa_4321));
+        assert_eq!(
+            events.last(),
+            Some(&DynamicL1Event::SelectorRestored { raw: 0x55aa_4321 })
         );
     }
 
