@@ -154,7 +154,7 @@ struct Dma {
     direction: DmaDirection,
 }
 struct LinuxVfio {
-    device: File,
+    device: Option<File>,
     iommu: File,
     ioas: u32,
     generation: u64,
@@ -162,6 +162,9 @@ struct LinuxVfio {
 }
 
 impl LinuxVfio {
+    fn device_fd(&self) -> RawFd {
+        self.device.as_ref().expect("live VFIO device").as_raw_fd()
+    }
     fn open(path: &str) -> Result<Self> {
         let device = OpenOptions::new()
             .read(true)
@@ -195,7 +198,7 @@ impl LinuxVfio {
             &mut attach,
         )?;
         Ok(Self {
-            device,
+            device: Some(device),
             iommu,
             ioas: alloc.out_ioas_id,
             generation: 1,
@@ -205,6 +208,8 @@ impl LinuxVfio {
 }
 impl Drop for LinuxVfio {
     fn drop(&mut self) {
+        self.irq.take();
+        self.device.take();
         let mut d = Destroy {
             size: std::mem::size_of::<Destroy>() as u32,
             id: self.ioas,
@@ -226,14 +231,10 @@ impl Backend for LinuxVfio {
             index: index as u32,
             ..Default::default()
         };
-        ioctl_mut(
-            self.device.as_raw_fd(),
-            VFIO_DEVICE_GET_REGION_INFO,
-            &mut info,
-        )?;
+        ioctl_mut(self.device_fd(), VFIO_DEVICE_GET_REGION_INFO, &mut info)?;
         let ptr = page_map(
             info.size as usize,
-            self.device.as_raw_fd(),
+            self.device_fd(),
             info.offset as i64,
             MAP_SHARED,
         )?;
@@ -352,7 +353,7 @@ impl Backend for LinuxVfio {
             count: 1,
             eventfd: fd,
         };
-        ioctl_mut(self.device.as_raw_fd(), VFIO_DEVICE_SET_IRQS, &mut set)?;
+        ioctl_mut(self.device_fd(), VFIO_DEVICE_SET_IRQS, &mut set)?;
         self.irq = Some(file);
         Ok(())
     }
@@ -370,7 +371,7 @@ impl Backend for LinuxVfio {
             start: 0,
             count: 1,
         };
-        ioctl_mut(self.device.as_raw_fd(), VFIO_DEVICE_SET_IRQS, &mut unmask)?;
+        ioctl_mut(self.device_fd(), VFIO_DEVICE_SET_IRQS, &mut unmask)?;
         Ok(Some(IrqEvent {
             vector: 0,
             count: u64::from_ne_bytes(bytes),
@@ -380,7 +381,7 @@ impl Backend for LinuxVfio {
     fn reset(&mut self) -> Result<u64> {
         // QEMU edu's VFIO cdev does not advertise a function-reset method on
         // every kernel; generation revocation remains mandatory either way.
-        let _ = unsafe { ioctl(self.device.as_raw_fd(), VFIO_DEVICE_RESET) };
+        let _ = unsafe { ioctl(self.device_fd(), VFIO_DEVICE_RESET) };
         self.generation += 1;
         Ok(self.generation)
     }
