@@ -40,6 +40,11 @@ pin boundary. New WLAN common, SoftMAC MLME, SME, RSN, and EAPOL packages:
 5. isolate host-only build changes as named patches without forking protocol or
    state-machine behavior.
 
+The fetch closure includes the `fuchsia.wlan.*` FIDL source namespaces consumed
+by these packages. Host bindings must be generated or represented by narrow
+path-shaped compatibility crates from those pinned schemas; they must not copy
+policy or invent a second protocol definition.
+
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
 archive convention, workspace, or lockfile for another Fuchsia subsystem.

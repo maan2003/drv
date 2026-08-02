@@ -52,6 +52,15 @@ paths=(
   sdk/fidl/fuchsia.hardware.audio
   sdk/fidl/fuchsia.hardware.audio.signalprocessing
   sdk/fidl/fuchsia.hardware.bluetooth
+  sdk/fidl/fuchsia.wlan.common
+  sdk/fidl/fuchsia.wlan.driver
+  sdk/fidl/fuchsia.wlan.ieee80211
+  sdk/fidl/fuchsia.wlan.internal
+  sdk/fidl/fuchsia.wlan.minstrel
+  sdk/fidl/fuchsia.wlan.mlme
+  sdk/fidl/fuchsia.wlan.sme
+  sdk/fidl/fuchsia.wlan.softmac
+  sdk/fidl/fuchsia.wlan.stats
 )
 
 # Additional pinned paths may be supplied by package overlays. This keeps one
