@@ -1998,6 +1998,60 @@ pub fn select_vfio_irq(capabilities: &[PciIrqCapability]) -> Option<PciIrqCapabi
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqLifecycle {
+    Uninstalled,
+    EventfdInstalled(PciIrqCapability),
+    DeviceSourceEnabled(PciIrqCapability),
+    EventObserved(PciIrqCapability),
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqLifecycleError {
+    InvalidTransition,
+    EmptyEvent,
+}
+
+impl IrqLifecycle {
+    pub fn install(self, capability: PciIrqCapability) -> Result<Self, IrqLifecycleError> {
+        if self != Self::Uninstalled || capability.count == 0 || !capability.eventfd {
+            return Err(IrqLifecycleError::InvalidTransition);
+        }
+        Ok(Self::EventfdInstalled(capability))
+    }
+
+    pub fn enable_device_source(self) -> Result<Self, IrqLifecycleError> {
+        match self {
+            Self::EventfdInstalled(capability) => Ok(Self::DeviceSourceEnabled(capability)),
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub fn observe_event(self, counter: u64) -> Result<Self, IrqLifecycleError> {
+        if counter == 0 {
+            return Err(IrqLifecycleError::EmptyEvent);
+        }
+        match self {
+            Self::DeviceSourceEnabled(capability) => Ok(Self::EventObserved(capability)),
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub fn disable(self) -> Result<Self, IrqLifecycleError> {
+        match self {
+            Self::EventfdInstalled(_) | Self::DeviceSourceEnabled(_) | Self::EventObserved(_) => {
+                Ok(Self::Disabled)
+            }
+            _ => Err(IrqLifecycleError::InvalidTransition),
+        }
+    }
+
+    pub const fn may_unmask_device(self) -> bool {
+        matches!(self, Self::EventfdInstalled(_))
+    }
+}
+
 pub const PINNED_DMA_QUIESCE_MS: u64 = 100;
 
 pub trait PinnedDmaTeardownTransport {
@@ -3313,6 +3367,26 @@ mod tests {
             }]),
             None
         );
+    }
+
+    #[test]
+    fn irq_lifecycle_cannot_unmask_before_eventfd_install() {
+        let capability = PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 1,
+            eventfd: true,
+        };
+        assert!(!IrqLifecycle::Uninstalled.may_unmask_device());
+        assert_eq!(
+            IrqLifecycle::Uninstalled.enable_device_source(),
+            Err(IrqLifecycleError::InvalidTransition)
+        );
+        let installed = IrqLifecycle::Uninstalled.install(capability).unwrap();
+        assert!(installed.may_unmask_device());
+        let enabled = installed.enable_device_source().unwrap();
+        assert_eq!(enabled.observe_event(0), Err(IrqLifecycleError::EmptyEvent));
+        let observed = enabled.observe_event(1).unwrap();
+        assert_eq!(observed.disable(), Ok(IrqLifecycle::Disabled));
     }
 
     struct FakePinnedTeardown {

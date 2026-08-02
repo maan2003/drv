@@ -153,6 +153,10 @@ capabilities without installing or triggering one, rejects modes without
 eventfd support, and reports the preferred MSI-X/MSI/INTx choice. Device
 interrupt unmasking remains unavailable until that chosen vector is actually
 installed and exercised by the deterministic completion path.
+`IrqLifecycle` prevents the device source from being enabled before an
+eventfd-capable VFIO vector is installed, rejects a zero eventfd counter, and
+requires explicit disable after an observed completion. It is deterministic
+only; the native eventfd/`VFIO_DEVICE_SET_IRQS` owner is still pending.
 
 `teardown_pinned_dma` makes reset ordering explicit for the future active path:
 mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
