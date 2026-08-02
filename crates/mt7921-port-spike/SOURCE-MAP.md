@@ -31,13 +31,21 @@ unmapped dependencies must fail closed.
 | MT792x platform/tools | `mt792x_{acpi_sar,debugfs,trace,usb}*` | 1,194 | stubbed target | platform/tool traits |
 | Required mt76 core | `mt76.h`, `dma.[ch]`, `mcu.c`, `mmio.c`, `pci.c`, `tx.c`, `util.[ch]` | 5,135 | unmapped/partial spike | DMA/MMIO/clock/workqueue traits |
 | Required connac | `mt76_connac.h`, `mt76_connac2_mac.h`, `mt76_connac_{mac,mcu}.c`, `mt76_connac_mcu.h` | 7,409 | partial spike | firmware protocol package |
-| Linux policy | `mac80211.c`, cfg80211/mac80211 calls reached above | reference only | stubbed target | typed unsupported policy traits |
+| Linux policy | `mac80211.c`, cfg80211/mac80211 calls reached above | reference only | replaced by Fuchsia SoftMAC | never a Rust runtime/compatibility layer |
 
-The production MLME/SME/RSN/EAPOL/frame path remains the pinned Fuchsia WLAN
-port. Linux mac80211/cfg80211 is retained only to preserve hardware-driver call
-graphs and must not become production policy.
+The production MLME/SME/RSN/EAPOL/frame path is the pinned BSD Fuchsia WLAN
+common/client SoftMAC closure. Every Linux mac80211/cfg80211 dependency is
+**replaced by Fuchsia SoftMAC**, not stubbed for later implementation and never
+used as a runtime or compatibility layer. Linux policy references are retained
+only to identify where hardware results cross the narrow Fuchsia-compatible
+hardware trait.
 
 ## Current translated item map
+
+[`SOURCE-ITEMS.tsv`](./SOURCE-ITEMS.tsv) is the exhaustive declaration-level
+inventory for the scoped pinned files (functions/prototypes, types, members,
+enumerators, macros/constants, and globals). Each of its 5,570 entries is
+explicitly marked; the initial majority is `unmapped`.
 
 | Linux item | Linux file | Rust item | Status | Verification |
 |---|---|---|---|---|
@@ -64,8 +72,9 @@ gate is **closed**.
    separately licensed crate before translation expands.
 3. Linux kernel primitives (SKBs, NAPI, workqueues, timers, RCU, page pools,
    DMA APIs, PCI power/reset, firmware loading) need explicit safe typed traits.
-4. mac80211/cfg80211 calls need typed unsupported stubs, while hardware-returned
-   data must cross into the Fuchsia production policy boundary.
+4. The pinned Fuchsia common/client portable closure and upstream tests must be
+   established first. Hardware-returned data then crosses only the narrow trait
+   matching Fuchsia SoftMAC semantics; mac80211/cfg80211 is replaced, not ported.
 5. The last physical trace reached all 18 idle TX rings, then userspace received
    SIGSEGV on the first ownership-write path. Physical writes remain disabled
    until the complete dependency path and MMIO fault semantics are modeled.
