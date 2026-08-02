@@ -1264,7 +1264,11 @@ dependencies = [
 name = "netstack3-port-integration"
 version = "0.1.0"
 dependencies = [
+ "dhcp-protocol",
+ "dhcp_client_core",
+ "diagnostics_traits",
  "edge-dhcp",
+ "futures",
  "hickory-proto",
  "net_declare",
  "net_types",
@@ -1281,6 +1285,8 @@ dependencies = [
  "packet_formats",
  "rand 0.9.4",
  "rand_core 0.6.4",
+ "trust-dns-proto",
+ "trust-dns-resolver",
  "zerocopy",
 ]
 

@@ -5,6 +5,8 @@
 
 #![recursion_limit = "256"]
 
+pub mod service;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
@@ -66,7 +68,9 @@ use netstack3_ip::raw::{
 };
 use netstack3_ip::{IpRoutingBindingsTypes, MarksBindingsContext};
 use netstack3_port_spike::control_plane::{DhcpOffer, MAX_CONTROL_DATAGRAM_LEN};
-use netstack3_port_spike::{EthernetFrame, StackEthernetEndpoint};
+use netstack3_port_spike::{
+    EthernetDeviceEvent, EthernetFrame, NetworkServiceEndpoint, StackEthernetEndpoint,
+};
 use netstack3_tcp::{Buffer, BufferLimits, IntoBuffers, ReceiveBuffer, SendBuffer};
 use netstack3_tcp::{
     BufferSizes, ListenerNotifier, TcpBindingsTypes, TcpSettings, TcpSocketDestructionContext,
@@ -1211,8 +1215,43 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn set_dns_servers(&mut self, servers: [Option<std::net::Ipv4Addr>; 2]) { self.dns_servers = servers; }
+
     pub fn dns_servers(&self) -> [Option<std::net::Ipv4Addr>; 2] {
         self.dns_servers
+    }
+
+    /// Sends an upstream DHCP core AF_PACKET payload through the private device socket.
+    pub fn dhcp_packet_send(&mut self, packet: &[u8]) -> Result<(), RuntimeError> {
+        if packet.len() > 1500 {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
+        self.stack
+            .api(&mut self.bindings)
+            .device_socket()
+            .send_frame::<_, EthernetLinkDevice>(
+                &self.dhcp_socket,
+                DeviceSocketMetadata {
+                    device_id: self.device.clone(),
+                    metadata: Some(EthernetHeaderParams {
+                        dest_addr: Mac::BROADCAST,
+                        protocol: EtherType::Ipv4,
+                    }),
+                },
+                Buf::new(packet.to_vec(), ..),
+            )
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
+    /// Takes one full IPv4 packet for the upstream DHCP core AF_PACKET adapter.
+    pub fn dhcp_packet_receive(&mut self) -> Option<Vec<u8>> {
+        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+            let Some(packet) = frame.get(14..) else { continue };
+            if packet.len() >= 20 && packet[0] >> 4 == 4 {
+                return Some(packet.to_vec());
+            }
+        }
+        None
     }
 
     /// Sends a pre-lease DHCP datagram through core's private device socket.
@@ -1393,12 +1432,54 @@ impl Runtime {
             .map_err(|_| RuntimeError::SendFailed)
     }
 
+    pub fn udp_connect(
+        &mut self,
+        handle: UdpSocketHandle,
+        remote_address: [u8; 4],
+        remote_port: NonZeroU16,
+    ) -> Result<(), RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let address = SpecifiedAddr::new(Ipv4Addr::new(remote_address))
+            .ok_or(RuntimeError::InvalidAddress)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .connect(
+                id,
+                Some(ZonedAddr::Unzoned(address)),
+                UdpRemotePort::Set(remote_port),
+            )
+            .map_err(|_| RuntimeError::InvalidState)
+    }
+
+    pub fn udp_send(
+        &mut self,
+        handle: UdpSocketHandle,
+        payload: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if payload.len() > 1472 {
+            return Err(RuntimeError::PayloadTooLarge);
+        }
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        self.stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .send(id, Buf::new(payload.to_vec(), ..))
+            .map_err(|_| RuntimeError::SendFailed)
+    }
+
     pub fn udp_receive(
         &mut self,
         handle: UdpSocketHandle,
     ) -> Result<Option<Vec<u8>>, RuntimeError> {
         let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id))
+    }
+
+    pub fn udp_close(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
+        let id = self.udp.remove(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        drop(self.stack.api(&mut self.bindings).udp::<Ipv4>().close(id));
+        Ok(())
     }
 
     pub fn udp_socket_ipv6(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
@@ -1476,6 +1557,15 @@ impl Runtime {
             .get(&handle)
             .ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id))
+    }
+
+    pub fn udp_close_ipv6(&mut self, handle: UdpSocketHandle) -> Result<(), RuntimeError> {
+        let id = self
+            .udp_v6
+            .remove(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        drop(self.stack.api(&mut self.bindings).udp::<Ipv6>().close(id));
+        Ok(())
     }
 
     pub fn tcp_socket(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
@@ -1853,6 +1943,20 @@ impl StackEthernetEndpoint for Runtime {
 
     fn take_transmit(&mut self) -> Option<EthernetFrame> {
         self.take_tx()
+    }
+}
+
+impl NetworkServiceEndpoint for Runtime {
+    fn poll_at(&mut self, now: Duration, budget: usize) -> usize {
+        let nanos = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+        self.set_now(NativeInstant::from_nanos(nanos));
+        self.dispatch_due(budget)
+    }
+
+    fn on_device_event(&mut self, event: EthernetDeviceEvent) {
+        if event == EthernetDeviceEvent::TransmitReady {
+            self.service_tx(1);
+        }
     }
 }
 

@@ -7,6 +7,12 @@ publish = false
 
 [dependencies]
 edge-dhcp.workspace = true
+dhcp_client_core.workspace = true
+dhcp_protocol.workspace = true
+diagnostics_traits.workspace = true
+futures.workspace = true
+trust-dns-proto.workspace = true
+trust-dns-resolver.workspace = true
 hickory-proto.workspace = true
 rand-core-06.workspace = true
 netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }
