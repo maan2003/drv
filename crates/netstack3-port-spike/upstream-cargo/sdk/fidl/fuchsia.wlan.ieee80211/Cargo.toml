@@ -1,0 +1,10 @@
+[package]
+name = "fidl-fuchsia-wlan-ieee80211"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fidl_fuchsia_wlan_ieee80211"
+path = "src/lib.rs"
+

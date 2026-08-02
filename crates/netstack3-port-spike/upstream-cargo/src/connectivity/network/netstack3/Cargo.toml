@@ -4,6 +4,7 @@ members = [
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
+  "../../wlan/lib/ieee80211", "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
   "../dhcpv4/client/core", "../dhcpv4/protocol",
   "../../../../third_party/rust_crates/forks/trust-dns-proto-0.22.0",
   "../../../../third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
@@ -28,6 +29,7 @@ trust-dns-resolver = { path = "../../../../third_party/rust_crates/forks/trust-d
 
 arc-swap = { version = "=1.9.1", features = ["weak"] }
 arrayvec = "=0.7.6"
+arbitrary = { version = "=1.4.2", features = ["derive"] }
 anyhow = "=1.0.102"
 assert_matches = "=1.5.0"
 async-trait = "=0.1.89"
@@ -69,6 +71,7 @@ net_types_macros = { path = "cargo/net-types-macros" }
 net_declare = { path = "cargo/net-declare-portable" }
 net_declare_macros = { path = "cargo/net-declare-macros" }
 internet_checksum = { path = "../../lib/internet-checksum" }
+ieee80211 = { path = "../../wlan/lib/ieee80211" }
 packet_formats = { path = "../../lib/packet-formats" }
 diagnostics_traits = { path = "../lib/diagnostics-traits" }
 explicit = { path = "../lib/explicit" }
