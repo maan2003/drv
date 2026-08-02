@@ -113,6 +113,15 @@ zeroed, both mappings are explicitly removed, and VFIO reset is mandatory.
 No ring register, producer index, DMA-enable bit, interrupt mask, or MCU command
 is written, so the device cannot observe the staged descriptor.
 
+`--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
+global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
+and that raw patch scatter is invalid until the MCU has accepted patch
+semaphore and `PATCH_START` commands. Active DMA therefore remains unavailable
+until the backend owns or guards every TX ring, resets and verifies every DMA
+index, installs a VFIO IRQ before unmasking it, implements the MCU command/RX
+response path, and keeps every mapping pinned through quiescence and function
+reset. The rejected command cannot map DMA or write MMIO.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

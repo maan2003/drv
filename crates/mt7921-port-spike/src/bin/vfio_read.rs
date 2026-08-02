@@ -138,6 +138,9 @@ fn run() -> Result<(), String> {
         Some("--program-disabled-fwdl-ring") => Operation::ProgramDisabledFwdlRing,
         Some("--mask-ack-disabled-fwdl") => Operation::MaskAckDisabledFwdl,
         Some("--stage-disabled-firmware-descriptor") => Operation::StageDisabledFirmwareDescriptor,
+        Some("--run-one-shot-fwdl") => {
+            return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
+        }
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let acquire = operation == Operation::AcquireDriverOwnership;
