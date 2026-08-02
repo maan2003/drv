@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bluetooth-hci-broker = { path = "../bluetooth-hci-broker" }
 libc = "0.2.189"
 wasmtime = { version = "47.0.2", default-features = false, features = [
   "cranelift",
@@ -12,3 +13,6 @@ wasmtime = { version = "47.0.2", default-features = false, features = [
   "std",
   "winch",
 ] }
+
+[dev-dependencies]
+wat = "1.245.1"

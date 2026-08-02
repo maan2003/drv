@@ -2,7 +2,43 @@ use std::collections::BTreeMap;
 use std::io;
 
 pub const MAX_HCI_PACKET: usize = 260;
+pub const MAX_OUTBOUND_HCI_PACKET: usize = 4096;
 pub const H4_EVENT: u8 = 0x04;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboundKind {
+    Command,
+    Acl,
+    Sco,
+    Iso,
+}
+
+pub fn validate_outbound(kind: OutboundKind, packet: &[u8]) -> io::Result<()> {
+    if packet.len() > MAX_OUTBOUND_HCI_PACKET {
+        return Err(invalid("outbound HCI packet exceeds boundary"));
+    }
+    let (header, payload_len) = match kind {
+        OutboundKind::Command => (3, packet.get(2).copied().map(usize::from)),
+        OutboundKind::Acl => (
+            4,
+            packet
+                .get(2..4)
+                .map(|bytes| usize::from(u16::from_le_bytes([bytes[0], bytes[1]]))),
+        ),
+        OutboundKind::Sco => (3, packet.get(2).copied().map(usize::from)),
+        OutboundKind::Iso => (
+            4,
+            packet
+                .get(2..4)
+                .map(|bytes| usize::from(u16::from_le_bytes([bytes[0], bytes[1]]) & 0x3fff)),
+        ),
+    };
+    let payload_len = payload_len.ok_or_else(|| invalid("short outbound HCI packet"))?;
+    if packet.len() != header + payload_len {
+        return Err(invalid("malformed outbound HCI packet length"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event<'a> {
@@ -281,6 +317,20 @@ mod tests {
         assert!(decode_event(&[4, 1, 2, 0]).is_err());
         assert!(decode_event(&vec![0; MAX_HCI_PACKET + 1]).is_err());
         assert!(decode_event(&[2, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn validates_bounded_outbound_transport_frames() {
+        validate_outbound(OutboundKind::Command, &[0x0c, 0x20, 1, 1]).unwrap();
+        validate_outbound(OutboundKind::Acl, &[1, 0, 2, 0, 0xaa, 0xbb]).unwrap();
+        validate_outbound(OutboundKind::Sco, &[1, 0, 1, 0xaa]).unwrap();
+        validate_outbound(OutboundKind::Iso, &[1, 0, 2, 0, 0xaa, 0xbb]).unwrap();
+
+        assert!(validate_outbound(OutboundKind::Command, &[0x0c, 0x20, 2, 1]).is_err());
+        assert!(validate_outbound(OutboundKind::Acl, &[1, 0, 3, 0, 0xaa]).is_err());
+        assert!(
+            validate_outbound(OutboundKind::Iso, &vec![0; MAX_OUTBOUND_HCI_PACKET + 1]).is_err()
+        );
     }
 
     #[test]

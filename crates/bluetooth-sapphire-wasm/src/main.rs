@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bluetooth_hci_broker::{MAX_OUTBOUND_HCI_PACKET, OutboundKind, validate_outbound};
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Store};
 
 const IPC_FD: i32 = 3;
@@ -19,6 +20,8 @@ const MAX_MODULE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PACKET_BYTES: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_WRITE: usize = 64 * 1024;
+const MAX_CONTROLLER_PACKETS: usize = 4096;
+const MAX_CONTROLLER_BYTES: usize = 8 * 1024 * 1024;
 const TEST_FUEL: u64 = 5_000_000_000;
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -29,7 +32,9 @@ const EXIT: u8 = 4;
 const CLOCK: u8 = 5;
 const RESULT: u8 = 6;
 const PROGRESS: u8 = 7;
+const CONTROLLER_SEND: u8 = 8;
 const ACK: u8 = 128;
+const CONTROLLER_MODULE: &str = "drv:bluetooth-sapphire/controller@0.1.0";
 
 struct TestHost {
     ipc: Arc<UnixDatagram>,
@@ -115,8 +120,10 @@ fn require_test_imports(module: &Module) -> wasmtime::Result<()> {
         ),
     ]
     .into_iter()
-    .collect();
-    if actual != expected {
+    .collect::<BTreeSet<_>>();
+    let mut expected_with_controller = expected.clone();
+    expected_with_controller.insert((CONTROLLER_MODULE.to_owned(), "send".to_owned()));
+    if actual != expected && actual != expected_with_controller {
         return Err(wasmtime::Error::msg(format!(
             "unexpected Sapphire test imports: {actual:?}"
         )));
@@ -214,6 +221,31 @@ fn run_worker(socket: Arc<UnixDatagram>) -> wasmtime::Result<i32> {
             Ok(0_i32)
         },
     )?;
+    // Transitional core-Wasm lowering of the WIT controller.send capability.
+    // The final component adapter retains the same copied packet and result
+    // semantics; neither form exposes a native controller descriptor.
+    linker.func_wrap(
+        CONTROLLER_MODULE,
+        "send",
+        |mut caller: Caller<'_, TestHost>, kind: i32, pointer: i32, length: i32| {
+            let kind = u8::try_from(kind)
+                .map_err(|_| wasmtime::Error::msg("invalid outbound HCI kind"))?;
+            let range = checked_range(pointer, length, MAX_OUTBOUND_HCI_PACKET)?;
+            let memory = guest_memory(&mut caller)?;
+            let bytes = memory
+                .data(&caller)
+                .get(range)
+                .ok_or_else(|| wasmtime::Error::msg("HCI packet range is outside memory"))?;
+            let mut payload = Vec::with_capacity(bytes.len() + 1);
+            payload.push(kind);
+            payload.extend_from_slice(bytes);
+            let reply = request(&caller.data().ipc, CONTROLLER_SEND, &payload)?;
+            match reply.as_slice() {
+                [status] => Ok(i32::from(*status)),
+                _ => Err(wasmtime::Error::msg("invalid controller broker reply")),
+            }
+        },
+    )?;
 
     let mut store = Store::new(
         &engine,
@@ -297,6 +329,38 @@ fn spawn_worker(socket: &UnixDatagram) -> io::Result<Child> {
     command.spawn()
 }
 
+#[derive(Debug, Default)]
+struct FakeControllerBroker {
+    packets: usize,
+    bytes: usize,
+}
+
+impl FakeControllerBroker {
+    fn send(&mut self, payload: &[u8]) -> u8 {
+        let Some((&kind, packet)) = payload.split_first() else {
+            return 1;
+        };
+        let kind = match kind {
+            0 => OutboundKind::Command,
+            1 => OutboundKind::Acl,
+            2 => OutboundKind::Sco,
+            3 => OutboundKind::Iso,
+            _ => return 1,
+        };
+        if validate_outbound(kind, packet).is_err() {
+            return 1;
+        }
+        if self.packets >= MAX_CONTROLLER_PACKETS
+            || self.bytes.saturating_add(packet.len()) > MAX_CONTROLLER_BYTES
+        {
+            return 2;
+        }
+        self.packets += 1;
+        self.bytes += packet.len();
+        0
+    }
+}
+
 fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
     let module = fs::read(path)?;
     if module.len() > MAX_MODULE_BYTES {
@@ -320,6 +384,7 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
     let mut log = Vec::new();
     let mut now_nanoseconds = 0_u64;
     let mut clock_requests = 0_u64;
+    let mut controller = FakeControllerBroker::default();
     let status = loop {
         if started.elapsed() > TEST_TIMEOUT {
             child.kill()?;
@@ -349,6 +414,9 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
                 log.extend_from_slice(b"[worker: ");
                 log.extend_from_slice(&payload);
                 log.extend_from_slice(b"]\n");
+            }
+            Ok((CONTROLLER_SEND, payload)) => {
+                send_packet(&supervisor, ACK, &[controller.send(&payload)])?;
             }
             Ok((EXIT, payload)) if payload.len() == 4 => {
                 send_packet(&supervisor, ACK, &[])?;
@@ -391,8 +459,11 @@ fn run_supervisor(path: impl AsRef<Path>) -> Result<String, Box<dyn Error>> {
         .into());
     }
     log.extend_from_slice(
-        format!("[supervisor: {clock_requests} clock requests, final={now_nanoseconds}ns]\n")
-            .as_bytes(),
+        format!(
+            "[supervisor: {clock_requests} clock requests, final={now_nanoseconds}ns; {} controller packets, {} bytes]\n",
+            controller.packets, controller.bytes
+        )
+        .as_bytes(),
     );
     Ok(String::from_utf8_lossy(&log).into_owned())
 }
@@ -440,6 +511,71 @@ mod tests {
     use super::*;
 
     const LOOP_MODULE: &[u8] = b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0\x03\x02\x01\0\x07\x07\x01\x03run\0\0\x0a\x09\x01\x07\0\x03\x40\x0c\0\x0b\x0b";
+
+    #[test]
+    fn controller_send_round_trips_over_framed_ipc() {
+        let module = wat::parse_str(format!(
+            r#"(module
+                (import "drv:test" "log" (func (param i32 i32 i32)))
+                (import "drv:test" "exit" (func (param i32)))
+                (import "wasi_snapshot_preview1" "clock_time_get"
+                    (func (param i32 i64 i32) (result i32)))
+                (import "{CONTROLLER_MODULE}" "send"
+                    (func $send (param i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "\0c\20\01\01")
+                (func (export "_initialize"))
+                (func (export "drv_test_entry") (result i32)
+                    i32.const 0
+                    i32.const 0
+                    i32.const 4
+                    call $send))"#
+        ))
+        .unwrap();
+        let (supervisor, worker) = UnixDatagram::pair().unwrap();
+        supervisor
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = Arc::new(worker);
+        let worker_thread = thread::spawn(move || run_worker(worker).unwrap());
+
+        send_packet(
+            &supervisor,
+            MODULE_LENGTH,
+            &(module.len() as u64).to_le_bytes(),
+        )
+        .unwrap();
+        for chunk in module.chunks(MAX_PACKET_BYTES - 1) {
+            send_packet(&supervisor, MODULE_CHUNK, chunk).unwrap();
+        }
+
+        let mut progress = 0;
+        loop {
+            match receive_packet(&supervisor).unwrap() {
+                (PROGRESS, _) => progress += 1,
+                (CONTROLLER_SEND, payload) => {
+                    assert_eq!(payload, [0, 0x0c, 0x20, 1, 1]);
+                    send_packet(&supervisor, ACK, &[0]).unwrap();
+                    break;
+                }
+                packet => panic!("unexpected worker packet: {packet:?}"),
+            }
+        }
+        assert_eq!(progress, 4);
+        assert_eq!(worker_thread.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn fake_controller_broker_bounds_and_validates_packets() {
+        let mut broker = FakeControllerBroker::default();
+        assert_eq!(broker.send(&[0, 0x0c, 0x20, 1, 1]), 0);
+        assert_eq!(broker.packets, 1);
+        assert_eq!(broker.bytes, 4);
+        assert_eq!(broker.send(&[0, 0x0c, 0x20, 2, 1]), 1);
+        assert_eq!(broker.send(&[4, 0, 0, 0]), 1);
+        broker.packets = MAX_CONTROLLER_PACKETS;
+        assert_eq!(broker.send(&[2, 1, 0, 1, 0xaa]), 2);
+    }
 
     #[test]
     fn fuel_interrupts_guest_execution() {

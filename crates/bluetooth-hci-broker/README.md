@@ -15,10 +15,13 @@ sandboxed Sapphire process <-> bounded HCI packets <-> privileged broker
 ```
 
 Sapphire must not receive the broker's descriptor or any USB, VFIO, firmware,
-filesystem, or unrelated host authority. The next integration step is to put
-Sapphire's `bt::hci::Transport` and GAP discovery managers on the packet side
-of this boundary. The deterministic decoder tests here cover that boundary;
-Sapphire's upstream fake-controller discovery tests remain the behavior oracle.
+filesystem, or unrelated host authority. The WASM supervisor now routes its
+bounded `controller.send` lowering through this crate's command, ACL, SCO, and
+ISO frame validation into a quota-limited fake controller. Attaching
+Sapphire's `bt::hci::Transport` and GAP discovery managers to inbound packet
+delivery remains the next integration step. The deterministic decoder tests
+here cover that boundary; Sapphire's upstream fake-controller discovery tests
+remain the behavior oracle.
 
 ## Upstream inventory and provenance
 

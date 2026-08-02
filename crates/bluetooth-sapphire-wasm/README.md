@@ -19,6 +19,12 @@ environment, arguments, process/exec, terminal, wall-clock, and device
 interfaces must remain absent. Logging, metrics, and keyed persistence remain
 project capabilities.
 
+The supervisor implements the first `controller.send` lowering over the same
+framed process socket. It validates command, ACL, SCO, and ISO length fields in
+the native broker crate and enforces packet-count and byte quotas. The current
+implementation terminates at a deterministic fake controller and owns no HCI
+descriptor; physical transport attachment remains a separate guarded step.
+
 The first executable target is the pinned upstream Sapphire fake-controller
 GAP discovery suite. Its WASM import list must match the interfaces in the WIT
 world before it can be connected to the physical HCI broker.
