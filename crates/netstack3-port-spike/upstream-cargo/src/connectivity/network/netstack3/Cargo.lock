@@ -410,6 +410,8 @@ dependencies = [
  "netstack3-port-spike",
  "netstack3_base",
  "netstack3_core",
+ "netstack3_ip",
+ "netstack3_tcp",
  "packet",
  "packet_formats",
 ]

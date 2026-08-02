@@ -13,3 +13,5 @@ net_declare.workspace = true
 netstack3_base.workspace = true
 packet.workspace = true
 packet_formats.workspace = true
+netstack3_tcp.workspace = true
+netstack3_ip.workspace = true
