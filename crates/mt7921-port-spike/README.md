@@ -35,6 +35,15 @@ The offsets come from pinned Linux `mt792x_regs.h` and the fixed map in
 `mt7921/pci.c`. It cannot write MMIO, remap arbitrary chip addresses, allocate
 DMA, arm an interrupt, or reset the function.
 
+With `--acquire-driver-ownership`, the same binary additionally ports
+`__mt792xe_mcu_drv_pmctrl` from pinned Linux `mt792x_core.c`: it writes only
+`PCIE_LPCR_HOST_CLR_OWN` to `MT_CONN_ON_LPCTL`, then polls only that register's
+`PCIE_LPCR_HOST_OWN_SYNC` bit. It preserves Linux's ten 50 ms attempts and 1 ms
+poll tick while adding a 500 ms absolute deadline and rejecting command bits
+on readback. Every write, status sample, retry, terminal success, timeout, or
+unexpected state is emitted as a structured event. No firmware-ownership or
+dynamic L1-remap write is admitted.
+
 ## Verified against pinned Linux 7.2-rc5 source
 
 All paths below are relative to

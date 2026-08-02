@@ -494,6 +494,122 @@ pub struct ReadOnlyStatus {
     pub rx_dma_busy: bool,
 }
 
+// Pinned Linux mt792x_regs.h names these bits PCIE_LPCR_HOST_{SET,CLR}_OWN and
+// PCIE_LPCR_HOST_OWN_SYNC. __mt792xe_mcu_drv_pmctrl writes CLR_OWN and polls
+// OWN_SYNC clear up to ten times, with a 50 ms poll per attempt at 1 ms ticks.
+pub const PCIE_LPCR_HOST_SET_OWN: u32 = 1 << 0;
+pub const PCIE_LPCR_HOST_CLR_OWN: u32 = 1 << 1;
+pub const PCIE_LPCR_HOST_OWN_SYNC: u32 = 1 << 2;
+pub const DRIVER_OWN_ATTEMPTS: u8 = 10;
+pub const DRIVER_OWN_ATTEMPT_MS: u64 = 50;
+pub const DRIVER_OWN_POLL_MS: u64 = 1;
+pub const DRIVER_OWN_HARD_DEADLINE_MS: u64 = DRIVER_OWN_ATTEMPTS as u64 * DRIVER_OWN_ATTEMPT_MS;
+
+pub trait OwnershipTransport {
+    type Error;
+
+    fn now_ms(&self) -> u64;
+    fn write_clear_own(&mut self) -> Result<(), Self::Error>;
+    fn read_low_power_control(&mut self) -> Result<u32, Self::Error>;
+    fn sleep_ms(&mut self, milliseconds: u64);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipEvent {
+    ClearOwnWritten { attempt: u8, at_ms: u64 },
+    StatusRead { attempt: u8, at_ms: u64, raw: u32 },
+    AttemptExpired { attempt: u8, at_ms: u64 },
+    Acquired { attempt: u8, at_ms: u64 },
+    UnexpectedState { attempt: u8, at_ms: u64, raw: u32 },
+    TimedOut { at_ms: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipError<E> {
+    Transport(E),
+    ClockOverflow,
+    UnexpectedState(u32),
+    Timeout,
+}
+
+/// Acquire PCIe driver ownership using the exact bounded Linux retry shape.
+///
+/// The transport contract exposes only the one CLR_OWN write, the matching
+/// status read, a monotonic clock, and bounded sleep. The event sink makes each
+/// state transition durable at the host adapter without coupling this logic to
+/// a logger or component runtime.
+pub fn acquire_driver_ownership<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<(), OwnershipError<T::Error>>
+where
+    T: OwnershipTransport,
+    F: FnMut(OwnershipEvent),
+{
+    let start = transport.now_ms();
+    let hard_deadline = start
+        .checked_add(DRIVER_OWN_HARD_DEADLINE_MS)
+        .ok_or(OwnershipError::ClockOverflow)?;
+    for attempt in 1..=DRIVER_OWN_ATTEMPTS {
+        let now = transport.now_ms();
+        if now >= hard_deadline {
+            event(OwnershipEvent::TimedOut { at_ms: now - start });
+            return Err(OwnershipError::Timeout);
+        }
+        transport
+            .write_clear_own()
+            .map_err(OwnershipError::Transport)?;
+        event(OwnershipEvent::ClearOwnWritten {
+            attempt,
+            at_ms: transport.now_ms().saturating_sub(start),
+        });
+        let attempt_deadline = transport
+            .now_ms()
+            .checked_add(DRIVER_OWN_ATTEMPT_MS)
+            .ok_or(OwnershipError::ClockOverflow)?
+            .min(hard_deadline);
+        loop {
+            let raw = transport
+                .read_low_power_control()
+                .map_err(OwnershipError::Transport)?;
+            let now = transport.now_ms();
+            event(OwnershipEvent::StatusRead {
+                attempt,
+                at_ms: now.saturating_sub(start),
+                raw,
+            });
+            // SET_OWN and CLR_OWN are write commands. Seeing either asserted
+            // on readback is not a state Linux relies on and is rejected.
+            if raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
+                event(OwnershipEvent::UnexpectedState {
+                    attempt,
+                    at_ms: now.saturating_sub(start),
+                    raw,
+                });
+                return Err(OwnershipError::UnexpectedState(raw));
+            }
+            if raw & PCIE_LPCR_HOST_OWN_SYNC == 0 {
+                event(OwnershipEvent::Acquired {
+                    attempt,
+                    at_ms: now.saturating_sub(start),
+                });
+                return Ok(());
+            }
+            if now >= attempt_deadline {
+                event(OwnershipEvent::AttemptExpired {
+                    attempt,
+                    at_ms: now.saturating_sub(start),
+                });
+                break;
+            }
+            transport.sleep_ms(DRIVER_OWN_POLL_MS.min(attempt_deadline - now));
+        }
+    }
+    let at_ms = transport.now_ms().saturating_sub(start);
+    event(OwnershipEvent::TimedOut { at_ms });
+    Err(OwnershipError::Timeout)
+}
+
 impl ReadOnlyStatus {
     pub const fn decode(conn_misc: u32, low_power: u32, wfdma_config: u32) -> Self {
         Self {
@@ -514,6 +630,7 @@ mod tests {
 
     use super::*;
     use std::vec;
+    use std::vec::Vec;
 
     #[test]
     fn ports_fuchsia_beacon_conversion_fixture() {
@@ -581,6 +698,103 @@ mod tests {
                 rx_dma_enabled: true,
                 rx_dma_busy: true,
             }
+        );
+    }
+
+    struct FakeOwnership {
+        now: u64,
+        status: u32,
+        clear_after_writes: Option<u8>,
+        writes: u8,
+    }
+    impl OwnershipTransport for FakeOwnership {
+        type Error = ();
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn write_clear_own(&mut self) -> Result<(), Self::Error> {
+            self.writes += 1;
+            if self.clear_after_writes == Some(self.writes) {
+                self.status &= !PCIE_LPCR_HOST_OWN_SYNC;
+            }
+            Ok(())
+        }
+        fn read_low_power_control(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.status)
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+    }
+
+    #[test]
+    fn driver_ownership_succeeds_and_logs_each_transition() {
+        let mut transport = FakeOwnership {
+            now: 10,
+            status: PCIE_LPCR_HOST_OWN_SYNC,
+            clear_after_writes: Some(2),
+            writes: 0,
+        };
+        let mut events = Vec::new();
+        acquire_driver_ownership(&mut transport, |event| events.push(event)).unwrap();
+        assert_eq!(transport.writes, 2);
+        assert!(events.contains(&OwnershipEvent::AttemptExpired {
+            attempt: 1,
+            at_ms: 50
+        }));
+        assert_eq!(
+            events.last(),
+            Some(&OwnershipEvent::Acquired {
+                attempt: 2,
+                at_ms: 50
+            })
+        );
+    }
+
+    #[test]
+    fn driver_ownership_times_out_at_hard_deadline() {
+        let mut transport = FakeOwnership {
+            now: 0,
+            status: PCIE_LPCR_HOST_OWN_SYNC,
+            clear_after_writes: None,
+            writes: 0,
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            acquire_driver_ownership(&mut transport, |event| events.push(event)),
+            Err(OwnershipError::Timeout)
+        );
+        assert_eq!(transport.writes, DRIVER_OWN_ATTEMPTS);
+        assert_eq!(transport.now, DRIVER_OWN_HARD_DEADLINE_MS);
+        assert_eq!(
+            events.last(),
+            Some(&OwnershipEvent::TimedOut {
+                at_ms: DRIVER_OWN_HARD_DEADLINE_MS
+            })
+        );
+    }
+
+    #[test]
+    fn driver_ownership_rejects_command_bits_on_readback() {
+        let mut transport = FakeOwnership {
+            now: 0,
+            status: PCIE_LPCR_HOST_CLR_OWN,
+            clear_after_writes: None,
+            writes: 0,
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            acquire_driver_ownership(&mut transport, |event| events.push(event)),
+            Err(OwnershipError::UnexpectedState(PCIE_LPCR_HOST_CLR_OWN))
+        );
+        assert_eq!(transport.writes, 1);
+        assert_eq!(
+            events.last(),
+            Some(&OwnershipEvent::UnexpectedState {
+                attempt: 1,
+                at_ms: 0,
+                raw: PCIE_LPCR_HOST_CLR_OWN
+            })
         );
     }
 

@@ -1,12 +1,16 @@
 //! Strictly read-only no-plastic MT7921 VFIO inventory.
 #![cfg(target_os = "linux")]
 
-use mt7921_port_spike::{ReadOnlyStatus, ReadRegister};
+use mt7921_port_spike::{
+    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
+    ReadRegister, acquire_driver_ownership,
+};
 use std::{
     env,
     fs::{File, OpenOptions},
     os::fd::{AsRawFd, RawFd},
     ptr::NonNull,
+    time::Instant,
 };
 
 const VFIO_TYPE: u64 = b';' as u64;
@@ -17,6 +21,7 @@ const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
 const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
 const IOMMU_IOAS_ALLOC: u64 = (VFIO_TYPE << 8) | 0x81;
 const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
 const MAP_SHARED: i32 = 1;
 const BAR0_REGION: u32 = 0;
 const PAGE: usize = 4096;
@@ -74,6 +79,11 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let acquire = match env::args().nth(1).as_deref() {
+        None => false,
+        Some("--acquire-driver-ownership") => true,
+        Some(argument) => return Err(format!("unknown argument {argument}")),
+    };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -137,8 +147,24 @@ fn run() -> Result<(), String> {
         "query BAR 0",
     )?;
 
-    let wfdma = ReadPage::map(&device, &info, 0xd4000)?;
-    let conn = ReadPage::map(&device, &info, 0xe0000)?;
+    let wfdma = ReadPage::map(&device, &info, 0xd4000, false)?;
+    let conn = ReadPage::map(&device, &info, 0xe0000, acquire)?;
+    if acquire {
+        let mut transport = VfioOwnership {
+            page: &conn,
+            start: Instant::now(),
+        };
+        acquire_driver_ownership(&mut transport, log_ownership_event).map_err(
+            |error| match error {
+                OwnershipError::Transport(error) => error,
+                OwnershipError::ClockOverflow => "ownership clock overflow".into(),
+                OwnershipError::UnexpectedState(raw) => {
+                    format!("unexpected ownership state {raw:#010x}")
+                }
+                OwnershipError::Timeout => "driver ownership timed out after 500 ms".into(),
+            },
+        )?;
+    }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
             0xd4 => &wfdma,
@@ -220,7 +246,12 @@ struct ReadPage {
     bar_page: usize,
 }
 impl ReadPage {
-    fn map(device: &File, region: &RegionInfo, bar_page: usize) -> Result<Self, String> {
+    fn map(
+        device: &File,
+        region: &RegionInfo,
+        bar_page: usize,
+        writable: bool,
+    ) -> Result<Self, String> {
         if bar_page % PAGE != 0 || bar_page + PAGE > region.size as usize {
             return Err("allowlisted BAR page is outside BAR 0".into());
         }
@@ -228,7 +259,7 @@ impl ReadPage {
             mmap(
                 std::ptr::null_mut(),
                 PAGE,
-                PROT_READ,
+                PROT_READ | if writable { PROT_WRITE } else { 0 },
                 MAP_SHARED,
                 device.as_raw_fd(),
                 (region.offset + bar_page as u64) as i64,
@@ -252,6 +283,20 @@ impl ReadPage {
         }
         Ok(unsafe { std::ptr::read_volatile(self.ptr.as_ptr().add(within).cast::<u32>()) })
     }
+    fn write_clear_own(&self) -> Result<(), String> {
+        let offset = ReadRegister::ConnOnLowPowerControl.bar_offset();
+        let within = offset - self.bar_page;
+        if self.bar_page != 0xe0000 || within + 4 > PAGE {
+            return Err("CLR_OWN write escaped immutable allowlist".into());
+        }
+        unsafe {
+            std::ptr::write_volatile(
+                self.ptr.as_ptr().add(within).cast::<u32>(),
+                PCIE_LPCR_HOST_CLR_OWN,
+            )
+        };
+        Ok(())
+    }
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
@@ -268,5 +313,57 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
         Err(format!("{operation}: {}", std::io::Error::last_os_error()))
     } else {
         Ok(())
+    }
+}
+
+struct VfioOwnership<'a> {
+    page: &'a ReadPage,
+    start: Instant,
+}
+impl OwnershipTransport for VfioOwnership<'_> {
+    type Error = String;
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    fn write_clear_own(&mut self) -> Result<(), Self::Error> {
+        self.page.write_clear_own()
+    }
+    fn read_low_power_control(&mut self) -> Result<u32, Self::Error> {
+        self.page
+            .read(ReadRegister::ConnOnLowPowerControl.bar_offset())
+    }
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
+fn log_ownership_event(event: OwnershipEvent) {
+    match event {
+        OwnershipEvent::ClearOwnWritten { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"clear_own_written\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"value\":\"{PCIE_LPCR_HOST_CLR_OWN:#010x}\"}}"
+        ),
+        OwnershipEvent::StatusRead {
+            attempt,
+            at_ms,
+            raw,
+        } => println!(
+            "{{\"ownership_event\":\"status_read\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"raw\":\"{raw:#010x}\"}}"
+        ),
+        OwnershipEvent::AttemptExpired { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"attempt_expired\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
+        ),
+        OwnershipEvent::Acquired { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"driver_ownership_acquired\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
+        ),
+        OwnershipEvent::UnexpectedState {
+            attempt,
+            at_ms,
+            raw,
+        } => println!(
+            "{{\"ownership_event\":\"unexpected_state\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"raw\":\"{raw:#010x}\"}}"
+        ),
+        OwnershipEvent::TimedOut { at_ms } => {
+            println!("{{\"ownership_event\":\"timed_out\",\"at_ms\":{at_ms}}}")
+        }
     }
 }
