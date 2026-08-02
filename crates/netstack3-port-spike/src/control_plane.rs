@@ -52,6 +52,46 @@ pub struct DhcpLeaseTiming {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DhcpLeasePhase {
+    Bound,
+    Renew,
+    Rebind,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DhcpLeaseSchedule {
+    renew_at_seconds: u64,
+    rebind_at_seconds: u64,
+    expire_at_seconds: u64,
+}
+
+impl DhcpLeaseSchedule {
+    pub fn new(acquired_at_seconds: u64, timing: DhcpLeaseTiming) -> Self {
+        Self {
+            renew_at_seconds: acquired_at_seconds
+                .saturating_add(u64::from(timing.renew_after_seconds)),
+            rebind_at_seconds: acquired_at_seconds
+                .saturating_add(u64::from(timing.rebind_after_seconds)),
+            expire_at_seconds: acquired_at_seconds
+                .saturating_add(u64::from(timing.expire_after_seconds)),
+        }
+    }
+
+    pub fn phase(self, now_seconds: u64) -> DhcpLeasePhase {
+        if now_seconds >= self.expire_at_seconds {
+            DhcpLeasePhase::Expired
+        } else if now_seconds >= self.rebind_at_seconds {
+            DhcpLeasePhase::Rebind
+        } else if now_seconds >= self.renew_at_seconds {
+            DhcpLeasePhase::Renew
+        } else {
+            DhcpLeasePhase::Bound
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DhcpReply {
     Ack(DhcpOffer),
     Nak,
@@ -96,6 +136,8 @@ pub struct DhcpTransmission {
     pub elapsed_seconds: u16,
     /// Server selected by a DHCPREQUEST, if this is not a broadcast discovery.
     pub server: Option<Ipv4Addr>,
+    /// Rebinding accepts an ACK from any server identifier.
+    pub accept_any_server: bool,
 }
 
 /// Pure DHCPv4 message state. UDP ports 68 -> 67, retry deadlines, and applying
@@ -123,6 +165,7 @@ impl<R: RngCore> Dhcpv4Client<R> {
                 transaction_id,
                 elapsed_seconds,
                 server: None,
+                accept_any_server: false,
             },
             bytes,
         ))
@@ -166,6 +209,43 @@ impl<R: RngCore> Dhcpv4Client<R> {
                 transaction_id,
                 elapsed_seconds,
                 server: Some(offer.server),
+                accept_any_server: false,
+            },
+            bytes,
+        ))
+    }
+
+    /// Builds a DHCPREQUEST for T1 renewal or T2 rebinding. The configured
+    /// address is carried in `ciaddr`; rebinding uses broadcast delivery and
+    /// accepts a response from any server.
+    pub fn renew(
+        &mut self,
+        elapsed_seconds: u16,
+        lease: DhcpOffer,
+        rebinding: bool,
+    ) -> Result<(DhcpTransmission, ControlDatagram), ControlPlaneError> {
+        const REQUEST_PARAMETERS: &[u8] = &[
+            DhcpOption::CODE_ROUTER,
+            DhcpOption::CODE_SUBNET,
+            DhcpOption::CODE_DNS,
+        ];
+        let options = [
+            DhcpOption::MessageType(DhcpMessageType::Request),
+            DhcpOption::ParameterRequestList(REQUEST_PARAMETERS),
+        ];
+        let (packet, transaction_id) = self.inner.bootp_request(
+            elapsed_seconds,
+            Some(lease.address),
+            rebinding,
+            Options::new(&options),
+        );
+        let bytes = encode_dhcp(&packet)?;
+        Ok((
+            DhcpTransmission {
+                transaction_id,
+                elapsed_seconds,
+                server: (!rebinding).then_some(lease.server),
+                accept_any_server: rebinding,
             },
             bytes,
         ))
@@ -191,16 +271,18 @@ impl<R: RngCore> Dhcpv4Client<R> {
         let packet = Packet::decode(bytes).map_err(ControlPlaneError::Dhcp)?;
         if self.inner.is_nak(&packet, transaction.transaction_id) {
             let server = Settings::new(&packet).server_ip;
-            return Ok(
-                (transaction.server.is_some() && transaction.server == server)
-                    .then_some(DhcpReply::Nak),
-            );
+            return Ok((transaction.accept_any_server
+                || (transaction.server.is_some() && transaction.server == server))
+                .then_some(DhcpReply::Nak));
         }
         if !self.inner.is_ack(&packet, transaction.transaction_id) {
             return Ok(None);
         }
         let offer = packet_to_offer(&packet)?;
-        Ok((transaction.server == Some(offer.server)).then_some(DhcpReply::Ack(offer)))
+        Ok(
+            (transaction.accept_any_server || transaction.server == Some(offer.server))
+                .then_some(DhcpReply::Ack(offer)),
+        )
     }
 }
 
@@ -415,6 +497,7 @@ mod tests {
             transaction_id: 1,
             elapsed_seconds: 3,
             server: None,
+            accept_any_server: false,
         };
         assert_eq!(client.accept_offer(wrong, offer.as_bytes()).unwrap(), None);
 
@@ -451,6 +534,19 @@ mod tests {
                 expire_after_seconds: 3600,
             })
         );
+        let schedule = DhcpLeaseSchedule::new(100, lease.timing().unwrap());
+        assert_eq!(schedule.phase(1899), DhcpLeasePhase::Bound);
+        assert_eq!(schedule.phase(1900), DhcpLeasePhase::Renew);
+        assert_eq!(schedule.phase(3250), DhcpLeasePhase::Rebind);
+        assert_eq!(schedule.phase(3700), DhcpLeasePhase::Expired);
+        let (renew_tx, renew) = client.renew(1800, lease, false).unwrap();
+        let renew = Packet::decode(renew.as_bytes()).unwrap();
+        assert_eq!(renew.ciaddr, lease.address);
+        assert!(!renew.broadcast);
+        assert_eq!(renew_tx.server, Some(lease.server));
+        let (rebind_tx, rebind) = client.renew(3150, lease, true).unwrap();
+        assert!(Packet::decode(rebind.as_bytes()).unwrap().broadcast);
+        assert!(rebind_tx.accept_any_server);
 
         let mut options = Options::buf();
         let nak_options = request.options.reply(
