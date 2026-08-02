@@ -37,9 +37,45 @@ pub struct DhcpOffer {
     pub address: Ipv4Addr,
     pub server: Ipv4Addr,
     pub lease_seconds: Option<u32>,
+    pub renewal_seconds: Option<u32>,
+    pub rebinding_seconds: Option<u32>,
     pub gateway: Option<Ipv4Addr>,
     pub subnet_mask: Option<Ipv4Addr>,
     pub dns_servers: [Option<Ipv4Addr>; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DhcpLeaseTiming {
+    pub renew_after_seconds: u32,
+    pub rebind_after_seconds: u32,
+    pub expire_after_seconds: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DhcpReply {
+    Ack(DhcpOffer),
+    Nak,
+}
+
+impl DhcpOffer {
+    /// Returns RFC 2131 lease deadlines, using T1=0.5 and T2=0.875 of the
+    /// lease when the server omitted or supplied inconsistent values.
+    pub fn timing(self) -> Option<DhcpLeaseTiming> {
+        let lease = self.lease_seconds?;
+        let defaults = (lease / 2, (u64::from(lease) * 7 / 8) as u32);
+        let renewal = self.renewal_seconds.unwrap_or(defaults.0);
+        let rebinding = self.rebinding_seconds.unwrap_or(defaults.1);
+        let (renewal, rebinding) = if renewal < rebinding && rebinding < lease {
+            (renewal, rebinding)
+        } else {
+            defaults
+        };
+        Some(DhcpLeaseTiming {
+            renew_after_seconds: renewal,
+            rebind_after_seconds: rebinding,
+            expire_after_seconds: lease,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +127,7 @@ impl<R: RngCore> Dhcpv4Client<R> {
         if !self.inner.is_offer(&packet, transaction.transaction_id) {
             return Ok(None);
         }
-        settings_to_offer(Settings::new(&packet)).map(Some)
+        packet_to_offer(&packet).map(Some)
     }
 
     pub fn request(
@@ -129,13 +165,31 @@ impl<R: RngCore> Dhcpv4Client<R> {
         transaction: DhcpTransmission,
         bytes: &[u8],
     ) -> Result<Option<DhcpOffer>, ControlPlaneError> {
+        Ok(match self.accept_reply(transaction, bytes)? {
+            Some(DhcpReply::Ack(offer)) => Some(offer),
+            Some(DhcpReply::Nak) | None => None,
+        })
+    }
+
+    pub fn accept_reply(
+        &self,
+        transaction: DhcpTransmission,
+        bytes: &[u8],
+    ) -> Result<Option<DhcpReply>, ControlPlaneError> {
         ensure_bounded(bytes)?;
         let packet = Packet::decode(bytes).map_err(ControlPlaneError::Dhcp)?;
+        if self.inner.is_nak(&packet, transaction.transaction_id) {
+            let server = Settings::new(&packet).server_ip;
+            return Ok(
+                (transaction.server.is_some() && transaction.server == server)
+                    .then_some(DhcpReply::Nak),
+            );
+        }
         if !self.inner.is_ack(&packet, transaction.transaction_id) {
             return Ok(None);
         }
-        let offer = settings_to_offer(Settings::new(&packet))?;
-        Ok((transaction.server == Some(offer.server)).then_some(offer))
+        let offer = packet_to_offer(&packet)?;
+        Ok((transaction.server == Some(offer.server)).then_some(DhcpReply::Ack(offer)))
     }
 }
 
@@ -154,7 +208,8 @@ fn ensure_bounded(bytes: &[u8]) -> Result<(), ControlPlaneError> {
     Ok(())
 }
 
-fn settings_to_offer(settings: Settings<'_>) -> Result<DhcpOffer, ControlPlaneError> {
+fn packet_to_offer(packet: &Packet<'_>) -> Result<DhcpOffer, ControlPlaneError> {
+    let settings = Settings::new(packet);
     let server = settings
         .server_ip
         .ok_or(ControlPlaneError::DhcpMissingServer)?;
@@ -162,9 +217,20 @@ fn settings_to_offer(settings: Settings<'_>) -> Result<DhcpOffer, ControlPlaneEr
         address: settings.ip,
         server,
         lease_seconds: settings.lease_time_secs,
+        renewal_seconds: dhcp_u32_option(packet, 58),
+        rebinding_seconds: dhcp_u32_option(packet, 59),
         gateway: settings.gateway,
         subnet_mask: settings.subnet,
         dns_servers: [settings.dns1, settings.dns2],
+    })
+}
+
+fn dhcp_u32_option(packet: &Packet<'_>, code: u8) -> Option<u32> {
+    packet.options.iter().find_map(|option| match option {
+        DhcpOption::Unrecognized(found, bytes) if found == code => {
+            <[u8; 4]>::try_from(bytes).ok().map(u32::from_be_bytes)
+        }
+        _ => None,
     })
 }
 
@@ -365,6 +431,34 @@ mod tests {
             .unwrap();
         assert_eq!(lease.gateway, Some(gateways[0]));
         assert_eq!(lease.dns_servers[0], Some(dns[0]));
+        assert_eq!(
+            lease.timing(),
+            Some(DhcpLeaseTiming {
+                renew_after_seconds: 1800,
+                rebind_after_seconds: 3150,
+                expire_after_seconds: 3600,
+            })
+        );
+
+        let mut options = Options::buf();
+        let nak_options = request.options.reply(
+            DhcpMessageType::Nak,
+            Ipv4Addr::new(192, 0, 2, 254),
+            0,
+            &[],
+            None,
+            &[],
+            None,
+            &mut options,
+        );
+        let nak = request.new_reply(None, nak_options);
+        let nak = encode_dhcp(&nak).unwrap();
+        assert_eq!(
+            client
+                .accept_reply(request_transaction, nak.as_bytes())
+                .unwrap(),
+            Some(DhcpReply::Nak)
+        );
 
         assert!(
             decoded
