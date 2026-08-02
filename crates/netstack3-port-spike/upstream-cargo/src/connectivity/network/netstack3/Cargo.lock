@@ -730,11 +730,17 @@ dependencies = [
  "netstack3-port-spike",
  "netstack3_base",
  "netstack3_core",
+ "netstack3_device",
+ "netstack3_filter",
+ "netstack3_icmp_echo",
  "netstack3_ip",
  "netstack3_tcp",
+ "netstack3_udp",
  "packet",
  "packet_formats",
+ "rand 0.9.4",
  "rand_core 0.6.4",
+ "zerocopy",
 ]
 
 [[package]]

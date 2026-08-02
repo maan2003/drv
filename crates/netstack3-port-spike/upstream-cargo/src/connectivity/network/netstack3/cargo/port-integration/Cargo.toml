@@ -10,11 +10,20 @@ edge-dhcp.workspace = true
 hickory-proto.workspace = true
 rand-core-06.workspace = true
 netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }
-netstack3_core = { path = "../../core", features = ["testutils"] }
+netstack3_core = { path = "../../core" }
 net_types.workspace = true
 net_declare.workspace = true
 netstack3_base.workspace = true
+netstack3_device.workspace = true
+netstack3_filter.workspace = true
+netstack3_icmp_echo.workspace = true
+netstack3_udp.workspace = true
 packet.workspace = true
 packet_formats.workspace = true
 netstack3_tcp.workspace = true
 netstack3_ip.workspace = true
+rand.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+netstack3_core = { path = "../../core", features = ["testutils"] }
