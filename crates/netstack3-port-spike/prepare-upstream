@@ -12,6 +12,7 @@ fi
 
 cp -R "$here/upstream-cargo/src" "$refroot/"
 cp -R "$here/upstream-cargo/sdk" "$refroot/"
+cp -R "$here/upstream-cargo/third_party" "$refroot/"
 cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 
 # Gate the sole Fuchsia-runtime convenience impl in the otherwise portable
@@ -28,5 +29,7 @@ cargo check --locked --manifest-path "$manifest" -p dhcp_client_core
 cargo check --locked --manifest-path "$manifest" -p trust-dns-resolver --no-default-features --features testing
 cargo check --locked --manifest-path "$manifest" -p wlan-common
 cargo test --locked --manifest-path "$manifest" -p eapol --lib
+cargo test --locked --manifest-path "$manifest" -p mundane --lib hash::tests
+cargo test --locked --manifest-path "$manifest" -p mundane --lib hmac::tests
 cargo check --locked --manifest-path "$manifest" -p netstack3_core --features testutils
 cargo test --locked --manifest-path "$manifest" -p netstack3-port-integration --tests

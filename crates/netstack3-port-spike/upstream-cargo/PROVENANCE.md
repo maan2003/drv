@@ -45,6 +45,12 @@ by these packages. Host bindings must be generated or represented by narrow
 path-shaped compatibility crates from those pinned schemas; they must not copy
 policy or invent a second protocol definition.
 
+The Fuchsia pin records BoringSSL as gitlink
+`156c7b75ae9b8c3b3f847acf264f17594c3859fb`. The fetch script materializes that
+exact revision at Fuchsia's expected `third_party/boringssl/src` path; the host
+build metadata compiles it with Fuchsia's generated bindings and compatibility
+wrapper. BoringSSL remains under its upstream Apache-2.0 license.
+
 `wlan-common-host.patch` gates only the Zircon-status conversion at the existing
 platform boundary and marks the already ignored host scan timestamp as consumed.
 The frame, IE, BSS, capability, channel, rate-vector, and security algorithms

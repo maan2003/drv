@@ -19,6 +19,7 @@ paths=(
   src/connectivity/network/dns
   src/connectivity/policy/netcfg
   src/connectivity/wlan
+  src/lib/mundane
   src/connectivity/lib/net-types
   src/connectivity/lib/net-declare
   src/connectivity/lib/internet-checksum
@@ -36,6 +37,7 @@ paths=(
   src/lib/replace-with
   third_party/rust_crates/forks/trust-dns-proto-0.22.0
   third_party/rust_crates/forks/trust-dns-resolver-0.22.0
+  third_party/boringssl/rust
   sdk/fidl/fuchsia.audio
   sdk/fidl/fuchsia.audio.effects
   sdk/fidl/fuchsia.bluetooth
@@ -88,6 +90,24 @@ for path in "${paths[@]}"; do
   mkdir -p "$root/$path"
   tar -xzf "$archive" -C "$root/$path"
 done
+
+# BoringSSL is a gitlink in fuchsia.git, so fetch the exact revision recorded
+# by the pinned Fuchsia tree separately into its expected checkout path.
+boringssl_commit=156c7b75ae9b8c3b3f847acf264f17594c3859fb
+boringssl_archive="reference/boringssl-$boringssl_commit.tar.gz"
+boringssl_root="$root/third_party/boringssl/src"
+
+if [[ ! -f "$boringssl_archive" ]]; then
+  curl -fL --retry 3 \
+    "https://boringssl.googlesource.com/boringssl/+archive/$boringssl_commit.tar.gz" \
+    -o "$boringssl_archive"
+fi
+
+sha256sum "$boringssl_archive" >"$boringssl_archive.sha256"
+rm -rf "$boringssl_root"
+mkdir -p "$boringssl_root"
+tar -xzf "$boringssl_archive" -C "$boringssl_root"
+printf '%s\n' "$boringssl_commit" >"$root/third_party/boringssl/COMMIT"
 
 printf '%s\n' "$commit" >"$root/COMMIT"
 

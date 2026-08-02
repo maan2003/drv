@@ -5,6 +5,8 @@ members = [
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
   "../../wlan/lib/common/rust", "../../wlan/lib/eapol", "../../wlan/lib/ieee80211",
+  "../../../lib/mundane",
+  "../../../../third_party/boringssl/rust/bssl-sys",
   "../../../../sdk/fidl/fuchsia.wlan.common",
   "../../../../sdk/fidl/fuchsia.wlan.ieee80211",
   "../../../../sdk/fidl/fuchsia.wlan.internal",
@@ -83,6 +85,7 @@ net_declare = { path = "cargo/net-declare-portable" }
 net_declare_macros = { path = "cargo/net-declare-macros" }
 internet_checksum = { path = "../../lib/internet-checksum" }
 ieee80211 = { path = "../../wlan/lib/ieee80211" }
+mundane = { path = "../../../lib/mundane" }
 packet_formats = { path = "../../lib/packet-formats" }
 diagnostics_traits = { path = "../lib/diagnostics-traits" }
 explicit = { path = "../lib/explicit" }

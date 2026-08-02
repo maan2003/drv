@@ -133,6 +133,7 @@
               cargo-component
               bazel_8
               clippy
+              cmake
               lld
               pkg-config
               python3
