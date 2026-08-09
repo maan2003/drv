@@ -99,6 +99,7 @@ pub trait SourceExactPassiveMechanics {
         &mut self,
         deadline_nanos: i64,
     ) -> Result<Option<PassiveMechanicsEvent>, Self::Error>;
+    fn confirm_scan_done(&mut self, scan_sequence: u8) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -350,6 +351,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                         actual: done.scan_sequence,
                     });
                 }
+                self.mechanics
+                    .confirm_scan_done(scan_sequence)
+                    .map_err(SourceExactTransportError::Mechanics)?;
                 let success = done.completed_channels == 1 && done.alpha2 == *b"00";
                 let mut active = self.active.take().expect("active above");
                 if success && let Some(channel) = active.remaining.pop_front() {
@@ -850,6 +854,7 @@ mod tests {
         commands: Vec<(PassiveMcuCommand, Vec<u8>, bool)>,
         prepare_after_commands: Option<usize>,
         events: VecDeque<PassiveMechanicsEvent>,
+        confirmed_scan_sequences: Vec<u8>,
     }
 
     impl SourceExactPassiveMechanics for ScriptedMechanics {
@@ -880,6 +885,11 @@ mod tests {
             _deadline_nanos: i64,
         ) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
             Ok(self.events.pop_front())
+        }
+
+        fn confirm_scan_done(&mut self, scan_sequence: u8) -> Result<(), Self::Error> {
+            self.confirmed_scan_sequences.push(scan_sequence);
+            Ok(())
         }
     }
 
@@ -1047,6 +1057,50 @@ mod tests {
                 scan_id: 1,
                 success: true,
             }))
+        );
+        assert_eq!(adapter.transport.mechanics.confirmed_scan_sequences, [1]);
+    }
+
+    #[test]
+    fn mismatched_hardware_scan_done_is_never_confirmed() {
+        let capability = nic();
+        let transport =
+            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let mut adapter = Mt7921SoftmacAdapter::new(
+            transport,
+            capability,
+            capability_channels(capability),
+            vec![channel(1)],
+        )
+        .unwrap();
+        adapter
+            .start_passive_scan(request(vec![channel(1)]))
+            .unwrap();
+        adapter
+            .transport
+            .mechanics
+            .events
+            .push_back(PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 2,
+                completed_channels: 1,
+                beacon_scan_count: 1,
+                alpha2: *b"00",
+            }));
+        assert!(matches!(
+            adapter.next_scan_event(),
+            Err(AdapterError::Transport(
+                SourceExactTransportError::ScanIdMismatch {
+                    expected: 1,
+                    actual: 2
+                }
+            ))
+        ));
+        assert!(
+            adapter
+                .transport
+                .mechanics
+                .confirmed_scan_sequences
+                .is_empty()
         );
     }
 

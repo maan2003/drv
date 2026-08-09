@@ -299,7 +299,7 @@ struct ActiveVfioResources {
     selector_page: Option<ReadPage>,
     dynamic_window: Option<ReadPage>,
     #[cfg(feature = "fuchsia-passive")]
-    passive_window_pages: Option<Vec<ReadPage>>,
+    passive_window_pages: [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
     swdef: Option<ReadPage>,
     dmashdl: Option<ReadPage>,
     tx_guard: Option<DmaArena>,
@@ -328,6 +328,7 @@ struct ActiveVfioCapsule {
     conn: Option<ReadPage>,
     active: Option<ActiveVfioResources>,
     containment: Option<ContainmentLedger>,
+    acquisition: AcquisitionLedger,
     #[cfg(test)]
     drop_probe: Option<CapsuleDropProbe>,
 }
@@ -353,6 +354,7 @@ impl ActiveVfioCapsule {
             conn: None,
             active: None,
             containment,
+            acquisition: AcquisitionLedger::default(),
             #[cfg(test)]
             drop_probe: None,
         }
@@ -404,14 +406,12 @@ impl ActiveVfioCapsule {
                 release_dma(slot, &mut failures);
             }
             #[cfg(feature = "fuchsia-passive")]
-            if let Some(pages) = active.passive_window_pages.as_mut() {
-                for page in pages {
-                    if let Err(error) = page.teardown() {
-                        failures.push(ReleaseFailure {
-                            action: ObservableRelease::BarMunmap,
-                            error,
-                        });
-                    }
+            for page in active.passive_window_pages.iter_mut().flatten() {
+                if let Err(error) = page.teardown() {
+                    failures.push(ReleaseFailure {
+                        action: ObservableRelease::BarMunmap,
+                        error,
+                    });
                 }
             }
             for slot in [
@@ -523,18 +523,15 @@ fn acquire_active_vfio_resources(
     map_bar!(dynamic_window, MT_HIF_REMAP_WINDOW_BAR_OFFSET);
     #[cfg(feature = "fuchsia-passive")]
     if operation.is_passive() {
-        resources.passive_window_pages = Some(Vec::new());
-        for bar_page in PASSIVE_MAC_BAR_PAGES {
+        for (slot, bar_page) in resources
+            .passive_window_pages
+            .iter_mut()
+            .zip(PASSIVE_MAC_BAR_PAGES)
+        {
             containment.mark_possibly_active(Hazard::BarMapping);
             ledger.record(AcquisitionIntent::MapBar(bar_page))?;
-            resources
-                .passive_window_pages
-                .as_mut()
-                .expect("initialized")
-                .push(ReadPage::map(device, info, bar_page, true)?);
+            *slot = Some(ReadPage::map(device, info, bar_page, true)?);
         }
-    } else {
-        resources.passive_window_pages = Some(Vec::new());
     }
     map_bar!(swdef, 0x9f000);
     map_bar!(dmashdl, 0xd6000);
@@ -704,15 +701,13 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
-    let mut acquisition_ledger = AcquisitionLedger::default();
-
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
     verify_pci_identity(&bdf)?;
     verify_pci_dma_disabled(&bdf)?;
 
     let base_acquisition = (|| -> Result<RegionInfo, String> {
-        acquisition_ledger.record(AcquisitionIntent::BindIommu)?;
+        capsule.acquisition.record(AcquisitionIntent::BindIommu)?;
         let mut bind = Bind {
             argsz: size::<Bind>(),
             iommufd: capsule.iommu.as_raw_fd(),
@@ -727,7 +722,9 @@ fn run() -> Result<(), String> {
             &mut bind,
             "bind iommufd",
         )?;
-        acquisition_ledger.record(AcquisitionIntent::AllocateIoas)?;
+        capsule
+            .acquisition
+            .record(AcquisitionIntent::AllocateIoas)?;
         let mut alloc = IoasAlloc {
             size: size::<IoasAlloc>(),
             ..Default::default()
@@ -746,7 +743,7 @@ fn run() -> Result<(), String> {
             id: alloc.out_ioas_id,
             destroyed: false,
         });
-        acquisition_ledger.record(AcquisitionIntent::AttachIoas)?;
+        capsule.acquisition.record(AcquisitionIntent::AttachIoas)?;
         let mut attach = Attach {
             argsz: size::<Attach>(),
             pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id,
@@ -777,7 +774,9 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::BarMapping);
         }
-        acquisition_ledger.record(AcquisitionIntent::MapBar(0xd4000))?;
+        capsule
+            .acquisition
+            .record(AcquisitionIntent::MapBar(0xd4000))?;
         capsule.wfdma = Some(ReadPage::map(
             &capsule.device,
             &info,
@@ -785,10 +784,14 @@ fn run() -> Result<(), String> {
             operation.wfdma_writable(),
         )?);
         if operation.needs_pcie_mac() {
-            acquisition_ledger.record(AcquisitionIntent::MapBar(0x10000))?;
+            capsule
+                .acquisition
+                .record(AcquisitionIntent::MapBar(0x10000))?;
             capsule.pcie_mac = Some(ReadPage::map(&capsule.device, &info, 0x10000, true)?);
         }
-        acquisition_ledger.record(AcquisitionIntent::MapBar(0xe0000))?;
+        capsule
+            .acquisition
+            .record(AcquisitionIntent::MapBar(0xe0000))?;
         capsule.conn = Some(ReadPage::map(
             &capsule.device,
             &info,
@@ -1141,6 +1144,7 @@ fn run() -> Result<(), String> {
         } else {
             None
         };
+        let acquisition_ledger = &mut capsule.acquisition;
         capsule
             .containment
             .as_mut()
@@ -1154,7 +1158,7 @@ fn run() -> Result<(), String> {
             capsule.ioas.as_ref().expect("IOAS acquired").id,
             &info,
             operation,
-            &mut acquisition_ledger,
+            acquisition_ledger,
             capsule
                 .containment
                 .as_mut()
@@ -1198,7 +1202,7 @@ fn run() -> Result<(), String> {
         let selector_page = selector_page.as_ref().expect("acquired");
         let dynamic_window = dynamic_window.as_ref().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
-        let passive_window_pages = passive_window_pages.as_ref().expect("acquired");
+        let passive_window_pages = passive_window_pages;
         let swdef = swdef.as_ref().expect("acquired");
         let dmashdl = dmashdl.as_ref().expect("acquired");
         let tx_guard = tx_guard.as_mut().expect("acquired");
@@ -1470,8 +1474,9 @@ fn run() -> Result<(), String> {
                                     rx_count: 8,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
-                                mac_pages: &passive_window_pages,
+                                mac_pages: &*passive_window_pages,
                                 scan_started: None,
+                                pending_scan_done: None,
                                 advertisements: Vec::new(),
                             };
                             let mut transport =
@@ -1534,8 +1539,9 @@ fn run() -> Result<(), String> {
                                     rx_count: 8,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
-                                mac_pages: &passive_window_pages,
+                                mac_pages: &*passive_window_pages,
                                 scan_started: None,
+                                pending_scan_done: None,
                                 advertisements: Vec::new(),
                             };
                             let transport =
@@ -1946,19 +1952,16 @@ fn run() -> Result<(), String> {
             cleanup_errors.push(error);
         }
         let reset = reset_vfio_device(&device);
-        if let Err(error) = reset {
-            retain_mappings_for_watchdog(&format!(
-                "reset while pinned failed: active={active:?} cleanup={cleanup_errors:?} reset={error}"
-            ));
+        if reset.is_err() {
+            retain_mappings_for_watchdog("reset while pinned failed");
         }
         println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
-        if let Err(error) = verify_pci_dma_disabled(&bdf)
+        if verify_pci_dma_disabled(&bdf)
             .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
             .and_then(|()| set_lab_safety("SAFE"))
+            .is_err()
         {
-            retain_mappings_for_watchdog(&format!(
-                "post-reset containment verification failed: active={active:?} cleanup={cleanup_errors:?} error={error}"
-            ));
+            retain_mappings_for_watchdog("post-reset containment verification failed");
         }
         for hazard in [
             Hazard::HostControl,
@@ -3519,15 +3522,15 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             errors.push(error);
         }
         if errors.is_empty() {
-            if let Err(error) = reset_vfio_device(self.device) {
-                retain_mappings_for_watchdog(&format!("loader reset while pinned failed: {error}"));
+            if reset_vfio_device(self.device).is_err() {
+                retain_mappings_for_watchdog("loader reset while pinned failed");
             }
-            if let Err(error) =
-                verify_pci_dma_disabled(self.bdf).and_then(|()| set_lab_safety("SAFE"))
+            if verify_pci_dma_disabled(self.bdf)
+                .and_then(|()| verify_active_reset_containment(self.mcu.wfdma, self.pcie_mac))
+                .and_then(|()| set_lab_safety("SAFE"))
+                .is_err()
             {
-                retain_mappings_for_watchdog(&format!(
-                    "loader post-reset containment verification failed: {error}"
-                ));
+                retain_mappings_for_watchdog("loader post-reset containment verification failed");
             }
             println!(r#"{{"active_fwdl_event":"reset_while_pinned"}}"#);
             Ok(())
@@ -3553,7 +3556,7 @@ impl std::error::Error for PhysicalPassiveError {}
 
 #[cfg(feature = "fuchsia-passive")]
 struct PassiveMacExecutor<'a> {
-    pages: &'a [ReadPage],
+    pages: &'a [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -3592,6 +3595,7 @@ impl PassiveMacExecutor<'_> {
         let bar_page = offset & !(PAGE - 1);
         self.pages
             .iter()
+            .flatten()
             .find(|page| page.bar_page == bar_page)
             .ok_or_else(|| format!("passive MAC address {address:#010x} has no mapped page"))
     }
@@ -3695,8 +3699,9 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     loader: &'a mut VfioFirmwareLoader<'b>,
     ledger: &'c mut ContainmentLedger,
     data: ActiveMcuRx<'b>,
-    mac_pages: &'b [ReadPage],
+    mac_pages: &'b [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
     scan_started: Option<Instant>,
+    pending_scan_done: Option<u8>,
     advertisements: Vec<mt7921_port_spike::PassiveAdvertisement>,
 }
 
@@ -3860,10 +3865,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     "post-scan RX interrupt mask {actual_irq:#010x}, expected {expected_irq:#010x}"
                 )));
             }
-            self.scan_started = None;
-            self.ledger
-                .transition(RunPhase::Scanning, RunPhase::PassiveReady)
-                .map_err(PhysicalPassiveError)?;
+            self.pending_scan_done = Some(done.scan_sequence);
             return Ok(Some(PassiveMechanicsEvent::ScanDone(done)));
         }
         let started = self
@@ -3877,6 +3879,18 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
         }
         Ok(None)
+    }
+
+    fn confirm_scan_done(&mut self, scan_sequence: u8) -> Result<(), Self::Error> {
+        if self.pending_scan_done.take() != Some(scan_sequence) {
+            return Err(PhysicalPassiveError(
+                "scan completion confirmation did not match pending hardware proof".into(),
+            ));
+        }
+        self.scan_started = None;
+        self.ledger
+            .transition(RunPhase::Scanning, RunPhase::PassiveReady)
+            .map_err(PhysicalPassiveError)
     }
 }
 
