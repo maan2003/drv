@@ -401,6 +401,25 @@ boot `febfd4af-29ef-4f72-8304-8ab6cfb73671` restored native Wi-Fi and its
 default route. This completes bounded physical coverage of all 39 channels in
 the mask-zero world/indoor `NO_IR` domain. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T164539Z-0000_05_00.0.log`.
+
+The source-exact transport now accepts one multi-channel Fuchsia hardware scan
+request and implements it as sequential single-channel firmware scans under a
+single device scan ID. It retains the strongest observation for each BSSID,
+sorts the aggregate by receive timestamp, then delivers deduplicated results
+and the final completion through pinned Fuchsia `PassiveScanner`; cancellation
+clears remaining channels and buffered results before sending the source-exact
+cancel command. No regulatory decisions are added here: the full physical gate
+obtains its 39-channel list from pinned Fuchsia `allowed_passive_channels`
+under the already-attested world/indoor, special-UNII-zero policy.
+
+Release SHA-256
+`d9df33caa3fe58ee318b1e7e04b3ab2b0c03f5f4407dbe2b938ba71f3bbf8586`
+completed all 39 sequential dwells as one SME transaction, delivered four
+deduplicated BSS results with transaction ID 1, and emitted a successful scan
+end. Cleanup and restoration returned success. The watchdog rebooted after the
+expected SSH loss; boot `0a4aa41e-1202-4228-bc1b-a0a0738d214d` restored
+`mt7921e`, iwd, `wlan0`, and its default route. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T165608Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
