@@ -3395,6 +3395,11 @@ pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveR
 pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
     let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
     let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let reported_len = (rxd0 & 0xffff) as usize;
+    let bytes = bytes.get(..reported_len).ok_or(PassiveRxError::Truncated)?;
+    if reported_len < 24 {
+        return Err(PassiveRxError::Truncated);
+    }
     let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
     let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
     let rxd3 = u32::from_le_bytes(header[12..16].try_into().expect("fixed field"));
@@ -4353,6 +4358,234 @@ impl ReadOnlyStatus {
 
 pub const MT7921_MGMT_TXWI_BYTES: usize = 64;
 
+pub const MT7921_SKU_RATE_COUNT: usize = 161;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConservativePowerLimits {
+    pub alpha2: [u8; 2],
+    pub max_reg_power_dbm: u8,
+    /// Minimum applicable SAR bound across every emitted static channel/rate.
+    pub sar_limit_half_dbm: Option<i8>,
+    /// Project-owned cap applied in addition to opaque, separately installed CLC policy.
+    pub external_safety_cap_half_dbm: Option<i8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateTxPowerError {
+    NonWorldDomain,
+    MissingBandCapabilities,
+    MissingLimit,
+    InvalidRegulatoryLimit,
+    InvalidSequence,
+    Unsupported6Ghz,
+}
+
+pub trait RateTxPowerTransport {
+    type Error;
+    /// Return after DMA consumption. This CE command has no response payload.
+    fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error>;
+    /// Mandatory pinned read after every batch to prevent PSE underflow.
+    fn read_pse_base(&mut self) -> Result<u32, Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RateTxPowerSubmission {
+    target_half_dbm: i8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RateTxPowerAuthorization {
+    generation: u64,
+    alpha2: [u8; 2],
+    target_half_dbm: i8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RateTxPowerAuthorizer {
+    generation: u64,
+    alpha2: [u8; 2],
+    authorization: Option<RateTxPowerAuthorization>,
+}
+
+impl RateTxPowerAuthorizer {
+    pub const fn new() -> Self {
+        Self {
+            generation: 0,
+            alpha2: *b"00",
+            authorization: None,
+        }
+    }
+
+    pub fn submit<T: RateTxPowerTransport>(
+        &mut self,
+        transport: &mut T,
+        capability: NicCapability,
+        limits: ConservativePowerLimits,
+        first_sequence: u8,
+    ) -> Result<RateTxPowerAuthorization, RateTxPowerInstallError<T::Error>> {
+        if limits.alpha2 != self.alpha2 || self.alpha2 != *b"00" {
+            return Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::NonWorldDomain,
+            ));
+        }
+        let submission =
+            submit_conservative_rate_tx_power(transport, capability, limits, first_sequence)?;
+        let authorization = RateTxPowerAuthorization {
+            generation: self.generation,
+            alpha2: self.alpha2,
+            target_half_dbm: submission.target_half_dbm,
+        };
+        self.authorization = Some(RateTxPowerAuthorization {
+            generation: authorization.generation,
+            alpha2: authorization.alpha2,
+            target_half_dbm: authorization.target_half_dbm,
+        });
+        Ok(authorization)
+    }
+
+    pub fn set_regulatory_domain(&mut self, alpha2: [u8; 2]) {
+        self.generation = self.generation.wrapping_add(1);
+        self.alpha2 = alpha2;
+        self.authorization = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.authorization = None;
+    }
+
+    pub fn permits(&self, authorization: &RateTxPowerAuthorization) -> bool {
+        self.authorization.as_ref() == Some(authorization)
+            && authorization.generation == self.generation
+            && authorization.alpha2 == self.alpha2
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RateTxPowerInstallError<E> {
+    Encode(RateTxPowerError),
+    Transport { command: u8, error: E },
+}
+
+fn submit_conservative_rate_tx_power<T: RateTxPowerTransport>(
+    transport: &mut T,
+    capability: NicCapability,
+    limits: ConservativePowerLimits,
+    first_sequence: u8,
+) -> Result<RateTxPowerSubmission, RateTxPowerInstallError<T::Error>> {
+    let commands = encode_conservative_rate_tx_power_commands(capability, limits, first_sequence)
+        .map_err(RateTxPowerInstallError::Encode)?;
+    for (index, command) in commands.iter().enumerate() {
+        transport.send_and_wait_consumed(command).map_err(|error| {
+            RateTxPowerInstallError::Transport {
+                command: index as u8,
+                error,
+            }
+        })?;
+        transport
+            .read_pse_base()
+            .map_err(|error| RateTxPowerInstallError::Transport {
+                command: index as u8,
+                error,
+            })?;
+    }
+    Ok(RateTxPowerSubmission {
+        target_half_dbm: (limits.max_reg_power_dbm as i8 * 2)
+            .min(limits.sar_limit_half_dbm.expect("encoder required SAR"))
+            .min(
+                limits
+                    .external_safety_cap_half_dbm
+                    .expect("encoder required safety cap"),
+            ),
+    })
+}
+
+/// Encode pinned Connac2 `MCU_CE_CMD(SET_RATE_TX_POWER)` batches. This narrow
+/// world-domain subset uses one most-restrictive limit for every rate, matching
+/// Linux when no platform per-rate DT table expands the initialized target.
+/// Both a platform/SAR bound and an explicit project safety cap are mandatory.
+pub fn encode_conservative_rate_tx_power_commands(
+    capability: NicCapability,
+    limits: ConservativePowerLimits,
+    first_sequence: u8,
+) -> Result<Vec<Vec<u8>>, RateTxPowerError> {
+    const CHANNELS_2GHZ: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    const CHANNELS_5GHZ: &[u8] = &[
+        36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110,
+        112, 114, 116, 118, 120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
+        153, 155, 157, 159, 161, 165, 169, 173, 177,
+    ];
+    if limits.alpha2 != *b"00" {
+        return Err(RateTxPowerError::NonWorldDomain);
+    }
+    if limits.max_reg_power_dbm > 20 {
+        return Err(RateTxPowerError::InvalidRegulatoryLimit);
+    }
+    let sar = limits
+        .sar_limit_half_dbm
+        .ok_or(RateTxPowerError::MissingLimit)?;
+    let safety_cap = limits
+        .external_safety_cap_half_dbm
+        .ok_or(RateTxPowerError::MissingLimit)?;
+    let target = (limits.max_reg_power_dbm as i8 * 2)
+        .min(sar)
+        .min(safety_cap);
+    let phy = capability
+        .phy
+        .ok_or(RateTxPowerError::MissingBandCapabilities)?;
+    if capability.has_6ghz != Some(false) {
+        return Err(RateTxPowerError::Unsupported6Ghz);
+    }
+    let mut bands = Vec::new();
+    // The pinned capability has no explicit has_2ghz bit; a present PHY always
+    // contributes the baseline 2-GHz table, while has_5ghz gates that table.
+    bands.push((1u8, CHANNELS_2GHZ));
+    if phy.has_5ghz {
+        bands.push((2u8, CHANNELS_5GHZ));
+    }
+    let command_count: usize = bands
+        .iter()
+        .map(|(_, channels)| channels.len().div_ceil(8))
+        .sum();
+    if first_sequence == 0 || usize::from(first_sequence) + command_count - 1 > 15 {
+        return Err(RateTxPowerError::InvalidSequence);
+    }
+    let final_channel = bands
+        .last()
+        .and_then(|(_, channels)| channels.last())
+        .copied();
+    let final_band = bands.last().map(|(band, _)| *band);
+    let mut commands = Vec::with_capacity(command_count);
+    for (band, channels) in bands {
+        for batch in channels.chunks(8) {
+            let request_length = 44 + batch.len() * (1 + MT7921_SKU_RATE_COUNT);
+            let total = CONNAC2_MCU_TXD_BYTES + request_length;
+            let mut bytes = vec![0u8; total];
+            bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+            bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+            bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+            bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+            bytes[36..40].copy_from_slice(&[0x5d, 0xa0, 1, first_sequence + commands.len() as u8]);
+            let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+            request[4] = batch.len() as u8;
+            request[5] = band;
+            request[6] =
+                u8::from(Some(band) == final_band && batch.last().copied() == final_channel);
+            request[8..10].copy_from_slice(&limits.alpha2);
+            for (index, channel) in batch.iter().copied().enumerate() {
+                let offset = 44 + index * (1 + MT7921_SKU_RATE_COUNT);
+                request[offset] = channel;
+                request[offset + 1..offset + 1 + MT7921_SKU_RATE_COUNT].fill(target as u8);
+                if band == 2 {
+                    request[offset + 1..offset + 5].fill(127);
+                }
+            }
+            commands.push(bytes);
+        }
+    }
+    Ok(commands)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mt7921MgmtTx {
     pub txwi: [u8; MT7921_MGMT_TXWI_BYTES],
@@ -4413,7 +4646,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
     let mut word = |index: usize, value: u32| {
         txwi[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes())
     };
-    // mt76_connac2_mac_write_txwi: CT packet, alternate TX queue, WCID/OMAC 0.
+    // mt76_connac2_mac_write_txwi: CT packet, alternate TX queue, caller WCID / OMAC 0.
     word(0, (0x10 << 25) | ((frame.len() as u32 + 32) & 0xffff));
     // Long format, 802.11 header, 24-byte management header / 2.
     word(1, (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid));
@@ -4629,6 +4862,141 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn source_exact_conservative_rate_power_batches_fail_closed() {
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 15,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let limits = ConservativePowerLimits {
+            alpha2: *b"00",
+            max_reg_power_dbm: 20,
+            sar_limit_half_dbm: Some(12),
+            external_safety_cap_half_dbm: Some(8),
+        };
+        let commands = encode_conservative_rate_tx_power_commands(capability, limits, 1).unwrap();
+        assert_eq!(commands.len(), 8);
+        for (index, command) in commands.iter().enumerate() {
+            assert_eq!(&command[36..40], &[0x5d, 0xa0, 1, index as u8 + 1]);
+            let request = &command[CONNAC2_MCU_TXD_BYTES..];
+            assert!(request[4] >= 1 && request[4] <= 8);
+            assert!(request[5] == 1 || request[5] == 2);
+            for entry in request[44..].chunks_exact(1 + MT7921_SKU_RATE_COUNT) {
+                if request[5] == 2 {
+                    assert_eq!(&entry[1..5], &[127; 4]);
+                    assert!(entry[5..].iter().all(|power| *power == 8));
+                } else {
+                    assert!(entry[1..].iter().all(|power| *power == 8));
+                }
+            }
+        }
+        assert_eq!(commands.last().unwrap()[CONNAC2_MCU_TXD_BYTES + 6], 1);
+        assert!(
+            commands[..7]
+                .iter()
+                .all(|command| command[CONNAC2_MCU_TXD_BYTES + 6] == 0)
+        );
+
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(
+                capability,
+                ConservativePowerLimits {
+                    sar_limit_half_dbm: None,
+                    ..limits
+                },
+                1,
+            ),
+            Err(RateTxPowerError::MissingLimit)
+        );
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(capability, limits, 9),
+            Err(RateTxPowerError::InvalidSequence)
+        );
+        let mut six_ghz = capability;
+        six_ghz.has_6ghz = Some(true);
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(six_ghz, limits, 1),
+            Err(RateTxPowerError::Unsupported6Ghz)
+        );
+        six_ghz.has_6ghz = None;
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(six_ghz, limits, 1),
+            Err(RateTxPowerError::Unsupported6Ghz)
+        );
+
+        struct PowerTransport {
+            completed: usize,
+            pse_reads: usize,
+            fail_at: Option<usize>,
+        }
+        impl RateTxPowerTransport for PowerTransport {
+            type Error = ();
+            fn send_and_wait_consumed(&mut self, _encoded: &[u8]) -> Result<(), Self::Error> {
+                if self.fail_at == Some(self.completed) {
+                    return Err(());
+                }
+                self.completed += 1;
+                Ok(())
+            }
+            fn read_pse_base(&mut self) -> Result<u32, Self::Error> {
+                self.pse_reads += 1;
+                Ok(0)
+            }
+        }
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        let mut authorizer = RateTxPowerAuthorizer::new();
+        let authorization = authorizer
+            .submit(&mut transport, capability, limits, 1)
+            .unwrap();
+        assert!(authorizer.permits(&authorization));
+        assert_eq!(transport.completed, 8);
+        assert_eq!(transport.pse_reads, 8);
+        authorizer.reset();
+        assert!(!authorizer.permits(&authorization));
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: Some(3),
+        };
+        assert_eq!(
+            RateTxPowerAuthorizer::new().submit(&mut transport, capability, limits, 1),
+            Err(RateTxPowerInstallError::Transport {
+                command: 3,
+                error: (),
+            })
+        );
+        let mut authorizer = RateTxPowerAuthorizer::new();
+        authorizer.set_regulatory_domain(*b"IN");
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        assert_eq!(
+            authorizer.submit(&mut transport, capability, limits, 1),
+            Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::NonWorldDomain
+            ))
+        );
+        assert_eq!(transport.completed, 0);
+    }
 
     #[test]
     fn source_exact_connac2_sae_auth_txwi_and_txp() {
@@ -6796,6 +7164,11 @@ mod tests {
         expected_5ghz.band = PhysicalBand::Ghz5;
         expected_5ghz.channel = 36;
         assert_eq!(parse_passive_advertisement(&rx_5ghz), Ok(expected_5ghz));
+        let mut stale_tail = rx.clone();
+        stale_tail[0..4].copy_from_slice(&((2u32 << 27) | 68).to_le_bytes());
+        let mut without_tail = parse_passive_advertisement(&rx).unwrap();
+        without_tail.ies.clear();
+        assert_eq!(parse_passive_advertisement(&stale_tail), Ok(without_tail));
         rx[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
         assert_eq!(
             parse_passive_advertisement(&rx),

@@ -96,10 +96,14 @@ The pinned Fuchsia authorization source is
 ordering first stops client connections and APs, then calls
 `PhyManager::set_country_code`, which invokes `DeviceMonitor.SetCountry` for
 every PHY; failure remains a failure rather than falling through to TX. A host
-port therefore needs user/location authority, this stop/set/recreate ordering,
-successful country-specific firmware/channel programming, and an exact channel
-rule without `NO_IR` before enabling the dormant SAE adapter. Channel 36 needs
-no CAC, but it still needs explicit IR authorization.
+port may use user/location authority with this stop/set/recreate ordering, or
+the smaller pinned cfg80211 beacon-hint transition: an error-free direct ESS
+beacon on exact non-radar channel 36 while world-roaming clears `NO_IR` for
+that channel. `BeaconHintAuthorizer` narrows this further to the configured
+SSID+BSSID and issues only a run-scoped token invalidated by channel,
+regulatory-domain, or reset transitions. Channel 36 needs no CAC, but the
+token and a live-verified regulatory/SAR/rate-power submission are both required
+before the dormant SAE adapter can be enabled.
 
 ## Source and license
 

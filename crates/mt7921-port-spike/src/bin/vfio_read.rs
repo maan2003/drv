@@ -2916,10 +2916,7 @@ fn read_ephemeral_sae_password() -> Result<Vec<u8>, String> {
     File::open(format!("/proc/self/fd/{fd}"))
         .and_then(|mut file| file.read_to_end(&mut password))
         .map_err(|error| format!("read ephemeral SAE credential: {error}"))?;
-    while password.last().is_some_and(u8::is_ascii_whitespace) {
-        password.pop();
-    }
-    if !(8..=63).contains(&password.len()) {
+    if !(8..=63).contains(&password.len()) || std::str::from_utf8(&password).is_err() {
         password.fill(0);
         return Err("ephemeral SAE credential length is invalid".into());
     }
@@ -2983,6 +2980,20 @@ fn run_one_shot_sae_auth(
         while let Some(update) = updates.pop_front() {
             match update {
                 SaeHandshakeUpdate::TxFrame(sae) => {
+                    // Pinned SAE emits TxFrame immediately followed by its
+                    // retransmission timer. Arm that timer before the
+                    // synchronous hardware completion wait, not afterwards.
+                    if let Some(SaeHandshakeUpdate::ScheduleTimeout {
+                        id,
+                        duration_millis,
+                    }) = updates.front()
+                    {
+                        timer = Some((
+                            *id,
+                            Instant::now() + std::time::Duration::from_millis(*duration_millis),
+                        ));
+                        updates.pop_front();
+                    }
                     if tx_index >= 8 {
                         return Err("SAE exceeded bounded management TX count".into());
                     }

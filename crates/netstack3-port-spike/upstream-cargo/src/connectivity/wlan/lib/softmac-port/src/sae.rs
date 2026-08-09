@@ -11,6 +11,7 @@ use ieee80211::{MacAddr, MacAddrBytes, Ssid};
 use wlan_common::ie::rsn::rsne;
 use wlan_common::mac;
 use wlan_common::mgmt_writer;
+use wlan_common::security::wpa::credential::Passphrase;
 use wlan_frame_writer::write_frame;
 use wlan_rsn::auth;
 use wlan_rsn::nonce::NonceReader;
@@ -46,6 +47,10 @@ impl SaeHandshake {
         authenticator_rsne: &[u8],
         hash_to_element_supported: bool,
     ) -> Result<Self, anyhow::Error> {
+        if hash_to_element_supported {
+            anyhow::bail!("SAE H2E requires peer RSNXE input, which this narrow wrapper omits");
+        }
+        let password: Vec<u8> = Passphrase::try_from(password.as_slice())?.into();
         let (_, authenticator) = rsne::from_bytes(authenticator_rsne)
             .map_err(|error| anyhow::format_err!("invalid authenticator RSNE: {error:?}"))?;
         let support = SecuritySupport {
@@ -60,11 +65,7 @@ impl SaeHandshake {
             ..Default::default()
         };
         let supplicant_rsne = authenticator.derive_wpa3_s_rsne(&support)?;
-        let pwe_method = if hash_to_element_supported {
-            PweMethod::Direct
-        } else {
-            PweMethod::Loop
-        };
+        let pwe_method = PweMethod::Loop;
         let supplicant = Supplicant::new_wpa_personal(
             NonceReader::new(&client)?,
             auth::Config::Sae {
@@ -240,6 +241,21 @@ mod tests {
         .unwrap();
         let _ = handshake.start().unwrap();
         assert!(handshake.on_timeout(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn h2e_is_rejected_until_peer_rsnxe_is_part_of_the_boundary() {
+        assert!(
+            SaeHandshake::new(
+                b"fixture".to_vec(),
+                b"fixture passphrase".to_vec(),
+                MacAddr::from([2; 6]),
+                MacAddr::from([6; 6]),
+                WPA3_SAE_RSNE,
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[test]

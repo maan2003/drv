@@ -149,6 +149,129 @@ pub fn allowed_passive_channels(
     Ok(allowed)
 }
 
+/// Valid only while retained by its originating authorizer. Production must
+/// feed observations from the active hardware scan path, not caller-built
+/// `ScanObservation` values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BeaconHintAuthorization {
+    epoch: u64,
+    channel: ChannelNumber,
+    bssid: [u8; 6],
+    scan_generation: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct BeaconHintAuthorizer {
+    alpha2: [u8; 2],
+    channel: Option<ChannelNumber>,
+    target_bssid: [u8; 6],
+    target_ssid: Vec<u8>,
+    epoch: u64,
+    scan_generation: Option<u64>,
+    authorization: Option<BeaconHintAuthorization>,
+}
+
+impl BeaconHintAuthorizer {
+    pub fn new(target_bssid: [u8; 6], target_ssid: Vec<u8>) -> Self {
+        Self {
+            alpha2: *b"00",
+            channel: None,
+            target_bssid,
+            target_ssid,
+            epoch: 0,
+            scan_generation: None,
+            authorization: None,
+        }
+    }
+
+    /// A channel transition invalidates the previous beacon hint even when
+    /// returning to the same channel later in the run.
+    pub fn set_channel(&mut self, channel: ChannelNumber) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.authorization = None;
+        self.channel = Some(channel);
+        self.scan_generation = None;
+    }
+
+    pub fn begin_passive_scan(&mut self, generation: u64, channel: ChannelNumber) {
+        self.set_channel(channel);
+        self.scan_generation = Some(generation);
+    }
+
+    pub fn set_regulatory_domain(&mut self, alpha2: [u8; 2]) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.authorization = None;
+        self.alpha2 = alpha2;
+        self.scan_generation = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.authorization = None;
+        self.channel = None;
+        self.scan_generation = None;
+    }
+
+    /// Port the narrow `regulatory_hint_found_beacon` case used here: direct
+    /// ESS beacon, world roaming domain, exact non-radar channel 36, and the
+    /// configured BSSID/SSID. Probe responses and AP Country IEs cannot mint
+    /// this authorization.
+    pub fn observe(
+        &mut self,
+        scan_generation: u64,
+        observation: &ScanObservation,
+    ) -> Option<BeaconHintAuthorization> {
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        if self.alpha2 != *b"00"
+            || self.channel != Some(channel)
+            || self.scan_generation != Some(scan_generation)
+            || observation.kind != AdvertisementKind::Beacon
+            || observation.bss.primary != channel
+            || observation.bss.bssid != self.target_bssid
+            || observation.bss.capability_info & 1 == 0
+            || ssid_from_ies(&observation.bss.ies) != Some(self.target_ssid.as_slice())
+        {
+            return None;
+        }
+        let authorization = BeaconHintAuthorization {
+            epoch: self.epoch,
+            channel,
+            bssid: self.target_bssid,
+            scan_generation,
+        };
+        self.authorization = Some(authorization);
+        Some(authorization)
+    }
+
+    /// Must be checked at the sole management-TX publish point. A copied token
+    /// cannot survive a channel, regulatory-domain, or reset transition.
+    pub fn permits(&self, authorization: &BeaconHintAuthorization) -> bool {
+        self.authorization.as_ref() == Some(authorization)
+            && authorization.epoch == self.epoch
+            && self.channel == Some(authorization.channel)
+            && authorization.bssid == self.target_bssid
+            && self.scan_generation == Some(authorization.scan_generation)
+    }
+}
+
+fn ssid_from_ies(ies: &[u8]) -> Option<&[u8]> {
+    let mut offset = 0usize;
+    while offset < ies.len() {
+        let header = ies.get(offset..offset + 2)?;
+        let len = usize::from(header[1]);
+        offset += 2;
+        let body = ies.get(offset..offset.checked_add(len)?)?;
+        if header[0] == 0 {
+            return (len <= 32).then_some(body);
+        }
+        offset += len;
+    }
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScanError<E> {
     Busy,
@@ -521,6 +644,56 @@ mod tests {
             ),
             Err(RegulatoryError::NonWorldDomain)
         );
+    }
+
+    #[test]
+    fn direct_target_beacon_mints_only_run_scoped_channel_36_authorization() {
+        let target = [6; 6];
+        let channel = channel_5ghz(36);
+        let observation = ScanObservation {
+            kind: AdvertisementKind::Beacon,
+            timestamp_nanos: 42,
+            bss: BssDescription {
+                bssid: target,
+                bss_type: BssType::Infrastructure,
+                beacon_period: 100,
+                capability_info: 1,
+                ies: vec![0, 3, b'p', b'h', b'1'],
+                primary: channel,
+                bandwidth: ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: channel_5ghz(0),
+                rssi_dbm: -30,
+                snr_db: 0,
+            },
+        };
+        let mut authorizer = BeaconHintAuthorizer::new(target, b"ph1".to_vec());
+        authorizer.begin_passive_scan(1, channel);
+        let authorization = authorizer.observe(1, &observation).unwrap();
+        assert!(authorizer.permits(&authorization));
+
+        let mut wrong = observation.clone();
+        wrong.kind = AdvertisementKind::ProbeResponse;
+        assert_eq!(authorizer.observe(1, &wrong), None);
+        wrong = observation.clone();
+        wrong.bss.bssid = [7; 6];
+        assert_eq!(authorizer.observe(1, &wrong), None);
+        wrong = observation.clone();
+        wrong.bss.ies = vec![0, 3, b'n', b'o', b'p'];
+        assert_eq!(authorizer.observe(1, &wrong), None);
+
+        authorizer.set_channel(channel_5ghz(40));
+        assert!(!authorizer.permits(&authorization));
+        authorizer.begin_passive_scan(2, channel);
+        assert!(!authorizer.permits(&authorization));
+        assert_eq!(authorizer.observe(1, &observation), None);
+        let authorization = authorizer.observe(2, &observation).unwrap();
+        authorizer.set_regulatory_domain(*b"IN");
+        assert!(!authorizer.permits(&authorization));
+        authorizer.set_regulatory_domain(*b"00");
+        authorizer.begin_passive_scan(1, channel);
+        let authorization = authorizer.observe(1, &observation).unwrap();
+        authorizer.reset();
+        assert!(!authorizer.permits(&authorization));
     }
 
     // Uses the BSS shape from upstream scanner advertisement fixtures.
