@@ -10,15 +10,32 @@
 
 pub mod fidl_fuchsia_wlan_policy {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum ConnectionState { Failed, Disconnected, Connecting, Connected }
+    pub enum ConnectionState {
+        Failed,
+        Disconnected,
+        Connecting,
+        Connected,
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum WlanClientState { ConnectionsDisabled, ConnectionsEnabled }
+    pub enum WlanClientState {
+        ConnectionsDisabled,
+        ConnectionsEnabled,
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum DisconnectStatus { ConnectionFailed, ConnectionStopped }
+    pub enum DisconnectStatus {
+        ConnectionFailed,
+        ConnectionStopped,
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum Compatibility { Supported, DisallowedNotSupported }
+    pub enum Compatibility {
+        Supported,
+        DisallowedNotSupported,
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum ScanErrorCode { GeneralError, Cancelled }
+    pub enum ScanErrorCode {
+        GeneralError,
+        Cancelled,
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum NetworkConfigChangeError {
         GeneralError,
@@ -30,13 +47,26 @@ pub mod fidl_fuchsia_wlan_policy {
         NetworkConfigWriteError,
     }
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    pub enum SecurityType { None, Wep, Wpa, Wpa2, Wpa3 }
+    pub enum SecurityType {
+        None,
+        Wep,
+        Wpa,
+        Wpa2,
+        Wpa3,
+    }
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub enum Credential { None(Empty), Password(Vec<u8>), Psk(Vec<u8>) }
+    pub enum Credential {
+        None(Empty),
+        Password(Vec<u8>),
+        Psk(Vec<u8>),
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Empty;
     #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct NetworkIdentifier { pub ssid: Vec<u8>, pub type_: SecurityType }
+    pub struct NetworkIdentifier {
+        pub ssid: Vec<u8>,
+        pub type_: SecurityType,
+    }
     #[derive(Clone, Debug, Default, Eq, PartialEq)]
     pub struct NetworkConfig {
         pub id: Option<NetworkIdentifier>,
@@ -72,7 +102,9 @@ pub mod wlan_metrics_registry {
     }
 }
 
-pub mod regulatory_manager { pub type CountryCode = [u8; 2]; }
+pub mod regulatory_manager {
+    pub type CountryCode = [u8; 2];
+}
 
 pub mod util {
     #[path = "historical_list.rs"]
@@ -86,12 +118,17 @@ pub mod telemetry {
     use futures::channel::mpsc;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum NetworkSelectionType { Directed, Undirected }
+    pub enum NetworkSelectionType {
+        Directed,
+        Undirected,
+    }
 
     #[derive(Clone)]
     pub struct TelemetrySender(mpsc::Sender<TelemetryEvent>);
     impl TelemetrySender {
-        pub fn new(sender: mpsc::Sender<TelemetryEvent>) -> Self { Self(sender) }
+        pub fn new(sender: mpsc::Sender<TelemetryEvent>) -> Self {
+            Self(sender)
+        }
         pub fn send(&self, event: TelemetryEvent) {
             let _ = self.0.clone().try_send(event);
         }
@@ -99,8 +136,12 @@ pub mod telemetry {
 
     #[derive(Clone)]
     pub enum TelemetryEvent {
-        NetworkSelectionScanInterval { time_since_last_scan: zx::MonotonicDuration },
-        ActiveScanRequested { num_ssids_requested: usize },
+        NetworkSelectionScanInterval {
+            time_since_last_scan: zx::MonotonicDuration,
+        },
+        ActiveScanRequested {
+            num_ssids_requested: usize,
+        },
         NetworkSelectionDecision {
             network_selection_type: NetworkSelectionType,
             num_candidates: Result<usize, ()>,
@@ -120,10 +161,10 @@ pub mod telemetry {
 }
 
 pub mod config_management {
-    #[path = "network_config.rs"]
-    pub mod network_config;
     #[path = "config_manager.rs"]
     mod config_manager;
+    #[path = "network_config.rs"]
+    pub mod network_config;
     pub use config_manager::*;
     pub use network_config::*;
 }

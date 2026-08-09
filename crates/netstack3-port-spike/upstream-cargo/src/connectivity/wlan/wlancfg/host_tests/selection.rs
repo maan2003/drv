@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use async_trait::async_trait;
+use fidl_fuchsia_wlan_common::{ScanType, SecuritySupport, SpectrumManagementSupport, WlanMacRole};
 use fidl_fuchsia_wlan_ieee80211::{
     BssDescription, BssType, ChannelBandwidth, ChannelNumber, WlanBand,
 };
-use fidl_fuchsia_wlan_sme::Protection;
-use fidl_fuchsia_wlan_common::{ScanType, SecuritySupport, SpectrumManagementSupport, WlanMacRole};
 use fidl_fuchsia_wlan_internal::{Authentication, Protocol};
 use fidl_fuchsia_wlan_mlme::{BandCapability, DeviceInfo};
 use fidl_fuchsia_wlan_sme::ConnectRequest;
+use fidl_fuchsia_wlan_sme::Protection;
 use futures::channel::mpsc;
 use futures::executor::block_on;
 use futures::lock::Mutex;
@@ -20,11 +20,13 @@ use wlan_common::channel::{Bandwidth, Channel};
 use wlan_common::scan::{Compatible, Incompatible};
 use wlan_common::security::SecurityDescriptor;
 use wlan_common::sequestered::Sequestered;
-use wlancfg_selection::client::connection_selection::{
-    ConnectionSelectionRequester, ConnectionSelector, ConnectionSelectorApi,
-};
+use wlan_sme::MlmeRequest;
+use wlan_sme::client::{ClientConfig, ClientSme};
 use wlancfg_selection::client::connection_selection::fut_manager::{
     ConnectionSelectionFutures, ConnectionSelectionManager, SelectionIdentifier,
+};
+use wlancfg_selection::client::connection_selection::{
+    ConnectionSelectionRequester, ConnectionSelector, ConnectionSelectorApi,
 };
 use wlancfg_selection::client::scan::{ScanReason, ScanRequestApi};
 use wlancfg_selection::client::types::{
@@ -36,8 +38,6 @@ use wlancfg_selection::config_management::{
 };
 use wlancfg_selection::telemetry::{TelemetryEvent, TelemetrySender};
 use wlancfg_selection::wlan_metrics_registry::PolicyConnectionAttemptMigratedMetricDimensionReason as ConnectReason;
-use wlan_sme::client::{ClientConfig, ClientSme};
-use wlan_sme::MlmeRequest;
 
 #[derive(Clone)]
 struct ScanCall {
@@ -53,7 +53,10 @@ struct SpyScan {
 
 impl SpyScan {
     fn new(results: Vec<Result<Vec<ScanResult>, types::ScanError>>) -> Self {
-        Self { calls: Mutex::new(vec![]), results: Mutex::new(results.into()) }
+        Self {
+            calls: Mutex::new(vec![]),
+            results: Mutex::new(results.into()),
+        }
     }
 }
 
@@ -65,8 +68,16 @@ impl ScanRequestApi for SpyScan {
         ssids: Vec<types::Ssid>,
         channels: Vec<types::WlanChan>,
     ) -> Result<Vec<ScanResult>, types::ScanError> {
-        self.calls.lock().await.push(ScanCall { reason, ssids, channels });
-        self.results.lock().await.pop_front().expect("unexpected scan request")
+        self.calls.lock().await.push(ScanCall {
+            reason,
+            ssids,
+            channels,
+        });
+        self.results
+            .lock()
+            .await
+            .pop_front()
+            .expect("unexpected scan request")
     }
 }
 
@@ -77,7 +88,10 @@ struct SpySavedNetworks {
 
 impl SpySavedNetworks {
     fn new(configs: Vec<NetworkConfig>) -> Self {
-        Self { configs, compatible_lookups: Mutex::new(vec![]) }
+        Self {
+            configs,
+            compatible_lookups: Mutex::new(vec![]),
+        }
     }
 }
 
@@ -86,17 +100,29 @@ impl SavedNetworksManagerApi for SpySavedNetworks {
     async fn remove(&self, _: NetworkIdentifier) -> Result<bool, NetworkConfigError> {
         panic!("unused saved-network effect")
     }
-    async fn known_network_count(&self) -> usize { self.configs.len() }
+    async fn known_network_count(&self) -> usize {
+        self.configs.len()
+    }
     async fn lookup(&self, id: &NetworkIdentifier) -> Option<NetworkConfig> {
-        self.configs.iter().find(|c| c.ssid == id.ssid && c.security_type == id.security_type).cloned()
+        self.configs
+            .iter()
+            .find(|c| c.ssid == id.ssid && c.security_type == id.security_type)
+            .cloned()
     }
     async fn lookup_compatible(
         &self,
         ssid: &types::Ssid,
         protection: Protection,
     ) -> Vec<NetworkConfig> {
-        self.compatible_lookups.lock().await.push((ssid.clone(), protection));
-        self.configs.iter().filter(|c| &c.ssid == ssid).cloned().collect()
+        self.compatible_lookups
+            .lock()
+            .await
+            .push((ssid.clone(), protection));
+        self.configs
+            .iter()
+            .filter(|c| &c.ssid == ssid)
+            .cloned()
+            .collect()
     }
     async fn store(
         &self,
@@ -123,7 +149,9 @@ impl SavedNetworksManagerApi for SpySavedNetworks {
     ) {
         panic!("unused saved-network effect")
     }
-    async fn record_periodic_metrics(&self) { panic!("unused saved-network effect") }
+    async fn record_periodic_metrics(&self) {
+        panic!("unused saved-network effect")
+    }
     async fn record_scan_result(
         &self,
         _: Vec<types::Ssid>,
@@ -138,7 +166,9 @@ impl SavedNetworksManagerApi for SpySavedNetworks {
     ) -> Result<bool, anyhow::Error> {
         panic!("unused saved-network effect")
     }
-    async fn get_networks(&self) -> Vec<NetworkConfig> { self.configs.clone() }
+    async fn get_networks(&self) -> Vec<NetworkConfig> {
+        self.configs.clone()
+    }
     async fn get_past_connections(
         &self,
         _: &NetworkIdentifier,
@@ -150,7 +180,11 @@ impl SavedNetworksManagerApi for SpySavedNetworks {
 }
 
 fn channel(primary: u8) -> Channel {
-    Channel { primary, bandwidth: Bandwidth::Cbw20, band: WlanBand::TwoGhz }
+    Channel {
+        primary,
+        bandwidth: Bandwidth::Cbw20,
+        band: WlanBand::TwoGhz,
+    }
 }
 
 fn fidl_bss(bssid: [u8; 6], ssid: &[u8], primary: u8, rssi: i8) -> BssDescription {
@@ -163,9 +197,15 @@ fn fidl_bss(bssid: [u8; 6], ssid: &[u8], primary: u8, rssi: i8) -> BssDescriptio
         beacon_period: 100,
         capability_info: 1,
         ies,
-        primary: ChannelNumber { band: WlanBand::TwoGhz, number: primary },
+        primary: ChannelNumber {
+            band: WlanBand::TwoGhz,
+            number: primary,
+        },
         bandwidth: ChannelBandwidth::Cbw20,
-        vht_secondary_80_channel: ChannelNumber { band: WlanBand::TwoGhz, number: 0 },
+        vht_secondary_80_channel: ChannelNumber {
+            band: WlanBand::TwoGhz,
+            number: 0,
+        },
         rssi_dbm: rssi,
         snr_db: 30,
     }
@@ -181,7 +221,10 @@ fn bss(
 ) -> Bss {
     Bss {
         bssid: bssid.into(),
-        signal: Signal { rssi_dbm: rssi, snr_db: 30 },
+        signal: Signal {
+            rssi_dbm: rssi,
+            snr_db: 30,
+        },
         channel: channel(primary),
         timestamp: zx::MonotonicInstant::from_nanos(1),
         observation,
@@ -256,10 +299,7 @@ fn directed_selection_uses_pinned_filter_and_score_order() {
         );
 
         let selected = selector
-            .find_and_select_connection_candidate(
-                Some(target),
-                ConnectReason::FidlConnectRequest,
-            )
+            .find_and_select_connection_candidate(Some(target), ConnectReason::FidlConnectRequest)
             .await
             .expect("pinned selector should choose a compatible BSS");
 
@@ -289,10 +329,7 @@ fn passive_winner_is_augmented_by_the_pinned_active_scan() {
         let (selector, _telemetry) = selector(scan.clone(), saved);
 
         let selected = selector
-            .find_and_select_connection_candidate(
-                None,
-                ConnectReason::IdleInterfaceAutoconnect,
-            )
+            .find_and_select_connection_candidate(None, ConnectReason::IdleInterfaceAutoconnect)
             .await
             .expect("pinned selector should return its augmented candidate");
 
@@ -350,7 +387,9 @@ fn no_candidates_returns_none_without_local_fallback() {
         );
         assert!(matches!(
             telemetry.try_recv(),
-            Ok(TelemetryEvent::ActiveScanRequested { num_ssids_requested: 0 })
+            Ok(TelemetryEvent::ActiveScanRequested {
+                num_ssids_requested: 0
+            })
         ));
     });
 }
@@ -359,7 +398,8 @@ fn no_candidates_returns_none_without_local_fallback() {
 fn pinned_selection_manager_cancellation_discards_the_result() {
     block_on(async {
         let (sender, mut requests) = mpsc::channel(1);
-        let mut manager = ConnectionSelectionManager::new(ConnectionSelectionRequester::new(sender));
+        let mut manager =
+            ConnectionSelectionManager::new(ConnectionSelectionRequester::new(sender));
         manager.initiate_automatic_connection_selection();
         assert!(manager.active_selections() == vec![SelectionIdentifier::Automatic]);
 
@@ -369,7 +409,9 @@ fn pinned_selection_manager_cancellation_discards_the_result() {
             let mut pending = std::pin::pin!(ConnectionSelectionFutures::new(&mut manager));
             assert!(matches!(futures::poll!(&mut pending), Poll::Pending));
         }
-        let pending_request = requests.try_recv().expect("selection request must be emitted");
+        let pending_request = requests
+            .try_recv()
+            .expect("selection request must be emitted");
         manager.cancel(&SelectionIdentifier::Automatic);
         let (id, result) = ConnectionSelectionFutures::new(&mut manager).await;
         assert!(id == SelectionIdentifier::Automatic);
@@ -397,7 +439,10 @@ fn ordinary_sme_connect_data_cannot_impersonate_wlancfg_selection() {
                     basic_rates: vec![2, 4, 11, 22],
                     ht_cap: None,
                     vht_cap: None,
-                    primary_channels: vec![ChannelNumber { band: WlanBand::TwoGhz, number: 1 }],
+                    primary_channels: vec![ChannelNumber {
+                        band: WlanBand::TwoGhz,
+                        number: 1,
+                    }],
                 }],
                 softmac_hardware_capability: 0,
                 qos_capable: false,
@@ -412,7 +457,10 @@ fn ordinary_sme_connect_data_cannot_impersonate_wlancfg_selection() {
             ssid: b"caller".to_vec(),
             bss_description: description,
             multiple_bss_candidates: false,
-            authentication: Authentication { protocol: Protocol::Open, credentials: None },
+            authentication: Authentication {
+                protocol: Protocol::Open,
+                credentials: None,
+            },
             deprecated_scan_type: ScanType::Passive,
         });
         assert!(matches!(requests.try_recv(), Ok(MlmeRequest::Connect(_))));
