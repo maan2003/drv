@@ -2,7 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-//! Host-portable extraction of the pinned Fuchsia SoftMAC passive scanner.
+//! Host-portable extraction of pinned Fuchsia SoftMAC client MLME boundaries.
+
+mod open_client;
+
+pub use open_client::*;
 
 #[path = "../../mlme/rust/src/client/convert_beacon.rs"]
 mod pinned_convert_beacon;

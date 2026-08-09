@@ -145,7 +145,9 @@ impl ReasonCode {
 impl StatusCode {
     pub const Success: Self = Self(0);
     pub const RefusedReasonUnspecified: Self = Self(1);
+    pub const RefusedCapabilitiesMismatch: Self = Self(10);
     pub const RejectedSequenceTimeout: Self = Self(16);
+    pub const RefusedTemporarily: Self = Self(30);
     pub const RefusedUnauthenticatedAccessNotSupported: Self = Self(68);
     pub const AntiCloggingTokenRequired: Self = Self(76);
     pub const SaeHashToElement: Self = Self(126);
@@ -268,6 +270,8 @@ mod tests {
         assert_eq!(BssType::Personal.into_primitive(), 4);
         assert_eq!(WlanPhyType::He.into_primitive(), 12);
         assert_eq!(CipherSuiteType::Ccmp128.into_primitive(), 4);
+        assert_eq!(StatusCode::RefusedCapabilitiesMismatch.into_primitive(), 10);
+        assert_eq!(StatusCode::RefusedTemporarily.into_primitive(), 30);
         assert_eq!(KeyType::Peer.into_primitive(), 4);
         assert_eq!(MAX_KEY_LEN, 32);
         assert_eq!(MAX_UNIQUE_CHANNEL_NUMBERS, 256);
