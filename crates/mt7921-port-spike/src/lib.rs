@@ -4351,6 +4351,238 @@ impl ReadOnlyStatus {
     }
 }
 
+pub const MT7921_MGMT_TXWI_BYTES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921MgmtTx {
+    pub txwi: [u8; MT7921_MGMT_TXWI_BYTES],
+    pub descriptor: DmaDescriptor,
+    pub token: u16,
+    pub pid: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921MgmtTxError {
+    InvalidFrame,
+    InvalidIova,
+    InvalidToken,
+    InvalidPid,
+    Descriptor(DescriptorError),
+}
+
+/// Encode the pinned Connac2 PCI TXWI + hardware TXP used by
+/// `mt7921e_tx_prepare_skb` for one 5-GHz authentication frame. The raw frame
+/// remains in a separate DMA mapping referenced by TXP; the WFDMA descriptor
+/// publishes only the 64-byte TXWI/TXP buffer on band-0 ring 0.
+pub fn encode_mt7921_5ghz_auth_tx(
+    frame: &[u8],
+    txwi_iova: u64,
+    frame_iova: u64,
+    token: u16,
+    pid: u8,
+) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
+    if frame.len() <= 14 || frame.len() > u16::MAX as usize || frame.len() < 24 {
+        return Err(Mt7921MgmtTxError::InvalidFrame);
+    }
+    let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
+    if frame_control & 0x000c != 0 || frame_control >> 4 & 0x0f != 0x0b {
+        return Err(Mt7921MgmtTxError::InvalidFrame);
+    }
+    if txwi_iova > u64::from(u32::MAX) || frame_iova > u64::from(u32::MAX) {
+        return Err(Mt7921MgmtTxError::InvalidIova);
+    }
+    if token >= 8192 {
+        return Err(Mt7921MgmtTxError::InvalidToken);
+    }
+    if pid < 3 {
+        return Err(Mt7921MgmtTxError::InvalidPid);
+    }
+
+    let mut txwi = [0u8; MT7921_MGMT_TXWI_BYTES];
+    let mut word = |index: usize, value: u32| {
+        txwi[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes())
+    };
+    // mt76_connac2_mac_write_txwi: CT packet, alternate TX queue, WCID/OMAC 0.
+    word(0, (0x10 << 25) | ((frame.len() as u32 + 32) & 0xffff));
+    // Long format, 802.11 header, 24-byte management header / 2.
+    word(1, (1 << 31) | (2 << 16) | (12 << 11));
+    // Authentication subtype, fixed legacy rate, and HTC-valid as in Linux.
+    word(2, (1 << 31) | (1 << 13) | 0x0b);
+    // 15 remaining attempts and BA disabled for fixed-rate management TX.
+    word(3, (1 << 28) | (15 << 11));
+    word(4, 0);
+    word(5, (1 << 10) | u32::from(pid));
+    // 5-GHz lowest basic rate: OFDM 6 Mbps (mode 1, hardware index 11).
+    word(6, ((0x40u32 | 11) << 16) | (1 << 2));
+    word(7, 0x0b << 16);
+    drop(word);
+
+    txwi[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
+    txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    let descriptor = DmaDescriptor::tx(
+        DmaSegment {
+            iova: txwi_iova,
+            len: MT7921_MGMT_TXWI_BYTES as u16,
+        },
+        None,
+        0,
+    )
+    .map_err(Mt7921MgmtTxError::Descriptor)?;
+    Ok(Mt7921MgmtTx {
+        txwi,
+        descriptor,
+        token,
+        pid,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mt7921TxFree {
+    pub token: u16,
+    pub dropped: bool,
+    pub attempts: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mt7921TxStatus {
+    pub wcid: u16,
+    pub pid: u8,
+    pub acked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921TxCompletionError {
+    Truncated,
+    WrongPacketType,
+    MultipleOrPaired,
+    InvalidFormat,
+}
+
+pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxCompletionError> {
+    let header = u32::from_le_bytes(
+        bytes
+            .get(0..4)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if header >> 27 & 0x1f != 1 {
+        return Err(Mt7921TxCompletionError::WrongPacketType);
+    }
+    if header >> 16 & 0x03ff != 1 {
+        return Err(Mt7921TxCompletionError::MultipleOrPaired);
+    }
+    let info = u32::from_le_bytes(
+        bytes
+            .get(8..12)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if info & (1 << 31) != 0 {
+        return Err(Mt7921TxCompletionError::MultipleOrPaired);
+    }
+    Ok(Mt7921TxFree {
+        token: ((info >> 16) & 0x7fff) as u16,
+        dropped: (info >> 13) & 0x3 != 0,
+        attempts: (info & 0x1fff) as u16,
+    })
+}
+
+pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCompletionError> {
+    let header = u32::from_le_bytes(
+        bytes
+            .get(0..4)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if header >> 27 & 0x1f != 0 {
+        return Err(Mt7921TxCompletionError::WrongPacketType);
+    }
+    let txs = bytes.get(8..40).ok_or(Mt7921TxCompletionError::Truncated)?;
+    let dword = |index: usize| {
+        u32::from_le_bytes(
+            txs[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("fixed field"),
+        )
+    };
+    if dword(0) >> 23 & 0x3 > 1 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    Ok(Mt7921TxStatus {
+        wcid: ((dword(2) >> 16) & 0x03ff) as u16,
+        pid: (dword(3) >> 24) as u8,
+        acked: dword(0) & (0x7 << 16) == 0,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921AuthRx {
+    pub receiver: [u8; 6],
+    pub transmitter: [u8; 6],
+    pub bssid: [u8; 6],
+    pub algorithm: u16,
+    pub sequence: u16,
+    pub status: u16,
+    pub fields: Vec<u8>,
+}
+
+/// Strip the pinned Connac2 normal-RX metadata and parse one raw 802.11
+/// authentication frame. Crypto and SAE interpretation remain Fuchsia-owned.
+pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError> {
+    let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
+    let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
+    let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
+    let packet_type = rxd0 >> 27 & 0x1f;
+    let packet_flag = rxd0 >> 16 & 0x0f;
+    if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
+        return Err(PassiveRxError::WrongPacketType);
+    }
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
+    {
+        return Err(PassiveRxError::RxError);
+    }
+    if rxd2 & (1 << 13) != 0 {
+        return Err(PassiveRxError::HeaderTranslated);
+    }
+    let mut offset = 24usize;
+    if rxd1 & (1 << 14) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 11) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 12) != 0 {
+        offset += 8;
+    }
+    if rxd1 & (1 << 13) == 0 {
+        return Err(PassiveRxError::MissingRxVector);
+    }
+    offset += 8;
+    if rxd1 & (1 << 15) != 0 {
+        offset += 72;
+    }
+    offset += 2 * ((rxd2 >> 14) & 0x3) as usize;
+    let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
+    if frame.len() < 30 || u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc != 0x00b0 {
+        return Err(PassiveRxError::UnsupportedFrame);
+    }
+    Ok(Mt7921AuthRx {
+        receiver: frame[4..10].try_into().expect("fixed field"),
+        transmitter: frame[10..16].try_into().expect("fixed field"),
+        bssid: frame[16..22].try_into().expect("fixed field"),
+        algorithm: u16::from_le_bytes([frame[24], frame[25]]),
+        sequence: u16::from_le_bytes([frame[26], frame[27]]),
+        status: u16::from_le_bytes([frame[28], frame[29]]),
+        fields: frame[30..].to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -4358,6 +4590,83 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn source_exact_connac2_sae_auth_txwi_and_txp() {
+        let mut frame = vec![0u8; 30];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        let tx = encode_mt7921_5ghz_auth_tx(&frame, 0x0102_0000, 0x0102_1000, 7, 3).unwrap();
+        let word = |index: usize| {
+            u32::from_le_bytes(tx.txwi[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!(word(0), (0x10 << 25) | 62);
+        assert_eq!(word(1), (1 << 31) | (2 << 16) | (12 << 11));
+        assert_eq!(word(2), (1 << 31) | (1 << 13) | 0x0b);
+        assert_eq!(word(3), (1 << 28) | (15 << 11));
+        assert_eq!(word(5), (1 << 10) | 3);
+        assert_eq!(word(6), (75 << 16) | 4);
+        assert_eq!(word(7), 0x0b << 16);
+        assert_eq!(&tx.txwi[32..34], &(0x8007u16).to_le_bytes());
+        assert_eq!(&tx.txwi[40..44], &0x0102_1000u32.to_le_bytes());
+        assert_eq!(&tx.txwi[44..46], &0x801eu16.to_le_bytes());
+        assert_eq!(
+            tx.descriptor,
+            DmaDescriptor {
+                buf0: 0x0102_0000,
+                ctrl: (64 << 16) | (1 << 30),
+                buf1: 0,
+                info: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn management_tx_encoder_rejects_non_auth_and_unrepresentable_identity() {
+        let mut frame = vec![0u8; 30];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 8192, 3),
+            Err(Mt7921MgmtTxError::InvalidToken)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 2),
+            Err(Mt7921MgmtTxError::InvalidPid)
+        );
+    }
+
+    #[test]
+    fn parses_correlated_tx_free_and_txs_completion() {
+        let mut free = [0u8; 12];
+        free[0..4].copy_from_slice(&((1u32 << 27) | (1 << 16)).to_le_bytes());
+        free[8..12].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_free(&free),
+            Ok(Mt7921TxFree {
+                token: 7,
+                dropped: false,
+                attempts: 1
+            })
+        );
+
+        let mut txs = [0u8; 40];
+        txs[16..20].copy_from_slice(&0u32.to_le_bytes());
+        txs[20..24].copy_from_slice(&(3u32 << 24).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&txs),
+            Ok(Mt7921TxStatus {
+                wcid: 0,
+                pid: 3,
+                acked: true
+            })
+        );
+        txs[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        assert_eq!(parse_mt7921_tx_status(&txs).unwrap().acked, false);
+    }
 
     #[test]
     fn ports_fuchsia_beacon_conversion_fixture() {
@@ -6404,6 +6713,36 @@ mod tests {
         assert_eq!(
             parse_passive_advertisement(&rx),
             Err(PassiveRxError::UnsupportedFrame)
+        );
+    }
+
+    #[test]
+    fn strips_connac2_rx_metadata_without_interpreting_sae_fields() {
+        let mut rx = vec![0; 24 + 8 + 30 + 4];
+        let rxd0 = (2u32 << 27) | rx.len() as u32;
+        rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        let frame = &mut rx[32..];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        frame[4..10].copy_from_slice(&[2; 6]);
+        frame[10..16].copy_from_slice(&[6; 6]);
+        frame[16..22].copy_from_slice(&[6; 6]);
+        frame[24..26].copy_from_slice(&3u16.to_le_bytes());
+        frame[26..28].copy_from_slice(&1u16.to_le_bytes());
+        frame[28..30].copy_from_slice(&0u16.to_le_bytes());
+        frame[30..34].copy_from_slice(&[9, 8, 7, 6]);
+        assert_eq!(
+            parse_mt7921_auth_rx(&rx),
+            Ok(Mt7921AuthRx {
+                receiver: [2; 6],
+                transmitter: [6; 6],
+                bssid: [6; 6],
+                algorithm: 3,
+                sequence: 1,
+                status: 0,
+                fields: vec![9, 8, 7, 6],
+            })
         );
     }
 

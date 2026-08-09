@@ -5,8 +5,10 @@
 //! Host-portable extraction of pinned Fuchsia SoftMAC client MLME boundaries.
 
 mod open_client;
+mod sae;
 
 pub use open_client::*;
+pub use sae::*;
 
 #[path = "../../mlme/rust/src/client/convert_beacon.rs"]
 mod pinned_convert_beacon;

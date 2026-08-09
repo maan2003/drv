@@ -35,6 +35,13 @@ The deterministic fake closure covers successful open association, wrong-BSSID
 and invalid-auth input, AP rejection, capability mismatch, authentication and
 association timeout, management transport failure, and device-programming
 failure. It has no physical adapter and therefore cannot transmit.
+
+`SaeHandshake` now packages the pinned Fuchsia SME-managed `wlan-rsn`
+supplicant for a management-auth-only WPA3 stage. It emits only pinned
+`SaeFrame`, timeout, and authentication-status updates; association, EAPOL,
+keys, and data are intentionally discarded at this boundary. The wrapper has
+no `Debug` implementation so its secret-bearing state cannot enter reports.
+`build_sae_auth_frame` retains the exact pinned MLME management-frame layout.
 Focused fixtures derived from the upstream MLME scanner run against the fake:
 
 ```sh
@@ -56,7 +63,7 @@ can expand this milestone's channel set.
 | Beacon/probe IE and channel conversion | MLME `client/convert_beacon.rs`, `wlan-common` | The exact pinned `construct_bss_description` is re-exported directly and its upstream fixtures run on host |
 | MLME client open authentication/association and connect timer | MLME `client/{state,station,bound}.rs`, `auth.rs`, `device.rs` | Open-network closure packaged here over raw RX/TX bytes and typed device programming; protected networks and associated-state maintenance remain gated |
 | SME connect/scan policy | `wlan-sme` | Already packaged and host-tested; endpoint serving is the only excluded transport edge |
-| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Already packaged unchanged with pinned crypto and host tests |
+| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE auth updates are now wrapped here; association/EAPOL/key progression remains gated |
 | Frame/IE parsing and serialization | `wlan-common`, `ieee80211`, `wlan-frame-writer` | Already packaged and tested; hardware supplies RX bytes/metadata only |
 | Rate control and diagnostics | MLME `minstrel.rs`, FIDL Minstrel/stats values, Inspect facades | Values/diagnostic facades are packaged; the MLME algorithm remains in the future client-closure package |
 
@@ -65,16 +72,16 @@ calibration, reset containment, and conversion of device RX metadata into the
 pinned SoftMAC value types. Authentication/association are reachable only through
 the offline fake in this milestone; no MT7921 management-TX adapter exists.
 
-## Physical association gate inventory
+## Physical authentication gate inventory
 
-No controlled AP is currently available, so physical management transmit remains
-blocked. The repository contains no hostapd configuration or controlled-AP
-harness. Inventory on `no-plastic` found only the MT7921-backed `wlan0`, a down
-Ethernet interface, no second USB WLAN adapter, and no active hostapd service.
-Nearby BSS observations from passive gates are not evidence of authorization and
-must not be used as association targets. A later physical run requires a separately
-identified controlled open AP, fixed channel/regulatory authorization, the existing
-watchdog containment, and an MT7921 adapter that preserves this trait boundary.
+Healthy preflight identified the authorized existing network as WPA3-Personal
+only: CCMP group/pairwise, SAE AKM, and management-frame protection required.
+It is not WPA2 transition mode. Consequently open-system authentication is not
+valid for this target; the physical gate must use SAE authentication frames.
+Credential material may enter only through a root-only ephemeral handoff and
+must never be printed, persisted in reports, committed, or retained after reset.
+The first physical stage stops after SAE authentication and before association,
+EAPOL, key installation, or data.
 
 ## Source and license
 

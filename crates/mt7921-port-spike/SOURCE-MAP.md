@@ -68,6 +68,9 @@ explicitly marked; the initial majority is `unmapped`.
 | PCI interrupt disable (`pci_intx(pdev, 0)`) | Linux PCI core call site | `disable_pci_intx` | adapted, tested | command-bit readback; physical run |
 | kernel DMA allocation/mapping | mt76 DMA/core | `DmaArena` | adapted | iommufd pin/unmap tests; incomplete call graph |
 | IRQ lifecycle/eventfd | mt76 PCI/IRQ paths | `IrqLifecycle`, `VfioIrq` | adapted, tested | state/UAPI tests; physical source-masked MSI RX0 trace |
+| Connac2 PCI management TXWI/TXP and DMA publish shape | `mt7921/pci_mac.c::mt7921e_tx_prepare_skb`, `mt76_connac_mac.c::{mt76_connac2_mac_write_txwi,mt76_connac_write_hw_txp}`, `dma.c` | `encode_mt7921_5ghz_auth_tx` | exact format subset, tested; physical pending | Golden word-level SAE-auth fixture, invalid frame/IOVA/token/PID rejection |
+| Management TX completion | `mt7921/mac.c::{mt7921_mac_tx_free,mt7921_mac_add_txs}`, `mt76_connac2_mac.h` | `parse_mt7921_{tx_free,tx_status}` | exact one-MSDU subset, tested; physical pending | Token/PID/WCID/ACK fixtures; paired/batched frees fail closed |
+| Connac2 authentication RX metadata strip | `mt7921/mac.c::mt7921_mac_fill_rx`, `mt76_connac2_mac.h` | `parse_mt7921_auth_rx` | adapted, tested; SAE interpretation excluded | Raw SAE fields delivered unchanged after RX error/header-format validation |
 
 This table is not yet exhaustive. The next inventory pass must list every
 function, struct/union/enum, macro/constant, and global in every scoped file,

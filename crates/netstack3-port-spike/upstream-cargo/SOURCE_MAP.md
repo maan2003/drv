@@ -42,6 +42,78 @@ files are byte-for-byte upstream.
 | DHCP configuration policy | `src/connectivity/policy/netcfg/src/dhcpv4.rs` | Adapted in cargo/port-integration/src/service.rs at the effect boundary only: address, route and DNS ownership are applied through native Netstack3 APIs instead of interfaces-admin/routes-admin/LookupAdmin FIDL | Fuchsia BSD-2-Clause |
 | DNS source policy | `src/connectivity/policy/netcfg/src/dns.rs` | Adapted by the DHCP effect and NativeDnsBridge configuration boundary; FIDL watcher plumbing is excluded | Fuchsia BSD-2-Clause |
 
+## Outer WLAN service inventory
+
+This is the pinned source inventory for an eventual host service with iwd-like
+responsibility. It is discovery, not part of the current Cargo closure. The
+canonical fetch already archives all of `src/connectivity/wlan`; the additional
+SDK FIDL directories named below must be requested from the same revision when
+their bindings are packaged. No second Fuchsia pin is needed.
+
+| Responsibility | Pinned production source | Port boundary |
+|---|---|---|
+| Client policy service, connect lifecycle, scan distribution, roaming and reconnect | `src/connectivity/wlan/wlancfg/src/client/{mod.rs,state_machine.rs,types.rs,scan/**,connection_selection/**,roaming/**}` | The selection/scoring and state-transition policy is host-reusable. Generated policy/SME values, monotonic timers, Inspect calls, scan-result VMO decoding, and SME endpoint proxies need existing host value facades or narrow adapters. |
+| Saved network model and history | `src/connectivity/wlan/wlancfg/src/config_management/{config_manager.rs,network_config.rs,stash_conversion.rs}` | The credential validation, compatibility, hidden-network probability, failure history, and `SavedNetworksManagerApi` contract are reusable. `PolicyStorage` and periodic metrics are effects, not policy. |
+| Persistent saved-network backend | `src/connectivity/wlan/lib/storage/src/{policy.rs,storage_store.rs,stash_store.rs,constants.rs}` | `wlan-storage` owns JSON/storage conversion and migration, but its production backends use component namespace `/data` and `fuchsia.stash.SecureStore`; substitute a project-owned durable store behind the saved-network contract on host. |
+| Interface/PHY ownership and recovery | `src/connectivity/wlan/wlancfg/src/mode_management/{iface_manager.rs,iface_manager_api.rs,iface_manager_types.rs,phy_manager.rs,device_monitor.rs,recovery.rs}` | Orchestration and recovery policy are reusable only after separating `DeviceMonitorProxy`, FIDL endpoint creation, Zircon statuses, and Inspect. Hardware discovery, interface creation/destruction, SME lookup, PHY reset, and country setting belong to the platform adapter. |
+| Regulatory coordination | `src/connectivity/wlan/wlancfg/src/regulatory_manager.rs` and `mode_management/{iface_manager.rs,phy_manager.rs}` | The stop/set-country/recreate/reconnect ordering is policy. `fuchsia.location.namedplace/RegulatoryRegionWatcher` and `DeviceMonitor.{SetCountry,ClearCountry}` are Fuchsia transports; the host must supply an authoritative regulatory source and driver operation and must retain the fail-closed channel authorization described by `fuchsia-softmac-port`. |
+| Metrics and diagnostics | `src/connectivity/wlan/wlancfg/src/telemetry/**` and `src/connectivity/wlan/lib/telemetry/src/**` | Windowed connection, scan, recovery, timeout, disconnect, power and interface counters are reusable logic. Cobalt-generated metric registries, `fuchsia.metrics`, Inspect publication/VMOs, tracing, battery service, and device-counter FIDL are replaceable sinks/sources. Metrics failure is non-fatal in pinned `main.rs`. |
+| AP and compatibility surfaces | `src/connectivity/wlan/wlancfg/src/access_point/**` and `src/connectivity/wlan/wlancfg/src/legacy/**` | `ApSme` start/stop/status and deprecated product protocols are outside the smallest client closure; add them only after the client service is complete. |
+| Process/service composition | `src/connectivity/wlan/wlancfg/src/{main.rs,lib.rs}`, `meta/wlancfg.cml` | `ServiceFs`, component capability routing/config, FIDL serving, Inspect publication and trace-provider setup are Fuchsia-only. A host daemon should preserve policy semantics behind a project-owned control API rather than emulate Component Framework or Zircon channels. |
+
+The direct crate/source closure is `wlancfg_lib`, `wlan-storage`,
+`wlan-telemetry`, `wlan-common`, `ieee80211`, and the already packaged
+`wlan-sme`, `wlan-rsn`, `wlan-fcg-crypto`, `eapol`, frame/bitfield/state-machine
+libraries and WLAN FIDL value crates. `wlancfg_lib` additionally uses
+`async-utils`, Fuchsia async/sync/time, Inspect/contrib, FIDL/component runtime,
+Cobalt client, and ordinary Rust crates (`anyhow`, `async-trait`, `futures`,
+`itertools`, `log`, `num-traits`, `rand`, and `thiserror`). Those runtime and
+diagnostic dependencies do not gain authority in the host design.
+
+### Service and SME/MLME boundary
+
+The exact transport schemas used by the outer service are
+`sdk/fidl/fuchsia.wlan.{policy,device.service,sme,common,ieee80211,internal,stats}`,
+`sdk/fidl/fuchsia.location.{namedplace,sensor}`, `sdk/fidl/fuchsia.metrics`,
+`sdk/fidl/fuchsia.stash`, and the two
+`sdk/fidl/fuchsia.wlan.product.deprecated*` libraries. Only the WLAN
+common/IEEE/internal/SME/stats value subsets are in the host overlay today;
+policy and device-service values plus all protocol endpoints remain absent.
+
+`wlancfg` has no direct MLME channel. It obtains `ClientSme` and `ApSme`
+endpoints through `DeviceMonitor` (`WatchDevices`, `QueryIface`,
+`CreateIface`, `DestroyIface`, `GetClientSme`, and `GetApSme`) and invokes:
+
+* client `Scan`, `Connect`, `Disconnect`, `Roam`, and `Status`, consuming
+  connect-transaction events for connect/roam results, disconnects, signal
+  reports, and channel switches;
+* AP `Start`, `Stop`, and `Status`; and
+* device/PHY query, reset, country set/clear, and counter-stat operations.
+
+Below that endpoint, the pinned `wlan-sme` crate already converts SME commands
+and events to its `MlmeRequest`/`MlmeEvent` state-machine boundary. Therefore a
+host port should adapt `wlancfg` to an in-process SME command/event interface;
+it should not recreate FIDL channels or bypass SME by duplicating MLME policy.
+
+### Smallest staged closure
+
+1. Package and test the decision core: `client/types.rs`,
+   `config_management/{network_config.rs,config_manager.rs}`, and
+   `client/connection_selection/**`, initially with fake scan, saved-network,
+   telemetry and Inspect dependencies. Add only the missing policy value shapes
+   from the pinned schema.
+2. Add one client interface: `client/{scan/**,state_machine.rs}` and the narrow
+   client portions of `iface_manager_api.rs`, backed directly by the packaged
+   `wlan-sme` station/MLME request-event boundary. Prove scan, open connect,
+   protected connect, disconnect and reconnect before porting PHY hotplug.
+3. Replace fakes with durable saved-network storage, a regulatory source/driver
+   adapter, metrics/diagnostic sinks, and the project-owned service transport.
+   Keep each effect outside the policy core and preserve metrics-unavailable
+   operation.
+4. Add multi-PHY lifecycle/recovery, roaming refinements and AP support as
+   separate closures. Do not carry legacy product protocols unless an actual
+   compatibility consumer requires them.
+
 ## Replacement rule
 
 The upstream DHCP state machine/protocol and Trust-DNS resolver are the sole
