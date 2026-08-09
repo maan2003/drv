@@ -391,6 +391,16 @@ emitted `sequential_gate_passed`; cleanup and restoration returned success,
 and watchdog boot `3ea2362d-a0f7-4ac0-9313-8a0a6fbf8581` returned with native
 Wi-Fi and its default route healthy. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T164050Z-0000_05_00.0.log`.
+
+The high-DFS group completed the remaining world/indoor channels 100, 104,
+108, 112, 116, 120, 124, 128, 132, 136, 140, and 144. Release SHA-256
+`681576803a43c7d9d9a30c4c6cc0cde190bb6ded70565394772089ce36bc137b`
+received matching successful completion on all 12 channels and correctly
+returned an empty BSS set. Cleanup and restoration returned success; watchdog
+boot `febfd4af-29ef-4f72-8304-8ab6cfb73671` restored native Wi-Fi and its
+default route. This completes bounded physical coverage of all 39 channels in
+the mask-zero world/indoor `NO_IR` domain. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T164539Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
