@@ -26,6 +26,24 @@ reusing the bounded VFIO firmware-loader backend; keeping that authority out of
 the adapter preserves this crate's testable policy/mechanics boundary. Neither
 crate uses mac80211, cfg80211, or the temporary `iw` scan binary.
 
+`client_device::Mt7921ClientDevice` is the one-way mechanical `DeviceOps`
+adapter for the pinned production `ClientMlme`. It forwards immutable
+query/support values and only set-channel, join, exact WLAN frame bytes/flags,
+key installation, association notification/clear, controlled-port link, MLME
+event, and frame/RX-status queue effects. Injected effects return already-mapped
+Zircon statuses; the adapter neither retries nor reinterprets them. Every other
+host-retained `DeviceOps` method returns `ZX_ERR_NOT_SUPPORTED` rather than fake
+success. Frames and key-bearing values are never included in adapter Debug or
+error output; tests use only a documented synthetic key pattern.
+
+The only public constructor requires `LiveBeaconPowerAuthorization`. Acquiring
+that capability is explicitly **UNIMPLEMENTED** and returns
+`ZX_ERR_NOT_SUPPORTED`: a later gate must bind a live beacon-derived channel
+authorization to completed MT7921 rate/SAR power authorization. The offline
+fake constructor exists only under this crate's unit-test configuration, so the
+current adapter cannot enable physical TX, VFIO, MMIO, DMA doorbells, or any
+other transport.
+
 ## Physical transport contract
 
 Any physical transport must supply these exact MT7921 mechanics before this
