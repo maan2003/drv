@@ -241,9 +241,7 @@ fn run() -> Result<(), String> {
         Some("--install-disable-vfio-irq") => Operation::InstallDisableVfioIrq,
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
-        Some("--run-one-shot-fwdl") => {
-            return Err("active firmware DMA remains disabled; the reviewed offline loader has no physical transport".into());
-        }
+        Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;

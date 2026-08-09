@@ -140,24 +140,29 @@ chunks of at most 4096 bytes, finishes the patch, downloads only RAM regions,
 starts the exact installed image, and bounds the N9-ready poll. Cleanup runs
 after success and every injected failure, preserving both primary and cleanup
 errors when necessary. Golden-trace and per-operation error-injection tests
-cover the transaction; no physical backend implements this transport, and
-`--run-one-shot-fwdl` remains rejected.
+cover the transaction. `VfioFirmwareLoader` is the bounded physical adapter: it
+uses the fully owned command/FWDL/RX rings, matched MCU responses, modular DIDX
+completion, cancellation, IRQ disable, DMA quiescence, and reset-while-pinned
+teardown before any mapping is released. `--run-one-shot-fwdl` is the explicit
+lab-only entry and must run through `wifi-driver-lab-remote`'s reboot watchdog.
 Like pinned Linux, a one-second download-ready timeout is recorded as a warning
 and loading continues; N9 readiness remains a terminal 1.5-second timeout. The
 offline safety model is stricter than Linux scatter submission: it requires an
 explicit completion for every chunk under a three-second deadline. Transport
 sequence allocation persists across transactions and skips zero on four-bit
 wrap. Fail-closed cleanup after `Ready` is lab transaction policy; Linux keeps
-the live device resources instead.
+the live device resources instead. The operation stops immediately after clean
+N9 readiness; it sends no capability or post-boot configuration command.
 
-`--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
+The earlier `--run-one-shot-fwdl` rejection identified that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
 and that raw patch scatter is invalid until the MCU has accepted patch
 semaphore and `PATCH_START` commands. Active DMA therefore remains unavailable
 until the backend owns or guards every TX ring, resets and verifies every DMA
 index, installs a VFIO IRQ before unmasking it, implements the MCU command/RX
 response path, and keeps every mapping pinned through quiescence and function
-reset. The rejected command cannot map DMA or write MMIO.
+reset. The bounded VFIO adapter now satisfies those gates for this explicit
+operation; other commands cannot enter its active DMA path.
 
 `prepare_global_tx_rings` is the deterministic replacement preflight. While TX
 DMA and all host interrupts remain disabled, it inventories all 18 hardware TX
@@ -254,11 +259,11 @@ mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
 function reset is issued while every IOVA remains pinned regardless of the poll
 result. Mappings are released only after reset succeeds. A reset failure never
 calls unmap, so the external reboot watchdog remains the containment boundary.
-The native backend now has an unexposed active-operation signal guard for
+The native backend has an active-operation signal guard for
 SIGHUP, SIGINT, and SIGTERM which performs only an atomic cancellation request
 in the handler and restores previous handlers on drop. The future physical
-control loop must check that request and enter `teardown_pinned_dma`; until it
-does, active DMA remains rejected.
+control loop checks that request throughout command, scatter, and readiness
+waits and enters the same reset-while-pinned containment path.
 
 ## Verified against pinned Linux 7.2-rc5 source
 
