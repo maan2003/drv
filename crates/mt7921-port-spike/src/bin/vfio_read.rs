@@ -1918,7 +1918,10 @@ fn run() -> Result<(), String> {
             ));
         }
         println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
-        if let Err(error) = verify_pci_dma_disabled(&bdf).and_then(|()| set_lab_safety("SAFE")) {
+        if let Err(error) = verify_pci_dma_disabled(&bdf)
+            .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
+            .and_then(|()| set_lab_safety("SAFE"))
+        {
             retain_mappings_for_watchdog(&format!(
                 "post-reset containment verification failed: active={active:?} cleanup={cleanup_errors:?} error={error}"
             ));
@@ -2107,6 +2110,21 @@ fn verify_pci_dma_disabled(bdf: &str) -> Result<(), String> {
     }
     if power_state != Some(0) {
         return Err(format!("PCI device is not in D0: {power_state:?}"));
+    }
+    Ok(())
+}
+
+fn verify_active_reset_containment(wfdma: &ReadPage, pcie_mac: &ReadPage) -> Result<(), String> {
+    let global = wfdma.read(0xd4208)?;
+    let host_irq = wfdma.read(0xd4204)?;
+    let mac_irq = pcie_mac.read(0x10188)?;
+    if global == u32::MAX || host_irq == u32::MAX || mac_irq == u32::MAX {
+        return Err("post-reset containment readback returned all ones".into());
+    }
+    if global & 0xf != 0 || host_irq != 0 || mac_irq != 0 {
+        return Err(format!(
+            "post-reset containment unsafe global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x}"
+        ));
     }
     Ok(())
 }
@@ -5660,6 +5678,43 @@ mod tests {
     }
 
     #[test]
+    fn every_normal_phase_requires_its_exact_predecessor() {
+        let mut ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        for (from, to) in [
+            (RunPhase::Acquiring, RunPhase::MappedDmaDisabled),
+            (RunPhase::MappedDmaDisabled, RunPhase::AcquiringHostControl),
+            (RunPhase::AcquiringHostControl, RunPhase::HostDriverOwned),
+            (
+                RunPhase::HostDriverOwned,
+                RunPhase::WfsysResetAndSelectorRestored,
+            ),
+            (
+                RunPhase::WfsysResetAndSelectorRestored,
+                RunPhase::RingsPreparedIrqSourceDisabled,
+            ),
+            (
+                RunPhase::RingsPreparedIrqSourceDisabled,
+                RunPhase::DmaAndResponseIrqEnabled,
+            ),
+            (RunPhase::DmaAndResponseIrqEnabled, RunPhase::FirmwareReady),
+            (RunPhase::FirmwareReady, RunPhase::PassivePreparing),
+            (RunPhase::PassivePreparing, RunPhase::PassiveReady),
+            (RunPhase::PassiveReady, RunPhase::Scanning),
+            (RunPhase::Scanning, RunPhase::PassiveReady),
+            (RunPhase::PassiveReady, RunPhase::BeaconAuthorized),
+            (RunPhase::BeaconAuthorized, RunPhase::PowerConfiguredNoFrame),
+        ] {
+            assert_eq!(ledger.phase, from);
+            ledger.transition(from, to).unwrap();
+        }
+        assert!(
+            ledger
+                .transition(RunPhase::PassiveReady, RunPhase::Scanning)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn parked_capsule_helper() {
         let Ok(path) = std::env::var("DRV_TEST_PARK_DROP_PATH") else {
             return;
@@ -5697,6 +5752,22 @@ mod tests {
             child.wait().unwrap();
             assert!(!marker.exists(), "killed process ran Rust destructors");
         }
+    }
+
+    #[test]
+    fn proven_safe_capsule_uses_ordered_raii_without_parking() {
+        let marker = std::env::temp_dir().join(format!("mt7921-safe-drop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let device = Arc::new(File::open("/dev/null").unwrap());
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        let mut ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        ledger.mark_possibly_active(Hazard::HostControl);
+        ledger.confirm_inactive(Hazard::HostControl);
+        let mut capsule = ActiveVfioCapsule::new(device, iommu, Some(ledger));
+        capsule.drop_probe = Some(CapsuleDropProbe(marker.clone()));
+        drop(capsule);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"dropped");
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[test]
