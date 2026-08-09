@@ -202,7 +202,9 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-    fn close(fd: i32) -> i32;
+    #[link_name = "write"]
+    fn write_fd(fd: i32, buffer: *const u8, count: usize) -> isize;
+    fn pause() -> i32;
     fn signal(number: i32, handler: usize) -> usize;
 }
 
@@ -1909,6 +1911,20 @@ fn retain_mappings_for_watchdog(message: &str) -> ! {
     eprintln!("mt7921-vfio-read: {message}; retaining device and every IOVA for watchdog reboot");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+fn park_retention_capsule<T>(capsule: T) -> ! {
+    const MESSAGE: &[u8] =
+        b"mt7921-vfio-read: hardware SAFE is unproven; resources pinned for reboot watchdog\n";
+    unsafe {
+        write_fd(2, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    loop {
+        std::hint::black_box(&capsule);
+        unsafe {
+            pause();
+        }
     }
 }
 
@@ -3625,6 +3641,7 @@ impl VfioIrq {
                 std::io::Error::last_os_error()
             ));
         }
+        let event_fd = unsafe { OwnedFd::from_raw_fd(event_fd_raw) };
         let mut set = IrqSetEventfd {
             header: IrqSetHeader {
                 argsz: size::<IrqSetEventfd>(),
@@ -3633,18 +3650,14 @@ impl VfioIrq {
                 start: 0,
                 count: 1,
             },
-            eventfd: event_fd_raw,
+            eventfd: event_fd.as_raw_fd(),
         };
-        if let Err(error) = ioctl_mut(
+        ioctl_mut(
             device.as_raw_fd(),
             VFIO_DEVICE_SET_IRQS,
             &mut set,
             "install VFIO IRQ eventfd",
-        ) {
-            unsafe { close(event_fd_raw) };
-            return Err(error);
-        }
-        let event_fd = unsafe { OwnedFd::from_raw_fd(event_fd_raw) };
+        )?;
         Ok(Self {
             device: Arc::clone(device),
             event_fd,
@@ -4679,6 +4692,7 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn vfio_irq_payload_matches_linux_uapi_layout() {
@@ -5114,5 +5128,41 @@ mod tests {
             [RunPhase::Scanning, RunPhase::Faulted, RunPhase::Containing]
         );
         assert!(!trace.contains(&RunPhase::PassiveReady));
+    }
+
+    struct ParkDropProbe(PathBuf);
+
+    impl Drop for ParkDropProbe {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"dropped");
+        }
+    }
+
+    #[test]
+    fn parked_capsule_helper() {
+        let Ok(path) = std::env::var("DRV_TEST_PARK_DROP_PATH") else {
+            return;
+        };
+        park_retention_capsule(ParkDropProbe(path.into()));
+    }
+
+    #[test]
+    fn parked_capsule_never_runs_its_resource_destructor() {
+        let marker =
+            std::env::temp_dir().join(format!("mt7921-retention-drop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::parked_capsule_helper", "--nocapture"])
+            .env("DRV_TEST_PARK_DROP_PATH", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "park helper returned");
+        assert!(!marker.exists(), "parked resource destructor ran");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!marker.exists(), "killed process ran Rust destructors");
     }
 }
