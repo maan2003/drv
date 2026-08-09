@@ -50,7 +50,10 @@ use std::{
     os::fd::{AsRawFd, RawFd},
     process::{Command, Stdio},
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -317,16 +320,20 @@ fn run() -> Result<(), String> {
         verify_external_watchdog_armed()?;
     }
 
-    let device = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&vfio)
-        .map_err(|error| format!("open {vfio}: {error}"))?;
-    let iommu = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/iommu")
-        .map_err(|error| format!("open /dev/iommu: {error}"))?;
+    let device = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&vfio)
+            .map_err(|error| format!("open {vfio}: {error}"))?,
+    );
+    let iommu = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/iommu")
+            .map_err(|error| format!("open /dev/iommu: {error}"))?,
+    );
     let mut bind = Bind {
         argsz: size::<Bind>(),
         iommufd: iommu.as_raw_fd(),
@@ -349,7 +356,7 @@ fn run() -> Result<(), String> {
         "allocate IOAS",
     )?;
     let ioas = Ioas {
-        fd: &iommu,
+        fd: Arc::clone(&iommu),
         id: alloc.out_ioas_id,
     };
     let mut attach = Attach {
@@ -1690,8 +1697,8 @@ fn retain_mappings_for_watchdog(message: &str) -> ! {
 
 fn publish_mcu_command(
     wfdma: &ReadPage,
-    tx_ring: &mut DmaArena<'_>,
-    payload: &mut DmaArena<'_>,
+    tx_ring: &mut DmaArena,
+    payload: &mut DmaArena,
     command: DownloadCommand,
     sequence: u8,
     descriptor_index: usize,
@@ -1703,8 +1710,8 @@ fn publish_mcu_command(
 
 fn publish_mcu_bytes(
     wfdma: &ReadPage,
-    tx_ring: &mut DmaArena<'_>,
-    payload: &mut DmaArena<'_>,
+    tx_ring: &mut DmaArena,
+    payload: &mut DmaArena,
     bytes: &[u8],
     sequence: u8,
     descriptor_index: usize,
@@ -1741,9 +1748,9 @@ fn publish_mcu_bytes(
     Ok(())
 }
 
-struct ActiveMcuRx<'a, 'b> {
-    rx_ring: &'a mut DmaArena<'b>,
-    rx_buffers: &'a DmaArena<'b>,
+struct ActiveMcuRx<'a> {
+    rx_ring: &'a mut DmaArena,
+    rx_buffers: &'a DmaArena,
     rx_tail: usize,
     rx_head: usize,
     rx_ring_index: usize,
@@ -1751,27 +1758,27 @@ struct ActiveMcuRx<'a, 'b> {
     irq_bit: u32,
 }
 
-struct ActiveMcuIo<'a, 'b> {
+struct ActiveMcuIo<'a> {
     wfdma: &'a ReadPage,
     irq: &'a mut VfioIrq,
     signal: &'a ActiveSignalGuard,
-    tx_ring: &'a mut DmaArena<'b>,
-    payload: &'a mut DmaArena<'b>,
-    wm: ActiveMcuRx<'a, 'b>,
-    wm2: Option<ActiveMcuRx<'a, 'b>>,
+    tx_ring: &'a mut DmaArena,
+    payload: &'a mut DmaArena,
+    wm: ActiveMcuRx<'a>,
+    wm2: Option<ActiveMcuRx<'a>>,
     extra_irq_mask: u32,
     unsolicited: Vec<ReceivedMcuResponse>,
     normal_rx_frames: Vec<Vec<u8>>,
 }
 
-struct VfioFirmwareLoader<'a, 'b> {
-    mcu: ActiveMcuIo<'a, 'b>,
+struct VfioFirmwareLoader<'a> {
+    mcu: ActiveMcuIo<'a>,
     conn: &'a ReadPage,
     pcie_mac: &'a ReadPage,
     device: &'a File,
     bdf: &'a str,
-    fwdl_ring: &'a mut DmaArena<'b>,
-    fwdl_payload: &'a mut DmaArena<'b>,
+    fwdl_ring: &'a mut DmaArena,
+    fwdl_payload: &'a mut DmaArena,
     sequence: u8,
     command_index: usize,
     fwdl_index: usize,
@@ -1979,7 +1986,7 @@ fn response_wait_timed_out(now: Instant, deadline: Instant) -> bool {
 
 fn drain_rx_queue(
     wfdma: &ReadPage,
-    queue: &mut ActiveMcuRx<'_, '_>,
+    queue: &mut ActiveMcuRx<'_>,
     expected_sequence: Option<u8>,
     unsolicited: &mut Vec<ReceivedMcuResponse>,
     normal_rx_frames: &mut Vec<Vec<u8>>,
@@ -2081,7 +2088,7 @@ fn drain_rx_queue(
     Ok(matched)
 }
 
-impl ActiveMcuIo<'_, '_> {
+impl ActiveMcuIo<'_> {
     fn rx_irq_mask(&self) -> u32 {
         self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit) | self.extra_irq_mask
     }
@@ -2225,7 +2232,7 @@ impl ActiveMcuIo<'_, '_> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-impl VfioFirmwareLoader<'_, '_> {
+impl VfioFirmwareLoader<'_> {
     fn send_passive_command(
         &mut self,
         command: &PassiveMcuCommand,
@@ -2394,7 +2401,7 @@ impl VfioFirmwareLoader<'_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 struct VfioRateTxPower<'x, 'a, 'b> {
-    loader: &'x mut VfioFirmwareLoader<'a, 'b>,
+    loader: &'x mut VfioFirmwareLoader<'a>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -2410,7 +2417,7 @@ impl RateTxPowerTransport for VfioRateTxPower<'_, '_, '_> {
     }
 }
 
-impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
+impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
     type Error = String;
 
     fn next_sequence(&mut self) -> u8 {
@@ -2859,7 +2866,7 @@ impl PassiveMacExecutor<'_> {
 #[cfg(feature = "fuchsia-passive")]
 fn drain_data_rx_queue(
     wfdma: &ReadPage,
-    queue: &mut ActiveMcuRx<'_, '_>,
+    queue: &mut ActiveMcuRx<'_>,
 ) -> Result<Vec<mt7921_port_spike::PassiveAdvertisement>, String> {
     let mut advertisements = Vec::new();
     loop {
@@ -2901,8 +2908,8 @@ fn drain_data_rx_queue(
 
 #[cfg(feature = "fuchsia-passive")]
 struct VfioPassiveMechanics<'a, 'b, 'c> {
-    loader: &'a mut VfioFirmwareLoader<'b, 'c>,
-    data: ActiveMcuRx<'b, 'c>,
+    loader: &'a mut VfioFirmwareLoader<'b>,
+    data: ActiveMcuRx<'b>,
     mac_pages: &'b [ReadPage],
     scan_started: Option<Instant>,
     advertisements: Vec<mt7921_port_spike::PassiveAdvertisement>,
@@ -3086,24 +3093,24 @@ fn verify_no_usable_mt792x_acpi_sar() -> Result<(), String> {
     Ok(())
 }
 
-struct Ioas<'a> {
-    fd: &'a File,
+struct Ioas {
+    fd: Arc<File>,
     id: u32,
 }
 
-struct DmaArena<'a> {
-    iommu: &'a File,
+struct DmaArena {
+    iommu: Arc<File>,
     ioas: u32,
     ptr: NonNull<u8>,
     len: usize,
     iova: u64,
     mapped: bool,
 }
-impl<'a> DmaArena<'a> {
-    fn map(iommu: &'a File, ioas: u32, iova: u64) -> Result<Self, String> {
+impl DmaArena {
+    fn map(iommu: &Arc<File>, ioas: u32, iova: u64) -> Result<Self, String> {
         Self::map_len(iommu, ioas, iova, PAGE)
     }
-    fn map_len(iommu: &'a File, ioas: u32, iova: u64, len: usize) -> Result<Self, String> {
+    fn map_len(iommu: &Arc<File>, ioas: u32, iova: u64, len: usize) -> Result<Self, String> {
         if len == 0 || !len.is_multiple_of(PAGE) || !iova.is_multiple_of(PAGE as u64) {
             return Err("DMA arena length and IOVA must be page aligned".into());
         }
@@ -3150,7 +3157,7 @@ impl<'a> DmaArena<'a> {
             return Err("iommufd did not honor low-32-bit fixed IOVA".into());
         }
         Ok(Self {
-            iommu,
+            iommu: Arc::clone(iommu),
             ioas,
             ptr,
             len,
@@ -3289,11 +3296,11 @@ impl<'a> DmaArena<'a> {
     }
 }
 
-struct VfioDisabledFirmwareStage<'a, 'b> {
-    ring: &'a mut DmaArena<'b>,
-    payload: &'a mut DmaArena<'b>,
+struct VfioDisabledFirmwareStage<'a> {
+    ring: &'a mut DmaArena,
+    payload: &'a mut DmaArena,
 }
-impl DisabledFirmwareStageTransport for VfioDisabledFirmwareStage<'_, '_> {
+impl DisabledFirmwareStageTransport for VfioDisabledFirmwareStage<'_> {
     type Error = String;
     fn write_payload(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
         self.payload.write_bytes(bytes)
@@ -3316,12 +3323,12 @@ impl DisabledFirmwareStageTransport for VfioDisabledFirmwareStage<'_, '_> {
         self.payload.zero_bytes(length)
     }
 }
-impl Drop for DmaArena<'_> {
+impl Drop for DmaArena {
     fn drop(&mut self) {
         let _ = self.teardown();
     }
 }
-impl Drop for Ioas<'_> {
+impl Drop for Ioas {
     fn drop(&mut self) {
         let mut destroy = Destroy {
             size: size::<Destroy>(),
