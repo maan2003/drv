@@ -36,8 +36,8 @@ host-retained `DeviceOps` method returns `ZX_ERR_NOT_SUPPORTED` rather than fake
 success. Frames and key-bearing values are never included in adapter Debug or
 error output; tests use only a documented synthetic key pattern.
 
-The only public constructor requires `LiveBeaconPowerAuthorization`. Acquiring
-that capability is explicitly **UNIMPLEMENTED** and returns
+The internal live constructor requires `LiveBeaconPowerAuthorization`.
+Acquiring that capability is explicitly **UNIMPLEMENTED** and returns
 `ZX_ERR_NOT_SUPPORTED`: a later gate must bind a live beacon-derived channel
 authorization to completed MT7921 rate/SAR power authorization. The offline
 fake constructor exists only under this crate's unit-test configuration, so the

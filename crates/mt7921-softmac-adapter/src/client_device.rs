@@ -29,7 +29,7 @@ pub struct ClientSupport {
 ///
 /// This intentionally has no `Debug` implementation: an 802.11 frame can
 /// contain SAE, RSN, EAPOL, or other secret-adjacent material.
-pub struct ClientRxFrame {
+pub(crate) struct ClientRxFrame {
     pub bytes: Vec<u8>,
     pub status: fidl_softmac::WlanRxInfo,
 }
@@ -38,7 +38,7 @@ pub struct ClientRxFrame {
 ///
 /// Errors are already-mapped Zircon statuses. The adapter forwards them
 /// unchanged and never retries or interprets them.
-pub trait Mt7921ClientEffects {
+pub(crate) trait Mt7921ClientEffects {
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -120,22 +120,15 @@ impl<E> Mt7921ClientDevice<E> {
         Self::new(effects, support)
     }
 
-    pub fn effects(&self) -> &E {
+    pub(crate) fn effects(&self) -> &E {
         &self.effects
     }
 
-    pub fn effects_mut(&mut self) -> &mut E {
-        &mut self.effects
-    }
-
-    pub fn into_effects(self) -> E {
-        self.effects
-    }
 }
 
 impl<E: Mt7921ClientEffects> Mt7921ClientDevice<E> {
     /// Pop exactly one frame/status pair from the injected RX effect queue.
-    pub fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+    pub(crate) fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
         self.effects.next_rx()
     }
 }
