@@ -170,16 +170,32 @@ rule data as opaque, and per-channel legality additionally requires the
 mutating `SET_CLC` response, cfg80211 country regdb, and any OF/DTS limits.
 The source-exact `SET_CLC` wire format is available only inside the explicit
 one-shot loader gate: it selects every opaque `00`/indoor rule from the accepted
-installed CLC record, requires the firmware CLC-event capability, encodes CID
+installed CLC record and encodes CID
 `0x5c`, preserves Linux's no-ACPI `MTCL_INVALID` sentinel as `0xff` in the
 packed request, and bounds the 68-byte response plus five-bit UNII mask. State advances
 to `ClcConfigured` before publication so any timeout or response mismatch still
 forces reset-while-pinned cleanup. Neither `SET_CHAN_DOMAIN` nor cfg80211 policy
 is represented here.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
-The VFIO adapter therefore owns a separate ring-4 descriptor/buffer arena from
-startup and switches the bounded response path and interrupt mask from boot-ROM
-ring 0 to ring 4 only after N9 readiness.
+It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
+(interrupt bit 22) allocated, enabled, and drained. The exact installed
+no-plastic artifact and EFUSE/NIC-capability fixture selects one rule:
+segment 0, country `00`, type `2d30` (`-0`), 482 opaque bytes, request length
+622, capability 1. Linux therefore passes `wait_resp=true` for that rule and
+sends it on `MT_MCUQ_WM` (WFDMA TX ring 17, TXD Q index `0x20`). A capability
+without `CLC_CAP_EVT_EN` instead passes `wait_resp=false`; enqueue success
+advances to the next rule without an IRQ or response, leaving the UNII mask
+unchanged. `mt7921-firmware-inspect` emits this rule-by-rule fixture directly
+from the installed artifact. The VFIO adapter now rejects response-enabled CLC
+before publication until it can monitor both Linux receive rings concurrently;
+choosing either ring in isolation is not source-equivalent.
+The stock driver exposes only `mt76` register/IRQ/TX-done tracepoints and
+current debugfs queue counters on no-plastic; `fw_debug` is disabled and the
+boot log contains firmware identity but no CLC command envelope or completion.
+Those read-only surfaces cannot reconstruct the probe-time CLC transaction.
+Capturing it would require pre-arming additional function/kprobe or firmware
+logging and then retriggering probe/regulatory work, so it remains behind a new
+explicit live-device gate.
 
 A watchdog-guarded physical run completed this boundary for the exact installed
 MT7961 artifacts. It downloaded one patch section and four RAM regions in 196

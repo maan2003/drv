@@ -598,6 +598,14 @@ pub struct ClcSetCommand {
     pub data: Vec<u8>,
 }
 
+impl ClcSetCommand {
+    /// Linux passes this exact predicate as `wait_resp` to
+    /// `mt76_mcu_skb_send_and_get_msg` for every selected rule.
+    pub const fn expects_response(&self) -> bool {
+        self.capability & 1 != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClcSetResponse {
     pub tag: u16,
@@ -2893,7 +2901,7 @@ pub trait FirmwareLoaderTransport {
         command: &ClcSetCommand,
         sequence: u8,
         encoded: &[u8],
-    ) -> Result<ClcSetResponse, Self::Error>;
+    ) -> Result<Option<ClcSetResponse>, Self::Error>;
     fn publish_scatter(
         &mut self,
         part: FirmwareImagePart,
@@ -2937,7 +2945,6 @@ pub enum FirmwareLoaderFailure<E> {
     MissingFirmwareOverride,
     N9ReadyTimeout,
     Clc(ClcDiscoveryError),
-    MissingClcEventCapability,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3002,7 +3009,7 @@ fn next_loader_sequence<T: FirmwareLoaderTransport>(
 fn loader_set_clc<T: FirmwareLoaderTransport>(
     transport: &mut T,
     command: &ClcSetCommand,
-) -> Result<ClcSetResponse, FirmwareLoaderFailure<T::Error>> {
+) -> Result<Option<ClcSetResponse>, FirmwareLoaderFailure<T::Error>> {
     let sequence = next_loader_sequence(transport)?;
     let encoded =
         encode_clc_set_command(command, sequence).map_err(FirmwareLoaderFailure::Command)?;
@@ -3272,9 +3279,6 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             )
             .map_err(FirmwareLoaderFailure::Clc)?;
             let chip_capability = report.nic_capability.chip_capability.unwrap_or(0);
-            if chip_capability & 1 == 0 {
-                return Err(FirmwareLoaderFailure::MissingClcEventCapability);
-            }
             let commands = world_clc_commands(
                 firmware,
                 block
@@ -3285,7 +3289,9 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             .map_err(FirmwareLoaderFailure::Clc)?;
             *state = FirmwareLoaderState::ClcConfigured;
             for command in &commands {
-                report.special_unii_mask = loader_set_clc(transport, command)?.special_unii_mask;
+                if let Some(response) = loader_set_clc(transport, command)? {
+                    report.special_unii_mask = response.special_unii_mask;
+                }
                 report.clc_rules_applied = report
                     .clc_rules_applied
                     .checked_add(1)
@@ -5409,6 +5415,12 @@ mod tests {
         assert_eq!(&encoded[68..76], &[0, 1, 0, 1, b'0', b'0', b'-', b'0']);
         assert_eq!(&encoded[76..78], &[0, 0xff]);
         assert_eq!(&encoded[140..], &[0x5a; 11]);
+        assert!(commands[0].expects_response());
+
+        let mut no_event_capability = commands[0].clone();
+        no_event_capability.capability = 0;
+        assert!(!no_event_capability.expects_response());
+        assert!(encode_clc_set_command(&no_event_capability, 6).is_ok());
 
         let mut zero_mtcl = commands[0].clone();
         zero_mtcl.mtcl_configuration = 0;
@@ -5576,17 +5588,17 @@ mod tests {
             command: &ClcSetCommand,
             sequence: u8,
             encoded: &[u8],
-        ) -> Result<ClcSetResponse, Self::Error> {
+        ) -> Result<Option<ClcSetResponse>, Self::Error> {
             assert_eq!(encoded[39], sequence);
             assert_eq!(&encoded[36..39], &[0x5c, 0xa0, 1]);
             self.trace
                 .push(LoaderTrace::SetClc(command.index, sequence));
             self.step()?;
-            Ok(ClcSetResponse {
+            Ok(command.expects_response().then_some(ClcSetResponse {
                 tag: 0,
                 length: 68,
                 special_unii_mask: 0x1f,
-            })
+            }))
         }
 
         fn publish_scatter(
@@ -5664,6 +5676,27 @@ mod tests {
             (0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc),
         ]);
         (patch, ram)
+    }
+
+    #[test]
+    fn clc_without_event_capability_advances_without_response() {
+        let mut transport = FakeFirmwareLoader::default();
+        let command = ClcSetCommand {
+            index: 0,
+            environment: 1,
+            acpi_configuration: 0,
+            capability: 0,
+            alpha2: *b"00",
+            rule_type: *b"-0",
+            environment_6ghz: 0,
+            mtcl_configuration: 0xff,
+            data: vec![0x5a; 11],
+        };
+        assert_eq!(loader_set_clc(&mut transport, &command), Ok(None));
+        assert!(matches!(
+            transport.trace.as_slice(),
+            [LoaderTrace::SetClc(0, 1)]
+        ));
     }
 
     #[test]

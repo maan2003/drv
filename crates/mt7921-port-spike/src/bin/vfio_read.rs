@@ -1272,6 +1272,10 @@ struct VfioFirmwareLoader<'a, 'b> {
 
 struct ReceivedMcuResponse {
     event_id: u8,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used after dual-ring CLC receive is implemented")
+    )]
     option: u8,
     bytes: Vec<u8>,
 }
@@ -1330,6 +1334,10 @@ fn classify_mcu_completion(
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used after dual-ring CLC receive is implemented")
+)]
 fn classify_clc_response(response: &ReceivedMcuResponse) -> Result<ClcSetResponse, String> {
     if response.event_id != 0x80 {
         return Err(format!(
@@ -1621,10 +1629,16 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         command: &ClcSetCommand,
         sequence: u8,
         encoded: &[u8],
-    ) -> Result<ClcSetResponse, Self::Error> {
+    ) -> Result<Option<ClcSetResponse>, Self::Error> {
         self.mcu.cancelled()?;
         if command.alpha2 != *b"00" || command.environment != 1 || command.index > 1 {
             return Err("SET_CLC escaped the world/indoor allowlist".into());
+        }
+        if command.expects_response() {
+            return Err(
+                "response-enabled SET_CLC requires simultaneous WM ring 0 and WM2 ring 4 receive"
+                    .into(),
+            );
         }
         // Pinned Linux names EID 0x80 as a WM CLC event. Normal post-N9
         // command replies use WM2/ring 4, while this event returns on the
@@ -1646,15 +1660,24 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             descriptor_index,
         )?;
         self.command_index = next;
-        let response = self
-            .mcu
-            .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
-        let parsed = classify_clc_response(&response)?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            self.mcu.cancelled()?;
+            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "SET_CLC TX completion timed out at descriptor {descriptor_index}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(PAGE)?;
-        Ok(parsed)
+        Ok(None)
     }
 
     fn publish_scatter(
