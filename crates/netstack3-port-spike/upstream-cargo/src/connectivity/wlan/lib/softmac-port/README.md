@@ -19,6 +19,8 @@ common/MLME conversion code.
 The scanner keeps Fuchsia's rejection and dwell-time conversion behavior: one
 scan at a time, nonempty channel list, maximum dwell not below minimum dwell,
 scan-offload support required, and IEEE 802.11 Time Units converted at 1024 us.
+Cancellation retains the device scan ID and the scanner remains busy until the
+matching hardware completion arrives.
 Focused fixtures derived from the upstream MLME scanner run against the fake:
 
 ```sh

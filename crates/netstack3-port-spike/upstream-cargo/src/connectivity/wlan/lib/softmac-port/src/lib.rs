@@ -9,12 +9,18 @@ mod pinned_convert_beacon;
 
 pub use pinned_convert_beacon::construct_bss_description;
 
-pub use fidl_fuchsia_wlan_ieee80211::{BssDescription, ChannelBandwidth, ChannelNumber, WlanBand};
+pub use fidl_fuchsia_wlan_ieee80211::{
+    BssDescription, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
+};
 pub use fidl_fuchsia_wlan_mlme::{ScanEnd, ScanRequest, ScanResult, ScanResultCode, ScanTypes};
 pub use fidl_fuchsia_wlan_softmac::{
-    DiscoverySupport, WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
-    WlanSoftmacBaseStartPassiveScanResponse, WlanSoftmacQueryResponse,
+    DiscoverySupport, ScanOffloadExtension, WlanRxInfo, WlanRxInfoFlags, WlanRxInfoValid,
+    WlanSoftmacBandCapability, WlanSoftmacBaseCancelScanRequest, WlanSoftmacBaseSetChannelRequest,
+    WlanSoftmacBaseStartPassiveScanRequest, WlanSoftmacBaseStartPassiveScanResponse,
+    WlanSoftmacQueryResponse,
 };
+pub use ieee80211::Bssid;
+pub use wlan_common::{TimeUnit, mac::CapabilityInfo};
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -56,6 +62,8 @@ pub trait SoftmacHardware {
         &mut self,
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, Self::Error>;
+    fn cancel_scan(&mut self, request: WlanSoftmacBaseCancelScanRequest)
+    -> Result<(), Self::Error>;
     fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, Self::Error>;
 }
 
@@ -86,8 +94,8 @@ pub fn allowed_passive_channels(
     policy: ConservativeRegulatoryPolicy,
 ) -> Result<Vec<ChannelNumber>, RegulatoryError> {
     const FUCHSIA_5GHZ: [u8; 25] = [
-        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
-        144, 149, 153, 157, 161, 165,
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165,
     ];
     if policy.alpha2 != *b"00" {
         return Err(RegulatoryError::NonWorldDomain);
@@ -264,6 +272,22 @@ impl PassiveScanner {
             HardwareScanEvent::Complete { .. } => Ok(None),
         }
     }
+
+    /// Request cancellation without discarding identity. The scanner remains
+    /// busy until hardware reports completion for the matching device scan.
+    pub fn cancel<H: SoftmacHardware>(
+        &mut self,
+        hardware: &mut H,
+    ) -> Result<(), ScanError<H::Error>> {
+        let Some(scan) = self.ongoing_scan else {
+            return Ok(());
+        };
+        hardware
+            .cancel_scan(WlanSoftmacBaseCancelScanRequest {
+                scan_id: Some(scan.device_scan_id),
+            })
+            .map_err(ScanError::Hardware)
+    }
 }
 
 fn time_units_to_nanos(time_units: u32) -> i64 {
@@ -290,6 +314,7 @@ pub struct FakeMt7921Adapter {
     events: VecDeque<HardwareScanEvent>,
     set_channel_requests: Vec<WlanSoftmacBaseSetChannelRequest>,
     passive_scan_requests: Vec<WlanSoftmacBaseStartPassiveScanRequest>,
+    cancel_scan_requests: Vec<WlanSoftmacBaseCancelScanRequest>,
 }
 
 impl FakeMt7921Adapter {
@@ -304,6 +329,7 @@ impl FakeMt7921Adapter {
             events: VecDeque::new(),
             set_channel_requests: Vec::new(),
             passive_scan_requests: Vec::new(),
+            cancel_scan_requests: Vec::new(),
         }
     }
 
@@ -317,6 +343,10 @@ impl FakeMt7921Adapter {
 
     pub fn passive_scan_requests(&self) -> &[WlanSoftmacBaseStartPassiveScanRequest] {
         &self.passive_scan_requests
+    }
+
+    pub fn cancel_scan_requests(&self) -> &[WlanSoftmacBaseCancelScanRequest] {
+        &self.cancel_scan_requests
     }
 }
 
@@ -353,6 +383,14 @@ impl SoftmacHardware for FakeMt7921Adapter {
 
     fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, Self::Error> {
         Ok(self.events.pop_front())
+    }
+
+    fn cancel_scan(
+        &mut self,
+        request: WlanSoftmacBaseCancelScanRequest,
+    ) -> Result<(), Self::Error> {
+        self.cancel_scan_requests.push(request);
+        Ok(())
     }
 }
 
@@ -459,7 +497,12 @@ mod tests {
                     special_unii_mask: 0x1f,
                 }
             ),
-            Ok(vec![channel(1), channel(14), channel_5ghz(36), channel_5ghz(165)])
+            Ok(vec![
+                channel(1),
+                channel(14),
+                channel_5ghz(36),
+                channel_5ghz(165)
+            ])
         );
         assert_eq!(
             allowed_passive_channels(
@@ -592,5 +635,31 @@ mod tests {
         });
         assert_eq!(scanner.poll(&mut hardware).unwrap(), None);
         assert!(scanner.is_scanning());
+    }
+
+    #[test]
+    fn cancellation_keeps_identity_until_matching_completion() {
+        let mut hardware = fake();
+        let mut scanner = PassiveScanner::default();
+        scanner.start(&mut hardware, passive_request()).unwrap();
+        scanner.cancel(&mut hardware).unwrap();
+        assert_eq!(
+            hardware.cancel_scan_requests(),
+            &[WlanSoftmacBaseCancelScanRequest { scan_id: Some(1) }]
+        );
+        assert!(scanner.is_scanning());
+
+        hardware.queue_event(HardwareScanEvent::Complete {
+            scan_id: 1,
+            success: false,
+        });
+        assert_eq!(
+            scanner.poll(&mut hardware).unwrap(),
+            Some(MlmeScanEvent::End(ScanEnd {
+                txn_id: 1337,
+                code: ScanResultCode::InternalError,
+            }))
+        );
+        assert!(!scanner.is_scanning());
     }
 }

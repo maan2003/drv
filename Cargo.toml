@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/bluetooth-hci-broker", "crates/bluetooth-sapphire-wasm", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe"]
 resolver = "3"
+exclude = ["crates/mt7921-softmac-adapter"]
 
 [workspace.package]
 edition = "2024"
