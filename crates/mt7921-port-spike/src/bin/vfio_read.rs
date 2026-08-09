@@ -950,16 +950,16 @@ fn run() -> Result<(), String> {
         }
         let reset = reset_vfio_device(&device);
         if let Err(error) = reset {
-            eprintln!(
-                "mt7921-vfio-read: reset while pinned failed; retaining device and every IOVA for watchdog reboot: active={active:?} cleanup={cleanup_errors:?} reset={error}"
-            );
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
+            retain_mappings_for_watchdog(&format!(
+                "reset while pinned failed: active={active:?} cleanup={cleanup_errors:?} reset={error}"
+            ));
         }
         println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
-        verify_pci_dma_disabled(&bdf)?;
-        set_lab_safety("SAFE")?;
+        if let Err(error) = verify_pci_dma_disabled(&bdf).and_then(|()| set_lab_safety("SAFE")) {
+            retain_mappings_for_watchdog(&format!(
+                "post-reset containment verification failed: active={active:?} cleanup={cleanup_errors:?} error={error}"
+            ));
+        }
         for arena in [
             &mut fwdl_payload,
             &mut command_payload,
@@ -1149,6 +1149,13 @@ fn set_lab_safety(value: &str) -> Result<(), String> {
         .map_err(|_| "DRV_LAB_SAFETY_STATE is required for mutating operations")?;
     std::fs::write(&path, format!("{value}\n"))
         .map_err(|error| format!("write lab safety state {path}: {error}"))
+}
+
+fn retain_mappings_for_watchdog(message: &str) -> ! {
+    eprintln!("mt7921-vfio-read: {message}; retaining device and every IOVA for watchdog reboot");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 
 fn publish_mcu_command(
@@ -1649,9 +1656,16 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             errors.push(error);
         }
         if errors.is_empty() {
-            reset_vfio_device(self.device)?;
-            verify_pci_dma_disabled(self.bdf)?;
-            set_lab_safety("SAFE")?;
+            if let Err(error) = reset_vfio_device(self.device) {
+                retain_mappings_for_watchdog(&format!("loader reset while pinned failed: {error}"));
+            }
+            if let Err(error) =
+                verify_pci_dma_disabled(self.bdf).and_then(|()| set_lab_safety("SAFE"))
+            {
+                retain_mappings_for_watchdog(&format!(
+                    "loader post-reset containment verification failed: {error}"
+                ));
+            }
             println!(r#"{{"active_fwdl_event":"reset_while_pinned"}}"#);
             Ok(())
         } else {
