@@ -2117,11 +2117,11 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2950	member	rdd_rx_sel	-	un
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2951	member	val	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2952	member	rsv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2963	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2966	function	mt76_connac_mcu_send_ram_firmware	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3016	function	mt76_connac2_load_ram	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	2966	function	mt76_connac_mcu_send_ram_firmware	load_mt7921_firmware	adapted	offline golden transaction and failure injection
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3016	function	mt76_connac2_load_ram	load_mt7921_firmware	adapted	offline golden transaction and failure injection
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3081	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3083	function	mt76_connac2_get_data_mode	patch_download_mode	adapted	plain/AES/scramble/fail-closed unit fixtures
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3111	function	mt76_connac2_load_patch	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3111	function	mt76_connac2_load_patch	load_mt7921_firmware	adapted	offline golden transaction and failure injection
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3194	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3196	function	mt76_connac2_mcu_fill_message	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	3270	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
@@ -3557,7 +3557,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1837	member	reg	-	unmapped	
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1838	member	val	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1839	variable	__packed	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1842	function	mt76_connac_mcu_get_cipher	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1875	function	mt76_connac_mcu_gen_dl_mode	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1875	function	mt76_connac_mcu_gen_dl_mode	firmware_download_mode	adapted	offline RAM feature-bit fixtures
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1892	macro	to_wcid_lo	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1893	macro	to_wcid_hi	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1896	function	mt76_connac_mcu_get_wlan_idx	-	unmapped	-
@@ -3627,8 +3627,8 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2073	prototype	mt76_connac_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2074	prototype	mt76_connac_mcu_del_wtbl_all	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2075	prototype	mt76_connac_mcu_rdd_cmd	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2077	prototype	mt76_connac_mcu_sta_wed_update	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2078	prototype	mt76_connac2_load_ram	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2080	prototype	mt76_connac2_load_patch	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2078	prototype	mt76_connac2_load_ram	load_mt7921_firmware	adapted	offline golden transaction and failure injection
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2080	prototype	mt76_connac2_load_patch	load_mt7921_firmware	adapted	offline golden transaction and failure injection
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2081	prototype	mt76_connac2_mcu_fill_message	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/debugfs.c	7	function	mt7921_reg_set	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/debugfs.c	19	function	mt7921_reg_get	-	unmapped	-
@@ -4770,7 +4770,7 @@ drivers/net/wireless/mediatek/mt76/mt792x.h	446	prototype	mt792x_mac_link_bss_re
 drivers/net/wireless/mediatek/mt76/mt792x.h	449	prototype	mt792x_config_mac_addr_list	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x.h	451	function	mt792x_ram_name	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x.h	467	function	mt792x_patch_name	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x.h	483	prototype	mt792x_load_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x.h	483	prototype	mt792x_load_firmware	load_mt7921_firmware	adapted	offline golden transaction and failure injection
 drivers/net/wireless/mediatek/mt76/mt792x.h	486	macro	MT_USB_TYPE_VENDOR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x.h	487	macro	MT_USB_TYPE_UHW_VENDOR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x.h	488	prototype	mt792xu_dma_init	-	unmapped	-
@@ -4985,7 +4985,7 @@ drivers/net/wireless/mediatek/mt76/mt792x_core.c	877	function	mt792xe_mcu_drv_pm
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	896	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	898	function	mt792xe_mcu_fw_pmctrl	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	923	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_core.c	925	function	mt792x_load_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_core.c	925	function	mt792x_load_firmware	load_mt7921_firmware	adapted	offline golden transaction and failure injection
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	966	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	968	function	mt792x_config_mac_addr_list	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_core.c	988	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-

@@ -68,11 +68,8 @@ const SIGTERM: i32 = 15;
 const SIG_ERR: usize = usize::MAX;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
-const RAM_PATH: &str = "/run/current-system/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin.zst";
 const PATCH_SHA256: &str = "a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6";
-const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9";
 const PATCH_IMAGE_BYTES: usize = 92_192;
-const RAM_IMAGE_BYTES: usize = 792_036;
 
 #[repr(C)]
 #[derive(Default)]
@@ -241,7 +238,7 @@ fn run() -> Result<(), String> {
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => {
-            return Err("active firmware DMA is disabled pending global-ring ownership, VFIO IRQ, and valid PATCH_START protocol".into());
+            return Err("active firmware DMA remains disabled; the reviewed offline loader has no physical transport".into());
         }
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
@@ -1147,9 +1144,7 @@ struct ActiveMcuIo<'a, 'b> {
 }
 
 struct ReceivedMcuResponse {
-    sequence: u8,
     event_id: u8,
-    length: u16,
     bytes: Vec<u8>,
 }
 
@@ -1211,9 +1206,7 @@ impl ActiveMcuIo<'_, '_> {
                     parsed.sequence, parsed.event_id, parsed.length, self.rx_ring_index
                 );
                 matched = Some(ReceivedMcuResponse {
-                    sequence: parsed.sequence,
                     event_id: parsed.event_id,
-                    length: parsed.length,
                     bytes: response,
                 });
             } else {
@@ -2440,10 +2433,6 @@ fn log_disabled_firmware_stage_event(event: DisabledFirmwareStageEvent) {
 
 fn decompress_patch() -> Result<Vec<u8>, String> {
     decompress_verified_image(PATCH_PATH, PATCH_SHA256, PATCH_IMAGE_BYTES)
-}
-
-fn decompress_ram() -> Result<Vec<u8>, String> {
-    decompress_verified_image(RAM_PATH, RAM_SHA256, RAM_IMAGE_BYTES)
 }
 
 fn decompress_verified_image(

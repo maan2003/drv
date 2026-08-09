@@ -128,6 +128,27 @@ The same pure encoder now includes the terminal `FW_START_REQ` used after the
 exact installed RAM regions, rejects an address/option pair other than their
 derived `0x00915000`/override values, and emits Linux's required legacy command
 queue ID (`0x8000`) in every command TXD.
+`firmware_download_mode` separately ports the Connac2 RAM-region feature-byte
+translation, including encryption, key index, encryption mode, response, and
+optional CR4 working-PDA bits. Address override and non-download remain region
+flow controls rather than download-mode bits.
+
+`load_mt7921_firmware` composes those pure pieces behind a typed transport. It
+powers the NIC, bounds the download-ready poll, and always attempts release of
+an acquired patch semaphore. It initializes and scatters every patch section in completed
+chunks of at most 4096 bytes, finishes the patch, downloads only RAM regions,
+starts the exact installed image, and bounds the N9-ready poll. Cleanup runs
+after success and every injected failure, preserving both primary and cleanup
+errors when necessary. Golden-trace and per-operation error-injection tests
+cover the transaction; no physical backend implements this transport, and
+`--run-one-shot-fwdl` remains rejected.
+Like pinned Linux, a one-second download-ready timeout is recorded as a warning
+and loading continues; N9 readiness remains a terminal 1.5-second timeout. The
+offline safety model is stricter than Linux scatter submission: it requires an
+explicit completion for every chunk under a three-second deadline. Transport
+sequence allocation persists across transactions and skips zero on four-bit
+wrap. Fail-closed cleanup after `Ready` is lab transaction policy; Linux keeps
+the live device resources instead.
 
 `--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,

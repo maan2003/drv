@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
@@ -2074,8 +2074,26 @@ pub const FIRMWARE_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 8;
 pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
 pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
 pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
+pub const DL_MODE_WORKING_PDA_CR4: u32 = 1 << 4;
 pub const DL_MODE_ENCRYPTION_MODE_SELECT: u32 = 1 << 6;
 pub const DL_MODE_NEED_RESPONSE: u32 = 1 << 31;
+
+/// Translate a Connac2 RAM region feature byte into Linux's download mode.
+/// Address override and non-download are caller-side region controls and do
+/// not contribute mode bits.
+pub const fn firmware_download_mode(feature_set: u8, working_pda_cr4: bool) -> u32 {
+    let mut mode = DL_MODE_NEED_RESPONSE | ((feature_set as u32) & DL_MODE_KEY_INDEX);
+    if feature_set & (1 << 0) != 0 {
+        mode |= DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV;
+    }
+    if feature_set & (1 << 4) != 0 {
+        mode |= DL_MODE_ENCRYPTION_MODE_SELECT;
+    }
+    if working_pda_cr4 {
+        mode |= DL_MODE_WORKING_PDA_CR4;
+    }
+    mode
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatchSecurityError {
@@ -2254,6 +2272,419 @@ pub fn encode_download_command(
     bytes[39] = sequence;
     bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
     Ok(bytes)
+}
+
+pub const FIRMWARE_POLL_INTERVAL_MS: u64 = 10;
+pub const DOWNLOAD_READY_TIMEOUT_MS: u64 = 1000;
+pub const N9_READY_TIMEOUT_MS: u64 = 1500;
+/// A fail-closed per-chunk safety deadline. Pinned PCI Linux uses a 3-second
+/// MCU timeout and requests no FW_SCATTER response; this offline model is
+/// deliberately stricter by requiring synchronous TX completion per chunk.
+pub const SCATTER_COMPLETION_TIMEOUT_MS: u64 = 3000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderState {
+    Powering,
+    DownloadReady,
+    PatchSemaphoreHeld,
+    PatchSemaphoreReleased,
+    PatchComplete,
+    RamDownloading,
+    FirmwareStarted,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareImagePart {
+    Patch,
+    Ram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderOperation {
+    Command(DownloadCommand),
+    PublishScatter(FirmwareImagePart),
+    WaitScatterCompletion(FirmwareImagePart),
+    PollDownloadReady,
+    PollN9Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareCommandCompletion {
+    NoResponse,
+    Ack,
+    PatchSemaphore(PatchSemaphoreStatus),
+    PatchFinish(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchSemaphoreStatus {
+    NotDownloadedFailed,
+    AlreadyDownloaded,
+    Acquired,
+    Released,
+    Other(u8),
+}
+
+impl From<u8> for PatchSemaphoreStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::NotDownloadedFailed,
+            1 => Self::AlreadyDownloaded,
+            2 => Self::Acquired,
+            3 => Self::Released,
+            value => Self::Other(value),
+        }
+    }
+}
+
+/// Transport boundary for the complete loader transaction. Implementations
+/// own command/RX matching and one completion for every scatter chunk.
+pub trait FirmwareLoaderTransport {
+    type Error;
+
+    /// Allocate the next persistent nonzero four-bit MCU sequence. Linux keeps
+    /// this counter on the device and consumes a value for scatter messages.
+    fn next_sequence(&mut self) -> u8;
+    fn command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<FirmwareCommandCompletion, Self::Error>;
+    fn publish_scatter(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        chunk: &[u8],
+    ) -> Result<(), Self::Error>;
+    fn wait_scatter_completion(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        deadline_ms: u64,
+    ) -> Result<(), Self::Error>;
+    fn firmware_download_state(&mut self) -> Result<u8, Self::Error>;
+    fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error>;
+    fn now_ms(&self) -> u64;
+    fn sleep_ms(&mut self, duration_ms: u64);
+    /// Quiesce DMA/IRQ activity and revoke all loader resources. `state` is
+    /// the last successfully entered protocol state, not cleanup permission.
+    fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderFailure<E> {
+    Command(DownloadCommandError),
+    PatchSecurity(PatchSecurityError),
+    Transport {
+        operation: FirmwareLoaderOperation,
+        source: E,
+    },
+    UnexpectedCommandCompletion {
+        command: DownloadCommand,
+        completion: FirmwareCommandCompletion,
+    },
+    UnexpectedPatchSemaphore(PatchSemaphoreStatus),
+    UnexpectedPatchRelease(PatchSemaphoreStatus),
+    UnexpectedPatchFinish(u8),
+    PatchRelease {
+        primary: Option<Box<FirmwareLoaderFailure<E>>>,
+        release: Box<FirmwareLoaderFailure<E>>,
+    },
+    MissingFirmwareOverride,
+    N9ReadyTimeout,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderError<E> {
+    Failed(FirmwareLoaderFailure<E>),
+    Cleanup {
+        failure: Option<FirmwareLoaderFailure<E>>,
+        source: E,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchDisposition {
+    AlreadyDownloaded,
+    Downloaded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareLoaderReport {
+    pub download_ready_observed: bool,
+    pub patch: PatchDisposition,
+    pub patch_sections: usize,
+    pub ram_regions: usize,
+    pub scatter_chunks: usize,
+    pub scatter_bytes: usize,
+}
+
+fn loader_command<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: DownloadCommand,
+) -> Result<FirmwareCommandCompletion, FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded =
+        encode_download_command(command, sequence).map_err(FirmwareLoaderFailure::Command)?;
+    transport
+        .command(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::Command(command),
+            source,
+        })
+}
+
+fn next_loader_sequence<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+) -> Result<u8, FirmwareLoaderFailure<T::Error>> {
+    let sequence = transport.next_sequence();
+    if sequence == 0 || sequence > 15 {
+        Err(FirmwareLoaderFailure::Command(
+            DownloadCommandError::InvalidSequence,
+        ))
+    } else {
+        Ok(sequence)
+    }
+}
+
+fn loader_scatter<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    part: FirmwareImagePart,
+    payload: &[u8],
+    report: &mut FirmwareLoaderReport,
+) -> Result<(), FirmwareLoaderFailure<T::Error>> {
+    for chunk in payload.chunks(MT7921_FWDL_CHUNK_BYTES) {
+        let sequence = next_loader_sequence(transport)?;
+        transport
+            .publish_scatter(part, sequence, chunk)
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PublishScatter(part),
+                source,
+            })?;
+        let deadline_ms = transport
+            .now_ms()
+            .saturating_add(SCATTER_COMPLETION_TIMEOUT_MS);
+        transport
+            .wait_scatter_completion(part, sequence, deadline_ms)
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::WaitScatterCompletion(part),
+                source,
+            })?;
+        report.scatter_chunks += 1;
+        report.scatter_bytes += chunk.len();
+    }
+    Ok(())
+}
+
+fn expect_loader_completion<E>(
+    command: DownloadCommand,
+    completion: FirmwareCommandCompletion,
+    expected: FirmwareCommandCompletion,
+) -> Result<(), FirmwareLoaderFailure<E>> {
+    if completion == expected {
+        Ok(())
+    } else {
+        Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+            command,
+            completion,
+        })
+    }
+}
+
+fn run_firmware_loader<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+    state: &mut FirmwareLoaderState,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
+    let mut report = FirmwareLoaderReport {
+        download_ready_observed: false,
+        patch: PatchDisposition::Downloaded,
+        patch_sections: 0,
+        ram_regions: 0,
+        scatter_chunks: 0,
+        scatter_bytes: 0,
+    };
+
+    let power = DownloadCommand::NicPowerControl;
+    let completion = loader_command(transport, power)?;
+    expect_loader_completion(power, completion, FirmwareCommandCompletion::NoResponse)?;
+    let download_deadline = transport.now_ms().saturating_add(DOWNLOAD_READY_TIMEOUT_MS);
+    loop {
+        let firmware_state = transport.firmware_download_state().map_err(|source| {
+            FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PollDownloadReady,
+                source,
+            }
+        })?;
+        if firmware_state == 1 {
+            *state = FirmwareLoaderState::DownloadReady;
+            report.download_ready_observed = true;
+            break;
+        }
+        if transport.now_ms() >= download_deadline {
+            // Pinned Linux warns and continues into patch semaphore handling.
+            break;
+        }
+        transport.sleep_ms(FIRMWARE_POLL_INTERVAL_MS);
+    }
+
+    let get = DownloadCommand::PatchSemaphoreGet;
+    match loader_command(transport, get)? {
+        FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::AlreadyDownloaded) => {
+            report.patch = PatchDisposition::AlreadyDownloaded
+        }
+        FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Acquired) => {
+            *state = FirmwareLoaderState::PatchSemaphoreHeld;
+            let patch_result = (|| {
+                for section in patch.sections() {
+                    let mode = patch_download_mode(section.security_info)
+                        .map_err(FirmwareLoaderFailure::PatchSecurity)?;
+                    let command = DownloadCommand::PatchStart {
+                        address: section.address,
+                        length: section.payload.len() as u32,
+                        mode,
+                    };
+                    let completion = loader_command(transport, command)?;
+                    expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+                    loader_scatter(
+                        transport,
+                        FirmwareImagePart::Patch,
+                        section.payload,
+                        &mut report,
+                    )?;
+                    report.patch_sections += 1;
+                }
+                let finish = DownloadCommand::PatchFinish;
+                match loader_command(transport, finish)? {
+                    FirmwareCommandCompletion::PatchFinish(0) => {}
+                    FirmwareCommandCompletion::PatchFinish(status) => {
+                        return Err(FirmwareLoaderFailure::UnexpectedPatchFinish(status));
+                    }
+                    completion => {
+                        return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                            command: finish,
+                            completion,
+                        });
+                    }
+                }
+                Ok(())
+            })();
+            let primary = patch_result.err();
+            let release = loader_command(transport, DownloadCommand::PatchSemaphoreRelease);
+            let release_failure = match release {
+                Ok(FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Released)) => {
+                    None
+                }
+                Ok(FirmwareCommandCompletion::PatchSemaphore(result)) => {
+                    Some(FirmwareLoaderFailure::UnexpectedPatchRelease(result))
+                }
+                Ok(completion) => Some(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                    command: DownloadCommand::PatchSemaphoreRelease,
+                    completion,
+                }),
+                Err(error) => Some(error),
+            };
+            if let Some(release) = release_failure {
+                return Err(FirmwareLoaderFailure::PatchRelease {
+                    primary: primary.map(Box::new),
+                    release: Box::new(release),
+                });
+            }
+            *state = FirmwareLoaderState::PatchSemaphoreReleased;
+            if let Some(primary) = primary {
+                return Err(primary);
+            }
+        }
+        FirmwareCommandCompletion::PatchSemaphore(result) => {
+            return Err(FirmwareLoaderFailure::UnexpectedPatchSemaphore(result));
+        }
+        completion => {
+            return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                command: get,
+                completion,
+            });
+        }
+    }
+    *state = FirmwareLoaderState::PatchComplete;
+
+    let mut override_address = 0;
+    *state = FirmwareLoaderState::RamDownloading;
+    for region in firmware.regions() {
+        if !region.is_downloadable() {
+            continue;
+        }
+        if region.feature_set & (1 << 5) != 0 {
+            override_address = region.address;
+        }
+        let command = DownloadCommand::TargetAddressLength {
+            address: region.address,
+            length: region.payload.len() as u32,
+            mode: firmware_download_mode(region.feature_set, false),
+        };
+        let completion = loader_command(transport, command)?;
+        expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+        loader_scatter(
+            transport,
+            FirmwareImagePart::Ram,
+            region.payload,
+            &mut report,
+        )?;
+        report.ram_regions += 1;
+    }
+    if override_address == 0 {
+        return Err(FirmwareLoaderFailure::MissingFirmwareOverride);
+    }
+    let start = DownloadCommand::FirmwareStart {
+        address: override_address,
+        option: 1,
+    };
+    let completion = loader_command(transport, start)?;
+    expect_loader_completion(start, completion, FirmwareCommandCompletion::Ack)?;
+    *state = FirmwareLoaderState::FirmwareStarted;
+    let n9_deadline = transport.now_ms().saturating_add(N9_READY_TIMEOUT_MS);
+    loop {
+        if transport
+            .firmware_n9_ready()
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PollN9Ready,
+                source,
+            })?
+        {
+            *state = FirmwareLoaderState::Ready;
+            return Ok(report);
+        }
+        if transport.now_ms() >= n9_deadline {
+            return Err(FirmwareLoaderFailure::N9ReadyTimeout);
+        }
+        transport.sleep_ms(FIRMWARE_POLL_INTERVAL_MS);
+    }
+}
+
+/// Execute the bounded Linux MT7921 patch + RAM loading sequence. Cleanup is
+/// mandatory after both success and failure; release of an acquired patch
+/// semaphore is always attempted before fail-closed cleanup.
+pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state);
+    match (result, transport.fail_closed_cleanup(state)) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(failure), Ok(())) => Err(FirmwareLoaderError::Failed(failure)),
+        (Ok(_), Err(source)) => Err(FirmwareLoaderError::Cleanup {
+            failure: None,
+            source,
+        }),
+        (Err(failure), Err(source)) => Err(FirmwareLoaderError::Cleanup {
+            failure: Some(failure),
+            source,
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3821,6 +4252,24 @@ mod tests {
     }
 
     #[test]
+    fn derives_connac2_ram_region_download_mode() {
+        assert_eq!(firmware_download_mode(0, false), DL_MODE_NEED_RESPONSE);
+        assert_eq!(
+            firmware_download_mode(0b0001_0111, false),
+            DL_MODE_NEED_RESPONSE
+                | DL_MODE_ENCRYPT
+                | DL_MODE_KEY_INDEX
+                | DL_MODE_RESET_SECURITY_IV
+                | DL_MODE_ENCRYPTION_MODE_SELECT
+        );
+        assert_eq!(firmware_download_mode(1 << 5, false), DL_MODE_NEED_RESPONSE);
+        assert_eq!(
+            firmware_download_mode(0, true),
+            DL_MODE_NEED_RESPONSE | DL_MODE_WORKING_PDA_CR4
+        );
+    }
+
+    #[test]
     fn parses_bounded_connac2_download_responses_by_sequence() {
         let mut bytes = [0u8; 40];
         bytes[24..26].copy_from_slice(&12u16.to_le_bytes());
@@ -4109,6 +4558,559 @@ mod tests {
         trailer[32..36].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         image.extend_from_slice(&trailer);
         image
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum LoaderTrace {
+        Command(DownloadCommand, u8),
+        PublishScatter(FirmwareImagePart, u8, usize),
+        ScatterCompletion(FirmwareImagePart, u8, u64),
+        DownloadState,
+        N9Ready,
+        Sleep(u64),
+        Cleanup(FirmwareLoaderState),
+    }
+
+    struct FakeFirmwareLoader {
+        trace: Vec<LoaderTrace>,
+        calls: usize,
+        sequence: u8,
+        now_ms: u64,
+        fail_at: Option<usize>,
+        download_states: Vec<u8>,
+        download_poll: usize,
+        n9_states: Vec<bool>,
+        n9_poll: usize,
+        semaphore_result: u8,
+        completion_override: Option<(DownloadCommand, FirmwareCommandCompletion)>,
+        fail_release: bool,
+        fail_patch_publish: bool,
+        fail_patch_completion: bool,
+    }
+
+    impl Default for FakeFirmwareLoader {
+        fn default() -> Self {
+            Self {
+                trace: vec![],
+                calls: 0,
+                sequence: 0,
+                now_ms: 0,
+                fail_at: None,
+                download_states: vec![0, 1],
+                download_poll: 0,
+                n9_states: vec![false, true],
+                n9_poll: 0,
+                semaphore_result: 2,
+                completion_override: None,
+                fail_release: false,
+                fail_patch_publish: false,
+                fail_patch_completion: false,
+            }
+        }
+    }
+
+    impl FakeFirmwareLoader {
+        fn step(&mut self) -> Result<(), &'static str> {
+            self.calls += 1;
+            if self.fail_at == Some(self.calls) {
+                Err("injected transport failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn next_download_state(&mut self) -> u8 {
+            let state = self
+                .download_states
+                .get(self.download_poll)
+                .copied()
+                .unwrap_or_else(|| *self.download_states.last().unwrap_or(&0));
+            self.download_poll += 1;
+            state
+        }
+
+        fn next_n9_state(&mut self) -> bool {
+            let ready = self
+                .n9_states
+                .get(self.n9_poll)
+                .copied()
+                .unwrap_or_else(|| *self.n9_states.last().unwrap_or(&false));
+            self.n9_poll += 1;
+            ready
+        }
+    }
+
+    impl FirmwareLoaderTransport for FakeFirmwareLoader {
+        type Error = &'static str;
+
+        fn next_sequence(&mut self) -> u8 {
+            self.sequence = (self.sequence + 1) & 0x0f;
+            if self.sequence == 0 {
+                self.sequence = 1;
+            }
+            self.sequence
+        }
+
+        fn command(
+            &mut self,
+            command: DownloadCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<FirmwareCommandCompletion, Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[34..36], &0x8000u16.to_le_bytes());
+            self.trace.push(LoaderTrace::Command(command, sequence));
+            self.step()?;
+            if self.fail_release && command == DownloadCommand::PatchSemaphoreRelease {
+                return Err("injected release failure");
+            }
+            if let Some((overridden, completion)) = self.completion_override
+                && overridden == command
+            {
+                return Ok(completion);
+            }
+            Ok(match command {
+                DownloadCommand::NicPowerControl => FirmwareCommandCompletion::NoResponse,
+                DownloadCommand::PatchSemaphoreGet => {
+                    FirmwareCommandCompletion::PatchSemaphore(self.semaphore_result.into())
+                }
+                DownloadCommand::PatchSemaphoreRelease => {
+                    FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Released)
+                }
+                DownloadCommand::PatchFinish => FirmwareCommandCompletion::PatchFinish(0),
+                DownloadCommand::PatchStart { .. }
+                | DownloadCommand::TargetAddressLength { .. }
+                | DownloadCommand::FirmwareStart { .. } => FirmwareCommandCompletion::Ack,
+            })
+        }
+
+        fn publish_scatter(
+            &mut self,
+            part: FirmwareImagePart,
+            sequence: u8,
+            chunk: &[u8],
+        ) -> Result<(), Self::Error> {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= MT7921_FWDL_CHUNK_BYTES);
+            self.trace
+                .push(LoaderTrace::PublishScatter(part, sequence, chunk.len()));
+            self.step()?;
+            if self.fail_patch_publish && part == FirmwareImagePart::Patch {
+                Err("injected patch publish failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_scatter_completion(
+            &mut self,
+            part: FirmwareImagePart,
+            sequence: u8,
+            deadline_ms: u64,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(
+                deadline_ms,
+                self.now_ms.saturating_add(SCATTER_COMPLETION_TIMEOUT_MS)
+            );
+            self.trace
+                .push(LoaderTrace::ScatterCompletion(part, sequence, deadline_ms));
+            self.step()?;
+            if self.fail_patch_completion && part == FirmwareImagePart::Patch {
+                Err("injected patch completion timeout")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn firmware_download_state(&mut self) -> Result<u8, Self::Error> {
+            self.trace.push(LoaderTrace::DownloadState);
+            self.step()?;
+            Ok(self.next_download_state())
+        }
+
+        fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
+            self.trace.push(LoaderTrace::N9Ready);
+            self.step()?;
+            Ok(self.next_n9_state())
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.now_ms
+        }
+
+        fn sleep_ms(&mut self, duration_ms: u64) {
+            self.trace.push(LoaderTrace::Sleep(duration_ms));
+            self.now_ms = self.now_ms.saturating_add(duration_ms);
+        }
+
+        fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
+            self.trace.push(LoaderTrace::Cleanup(state));
+            self.step()
+        }
+    }
+
+    fn loader_images() -> (Vec<u8>, Vec<u8>) {
+        let patch = patch_image(0x0004_0002, 160, 4097);
+        let ram_large = vec![0x5a; 4097];
+        let ram = firmware_image(&[
+            (0x0091_5000, 1 << 5, 0, &ram_large),
+            (0x0201_5c00, 0, 0, b"ram"),
+            (0, FW_FEATURE_NON_DL, FW_TYPE_CLC, b"clc"),
+        ]);
+        (patch, ram)
+    }
+
+    #[test]
+    fn firmware_loader_matches_linux_transaction_golden_trace() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader::default();
+        let report = load_mt7921_firmware(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report,
+            FirmwareLoaderReport {
+                download_ready_observed: true,
+                patch: PatchDisposition::Downloaded,
+                patch_sections: 1,
+                ram_regions: 2,
+                scatter_chunks: 5,
+                scatter_bytes: 8197,
+            }
+        );
+        assert_eq!(
+            transport.trace,
+            [
+                LoaderTrace::Command(DownloadCommand::NicPowerControl, 1),
+                LoaderTrace::DownloadState,
+                LoaderTrace::Sleep(10),
+                LoaderTrace::DownloadState,
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 2),
+                LoaderTrace::Command(
+                    DownloadCommand::PatchStart {
+                        address: 0x0090_0000,
+                        length: 4097,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    3,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 4, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 4, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 5, 1),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 5, 3010),
+                LoaderTrace::Command(DownloadCommand::PatchFinish, 6),
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, 7),
+                LoaderTrace::Command(
+                    DownloadCommand::TargetAddressLength {
+                        address: 0x0091_5000,
+                        length: 4097,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    8,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 9, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 9, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 10, 1),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 10, 3010),
+                LoaderTrace::Command(
+                    DownloadCommand::TargetAddressLength {
+                        address: 0x0201_5c00,
+                        length: 3,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    11,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 12, 3),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 12, 3010),
+                LoaderTrace::Command(
+                    DownloadCommand::FirmwareStart {
+                        address: 0x0091_5000,
+                        option: 1,
+                    },
+                    13,
+                ),
+                LoaderTrace::N9Ready,
+                LoaderTrace::Sleep(10),
+                LoaderTrace::N9Ready,
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_loader_injected_transport_failures_always_cleanup_and_release() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut baseline = FakeFirmwareLoader::default();
+        load_mt7921_firmware(
+            &mut baseline,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        for fail_at in 1..=baseline.calls {
+            let mut transport = FakeFirmwareLoader {
+                fail_at: Some(fail_at),
+                ..Default::default()
+            };
+            assert!(
+                load_mt7921_firmware(
+                    &mut transport,
+                    Patch::parse(&patch_bytes).unwrap(),
+                    Firmware::parse(&ram_bytes).unwrap(),
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                transport.trace.last(),
+                Some(LoaderTrace::Cleanup(_))
+            ));
+            let acquired = transport.trace.iter().any(|event| {
+                matches!(
+                    event,
+                    LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, _)
+                )
+            }) && fail_at > 4;
+            if acquired {
+                assert!(transport.trace.iter().any(|event| {
+                    matches!(
+                        event,
+                        LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+                    )
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn firmware_loader_preserves_patch_release_and_completion_failures() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut combined = FakeFirmwareLoader {
+            fail_patch_publish: true,
+            fail_release: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut combined,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::PatchRelease {
+                    primary: Some(_),
+                    release: _,
+                }
+            ))
+        ));
+        assert_eq!(
+            combined.trace.last(),
+            Some(&LoaderTrace::Cleanup(
+                FirmwareLoaderState::PatchSemaphoreHeld
+            ))
+        );
+
+        let mut completion_timeout = FakeFirmwareLoader {
+            fail_patch_completion: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut completion_timeout,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::WaitScatterCompletion(
+                        FirmwareImagePart::Patch
+                    ),
+                    ..
+                }
+            ))
+        ));
+        assert!(completion_timeout.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+        )));
+    }
+
+    #[test]
+    fn firmware_loader_rejects_wrong_completions_and_wraps_sequence() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut wrong = FakeFirmwareLoader {
+            completion_override: Some((
+                DownloadCommand::NicPowerControl,
+                FirmwareCommandCompletion::Ack,
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut wrong,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                    command: DownloadCommand::NicPowerControl,
+                    completion: FirmwareCommandCompletion::Ack,
+                }
+            ))
+        ));
+
+        let mut wrong_and_cleanup = FakeFirmwareLoader {
+            fail_at: Some(2),
+            completion_override: Some((
+                DownloadCommand::NicPowerControl,
+                FirmwareCommandCompletion::Ack,
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut wrong_and_cleanup,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Cleanup {
+                failure: Some(FirmwareLoaderFailure::UnexpectedCommandCompletion { .. }),
+                source: "injected transport failure",
+            })
+        ));
+
+        let mut finish_status = FakeFirmwareLoader {
+            completion_override: Some((
+                DownloadCommand::PatchFinish,
+                FirmwareCommandCompletion::PatchFinish(9),
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut finish_status,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::UnexpectedPatchFinish(9)
+            ))
+        ));
+
+        let mut wrapped = FakeFirmwareLoader {
+            sequence: 14,
+            ..Default::default()
+        };
+        load_mt7921_firmware(
+            &mut wrapped,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped.trace[0],
+            LoaderTrace::Command(DownloadCommand::NicPowerControl, 15)
+        );
+        assert!(wrapped.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 1)
+        )));
+        assert!(!wrapped.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(_, 0)
+                | LoaderTrace::PublishScatter(_, 0, _)
+                | LoaderTrace::ScatterCompletion(_, 0, _)
+        )));
+    }
+
+    #[test]
+    fn firmware_loader_bounds_readiness_warning_and_skips_an_existing_patch() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut timeout = FakeFirmwareLoader {
+            download_states: vec![0],
+            ..Default::default()
+        };
+        let timed_out_report = load_mt7921_firmware(
+            &mut timeout,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(!timed_out_report.download_ready_observed);
+        assert_eq!(timeout.now_ms, DOWNLOAD_READY_TIMEOUT_MS + 10);
+        assert_eq!(
+            timeout
+                .trace
+                .iter()
+                .filter(|event| matches!(event, LoaderTrace::DownloadState))
+                .count(),
+            101
+        );
+        assert_eq!(
+            timeout.trace.last(),
+            Some(&LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        );
+
+        let mut existing = FakeFirmwareLoader {
+            semaphore_result: 1,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware(
+            &mut existing,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.patch, PatchDisposition::AlreadyDownloaded);
+        assert_eq!(report.patch_sections, 0);
+        assert!(!existing.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::PublishScatter(FirmwareImagePart::Patch, ..)
+        )));
+        assert_eq!(
+            existing
+                .trace
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    LoaderTrace::Command(DownloadCommand::TargetAddressLength { .. }, _)
+                ))
+                .count(),
+            2
+        );
+        assert!(!existing.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+        )));
+
+        let mut n9_timeout = FakeFirmwareLoader {
+            n9_states: vec![false],
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut n9_timeout,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::N9ReadyTimeout
+            ))
+        ));
+        assert_eq!(
+            n9_timeout.trace.last(),
+            Some(&LoaderTrace::Cleanup(FirmwareLoaderState::FirmwareStarted))
+        );
+        assert_eq!(
+            n9_timeout
+                .trace
+                .iter()
+                .filter(|event| matches!(event, LoaderTrace::N9Ready))
+                .count(),
+            151
+        );
     }
 
     #[test]
