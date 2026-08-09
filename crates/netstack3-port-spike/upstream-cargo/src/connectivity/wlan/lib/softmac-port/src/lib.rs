@@ -31,6 +31,8 @@ pub use wlan_common::{TimeUnit, mac::CapabilityInfo};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdvertisementKind {
@@ -154,6 +156,7 @@ pub fn allowed_passive_channels(
 /// `ScanObservation` values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BeaconHintAuthorization {
+    owner_id: NonZeroU64,
     epoch: u64,
     channel: ChannelNumber,
     bssid: [u8; 6],
@@ -162,6 +165,7 @@ pub struct BeaconHintAuthorization {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct BeaconHintAuthorizer {
+    owner_id: NonZeroU64,
     alpha2: [u8; 2],
     channel: Option<ChannelNumber>,
     target_bssid: [u8; 6],
@@ -174,6 +178,7 @@ pub struct BeaconHintAuthorizer {
 impl BeaconHintAuthorizer {
     pub fn new(target_bssid: [u8; 6], target_ssid: Vec<u8>) -> Self {
         Self {
+            owner_id: next_beacon_authorizer_id(),
             alpha2: *b"00",
             channel: None,
             target_bssid,
@@ -237,6 +242,7 @@ impl BeaconHintAuthorizer {
             return None;
         }
         let authorization = BeaconHintAuthorization {
+            owner_id: self.owner_id,
             epoch: self.epoch,
             channel,
             bssid: self.target_bssid,
@@ -250,11 +256,20 @@ impl BeaconHintAuthorizer {
     /// cannot survive a channel, regulatory-domain, or reset transition.
     pub fn permits(&self, authorization: &BeaconHintAuthorization) -> bool {
         self.authorization.as_ref() == Some(authorization)
+            && authorization.owner_id == self.owner_id
             && authorization.epoch == self.epoch
             && self.channel == Some(authorization.channel)
             && authorization.bssid == self.target_bssid
             && self.scan_generation == Some(authorization.scan_generation)
     }
+}
+
+fn next_beacon_authorizer_id() -> NonZeroU64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("beacon authorizer identity space exhausted");
+    NonZeroU64::new(id).expect("beacon authorizer identities start at one")
 }
 
 fn ssid_from_ies(ies: &[u8]) -> Option<&[u8]> {
@@ -670,6 +685,13 @@ mod tests {
         authorizer.begin_passive_scan(1, channel);
         let authorization = authorizer.observe(1, &observation).unwrap();
         assert!(authorizer.permits(&authorization));
+
+        let mut other_authorizer = BeaconHintAuthorizer::new(target, b"ph1".to_vec());
+        other_authorizer.begin_passive_scan(1, channel);
+        let other_authorization = other_authorizer.observe(1, &observation).unwrap();
+        assert!(other_authorizer.permits(&other_authorization));
+        assert!(!authorizer.permits(&other_authorization));
+        assert!(!other_authorizer.permits(&authorization));
 
         let mut wrong = observation.clone();
         wrong.kind = AdvertisementKind::ProbeResponse;
