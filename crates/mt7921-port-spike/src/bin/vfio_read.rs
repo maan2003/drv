@@ -2318,7 +2318,11 @@ impl ReadPage {
         }
         match offset {
             0xd4200 if value & !((1 << 0) | (1 << 27)) == 0 => {}
-            0xd4204 if value == 0 || value == (1 << 0) || value == ((1 << 0) | (1 << 27)) => {}
+            0xd4204
+                if value == 0
+                    || value == (1 << 0)
+                    || value == (1 << 27)
+                    || value == ((1 << 0) | (1 << 27)) => {}
             0xd4208 => {}
             0xd4100 => {}
             0xd42b0 => {}
