@@ -6,15 +6,16 @@ use mt7921_port_spike::{
     DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
     DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
-    DynamicL1Error, DynamicL1Event, DynamicL1Transport, GlobalTxRingError, GlobalTxRingEvent,
-    GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
+    DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
+    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
+    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, McuRxRegisters, OwnershipError, OwnershipEvent, OwnershipTransport,
     PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    encode_download_command, mask_ack_disabled_fwdl_interrupt, parse_download_response,
-    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    encode_download_command, load_mt7921_firmware, mask_ack_disabled_fwdl_interrupt,
+    parse_download_response, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
     program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
     stage_disabled_firmware_chunk,
 };
@@ -68,8 +69,11 @@ const SIGTERM: i32 = 15;
 const SIG_ERR: usize = usize::MAX;
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
+const RAM_PATH: &str = "/run/current-system/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin.zst";
 const PATCH_SHA256: &str = "a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6";
+const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9";
 const PATCH_IMAGE_BYTES: usize = 92_192;
+const RAM_IMAGE_BYTES: usize = 792_036;
 
 #[repr(C)]
 #[derive(Default)]
@@ -308,7 +312,9 @@ fn run() -> Result<(), String> {
     let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
     let pcie_mac = if matches!(
         operation,
-        Operation::PrepareOwnedGlobalTxRings | Operation::QueryPatchSemaphore
+        Operation::PrepareOwnedGlobalTxRings
+            | Operation::QueryPatchSemaphore
+            | Operation::RunOneShotFirmware
     ) {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
@@ -627,7 +633,10 @@ fn run() -> Result<(), String> {
         println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
         operation?;
     }
-    if operation == Operation::QueryPatchSemaphore {
+    if matches!(
+        operation,
+        Operation::QueryPatchSemaphore | Operation::RunOneShotFirmware
+    ) {
         verify_pci_dma_disabled(&bdf)?;
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
         let selected = select_vfio_irq(&vfio_irq_capabilities(&device)?)
@@ -637,6 +646,15 @@ fn run() -> Result<(), String> {
         }
         verify_vfio_reset_supported(&device)?;
         println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+        let firmware_images = if operation == Operation::RunOneShotFirmware {
+            let patch = decompress_patch()?;
+            let ram = decompress_ram()?;
+            Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+            Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+            Some((patch, ram))
+        } else {
+            None
+        };
         let selector_page = ReadPage::map(&device, &info, 0xfe000, true)?;
         let dynamic_window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, true)?;
         let swdef = ReadPage::map(&device, &info, 0x9f000, true)?;
@@ -649,6 +667,7 @@ fn run() -> Result<(), String> {
         let mut mcu_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_4000)?;
         let mut mcu_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_5000, 4 * PAGE)?;
         let mut command_payload = DmaArena::map(&iommu, ioas.id, 0x0100_9000)?;
+        let mut fwdl_payload = DmaArena::map(&iommu, ioas.id, 0x0100_a000)?;
         tx_guard.initialize_descriptor_page()?;
         fwdl_ring.initialize_descriptor_page()?;
         mcu_tx_ring.initialize_descriptor_page()?;
@@ -656,6 +675,7 @@ fn run() -> Result<(), String> {
         mcu_rx_ring.initialize_descriptor_page()?;
         mcu_rx_buffers.zero_bytes(4 * PAGE)?;
         command_payload.zero_bytes(PAGE)?;
+        fwdl_payload.zero_bytes(PAGE)?;
         let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
             .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
         for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
@@ -781,9 +801,52 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
             pcie_mac.disable_pcie_l0s()?;
             swdef.write_swdef_normal()?;
+            if operation == Operation::RunOneShotFirmware {
+                let (patch_bytes, ram_bytes) = firmware_images
+                    .as_ref()
+                    .expect("one-shot operation validated firmware artifacts");
+                let mcu = ActiveMcuIo {
+                    wfdma: &wfdma,
+                    irq: irq.as_mut().expect("IRQ installed"),
+                    signal: &signal,
+                    tx_ring: &mut mcu_tx_ring,
+                    payload: &mut command_payload,
+                    rx_ring: &mut mcu_rx_ring,
+                    rx_buffers: &mcu_rx_buffers,
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 0,
+                    rx_count: 8,
+                    irq_bit: 1 << 0,
+                };
+                let mut loader = VfioFirmwareLoader {
+                    mcu,
+                    conn: &conn,
+                    pcie_mac,
+                    device: &device,
+                    bdf: &bdf,
+                    fwdl_ring: &mut fwdl_ring,
+                    fwdl_payload: &mut fwdl_payload,
+                    sequence: 0,
+                    command_index: 0,
+                    fwdl_index: 0,
+                    pending_scatter: None,
+                    start: Instant::now(),
+                };
+                let report = load_mt7921_firmware(
+                    &mut loader,
+                    Patch::parse(patch_bytes)
+                        .map_err(|error| format!("parse patch for loader: {error:?}"))?,
+                    Firmware::parse(ram_bytes)
+                        .map_err(|error| format!("parse RAM for loader: {error:?}"))?,
+                )
+                .map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
+                println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
+                return Ok(());
+            }
             let mut mcu_io = ActiveMcuIo {
                 wfdma: &wfdma,
-                irq: irq.as_ref().expect("IRQ installed"),
+                irq: irq.as_mut().expect("IRQ installed"),
                 signal: &signal,
                 tx_ring: &mut mcu_tx_ring,
                 payload: &mut command_payload,
@@ -900,6 +963,7 @@ fn run() -> Result<(), String> {
         verify_pci_dma_disabled(&bdf)?;
         set_lab_safety("SAFE")?;
         for arena in [
+            &mut fwdl_payload,
             &mut command_payload,
             &mut mcu_rx_buffers,
             &mut mcu_rx_ring,
@@ -1099,6 +1163,17 @@ fn publish_mcu_command(
 ) -> Result<(), String> {
     let bytes = encode_download_command(command, sequence)
         .map_err(|error| format!("encode MCU command: {error:?}"))?;
+    publish_mcu_bytes(wfdma, tx_ring, payload, &bytes, sequence, descriptor_index)
+}
+
+fn publish_mcu_bytes(
+    wfdma: &ReadPage,
+    tx_ring: &mut DmaArena<'_>,
+    payload: &mut DmaArena<'_>,
+    bytes: &[u8],
+    sequence: u8,
+    descriptor_index: usize,
+) -> Result<(), String> {
     let payload_offset = descriptor_index * 256;
     if payload_offset + bytes.len() > payload.len {
         return Err("MCU command payload arena exhausted".into());
@@ -1121,7 +1196,7 @@ fn publish_mcu_command(
     .map_err(|error| format!("encode MCU command DMA descriptor: {error:?}"))?;
     tx_ring.write_descriptor_at(descriptor_index, descriptor);
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    wfdma.write_active_wfdma(0xd4418, (descriptor_index + 1) as u32)?;
+    wfdma.write_active_wfdma(0xd4418, next_dma_index(descriptor_index, 256) as u32)?;
     println!(
         "{{\"active_mcu_event\":\"command_published\",\"sequence\":{sequence},\"tx_descriptor\":{descriptor_index}}}"
     );
@@ -1130,7 +1205,7 @@ fn publish_mcu_command(
 
 struct ActiveMcuIo<'a, 'b> {
     wfdma: &'a ReadPage,
-    irq: &'a VfioIrq,
+    irq: &'a mut VfioIrq,
     signal: &'a ActiveSignalGuard,
     tx_ring: &'a mut DmaArena<'b>,
     payload: &'a mut DmaArena<'b>,
@@ -1143,9 +1218,68 @@ struct ActiveMcuIo<'a, 'b> {
     irq_bit: u32,
 }
 
+struct VfioFirmwareLoader<'a, 'b> {
+    mcu: ActiveMcuIo<'a, 'b>,
+    conn: &'a ReadPage,
+    pcie_mac: &'a ReadPage,
+    device: &'a File,
+    bdf: &'a str,
+    fwdl_ring: &'a mut DmaArena<'b>,
+    fwdl_payload: &'a mut DmaArena<'b>,
+    sequence: u8,
+    command_index: usize,
+    fwdl_index: usize,
+    pending_scatter: Option<(FirmwareImagePart, u8, usize, u32)>,
+    start: Instant,
+}
+
 struct ReceivedMcuResponse {
     event_id: u8,
     bytes: Vec<u8>,
+}
+
+fn classify_mcu_completion(
+    command: DownloadCommand,
+    response: &ReceivedMcuResponse,
+) -> Result<FirmwareCommandCompletion, String> {
+    match command {
+        DownloadCommand::PatchSemaphoreGet | DownloadCommand::PatchSemaphoreRelease => {
+            if response.event_id != 0x04 {
+                return Err(format!(
+                    "patch semaphore response event was {:#04x}, expected 0x04",
+                    response.event_id
+                ));
+            }
+            let result = response
+                .bytes
+                .get(32)
+                .copied()
+                .ok_or("patch semaphore response omitted result")?;
+            Ok(FirmwareCommandCompletion::PatchSemaphore(result.into()))
+        }
+        DownloadCommand::PatchFinish => {
+            let status = response
+                .bytes
+                .get(32)
+                .copied()
+                .ok_or("patch finish response omitted status")?;
+            Ok(FirmwareCommandCompletion::PatchFinish(status))
+        }
+        DownloadCommand::PatchStart { .. }
+        | DownloadCommand::TargetAddressLength { .. }
+        | DownloadCommand::FirmwareStart { .. } => Ok(FirmwareCommandCompletion::Ack),
+        DownloadCommand::NicPowerControl => {
+            Err("NIC power command unexpectedly requested RX classification".into())
+        }
+    }
+}
+
+const fn next_dma_index(index: usize, count: usize) -> usize {
+    (index + 1) % count
+}
+
+const fn dma_index_completed(actual: u32, expected: u32) -> bool {
+    actual == expected
 }
 
 impl ActiveMcuIo<'_, '_> {
@@ -1249,13 +1383,30 @@ impl ActiveMcuIo<'_, '_> {
             if self.handle_irq(None)?.is_some() {
                 return Err("unexpected patch response while waiting for NIC power".into());
             }
-            if self.wfdma.read(0xd441c)? >= expected_dma_index {
+            if self.wfdma.read(0xd441c)? == expected_dma_index {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
                     "MCU TX descriptor was not consumed: expected DIDX {expected_dma_index}"
                 ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn wait_response(
+        &mut self,
+        sequence: u8,
+        deadline: Instant,
+    ) -> Result<ReceivedMcuResponse, String> {
+        loop {
+            self.cancelled()?;
+            if let Some(response) = self.handle_irq(Some(sequence))? {
+                return Ok(response);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("MCU response timed out for sequence {sequence}"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1297,6 +1448,216 @@ impl ActiveMcuIo<'_, '_> {
                 return Err(format!("patch response timed out for sequence {sequence}"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
+    type Error = String;
+
+    fn next_sequence(&mut self) -> u8 {
+        self.sequence = (self.sequence + 1) & 0x0f;
+        if self.sequence == 0 {
+            self.sequence = 1;
+        }
+        self.sequence
+    }
+
+    fn command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<FirmwareCommandCompletion, Self::Error> {
+        self.mcu.cancelled()?;
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, 256);
+        let expects_response = command != DownloadCommand::NicPowerControl;
+        if expects_response {
+            self.mcu
+                .wfdma
+                .write_active_wfdma(0xd4204, self.mcu.irq_bit)?;
+        }
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+
+        let completion = if expects_response {
+            let response = self
+                .mcu
+                .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
+            classify_mcu_completion(command, &response)?
+        } else {
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                self.mcu.cancelled()?;
+                if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "MCU command TX completion timed out at descriptor {descriptor_index}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            FirmwareCommandCompletion::NoResponse
+        };
+        self.mcu
+            .tx_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        self.mcu.payload.zero_bytes(PAGE)?;
+        Ok(completion)
+    }
+
+    fn publish_scatter(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        chunk: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.mcu.cancelled()?;
+        if self.pending_scatter.is_some() {
+            return Err("scatter publication attempted before prior completion".into());
+        }
+        if chunk.is_empty() || chunk.len() > MT7921_FWDL_CHUNK_BYTES {
+            return Err(format!("invalid firmware scatter length {}", chunk.len()));
+        }
+        self.fwdl_payload.write_bytes(chunk)?;
+        let descriptor_index = self.fwdl_index;
+        let next = next_dma_index(descriptor_index, 128);
+        let descriptor = DmaDescriptor::tx(
+            DmaSegment {
+                iova: self.fwdl_payload.iova,
+                len: chunk.len() as u16,
+            },
+            None,
+            0,
+        )
+        .map_err(|error| format!("encode FWDL descriptor: {error:?}"))?;
+        self.fwdl_ring
+            .write_descriptor_at(descriptor_index, descriptor);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.mcu.wfdma.write_active_wfdma(0xd4408, next as u32)?;
+        self.fwdl_index = next;
+        self.pending_scatter = Some((part, sequence, descriptor_index, next as u32));
+        println!(
+            r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index},"bytes":{}}}"#,
+            chunk.len()
+        );
+        Ok(())
+    }
+
+    fn wait_scatter_completion(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        deadline_ms: u64,
+    ) -> Result<(), Self::Error> {
+        let Some((pending_part, pending_sequence, descriptor_index, expected_didx)) =
+            self.pending_scatter
+        else {
+            return Err("scatter completion requested without publication".into());
+        };
+        if (pending_part, pending_sequence) != (part, sequence) {
+            return Err("scatter completion did not match pending publication".into());
+        }
+        loop {
+            self.mcu.cancelled()?;
+            if dma_index_completed(self.mcu.wfdma.read(0xd440c)?, expected_didx) {
+                break;
+            }
+            if self.now_ms() >= deadline_ms {
+                return Err(format!(
+                    "FWDL completion timed out for {part:?} sequence {sequence}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        self.fwdl_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        self.fwdl_payload.zero_bytes(PAGE)?;
+        self.pending_scatter = None;
+        println!(
+            r#"{{"active_fwdl_event":"scatter_completed","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index}}}"#
+        );
+        Ok(())
+    }
+
+    fn firmware_download_state(&mut self) -> Result<u8, Self::Error> {
+        self.mcu.cancelled()?;
+        Ok((self.conn.read(0xe00f0)? & 0x7) as u8)
+    }
+
+    fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
+        self.mcu.cancelled()?;
+        Ok(self.conn.read(0xe00f0)? & 3 == 3)
+    }
+
+    fn now_ms(&self) -> u64 {
+        Instant::now().duration_since(self.start).as_millis() as u64
+    }
+
+    fn sleep_ms(&mut self, duration_ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(duration_ms));
+    }
+
+    fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
+        println!(r#"{{"active_fwdl_event":"cleanup_started","state":"{state:?}"}}"#);
+        let mut errors = Vec::new();
+        if let Err(error) = self.pcie_mac.write_pcie_mac_interrupt_enable_zero() {
+            errors.push(error);
+        }
+        if let Err(error) = self.mcu.wfdma.write_active_wfdma(0xd4204, 0) {
+            errors.push(error);
+        }
+        match self.mcu.wfdma.read(0xd4208) {
+            Ok(global) if global != u32::MAX => {
+                let disabled =
+                    global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+                if let Err(error) = self.mcu.wfdma.write_active_wfdma(0xd4208, disabled) {
+                    errors.push(error);
+                }
+            }
+            Ok(_) => errors.push("WFDMA global config returned all ones during cleanup".into()),
+            Err(error) => errors.push(error),
+        }
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match self.mcu.wfdma.read(0xd4208) {
+                Ok(global) if global & 0xa == 0 => break,
+                Ok(global) if Instant::now() >= deadline => {
+                    errors.push(format!("DMA busy during loader cleanup: {global:#010x}"));
+                    break;
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) => {
+                    errors.push(error);
+                    break;
+                }
+            }
+        }
+        if let Err(error) = set_pci_bus_master(self.bdf, false) {
+            errors.push(error);
+        }
+        if let Err(error) = self.mcu.irq.disable() {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            reset_vfio_device(self.device)?;
+            verify_pci_dma_disabled(self.bdf)?;
+            set_lab_safety("SAFE")?;
+            println!(r#"{{"active_fwdl_event":"reset_while_pinned"}}"#);
+            Ok(())
+        } else {
+            Err(format!("loader cleanup failed before reset: {errors:?}"))
         }
     }
 }
@@ -1906,7 +2267,8 @@ impl ReadPage {
             0xd4690 if value == 0x00c0_0004 => {}
             0xd4640 if value == 0x0340_0004 => {}
             0xd4644 if value == 0x0380_0004 => {}
-            0xd4418 if value <= 3 => {}
+            0xd4408 if value < 128 => {}
+            0xd4418 if value < 256 => {}
             _ => {
                 return Err(format!(
                     "active WFDMA write {offset:#x}={value:#x} escaped allowlist"
@@ -2073,6 +2435,7 @@ enum Operation {
     InstallDisableVfioIrq,
     PrepareOwnedGlobalTxRings,
     QueryPatchSemaphore,
+    RunOneShotFirmware,
 }
 
 impl Operation {
@@ -2083,13 +2446,14 @@ impl Operation {
                 | Self::MaskAckDisabledFwdl
                 | Self::PrepareOwnedGlobalTxRings
                 | Self::QueryPatchSemaphore
+                | Self::RunOneShotFirmware
         )
     }
 
     fn conn_writable(self) -> bool {
         matches!(
             self,
-            Self::AcquireDriverOwnership | Self::QueryPatchSemaphore
+            Self::AcquireDriverOwnership | Self::QueryPatchSemaphore | Self::RunOneShotFirmware
         )
     }
 }
@@ -2435,6 +2799,10 @@ fn decompress_patch() -> Result<Vec<u8>, String> {
     decompress_verified_image(PATCH_PATH, PATCH_SHA256, PATCH_IMAGE_BYTES)
 }
 
+fn decompress_ram() -> Result<Vec<u8>, String> {
+    decompress_verified_image(RAM_PATH, RAM_SHA256, RAM_IMAGE_BYTES)
+}
+
 fn decompress_verified_image(
     path: &str,
     expected_sha256: &str,
@@ -2514,13 +2882,44 @@ mod tests {
         assert!(Operation::MaskAckDisabledFwdl.wfdma_writable());
         assert!(Operation::PrepareOwnedGlobalTxRings.wfdma_writable());
         assert!(Operation::QueryPatchSemaphore.wfdma_writable());
+        assert!(Operation::RunOneShotFirmware.wfdma_writable());
         assert!(!Operation::ReadFixed.wfdma_writable());
         assert!(!Operation::AcquireDriverOwnership.wfdma_writable());
         assert!(!Operation::InventoryVfioIrqs.wfdma_writable());
         assert!(Operation::AcquireDriverOwnership.conn_writable());
         assert!(Operation::QueryPatchSemaphore.conn_writable());
+        assert!(Operation::RunOneShotFirmware.conn_writable());
         assert!(!Operation::ReadFixed.conn_writable());
         assert!(!Operation::PrepareOwnedGlobalTxRings.conn_writable());
+    }
+
+    #[test]
+    fn active_backend_classifies_responses_and_modular_completion_fail_closed() {
+        let mut bytes = vec![0; 33];
+        bytes[32] = 2;
+        let response = ReceivedMcuResponse {
+            event_id: 0x04,
+            bytes,
+        };
+        assert_eq!(
+            classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &response),
+            Ok(FirmwareCommandCompletion::PatchSemaphore(
+                mt7921_port_spike::PatchSemaphoreStatus::Acquired
+            ))
+        );
+        let wrong_event = ReceivedMcuResponse {
+            event_id: 3,
+            bytes: response.bytes.clone(),
+        };
+        assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &wrong_event).is_err());
+        let truncated = ReceivedMcuResponse {
+            event_id: 4,
+            bytes: vec![0; 32],
+        };
+        assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &truncated).is_err());
+        assert_eq!(next_dma_index(127, 128), 0);
+        assert!(dma_index_completed(0, 0));
+        assert!(!dma_index_completed(127, 0));
     }
 
     #[test]
