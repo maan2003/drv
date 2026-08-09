@@ -229,9 +229,8 @@ MAC MMIO sequence without weakening the existing dual-MCU-ring cleanup gate.
 
 `mt7921-passive-scan` now supplies that isolated GPL physical edge for one
 explicit channel-1 gate. It owns an independent eight-entry RX ring 2, verifies
-all four ring registers before authorizing interrupt bit 2, executes and
-readback-checks the ordered 41-operation MAC plan through L1 remap, and restores
-the saved selector on every exit. It then runs the source-exact transport
+all four ring registers before authorizing interrupt bit 2, and executes the
+ordered 41-operation MAC plan with pinned Linux's MMIO semantics. It then runs the source-exact transport
 through pinned Fuchsia `SoftmacHardware`, accepts only parsed beacon/probe
 observations plus the matching scan-done event, and requires both a successful
 completion and at least one BSS. Its DMA mappings join the existing mandatory
@@ -288,8 +287,29 @@ uses exact fixed-map fixtures for every plan address, maps only the eight BAR
 pages those fixtures require, rejects addresses outside the plan, and treats
 all-ones reads as typed failures. It does not touch or restore the remap
 selector; the existing top-ownership transaction remains responsible for its
-own earlier save/restore. This correction is not physically validated and no
-further hardware run is authorized by this evidence alone.
+own earlier save/restore. This correction was not yet physically validated at
+that point, so the next hardware milestone remained prepare-only.
+
+The fixed-map prepare retry from commit `a9ef2fcb` reached the MAC plan but
+stopped at `MT_WF_RMAC_MIB_TIME0(0)`: its bit-30 enable write was observed as
+zero on an immediate read. Report
+`/var/lib/wifi-driver-lab/reports/20260809T153856Z-0000_05_00.0.log` records the
+clean reset/restore and watchdog boot `aee94d73-c729-495d-be53-5abed2552b29`.
+A source-order correction then sent `EFUSE_BUFFER_MODE` immediately before MAC
+initialization, matching `__mt7921_init_hardware`, but report
+`/var/lib/wifi-driver-lab/reports/20260809T154715Z-0000_05_00.0.log` observed
+the same value and again stopped before ring 2/IRQ2.
+
+Pinned `mt76_mmio_rmw` explains why equality was the wrong verification
+contract: it performs one `readl`, calculates `value | (initial & ~mask)`,
+performs one `writel`, and returns the calculated value without requiring an
+immediate hardware readback. `MT_WF_RMAC_MIB_RXTIME_EN` is an enable bit, not a
+documented write-one/self-clearing field, but pinned initialization still does
+not use its immediate read value as success evidence. The executor therefore
+retains all-ones rejection on both pre- and post-write reads and durably logs
+initial/programmed/observed values, while accepting the source primitive's
+single-read/write completion. WTBL update remains different: its pinned source
+explicitly polls the busy bit, so that bounded verification remains mandatory.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed

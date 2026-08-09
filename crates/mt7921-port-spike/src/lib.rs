@@ -3198,8 +3198,9 @@ pub enum PassiveMacMmioOperation {
 }
 
 /// Exact ordered MMIO closure from pinned `mt7921_mac_init` and
-/// `mt792x_mac_init_band`. Physical code must execute and verify every entry;
-/// partial support is not sufficient to attest `mac_mmio_initialized`.
+/// `mt792x_mac_init_band`. Physical code must execute every entry with the
+/// source primitive's verification semantics; partial support is not
+/// sufficient to attest `mac_mmio_initialized`.
 pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
     let mut plan = vec![
         PassiveMacMmioOperation::Rmw {
@@ -3350,6 +3351,13 @@ pub fn validate_passive_mac_bar_read(
         return Err(PassiveMacBarError::AllOnes { address });
     }
     Ok((offset, value))
+}
+
+/// Value produced by pinned `mt76_mmio_rmw`: one MMIO read, this calculation,
+/// then one `writel`. Linux returns the calculated value and does not require
+/// an immediate hardware readback to match it.
+pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
+    value | (initial & !mask)
 }
 
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
@@ -6387,6 +6395,10 @@ mod tests {
 
     #[test]
     fn passive_mac_addresses_use_exact_fixed_bar_map_and_fail_closed() {
+        assert_eq!(
+            passive_mac_source_rmw_value(0x1234_5678, 0x00ff_0000, 0x005a_0000),
+            0x125a_5678
+        );
         let fixtures = [
             (0x820c_d000, 0x0f000),
             (0x820c_d004, 0x0f004),

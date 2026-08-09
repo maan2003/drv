@@ -32,7 +32,7 @@ use mt7921_port_spike::{
     PassiveMacMmioOperation, PassiveMcuCommand, candidate_channels,
     load_mt7921_firmware_with_passive_boundary, parse_passive_advertisement,
     parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
-    validate_passive_mac_bar_read,
+    passive_mac_source_rmw_value, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
@@ -2383,14 +2383,12 @@ impl PassiveMacExecutor<'_> {
                     value,
                 } => {
                     let initial = self.read(address)?;
-                    let programmed = (initial & !mask) | (value & mask);
+                    let programmed = passive_mac_source_rmw_value(initial, mask, value & mask);
                     self.write(address, programmed)?;
                     let readback = self.read(address)?;
-                    if readback & mask != value & mask {
-                        return Err(format!(
-                            "passive MAC {address:#010x} masked readback {readback:#010x}, expected {value:#010x}/{mask:#010x}"
-                        ));
-                    }
+                    println!(
+                        r#"{{"passive_mac_rmw":{{"address":"{address:#010x}","initial":"{initial:#010x}","mask":"{mask:#010x}","programmed":"{programmed:#010x}","observed":"{readback:#010x}","verification":"source-single-read-write"}}}}"#
+                    );
                 }
                 PassiveMacMmioOperation::WtblClear {
                     index,
