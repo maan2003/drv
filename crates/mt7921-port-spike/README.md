@@ -370,6 +370,17 @@ retry and the armed watchdog rebooted as designed; boot
 `5e7097d2-4971-4fa1-a9fd-ffa2a1cc8173` returned with `mt7921e`, iwd, `wlan0`,
 and its default route healthy. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T162423Z-0000_05_00.0.log`.
+
+The first bounded 5 GHz group covered non-DFS world/indoor channels 36, 40,
+44, 48, 149, 153, 157, 161, and 165. The source-exact encoders preserve passive
+scan type, zero SSIDs/probes/IEs/random MAC, and the existing `NO_IR` channel
+domain while selecting Linux's 5 GHz band fields. Release SHA-256
+`82289992d61a5cfd75947c4a15ffbb9c54ad2d6f945db49d6a7a2f7df950768d`
+received matching completion on all nine channels and one valid channel-36
+beacon. Cleanup and restore returned success; after the watchdog reboot,
+`mt7921e`, iwd, `wlan0`, and its default route were healthy on boot
+`1b50ae57-836e-4a88-9600-2a2692e5702d`. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T163223Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
