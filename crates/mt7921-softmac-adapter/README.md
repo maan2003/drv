@@ -20,15 +20,18 @@ timestamps, and waits for matching completion after cancellation. Transport or
 untrusted-input failures poison the state machine. Beacon/probe IEs are passed
 to pinned Fuchsia `construct_bss_description`; this crate contains no IE parser.
 
-The crate has no transport implementation outside its scripted unit test. It
-cannot open a device, send an MCU command, tune a radio, or interact with Linux
-network policy. In particular it does not use `vfio_read`, mac80211, cfg80211,
-or the temporary `iw` scan binary.
+This crate itself has no device-opening implementation. The separate GPL
+`mt7921-passive-scan` workspace implements its physical mechanics trait by
+reusing the bounded VFIO firmware-loader backend; keeping that authority out of
+the adapter preserves this crate's testable policy/mechanics boundary. Neither
+crate uses mac80211, cfg80211, or the temporary `iw` scan binary.
 
-## Physical transport roadmap (not implemented)
+## Physical transport contract
 
-A future, separately authorized physical transport must supply these exact
-MT7921 mechanics before this adapter can operate hardware:
+Any physical transport must supply these exact MT7921 mechanics before this
+adapter can operate hardware. `mt7921-passive-scan` implements the bounded
+one-channel subset; wider channel-list operation remains gated on physical
+evidence:
 
 1. encode and submit the mt76/MT7921 MCU channel-context command for a 20 MHz
    primary channel and match its sequence/status completion;

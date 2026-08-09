@@ -1,6 +1,12 @@
 //! Strictly read-only no-plastic MT7921 VFIO inventory.
 #![cfg(target_os = "linux")]
+#![allow(unexpected_cfgs)]
 
+#[cfg(feature = "fuchsia-passive")]
+use fuchsia_softmac_port::{
+    ChannelBandwidth, ChannelNumber, HardwareScanEvent, SoftmacHardware, WlanBand,
+    WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
+};
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
@@ -20,6 +26,17 @@ use mt7921_port_spike::{
     parse_eeprom_block, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
     prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
     select_vfio_irq, stage_disabled_firmware_chunk,
+};
+#[cfg(feature = "fuchsia-passive")]
+use mt7921_port_spike::{
+    PassiveMacMmioOperation, PassiveMcuCommand, candidate_channels,
+    load_mt7921_firmware_with_passive_boundary, parse_passive_advertisement,
+    parse_passive_scan_done, passive_mac_mmio_plan,
+};
+#[cfg(feature = "fuchsia-passive")]
+use mt7921_softmac_adapter::{
+    Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites, SourceExactPassiveMechanics,
+    SourceExactPassiveTransport,
 };
 use std::{
     cell::Cell,
@@ -245,6 +262,8 @@ fn run() -> Result<(), String> {
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
         Some("--run-one-shot-channel-domain") => Operation::RunOneShotChannelDomain,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -311,13 +330,7 @@ fn run() -> Result<(), String> {
     )?;
 
     let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
-    let pcie_mac = if matches!(
-        operation,
-        Operation::PrepareOwnedGlobalTxRings
-            | Operation::QueryPatchSemaphore
-            | Operation::RunOneShotFirmware
-            | Operation::RunOneShotChannelDomain
-    ) {
+    let pcie_mac = if operation.needs_pcie_mac() {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
         None
@@ -635,12 +648,7 @@ fn run() -> Result<(), String> {
         println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
         operation?;
     }
-    if matches!(
-        operation,
-        Operation::QueryPatchSemaphore
-            | Operation::RunOneShotFirmware
-            | Operation::RunOneShotChannelDomain
-    ) {
+    if operation.is_active_mcu() {
         verify_pci_dma_disabled(&bdf)?;
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
         let selected = select_vfio_irq(&vfio_irq_capabilities(&device)?)
@@ -650,10 +658,7 @@ fn run() -> Result<(), String> {
         }
         verify_vfio_reset_supported(&device)?;
         println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
-        let firmware_images = if matches!(
-            operation,
-            Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
-        ) {
+        let firmware_images = if operation.loads_firmware() {
             let patch = decompress_patch()?;
             let ram = decompress_ram()?;
             Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
@@ -664,6 +669,15 @@ fn run() -> Result<(), String> {
         };
         let selector_page = ReadPage::map(&device, &info, 0xfe000, true)?;
         let dynamic_window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, true)?;
+        #[cfg(feature = "fuchsia-passive")]
+        let passive_window_pages = if operation.is_passive() {
+            PASSIVE_MAC_BAR_PAGES
+                .into_iter()
+                .map(|bar_page| ReadPage::map(&device, &info, bar_page, true))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let swdef = ReadPage::map(&device, &info, 0x9f000, true)?;
         let dmashdl = ReadPage::map(&device, &info, 0xd6000, true)?;
 
@@ -677,6 +691,10 @@ fn run() -> Result<(), String> {
         let mut fwdl_payload = DmaArena::map(&iommu, ioas.id, 0x0100_a000)?;
         let mut mcu_wa_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_b000)?;
         let mut mcu_wa_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_c000, 4 * PAGE)?;
+        #[cfg(feature = "fuchsia-passive")]
+        let mut data_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0101_0000)?;
+        #[cfg(feature = "fuchsia-passive")]
+        let mut data_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0101_1000, 4 * PAGE)?;
         tx_guard.initialize_descriptor_page()?;
         fwdl_ring.initialize_descriptor_page()?;
         mcu_tx_ring.initialize_descriptor_page()?;
@@ -687,6 +705,11 @@ fn run() -> Result<(), String> {
         fwdl_payload.zero_bytes(PAGE)?;
         mcu_wa_rx_ring.initialize_descriptor_page()?;
         mcu_wa_rx_buffers.zero_bytes(4 * PAGE)?;
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            data_rx_ring.initialize_descriptor_page()?;
+            data_rx_buffers.zero_bytes(4 * PAGE)?;
+        }
         let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
             .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
         for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
@@ -696,6 +719,14 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("prepare post-N9 MCU RX descriptors: {error:?}"))?;
         for (index, descriptor) in prepared_wa_rx.descriptors.into_iter().enumerate() {
             mcu_wa_rx_ring.write_descriptor_at(index, descriptor);
+        }
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            let prepared_data = prepare_mcu_rx_ring(data_rx_ring.iova, data_rx_buffers.iova)
+                .map_err(|error| format!("prepare data RX descriptors: {error:?}"))?;
+            for (index, descriptor) in prepared_data.descriptors.into_iter().enumerate() {
+                data_rx_ring.write_descriptor_at(index, descriptor);
+            }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
 
@@ -771,6 +802,12 @@ fn run() -> Result<(), String> {
                 )
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
+                #[cfg(feature = "fuchsia-passive")]
+                if operation == Operation::RunOneShotPassiveChannel1 {
+                    wfdma.write_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
+                    wfdma.verify_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
+                    wfdma.authorize_passive_data_rx_irq()?;
+                }
             }
             let installed = VfioIrq::install(&device, selected)?;
             if installed.try_read()?.is_some() {
@@ -804,11 +841,14 @@ fn run() -> Result<(), String> {
                 | (1 << 30);
             pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
             wfdma.write_active_wfdma(0xd4208, global)?;
-            let response_irq_mask = if matches!(
-                operation,
-                Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
-            ) {
-                WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
+            let response_irq_mask = if operation.loads_firmware() {
+                WM_RX_IRQ_BIT
+                    | WM2_RX_IRQ_BIT
+                    | if operation.is_passive() {
+                        DATA_RX_IRQ_BIT
+                    } else {
+                        0
+                    }
             } else {
                 1 << 0
             };
@@ -826,10 +866,7 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
             pcie_mac.disable_pcie_l0s()?;
             swdef.write_swdef_normal()?;
-            if matches!(
-                operation,
-                Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
-            ) {
+            if operation.loads_firmware() {
                 let (patch_bytes, ram_bytes) = firmware_images
                     .as_ref()
                     .expect("one-shot operation validated firmware artifacts");
@@ -857,6 +894,12 @@ fn run() -> Result<(), String> {
                         rx_count: 8,
                         irq_bit: WM2_RX_IRQ_BIT,
                     }),
+                    extra_irq_mask: if operation.is_passive() {
+                        DATA_RX_IRQ_BIT
+                    } else {
+                        0
+                    },
+                    unsolicited: Vec::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
                     mcu,
@@ -876,6 +919,104 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("parse patch for loader: {error:?}"))?;
                 let firmware = Firmware::parse(ram_bytes)
                     .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
+                #[cfg(feature = "fuchsia-passive")]
+                let result = if operation == Operation::RunOneShotPassiveChannel1 {
+                    load_mt7921_firmware_with_passive_boundary(
+                        &mut loader,
+                        patch,
+                        firmware,
+                        |loader, report| {
+                            let mechanics = VfioPassiveMechanics {
+                                loader,
+                                data: ActiveMcuRx {
+                                    rx_ring: &mut data_rx_ring,
+                                    rx_buffers: &data_rx_buffers,
+                                    rx_tail: 0,
+                                    rx_head: 7,
+                                    rx_ring_index: 2,
+                                    rx_count: 8,
+                                    irq_bit: DATA_RX_IRQ_BIT,
+                                },
+                                selector: &selector_page,
+                                mac_pages: &passive_window_pages,
+                                scan_started: None,
+                                advertisements: Vec::new(),
+                            };
+                            let transport =
+                                SourceExactPassiveTransport::new(mechanics, report.nic_capability)
+                                    .map_err(|error| error.to_string())?;
+                            let candidates = candidate_channels(report.nic_capability);
+                            let channel = ChannelNumber {
+                                band: WlanBand::TwoGhz,
+                                number: 1,
+                            };
+                            let mut adapter = Mt7921SoftmacAdapter::new(
+                                transport,
+                                report.nic_capability,
+                                candidates,
+                                vec![channel],
+                            )
+                            .map_err(|error| error.to_string())?;
+                            adapter
+                                .set_channel(WlanSoftmacBaseSetChannelRequest {
+                                    primary: Some(channel),
+                                    bandwidth: Some(ChannelBandwidth::Cbw20),
+                                    vht_secondary_80_channel: None,
+                                })
+                                .map_err(|error| error.to_string())?;
+                            let response = adapter
+                                .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+                                    channels: Some(vec![channel]),
+                                    min_channel_time: Some(50_000_000),
+                                    max_channel_time: Some(120_000_000),
+                                    min_home_time: Some(0),
+                                })
+                                .map_err(|error| error.to_string())?;
+                            let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
+                            let mut observations = 0usize;
+                            let success = loop {
+                                match adapter
+                                    .next_scan_event()
+                                    .map_err(|error| error.to_string())?
+                                {
+                                    Some(HardwareScanEvent::Observation(observation)) => {
+                                        observations += 1;
+                                        println!(
+                                            r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
+                                        );
+                                    }
+                                    Some(HardwareScanEvent::Complete {
+                                        scan_id: completed,
+                                        success,
+                                    }) if completed == scan_id => break success,
+                                    Some(HardwareScanEvent::Complete {
+                                        scan_id: completed,
+                                        ..
+                                    }) => {
+                                        return Err(format!(
+                                            "passive completion id {completed} did not match {scan_id}"
+                                        ));
+                                    }
+                                    None => std::thread::sleep(std::time::Duration::from_millis(1)),
+                                }
+                            };
+                            if !success || observations == 0 {
+                                return Err(format!(
+                                    "one-channel passive gate failed: success={success} observations={observations}"
+                                ));
+                            }
+                            println!(
+                                r#"{{"passive_scan_event":"one_channel_gate_passed","scan_id":{scan_id},"observations":{observations}}}"#
+                            );
+                            Ok(())
+                        },
+                    )
+                } else if operation == Operation::RunOneShotChannelDomain {
+                    load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
+                } else {
+                    load_mt7921_firmware(&mut loader, patch, firmware)
+                };
+                #[cfg(not(feature = "fuchsia-passive"))]
                 let result = if operation == Operation::RunOneShotChannelDomain {
                     load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
                 } else {
@@ -902,6 +1043,8 @@ fn run() -> Result<(), String> {
                     irq_bit: WM_RX_IRQ_BIT,
                 },
                 wm2: None,
+                extra_irq_mask: 0,
+                unsolicited: Vec::new(),
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -1009,6 +1152,10 @@ fn run() -> Result<(), String> {
         }
         cleanup_errors.extend(attempt_all_cleanup(
             [
+                #[cfg(feature = "fuchsia-passive")]
+                (ActiveArenaKind::DataBuffers, &mut data_rx_buffers),
+                #[cfg(feature = "fuchsia-passive")]
+                (ActiveArenaKind::DataRing, &mut data_rx_ring),
                 (ActiveArenaKind::Wm2Buffers, &mut mcu_wa_rx_buffers),
                 (ActiveArenaKind::Wm2Ring, &mut mcu_wa_rx_ring),
                 (ActiveArenaKind::FwdlPayload, &mut fwdl_payload),
@@ -1280,6 +1427,8 @@ struct ActiveMcuIo<'a, 'b> {
     payload: &'a mut DmaArena<'b>,
     wm: ActiveMcuRx<'a, 'b>,
     wm2: Option<ActiveMcuRx<'a, 'b>>,
+    extra_irq_mask: u32,
+    unsolicited: Vec<ReceivedMcuResponse>,
 }
 
 struct VfioFirmwareLoader<'a, 'b> {
@@ -1305,6 +1454,10 @@ struct ReceivedMcuResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveArenaKind {
+    #[cfg(feature = "fuchsia-passive")]
+    DataBuffers,
+    #[cfg(feature = "fuchsia-passive")]
+    DataRing,
     Wm2Buffers,
     Wm2Ring,
     FwdlPayload,
@@ -1332,7 +1485,10 @@ where
 }
 
 const WM_RX_IRQ_BIT: u32 = 1 << 0;
+const DATA_RX_IRQ_BIT: u32 = 1 << 2;
 const WM2_RX_IRQ_BIT: u32 = 1 << 22;
+#[cfg(feature = "fuchsia-passive")]
+const PASSIVE_MAC_BAR_PAGES: [usize; 5] = [0x44000, 0x45000, 0x47000, 0x49000, 0x4d000];
 
 fn merge_matching_response(
     matched: &mut Option<ReceivedMcuResponse>,
@@ -1363,14 +1519,15 @@ const fn rx_irq_acknowledge(status: u32, mask: u32) -> u32 {
     status & mask
 }
 
-const fn active_wfdma_write_allowed(offset: usize, value: u32) -> bool {
+const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32) -> bool {
     match offset {
-        0xd4200 => value & !(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT) == 0,
+        0xd4200 => value & !rx_irq_mask == 0,
         0xd4204 => {
             value == 0
                 || value == WM_RX_IRQ_BIT
                 || value == WM2_RX_IRQ_BIT
                 || value == (WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT)
+                || (rx_irq_mask & DATA_RX_IRQ_BIT != 0 && value == rx_irq_mask)
         }
         0xd4208 | 0xd4100 | 0xd42b0 => true,
         0xd42f0 => value == 0,
@@ -1382,6 +1539,20 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32) -> bool {
         0xd4418 => value < 256,
         _ => false,
     }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn passive_mac_address_allowed(address: u32) -> bool {
+    passive_mac_mmio_plan()
+        .iter()
+        .any(|operation| match operation {
+            PassiveMacMmioOperation::Rmw {
+                address: expected, ..
+            }
+            | PassiveMacMmioOperation::WtblClear {
+                address: expected, ..
+            } => *expected == address,
+        })
 }
 
 fn classify_mcu_completion(
@@ -1471,6 +1642,7 @@ fn drain_rx_queue(
     wfdma: &ReadPage,
     queue: &mut ActiveMcuRx<'_, '_>,
     expected_sequence: Option<u8>,
+    unsolicited: &mut Vec<ReceivedMcuResponse>,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
     let mut matched = None;
     loop {
@@ -1510,7 +1682,7 @@ fn drain_rx_queue(
         queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
 
         let (parsed, response) = parsed?;
-        let candidate = response_for_sequence(expected_sequence, parsed, response);
+        let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
         if candidate.is_some() {
             if matched.is_some() {
                 return Err(format!(
@@ -1524,6 +1696,13 @@ fn drain_rx_queue(
             );
             matched = candidate;
         } else {
+            if parsed.sequence == 0 {
+                unsolicited.push(ReceivedMcuResponse {
+                    event_id: parsed.event_id,
+                    option: parsed.option,
+                    bytes: response.clone(),
+                });
+            }
             println!(
                 "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}",
                 parsed.sequence, parsed.event_id, queue.rx_ring_index
@@ -1535,7 +1714,7 @@ fn drain_rx_queue(
 
 impl ActiveMcuIo<'_, '_> {
     fn rx_irq_mask(&self) -> u32 {
-        self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit)
+        self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit) | self.extra_irq_mask
     }
 
     fn cancelled(&self) -> Result<(), String> {
@@ -1579,9 +1758,15 @@ impl ActiveMcuIo<'_, '_> {
         println!(
             "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
         );
-        let mut matched = drain_rx_queue(self.wfdma, &mut self.wm, expected_sequence)?;
+        let mut matched = drain_rx_queue(
+            self.wfdma,
+            &mut self.wm,
+            expected_sequence,
+            &mut self.unsolicited,
+        )?;
         if let Some(wm2) = self.wm2.as_mut() {
-            let wm2_match = drain_rx_queue(self.wfdma, wm2, expected_sequence)?;
+            let wm2_match =
+                drain_rx_queue(self.wfdma, wm2, expected_sequence, &mut self.unsolicited)?;
             merge_matching_response(&mut matched, wm2_match)?;
         }
         self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
@@ -1661,6 +1846,91 @@ impl ActiveMcuIo<'_, '_> {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl VfioFirmwareLoader<'_, '_> {
+    fn send_passive_command(
+        &mut self,
+        command: &PassiveMcuCommand,
+        encoded: &[u8],
+        wait_response: bool,
+    ) -> Result<(), String> {
+        self.mcu.cancelled()?;
+        let sequence = *encoded
+            .get(39)
+            .filter(|sequence| (1..=15).contains(*sequence))
+            .ok_or("passive command omitted valid sequence")?;
+        if wait_response != command.expects_response() {
+            return Err("passive response policy disagreed with encoded command".into());
+        }
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, 256);
+        self.mcu
+            .wfdma
+            .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+        if wait_response {
+            let response = self
+                .mcu
+                .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
+            if response.option & (1 << 2) != 0 {
+                return Err("passive command response was unsolicited".into());
+            }
+            match command {
+                PassiveMcuCommand::AddDevice { .. } | PassiveMcuCommand::AddBss => {
+                    let expected_cid = if matches!(command, PassiveMcuCommand::AddDevice { .. }) {
+                        1
+                    } else {
+                        2
+                    };
+                    let body = response
+                        .bytes
+                        .get(36..44)
+                        .ok_or("unified passive response omitted result")?;
+                    let status = u32::from_le_bytes(body[4..8].try_into().expect("fixed field"));
+                    if response.event_id != 1 || body[0] != expected_cid || status != 0 {
+                        return Err(format!(
+                            "unified passive response mismatch: eid={} cid={} status={status}",
+                            response.event_id, body[0]
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                self.mcu.cancelled()?;
+                let _ = self.mcu.handle_irq(None)?;
+                if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "passive command TX completion timed out at descriptor {descriptor_index}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        self.mcu
+            .tx_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        self.mcu.payload.zero_bytes(PAGE)?;
+        println!(
+            r#"{{"passive_scan_event":"command_completed","command":"{command:?}","sequence":{sequence}}}"#
+        );
+        Ok(())
     }
 }
 
@@ -1992,6 +2262,272 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         } else {
             Err(format!("loader cleanup failed before reset: {errors:?}"))
         }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Debug)]
+struct PhysicalPassiveError(String);
+
+#[cfg(feature = "fuchsia-passive")]
+impl std::fmt::Display for PhysicalPassiveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl std::error::Error for PhysicalPassiveError {}
+
+#[cfg(feature = "fuchsia-passive")]
+struct PassiveMacExecutor<'a> {
+    selector: &'a ReadPage,
+    pages: &'a [ReadPage],
+    saved_selector: u32,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl PassiveMacExecutor<'_> {
+    fn page(&self, address: u32) -> Result<&ReadPage, String> {
+        let bar_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
+        self.pages
+            .iter()
+            .find(|page| page.bar_page == bar_page)
+            .ok_or_else(|| format!("passive MAC address {address:#010x} has no mapped page"))
+    }
+
+    fn select(&self, address: u32) -> Result<(), String> {
+        if !passive_mac_address_allowed(address) {
+            return Err(format!("passive MAC selector {address:#010x} escaped plan"));
+        }
+        let value = (self.saved_selector & !0xffff) | address >> 16;
+        self.selector.write_remap_selector(value)?;
+        let actual = self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+        if actual != value {
+            return Err(format!(
+                "passive MAC selector readback {actual:#010x}, expected {value:#010x}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn read(&self, address: u32) -> Result<u32, String> {
+        self.select(address)?;
+        let value = self
+            .page(address)?
+            .read_passive_mac(self.selector, address)?;
+        if value == u32::MAX {
+            return Err(format!(
+                "passive MAC read {address:#010x} returned all ones"
+            ));
+        }
+        Ok(value)
+    }
+
+    fn write(&self, address: u32, value: u32) -> Result<(), String> {
+        self.select(address)?;
+        self.page(address)?
+            .write_passive_mac(self.selector, address, value)
+    }
+
+    fn execute(&self) -> Result<(), String> {
+        let result = (|| {
+            for operation in passive_mac_mmio_plan() {
+                match operation {
+                    PassiveMacMmioOperation::Rmw {
+                        address,
+                        mask,
+                        value,
+                    } => {
+                        let initial = self.read(address)?;
+                        let programmed = (initial & !mask) | (value & mask);
+                        self.write(address, programmed)?;
+                        let readback = self.read(address)?;
+                        if readback & mask != value & mask {
+                            return Err(format!(
+                                "passive MAC {address:#010x} masked readback {readback:#010x}, expected {value:#010x}/{mask:#010x}"
+                            ));
+                        }
+                    }
+                    PassiveMacMmioOperation::WtblClear {
+                        index,
+                        address,
+                        value,
+                        busy_mask,
+                        timeout_us,
+                    } => {
+                        self.write(address, value)?;
+                        let deadline = Instant::now()
+                            + std::time::Duration::from_micros(u64::from(timeout_us));
+                        loop {
+                            let readback = self.read(address)?;
+                            if readback & busy_mask == 0 {
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(format!("WTBL clear {index} busy timeout"));
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(10));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let restore = self.selector.write_remap_selector(self.saved_selector);
+        match (result, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(format!("restore passive MAC selector: {error}")),
+            (Err(error), Err(restore)) => Err(format!(
+                "{error}; restore passive MAC selector also failed: {restore}"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn drain_data_rx_queue(
+    wfdma: &ReadPage,
+    queue: &mut ActiveMcuRx<'_, '_>,
+) -> Result<Vec<mt7921_port_spike::PassiveAdvertisement>, String> {
+    let mut advertisements = Vec::new();
+    loop {
+        let descriptor = queue.rx_ring.read_descriptor_at(queue.rx_tail);
+        if !descriptor.is_dma_done() {
+            break;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let completed_index = queue.rx_tail;
+        let length = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
+        let parsed = if descriptor.ctrl & (1 << 30) == 0 {
+            Err("fragmented data RX descriptor is unsupported".into())
+        } else if !(24..=2048).contains(&length) {
+            Err(format!("invalid data RX descriptor length {length}"))
+        } else {
+            let bytes = queue
+                .rx_buffers
+                .read_bytes(completed_index * 2048, length)?;
+            parse_passive_advertisement(&bytes).map_err(|error| {
+                format!("reject passive RX descriptor {completed_index}: {error:?}")
+            })
+        };
+
+        let refill_index = queue.rx_head;
+        let refill = DmaDescriptor::rx(DmaSegment {
+            iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
+            len: 2048,
+        })
+        .map_err(|error| format!("rearm data RX descriptor: {error:?}"))?;
+        queue.rx_ring.write_descriptor_at(refill_index, refill);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
+        wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)?;
+        queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
+        advertisements.push(parsed?);
+    }
+    Ok(advertisements)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct VfioPassiveMechanics<'a, 'b, 'c> {
+    loader: &'a mut VfioFirmwareLoader<'b, 'c>,
+    data: ActiveMcuRx<'b, 'c>,
+    selector: &'b ReadPage,
+    mac_pages: &'b [ReadPage],
+    scan_started: Option<Instant>,
+    advertisements: Vec<mt7921_port_spike::PassiveAdvertisement>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
+    type Error = PhysicalPassiveError;
+
+    fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+        if self.data.rx_ring_index != 2
+            || self.data.irq_bit != DATA_RX_IRQ_BIT
+            || self.data.rx_count != 8
+            || self.loader.mcu.extra_irq_mask != DATA_RX_IRQ_BIT
+        {
+            return Err(PhysicalPassiveError(
+                "data RX ring 2 identity mismatch".into(),
+            ));
+        }
+        let saved_selector = self
+            .selector
+            .read(MT_HIF_REMAP_L1_BAR_OFFSET)
+            .map_err(PhysicalPassiveError)?;
+        PassiveMacExecutor {
+            selector: self.selector,
+            pages: self.mac_pages,
+            saved_selector,
+        }
+        .execute()
+        .map_err(PhysicalPassiveError)?;
+        println!(r#"{{"passive_scan_event":"mac_mmio_plan_completed","operations":41}}"#);
+        Ok(PassivePrerequisites {
+            channel_domain_mask_zero: true,
+            mac_mmio_initialized: true,
+            data_rx_owned: true,
+        })
+    }
+
+    fn command(
+        &mut self,
+        command: &PassiveMcuCommand,
+        encoded: &[u8],
+        wait_response: bool,
+    ) -> Result<(), Self::Error> {
+        self.loader
+            .send_passive_command(command, encoded, wait_response)
+            .map_err(PhysicalPassiveError)?;
+        if matches!(command, PassiveMcuCommand::StartScan { .. }) {
+            self.scan_started = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    fn next_event(
+        &mut self,
+        deadline_nanos: i64,
+    ) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
+        self.loader
+            .mcu
+            .handle_irq(None)
+            .map_err(PhysicalPassiveError)?;
+        self.advertisements.extend(
+            drain_data_rx_queue(self.loader.mcu.wfdma, &mut self.data)
+                .map_err(PhysicalPassiveError)?,
+        );
+        if let Some(advertisement) = self.advertisements.pop() {
+            return Ok(Some(PassiveMechanicsEvent::Advertisement {
+                timestamp_nanos: self.loader.start.elapsed().as_nanos() as i64,
+                advertisement,
+            }));
+        }
+        if let Some(index) = self
+            .loader
+            .mcu
+            .unsolicited
+            .iter()
+            .position(|event| event.event_id == 0x0d)
+        {
+            let event = self.loader.mcu.unsolicited.remove(index);
+            let done = parse_passive_scan_done(&event.bytes)
+                .map_err(|error| PhysicalPassiveError(format!("parse scan done: {error:?}")))?;
+            return Ok(Some(PassiveMechanicsEvent::ScanDone(done)));
+        }
+        let started = self
+            .scan_started
+            .ok_or_else(|| PhysicalPassiveError("scan event requested before START_SCAN".into()))?;
+        let allowed = u64::try_from(deadline_nanos)
+            .map_err(|_| PhysicalPassiveError("negative passive deadline".into()))?;
+        if started.elapsed() > std::time::Duration::from_nanos(allowed + 2_000_000_000) {
+            return Err(PhysicalPassiveError(
+                "passive scan completion timed out".into(),
+            ));
+        }
+        Ok(None)
     }
 }
 
@@ -2347,6 +2883,7 @@ impl Drop for VfioIrq {
 struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
+    active_rx_irq_mask: Cell<u32>,
 }
 impl ReadPage {
     fn map(
@@ -2376,7 +2913,11 @@ impl ReadPage {
                 std::io::Error::last_os_error()
             )
         })?;
-        Ok(Self { ptr, bar_page })
+        Ok(Self {
+            ptr,
+            bar_page,
+            active_rx_irq_mask: Cell::new(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT),
+        })
     }
     fn read(&self, offset: usize) -> Result<u32, String> {
         let within = offset
@@ -2439,6 +2980,45 @@ impl ReadPage {
             return Err("WFSYS reset write escaped immutable target".into());
         }
         let within = offset - self.bar_page;
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    fn read_passive_mac(&self, selector: &ReadPage, address: u32) -> Result<u32, String> {
+        if !passive_mac_address_allowed(address) {
+            return Err(format!(
+                "passive MAC read {address:#010x} escaped exact plan"
+            ));
+        }
+        let expected_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
+        if self.bar_page != expected_page
+            || selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff != address >> 16
+        {
+            return Err(format!("passive MAC read {address:#010x} used wrong remap"));
+        }
+        self.read(self.bar_page + (address as usize & 0xfff))
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    fn write_passive_mac(
+        &self,
+        selector: &ReadPage,
+        address: u32,
+        value: u32,
+    ) -> Result<(), String> {
+        if !passive_mac_address_allowed(address) {
+            return Err(format!(
+                "passive MAC write {address:#010x} escaped exact plan"
+            ));
+        }
+        let expected_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
+        if self.bar_page != expected_page
+            || selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff != address >> 16
+        {
+            return Err(format!(
+                "passive MAC write {address:#010x} used wrong remap"
+            ));
+        }
+        let within = address as usize & 0xfff;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
@@ -2585,17 +3165,50 @@ impl ReadPage {
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
+    #[cfg(feature = "fuchsia-passive")]
+    fn verify_rx_ring_slot(
+        &self,
+        index: usize,
+        descriptor_base: u32,
+        descriptor_count: u32,
+        cpu_index: u32,
+        dma_index: u32,
+    ) -> Result<(), String> {
+        if self.bar_page != 0xd4000 || index != 2 {
+            return Err("passive RX verification escaped ring 2".into());
+        }
+        let expected = [descriptor_base, descriptor_count, cpu_index, dma_index];
+        for (word, expected) in expected.into_iter().enumerate() {
+            let offset = self.bar_page + 0x500 + index * 0x10 + word * 4;
+            let actual = self.read(offset)?;
+            if actual != expected {
+                return Err(format!(
+                    "passive RX ring 2 word {word} readback {actual:#010x}, expected {expected:#010x}"
+                ));
+            }
+        }
+        Ok(())
+    }
     fn write_active_wfdma(&self, offset: usize, value: u32) -> Result<(), String> {
         if self.bar_page != 0xd4000 {
             return Err("active WFDMA write escaped BAR page".into());
         }
-        if !active_wfdma_write_allowed(offset, value) {
+        if !active_wfdma_write_allowed(offset, value, self.active_rx_irq_mask.get()) {
             return Err(format!(
                 "active WFDMA write {offset:#x}={value:#x} escaped allowlist"
             ));
         }
         let within = offset - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        Ok(())
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    fn authorize_passive_data_rx_irq(&self) -> Result<(), String> {
+        if self.bar_page != 0xd4000 {
+            return Err("data RX authorization escaped WFDMA BAR page".into());
+        }
+        self.active_rx_irq_mask
+            .set(WM_RX_IRQ_BIT | DATA_RX_IRQ_BIT | WM2_RX_IRQ_BIT);
         Ok(())
     }
 }
@@ -2756,9 +3369,37 @@ enum Operation {
     QueryPatchSemaphore,
     RunOneShotFirmware,
     RunOneShotChannelDomain,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassiveChannel1,
 }
 
 impl Operation {
+    fn is_passive(self) -> bool {
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            self == Self::RunOneShotPassiveChannel1
+        }
+        #[cfg(not(feature = "fuchsia-passive"))]
+        {
+            false
+        }
+    }
+
+    fn loads_firmware(self) -> bool {
+        matches!(
+            self,
+            Self::RunOneShotFirmware | Self::RunOneShotChannelDomain
+        ) || self.is_passive()
+    }
+
+    fn is_active_mcu(self) -> bool {
+        self == Self::QueryPatchSemaphore || self.loads_firmware()
+    }
+
+    fn needs_pcie_mac(self) -> bool {
+        self == Self::PrepareOwnedGlobalTxRings || self.is_active_mcu()
+    }
+
     fn wfdma_writable(self) -> bool {
         matches!(
             self,
@@ -2768,7 +3409,7 @@ impl Operation {
                 | Self::QueryPatchSemaphore
                 | Self::RunOneShotFirmware
                 | Self::RunOneShotChannelDomain
-        )
+        ) || self.is_passive()
     }
 
     fn conn_writable(self) -> bool {
@@ -2778,7 +3419,7 @@ impl Operation {
                 | Self::QueryPatchSemaphore
                 | Self::RunOneShotFirmware
                 | Self::RunOneShotChannelDomain
-        )
+        ) || self.is_passive()
     }
 }
 
@@ -3252,17 +3893,61 @@ mod tests {
         let mask = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
         assert_eq!(rx_irq_acknowledge(mask | (1 << 27), mask), mask);
         assert_eq!(rx_irq_acknowledge(1 << 27, mask), 0);
-        assert!(active_wfdma_write_allowed(0xd4200, mask));
-        assert!(active_wfdma_write_allowed(0xd4204, mask));
-        assert!(active_wfdma_write_allowed(0xd4204, WM2_RX_IRQ_BIT));
-        assert!(!active_wfdma_write_allowed(0xd4200, 1 << 27));
-        assert!(!active_wfdma_write_allowed(0xd4204, 1 << 27));
+        assert!(active_wfdma_write_allowed(0xd4200, mask, mask));
+        assert!(active_wfdma_write_allowed(0xd4204, mask, mask));
+        assert!(active_wfdma_write_allowed(0xd4204, WM2_RX_IRQ_BIT, mask));
+        assert!(!active_wfdma_write_allowed(0xd4200, DATA_RX_IRQ_BIT, mask));
+        assert!(!active_wfdma_write_allowed(0xd4204, DATA_RX_IRQ_BIT, mask));
+        let passive_mask = mask | DATA_RX_IRQ_BIT;
+        assert!(active_wfdma_write_allowed(
+            0xd4204,
+            passive_mask,
+            passive_mask
+        ));
+        assert!(!active_wfdma_write_allowed(0xd4200, 1 << 27, mask));
+        assert!(!active_wfdma_write_allowed(0xd4204, 1 << 27, mask));
         let deadline = Instant::now() + std::time::Duration::from_millis(10);
         assert!(!response_wait_timed_out(
             deadline - std::time::Duration::from_nanos(1),
             deadline
         ));
         assert!(response_wait_timed_out(deadline, deadline));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn passive_rx_irq_and_mac_pages_are_exactly_gated() {
+        let base = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
+        let passive = base | DATA_RX_IRQ_BIT;
+        assert!(!active_wfdma_write_allowed(
+            0xd4204,
+            DATA_RX_IRQ_BIT,
+            passive
+        ));
+        assert!(!active_wfdma_write_allowed(
+            0xd4204,
+            WM_RX_IRQ_BIT | DATA_RX_IRQ_BIT,
+            passive
+        ));
+        assert!(active_wfdma_write_allowed(0xd4204, passive, passive));
+        assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
+        assert!(Operation::RunOneShotPassiveChannel1.conn_writable());
+        assert!(Operation::RunOneShotPassiveChannel1.loads_firmware());
+
+        let mut required = passive_mac_mmio_plan()
+            .into_iter()
+            .map(|operation| match operation {
+                PassiveMacMmioOperation::Rmw { address, .. }
+                | PassiveMacMmioOperation::WtblClear { address, .. } => {
+                    MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000)
+                }
+            })
+            .collect::<Vec<_>>();
+        required.sort_unstable();
+        required.dedup();
+        assert_eq!(required, PASSIVE_MAC_BAR_PAGES);
+        assert!(!passive_mac_address_allowed(0x820e_4000));
+        assert!(!passive_mac_address_allowed(0x820e_40f8));
     }
 
     #[test]

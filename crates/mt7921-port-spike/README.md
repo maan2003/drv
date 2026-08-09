@@ -221,9 +221,20 @@ bounded requested timing, advertisement conversion, and completion semantics.
 The lower mechanics edge must attest that the mask-zero channel domain,
 source-required MAC MMIO initialization, and separately owned data-RX ring are
 all present before the first MCU command; any missing mandatory dependency
-poisons the adapter before publication. This remains offline-only until the
+poisons the adapter before publication. This remained offline-only until the
 physical mechanics edge owns RX ring 2/interrupt bit 2 and ports the mandatory
 MAC MMIO sequence without weakening the existing dual-MCU-ring cleanup gate.
+
+`mt7921-passive-scan` now supplies that isolated GPL physical edge for one
+explicit channel-1 gate. It owns an independent eight-entry RX ring 2, verifies
+all four ring registers before authorizing interrupt bit 2, executes and
+readback-checks the ordered 41-operation MAC plan through L1 remap, and restores
+the saved selector on every exit. It then runs the source-exact transport
+through pinned Fuchsia `SoftmacHardware`, accepts only parsed beacon/probe
+observations plus the matching scan-done event, and requires both a successful
+completion and at least one BSS. Its DMA mappings join the existing mandatory
+reset-while-pinned cleanup. This edge is offline-tested but not yet physically
+validated; no claim about channel-1 reception or restoration is made here.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
