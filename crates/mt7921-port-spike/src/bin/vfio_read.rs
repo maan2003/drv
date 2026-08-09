@@ -2,24 +2,24 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
-    ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError, DisabledFirmwareStageEvent,
-    DisabledFirmwareStageTransport, DisabledFwdlError, DisabledFwdlEvent,
-    DisabledFwdlInterruptTransport, DisabledFwdlRegister, DisabledFwdlRingTransport,
-    DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent, DisabledMcuRxEvent,
-    DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand, DynamicL1Error,
-    DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion, FirmwareImagePart,
-    FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError, GlobalTxRingEvent,
-    GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
+    ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
+    DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
+    DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
+    DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
+    DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
+    DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
+    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
+    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, McuRxRegisters, OwnershipError, OwnershipEvent, OwnershipTransport,
     PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    encode_download_command, load_mt7921_firmware, mask_ack_disabled_fwdl_interrupt,
-    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_nic_capability,
-    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    encode_download_command, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
+    mask_ack_disabled_fwdl_interrupt, parse_clc_set_response, parse_download_response,
+    parse_eeprom_block, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
+    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    select_vfio_irq, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -244,6 +244,7 @@ fn run() -> Result<(), String> {
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
+        Some("--run-one-shot-channel-domain") => Operation::RunOneShotChannelDomain,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -315,6 +316,7 @@ fn run() -> Result<(), String> {
         Operation::PrepareOwnedGlobalTxRings
             | Operation::QueryPatchSemaphore
             | Operation::RunOneShotFirmware
+            | Operation::RunOneShotChannelDomain
     ) {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
     } else {
@@ -635,7 +637,9 @@ fn run() -> Result<(), String> {
     }
     if matches!(
         operation,
-        Operation::QueryPatchSemaphore | Operation::RunOneShotFirmware
+        Operation::QueryPatchSemaphore
+            | Operation::RunOneShotFirmware
+            | Operation::RunOneShotChannelDomain
     ) {
         verify_pci_dma_disabled(&bdf)?;
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
@@ -646,7 +650,10 @@ fn run() -> Result<(), String> {
         }
         verify_vfio_reset_supported(&device)?;
         println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
-        let firmware_images = if operation == Operation::RunOneShotFirmware {
+        let firmware_images = if matches!(
+            operation,
+            Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
+        ) {
             let patch = decompress_patch()?;
             let ram = decompress_ram()?;
             Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
@@ -797,7 +804,10 @@ fn run() -> Result<(), String> {
                 | (1 << 30);
             pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
             wfdma.write_active_wfdma(0xd4208, global)?;
-            let response_irq_mask = if operation == Operation::RunOneShotFirmware {
+            let response_irq_mask = if matches!(
+                operation,
+                Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
+            ) {
                 WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
             } else {
                 1 << 0
@@ -816,7 +826,10 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
             pcie_mac.disable_pcie_l0s()?;
             swdef.write_swdef_normal()?;
-            if operation == Operation::RunOneShotFirmware {
+            if matches!(
+                operation,
+                Operation::RunOneShotFirmware | Operation::RunOneShotChannelDomain
+            ) {
                 let (patch_bytes, ram_bytes) = firmware_images
                     .as_ref()
                     .expect("one-shot operation validated firmware artifacts");
@@ -859,14 +872,17 @@ fn run() -> Result<(), String> {
                     pending_scatter: None,
                     start: Instant::now(),
                 };
-                let report = load_mt7921_firmware(
-                    &mut loader,
-                    Patch::parse(patch_bytes)
-                        .map_err(|error| format!("parse patch for loader: {error:?}"))?,
-                    Firmware::parse(ram_bytes)
-                        .map_err(|error| format!("parse RAM for loader: {error:?}"))?,
-                )
-                .map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
+                let patch = Patch::parse(patch_bytes)
+                    .map_err(|error| format!("parse patch for loader: {error:?}"))?;
+                let firmware = Firmware::parse(ram_bytes)
+                    .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
+                let result = if operation == Operation::RunOneShotChannelDomain {
+                    load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
+                } else {
+                    load_mt7921_firmware(&mut loader, patch, firmware)
+                };
+                let report =
+                    result.map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
                 println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
                 return Ok(());
             }
@@ -1772,6 +1788,58 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(PAGE)?;
         Ok(response)
+    }
+
+    fn set_channel_domain(
+        &mut self,
+        command: &ChannelDomainCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.mcu.cancelled()?;
+        if command.alpha2 != *b"00"
+            || !command.indoor
+            || command.special_unii_mask != 0
+            || command.channels.is_empty()
+        {
+            return Err("SET_CHAN_DOMAIN escaped the world/indoor mask-zero allowlist".into());
+        }
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, 256);
+        self.mcu
+            .wfdma
+            .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            self.mcu.cancelled()?;
+            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "SET_CHAN_DOMAIN TX completion timed out at descriptor {descriptor_index}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.mcu
+            .tx_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        self.mcu.payload.zero_bytes(PAGE)?;
+        println!(
+            "{{\"active_mcu_event\":\"set_channel_domain_tx_complete\",\"sequence\":{sequence},\"channels\":{}}}",
+            command.channels.len()
+        );
+        Ok(())
     }
 
     fn publish_scatter(
@@ -2687,6 +2755,7 @@ enum Operation {
     PrepareOwnedGlobalTxRings,
     QueryPatchSemaphore,
     RunOneShotFirmware,
+    RunOneShotChannelDomain,
 }
 
 impl Operation {
@@ -2698,13 +2767,17 @@ impl Operation {
                 | Self::PrepareOwnedGlobalTxRings
                 | Self::QueryPatchSemaphore
                 | Self::RunOneShotFirmware
+                | Self::RunOneShotChannelDomain
         )
     }
 
     fn conn_writable(self) -> bool {
         matches!(
             self,
-            Self::AcquireDriverOwnership | Self::QueryPatchSemaphore | Self::RunOneShotFirmware
+            Self::AcquireDriverOwnership
+                | Self::QueryPatchSemaphore
+                | Self::RunOneShotFirmware
+                | Self::RunOneShotChannelDomain
         )
     }
 }
@@ -3220,12 +3293,14 @@ mod tests {
         assert!(Operation::PrepareOwnedGlobalTxRings.wfdma_writable());
         assert!(Operation::QueryPatchSemaphore.wfdma_writable());
         assert!(Operation::RunOneShotFirmware.wfdma_writable());
+        assert!(Operation::RunOneShotChannelDomain.wfdma_writable());
         assert!(!Operation::ReadFixed.wfdma_writable());
         assert!(!Operation::AcquireDriverOwnership.wfdma_writable());
         assert!(!Operation::InventoryVfioIrqs.wfdma_writable());
         assert!(Operation::AcquireDriverOwnership.conn_writable());
         assert!(Operation::QueryPatchSemaphore.conn_writable());
         assert!(Operation::RunOneShotFirmware.conn_writable());
+        assert!(Operation::RunOneShotChannelDomain.conn_writable());
         assert!(!Operation::ReadFixed.conn_writable());
         assert!(!Operation::PrepareOwnedGlobalTxRings.conn_writable());
     }

@@ -2474,6 +2474,82 @@ pub struct CandidateChannelSummary {
     pub ghz6: u16,
 }
 
+const FUCHSIA_PASSIVE_5GHZ: [u16; 25] = [
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165,
+];
+
+/// One enabled channel in pinned Linux `mt76_connac_mcu_channel_domain`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelDomainChannel {
+    pub band: PhysicalBand,
+    pub number: u16,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelDomainCommand {
+    pub alpha2: [u8; 2],
+    pub indoor: bool,
+    pub special_unii_mask: u8,
+    pub channels: Vec<ChannelDomainChannel>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelDomainError {
+    NonWorldDomain,
+    OutdoorEnvironment,
+    NonzeroSpecialUniiMask,
+    MissingBandCapabilities,
+    InvalidSequence,
+    InvalidChannelSet,
+}
+
+/// Generate only the pinned Fuchsia world/indoor passive channel intersection.
+/// Every entry carries Linux `IEEE80211_CHAN_NO_IR`; SET_CHAN_DOMAIN therefore
+/// cannot authorize transmission before the later passive-scan boundary.
+pub fn conservative_channel_domain(
+    capability: NicCapability,
+    alpha2: [u8; 2],
+    indoor: bool,
+    special_unii_mask: u8,
+) -> Result<ChannelDomainCommand, ChannelDomainError> {
+    if alpha2 != *b"00" {
+        return Err(ChannelDomainError::NonWorldDomain);
+    }
+    if !indoor {
+        return Err(ChannelDomainError::OutdoorEnvironment);
+    }
+    if special_unii_mask != 0 {
+        return Err(ChannelDomainError::NonzeroSpecialUniiMask);
+    }
+    if capability.phy.is_none() {
+        return Err(ChannelDomainError::MissingBandCapabilities);
+    }
+    let channels: Vec<ChannelDomainChannel> = candidate_channels(capability)
+        .into_iter()
+        .filter(|channel| {
+            matches!(channel.band, PhysicalBand::Ghz2) && channel.number <= 14
+                || matches!(channel.band, PhysicalBand::Ghz5)
+                    && FUCHSIA_PASSIVE_5GHZ.contains(&channel.number)
+        })
+        .map(|channel| ChannelDomainChannel {
+            band: channel.band,
+            number: channel.number,
+            flags: 1 << 1,
+        })
+        .collect();
+    if channels.is_empty() {
+        return Err(ChannelDomainError::MissingBandCapabilities);
+    }
+    Ok(ChannelDomainCommand {
+        alpha2,
+        indoor,
+        special_unii_mask,
+        channels,
+    })
+}
+
 /// Build the physical candidate universe installed by pinned mt76. These are
 /// not regulatory-valid channels until regdb, platform limits and CLC output
 /// have been applied.
@@ -2811,6 +2887,73 @@ pub fn encode_clc_set_command(
     Ok(bytes)
 }
 
+/// Encode pinned Linux `MCU_CE_CMD(SET_CHAN_DOMAIN)` with its packed header
+/// and channel records. This command intentionally requests no MCU response.
+pub fn encode_channel_domain_command(
+    command: &ChannelDomainCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, ChannelDomainError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(ChannelDomainError::InvalidSequence);
+    }
+    if command.alpha2 != *b"00" {
+        return Err(ChannelDomainError::NonWorldDomain);
+    }
+    if !command.indoor {
+        return Err(ChannelDomainError::OutdoorEnvironment);
+    }
+    if command.special_unii_mask != 0 {
+        return Err(ChannelDomainError::NonzeroSpecialUniiMask);
+    }
+    let mut n_2ch = 0u8;
+    let mut n_5ch = 0u8;
+    let mut previous = None;
+    for channel in &command.channels {
+        let valid = match channel.band {
+            PhysicalBand::Ghz2 => channel.number >= 1 && channel.number <= 14,
+            PhysicalBand::Ghz5 => FUCHSIA_PASSIVE_5GHZ.contains(&channel.number),
+            PhysicalBand::Ghz6 => false,
+        };
+        let order = match channel.band {
+            PhysicalBand::Ghz2 => channel.number,
+            PhysicalBand::Ghz5 => 256 + channel.number,
+            PhysicalBand::Ghz6 => u16::MAX,
+        };
+        if !valid || channel.flags != 1 << 1 || previous.is_some_and(|value| value >= order) {
+            return Err(ChannelDomainError::InvalidChannelSet);
+        }
+        previous = Some(order);
+        match channel.band {
+            PhysicalBand::Ghz2 => n_2ch = n_2ch.saturating_add(1),
+            PhysicalBand::Ghz5 => n_5ch = n_5ch.saturating_add(1),
+            PhysicalBand::Ghz6 => unreachable!("6 GHz was rejected"),
+        }
+    }
+    if command.channels.is_empty() {
+        return Err(ChannelDomainError::InvalidChannelSet);
+    }
+    let request_length = 12 + command.channels.len() * 8;
+    let total = CONNAC2_MCU_TXD_BYTES + request_length;
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0x0f, 0xa0, 1, sequence]);
+    let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+    request[..2].copy_from_slice(&command.alpha2);
+    request[4..8].copy_from_slice(&[0, 3, 3, 0]);
+    request[8..12].copy_from_slice(&[n_2ch, n_5ch, 0, 0]);
+    for (index, channel) in command.channels.iter().enumerate() {
+        let offset = 12 + index * 8;
+        request[offset..offset + 2].copy_from_slice(&channel.number.to_le_bytes());
+        request[offset + 4..offset + 8].copy_from_slice(&channel.flags.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
 pub const FIRMWARE_POLL_INTERVAL_MS: u64 = 10;
 pub const DOWNLOAD_READY_TIMEOUT_MS: u64 = 1000;
 pub const N9_READY_TIMEOUT_MS: u64 = 1500;
@@ -2832,6 +2975,7 @@ pub enum FirmwareLoaderState {
     CapabilityDiscovered,
     EepromDiscovered,
     ClcConfigured,
+    ChannelDomainConfigured,
     Ready,
 }
 
@@ -2849,6 +2993,7 @@ pub enum FirmwareLoaderOperation {
     PollDownloadReady,
     PollN9Ready,
     SetClc,
+    SetChannelDomain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2902,6 +3047,12 @@ pub trait FirmwareLoaderTransport {
         sequence: u8,
         encoded: &[u8],
     ) -> Result<Option<ClcSetResponse>, Self::Error>;
+    fn set_channel_domain(
+        &mut self,
+        command: &ChannelDomainCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<(), Self::Error>;
     fn publish_scatter(
         &mut self,
         part: FirmwareImagePart,
@@ -2945,6 +3096,7 @@ pub enum FirmwareLoaderFailure<E> {
     MissingFirmwareOverride,
     N9ReadyTimeout,
     Clc(ClcDiscoveryError),
+    ChannelDomain(ChannelDomainError),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3021,6 +3173,21 @@ fn loader_set_clc<T: FirmwareLoaderTransport>(
         })
 }
 
+fn loader_set_channel_domain<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: &ChannelDomainCommand,
+) -> Result<(), FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded = encode_channel_domain_command(command, sequence)
+        .map_err(FirmwareLoaderFailure::ChannelDomain)?;
+    transport
+        .set_channel_domain(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::SetChannelDomain,
+            source,
+        })
+}
+
 fn loader_scatter<T: FirmwareLoaderTransport>(
     transport: &mut T,
     part: FirmwareImagePart,
@@ -3070,6 +3237,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     patch: Patch<'_>,
     firmware: Firmware<'_>,
     state: &mut FirmwareLoaderState,
+    configure_channel_domain: bool,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
     let mut report = FirmwareLoaderReport {
         download_ready_observed: false,
@@ -3297,6 +3465,17 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                     .checked_add(1)
                     .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
             }
+            if configure_channel_domain {
+                let command = conservative_channel_domain(
+                    report.nic_capability,
+                    *b"00",
+                    true,
+                    report.special_unii_mask,
+                )
+                .map_err(FirmwareLoaderFailure::ChannelDomain)?;
+                loader_set_channel_domain(transport, &command)?;
+                *state = FirmwareLoaderState::ChannelDomainConfigured;
+            }
             *state = FirmwareLoaderState::Ready;
             Ok(report)
         }
@@ -3316,7 +3495,27 @@ pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false);
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Execute through the separately gated source-exact SET_CHAN_DOMAIN boundary.
+/// No channel tuning, radio enable, or scan command is issued.
+pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true);
+    finish_firmware_loader(transport, state, result)
+}
+
+fn finish_firmware_loader<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    state: FirmwareLoaderState,
+    result: Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     match (result, transport.fail_closed_cleanup(state)) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(failure), Ok(())) => Err(FirmwareLoaderError::Failed(failure)),
@@ -5452,6 +5651,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn channel_domain_is_exact_fuchsia_world_indoor_passive_intersection() {
+        let capability = nic_capability_fixture().1;
+        let command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        assert_eq!(command.channels.len(), 39);
+        assert_eq!(command.channels[0].number, 1);
+        assert_eq!(command.channels[13].number, 14);
+        assert_eq!(command.channels[14].number, 36);
+        assert_eq!(command.channels.last().unwrap().number, 165);
+        assert!(
+            command
+                .channels
+                .iter()
+                .all(|channel| channel.flags == 1 << 1)
+        );
+        assert!(
+            !command
+                .channels
+                .iter()
+                .any(|channel| channel.band == PhysicalBand::Ghz6 || channel.number >= 169)
+        );
+
+        let encoded = encode_channel_domain_command(&command, 2).unwrap();
+        assert_eq!(encoded.len(), CONNAC2_MCU_TXD_BYTES + 12 + 39 * 8);
+        assert_eq!(&encoded[36..44], &[0x0f, 0xa0, 1, 2, 0, 0, 0, 0]);
+        assert_eq!(
+            &encoded[64..76],
+            &[b'0', b'0', 0, 0, 0, 3, 3, 0, 14, 25, 0, 0]
+        );
+        assert_eq!(&encoded[76..84], &[1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(&encoded[188..196], &[36, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            encode_channel_domain_command(&command, 0),
+            Err(ChannelDomainError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn channel_domain_policy_and_encoder_fail_closed() {
+        let capability = nic_capability_fixture().1;
+        assert_eq!(
+            conservative_channel_domain(capability, *b"US", true, 0),
+            Err(ChannelDomainError::NonWorldDomain)
+        );
+        assert_eq!(
+            conservative_channel_domain(capability, *b"00", false, 0),
+            Err(ChannelDomainError::OutdoorEnvironment)
+        );
+        assert_eq!(
+            conservative_channel_domain(capability, *b"00", true, 1),
+            Err(ChannelDomainError::NonzeroSpecialUniiMask)
+        );
+        let mut command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        command.channels[14].number = 169;
+        assert_eq!(
+            encode_channel_domain_command(&command, 1),
+            Err(ChannelDomainError::InvalidChannelSet)
+        );
+        let mut command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        command.channels[0].flags = 0;
+        assert_eq!(
+            encode_channel_domain_command(&command, 1),
+            Err(ChannelDomainError::InvalidChannelSet)
+        );
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum LoaderTrace {
         Command(DownloadCommand, u8),
@@ -5462,6 +5727,7 @@ mod tests {
         Sleep(u64),
         Cleanup(FirmwareLoaderState),
         SetClc(u8, u8),
+        SetChannelDomain(usize, u8),
     }
 
     struct FakeFirmwareLoader {
@@ -5479,6 +5745,7 @@ mod tests {
         fail_release: bool,
         fail_patch_publish: bool,
         fail_patch_completion: bool,
+        clc_mask: u8,
     }
 
     impl Default for FakeFirmwareLoader {
@@ -5498,6 +5765,7 @@ mod tests {
                 fail_release: false,
                 fail_patch_publish: false,
                 fail_patch_completion: false,
+                clc_mask: 0x1f,
             }
         }
     }
@@ -5597,8 +5865,23 @@ mod tests {
             Ok(command.expects_response().then_some(ClcSetResponse {
                 tag: 0,
                 length: 68,
-                special_unii_mask: 0x1f,
+                special_unii_mask: self.clc_mask,
             }))
+        }
+
+        fn set_channel_domain(
+            &mut self,
+            command: &ChannelDomainCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<(), Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[36..39], &[0x0f, 0xa0, 1]);
+            self.trace.push(LoaderTrace::SetChannelDomain(
+                command.channels.len(),
+                sequence,
+            ));
+            self.step()
         }
 
         fn publish_scatter(
@@ -5803,6 +6086,74 @@ mod tests {
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
+    }
+
+    #[test]
+    fn channel_domain_loader_boundary_is_separate_and_cleans_up() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware_through_channel_domain(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.special_unii_mask, 0);
+        assert!(matches!(
+            &transport.trace[transport.trace.len() - 2..],
+            [
+                LoaderTrace::SetChannelDomain(39, 2),
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
+            ]
+        ));
+
+        let mut rejected = FakeFirmwareLoader::default();
+        assert!(matches!(
+            load_mt7921_firmware_through_channel_domain(
+                &mut rejected,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::ChannelDomain(ChannelDomainError::NonzeroSpecialUniiMask)
+            ))
+        ));
+        assert!(
+            !rejected
+                .trace
+                .iter()
+                .any(|event| matches!(event, LoaderTrace::SetChannelDomain(_, _)))
+        );
+        assert!(matches!(
+            rejected.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::ClcConfigured))
+        ));
+
+        let mut failed = FakeFirmwareLoader {
+            clc_mask: 0,
+            fail_at: Some(transport.calls - 1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware_through_channel_domain(
+                &mut failed,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::SetChannelDomain,
+                    source: "injected transport failure",
+                }
+            ))
+        ));
+        assert!(matches!(
+            failed.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::ClcConfigured))
+        ));
     }
 
     #[test]

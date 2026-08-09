@@ -174,8 +174,21 @@ installed CLC record and encodes CID
 `0x5c`, preserves Linux's no-ACPI `MTCL_INVALID` sentinel as `0xff` in the
 packed request, and bounds the 68-byte response plus five-bit UNII mask. State advances
 to `ClcConfigured` before publication so any timeout or response mismatch still
-forces reset-while-pinned cleanup. Neither `SET_CHAN_DOMAIN` nor cfg80211 policy
-is represented here.
+forces reset-while-pinned cleanup.
+
+`SET_CHAN_DOMAIN` is a second, separately selected one-shot boundary. Its
+source-exact packed Connac2 request uses CID `0x0f`, bandwidth fields `0/3/3`,
+and eight-byte little-endian channel records, with Linux's `wait_resp=false`
+TX-completion contract. The request can only be generated for country `00`,
+indoor operation, and a firmware special-UNII mask of zero. It intersects the
+device capability with the pinned Fuchsia passive universe: 2.4 GHz channels
+1-14 and 5 GHz channels 36-165 (excluding 169-177), never 6 GHz. All 39 channels
+in the installed capability fixture carry `IEEE80211_CHAN_NO_IR`, so this step
+does not authorize transmission. The old `--run-one-shot-fwdl` mode still stops
+after CLC; only `--run-one-shot-channel-domain` can publish the new command.
+Both modes retain simultaneous WM/WM2 receive ownership and mandatory
+reset-while-pinned cleanup. No set-channel, radio-enable, or scan command is
+encoded by this boundary, and it has not yet received live authorization.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
