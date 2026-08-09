@@ -277,6 +277,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-2ghz") => Operation::RunOneShotPassive2Ghz,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-5ghz-non-dfs") => Operation::RunOneShotPassive5GhzNonDfs,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-5ghz-dfs-low") => Operation::RunOneShotPassive5GhzDfsLow,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -971,6 +973,7 @@ fn run() -> Result<(), String> {
                         | Operation::RunOneShotPassiveChannels1And6
                         | Operation::RunOneShotPassive2Ghz
                         | Operation::RunOneShotPassive5GhzNonDfs
+                        | Operation::RunOneShotPassive5GhzDfsLow
                 ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -1008,6 +1011,9 @@ fn run() -> Result<(), String> {
                                     WlanBand::FiveGhz,
                                     vec![36, 40, 44, 48, 149, 153, 157, 161, 165],
                                 ),
+                                Operation::RunOneShotPassive5GhzDfsLow => {
+                                    (WlanBand::FiveGhz, vec![52, 56, 60, 64])
+                                }
                                 _ => unreachable!("passive scan operation matched above"),
                             };
                             let channels = channel_numbers
@@ -3543,6 +3549,8 @@ enum Operation {
     RunOneShotPassive2Ghz,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassive5GhzNonDfs,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassive5GhzDfsLow,
 }
 
 impl Operation {
@@ -3556,6 +3564,7 @@ impl Operation {
                     | Self::RunOneShotPassiveChannels1And6
                     | Self::RunOneShotPassive2Ghz
                     | Self::RunOneShotPassive5GhzNonDfs
+                    | Self::RunOneShotPassive5GhzDfsLow
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -4123,6 +4132,9 @@ mod tests {
         assert!(Operation::RunOneShotPassive5GhzNonDfs.wfdma_writable());
         assert!(Operation::RunOneShotPassive5GhzNonDfs.conn_writable());
         assert!(Operation::RunOneShotPassive5GhzNonDfs.loads_firmware());
+        assert!(Operation::RunOneShotPassive5GhzDfsLow.wfdma_writable());
+        assert!(Operation::RunOneShotPassive5GhzDfsLow.conn_writable());
+        assert!(Operation::RunOneShotPassive5GhzDfsLow.loads_firmware());
         assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
         assert!(Operation::RunOneShotPassivePrepare.conn_writable());
         assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
