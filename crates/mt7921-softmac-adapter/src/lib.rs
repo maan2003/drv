@@ -18,6 +18,7 @@ use mt7921_port_spike::{
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand,
     candidate_channels as capability_channels, encode_passive_mcu_command,
 };
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 
@@ -131,7 +132,16 @@ pub struct SourceExactPassiveTransport<M> {
     selected: Option<CandidateChannel>,
     receive_prepared: bool,
     initialized: bool,
-    active: Option<(u64, u8, i64)>,
+    active: Option<ActivePassiveScan>,
+    delivery: VecDeque<TransportEvent>,
+}
+
+struct ActivePassiveScan {
+    scan_id: u64,
+    scan_sequence: u8,
+    deadline_nanos: i64,
+    remaining: VecDeque<CandidateChannel>,
+    observations: Vec<RawAdvertisement>,
 }
 
 impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
@@ -155,6 +165,7 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
             receive_prepared: false,
             initialized: false,
             active: None,
+            delivery: VecDeque::new(),
         })
     }
 
@@ -233,12 +244,11 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
 
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error> {
-        if command.channels.len() != 1 {
+        let Some((&channel, remaining)) = command.channels.split_first() else {
             return Err(SourceExactTransportError::UnsupportedMultiChannelScan);
-        }
-        let channel = command.channels[0];
+        };
         if self.selected != Some(channel) {
-            return Err(SourceExactTransportError::ChannelNotSelected);
+            self.set_channel(channel)?;
         }
         if command.min_channel_time_nanos < 0
             || command.max_channel_time_nanos < command.min_channel_time_nanos
@@ -251,28 +261,41 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             scan_sequence: self.scan_sequence,
             channel,
         })?;
-        self.active = Some((
-            command.scan_id,
-            self.scan_sequence,
-            command.max_channel_time_nanos,
-        ));
+        self.active = Some(ActivePassiveScan {
+            scan_id: command.scan_id,
+            scan_sequence: self.scan_sequence,
+            deadline_nanos: command.max_channel_time_nanos,
+            remaining: remaining.iter().copied().collect(),
+            observations: Vec::new(),
+        });
         Ok(())
     }
 
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error> {
-        let (expected, scan_sequence, _) = self
+        let active = self
             .active
+            .as_mut()
             .ok_or(SourceExactTransportError::InvalidSequence)?;
-        if scan_id != expected {
+        if scan_id != active.scan_id {
             return Err(SourceExactTransportError::InvalidSequence);
         }
+        let scan_sequence = active.scan_sequence;
+        active.remaining.clear();
+        active.observations.clear();
+        self.delivery.clear();
         self.issue(PassiveMcuCommand::CancelScan { scan_sequence })
     }
 
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error> {
-        let Some((scan_id, scan_sequence, deadline)) = self.active else {
+        if let Some(event) = self.delivery.pop_front() {
+            return Ok(Some(event));
+        }
+        let Some(active) = self.active.as_ref() else {
             return Ok(None);
         };
+        let scan_id = active.scan_id;
+        let scan_sequence = active.scan_sequence;
+        let deadline = active.deadline_nanos;
         match self
             .mechanics
             .next_event(deadline)
@@ -282,30 +305,42 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             Some(PassiveMechanicsEvent::Advertisement {
                 timestamp_nanos,
                 advertisement,
-            }) => Ok(Some(TransportEvent::Advertisement(RawAdvertisement {
-                scan_id,
-                kind: if advertisement.probe_response {
-                    AdvertisementKind::ProbeResponse
-                } else {
-                    AdvertisementKind::Beacon
-                },
-                timestamp_nanos,
-                bssid: advertisement.bssid,
-                beacon_interval_tu: advertisement.beacon_interval_tu,
-                capability_info: advertisement.capability_info,
-                ies: advertisement.ies,
-                channel: CandidateChannel {
-                    band: advertisement.band,
-                    number: advertisement.channel.into(),
-                    frequency_mhz: match advertisement.band {
-                        PhysicalBand::Ghz2 if advertisement.channel == 14 => 2484,
-                        PhysicalBand::Ghz2 => 2407 + 5 * u16::from(advertisement.channel),
-                        PhysicalBand::Ghz5 => 5000 + 5 * u16::from(advertisement.channel),
-                        PhysicalBand::Ghz6 => 5950 + 5 * u16::from(advertisement.channel),
+            }) => {
+                let raw = RawAdvertisement {
+                    scan_id,
+                    kind: if advertisement.probe_response {
+                        AdvertisementKind::ProbeResponse
+                    } else {
+                        AdvertisementKind::Beacon
                     },
-                },
-                rssi_dbm: advertisement.rssi_dbm,
-            }))),
+                    timestamp_nanos,
+                    bssid: advertisement.bssid,
+                    beacon_interval_tu: advertisement.beacon_interval_tu,
+                    capability_info: advertisement.capability_info,
+                    ies: advertisement.ies,
+                    channel: CandidateChannel {
+                        band: advertisement.band,
+                        number: advertisement.channel.into(),
+                        frequency_mhz: match advertisement.band {
+                            PhysicalBand::Ghz2 if advertisement.channel == 14 => 2484,
+                            PhysicalBand::Ghz2 => 2407 + 5 * u16::from(advertisement.channel),
+                            PhysicalBand::Ghz5 => 5000 + 5 * u16::from(advertisement.channel),
+                            PhysicalBand::Ghz6 => 5950 + 5 * u16::from(advertisement.channel),
+                        },
+                    },
+                    rssi_dbm: advertisement.rssi_dbm,
+                };
+                let observations = &mut self.active.as_mut().expect("active above").observations;
+                if let Some(existing) = observations.iter_mut().find(|item| item.bssid == raw.bssid)
+                {
+                    if raw.rssi_dbm > existing.rssi_dbm {
+                        *existing = raw;
+                    }
+                } else {
+                    observations.push(raw);
+                }
+                Ok(None)
+            }
             Some(PassiveMechanicsEvent::ScanDone(done)) => {
                 if done.scan_sequence != scan_sequence {
                     return Err(SourceExactTransportError::ScanIdMismatch {
@@ -313,11 +348,35 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                         actual: done.scan_sequence,
                     });
                 }
-                self.active = None;
-                Ok(Some(TransportEvent::Complete {
-                    scan_id,
-                    success: done.completed_channels == 1 && done.alpha2 == *b"00",
-                }))
+                let success = done.completed_channels == 1 && done.alpha2 == *b"00";
+                let mut active = self.active.take().expect("active above");
+                if success && let Some(channel) = active.remaining.pop_front() {
+                    self.issue(PassiveMcuCommand::ChannelSwitch {
+                        channel,
+                        antenna_mask: self.antenna_mask,
+                    })?;
+                    self.selected = Some(channel);
+                    self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
+                    self.issue(PassiveMcuCommand::StartScan {
+                        scan_sequence: self.scan_sequence,
+                        channel,
+                    })?;
+                    active.scan_sequence = self.scan_sequence;
+                    self.active = Some(active);
+                    return Ok(None);
+                }
+                active
+                    .observations
+                    .sort_by_key(|observation| observation.timestamp_nanos);
+                self.delivery.extend(
+                    active
+                        .observations
+                        .into_iter()
+                        .map(TransportEvent::Advertisement),
+                );
+                self.delivery
+                    .push_back(TransportEvent::Complete { scan_id, success });
+                Ok(self.delivery.pop_front())
             }
         }
     }
@@ -975,6 +1034,7 @@ mod tests {
                 beacon_scan_count: 1,
                 alpha2: *b"00",
             }));
+        assert_eq!(adapter.next_scan_event(), Ok(None));
         assert!(matches!(
             adapter.next_scan_event(),
             Ok(Some(HardwareScanEvent::Observation(_)))
@@ -986,6 +1046,154 @@ mod tests {
                 success: true,
             }))
         );
+    }
+
+    #[test]
+    fn multi_channel_scan_aggregates_strongest_bss_before_sme_delivery() {
+        let capability = nic();
+        let transport =
+            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let mut adapter = Mt7921SoftmacAdapter::new(
+            transport,
+            capability,
+            capability_channels(capability),
+            vec![channel(1), channel(6)],
+        )
+        .unwrap();
+        assert_eq!(
+            adapter
+                .start_passive_scan(request(vec![channel(1), channel(6)]))
+                .unwrap()
+                .scan_id,
+            Some(1)
+        );
+
+        let advertisement =
+            |timestamp_nanos, bssid, channel, rssi_dbm| PassiveMechanicsEvent::Advertisement {
+                timestamp_nanos,
+                advertisement: PassiveAdvertisement {
+                    probe_response: false,
+                    bssid,
+                    beacon_interval_tu: 100,
+                    capability_info: 0x0431,
+                    ies: vec![0, 1, b'x'],
+                    band: PhysicalBand::Ghz2,
+                    channel,
+                    rssi_dbm,
+                },
+            };
+        adapter.transport.mechanics.events.extend([
+            advertisement(10, [1; 6], 1, -70),
+            PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 1,
+                completed_channels: 1,
+                beacon_scan_count: 1,
+                alpha2: *b"00",
+            }),
+            advertisement(20, [1; 6], 6, -40),
+            advertisement(21, [2; 6], 6, -60),
+            PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 2,
+                completed_channels: 1,
+                beacon_scan_count: 2,
+                alpha2: *b"00",
+            }),
+        ]);
+        assert_eq!(adapter.next_scan_event(), Ok(None));
+        assert_eq!(adapter.next_scan_event(), Ok(None));
+        assert_eq!(adapter.next_scan_event(), Ok(None));
+        assert_eq!(adapter.next_scan_event(), Ok(None));
+        let Some(HardwareScanEvent::Observation(first)) = adapter.next_scan_event().unwrap() else {
+            panic!("missing first aggregate")
+        };
+        assert_eq!(first.bss.bssid, [1; 6]);
+        assert_eq!(first.bss.rssi_dbm, -40);
+        let Some(HardwareScanEvent::Observation(second)) = adapter.next_scan_event().unwrap()
+        else {
+            panic!("missing second aggregate")
+        };
+        assert_eq!(second.bss.bssid, [2; 6]);
+        assert_eq!(
+            adapter.next_scan_event().unwrap(),
+            Some(HardwareScanEvent::Complete {
+                scan_id: 1,
+                success: true,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregated_multi_channel_results_reach_pinned_fuchsia_scanner() {
+        let capability = nic();
+        let transport =
+            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let mut adapter = Mt7921SoftmacAdapter::new(
+            transport,
+            capability,
+            capability_channels(capability),
+            vec![channel(1), channel(6)],
+        )
+        .unwrap();
+        let mut scanner = fuchsia_softmac_port::PassiveScanner::default();
+        scanner
+            .start(
+                &mut adapter,
+                fuchsia_softmac_port::ScanRequest {
+                    txn_id: 77,
+                    scan_type: fuchsia_softmac_port::ScanTypes::Passive,
+                    channel_list: vec![channel(1), channel(6)],
+                    ssid_list: vec![],
+                    probe_delay: 0,
+                    min_channel_time: 50,
+                    max_channel_time: 120,
+                },
+            )
+            .unwrap();
+        let advertisement =
+            |timestamp_nanos, channel, rssi_dbm| PassiveMechanicsEvent::Advertisement {
+                timestamp_nanos,
+                advertisement: PassiveAdvertisement {
+                    probe_response: false,
+                    bssid: [9; 6],
+                    beacon_interval_tu: 100,
+                    capability_info: 1,
+                    ies: vec![0, 1, b'x'],
+                    band: PhysicalBand::Ghz2,
+                    channel,
+                    rssi_dbm,
+                },
+            };
+        adapter.transport.mechanics.events.extend([
+            advertisement(1, 1, -70),
+            PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 1,
+                completed_channels: 1,
+                beacon_scan_count: 1,
+                alpha2: *b"00",
+            }),
+            advertisement(2, 6, -40),
+            PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 2,
+                completed_channels: 1,
+                beacon_scan_count: 1,
+                alpha2: *b"00",
+            }),
+        ]);
+        assert_eq!(scanner.poll(&mut adapter).unwrap(), None);
+        assert_eq!(scanner.poll(&mut adapter).unwrap(), None);
+        assert_eq!(scanner.poll(&mut adapter).unwrap(), None);
+        let Some(fuchsia_softmac_port::MlmeScanEvent::Result { result, .. }) =
+            scanner.poll(&mut adapter).unwrap()
+        else {
+            panic!("missing SME scan result")
+        };
+        assert_eq!(result.txn_id, 77);
+        assert_eq!(result.bss.bssid, [9; 6]);
+        assert_eq!(result.bss.rssi_dbm, -40);
+        assert!(matches!(
+            scanner.poll(&mut adapter).unwrap(),
+            Some(fuchsia_softmac_port::MlmeScanEvent::End(_))
+        ));
     }
 
     #[test]
