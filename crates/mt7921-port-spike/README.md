@@ -154,6 +154,14 @@ wrap. Fail-closed cleanup after `Ready` is lab transaction policy; Linux keeps
 the live device resources instead. The operation stops immediately after clean
 N9 readiness; it sends no capability or post-boot configuration command.
 
+A watchdog-guarded physical run completed this boundary for the exact installed
+MT7961 artifacts. It downloaded one patch section and four RAM regions in 196
+individually completed chunks (795,264 bytes), skipped the CLC region, reached
+N9 `Ready`, disabled DMA and PCI bus mastering, reset while all mappings were
+pinned, then released every mapping. The lab restored `mt7921e`, iwd, network,
+and SSH with `failed=0`. The durable root-only report is
+`/var/lib/wifi-driver-lab/reports/20260809T121656Z-0000_05_00.0.log`.
+
 The earlier `--run-one-shot-fwdl` rejection identified that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
 and that raw patch scatter is invalid until the MCU has accepted patch
