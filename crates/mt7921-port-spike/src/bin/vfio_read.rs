@@ -47,7 +47,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     process::{Command, Stdio},
     ptr::NonNull,
     sync::{
@@ -3602,14 +3602,14 @@ impl Drop for Ioas {
 
 #[allow(dead_code)]
 struct VfioIrq {
-    device_fd: RawFd,
-    event_fd: RawFd,
+    device: Arc<File>,
+    event_fd: OwnedFd,
     index: u32,
     installed: bool,
 }
 #[allow(dead_code)]
 impl VfioIrq {
-    fn install(device: &File, capability: PciIrqCapability) -> Result<Self, String> {
+    fn install(device: &Arc<File>, capability: PciIrqCapability) -> Result<Self, String> {
         if capability.count == 0 || !capability.eventfd {
             return Err("refused non-eventfd VFIO interrupt".into());
         }
@@ -3618,8 +3618,8 @@ impl VfioIrq {
             PciIrqKind::Msi => 1,
             PciIrqKind::Msix => 2,
         };
-        let event_fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-        if event_fd < 0 {
+        let event_fd_raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+        if event_fd_raw < 0 {
             return Err(format!(
                 "create IRQ eventfd: {}",
                 std::io::Error::last_os_error()
@@ -3633,7 +3633,7 @@ impl VfioIrq {
                 start: 0,
                 count: 1,
             },
-            eventfd: event_fd,
+            eventfd: event_fd_raw,
         };
         if let Err(error) = ioctl_mut(
             device.as_raw_fd(),
@@ -3641,11 +3641,12 @@ impl VfioIrq {
             &mut set,
             "install VFIO IRQ eventfd",
         ) {
-            unsafe { close(event_fd) };
+            unsafe { close(event_fd_raw) };
             return Err(error);
         }
+        let event_fd = unsafe { OwnedFd::from_raw_fd(event_fd_raw) };
         Ok(Self {
-            device_fd: device.as_raw_fd(),
+            device: Arc::clone(device),
             event_fd,
             index,
             installed: true,
@@ -3655,7 +3656,7 @@ impl VfioIrq {
         let mut counter = 0u64;
         let result = unsafe {
             read(
-                self.event_fd,
+                self.event_fd.as_raw_fd(),
                 (&mut counter as *mut u64).cast::<u8>(),
                 std::mem::size_of::<u64>(),
             )
@@ -3683,7 +3684,7 @@ impl VfioIrq {
             count: 0,
         };
         ioctl_mut(
-            self.device_fd,
+            self.device.as_raw_fd(),
             VFIO_DEVICE_SET_IRQS,
             &mut set,
             "disable VFIO IRQ eventfd",
@@ -3695,7 +3696,6 @@ impl VfioIrq {
 impl Drop for VfioIrq {
     fn drop(&mut self) {
         let _ = self.disable();
-        unsafe { close(self.event_fd) };
     }
 }
 
