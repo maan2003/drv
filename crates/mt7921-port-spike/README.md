@@ -171,7 +171,8 @@ mutating `SET_CLC` response, cfg80211 country regdb, and any OF/DTS limits.
 The source-exact `SET_CLC` wire format is available only inside the explicit
 one-shot loader gate: it selects every opaque `00`/indoor rule from the accepted
 installed CLC record, requires the firmware CLC-event capability, encodes CID
-`0x5c`, and bounds the 68-byte response plus five-bit UNII mask. State advances
+`0x5c`, preserves Linux's no-ACPI `MTCL_INVALID` sentinel as `0xff` in the
+packed request, and bounds the 68-byte response plus five-bit UNII mask. State advances
 to `ClcConfigured` before publication so any timeout or response mismatch still
 forces reset-while-pinned cleanup. Neither `SET_CHAN_DOMAIN` nor cfg80211 policy
 is represented here.

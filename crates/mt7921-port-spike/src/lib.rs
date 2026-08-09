@@ -589,9 +589,12 @@ pub fn discover_clc(
 pub struct ClcSetCommand {
     pub index: u8,
     pub environment: u8,
+    pub acpi_configuration: u8,
     pub capability: u8,
     pub alpha2: [u8; 2],
     pub rule_type: [u8; 2],
+    pub environment_6ghz: u8,
+    pub mtcl_configuration: u8,
     pub data: Vec<u8>,
 }
 
@@ -665,9 +668,15 @@ pub fn world_clc_commands(
                 commands.push(ClcSetCommand {
                     index,
                     environment: 1,
+                    acpi_configuration: 0,
                     capability: u8::from(chip_capability & 1 != 0),
                     alpha2: *b"00",
                     rule_type: [rule[2], rule[3]],
+                    environment_6ghz: 0,
+                    // mt792x_acpi_get_mtcl_conf returns u32::MAX when no
+                    // ACPI SAR country table exists; assignment to the
+                    // packed u8 request field retains 0xff.
+                    mtcl_configuration: 0xff,
                     data: region.payload[rule_offset + 6..rule_end].to_vec(),
                 });
             }
@@ -2757,8 +2766,11 @@ pub fn encode_clc_set_command(
     }
     if command.index > 1
         || command.environment != 1
+        || command.acpi_configuration != 0
         || command.capability & !1 != 0
         || command.alpha2 != *b"00"
+        || command.environment_6ghz != 0
+        || command.mtcl_configuration != 0xff
         || command.data.is_empty()
     {
         return Err(DownloadCommandError::InvalidLength);
@@ -2781,9 +2793,12 @@ pub fn encode_clc_set_command(
     request[2..4].copy_from_slice(&(request_length as u16).to_le_bytes());
     request[4] = command.index;
     request[5] = command.environment;
+    request[6] = command.acpi_configuration;
     request[7] = command.capability;
     request[8..10].copy_from_slice(&command.alpha2);
     request[10..12].copy_from_slice(&command.rule_type);
+    request[12] = command.environment_6ghz;
+    request[13] = command.mtcl_configuration;
     request[76..].copy_from_slice(&command.data);
     Ok(bytes)
 }
@@ -5378,9 +5393,12 @@ mod tests {
             [ClcSetCommand {
                 index: 0,
                 environment: 1,
+                acpi_configuration: 0,
                 capability: 1,
                 alpha2: *b"00",
                 rule_type: *b"-0",
+                environment_6ghz: 0,
+                mtcl_configuration: 0xff,
                 data: vec![0x5a; 11],
             }]
         );
@@ -5389,7 +5407,15 @@ mod tests {
         assert_eq!(&encoded[36..44], &[0x5c, 0xa0, 1, 6, 0, 0, 0, 0]);
         assert_eq!(&encoded[64..68], &[1, 0, 87, 0]);
         assert_eq!(&encoded[68..76], &[0, 1, 0, 1, b'0', b'0', b'-', b'0']);
+        assert_eq!(&encoded[76..78], &[0, 0xff]);
         assert_eq!(&encoded[140..], &[0x5a; 11]);
+
+        let mut zero_mtcl = commands[0].clone();
+        zero_mtcl.mtcl_configuration = 0;
+        assert_eq!(
+            encode_clc_set_command(&zero_mtcl, 6),
+            Err(DownloadCommandError::InvalidLength)
+        );
 
         let mut response = vec![0; 72];
         response[4..6].copy_from_slice(&0x1234u16.to_le_bytes());
