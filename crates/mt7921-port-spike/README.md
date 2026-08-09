@@ -165,10 +165,13 @@ ring 0 to ring 4 only after N9 readiness.
 A watchdog-guarded physical run completed this boundary for the exact installed
 MT7961 artifacts. It downloaded one patch section and four RAM regions in 196
 individually completed chunks (795,264 bytes), skipped the CLC region, reached
-N9 `Ready`, disabled DMA and PCI bus mastering, reset while all mappings were
-pinned, then released every mapping. The lab restored `mt7921e`, iwd, network,
-and SSH with `failed=0`. The durable root-only report is
-`/var/lib/wifi-driver-lab/reports/20260809T121656Z-0000_05_00.0.log`.
+N9 `Ready`, switched to WM2 ring 4, and received a 528-byte capability response.
+The typed result reports 23 elements, MAC `50:5a:65:f6:f9:89`, HT/VHT/HE,
+5 GHz, two spatial streams, no 6 GHz, chip capability 19, and 19 preserved
+unknown elements. It then disabled DMA and PCI bus mastering, reset while all
+mappings were pinned, and released every mapping. The lab restored `mt7921e`,
+iwd, network, and SSH with `failed=0`. The durable root-only report is
+`/var/lib/wifi-driver-lab/reports/20260809T123315Z-0000_05_00.0.log`.
 
 The earlier `--run-one-shot-fwdl` rejection identified that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,

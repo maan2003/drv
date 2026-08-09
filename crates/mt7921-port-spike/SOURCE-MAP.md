@@ -90,5 +90,6 @@ gate is **closed**.
    patch-semaphore commands, conditionally releases the semaphore, and disables
    both DMA directions before reset-while-pinned. The physical trace drained
    NIC-power event 3, received patch GET result 2, and received release result
-   3 before a healthy kernel/iwd/network restore. NIC capability remains
-   blocked on full firmware/N9 startup.
+   3 before a healthy kernel/iwd/network restore. Full firmware loading now
+   reaches N9, switches normal responses to WM2 ring 4, and parses the read-only
+   NIC capability response before reset-while-pinned and healthy restoration.
