@@ -279,6 +279,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-5ghz-non-dfs") => Operation::RunOneShotPassive5GhzNonDfs,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-5ghz-dfs-low") => Operation::RunOneShotPassive5GhzDfsLow,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-5ghz-dfs-high") => Operation::RunOneShotPassive5GhzDfsHigh,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -974,6 +976,7 @@ fn run() -> Result<(), String> {
                         | Operation::RunOneShotPassive2Ghz
                         | Operation::RunOneShotPassive5GhzNonDfs
                         | Operation::RunOneShotPassive5GhzDfsLow
+                        | Operation::RunOneShotPassive5GhzDfsHigh
                 ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -1014,6 +1017,12 @@ fn run() -> Result<(), String> {
                                 Operation::RunOneShotPassive5GhzDfsLow => {
                                     (WlanBand::FiveGhz, vec![52, 56, 60, 64])
                                 }
+                                Operation::RunOneShotPassive5GhzDfsHigh => (
+                                    WlanBand::FiveGhz,
+                                    vec![
+                                        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+                                    ],
+                                ),
                                 _ => unreachable!("passive scan operation matched above"),
                             };
                             let channels = channel_numbers
@@ -1086,8 +1095,11 @@ fn run() -> Result<(), String> {
                                     channel.number
                                 );
                             }
-                            let completion_only_group =
-                                matches!(operation, Operation::RunOneShotPassive5GhzDfsLow);
+                            let completion_only_group = matches!(
+                                operation,
+                                Operation::RunOneShotPassive5GhzDfsLow
+                                    | Operation::RunOneShotPassive5GhzDfsHigh
+                            );
                             if total_observations == 0 && !completion_only_group {
                                 return Err(format!(
                                     "passive scan gate observed no BSS across {} channels",
@@ -3553,6 +3565,8 @@ enum Operation {
     RunOneShotPassive5GhzNonDfs,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassive5GhzDfsLow,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassive5GhzDfsHigh,
 }
 
 impl Operation {
@@ -3567,6 +3581,7 @@ impl Operation {
                     | Self::RunOneShotPassive2Ghz
                     | Self::RunOneShotPassive5GhzNonDfs
                     | Self::RunOneShotPassive5GhzDfsLow
+                    | Self::RunOneShotPassive5GhzDfsHigh
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -4137,6 +4152,9 @@ mod tests {
         assert!(Operation::RunOneShotPassive5GhzDfsLow.wfdma_writable());
         assert!(Operation::RunOneShotPassive5GhzDfsLow.conn_writable());
         assert!(Operation::RunOneShotPassive5GhzDfsLow.loads_firmware());
+        assert!(Operation::RunOneShotPassive5GhzDfsHigh.wfdma_writable());
+        assert!(Operation::RunOneShotPassive5GhzDfsHigh.conn_writable());
+        assert!(Operation::RunOneShotPassive5GhzDfsHigh.loads_firmware());
         assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
         assert!(Operation::RunOneShotPassivePrepare.conn_writable());
         assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
