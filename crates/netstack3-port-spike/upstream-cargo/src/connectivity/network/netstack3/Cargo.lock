@@ -777,9 +777,12 @@ dependencies = [
 name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-softmac",
+ "ieee80211",
+ "wlan-common",
 ]
 
 [[package]]

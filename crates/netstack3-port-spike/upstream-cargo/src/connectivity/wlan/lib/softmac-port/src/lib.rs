@@ -4,6 +4,11 @@
 
 //! Host-portable extraction of the pinned Fuchsia SoftMAC passive scanner.
 
+#[path = "../../mlme/rust/src/client/convert_beacon.rs"]
+mod pinned_convert_beacon;
+
+pub use pinned_convert_beacon::construct_bss_description;
+
 pub use fidl_fuchsia_wlan_ieee80211::{BssDescription, ChannelBandwidth, ChannelNumber, WlanBand};
 pub use fidl_fuchsia_wlan_mlme::{ScanEnd, ScanRequest, ScanResult, ScanResultCode, ScanTypes};
 pub use fidl_fuchsia_wlan_softmac::{
@@ -52,6 +57,82 @@ pub trait SoftmacHardware {
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, Self::Error>;
     fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConservativeRegulatoryPolicy {
+    pub alpha2: [u8; 2],
+    pub indoor: bool,
+    pub special_unii_mask: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegulatoryError {
+    NonWorldDomain,
+    OutdoorEnvironment,
+    InvalidSpecialUniiMask,
+    MissingBandCapabilities,
+}
+
+/// Apply the pinned Fuchsia SME passive-scan channel policy to hardware-
+/// reported channels under the temporary world/indoor CLC authorization.
+///
+/// The pinned policy's candidate universe is 2.4 GHz 1-14 and 5 GHz 36-165.
+/// It has no 6 GHz `WlanBand` and deliberately omits UNII-4 channels 169-177,
+/// so the firmware special-UNII mask can only restrict future policy; it never
+/// expands this conservative milestone's permissions.
+pub fn allowed_passive_channels(
+    query: &WlanSoftmacQueryResponse,
+    policy: ConservativeRegulatoryPolicy,
+) -> Result<Vec<ChannelNumber>, RegulatoryError> {
+    const FUCHSIA_5GHZ: [u8; 25] = [
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+        144, 149, 153, 157, 161, 165,
+    ];
+    if policy.alpha2 != *b"00" {
+        return Err(RegulatoryError::NonWorldDomain);
+    }
+    if !policy.indoor {
+        return Err(RegulatoryError::OutdoorEnvironment);
+    }
+    if policy.special_unii_mask & !0x1f != 0 {
+        return Err(RegulatoryError::InvalidSpecialUniiMask);
+    }
+    let bands = query
+        .band_caps
+        .as_ref()
+        .ok_or(RegulatoryError::MissingBandCapabilities)?;
+    let supports = |band: WlanBand, number: u8| {
+        bands.iter().any(|capability| {
+            capability.band == Some(band)
+                && capability
+                    .primary_channels
+                    .as_ref()
+                    .is_some_and(|channels| {
+                        channels
+                            .iter()
+                            .any(|channel| channel.band == band && channel.number == number)
+                    })
+        })
+    };
+    let mut allowed = Vec::new();
+    for number in 1..=14 {
+        if supports(WlanBand::TwoGhz, number) {
+            allowed.push(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number,
+            });
+        }
+    }
+    for number in FUCHSIA_5GHZ {
+        if supports(WlanBand::FiveGhz, number) {
+            allowed.push(ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number,
+            });
+        }
+    }
+    Ok(allowed)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +369,13 @@ mod tests {
         }
     }
 
+    fn channel_5ghz(number: u8) -> ChannelNumber {
+        ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number,
+        }
+    }
+
     fn fake() -> FakeMt7921Adapter {
         FakeMt7921Adapter::new(
             WlanSoftmacQueryResponse {
@@ -335,6 +423,54 @@ mod tests {
                 max_channel_time: Some(307_200_000),
                 min_home_time: Some(0),
             }]
+        );
+    }
+
+    // Matches pinned SME `get_primary_channels_for_scan`: passive scans use
+    // the intersection of its fixed candidates and hardware primary channels.
+    #[test]
+    fn world_indoor_policy_never_expands_from_clc_or_country_ie() {
+        let query = WlanSoftmacQueryResponse {
+            band_caps: Some(vec![
+                WlanSoftmacBandCapability {
+                    band: Some(WlanBand::TwoGhz),
+                    primary_channels: Some(vec![channel(1), channel(14)]),
+                    ..Default::default()
+                },
+                WlanSoftmacBandCapability {
+                    band: Some(WlanBand::FiveGhz),
+                    primary_channels: Some(vec![
+                        channel_5ghz(36),
+                        channel_5ghz(165),
+                        channel_5ghz(169),
+                        channel_5ghz(177),
+                    ]),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            allowed_passive_channels(
+                &query,
+                ConservativeRegulatoryPolicy {
+                    alpha2: *b"00",
+                    indoor: true,
+                    special_unii_mask: 0x1f,
+                }
+            ),
+            Ok(vec![channel(1), channel(14), channel_5ghz(36), channel_5ghz(165)])
+        );
+        assert_eq!(
+            allowed_passive_channels(
+                &query,
+                ConservativeRegulatoryPolicy {
+                    alpha2: *b"US",
+                    indoor: true,
+                    special_unii_mask: 0x1f,
+                }
+            ),
+            Err(RegulatoryError::NonWorldDomain)
         );
     }
 

@@ -25,6 +25,30 @@ Focused fixtures derived from the upstream MLME scanner run against the fake:
 cargo test -p fuchsia-softmac-port
 ```
 
+The temporary regulatory boundary is fixed to `alpha2="00"` and indoor use.
+`allowed_passive_channels` applies the pinned SME passive-scan intersection to
+hardware-reported primary channels and accepts the firmware five-bit special-
+UNII mask only as a restriction input. The pinned policy omits UNII-4 and has
+no 6-GHz band type, so neither a permissive CLC response nor an AP Country IE
+can expand this milestone's channel set.
+
+## Pinned WLAN closure roadmap
+
+| Responsibility | Pinned ownership | Current disposition |
+| --- | --- | --- |
+| Passive scan request/state and regulatory candidate intersection | MLME `client/scanner.rs`, SME `client/scan.rs` | Packaged here over Fuchsia value types; hardware execution remains gated |
+| Beacon/probe IE and channel conversion | MLME `client/convert_beacon.rs`, `wlan-common` | The exact pinned `construct_bss_description` is re-exported directly and its upstream fixtures run on host |
+| MLME client authentication/association/channel-switch/timers | MLME `client/{state,station,channel_switch,bound}.rs`, `auth.rs`, `device.rs` | Source retained at the pin; package the client closure rather than implementing it in MT7921 |
+| SME connect/scan policy | `wlan-sme` | Already packaged and host-tested; endpoint serving is the only excluded transport edge |
+| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Already packaged unchanged with pinned crypto and host tests |
+| Frame/IE parsing and serialization | `wlan-common`, `ieee80211`, `wlan-frame-writer` | Already packaged and tested; hardware supplies RX bytes/metadata only |
+| Rate control and diagnostics | MLME `minstrel.rs`, FIDL Minstrel/stats values, Inspect facades | Values/diagnostic facades are packaged; the MLME algorithm remains in the future client-closure package |
+
+The only MT7921-owned pieces are firmware/MCU commands, DMA/IRQ/RX transport,
+calibration, reset containment, and conversion of device RX metadata into the
+pinned SoftMAC value types. Active scan, authentication, and association are
+not reachable in the passive milestone.
+
 ## Source and license
 
 See [`SOURCE-MAP.md`](SOURCE-MAP.md). Fuchsia-derived code is BSD-2-Clause and
