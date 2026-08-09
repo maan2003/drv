@@ -316,9 +316,14 @@ fn run() -> Result<(), String> {
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
-    if operation.is_active_mcu() {
-        verify_external_watchdog_armed()?;
-    }
+    let watchdog = operation
+        .is_active_mcu()
+        .then(verify_external_watchdog_armed)
+        .transpose()?;
+    let mut active_ledger = operation
+        .is_active_mcu()
+        .then(|| ContainmentLedger::acquire(watchdog))
+        .transpose()?;
 
     let device = Arc::new(
         OpenOptions::new()
@@ -339,6 +344,9 @@ fn run() -> Result<(), String> {
         iommufd: iommu.as_raw_fd(),
         ..Default::default()
     };
+    if let Some(ledger) = active_ledger.as_mut() {
+        ledger.mark_possibly_active(Hazard::VfioBound);
+    }
     ioctl_mut(
         device.as_raw_fd(),
         VFIO_DEVICE_BIND_IOMMUFD,
@@ -349,6 +357,9 @@ fn run() -> Result<(), String> {
         size: size::<IoasAlloc>(),
         ..Default::default()
     };
+    if let Some(ledger) = active_ledger.as_mut() {
+        ledger.mark_possibly_active(Hazard::IoasAllocated);
+    }
     ioctl_mut(
         iommu.as_raw_fd(),
         IOMMU_IOAS_ALLOC,
@@ -364,6 +375,9 @@ fn run() -> Result<(), String> {
         pt_id: ioas.id,
         ..Default::default()
     };
+    if let Some(ledger) = active_ledger.as_mut() {
+        ledger.mark_possibly_active(Hazard::IoasAttached);
+    }
     ioctl_mut(
         device.as_raw_fd(),
         VFIO_DEVICE_ATTACH_IOMMUFD_PT,
@@ -383,6 +397,9 @@ fn run() -> Result<(), String> {
         "query BAR 0",
     )?;
 
+    if let Some(ledger) = active_ledger.as_mut() {
+        ledger.mark_possibly_active(Hazard::BarMapping);
+    }
     let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
     let pcie_mac = if operation.needs_pcie_mac() {
         Some(ReadPage::map(&device, &info, 0x10000, true)?)
@@ -735,6 +752,14 @@ fn run() -> Result<(), String> {
         let swdef = ReadPage::map(&device, &info, 0x9f000, true)?;
         let dmashdl = ReadPage::map(&device, &info, 0xd6000, true)?;
 
+        active_ledger
+            .as_mut()
+            .expect("active MCU operation has containment ledger")
+            .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled)?;
+        active_ledger
+            .as_mut()
+            .expect("active MCU operation has containment ledger")
+            .mark_possibly_active(Hazard::DmaMapping);
         let mut tx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
         let mut fwdl_ring = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
         let mut mcu_tx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
@@ -790,6 +815,12 @@ fn run() -> Result<(), String> {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
 
         let signal = ActiveSignalGuard::install()?;
+        let ledger = active_ledger
+            .as_mut()
+            .expect("active MCU operation has containment ledger");
+        ledger.transition(RunPhase::MappedDmaDisabled, RunPhase::AcquiringHostControl)?;
+        ledger.mark_possibly_active(Hazard::LabMutated);
+        ledger.mark_possibly_active(Hazard::HostControl);
         set_lab_safety("MUTATED")?;
         let mut irq = None;
         let active = (|| -> Result<(), String> {
@@ -801,6 +832,10 @@ fn run() -> Result<(), String> {
             };
             acquire_driver_ownership(&mut ownership, log_ownership_event)
                 .map_err(|error| format!("acquire ownership for MCU transaction: {error:?}"))?;
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .transition(RunPhase::AcquiringHostControl, RunPhase::HostDriverOwned)?;
             let saved_selector = selector_page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
             let mut wfsys = VfioWfsysReset {
                 selector: &selector_page,
@@ -813,6 +848,13 @@ fn run() -> Result<(), String> {
             let restore_result = wfsys.restore();
             wfsys_result?;
             restore_result?;
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .transition(
+                    RunPhase::HostDriverOwned,
+                    RunPhase::WfsysResetAndSelectorRestored,
+                )?;
 
             let initial_global = wfdma.read(0xd4208)?;
             if initial_global == u32::MAX {
@@ -862,6 +904,10 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .mark_possibly_active(Hazard::DeviceIrq);
             let installed = VfioIrq::install(&device, selected)?;
             if installed.try_read()?.is_some() {
                 return Err("unexpected IRQ before device source enable".into());
@@ -874,11 +920,26 @@ fn run() -> Result<(), String> {
                     wfdma.read(0xd4200)?
                 ));
             }
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .transition(
+                    RunPhase::WfsysResetAndSelectorRestored,
+                    RunPhase::RingsPreparedIrqSourceDisabled,
+                )?;
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .mark_possibly_active(Hazard::Wfdma);
             wfdma.write_active_wfdma(0xd42f0, 0)?;
             wfdma.write_active_wfdma(0xd4680, 4)?;
             wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
             wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
             wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .mark_possibly_active(Hazard::BusMaster);
             set_pci_bus_master(&bdf, true)?;
             let global = wfdma.read(0xd4208)?
                 | (1 << 0)
@@ -900,6 +961,13 @@ fn run() -> Result<(), String> {
                 1 << 0
             };
             wfdma.write_active_wfdma(0xd4204, response_irq_mask)?;
+            active_ledger
+                .as_mut()
+                .expect("active MCU operation has containment ledger")
+                .transition(
+                    RunPhase::RingsPreparedIrqSourceDisabled,
+                    RunPhase::DmaAndResponseIrqEnabled,
+                )?;
             println!(
                 "{{\"active_mcu_event\":\"dma_and_response_irq_enabled\",\"global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\"}}"
             );
@@ -970,8 +1038,18 @@ fn run() -> Result<(), String> {
                         patch,
                         firmware,
                         |loader, report| {
+                            active_ledger
+                                .as_mut()
+                                .expect("active MCU operation has containment ledger")
+                                .transition(
+                                    RunPhase::DmaAndResponseIrqEnabled,
+                                    RunPhase::FirmwareReady,
+                                )?;
                             let mechanics = VfioPassiveMechanics {
                                 loader,
+                                ledger: active_ledger
+                                    .as_mut()
+                                    .expect("active MCU operation has containment ledger"),
                                 data: ActiveMcuRx {
                                     rx_ring: &mut data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
@@ -1022,8 +1100,18 @@ fn run() -> Result<(), String> {
                         patch,
                         firmware,
                         |loader, report| {
+                            active_ledger
+                                .as_mut()
+                                .expect("active MCU operation has containment ledger")
+                                .transition(
+                                    RunPhase::DmaAndResponseIrqEnabled,
+                                    RunPhase::FirmwareReady,
+                                )?;
                             let mechanics = VfioPassiveMechanics {
                                 loader,
+                                ledger: active_ledger
+                                    .as_mut()
+                                    .expect("active MCU operation has containment ledger"),
                                 data: ActiveMcuRx {
                                     rx_ring: &mut data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
@@ -1251,6 +1339,10 @@ fn run() -> Result<(), String> {
                                 }
                                 let transport = adapter.into_transport();
                                 let mut mechanics = transport.into_mechanics();
+                                mechanics.ledger.transition(
+                                    RunPhase::PassiveReady,
+                                    RunPhase::BeaconAuthorized,
+                                )?;
                                 let _ = drain_data_rx_queue(
                                     mechanics.loader.mcu.wfdma,
                                     &mut mechanics.data,
@@ -1261,7 +1353,7 @@ fn run() -> Result<(), String> {
                                     mechanics.loader.mcu.rx_irq_mask(),
                                 )?;
                                 let mut power_transport = VfioRateTxPower {
-                                    loader: mechanics.loader,
+                                    loader: &mut *mechanics.loader,
                                 };
                                 let mut power_authorizer = RateTxPowerAuthorizer::new();
                                 let authorization = power_authorizer
@@ -1286,6 +1378,10 @@ fn run() -> Result<(), String> {
                                 if !power_authorizer.permits(&authorization) {
                                     return Err("rate-power authorization is not live".into());
                                 }
+                                mechanics.ledger.transition(
+                                    RunPhase::BeaconAuthorized,
+                                    RunPhase::PowerConfiguredNoFrame,
+                                )?;
                                 println!(
                                     "{}",
                                     r#"{"power_setup_event":"no_frame_gate_passed","beacon_authorized":true,"rate_power_consumed":true,"management_frame_publish_reachable":false}"#
@@ -1386,6 +1482,13 @@ fn run() -> Result<(), String> {
             Ok(())
         })();
 
+        let ledger = active_ledger
+            .as_mut()
+            .expect("active MCU operation has containment ledger");
+        if active.is_err() {
+            ledger.phase = RunPhase::Faulted;
+        }
+        ledger.phase = RunPhase::Containing;
         let mut cleanup_errors = Vec::new();
         if let Err(error) = pcie_mac.write_pcie_mac_interrupt_enable_zero() {
             cleanup_errors.push(error);
@@ -1440,6 +1543,15 @@ fn run() -> Result<(), String> {
                 "post-reset containment verification failed: active={active:?} cleanup={cleanup_errors:?} error={error}"
             ));
         }
+        for hazard in [
+            Hazard::HostControl,
+            Hazard::DeviceIrq,
+            Hazard::Wfdma,
+            Hazard::BusMaster,
+            Hazard::LabMutated,
+        ] {
+            ledger.confirm_inactive(hazard);
+        }
         cleanup_errors.extend(attempt_all_cleanup(
             [
                 #[cfg(feature = "fuchsia-passive")]
@@ -1463,10 +1575,20 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("teardown {kind:?}: {error}"))
             },
         ));
+        ledger.confirm_inactive(Hazard::DmaMapping);
         println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
-        active?;
-        if !cleanup_errors.is_empty() {
-            return Err(format!("active MCU cleanup failed: {cleanup_errors:?}"));
+        match (active, cleanup_errors.is_empty()) {
+            (Err(primary), true) => return Err(primary),
+            (Err(primary), false) => {
+                return Err(format!(
+                    "active MCU operation failed: {primary}; cleanup errors: {cleanup_errors:?}"
+                ));
+            }
+            (Ok(()), false) => {
+                ledger.phase = RunPhase::SafeReleaseError;
+                return Err(format!("active MCU cleanup failed: {cleanup_errors:?}"));
+            }
+            (Ok(()), true) => {}
         }
     }
     let read = |register: ReadRegister| -> Result<u32, String> {
@@ -1642,7 +1764,102 @@ fn set_lab_safety(value: &str) -> Result<(), String> {
         .map_err(|error| format!("write lab safety state {path}: {error}"))
 }
 
-fn verify_external_watchdog_armed() -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArmedWatchdog {
+    deadline: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunPhase {
+    Acquiring,
+    MappedDmaDisabled,
+    AcquiringHostControl,
+    HostDriverOwned,
+    WfsysResetAndSelectorRestored,
+    RingsPreparedIrqSourceDisabled,
+    DmaAndResponseIrqEnabled,
+    FirmwareReady,
+    PassivePreparing,
+    PassiveReady,
+    Scanning,
+    BeaconAuthorized,
+    PowerConfiguredNoFrame,
+    Faulted,
+    Containing,
+    Contained,
+    SafeReleaseError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hazard {
+    VfioBound,
+    IoasAllocated,
+    IoasAttached,
+    BarMapping,
+    DmaMapping,
+    HostControl,
+    DeviceIrq,
+    Wfdma,
+    BusMaster,
+    LabMutated,
+}
+
+impl Hazard {
+    const COUNT: usize = 10;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectState {
+    Inactive,
+    PossiblyActive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContainmentLedger {
+    phase: RunPhase,
+    effects: [EffectState; Hazard::COUNT],
+}
+
+impl ContainmentLedger {
+    fn acquire(watchdog: Option<ArmedWatchdog>) -> Result<Self, String> {
+        watchdog.ok_or_else(|| {
+            "external reboot watchdog was not verified before acquisition".to_string()
+        })?;
+        Ok(Self {
+            phase: RunPhase::Acquiring,
+            effects: [EffectState::Inactive; Hazard::COUNT],
+        })
+    }
+
+    fn mark_possibly_active(&mut self, hazard: Hazard) {
+        self.effects[hazard.index()] = EffectState::PossiblyActive;
+    }
+
+    fn confirm_inactive(&mut self, hazard: Hazard) {
+        self.effects[hazard.index()] = EffectState::Inactive;
+    }
+
+    fn must_disable(&self, hazard: Hazard, resource_present: bool) -> bool {
+        resource_present || self.effects[hazard.index()] == EffectState::PossiblyActive
+    }
+
+    fn transition(&mut self, expected: RunPhase, next: RunPhase) -> Result<(), String> {
+        if self.phase != expected {
+            return Err(format!(
+                "active VFIO phase mismatch: expected {expected:?}, found {:?}",
+                self.phase
+            ));
+        }
+        self.phase = next;
+        Ok(())
+    }
+}
+
+fn verify_external_watchdog_armed() -> Result<ArmedWatchdog, String> {
     let output = Command::new("wifi-lab-watchdog")
         .arg("status")
         .output()
@@ -1665,7 +1882,7 @@ fn unix_time_seconds() -> Result<u64, String> {
         .map_err(|error| format!("read wall clock for reboot watchdog: {error}"))
 }
 
-fn verify_watchdog_status(status: &str, now: u64) -> Result<(), String> {
+fn verify_watchdog_status(status: &str, now: u64) -> Result<ArmedWatchdog, String> {
     let mut lines = status.lines();
     let first = lines.next().unwrap_or_default();
     let deadline = first
@@ -1685,7 +1902,7 @@ fn verify_watchdog_status(status: &str, now: u64) -> Result<(), String> {
     if !active || !waiting {
         return Err("external reboot watchdog timer is not active and waiting".into());
     }
-    Ok(())
+    Ok(ArmedWatchdog { deadline })
 }
 
 fn retain_mappings_for_watchdog(message: &str) -> ! {
@@ -2400,12 +2617,12 @@ impl VfioFirmwareLoader<'_> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-struct VfioRateTxPower<'x, 'a, 'b> {
+struct VfioRateTxPower<'x, 'a> {
     loader: &'x mut VfioFirmwareLoader<'a>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
-impl RateTxPowerTransport for VfioRateTxPower<'_, '_, '_> {
+impl RateTxPowerTransport for VfioRateTxPower<'_, '_> {
     type Error = String;
 
     fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error> {
@@ -2909,6 +3126,7 @@ fn drain_data_rx_queue(
 #[cfg(feature = "fuchsia-passive")]
 struct VfioPassiveMechanics<'a, 'b, 'c> {
     loader: &'a mut VfioFirmwareLoader<'b>,
+    ledger: &'c mut ContainmentLedger,
     data: ActiveMcuRx<'b>,
     mac_pages: &'b [ReadPage],
     scan_started: Option<Instant>,
@@ -2920,6 +3138,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
     fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+        self.ledger
+            .transition(RunPhase::FirmwareReady, RunPhase::PassivePreparing)
+            .map_err(PhysicalPassiveError)?;
         if self.data.rx_ring_index != 2
             || self.data.irq_bit != DATA_RX_IRQ_BIT
             || self.data.rx_count != 8
@@ -2984,11 +3205,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             println!(r#"{{"passive_prepare_step":"{step:?}"}}"#);
             Ok(())
         })?;
-        Ok(PassivePrerequisites {
+        let prerequisites = PassivePrerequisites {
             channel_domain_mask_zero: true,
             mac_mmio_initialized: true,
             data_rx_owned: true,
-        })
+        };
+        self.ledger
+            .transition(RunPhase::PassivePreparing, RunPhase::PassiveReady)
+            .map_err(PhysicalPassiveError)?;
+        Ok(prerequisites)
     }
 
     fn command(
@@ -2997,6 +3222,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
+        if matches!(command, PassiveMcuCommand::StartScan { .. }) {
+            self.ledger
+                .transition(RunPhase::PassiveReady, RunPhase::Scanning)
+                .map_err(PhysicalPassiveError)?;
+        }
         self.loader
             .send_passive_command(command, encoded, wait_response)
             .map_err(PhysicalPassiveError)?;
@@ -3040,6 +3270,33 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let event = self.loader.mcu.unsolicited.remove(index);
             let done = parse_passive_scan_done(&event.bytes)
                 .map_err(|error| PhysicalPassiveError(format!("parse scan done: {error:?}")))?;
+            self.loader
+                .mcu
+                .wfdma
+                .verify_rx_ring_slot(
+                    2,
+                    self.data.rx_ring.iova as u32,
+                    8,
+                    self.data.rx_head as u32,
+                    self.data.rx_tail as u32,
+                )
+                .map_err(PhysicalPassiveError)?;
+            let expected_irq = self.loader.mcu.rx_irq_mask();
+            let actual_irq = self
+                .loader
+                .mcu
+                .wfdma
+                .read(0xd4204)
+                .map_err(PhysicalPassiveError)?;
+            if actual_irq != expected_irq {
+                return Err(PhysicalPassiveError(format!(
+                    "post-scan RX interrupt mask {actual_irq:#010x}, expected {expected_irq:#010x}"
+                )));
+            }
+            self.scan_started = None;
+            self.ledger
+                .transition(RunPhase::Scanning, RunPhase::PassiveReady)
+                .map_err(PhysicalPassiveError)?;
             return Ok(Some(PassiveMechanicsEvent::ScanDone(done)));
         }
         let started = self
@@ -4822,5 +5079,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn watchdog_unavailable_refuses_acquisition_before_activation() {
+        assert_eq!(
+            ContainmentLedger::acquire(None),
+            Err("external reboot watchdog was not verified before acquisition".into())
+        );
+    }
+
+    #[test]
+    fn ledger_resource_mismatch_always_selects_conservative_disable() {
+        let mut ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        assert!(!ledger.must_disable(Hazard::BusMaster, false));
+        assert!(ledger.must_disable(Hazard::BusMaster, true));
+        ledger.mark_possibly_active(Hazard::BusMaster);
+        assert!(ledger.must_disable(Hazard::BusMaster, false));
+        ledger.confirm_inactive(Hazard::BusMaster);
+        assert!(!ledger.must_disable(Hazard::BusMaster, false));
+    }
+
+    #[test]
+    fn ambiguous_scan_exit_never_claims_passive_ready() {
+        let mut ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        ledger.phase = RunPhase::Scanning;
+        let mut trace = vec![ledger.phase];
+        ledger.phase = RunPhase::Faulted;
+        trace.push(ledger.phase);
+        ledger.phase = RunPhase::Containing;
+        trace.push(ledger.phase);
+        assert_eq!(
+            trace,
+            [RunPhase::Scanning, RunPhase::Faulted, RunPhase::Containing]
+        );
+        assert!(!trace.contains(&RunPhase::PassiveReady));
     }
 }
