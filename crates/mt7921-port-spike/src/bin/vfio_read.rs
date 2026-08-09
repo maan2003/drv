@@ -1086,7 +1086,9 @@ fn run() -> Result<(), String> {
                                     channel.number
                                 );
                             }
-                            if total_observations == 0 {
+                            let completion_only_group =
+                                matches!(operation, Operation::RunOneShotPassive5GhzDfsLow);
+                            if total_observations == 0 && !completion_only_group {
                                 return Err(format!(
                                     "passive scan gate observed no BSS across {} channels",
                                     channels.len()
