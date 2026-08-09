@@ -267,7 +267,9 @@ impl<E: Mt7921ClientEffects> DeviceOps for Mt7921ClientDevice<E> {
     }
 
     fn send_mlme_event(&mut self, event: fidl_mlme::MlmeEvent) -> Result<(), anyhow::Error> {
-        self.event_sink.unbounded_send(event).map_err(Into::into)
+        self.event_sink
+            .unbounded_send(event)
+            .map_err(|_| anyhow::anyhow!("MLME event queue closed"))
     }
 
     fn set_minstrel(&mut self, minstrel: wlan_mlme::MinstrelWrapper) {
@@ -617,6 +619,25 @@ mod tests {
             assert_eq!(rx.status, status);
             assert!(device.next_rx().unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn closed_event_queue_error_redacts_sae_fields() {
+        let mut device = Mt7921ClientDevice::new_offline_fake(FakeEffects::default(), support());
+        drop(device.take_mlme_event_stream().unwrap());
+        let sae_marker = vec![0xde, 0xad, 0xbe, 0xef];
+        let error = device
+            .send_mlme_event(fidl_mlme::MlmeEvent::OnSaeFrameRx {
+                frame: fidl_mlme::SaeFrame {
+                    peer_sta_address: BSSID,
+                    status_code: fidl_ieee80211::StatusCode::Success,
+                    seq_num: 1,
+                    sae_fields: sae_marker,
+                },
+            })
+            .unwrap_err();
+        assert_eq!(format!("{error}"), "MLME event queue closed");
+        assert_eq!(format!("{error:?}"), "MLME event queue closed");
     }
 
     #[test]
