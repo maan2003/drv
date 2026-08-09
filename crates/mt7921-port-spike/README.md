@@ -310,6 +310,17 @@ retains all-ones rejection on both pre- and post-write reads and durably logs
 initial/programmed/observed values, while accepting the source primitive's
 single-read/write completion. WTBL update remains different: its pinned source
 explicitly polls the busy bit, so that bounded verification remains mandatory.
+
+The source-semantics prepare run from commit `3dcae792` (release SHA-256
+`cad2920e1e176b13c59803fc6cf4d68d34a57428c34ba8c3183f72cf9dc79c52`)
+passed the complete non-radio gate. All 41 fixed-map operations executed; both
+WTBL busy polling and all-ones rejection remained active. Ring 2 programming
+and its four-word readback passed, interrupt bit 2 was authorized/enabled and
+the full mask read back, then the hook stopped without channel or scan
+commands. Cleanup/reset/unmap returned success and supervisor restore reported
+`failed=0`. The watchdog rebooted to healthy boot
+`2ea5e790-451a-48dc-b277-0e0a8a37e8be`. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T155035Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
