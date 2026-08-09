@@ -188,7 +188,20 @@ does not authorize transmission. The old `--run-one-shot-fwdl` mode still stops
 after CLC; only `--run-one-shot-channel-domain` can publish the new command.
 Both modes retain simultaneous WM/WM2 receive ownership and mandatory
 reset-while-pinned cleanup. No set-channel, radio-enable, or scan command is
-encoded by this boundary, and it has not yet received live authorization.
+encoded by this boundary.
+
+One watchdog-guarded physical run completed the channel-domain boundary from
+commit `8b7f6dac` (release SHA-256
+`f2a335e253383d679903ee1951e02bad4a1a76847a75e3ed7aad94176b45b58d`).
+The dual-ring CLC response returned special-UNII mask zero, then sequence 15
+published exactly 39 world/indoor `NO_IR` channels and reached TX completion.
+The run stopped there, reset while pinned, released every DMA mapping, and
+returned success; the supervisor restored `mt7921e` and iwd with no restore
+failure. No set-channel, radio, or scan command followed. The mandatory
+watchdog reboot restored boot `361cd83b-d30d-4f3c-abdd-2954758326c2` with
+`wlan0` up, its default route present, iwd active, and `failed=0`. The durable
+report is
+`/var/lib/wifi-driver-lab/reports/20260809T143339Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
