@@ -271,6 +271,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-channels-1-6") => Operation::RunOneShotPassiveChannels1And6,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -959,7 +961,11 @@ fn run() -> Result<(), String> {
                             Ok(())
                         },
                     )
-                } else if operation == Operation::RunOneShotPassiveChannel1 {
+                } else if matches!(
+                    operation,
+                    Operation::RunOneShotPassiveChannel1
+                        | Operation::RunOneShotPassiveChannels1And6
+                ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
                         patch,
@@ -984,67 +990,98 @@ fn run() -> Result<(), String> {
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
                             let candidates = candidate_channels(report.nic_capability);
-                            let channel = ChannelNumber {
-                                band: WlanBand::TwoGhz,
-                                number: 1,
+                            let channels = if operation == Operation::RunOneShotPassiveChannel1 {
+                                vec![ChannelNumber {
+                                    band: WlanBand::TwoGhz,
+                                    number: 1,
+                                }]
+                            } else {
+                                vec![
+                                    ChannelNumber {
+                                        band: WlanBand::TwoGhz,
+                                        number: 1,
+                                    },
+                                    ChannelNumber {
+                                        band: WlanBand::TwoGhz,
+                                        number: 6,
+                                    },
+                                ]
                             };
                             let mut adapter = Mt7921SoftmacAdapter::new(
                                 transport,
                                 report.nic_capability,
                                 candidates,
-                                vec![channel],
+                                channels.clone(),
                             )
                             .map_err(|error| error.to_string())?;
-                            adapter
-                                .set_channel(WlanSoftmacBaseSetChannelRequest {
-                                    primary: Some(channel),
-                                    bandwidth: Some(ChannelBandwidth::Cbw20),
-                                    vht_secondary_80_channel: None,
-                                })
-                                .map_err(|error| error.to_string())?;
-                            let response = adapter
-                                .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
-                                    channels: Some(vec![channel]),
-                                    min_channel_time: Some(50_000_000),
-                                    max_channel_time: Some(120_000_000),
-                                    min_home_time: Some(0),
-                                })
-                                .map_err(|error| error.to_string())?;
-                            let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
-                            let mut observations = 0usize;
-                            let success = loop {
-                                match adapter
-                                    .next_scan_event()
-                                    .map_err(|error| error.to_string())?
-                                {
-                                    Some(HardwareScanEvent::Observation(observation)) => {
-                                        observations += 1;
-                                        println!(
-                                            r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
-                                        );
+                            let mut total_observations = 0usize;
+                            for channel in &channels {
+                                adapter
+                                    .set_channel(WlanSoftmacBaseSetChannelRequest {
+                                        primary: Some(*channel),
+                                        bandwidth: Some(ChannelBandwidth::Cbw20),
+                                        vht_secondary_80_channel: None,
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                let response = adapter
+                                    .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+                                        channels: Some(vec![*channel]),
+                                        min_channel_time: Some(50_000_000),
+                                        max_channel_time: Some(120_000_000),
+                                        min_home_time: Some(0),
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
+                                let mut observations = 0usize;
+                                let success = loop {
+                                    match adapter
+                                        .next_scan_event()
+                                        .map_err(|error| error.to_string())?
+                                    {
+                                        Some(HardwareScanEvent::Observation(observation)) => {
+                                            observations += 1;
+                                            println!(
+                                                r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
+                                            );
+                                        }
+                                        Some(HardwareScanEvent::Complete {
+                                            scan_id: completed,
+                                            success,
+                                        }) if completed == scan_id => break success,
+                                        Some(HardwareScanEvent::Complete {
+                                            scan_id: completed,
+                                            ..
+                                        }) => {
+                                            return Err(format!(
+                                                "passive completion id {completed} did not match {scan_id}"
+                                            ));
+                                        }
+                                        None => {
+                                            std::thread::sleep(std::time::Duration::from_millis(1))
+                                        }
                                     }
-                                    Some(HardwareScanEvent::Complete {
-                                        scan_id: completed,
-                                        success,
-                                    }) if completed == scan_id => break success,
-                                    Some(HardwareScanEvent::Complete {
-                                        scan_id: completed,
-                                        ..
-                                    }) => {
-                                        return Err(format!(
-                                            "passive completion id {completed} did not match {scan_id}"
-                                        ));
-                                    }
-                                    None => std::thread::sleep(std::time::Duration::from_millis(1)),
+                                };
+                                if !success {
+                                    return Err(format!(
+                                        "passive channel {} failed completion",
+                                        channel.number
+                                    ));
                                 }
-                            };
-                            if !success || observations == 0 {
+                                total_observations += observations;
+                                println!(
+                                    r#"{{"passive_scan_event":"channel_gate_passed","scan_id":{scan_id},"channel":{},"observations":{observations}}}"#,
+                                    channel.number
+                                );
+                            }
+                            if total_observations == 0 {
                                 return Err(format!(
-                                    "one-channel passive gate failed: success={success} observations={observations}"
+                                    "passive scan gate observed no BSS across {} channels",
+                                    channels.len()
                                 ));
                             }
                             println!(
-                                r#"{{"passive_scan_event":"one_channel_gate_passed","scan_id":{scan_id},"observations":{observations}}}"#
+                                r#"{{"passive_scan_event":"sequential_gate_passed","channels":{},"observations":{total_observations}}}"#,
+                                channels.len()
                             );
                             Ok(())
                         },
@@ -3493,6 +3530,8 @@ enum Operation {
     RunOneShotPassivePrepare,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassiveChannel1,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassiveChannels1And6,
 }
 
 impl Operation {
@@ -3501,7 +3540,9 @@ impl Operation {
         {
             matches!(
                 self,
-                Self::RunOneShotPassivePrepare | Self::RunOneShotPassiveChannel1
+                Self::RunOneShotPassivePrepare
+                    | Self::RunOneShotPassiveChannel1
+                    | Self::RunOneShotPassiveChannels1And6
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -4060,6 +4101,9 @@ mod tests {
         assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
         assert!(Operation::RunOneShotPassiveChannel1.conn_writable());
         assert!(Operation::RunOneShotPassiveChannel1.loads_firmware());
+        assert!(Operation::RunOneShotPassiveChannels1And6.wfdma_writable());
+        assert!(Operation::RunOneShotPassiveChannels1And6.conn_writable());
+        assert!(Operation::RunOneShotPassiveChannels1And6.loads_firmware());
         assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
         assert!(Operation::RunOneShotPassivePrepare.conn_writable());
         assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
