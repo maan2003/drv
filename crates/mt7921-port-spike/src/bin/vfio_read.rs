@@ -666,6 +666,8 @@ fn run() -> Result<(), String> {
         let mut mcu_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_5000, 4 * PAGE)?;
         let mut command_payload = DmaArena::map(&iommu, ioas.id, 0x0100_9000)?;
         let mut fwdl_payload = DmaArena::map(&iommu, ioas.id, 0x0100_a000)?;
+        let mut mcu_wa_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_b000)?;
+        let mut mcu_wa_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_c000, 4 * PAGE)?;
         tx_guard.initialize_descriptor_page()?;
         fwdl_ring.initialize_descriptor_page()?;
         mcu_tx_ring.initialize_descriptor_page()?;
@@ -674,10 +676,17 @@ fn run() -> Result<(), String> {
         mcu_rx_buffers.zero_bytes(4 * PAGE)?;
         command_payload.zero_bytes(PAGE)?;
         fwdl_payload.zero_bytes(PAGE)?;
+        mcu_wa_rx_ring.initialize_descriptor_page()?;
+        mcu_wa_rx_buffers.zero_bytes(4 * PAGE)?;
         let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
             .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
         for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
             mcu_rx_ring.write_descriptor_at(index, descriptor);
+        }
+        let prepared_wa_rx = prepare_mcu_rx_ring(mcu_wa_rx_ring.iova, mcu_wa_rx_buffers.iova)
+            .map_err(|error| format!("prepare post-N9 MCU RX descriptors: {error:?}"))?;
+        for (index, descriptor) in prepared_wa_rx.descriptors.into_iter().enumerate() {
+            mcu_wa_rx_ring.write_descriptor_at(index, descriptor);
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
 
@@ -752,6 +761,7 @@ fn run() -> Result<(), String> {
                     log_global_rx_ring_event,
                 )
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
+                wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
             let installed = VfioIrq::install(&device, selected)?;
             if installed.try_read()?.is_some() {
@@ -811,6 +821,8 @@ fn run() -> Result<(), String> {
                     payload: &mut command_payload,
                     rx_ring: &mut mcu_rx_ring,
                     rx_buffers: &mcu_rx_buffers,
+                    wa_rx_ring: Some(&mut mcu_wa_rx_ring),
+                    wa_rx_buffers: Some(&mcu_wa_rx_buffers),
                     rx_tail: 0,
                     rx_head: 7,
                     rx_ring_index: 0,
@@ -850,6 +862,8 @@ fn run() -> Result<(), String> {
                 payload: &mut command_payload,
                 rx_ring: &mut mcu_rx_ring,
                 rx_buffers: &mcu_rx_buffers,
+                wa_rx_ring: None,
+                wa_rx_buffers: None,
                 rx_tail: 0,
                 rx_head: 7,
                 rx_ring_index: 0,
@@ -961,6 +975,8 @@ fn run() -> Result<(), String> {
             ));
         }
         for arena in [
+            &mut mcu_wa_rx_buffers,
+            &mut mcu_wa_rx_ring,
             &mut fwdl_payload,
             &mut command_payload,
             &mut mcu_rx_buffers,
@@ -1216,6 +1232,8 @@ struct ActiveMcuIo<'a, 'b> {
     payload: &'a mut DmaArena<'b>,
     rx_ring: &'a mut DmaArena<'b>,
     rx_buffers: &'a DmaArena<'b>,
+    wa_rx_ring: Option<&'a mut DmaArena<'b>>,
+    wa_rx_buffers: Option<&'a DmaArena<'b>>,
     rx_tail: usize,
     rx_head: usize,
     rx_ring_index: usize,
@@ -1297,6 +1315,24 @@ const fn dma_index_completed(actual: u32, expected: u32) -> bool {
 }
 
 impl ActiveMcuIo<'_, '_> {
+    fn switch_to_wa_rx(&mut self) -> Result<(), String> {
+        let ring = self
+            .wa_rx_ring
+            .take()
+            .ok_or("post-N9 MCU RX ring is unavailable")?;
+        let buffers = self
+            .wa_rx_buffers
+            .take()
+            .ok_or("post-N9 MCU RX buffers are unavailable")?;
+        self.rx_ring = ring;
+        self.rx_buffers = buffers;
+        self.rx_tail = 0;
+        self.rx_head = 7;
+        self.rx_ring_index = 4;
+        self.irq_bit = 1 << 27;
+        println!(r#"{{"active_mcu_event":"post_n9_rx_ring_selected","ring":4}}"#);
+        Ok(())
+    }
     fn cancelled(&self) -> Result<(), String> {
         if self.signal.stop_requested() {
             Err("active MCU transaction cancelled by signal".into())
@@ -1484,6 +1520,9 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         encoded: &[u8],
     ) -> Result<FirmwareCommandCompletion, Self::Error> {
         self.mcu.cancelled()?;
+        if command == DownloadCommand::GetNicCapability {
+            self.mcu.switch_to_wa_rx()?;
+        }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, 256);
         let expects_response = command != DownloadCommand::NicPowerControl;

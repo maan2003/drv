@@ -157,6 +157,10 @@ The bounds-checked response parser exposes MAC, PHY stream/band, 6 GHz, and chip
 capability TLVs while retaining the element/unknown counts. It rejects truncated
 headers, values, and undersized known elements. No radio, channel, regulatory,
 or scan command is encoded or sent.
+Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
+The VFIO adapter therefore owns a separate ring-4 descriptor/buffer arena from
+startup and switches the bounded response path and interrupt mask from boot-ROM
+ring 0 to ring 4 only after N9 readiness.
 
 A watchdog-guarded physical run completed this boundary for the exact installed
 MT7961 artifacts. It downloaded one patch section and four RAM regions in 196
