@@ -359,6 +359,17 @@ emitting `sequential_gate_passed`. Cleanup, restoration, and watchdog disarm
 all succeeded without reboot; `mt7921e`, iwd, and the default route remained
 healthy on the same boot. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T162215Z-0000_05_00.0.log`.
+
+The next gate completed sequential passive dwells across every 2.4 GHz channel
+1-14 from release SHA-256
+`4535b5ae1af9544a5bfab3033a3873d17d7241aba42f0073c096d6c1b468ea43`.
+All 14 scan IDs received matching successful completion and three valid beacon
+observations were delivered overall. Cleanup and supervisor restoration both
+returned success. SSH dropped during the longer handoff, so the client did not
+retry and the armed watchdog rebooted as designed; boot
+`5e7097d2-4971-4fa1-a9fd-ffa2a1cc8173` returned with `mt7921e`, iwd, `wlan0`,
+and its default route healthy. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T162423Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
