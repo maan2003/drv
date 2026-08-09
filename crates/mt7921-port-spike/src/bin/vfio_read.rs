@@ -261,6 +261,7 @@ enum AcquisitionIntent {
     AttachIoas,
     MapBar(usize),
     MapDma { iova: u64, len: usize },
+    InstallIrq,
 }
 
 struct AcquisitionLedger {
@@ -438,6 +439,29 @@ impl ActiveVfioCapsule {
 
     fn retain_forever(self) -> ! {
         park_retention_capsule(self)
+    }
+}
+
+fn report_acquisition_failure(capsule: &mut ActiveVfioCapsule, primary: String) -> String {
+    if capsule
+        .containment
+        .as_ref()
+        .is_some_and(ContainmentLedger::hardware_may_be_active)
+    {
+        park_retention_capsule_ref(capsule);
+    }
+    let release_errors = capsule.release_observable();
+    if let Some(ledger) = capsule.containment.as_mut() {
+        ledger.phase = if release_errors.is_empty() {
+            RunPhase::Contained
+        } else {
+            RunPhase::SafeReleaseError
+        };
+    }
+    if release_errors.is_empty() {
+        primary
+    } else {
+        format!("{primary}; SAFE acquisition release errors: {release_errors:?}")
     }
 }
 
@@ -687,89 +711,96 @@ fn run() -> Result<(), String> {
     verify_pci_identity(&bdf)?;
     verify_pci_dma_disabled(&bdf)?;
 
-    acquisition_ledger.record(AcquisitionIntent::BindIommu)?;
-    let mut bind = Bind {
-        argsz: size::<Bind>(),
-        iommufd: capsule.iommu.as_raw_fd(),
-        ..Default::default()
-    };
-    if let Some(ledger) = capsule.containment.as_mut() {
-        ledger.mark_possibly_active(Hazard::VfioBound);
-    }
-    ioctl_mut(
-        capsule.device.as_raw_fd(),
-        VFIO_DEVICE_BIND_IOMMUFD,
-        &mut bind,
-        "bind iommufd",
-    )?;
-    acquisition_ledger.record(AcquisitionIntent::AllocateIoas)?;
-    let mut alloc = IoasAlloc {
-        size: size::<IoasAlloc>(),
-        ..Default::default()
-    };
-    if let Some(ledger) = capsule.containment.as_mut() {
-        ledger.mark_possibly_active(Hazard::IoasAllocated);
-    }
-    ioctl_mut(
-        capsule.iommu.as_raw_fd(),
-        IOMMU_IOAS_ALLOC,
-        &mut alloc,
-        "allocate IOAS",
-    )?;
-    capsule.ioas = Some(Ioas {
-        fd: Arc::clone(&capsule.iommu),
-        id: alloc.out_ioas_id,
-        destroyed: false,
-    });
-    acquisition_ledger.record(AcquisitionIntent::AttachIoas)?;
-    let mut attach = Attach {
-        argsz: size::<Attach>(),
-        pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id,
-        ..Default::default()
-    };
-    if let Some(ledger) = capsule.containment.as_mut() {
-        ledger.mark_possibly_active(Hazard::IoasAttached);
-    }
-    ioctl_mut(
-        capsule.device.as_raw_fd(),
-        VFIO_DEVICE_ATTACH_IOMMUFD_PT,
-        &mut attach,
-        "attach IOAS",
-    )?;
+    let base_acquisition = (|| -> Result<RegionInfo, String> {
+        acquisition_ledger.record(AcquisitionIntent::BindIommu)?;
+        let mut bind = Bind {
+            argsz: size::<Bind>(),
+            iommufd: capsule.iommu.as_raw_fd(),
+            ..Default::default()
+        };
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.mark_possibly_active(Hazard::VfioBound);
+        }
+        ioctl_mut(
+            capsule.device.as_raw_fd(),
+            VFIO_DEVICE_BIND_IOMMUFD,
+            &mut bind,
+            "bind iommufd",
+        )?;
+        acquisition_ledger.record(AcquisitionIntent::AllocateIoas)?;
+        let mut alloc = IoasAlloc {
+            size: size::<IoasAlloc>(),
+            ..Default::default()
+        };
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.mark_possibly_active(Hazard::IoasAllocated);
+        }
+        ioctl_mut(
+            capsule.iommu.as_raw_fd(),
+            IOMMU_IOAS_ALLOC,
+            &mut alloc,
+            "allocate IOAS",
+        )?;
+        capsule.ioas = Some(Ioas {
+            fd: Arc::clone(&capsule.iommu),
+            id: alloc.out_ioas_id,
+            destroyed: false,
+        });
+        acquisition_ledger.record(AcquisitionIntent::AttachIoas)?;
+        let mut attach = Attach {
+            argsz: size::<Attach>(),
+            pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id,
+            ..Default::default()
+        };
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.mark_possibly_active(Hazard::IoasAttached);
+        }
+        ioctl_mut(
+            capsule.device.as_raw_fd(),
+            VFIO_DEVICE_ATTACH_IOMMUFD_PT,
+            &mut attach,
+            "attach IOAS",
+        )?;
 
-    let mut info = RegionInfo {
-        argsz: size::<RegionInfo>(),
-        index: BAR0_REGION,
-        ..Default::default()
-    };
-    ioctl_mut(
-        capsule.device.as_raw_fd(),
-        VFIO_DEVICE_GET_REGION_INFO,
-        &mut info,
-        "query BAR 0",
-    )?;
+        let mut info = RegionInfo {
+            argsz: size::<RegionInfo>(),
+            index: BAR0_REGION,
+            ..Default::default()
+        };
+        ioctl_mut(
+            capsule.device.as_raw_fd(),
+            VFIO_DEVICE_GET_REGION_INFO,
+            &mut info,
+            "query BAR 0",
+        )?;
 
-    if let Some(ledger) = capsule.containment.as_mut() {
-        ledger.mark_possibly_active(Hazard::BarMapping);
-    }
-    acquisition_ledger.record(AcquisitionIntent::MapBar(0xd4000))?;
-    capsule.wfdma = Some(ReadPage::map(
-        &capsule.device,
-        &info,
-        0xd4000,
-        operation.wfdma_writable(),
-    )?);
-    if operation.needs_pcie_mac() {
-        acquisition_ledger.record(AcquisitionIntent::MapBar(0x10000))?;
-        capsule.pcie_mac = Some(ReadPage::map(&capsule.device, &info, 0x10000, true)?);
-    }
-    acquisition_ledger.record(AcquisitionIntent::MapBar(0xe0000))?;
-    capsule.conn = Some(ReadPage::map(
-        &capsule.device,
-        &info,
-        0xe0000,
-        operation.conn_writable(),
-    )?);
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.mark_possibly_active(Hazard::BarMapping);
+        }
+        acquisition_ledger.record(AcquisitionIntent::MapBar(0xd4000))?;
+        capsule.wfdma = Some(ReadPage::map(
+            &capsule.device,
+            &info,
+            0xd4000,
+            operation.wfdma_writable(),
+        )?);
+        if operation.needs_pcie_mac() {
+            acquisition_ledger.record(AcquisitionIntent::MapBar(0x10000))?;
+            capsule.pcie_mac = Some(ReadPage::map(&capsule.device, &info, 0x10000, true)?);
+        }
+        acquisition_ledger.record(AcquisitionIntent::MapBar(0xe0000))?;
+        capsule.conn = Some(ReadPage::map(
+            &capsule.device,
+            &info,
+            0xe0000,
+            operation.conn_writable(),
+        )?);
+        Ok(info)
+    })();
+    let info = match base_acquisition {
+        Ok(info) => info,
+        Err(primary) => return Err(report_acquisition_failure(&mut capsule, primary)),
+    };
 
     let device = &capsule.device;
     let iommu = &capsule.iommu;
@@ -1116,7 +1147,7 @@ fn run() -> Result<(), String> {
             .expect("active MCU operation has containment ledger")
             .mark_possibly_active(Hazard::DmaMapping);
         capsule.active = Some(ActiveVfioResources::default());
-        acquire_active_vfio_resources(
+        let active_acquisition = acquire_active_vfio_resources(
             capsule.active.as_mut().expect("active slots installed"),
             &capsule.device,
             &capsule.iommu,
@@ -1128,7 +1159,10 @@ fn run() -> Result<(), String> {
                 .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger"),
-        )?;
+        );
+        if let Err(primary) = active_acquisition {
+            return Err(report_acquisition_failure(&mut capsule, primary));
+        }
         capsule
             .containment
             .as_mut()
@@ -1279,11 +1313,11 @@ fn run() -> Result<(), String> {
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::DeviceIrq);
-            let installed = VfioIrq::install(&device, selected)?;
-            if installed.try_read()?.is_some() {
+            acquisition_ledger.record(AcquisitionIntent::InstallIrq)?;
+            *irq = Some(VfioIrq::install(&device, selected)?);
+            if irq.as_ref().expect("IRQ installed").try_read()?.is_some() {
                 return Err("unexpected IRQ before device source enable".into());
             }
-            *irq = Some(installed);
             println!("{{\"active_mcu_event\":\"vfio_irq_installed\"}}");
             if wfdma.read(0xd4200)? != 0 {
                 return Err(format!(
@@ -5738,7 +5772,7 @@ mod tests {
                 .join(format!("mt7921-retention-{mode}-{}", std::process::id()));
             let _ = std::fs::remove_file(&marker);
             let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::parked_capsule_helper", "--nocapture"])
+                .args(["parked_capsule_helper", "--nocapture"])
                 .env("DRV_TEST_PARK_DROP_PATH", &marker)
                 .env("DRV_TEST_PARK_MODE", mode)
                 .stdout(Stdio::null())
@@ -5832,6 +5866,7 @@ mod tests {
                 len: PAGE,
             })
             .unwrap();
+        ledger.record(AcquisitionIntent::InstallIrq).unwrap();
         assert_eq!(
             ledger.recorded().collect::<Vec<_>>(),
             [
@@ -5843,7 +5878,28 @@ mod tests {
                     iova: 0x0100_0000,
                     len: PAGE,
                 },
+                AcquisitionIntent::InstallIrq,
             ]
+        );
+    }
+
+    #[test]
+    fn partial_acquisition_preserves_primary_and_observable_release_error() {
+        let device = Arc::new(File::open("/dev/null").unwrap());
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        let ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        let mut capsule = ActiveVfioCapsule::new(device, Arc::clone(&iommu), Some(ledger));
+        capsule.ioas = Some(Ioas {
+            fd: iommu,
+            id: 1,
+            destroyed: false,
+        });
+        let error = report_acquisition_failure(&mut capsule, "primary".into());
+        assert!(error.contains("primary"));
+        assert!(error.contains("SAFE acquisition release errors"));
+        assert_eq!(
+            capsule.containment.as_ref().unwrap().phase,
+            RunPhase::SafeReleaseError
         );
     }
 }
