@@ -9,6 +9,8 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
@@ -4450,6 +4452,7 @@ struct RateTxPowerSubmission {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct RateTxPowerAuthorization {
+    owner_id: NonZeroU64,
     generation: u64,
     alpha2: [u8; 2],
     target_half_dbm: i8,
@@ -4457,6 +4460,7 @@ pub struct RateTxPowerAuthorization {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct RateTxPowerAuthorizer {
+    owner_id: Option<NonZeroU64>,
     generation: u64,
     alpha2: [u8; 2],
     authorization: Option<RateTxPowerAuthorization>,
@@ -4465,6 +4469,7 @@ pub struct RateTxPowerAuthorizer {
 impl RateTxPowerAuthorizer {
     pub const fn new() -> Self {
         Self {
+            owner_id: None,
             generation: 0,
             alpha2: *b"00",
             authorization: None,
@@ -4485,12 +4490,17 @@ impl RateTxPowerAuthorizer {
         }
         let submission =
             submit_conservative_rate_tx_power(transport, capability, limits, first_sequence)?;
+        let owner_id = *self
+            .owner_id
+            .get_or_insert_with(next_rate_power_authorizer_id);
         let authorization = RateTxPowerAuthorization {
+            owner_id,
             generation: self.generation,
             alpha2: self.alpha2,
             target_half_dbm: submission.target_half_dbm,
         };
         self.authorization = Some(RateTxPowerAuthorization {
+            owner_id: authorization.owner_id,
             generation: authorization.generation,
             alpha2: authorization.alpha2,
             target_half_dbm: authorization.target_half_dbm,
@@ -4511,9 +4521,18 @@ impl RateTxPowerAuthorizer {
 
     pub fn permits(&self, authorization: &RateTxPowerAuthorization) -> bool {
         self.authorization.as_ref() == Some(authorization)
+            && self.owner_id == Some(authorization.owner_id)
             && authorization.generation == self.generation
             && authorization.alpha2 == self.alpha2
     }
+}
+
+fn next_rate_power_authorizer_id() -> NonZeroU64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("rate-power authorizer identity space exhausted");
+    NonZeroU64::new(id).expect("rate-power authorizer identities start at one")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5049,6 +5068,20 @@ mod tests {
         assert!(authorizer.permits(&authorization));
         assert_eq!(transport.completed, 8);
         assert_eq!(transport.pse_reads, 8);
+
+        let mut other_transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        let mut other_authorizer = RateTxPowerAuthorizer::new();
+        let other_authorization = other_authorizer
+            .submit(&mut other_transport, capability, limits, 1)
+            .unwrap();
+        assert!(other_authorizer.permits(&other_authorization));
+        assert!(!authorizer.permits(&other_authorization));
+        assert!(!other_authorizer.permits(&authorization));
+
         authorizer.reset();
         assert!(!authorizer.permits(&authorization));
         let mut transport = PowerTransport {
