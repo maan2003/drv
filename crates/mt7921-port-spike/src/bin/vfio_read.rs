@@ -104,6 +104,7 @@ const PATCH_SHA256: &str = "a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea
 const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9";
 const PATCH_IMAGE_BYTES: usize = 92_192;
 const RAM_IMAGE_BYTES: usize = 792_036;
+const WATCHDOG_STATUS_PATH: &str = "/run/current-system/sw/bin/wifi-lab-watchdog";
 
 #[repr(C)]
 #[derive(Default)]
@@ -253,6 +254,325 @@ impl Drop for ActiveSignalGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcquisitionIntent {
+    BindIommu,
+    AllocateIoas,
+    AttachIoas,
+    MapBar(usize),
+    MapDma { iova: u64, len: usize },
+}
+
+struct AcquisitionLedger {
+    intents: [Option<AcquisitionIntent>; 64],
+    len: usize,
+}
+
+impl Default for AcquisitionLedger {
+    fn default() -> Self {
+        Self {
+            intents: [None; 64],
+            len: 0,
+        }
+    }
+}
+
+impl AcquisitionLedger {
+    fn record(&mut self, intent: AcquisitionIntent) -> Result<(), String> {
+        let slot = self
+            .intents
+            .get_mut(self.len)
+            .ok_or_else(|| "active acquisition ledger capacity exhausted".to_string())?;
+        *slot = Some(intent);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn recorded(&self) -> impl Iterator<Item = AcquisitionIntent> + '_ {
+        self.intents[..self.len].iter().copied().flatten()
+    }
+}
+
+#[derive(Default)]
+struct ActiveVfioResources {
+    selector_page: Option<ReadPage>,
+    dynamic_window: Option<ReadPage>,
+    #[cfg(feature = "fuchsia-passive")]
+    passive_window_pages: Option<Vec<ReadPage>>,
+    swdef: Option<ReadPage>,
+    dmashdl: Option<ReadPage>,
+    tx_guard: Option<DmaArena>,
+    fwdl_ring: Option<DmaArena>,
+    mcu_tx_ring: Option<DmaArena>,
+    rx_guard: Option<DmaArena>,
+    mcu_rx_ring: Option<DmaArena>,
+    mcu_rx_buffers: Option<DmaArena>,
+    command_payload: Option<DmaArena>,
+    fwdl_payload: Option<DmaArena>,
+    mcu_wa_rx_ring: Option<DmaArena>,
+    mcu_wa_rx_buffers: Option<DmaArena>,
+    #[cfg(feature = "fuchsia-passive")]
+    data_rx_ring: Option<DmaArena>,
+    #[cfg(feature = "fuchsia-passive")]
+    data_rx_buffers: Option<DmaArena>,
+    irq: Option<VfioIrq>,
+}
+
+struct ActiveVfioCapsule {
+    device: Arc<File>,
+    iommu: Arc<File>,
+    ioas: Option<Ioas>,
+    wfdma: Option<ReadPage>,
+    pcie_mac: Option<ReadPage>,
+    conn: Option<ReadPage>,
+    active: Option<ActiveVfioResources>,
+    containment: Option<ContainmentLedger>,
+}
+
+impl ActiveVfioCapsule {
+    fn new(device: Arc<File>, iommu: Arc<File>, containment: Option<ContainmentLedger>) -> Self {
+        Self {
+            device,
+            iommu,
+            ioas: None,
+            wfdma: None,
+            pcie_mac: None,
+            conn: None,
+            active: None,
+            containment,
+        }
+    }
+
+    fn release_observable(&mut self) -> Vec<ReleaseFailure> {
+        fn release_dma(slot: &mut Option<DmaArena>, failures: &mut Vec<ReleaseFailure>) {
+            if let Some(arena) = slot.as_mut()
+                && let Err(error) = arena.teardown()
+            {
+                failures.push(ReleaseFailure {
+                    action: ObservableRelease::DmaUnmap,
+                    error,
+                });
+            }
+        }
+        fn release_bar(slot: &mut Option<ReadPage>, failures: &mut Vec<ReleaseFailure>) {
+            if let Some(page) = slot.as_mut()
+                && let Err(error) = page.teardown()
+            {
+                failures.push(ReleaseFailure {
+                    action: ObservableRelease::BarMunmap,
+                    error,
+                });
+            }
+        }
+
+        let mut failures = Vec::new();
+        if let Some(active) = self.active.as_mut() {
+            // OwnedFd/File close is normal RAII, not proof, and is never
+            // retried as a raw close operation.
+            drop(active.irq.take());
+            #[cfg(feature = "fuchsia-passive")]
+            release_dma(&mut active.data_rx_buffers, &mut failures);
+            #[cfg(feature = "fuchsia-passive")]
+            release_dma(&mut active.data_rx_ring, &mut failures);
+            for slot in [
+                &mut active.mcu_wa_rx_buffers,
+                &mut active.mcu_wa_rx_ring,
+                &mut active.fwdl_payload,
+                &mut active.command_payload,
+                &mut active.mcu_rx_buffers,
+                &mut active.mcu_rx_ring,
+                &mut active.rx_guard,
+                &mut active.mcu_tx_ring,
+                &mut active.fwdl_ring,
+                &mut active.tx_guard,
+            ] {
+                release_dma(slot, &mut failures);
+            }
+            #[cfg(feature = "fuchsia-passive")]
+            if let Some(pages) = active.passive_window_pages.as_mut() {
+                for page in pages {
+                    if let Err(error) = page.teardown() {
+                        failures.push(ReleaseFailure {
+                            action: ObservableRelease::BarMunmap,
+                            error,
+                        });
+                    }
+                }
+            }
+            for slot in [
+                &mut active.dmashdl,
+                &mut active.swdef,
+                &mut active.dynamic_window,
+                &mut active.selector_page,
+            ] {
+                release_bar(slot, &mut failures);
+            }
+        }
+        for slot in [&mut self.conn, &mut self.pcie_mac, &mut self.wfdma] {
+            release_bar(slot, &mut failures);
+        }
+        if let Some(ioas) = self.ioas.as_mut()
+            && let Err(error) = ioas.teardown()
+        {
+            failures.push(ReleaseFailure {
+                action: ObservableRelease::IoasDestroy,
+                error,
+            });
+        }
+        failures
+    }
+}
+
+impl Drop for ActiveVfioResources {
+    fn drop(&mut self) {
+        // The IRQ contains the device raw fd, so release it before mappings and handles.
+        drop(self.irq.take());
+    }
+}
+
+impl Drop for ActiveVfioCapsule {
+    fn drop(&mut self) {
+        if self
+            .containment
+            .as_ref()
+            .is_some_and(ContainmentLedger::hardware_may_be_active)
+        {
+            park_retention_capsule_ref(self);
+        }
+        // Preserve dependency order even on partial acquisition failures.
+        drop(self.active.take());
+        drop(self.conn.take());
+        drop(self.pcie_mac.take());
+        drop(self.wfdma.take());
+        drop(self.ioas.take());
+    }
+}
+
+fn acquire_active_vfio_resources(
+    resources: &mut ActiveVfioResources,
+    device: &Arc<File>,
+    iommu: &Arc<File>,
+    ioas: u32,
+    info: &RegionInfo,
+    operation: Operation,
+    ledger: &mut AcquisitionLedger,
+    containment: &mut ContainmentLedger,
+) -> Result<(), String> {
+    #[cfg(not(feature = "fuchsia-passive"))]
+    let _ = operation;
+    macro_rules! map_bar {
+        ($field:ident, $offset:expr) => {{
+            containment.mark_possibly_active(Hazard::BarMapping);
+            ledger.record(AcquisitionIntent::MapBar($offset))?;
+            resources.$field = Some(ReadPage::map(device, info, $offset, true)?);
+        }};
+    }
+    macro_rules! map_dma {
+        ($field:ident, $iova:expr, $len:expr) => {{
+            containment.mark_possibly_active(Hazard::DmaMapping);
+            ledger.record(AcquisitionIntent::MapDma {
+                iova: $iova,
+                len: $len,
+            })?;
+            resources.$field = Some(DmaArena::map_len(iommu, ioas, $iova, $len)?);
+        }};
+    }
+    map_bar!(selector_page, 0xfe000);
+    map_bar!(dynamic_window, MT_HIF_REMAP_WINDOW_BAR_OFFSET);
+    #[cfg(feature = "fuchsia-passive")]
+    if operation.is_passive() {
+        resources.passive_window_pages = Some(Vec::new());
+        for bar_page in PASSIVE_MAC_BAR_PAGES {
+            containment.mark_possibly_active(Hazard::BarMapping);
+            ledger.record(AcquisitionIntent::MapBar(bar_page))?;
+            resources
+                .passive_window_pages
+                .as_mut()
+                .expect("initialized")
+                .push(ReadPage::map(device, info, bar_page, true)?);
+        }
+    } else {
+        resources.passive_window_pages = Some(Vec::new());
+    }
+    map_bar!(swdef, 0x9f000);
+    map_bar!(dmashdl, 0xd6000);
+    map_dma!(tx_guard, 0x0100_0000, PAGE);
+    map_dma!(fwdl_ring, 0x0100_1000, PAGE);
+    map_dma!(mcu_tx_ring, 0x0100_2000, PAGE);
+    map_dma!(rx_guard, 0x0100_3000, PAGE);
+    map_dma!(mcu_rx_ring, 0x0100_4000, PAGE);
+    map_dma!(mcu_rx_buffers, 0x0100_5000, 4 * PAGE);
+    map_dma!(
+        command_payload,
+        MCU_COMMAND_PAYLOAD_IOVA,
+        MCU_COMMAND_PAYLOAD_BYTES
+    );
+    map_dma!(fwdl_payload, 0x0100_a000, PAGE);
+    map_dma!(mcu_wa_rx_ring, 0x0100_b000, PAGE);
+    map_dma!(mcu_wa_rx_buffers, 0x0100_c000, 4 * PAGE);
+    #[cfg(feature = "fuchsia-passive")]
+    {
+        map_dma!(data_rx_ring, 0x0101_0000, PAGE);
+        map_dma!(data_rx_buffers, 0x0101_1000, 4 * PAGE);
+    }
+
+    let tx_guard = resources.tx_guard.as_mut().expect("mapped");
+    let fwdl_ring = resources.fwdl_ring.as_mut().expect("mapped");
+    let mcu_tx_ring = resources.mcu_tx_ring.as_mut().expect("mapped");
+    let rx_guard = resources.rx_guard.as_mut().expect("mapped");
+    let mcu_rx_ring = resources.mcu_rx_ring.as_mut().expect("mapped");
+    let mcu_rx_buffers = resources.mcu_rx_buffers.as_mut().expect("mapped");
+    let command_payload = resources.command_payload.as_mut().expect("mapped");
+    let fwdl_payload = resources.fwdl_payload.as_mut().expect("mapped");
+    let mcu_wa_rx_ring = resources.mcu_wa_rx_ring.as_mut().expect("mapped");
+    let mcu_wa_rx_buffers = resources.mcu_wa_rx_buffers.as_mut().expect("mapped");
+    tx_guard.initialize_descriptor_page()?;
+    fwdl_ring.initialize_descriptor_page()?;
+    mcu_tx_ring.initialize_descriptor_page()?;
+    rx_guard.initialize_descriptor_page()?;
+    mcu_rx_ring.initialize_descriptor_page()?;
+    mcu_rx_buffers.zero_bytes(4 * PAGE)?;
+    command_payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+    fwdl_payload.zero_bytes(PAGE)?;
+    mcu_wa_rx_ring.initialize_descriptor_page()?;
+    mcu_wa_rx_buffers.zero_bytes(4 * PAGE)?;
+    #[cfg(feature = "fuchsia-passive")]
+    {
+        resources
+            .data_rx_ring
+            .as_mut()
+            .expect("mapped")
+            .initialize_descriptor_page()?;
+        resources
+            .data_rx_buffers
+            .as_mut()
+            .expect("mapped")
+            .zero_bytes(4 * PAGE)?;
+    }
+    let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
+        .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
+    for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
+        mcu_rx_ring.write_descriptor_at(index, descriptor);
+    }
+    let prepared_wa_rx = prepare_mcu_rx_ring(mcu_wa_rx_ring.iova, mcu_wa_rx_buffers.iova)
+        .map_err(|error| format!("prepare post-N9 MCU RX descriptors: {error:?}"))?;
+    for (index, descriptor) in prepared_wa_rx.descriptors.into_iter().enumerate() {
+        mcu_wa_rx_ring.write_descriptor_at(index, descriptor);
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    {
+        let data_rx_ring = resources.data_rx_ring.as_mut().expect("mapped");
+        let data_rx_buffers = resources.data_rx_buffers.as_ref().expect("mapped");
+        let prepared_data = prepare_mcu_rx_ring(data_rx_ring.iova, data_rx_buffers.iova)
+            .map_err(|error| format!("prepare data RX descriptors: {error:?}"))?;
+        for (index, descriptor) in prepared_data.descriptors.into_iter().enumerate() {
+            data_rx_ring.write_descriptor_at(index, descriptor);
+        }
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 pub fn main() {
     if let Err(message) = run() {
         eprintln!("mt7921-vfio-read: {message}");
@@ -322,7 +642,7 @@ fn run() -> Result<(), String> {
         .is_active_mcu()
         .then(verify_external_watchdog_armed)
         .transpose()?;
-    let mut active_ledger = operation
+    let containment = operation
         .is_active_mcu()
         .then(|| ContainmentLedger::acquire(watchdog))
         .transpose()?;
@@ -341,47 +661,59 @@ fn run() -> Result<(), String> {
             .open("/dev/iommu")
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
+    let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
+    let mut acquisition_ledger = AcquisitionLedger::default();
+
+    // Advisory preflight facts are re-read with the complete resource owner
+    // installed, before the first stateful VFIO operation is attempted.
+    verify_pci_identity(&bdf)?;
+    verify_pci_dma_disabled(&bdf)?;
+
+    acquisition_ledger.record(AcquisitionIntent::BindIommu)?;
     let mut bind = Bind {
         argsz: size::<Bind>(),
-        iommufd: iommu.as_raw_fd(),
+        iommufd: capsule.iommu.as_raw_fd(),
         ..Default::default()
     };
-    if let Some(ledger) = active_ledger.as_mut() {
+    if let Some(ledger) = capsule.containment.as_mut() {
         ledger.mark_possibly_active(Hazard::VfioBound);
     }
     ioctl_mut(
-        device.as_raw_fd(),
+        capsule.device.as_raw_fd(),
         VFIO_DEVICE_BIND_IOMMUFD,
         &mut bind,
         "bind iommufd",
     )?;
+    acquisition_ledger.record(AcquisitionIntent::AllocateIoas)?;
     let mut alloc = IoasAlloc {
         size: size::<IoasAlloc>(),
         ..Default::default()
     };
-    if let Some(ledger) = active_ledger.as_mut() {
+    if let Some(ledger) = capsule.containment.as_mut() {
         ledger.mark_possibly_active(Hazard::IoasAllocated);
     }
     ioctl_mut(
-        iommu.as_raw_fd(),
+        capsule.iommu.as_raw_fd(),
         IOMMU_IOAS_ALLOC,
         &mut alloc,
         "allocate IOAS",
     )?;
-    let ioas = Ioas {
-        fd: Arc::clone(&iommu),
+    capsule.ioas = Some(Ioas {
+        fd: Arc::clone(&capsule.iommu),
         id: alloc.out_ioas_id,
-    };
+        destroyed: false,
+    });
+    acquisition_ledger.record(AcquisitionIntent::AttachIoas)?;
     let mut attach = Attach {
         argsz: size::<Attach>(),
-        pt_id: ioas.id,
+        pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id,
         ..Default::default()
     };
-    if let Some(ledger) = active_ledger.as_mut() {
+    if let Some(ledger) = capsule.containment.as_mut() {
         ledger.mark_possibly_active(Hazard::IoasAttached);
     }
     ioctl_mut(
-        device.as_raw_fd(),
+        capsule.device.as_raw_fd(),
         VFIO_DEVICE_ATTACH_IOMMUFD_PT,
         &mut attach,
         "attach IOAS",
@@ -393,22 +725,41 @@ fn run() -> Result<(), String> {
         ..Default::default()
     };
     ioctl_mut(
-        device.as_raw_fd(),
+        capsule.device.as_raw_fd(),
         VFIO_DEVICE_GET_REGION_INFO,
         &mut info,
         "query BAR 0",
     )?;
 
-    if let Some(ledger) = active_ledger.as_mut() {
+    if let Some(ledger) = capsule.containment.as_mut() {
         ledger.mark_possibly_active(Hazard::BarMapping);
     }
-    let wfdma = ReadPage::map(&device, &info, 0xd4000, operation.wfdma_writable())?;
-    let pcie_mac = if operation.needs_pcie_mac() {
-        Some(ReadPage::map(&device, &info, 0x10000, true)?)
-    } else {
-        None
-    };
-    let conn = ReadPage::map(&device, &info, 0xe0000, operation.conn_writable())?;
+    acquisition_ledger.record(AcquisitionIntent::MapBar(0xd4000))?;
+    capsule.wfdma = Some(ReadPage::map(
+        &capsule.device,
+        &info,
+        0xd4000,
+        operation.wfdma_writable(),
+    )?);
+    if operation.needs_pcie_mac() {
+        acquisition_ledger.record(AcquisitionIntent::MapBar(0x10000))?;
+        capsule.pcie_mac = Some(ReadPage::map(&capsule.device, &info, 0x10000, true)?);
+    }
+    acquisition_ledger.record(AcquisitionIntent::MapBar(0xe0000))?;
+    capsule.conn = Some(ReadPage::map(
+        &capsule.device,
+        &info,
+        0xe0000,
+        operation.conn_writable(),
+    )?);
+
+    let device = &capsule.device;
+    let iommu = &capsule.iommu;
+    let ioas = capsule.ioas.as_ref().expect("IOAS acquired");
+    let wfdma = capsule.wfdma.as_ref().expect("WFDMA page acquired");
+    let pcie_mac = capsule.pcie_mac.as_ref();
+    let conn = capsule.conn.as_ref().expect("CONN page acquired");
+
     if matches!(
         operation,
         Operation::InventoryVfioIrqs | Operation::InstallDisableVfioIrq
@@ -721,6 +1072,7 @@ fn run() -> Result<(), String> {
         println!("{{\"global_tx_ring_event\":\"owned_arenas_unmapped_after_reset\"}}");
         operation?;
     }
+    let mut active_terminal_error = None;
     if operation.is_active_mcu() {
         verify_pci_dma_disabled(&bdf)?;
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
@@ -740,92 +1092,88 @@ fn run() -> Result<(), String> {
         } else {
             None
         };
-        let selector_page = ReadPage::map(&device, &info, 0xfe000, true)?;
-        let dynamic_window = ReadPage::map(&device, &info, MT_HIF_REMAP_WINDOW_BAR_OFFSET, true)?;
-        #[cfg(feature = "fuchsia-passive")]
-        let passive_window_pages = if operation.is_passive() {
-            PASSIVE_MAC_BAR_PAGES
-                .into_iter()
-                .map(|bar_page| ReadPage::map(&device, &info, bar_page, true))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
-        let swdef = ReadPage::map(&device, &info, 0x9f000, true)?;
-        let dmashdl = ReadPage::map(&device, &info, 0xd6000, true)?;
-
-        active_ledger
-            .as_mut()
-            .expect("active MCU operation has containment ledger")
-            .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled)?;
-        active_ledger
+        capsule
+            .containment
             .as_mut()
             .expect("active MCU operation has containment ledger")
             .mark_possibly_active(Hazard::DmaMapping);
-        let mut tx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
-        let mut fwdl_ring = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
-        let mut mcu_tx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
-        let mut rx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_3000)?;
-        let mut mcu_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_4000)?;
-        let mut mcu_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_5000, 4 * PAGE)?;
-        let mut command_payload = DmaArena::map_len(
-            &iommu,
-            ioas.id,
-            MCU_COMMAND_PAYLOAD_IOVA,
-            MCU_COMMAND_PAYLOAD_BYTES,
+        capsule.active = Some(ActiveVfioResources::default());
+        acquire_active_vfio_resources(
+            capsule.active.as_mut().expect("active slots installed"),
+            &capsule.device,
+            &capsule.iommu,
+            capsule.ioas.as_ref().expect("IOAS acquired").id,
+            &info,
+            operation,
+            &mut acquisition_ledger,
+            capsule
+                .containment
+                .as_mut()
+                .expect("active MCU operation has containment ledger"),
         )?;
-        let mut fwdl_payload = DmaArena::map(&iommu, ioas.id, 0x0100_a000)?;
-        let mut mcu_wa_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_b000)?;
-        let mut mcu_wa_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_c000, 4 * PAGE)?;
+        capsule
+            .containment
+            .as_mut()
+            .expect("active MCU operation has containment ledger")
+            .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled)?;
+        let resources = capsule
+            .active
+            .as_mut()
+            .expect("active resources acquired before mutation");
+        let ActiveVfioResources {
+            selector_page,
+            dynamic_window,
+            #[cfg(feature = "fuchsia-passive")]
+            passive_window_pages,
+            swdef,
+            dmashdl,
+            tx_guard,
+            fwdl_ring,
+            mcu_tx_ring,
+            rx_guard,
+            mcu_rx_ring,
+            mcu_rx_buffers,
+            command_payload,
+            fwdl_payload,
+            mcu_wa_rx_ring,
+            mcu_wa_rx_buffers,
+            #[cfg(feature = "fuchsia-passive")]
+            data_rx_ring,
+            #[cfg(feature = "fuchsia-passive")]
+            data_rx_buffers,
+            irq,
+        } = resources;
+        let selector_page = selector_page.as_ref().expect("acquired");
+        let dynamic_window = dynamic_window.as_ref().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
-        let mut data_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0101_0000)?;
+        let passive_window_pages = passive_window_pages.as_ref().expect("acquired");
+        let swdef = swdef.as_ref().expect("acquired");
+        let dmashdl = dmashdl.as_ref().expect("acquired");
+        let tx_guard = tx_guard.as_mut().expect("acquired");
+        let fwdl_ring = fwdl_ring.as_mut().expect("acquired");
+        let mcu_tx_ring = mcu_tx_ring.as_mut().expect("acquired");
+        let rx_guard = rx_guard.as_mut().expect("acquired");
+        let mcu_rx_ring = mcu_rx_ring.as_mut().expect("acquired");
+        let mcu_rx_buffers = mcu_rx_buffers.as_mut().expect("acquired");
+        let command_payload = command_payload.as_mut().expect("acquired");
+        let fwdl_payload = fwdl_payload.as_mut().expect("acquired");
+        let mcu_wa_rx_ring = mcu_wa_rx_ring.as_mut().expect("acquired");
+        let mcu_wa_rx_buffers = mcu_wa_rx_buffers.as_mut().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
-        let mut data_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0101_1000, 4 * PAGE)?;
-        tx_guard.initialize_descriptor_page()?;
-        fwdl_ring.initialize_descriptor_page()?;
-        mcu_tx_ring.initialize_descriptor_page()?;
-        rx_guard.initialize_descriptor_page()?;
-        mcu_rx_ring.initialize_descriptor_page()?;
-        mcu_rx_buffers.zero_bytes(4 * PAGE)?;
-        command_payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
-        fwdl_payload.zero_bytes(PAGE)?;
-        mcu_wa_rx_ring.initialize_descriptor_page()?;
-        mcu_wa_rx_buffers.zero_bytes(4 * PAGE)?;
+        let data_rx_ring = data_rx_ring.as_mut().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
-        {
-            data_rx_ring.initialize_descriptor_page()?;
-            data_rx_buffers.zero_bytes(4 * PAGE)?;
-        }
-        let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
-            .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
-        for (index, descriptor) in prepared_rx.descriptors.into_iter().enumerate() {
-            mcu_rx_ring.write_descriptor_at(index, descriptor);
-        }
-        let prepared_wa_rx = prepare_mcu_rx_ring(mcu_wa_rx_ring.iova, mcu_wa_rx_buffers.iova)
-            .map_err(|error| format!("prepare post-N9 MCU RX descriptors: {error:?}"))?;
-        for (index, descriptor) in prepared_wa_rx.descriptors.into_iter().enumerate() {
-            mcu_wa_rx_ring.write_descriptor_at(index, descriptor);
-        }
-        #[cfg(feature = "fuchsia-passive")]
-        {
-            let prepared_data = prepare_mcu_rx_ring(data_rx_ring.iova, data_rx_buffers.iova)
-                .map_err(|error| format!("prepare data RX descriptors: {error:?}"))?;
-            for (index, descriptor) in prepared_data.descriptors.into_iter().enumerate() {
-                data_rx_ring.write_descriptor_at(index, descriptor);
-            }
-        }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let data_rx_buffers = data_rx_buffers.as_mut().expect("acquired");
 
         let signal = ActiveSignalGuard::install()?;
-        let ledger = active_ledger
+        let ledger = capsule
+            .containment
             .as_mut()
             .expect("active MCU operation has containment ledger");
         ledger.transition(RunPhase::MappedDmaDisabled, RunPhase::AcquiringHostControl)?;
         ledger.mark_possibly_active(Hazard::LabMutated);
         ledger.mark_possibly_active(Hazard::HostControl);
-        set_lab_safety("MUTATED")?;
-        let mut irq = None;
         let active = (|| -> Result<(), String> {
+            set_lab_safety("MUTATED")?;
             disable_pci_intx(&bdf)?;
             pcie_mac.write_pcie_mac_interrupt_enable_zero()?;
             let mut ownership = VfioOwnership {
@@ -834,7 +1182,8 @@ fn run() -> Result<(), String> {
             };
             acquire_driver_ownership(&mut ownership, log_ownership_event)
                 .map_err(|error| format!("acquire ownership for MCU transaction: {error:?}"))?;
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .transition(RunPhase::AcquiringHostControl, RunPhase::HostDriverOwned)?;
@@ -850,7 +1199,8 @@ fn run() -> Result<(), String> {
             let restore_result = wfsys.restore();
             wfsys_result?;
             restore_result?;
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .transition(
@@ -906,7 +1256,8 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::DeviceIrq);
@@ -914,7 +1265,7 @@ fn run() -> Result<(), String> {
             if installed.try_read()?.is_some() {
                 return Err("unexpected IRQ before device source enable".into());
             }
-            irq = Some(installed);
+            *irq = Some(installed);
             println!("{{\"active_mcu_event\":\"vfio_irq_installed\"}}");
             if wfdma.read(0xd4200)? != 0 {
                 return Err(format!(
@@ -922,14 +1273,16 @@ fn run() -> Result<(), String> {
                     wfdma.read(0xd4200)?
                 ));
             }
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .transition(
                     RunPhase::WfsysResetAndSelectorRestored,
                     RunPhase::RingsPreparedIrqSourceDisabled,
                 )?;
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::Wfdma);
@@ -938,7 +1291,8 @@ fn run() -> Result<(), String> {
             wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
             wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
             wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::BusMaster);
@@ -963,7 +1317,8 @@ fn run() -> Result<(), String> {
                 1 << 0
             };
             wfdma.write_active_wfdma(0xd4204, response_irq_mask)?;
-            active_ledger
+            capsule
+                .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .transition(
@@ -991,10 +1346,10 @@ fn run() -> Result<(), String> {
                     wfdma: &wfdma,
                     irq: irq.as_mut().expect("IRQ installed"),
                     signal: &signal,
-                    tx_ring: &mut mcu_tx_ring,
-                    payload: &mut command_payload,
+                    tx_ring: &mut *mcu_tx_ring,
+                    payload: &mut *command_payload,
                     wm: ActiveMcuRx {
-                        rx_ring: &mut mcu_rx_ring,
+                        rx_ring: &mut *mcu_rx_ring,
                         rx_buffers: &mcu_rx_buffers,
                         rx_tail: 0,
                         rx_head: 7,
@@ -1003,7 +1358,7 @@ fn run() -> Result<(), String> {
                         irq_bit: WM_RX_IRQ_BIT,
                     },
                     wm2: Some(ActiveMcuRx {
-                        rx_ring: &mut mcu_wa_rx_ring,
+                        rx_ring: &mut *mcu_wa_rx_ring,
                         rx_buffers: &mcu_wa_rx_buffers,
                         rx_tail: 0,
                         rx_head: 7,
@@ -1021,8 +1376,8 @@ fn run() -> Result<(), String> {
                     pcie_mac,
                     device: &device,
                     bdf: &bdf,
-                    fwdl_ring: &mut fwdl_ring,
-                    fwdl_payload: &mut fwdl_payload,
+                    fwdl_ring: &mut *fwdl_ring,
+                    fwdl_payload: &mut *fwdl_payload,
                     sequence: 0,
                     command_index: 0,
                     fwdl_index: 0,
@@ -1040,7 +1395,8 @@ fn run() -> Result<(), String> {
                         patch,
                         firmware,
                         |loader, report| {
-                            active_ledger
+                            capsule
+                                .containment
                                 .as_mut()
                                 .expect("active MCU operation has containment ledger")
                                 .transition(
@@ -1049,11 +1405,12 @@ fn run() -> Result<(), String> {
                                 )?;
                             let mechanics = VfioPassiveMechanics {
                                 loader,
-                                ledger: active_ledger
+                                ledger: capsule
+                                    .containment
                                     .as_mut()
                                     .expect("active MCU operation has containment ledger"),
                                 data: ActiveMcuRx {
-                                    rx_ring: &mut data_rx_ring,
+                                    rx_ring: &mut *data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
                                     rx_tail: 0,
                                     rx_head: 7,
@@ -1102,7 +1459,8 @@ fn run() -> Result<(), String> {
                         patch,
                         firmware,
                         |loader, report| {
-                            active_ledger
+                            capsule
+                                .containment
                                 .as_mut()
                                 .expect("active MCU operation has containment ledger")
                                 .transition(
@@ -1111,11 +1469,12 @@ fn run() -> Result<(), String> {
                                 )?;
                             let mechanics = VfioPassiveMechanics {
                                 loader,
-                                ledger: active_ledger
+                                ledger: capsule
+                                    .containment
                                     .as_mut()
                                     .expect("active MCU operation has containment ledger"),
                                 data: ActiveMcuRx {
-                                    rx_ring: &mut data_rx_ring,
+                                    rx_ring: &mut *data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
                                     rx_tail: 0,
                                     rx_head: 7,
@@ -1418,10 +1777,10 @@ fn run() -> Result<(), String> {
                 wfdma: &wfdma,
                 irq: irq.as_mut().expect("IRQ installed"),
                 signal: &signal,
-                tx_ring: &mut mcu_tx_ring,
-                payload: &mut command_payload,
+                tx_ring: &mut *mcu_tx_ring,
+                payload: &mut *command_payload,
                 wm: ActiveMcuRx {
-                    rx_ring: &mut mcu_rx_ring,
+                    rx_ring: &mut *mcu_rx_ring,
                     rx_buffers: &mcu_rx_buffers,
                     rx_tail: 0,
                     rx_head: 7,
@@ -1484,7 +1843,8 @@ fn run() -> Result<(), String> {
             Ok(())
         })();
 
-        let ledger = active_ledger
+        let ledger = capsule
+            .containment
             .as_mut()
             .expect("active MCU operation has containment ledger");
         if active.is_err() {
@@ -1528,7 +1888,7 @@ fn run() -> Result<(), String> {
         if let Err(error) = set_pci_bus_master(&bdf, false) {
             cleanup_errors.push(error);
         }
-        if let Some(mut installed) = irq
+        if let Some(installed) = irq.as_mut()
             && let Err(error) = installed.disable()
         {
             cleanup_errors.push(error);
@@ -1554,44 +1914,71 @@ fn run() -> Result<(), String> {
         ] {
             ledger.confirm_inactive(hazard);
         }
-        cleanup_errors.extend(attempt_all_cleanup(
+        let release_errors = attempt_all_cleanup(
             [
                 #[cfg(feature = "fuchsia-passive")]
-                (ActiveArenaKind::DataBuffers, &mut data_rx_buffers),
+                (ActiveArenaKind::DataBuffers, data_rx_buffers),
                 #[cfg(feature = "fuchsia-passive")]
-                (ActiveArenaKind::DataRing, &mut data_rx_ring),
-                (ActiveArenaKind::Wm2Buffers, &mut mcu_wa_rx_buffers),
-                (ActiveArenaKind::Wm2Ring, &mut mcu_wa_rx_ring),
-                (ActiveArenaKind::FwdlPayload, &mut fwdl_payload),
-                (ActiveArenaKind::CommandPayload, &mut command_payload),
-                (ActiveArenaKind::WmBuffers, &mut mcu_rx_buffers),
-                (ActiveArenaKind::WmRing, &mut mcu_rx_ring),
-                (ActiveArenaKind::RxGuard, &mut rx_guard),
-                (ActiveArenaKind::McuTxRing, &mut mcu_tx_ring),
-                (ActiveArenaKind::FwdlRing, &mut fwdl_ring),
-                (ActiveArenaKind::TxGuard, &mut tx_guard),
+                (ActiveArenaKind::DataRing, data_rx_ring),
+                (ActiveArenaKind::Wm2Buffers, mcu_wa_rx_buffers),
+                (ActiveArenaKind::Wm2Ring, mcu_wa_rx_ring),
+                (ActiveArenaKind::FwdlPayload, fwdl_payload),
+                (ActiveArenaKind::CommandPayload, command_payload),
+                (ActiveArenaKind::WmBuffers, mcu_rx_buffers),
+                (ActiveArenaKind::WmRing, mcu_rx_ring),
+                (ActiveArenaKind::RxGuard, rx_guard),
+                (ActiveArenaKind::McuTxRing, mcu_tx_ring),
+                (ActiveArenaKind::FwdlRing, fwdl_ring),
+                (ActiveArenaKind::TxGuard, tx_guard),
             ],
             |(kind, arena)| {
                 arena
                     .teardown()
                     .map_err(|error| format!("teardown {kind:?}: {error}"))
             },
-        ));
+        );
         ledger.confirm_inactive(Hazard::DmaMapping);
         println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
-        match (active, cleanup_errors.is_empty()) {
-            (Err(primary), true) => return Err(primary),
-            (Err(primary), false) => {
-                return Err(format!(
-                    "active MCU operation failed: {primary}; cleanup errors: {cleanup_errors:?}"
-                ));
+        if !release_errors.is_empty() {
+            ledger.phase = RunPhase::SafeReleaseError;
+            active_terminal_error = Some(match active {
+                Err(primary) => format!(
+                    "active MCU operation failed: {primary}; cleanup errors: {cleanup_errors:?}; SAFE resource release errors: {release_errors:?}"
+                ),
+                Ok(()) => format!(
+                    "active MCU hardware is SAFE but resource release failed: {release_errors:?}; cleanup errors: {cleanup_errors:?}"
+                ),
+            });
+        } else {
+            match (active, cleanup_errors.is_empty()) {
+                (Err(primary), true) => active_terminal_error = Some(primary),
+                (Err(primary), false) => {
+                    active_terminal_error = Some(format!(
+                        "active MCU operation failed: {primary}; cleanup errors: {cleanup_errors:?}"
+                    ));
+                }
+                (Ok(()), false) => {
+                    active_terminal_error =
+                        Some(format!("active MCU cleanup failed: {cleanup_errors:?}"));
+                }
+                (Ok(()), true) => {}
             }
-            (Ok(()), false) => {
-                ledger.phase = RunPhase::SafeReleaseError;
-                return Err(format!("active MCU cleanup failed: {cleanup_errors:?}"));
-            }
-            (Ok(()), true) => {}
         }
+    }
+    if let Some(primary) = active_terminal_error {
+        let release_errors = capsule.release_observable();
+        let ledger = capsule
+            .containment
+            .as_mut()
+            .expect("active MCU operation has containment ledger");
+        if release_errors.is_empty() {
+            ledger.phase = RunPhase::Contained;
+            return Err(primary);
+        }
+        ledger.phase = RunPhase::SafeReleaseError;
+        return Err(format!(
+            "{primary}; SAFE resource release errors: {release_errors:?}"
+        ));
     }
     let read = |register: ReadRegister| -> Result<u32, String> {
         let page = match register.bar_offset() / PAGE {
@@ -1631,10 +2018,20 @@ fn run() -> Result<(), String> {
             status.rx_dma_busy,
         );
     }
-    drop(wfdma);
-    drop(conn);
-    drop(device);
-    drop(ioas);
+    let release_errors = capsule.release_observable();
+    if let Some(ledger) = capsule.containment.as_mut() {
+        ledger.phase = if release_errors.is_empty() {
+            RunPhase::Contained
+        } else {
+            RunPhase::SafeReleaseError
+        };
+    }
+    if !release_errors.is_empty() {
+        return Err(format!(
+            "hardware is SAFE but resource release failed: {release_errors:?}"
+        ));
+    }
+    drop(capsule);
     Ok(())
 }
 
@@ -1849,6 +2246,18 @@ impl ContainmentLedger {
         resource_present || self.effects[hazard.index()] == EffectState::PossiblyActive
     }
 
+    fn hardware_may_be_active(&self) -> bool {
+        [
+            Hazard::HostControl,
+            Hazard::DeviceIrq,
+            Hazard::Wfdma,
+            Hazard::BusMaster,
+            Hazard::LabMutated,
+        ]
+        .into_iter()
+        .any(|hazard| self.effects[hazard.index()] == EffectState::PossiblyActive)
+    }
+
     fn transition(&mut self, expected: RunPhase, next: RunPhase) -> Result<(), String> {
         if self.phase != expected {
             return Err(format!(
@@ -1923,7 +2332,7 @@ impl ContainmentOutcome {
 }
 
 fn verify_external_watchdog_armed() -> Result<ArmedWatchdog, String> {
-    let output = Command::new("wifi-lab-watchdog")
+    let output = Command::new(WATCHDOG_STATUS_PATH)
         .arg("status")
         .output()
         .map_err(|error| format!("query external reboot watchdog: {error}"))?;
@@ -1976,13 +2385,17 @@ fn retain_mappings_for_watchdog(message: &str) -> ! {
 }
 
 fn park_retention_capsule<T>(capsule: T) -> ! {
+    park_retention_capsule_ref(&capsule)
+}
+
+fn park_retention_capsule_ref<T: ?Sized>(capsule: &T) -> ! {
     const MESSAGE: &[u8] =
         b"mt7921-vfio-read: hardware SAFE is unproven; resources pinned for reboot watchdog\n";
     unsafe {
         write_fd(2, MESSAGE.as_ptr(), MESSAGE.len());
     }
     loop {
-        std::hint::black_box(&capsule);
+        std::hint::black_box(capsule);
         unsafe {
             pause();
         }
@@ -3430,6 +3843,7 @@ fn verify_no_usable_mt792x_acpi_sar() -> Result<(), String> {
 struct Ioas {
     fd: Arc<File>,
     id: u32,
+    destroyed: bool,
 }
 
 struct DmaArena {
@@ -3664,16 +4078,27 @@ impl Drop for DmaArena {
 }
 impl Drop for Ioas {
     fn drop(&mut self) {
+        let _ = self.teardown();
+    }
+}
+
+impl Ioas {
+    fn teardown(&mut self) -> Result<(), String> {
+        if self.destroyed {
+            return Ok(());
+        }
         let mut destroy = Destroy {
             size: size::<Destroy>(),
             id: self.id,
         };
-        let _ = ioctl_mut(
+        ioctl_mut(
             self.fd.as_raw_fd(),
             IOMMU_DESTROY,
             &mut destroy,
             "destroy IOAS",
-        );
+        )?;
+        self.destroyed = true;
+        Ok(())
     }
 }
 
@@ -3777,6 +4202,7 @@ struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
     active_rx_irq_mask: Cell<u32>,
+    mapped: bool,
 }
 impl ReadPage {
     fn map(
@@ -3810,6 +4236,7 @@ impl ReadPage {
             ptr,
             bar_page,
             active_rx_irq_mask: Cell::new(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT),
+            mapped: true,
         })
     }
     fn read(&self, offset: usize) -> Result<u32, String> {
@@ -4123,7 +4550,24 @@ fn validate_region_mapping(region: &RegionInfo, writable: bool) -> Result<(), St
 }
 impl Drop for ReadPage {
     fn drop(&mut self) {
-        unsafe { munmap(self.ptr.as_ptr(), PAGE) };
+        let _ = self.teardown();
+    }
+}
+
+impl ReadPage {
+    fn teardown(&mut self) -> Result<(), String> {
+        if !self.mapped {
+            return Ok(());
+        }
+        if unsafe { munmap(self.ptr.as_ptr(), PAGE) } != 0 {
+            return Err(format!(
+                "unmap BAR page {:#x}: {}",
+                self.bar_page,
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.mapped = false;
+        Ok(())
     }
 }
 
@@ -5274,5 +5718,33 @@ mod tests {
             ObservableRelease::IoasDestroy,
         ];
         assert_eq!(observable_actions.len(), 3);
+    }
+
+    #[test]
+    fn acquisition_ledger_records_intent_before_resource_ownership() {
+        let mut ledger = AcquisitionLedger::default();
+        ledger.record(AcquisitionIntent::BindIommu).unwrap();
+        ledger.record(AcquisitionIntent::AllocateIoas).unwrap();
+        ledger.record(AcquisitionIntent::AttachIoas).unwrap();
+        ledger.record(AcquisitionIntent::MapBar(0xd4000)).unwrap();
+        ledger
+            .record(AcquisitionIntent::MapDma {
+                iova: 0x0100_0000,
+                len: PAGE,
+            })
+            .unwrap();
+        assert_eq!(
+            ledger.recorded().collect::<Vec<_>>(),
+            [
+                AcquisitionIntent::BindIommu,
+                AcquisitionIntent::AllocateIoas,
+                AcquisitionIntent::AttachIoas,
+                AcquisitionIntent::MapBar(0xd4000),
+                AcquisitionIntent::MapDma {
+                    iova: 0x0100_0000,
+                    len: PAGE,
+                },
+            ]
+        );
     }
 }
