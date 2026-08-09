@@ -61,7 +61,7 @@ VFIO, management-TX enablement, or `open_client` extension is present.
 The integration gate was repeated from a newly fetched, repo-local copy of the
 exact pin. Before building, every patch in `upstream-cargo/patches` was applied
 with GNU `patch --fuzz=0`; output containing `fuzz` or `offset` was rejected.
-All ten patches applied exactly. From that clean root,
+The complete shared patch set applied exactly. From that clean root,
 `cargo test --locked --manifest-path <root>/src/connectivity/network/netstack3/Cargo.toml -p wlan-mlme --test host-client-gate`
 passed both tests, and the corresponding `-p fdf` arena test passed. Evidence
 from a previously materialized reference is not accepted for this gate.
