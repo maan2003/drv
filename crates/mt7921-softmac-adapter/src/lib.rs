@@ -760,7 +760,7 @@ fn to_fuchsia_channel(channel: CandidateChannel) -> Option<ChannelNumber> {
     Some(ChannelNumber { band, number })
 }
 
-fn query_from_capabilities(
+pub fn query_from_capabilities(
     nic: NicCapability,
     candidates: &[CandidateChannel],
 ) -> WlanSoftmacQueryResponse {

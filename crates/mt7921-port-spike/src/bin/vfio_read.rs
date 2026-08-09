@@ -4,8 +4,10 @@
 
 #[cfg(feature = "fuchsia-passive")]
 use fuchsia_softmac_port::{
-    ChannelBandwidth, ChannelNumber, HardwareScanEvent, SoftmacHardware, WlanBand,
-    WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
+    ChannelBandwidth, ChannelNumber, ConservativeRegulatoryPolicy, HardwareScanEvent,
+    MlmeScanEvent, PassiveScanner, ScanRequest, ScanResultCode, ScanTypes, SoftmacHardware,
+    WlanBand, WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
+    allowed_passive_channels,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -37,7 +39,7 @@ use mt7921_port_spike::{
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
     Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites, SourceExactPassiveMechanics,
-    SourceExactPassiveTransport,
+    SourceExactPassiveTransport, query_from_capabilities,
 };
 use std::{
     cell::Cell,
@@ -281,6 +283,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-5ghz-dfs-low") => Operation::RunOneShotPassive5GhzDfsLow,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-5ghz-dfs-high") => Operation::RunOneShotPassive5GhzDfsHigh,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-sme-full") => Operation::RunOneShotPassiveSmeFull,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -977,6 +981,7 @@ fn run() -> Result<(), String> {
                         | Operation::RunOneShotPassive5GhzNonDfs
                         | Operation::RunOneShotPassive5GhzDfsLow
                         | Operation::RunOneShotPassive5GhzDfsHigh
+                        | Operation::RunOneShotPassiveSmeFull
                 ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -1002,33 +1007,48 @@ fn run() -> Result<(), String> {
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
                             let candidates = candidate_channels(report.nic_capability);
-                            let (band, channel_numbers): (WlanBand, Vec<u8>) = match operation {
-                                Operation::RunOneShotPassiveChannel1 => (WlanBand::TwoGhz, vec![1]),
+                            let channels_for = |band, numbers: &[u8]| {
+                                numbers
+                                    .iter()
+                                    .copied()
+                                    .map(|number| ChannelNumber { band, number })
+                                    .collect::<Vec<_>>()
+                            };
+                            let channels = match operation {
+                                Operation::RunOneShotPassiveChannel1 => {
+                                    channels_for(WlanBand::TwoGhz, &[1])
+                                }
                                 Operation::RunOneShotPassiveChannels1And6 => {
-                                    (WlanBand::TwoGhz, vec![1, 6])
+                                    channels_for(WlanBand::TwoGhz, &[1, 6])
                                 }
                                 Operation::RunOneShotPassive2Ghz => {
-                                    (WlanBand::TwoGhz, (1..=14).collect())
+                                    let numbers = (1..=14).collect::<Vec<_>>();
+                                    channels_for(WlanBand::TwoGhz, &numbers)
                                 }
-                                Operation::RunOneShotPassive5GhzNonDfs => (
+                                Operation::RunOneShotPassive5GhzNonDfs => channels_for(
                                     WlanBand::FiveGhz,
-                                    vec![36, 40, 44, 48, 149, 153, 157, 161, 165],
+                                    &[36, 40, 44, 48, 149, 153, 157, 161, 165],
                                 ),
                                 Operation::RunOneShotPassive5GhzDfsLow => {
-                                    (WlanBand::FiveGhz, vec![52, 56, 60, 64])
+                                    channels_for(WlanBand::FiveGhz, &[52, 56, 60, 64])
                                 }
-                                Operation::RunOneShotPassive5GhzDfsHigh => (
+                                Operation::RunOneShotPassive5GhzDfsHigh => channels_for(
                                     WlanBand::FiveGhz,
-                                    vec![
-                                        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-                                    ],
+                                    &[100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144],
                                 ),
+                                Operation::RunOneShotPassiveSmeFull => allowed_passive_channels(
+                                    &query_from_capabilities(report.nic_capability, &candidates),
+                                    ConservativeRegulatoryPolicy {
+                                        alpha2: *b"00",
+                                        indoor: true,
+                                        special_unii_mask: report.special_unii_mask,
+                                    },
+                                )
+                                .map_err(|error| {
+                                    format!("derive pinned SME channels: {error:?}")
+                                })?,
                                 _ => unreachable!("passive scan operation matched above"),
                             };
-                            let channels = channel_numbers
-                                .into_iter()
-                                .map(|number| ChannelNumber { band, number })
-                                .collect::<Vec<_>>();
                             let mut adapter = Mt7921SoftmacAdapter::new(
                                 transport,
                                 report.nic_capability,
@@ -1036,6 +1056,55 @@ fn run() -> Result<(), String> {
                                 channels.clone(),
                             )
                             .map_err(|error| error.to_string())?;
+                            if operation == Operation::RunOneShotPassiveSmeFull {
+                                let mut scanner = PassiveScanner::default();
+                                scanner
+                                    .start(
+                                        &mut adapter,
+                                        ScanRequest {
+                                            txn_id: 1,
+                                            scan_type: ScanTypes::Passive,
+                                            channel_list: channels,
+                                            ssid_list: vec![],
+                                            probe_delay: 0,
+                                            min_channel_time: 50,
+                                            max_channel_time: 120,
+                                        },
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                let mut results = 0usize;
+                                loop {
+                                    match scanner
+                                        .poll(&mut adapter)
+                                        .map_err(|error| error.to_string())?
+                                    {
+                                        Some(MlmeScanEvent::Result { result, .. }) => {
+                                            results += 1;
+                                            println!(
+                                                r#"{{"passive_sme_result":{{"txn_id":{},"bss":"{:?}"}}}}"#,
+                                                result.txn_id, result.bss
+                                            );
+                                        }
+                                        Some(MlmeScanEvent::End(end)) => {
+                                            if end.txn_id != 1
+                                                || end.code != ScanResultCode::Success
+                                                || results == 0
+                                            {
+                                                return Err(format!(
+                                                    "SME full scan failed: end={end:?} results={results}"
+                                                ));
+                                            }
+                                            println!(
+                                                r#"{{"passive_scan_event":"sme_full_gate_passed","txn_id":1,"results":{results}}}"#
+                                            );
+                                            return Ok(());
+                                        }
+                                        None => {
+                                            std::thread::sleep(std::time::Duration::from_millis(1))
+                                        }
+                                    }
+                                }
+                            }
                             let mut total_observations = 0usize;
                             for channel in &channels {
                                 adapter
@@ -3567,6 +3636,8 @@ enum Operation {
     RunOneShotPassive5GhzDfsLow,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassive5GhzDfsHigh,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassiveSmeFull,
 }
 
 impl Operation {
@@ -3582,6 +3653,7 @@ impl Operation {
                     | Self::RunOneShotPassive5GhzNonDfs
                     | Self::RunOneShotPassive5GhzDfsLow
                     | Self::RunOneShotPassive5GhzDfsHigh
+                    | Self::RunOneShotPassiveSmeFull
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -4155,6 +4227,9 @@ mod tests {
         assert!(Operation::RunOneShotPassive5GhzDfsHigh.wfdma_writable());
         assert!(Operation::RunOneShotPassive5GhzDfsHigh.conn_writable());
         assert!(Operation::RunOneShotPassive5GhzDfsHigh.loads_firmware());
+        assert!(Operation::RunOneShotPassiveSmeFull.wfdma_writable());
+        assert!(Operation::RunOneShotPassiveSmeFull.conn_writable());
+        assert!(Operation::RunOneShotPassiveSmeFull.loads_firmware());
         assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
         assert!(Operation::RunOneShotPassivePrepare.conn_writable());
         assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
