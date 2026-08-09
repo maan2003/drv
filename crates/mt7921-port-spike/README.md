@@ -234,8 +234,8 @@ ordered 41-operation MAC plan with pinned Linux's MMIO semantics. It then runs t
 through pinned Fuchsia `SoftmacHardware`, accepts only parsed beacon/probe
 observations plus the matching scan-done event, and requires both a successful
 completion and at least one BSS. Its DMA mappings join the existing mandatory
-reset-while-pinned cleanup. This edge is offline-tested but not yet physically
-validated; no claim about channel-1 reception or restoration is made here.
+reset-while-pinned cleanup. The channel-1 gate is now physically validated as
+described below; broader channel coverage remains outside that result.
 
 The first watchdog-contained physical attempt from commit `301cdcec` (release
 SHA-256
@@ -321,6 +321,35 @@ commands. Cleanup/reset/unmap returned success and supervisor restore reported
 `failed=0`. The watchdog rebooted to healthy boot
 `2ea5e790-451a-48dc-b277-0e0a8a37e8be`. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T155035Z-0000_05_00.0.log`.
+
+The first full channel-1 attempt then exposed a bounded host-side allocation
+error after MAC enable: the 256-entry MCU TX ring had only 4 KiB of command
+payload space, enough for descriptor slots 0-15. Report
+`/var/lib/wifi-driver-lab/reports/20260809T155608Z-0000_05_00.0.log` stopped
+before `SET_RX_PATH`. Commit `f38fc7ce` provisions a non-overlapping 64 KiB
+arena for all 256 256-byte descriptor offsets. The next attempt reached and
+completed `START_HW_SCAN`, then report
+`/var/lib/wifi-driver-lab/reports/20260809T160535Z-0000_05_00.0.log` rejected a
+181-byte ring-4 packet because it was not an MCU event envelope. A diagnostic
+retry in report
+`/var/lib/wifi-driver-lab/reports/20260809T161149Z-0000_05_00.0.log` identified
+Connac2 packet type 7 with flag 1. Pinned `mt7921_queue_rx_skb` normalizes that
+exact combination to normal data, so commit `961c038b` routes it to the same
+strict beacon/probe parser while all other malformed MCU envelopes still fail
+closed.
+
+The resulting watchdog-contained run passed the complete one-channel physical
+gate from release SHA-256
+`8f0b47cbf751df35f1d72c48c6d808d00307b76ad9c724040e032e84c78539aa`.
+It completed every source-exact setup command, received one channel-1 beacon at
+-61 dBm through WM2 ring 4, matched unsolicited scan-done event `0x0d` to scan
+ID 1, and emitted `one_channel_gate_passed`. Cleanup disabled bus mastering,
+reset while every IOVA remained pinned, released every mapping, and returned
+success; supervisor restoration also returned `failed=0`. The watchdog was
+disarmed without reboot. On unchanged boot
+`34c7207e-885b-4d1c-987c-e691c079285c`, `mt7921e` and iwd were active and
+`wlan1` held the default route. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T161754Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
@@ -618,6 +647,5 @@ the IOAS, and returned the function to `mt7921e`; it did not map BARs or arm an
 interrupt. iwd reconnects after each handoff, although the kernel interface name
 advances from `wlan0` to `wlanN` after reprobe.
 
-BAR 0 policy and translation, interrupt topology, DMA coherence, firmware and
-calibration sources, RF-kill/wakeup wiring, ASPM quirks, and device-specific
-reset behavior remain unverified.
+RF-kill/wakeup wiring, ASPM quirks, and reset behavior beyond the repeatedly
+successful VFIO-reset-and-native-rebind boundary remain unverified.
