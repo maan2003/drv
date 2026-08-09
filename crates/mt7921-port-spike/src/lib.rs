@@ -479,6 +479,8 @@ pub enum ClcDiscoveryError {
     UnsupportedSegmentIndex(u8),
     TruncatedRule { segment: u16 },
     CountOverflow,
+    MissingWorldRule,
+    RuleTooLarge,
 }
 
 /// Inventory the local CLC region exactly up to (but not including) Linux's
@@ -581,6 +583,120 @@ pub fn discover_clc(
     discovery.unique_country_codes =
         u16::try_from(countries.len()).map_err(|_| ClcDiscoveryError::CountOverflow)?;
     Ok(discovery)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClcSetCommand {
+    pub index: u8,
+    pub environment: u8,
+    pub capability: u8,
+    pub alpha2: [u8; 2],
+    pub rule_type: [u8; 2],
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClcSetResponse {
+    pub tag: u16,
+    pub length: u16,
+    pub special_unii_mask: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClcSetResponseError {
+    Truncated,
+    InvalidLength(u16),
+    InvalidMask(u8),
+}
+
+/// Select every opaque `"00"` rule from Linux's accepted CLC records. This
+/// intentionally supplies no ACPI/MTCL overrides and never interprets data.
+pub fn world_clc_commands(
+    firmware: Firmware<'_>,
+    hardware: EepromHardwareInfo,
+    chip_capability: u64,
+) -> Result<Vec<ClcSetCommand>, ClcDiscoveryError> {
+    let Some(region) = firmware.regions().find(FirmwareRegion::is_clc) else {
+        return Err(ClcDiscoveryError::MissingWorldRule);
+    };
+    let mut commands = Vec::new();
+    let mut accepted = [false; 2];
+    let mut offset = 0usize;
+    while offset < region.payload.len() {
+        let header = region
+            .payload
+            .get(offset..offset + 16)
+            .ok_or(ClcDiscoveryError::TruncatedSegmentHeader)?;
+        let length = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+        let length_usize = length as usize;
+        if length_usize < 16
+            || offset
+                .checked_add(length_usize)
+                .is_none_or(|end| end > region.payload.len())
+        {
+            return Err(ClcDiscoveryError::InvalidSegmentLength(length));
+        }
+        let index = header[4];
+        if index > 1 {
+            return Err(ClcDiscoveryError::UnsupportedSegmentIndex(index));
+        }
+        let selected = !accepted[index as usize]
+            && (index == 1 || ((header[7] & 1 != 0) == hardware.encapsulated_calibration));
+        if selected {
+            accepted[index as usize] = true;
+        }
+        let end = offset + length_usize;
+        let mut rule_offset = offset + 16;
+        while end - rule_offset > 16 {
+            let rule = region.payload.get(rule_offset..rule_offset + 6).ok_or(
+                ClcDiscoveryError::TruncatedRule {
+                    segment: index as u16,
+                },
+            )?;
+            let data_length = u16::from_le_bytes([rule[4], rule[5]]) as usize;
+            let rule_end = rule_offset
+                .checked_add(6)
+                .and_then(|start| start.checked_add(data_length))
+                .filter(|rule_end| *rule_end <= end)
+                .ok_or(ClcDiscoveryError::TruncatedRule {
+                    segment: index as u16,
+                })?;
+            if selected && &rule[..2] == b"00" {
+                commands.push(ClcSetCommand {
+                    index,
+                    environment: 1,
+                    capability: u8::from(chip_capability & 1 != 0),
+                    alpha2: *b"00",
+                    rule_type: [rule[2], rule[3]],
+                    data: region.payload[rule_offset + 6..rule_end].to_vec(),
+                });
+            }
+            rule_offset = rule_end;
+        }
+        offset = end;
+    }
+    if commands.is_empty() {
+        Err(ClcDiscoveryError::MissingWorldRule)
+    } else {
+        Ok(commands)
+    }
+}
+
+pub fn parse_clc_set_response(bytes: &[u8]) -> Result<ClcSetResponse, ClcSetResponseError> {
+    let response = bytes.get(4..72).ok_or(ClcSetResponseError::Truncated)?;
+    let length = u16::from_le_bytes([response[2], response[3]]);
+    if length != 68 {
+        return Err(ClcSetResponseError::InvalidLength(length));
+    }
+    let special_unii_mask = response[4];
+    if special_unii_mask & !0x1f != 0 {
+        return Err(ClcSetResponseError::InvalidMask(special_unii_mask));
+    }
+    Ok(ClcSetResponse {
+        tag: u16::from_le_bytes([response[0], response[1]]),
+        length,
+        special_unii_mask,
+    })
 }
 
 /// A bounds-checked view of the Connac2 RAM firmware layout consumed by
@@ -2628,6 +2744,47 @@ pub fn encode_download_command(
     bytes[41] = ext_cid;
     bytes[43] = ext_cid_ack;
     bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
+    Ok(bytes)
+}
+
+/// Encode pinned Linux `MCU_CE_CMD(SET_CLC)` for one opaque CLC rule.
+pub fn encode_clc_set_command(
+    command: &ClcSetCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, DownloadCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(DownloadCommandError::InvalidSequence);
+    }
+    if command.index > 1
+        || command.environment != 1
+        || command.capability & !1 != 0
+        || command.alpha2 != *b"00"
+        || command.data.is_empty()
+    {
+        return Err(DownloadCommandError::InvalidLength);
+    }
+    let request_length = 76usize
+        .checked_add(command.data.len())
+        .filter(|length| *length <= u16::MAX as usize)
+        .ok_or(DownloadCommandError::InvalidLength)?;
+    let total = CONNAC2_MCU_TXD_BYTES + request_length;
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0x5c, 0xa0, 1, sequence]);
+    let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+    request[0] = 1;
+    request[2..4].copy_from_slice(&(request_length as u16).to_le_bytes());
+    request[4] = command.index;
+    request[5] = command.environment;
+    request[7] = command.capability;
+    request[8..10].copy_from_slice(&command.alpha2);
+    request[10..12].copy_from_slice(&command.rule_type);
+    request[76..].copy_from_slice(&command.data);
     Ok(bytes)
 }
 
@@ -5155,6 +5312,57 @@ mod tests {
                 }
             ),
             Err(ClcDiscoveryError::InvalidSegmentLength(34))
+        );
+
+        let clc = clc_fixture();
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc)]);
+        let commands = world_clc_commands(
+            Firmware::parse(&image).unwrap(),
+            EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            },
+            19,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            [ClcSetCommand {
+                index: 0,
+                environment: 1,
+                capability: 1,
+                alpha2: *b"00",
+                rule_type: *b"-0",
+                data: vec![0x5a; 11],
+            }]
+        );
+        let encoded = encode_clc_set_command(&commands[0], 6).unwrap();
+        assert_eq!(encoded.len(), 64 + 76 + 11);
+        assert_eq!(&encoded[36..44], &[0x5c, 0xa0, 1, 6, 0, 0, 0, 0]);
+        assert_eq!(&encoded[64..68], &[1, 0, 87, 0]);
+        assert_eq!(&encoded[68..76], &[0, 1, 0, 1, b'0', b'0', b'-', b'0']);
+        assert_eq!(&encoded[140..], &[0x5a; 11]);
+
+        let mut response = vec![0; 72];
+        response[4..6].copy_from_slice(&0x1234u16.to_le_bytes());
+        response[6..8].copy_from_slice(&68u16.to_le_bytes());
+        response[8] = 0x1f;
+        assert_eq!(
+            parse_clc_set_response(&response),
+            Ok(ClcSetResponse {
+                tag: 0x1234,
+                length: 68,
+                special_unii_mask: 0x1f,
+            })
+        );
+        response[8] = 0x20;
+        assert_eq!(
+            parse_clc_set_response(&response),
+            Err(ClcSetResponseError::InvalidMask(0x20))
+        );
+        assert_eq!(
+            parse_clc_set_response(&response[..71]),
+            Err(ClcSetResponseError::Truncated)
         );
     }
 

@@ -168,6 +168,11 @@ the calibration/regulatory catalog supported by the exact hardware artifact.
 It deliberately cannot claim a final valid-channel set: pinned Linux treats CLC
 rule data as opaque, and per-channel legality additionally requires the
 mutating `SET_CLC` response, cfg80211 country regdb, and any OF/DTS limits.
+The source-exact `SET_CLC` wire format is prepared offline behind a separate
+gate: it selects every opaque `00`/indoor rule from the accepted installed CLC
+record, encodes CID `0x5c`, and bounds the 68-byte response plus five-bit UNII
+mask. This encoder/parser is not yet reachable from the physical loader, and
+neither `SET_CHAN_DOMAIN` nor cfg80211 policy is represented here.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 The VFIO adapter therefore owns a separate ring-4 descriptor/buffer arena from
 startup and switches the bounded response path and interrupt mask from boot-ROM
