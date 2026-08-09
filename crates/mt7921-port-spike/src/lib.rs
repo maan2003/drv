@@ -3306,6 +3306,7 @@ pub enum FirmwareLoaderOperation {
     PollN9Ready,
     SetClc,
     SetChannelDomain,
+    PassiveBoundary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3820,6 +3821,31 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
     let result = run_firmware_loader(transport, patch, firmware, &mut state, true);
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Execute channel-domain setup, then one caller-owned bounded passive hook
+/// before the same mandatory cleanup transaction. The hook cannot bypass or
+/// replace cleanup and its failure is preserved as a typed transport error.
+pub fn load_mt7921_firmware_with_passive_boundary<T, F>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+    passive: F,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>>
+where
+    T: FirmwareLoaderTransport,
+    F: FnOnce(&mut T, &FirmwareLoaderReport) -> Result<(), T::Error>,
+{
+    let mut state = FirmwareLoaderState::Powering;
+    let result =
+        run_firmware_loader(transport, patch, firmware, &mut state, true).and_then(|report| {
+            passive(transport, &report).map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PassiveBoundary,
+                source,
+            })?;
+            Ok(report)
+        });
     finish_firmware_loader(transport, state, result)
 }
 
@@ -6153,6 +6179,7 @@ mod tests {
         Cleanup(FirmwareLoaderState),
         SetClc(u8, u8),
         SetChannelDomain(usize, u8),
+        PassiveHook,
     }
 
     struct FakeFirmwareLoader {
@@ -6578,6 +6605,61 @@ mod tests {
         assert!(matches!(
             failed.trace.last(),
             Some(LoaderTrace::Cleanup(FirmwareLoaderState::ClcConfigured))
+        ));
+    }
+
+    #[test]
+    fn passive_hook_is_inside_mandatory_loader_cleanup() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware_with_passive_boundary(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+            |transport, report| {
+                assert_eq!(report.special_unii_mask, 0);
+                transport.trace.push(LoaderTrace::PassiveHook);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(report.special_unii_mask, 0);
+        assert!(matches!(
+            &transport.trace[transport.trace.len() - 3..],
+            [
+                LoaderTrace::SetChannelDomain(39, _),
+                LoaderTrace::PassiveHook,
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
+            ]
+        ));
+
+        let mut failed = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware_with_passive_boundary(
+                &mut failed,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+                |transport, _| {
+                    transport.trace.push(LoaderTrace::PassiveHook);
+                    Err("passive failure")
+                },
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::PassiveBoundary,
+                    source: "passive failure",
+                }
+            ))
+        ));
+        assert!(matches!(
+            failed.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
         ));
     }
 
