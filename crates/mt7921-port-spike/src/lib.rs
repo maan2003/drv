@@ -2808,6 +2808,7 @@ pub enum FirmwareLoaderState {
     N9Ready,
     CapabilityDiscovered,
     EepromDiscovered,
+    ClcConfigured,
     Ready,
 }
 
@@ -2824,6 +2825,7 @@ pub enum FirmwareLoaderOperation {
     WaitScatterCompletion(FirmwareImagePart),
     PollDownloadReady,
     PollN9Ready,
+    SetClc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2871,6 +2873,12 @@ pub trait FirmwareLoaderTransport {
         sequence: u8,
         encoded: &[u8],
     ) -> Result<FirmwareCommandCompletion, Self::Error>;
+    fn set_clc(
+        &mut self,
+        command: &ClcSetCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<ClcSetResponse, Self::Error>;
     fn publish_scatter(
         &mut self,
         part: FirmwareImagePart,
@@ -2914,6 +2922,7 @@ pub enum FirmwareLoaderFailure<E> {
     MissingFirmwareOverride,
     N9ReadyTimeout,
     Clc(ClcDiscoveryError),
+    MissingClcEventCapability,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2943,6 +2952,8 @@ pub struct FirmwareLoaderReport {
     pub candidate_channels: CandidateChannelSummary,
     pub eeprom_hardware: EepromBlock,
     pub clc: ClcDiscovery,
+    pub clc_rules_applied: u16,
+    pub special_unii_mask: u8,
 }
 
 fn loader_command<T: FirmwareLoaderTransport>(
@@ -2971,6 +2982,21 @@ fn next_loader_sequence<T: FirmwareLoaderTransport>(
     } else {
         Ok(sequence)
     }
+}
+
+fn loader_set_clc<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: &ClcSetCommand,
+) -> Result<ClcSetResponse, FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded =
+        encode_clc_set_command(command, sequence).map_err(FirmwareLoaderFailure::Command)?;
+    transport
+        .set_clc(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::SetClc,
+            source,
+        })
 }
 
 fn loader_scatter<T: FirmwareLoaderTransport>(
@@ -3045,6 +3071,8 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             data: [0; MT7921_EEPROM_BLOCK_SIZE],
         },
         clc: ClcDiscovery::default(),
+        clc_rules_applied: 0,
+        special_unii_mask: 0,
     };
 
     let power = DownloadCommand::NicPowerControl;
@@ -3228,6 +3256,26 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                     .expect("the fixed EEPROM hardware block was validated"),
             )
             .map_err(FirmwareLoaderFailure::Clc)?;
+            let chip_capability = report.nic_capability.chip_capability.unwrap_or(0);
+            if chip_capability & 1 == 0 {
+                return Err(FirmwareLoaderFailure::MissingClcEventCapability);
+            }
+            let commands = world_clc_commands(
+                firmware,
+                block
+                    .hardware_info()
+                    .expect("the fixed EEPROM hardware block was validated"),
+                chip_capability,
+            )
+            .map_err(FirmwareLoaderFailure::Clc)?;
+            *state = FirmwareLoaderState::ClcConfigured;
+            for command in &commands {
+                report.special_unii_mask = loader_set_clc(transport, command)?.special_unii_mask;
+                report.clc_rules_applied = report
+                    .clc_rules_applied
+                    .checked_add(1)
+                    .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
+            }
             *state = FirmwareLoaderState::Ready;
             Ok(report)
         }
@@ -5161,7 +5209,7 @@ mod tests {
             (7u32, vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
             (8, vec![1, 1, 1, 2, 2, 0, 1, 1, 1, 1, 3, 1]),
             (0x18, vec![1]),
-            (0x20, 0x1122_3344_5566_7788u64.to_le_bytes().to_vec()),
+            (0x20, 0x1122_3344_5566_7789u64.to_le_bytes().to_vec()),
         ] {
             bytes.extend_from_slice(&kind.to_le_bytes());
             bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -5182,7 +5230,7 @@ mod tests {
                     he: true,
                 }),
                 has_6ghz: Some(true),
-                chip_capability: Some(0x1122_3344_5566_7788),
+                chip_capability: Some(0x1122_3344_5566_7789),
                 unknown_elements: 0,
             },
         )
@@ -5375,6 +5423,7 @@ mod tests {
         N9Ready,
         Sleep(u64),
         Cleanup(FirmwareLoaderState),
+        SetClc(u8, u8),
     }
 
     struct FakeFirmwareLoader {
@@ -5496,6 +5545,24 @@ mod tests {
             })
         }
 
+        fn set_clc(
+            &mut self,
+            command: &ClcSetCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<ClcSetResponse, Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[36..39], &[0x5c, 0xa0, 1]);
+            self.trace
+                .push(LoaderTrace::SetClc(command.index, sequence));
+            self.step()?;
+            Ok(ClcSetResponse {
+                tag: 0,
+                length: 68,
+                special_unii_mask: 0x1f,
+            })
+        }
+
         fn publish_scatter(
             &mut self,
             part: FirmwareImagePart,
@@ -5608,6 +5675,8 @@ mod tests {
                     unique_country_codes: 1,
                     world_domain_available: true,
                 },
+                clc_rules_applied: 1,
+                special_unii_mask: 0x1f,
             }
         );
         assert_eq!(
@@ -5671,6 +5740,7 @@ mod tests {
                     },
                     15,
                 ),
+                LoaderTrace::SetClc(0, 1),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );

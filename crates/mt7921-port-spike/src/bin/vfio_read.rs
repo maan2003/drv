@@ -2,22 +2,24 @@
 #![cfg(target_os = "linux")]
 
 use mt7921_port_spike::{
-    DisabledFirmwareStageError, DisabledFirmwareStageEvent, DisabledFirmwareStageTransport,
-    DisabledFwdlError, DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
-    DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
-    DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
-    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
-    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
+    ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError, DisabledFirmwareStageEvent,
+    DisabledFirmwareStageTransport, DisabledFwdlError, DisabledFwdlEvent,
+    DisabledFwdlInterruptTransport, DisabledFwdlRegister, DisabledFwdlRingTransport,
+    DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent, DisabledMcuRxEvent,
+    DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand, DynamicL1Error,
+    DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion, FirmwareImagePart,
+    FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError, GlobalTxRingEvent,
+    GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, McuRxRegisters, OwnershipError, OwnershipEvent, OwnershipTransport,
     PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
     encode_download_command, load_mt7921_firmware, mask_ack_disabled_fwdl_interrupt,
-    parse_download_response, parse_eeprom_block, parse_nic_capability, prepare_global_rx_rings,
-    prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, reset_wfsys, select_vfio_irq, stage_disabled_firmware_chunk,
+    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_nic_capability,
+    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
+    stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -1576,6 +1578,46 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(PAGE)?;
         Ok(completion)
+    }
+
+    fn set_clc(
+        &mut self,
+        command: &ClcSetCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<ClcSetResponse, Self::Error> {
+        self.mcu.cancelled()?;
+        if command.alpha2 != *b"00" || command.environment != 1 || command.index > 1 {
+            return Err("SET_CLC escaped the world/indoor allowlist".into());
+        }
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, 256);
+        self.mcu
+            .wfdma
+            .write_active_wfdma(0xd4204, self.mcu.irq_bit)?;
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+        let response = self
+            .mcu
+            .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
+        let body = response
+            .bytes
+            .get(36..)
+            .ok_or("SET_CLC response omitted MCU header")?;
+        let parsed = parse_clc_set_response(body)
+            .map_err(|error| format!("parse SET_CLC response: {error:?}"))?;
+        self.mcu
+            .tx_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        self.mcu.payload.zero_bytes(PAGE)?;
+        Ok(parsed)
     }
 
     fn publish_scatter(

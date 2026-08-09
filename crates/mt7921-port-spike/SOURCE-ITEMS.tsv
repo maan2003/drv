@@ -3185,7 +3185,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1349	enumerator	MCU_CE_CMD_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1350	enumerator	MCU_CE_CMD_SET_ROC	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1351	enumerator	MCU_CE_CMD_SET_EDCA_PARMS	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1352	enumerator	MCU_CE_CMD_SET_P2P_OPPPS	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1353	enumerator	MCU_CE_CMD_SET_CLC	encode_clc_set_command	exact	offline golden TXD fixture; active path pending
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1353	enumerator	MCU_CE_CMD_SET_CLC	encode_clc_set_command	exact	offline golden TXD fixture; explicit loader gate, physical pending
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1354	enumerator	MCU_CE_CMD_SET_RATE_TX_POWER	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1355	enumerator	MCU_CE_CMD_SCHED_SCAN_ENABLE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1356	enumerator	MCU_CE_CMD_SCHED_SCAN_REQ	-	unmapped	-
@@ -4031,7 +4031,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1257	member	type	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1258	member	pkt_len	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1259	member	pkt	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1260	member	beacon_tlv	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1308	function	__mt7921_mcu_set_clc	world_clc_commands, encode_clc_set_command, parse_clc_set_response	adapted	offline opaque-rule golden/error fixtures; active path pending
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1308	function	__mt7921_mcu_set_clc	world_clc_commands, encode_clc_set_command, parse_clc_set_response	adapted	offline opaque-rule golden/error fixtures; explicit loader gate, physical pending
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1313	macro	CLC_CAP_EVT_EN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1314	macro	CLC_CAP_DTS_EN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1316	struct	__anone31f438c1608	-	unmapped	-
