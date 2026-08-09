@@ -44,6 +44,13 @@ fake constructor exists only under this crate's unit-test configuration, so the
 current adapter cannot enable physical TX, VFIO, MMIO, DMA doorbells, or any
 other transport.
 
+The offline mechanics gate is complete: tests pass exact query, channel, join,
+frame/flag, synthetic-key, association, link, MLME-event, and RX-status values
+through the pinned `DeviceOps` contract; injected failures are returned once
+without later effects. The internal effects seam has no public consumer API,
+and the pristine production SME/MLME/RSN gate remains green. This is not
+evidence for management-frame transmission or a production backend.
+
 ## Physical transport contract
 
 Any physical transport must supply these exact MT7921 mechanics before this
