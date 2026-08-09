@@ -224,6 +224,18 @@ every mapping. The lab restored `mt7921e`,
 iwd, network, and SSH with `failed=0`. The durable root-only report is
 `/var/lib/wifi-driver-lab/reports/20260809T124531Z-0000_05_00.0.log`.
 
+A later single watchdog-guarded run validated the simultaneous Linux receive
+contract. Post-N9 commands kept WM ring 0/interrupt bit 0 and WM2 ring
+4/interrupt bit 22 active together (`0x00400001`). Capability event `0xec` and
+EFUSE event `0xed` arrived on ring 4, followed by the solicited `SET_CLC` event
+`0x80` for sequence 14 on ring 4. The bounded CLC response parsed successfully,
+one world/indoor rule was applied, and the special-UNII mask was zero. The run
+stopped before channel-domain, radio, channel, or scan operations, reset while
+all mappings remained pinned, released every mapping, and restored `mt7921e`
+and iwd with `failed=0`. The mandatory watchdog reboot then restored a healthy
+network on boot `3aa1bf1a-1634-41bf-aba5-973ee65d14df`. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T141820Z-0000_05_00.0.log`.
+
 The earlier `--run-one-shot-fwdl` rejection identified that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
 and that raw patch scatter is invalid until the MCU has accepted patch
