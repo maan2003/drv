@@ -59,6 +59,7 @@ explicitly marked; the initial majority is `unmapped`.
 | `mt76_connac_mcu_start_firmware` request | `mt76_connac_mcu.c` | `DownloadCommand::FirmwareStart` | adapted, tested | pinned-format fixture; not wired to active DMA |
 | `mt792x_load_firmware`, connac2 patch/RAM loaders | `mt792x_core.c`, `mt76_connac_mcu.c` | `load_mt7921_firmware`, `FirmwareLoaderTransport`, `VfioFirmwareLoader` | MT7961 installed-artifact subset, tested | golden transaction trace, bounded polls/completions, per-operation failure injection, reset-while-pinned VFIO adapter |
 | `mt7921_mcu_get_nic_capability` | `mt7921/mcu.c`, `mt76_connac_mcu.h` | `DownloadCommand::GetNicCapability`, `parse_nic_capability` | adapted, tested | source-exact command fixture; bounded known/unknown TLV fixtures; no radio mutation |
+| `mt7921_mcu_read_eeprom`, pre-`SET_CLC` `mt7921_load_clc` | `mt7921/mcu.c`, `mcu.h`, `mt7921.h` | `DownloadCommand::ReadEepromBlock`, `parse_eeprom_block`, `discover_clc` | adapted, tested | exact EFUSE query fixture; bounded response/CLC fixtures; mutating CLC application excluded |
 | connac2 patch header/sections | `mt76_connac_mcu.h` | `Patch` parser | adapted, tested | malformed/bounded fixtures |
 | `mt792x_wfsys_reset` | `mt7921/pci.c` | `reset_wfsys`, dynamic-L1 adapter | adapted, tested | ordering/timeout tests; physical ready at 57 ms |
 | driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests; physical first-attempt CLR_OWN response |

@@ -152,11 +152,22 @@ explicit completion for every chunk under a three-second deadline. Transport
 sequence allocation persists across transactions and skips zero on four-bit
 wrap. Fail-closed cleanup after `Ready` is lab transaction policy; Linux keeps
 the live device resources instead. The operation stops immediately after clean
-N9 readiness and sends only the read-only `GET_NIC_CAPAB` query before cleanup.
+N9 readiness and sends only the read-only `GET_NIC_CAPAB` and source-exact
+`EFUSE_ACCESS` query for the 16-byte EEPROM block containing `MT_EE_HW_TYPE`
+before cleanup.
 The bounds-checked response parser exposes MAC, PHY stream/band, 6 GHz, and chip
 capability TLVs while retaining the element/unknown counts. It rejects truncated
 headers, values, and undersized known elements. No radio, channel, regulatory,
-or scan command is encoded or sent.
+or scan command is encoded or sent. The EEPROM response is bounded, matched to
+address `0x550`, and exposes byte `0x55b` bit 0 as the calibration-enclosure
+selector used by pinned Linux. The local non-download CLC firmware region is
+then inventoried without sending `SET_CLC`: segment/rule bounds, first-record
+selection, duplicate country rules, and the `00` fallback domain are retained.
+This read-only boundary can derive physical band availability from NIC caps and
+the calibration/regulatory catalog supported by the exact hardware artifact.
+It deliberately cannot claim a final valid-channel set: pinned Linux treats CLC
+rule data as opaque, and per-channel legality additionally requires the
+mutating `SET_CLC` response, cfg80211 country regdb, and any OF/DTS limits.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 The VFIO adapter therefore owns a separate ring-4 descriptor/buffer arena from
 startup and switches the bounded response path and interrupt mask from boot-ROM

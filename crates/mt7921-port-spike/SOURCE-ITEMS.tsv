@@ -3767,7 +3767,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	12	macro	MT_STA_BFEE	-	unmapped	
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	14	variable	mt7921_disable_clc	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	18	function	mt7921_mcu_parse_response	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	76	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	78	function	mt7921_mcu_read_eeprom	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	78	function	mt7921_mcu_read_eeprom	DownloadCommand::ReadEepromBlock, parse_eeprom_block	adapted	source-exact TXD/request fixture; bounded response fixtures; loader failure injection
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	102	function	mt7921_mcu_set_ipv6_ns_filter	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	106	struct	__anone31f438c0108	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	107	struct	__anone31f438c0208	-	unmapped	-
@@ -3800,7 +3800,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	336	function	mt7921_mcu_uni_rx_u
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	353	function	mt7921_mcu_rx_event	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	388	function	mt7921_mcu_uni_tx_ba	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	402	function	mt7921_mcu_uni_rx_ba	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	413	function	mt7921_load_clc	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	413	function	mt7921_load_clc	discover_clc (pre-SET_CLC boundary)	adapted	bounds/selection fixtures; mutating SET_CLC deliberately excluded
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	498	function	mt7921_mcu_parse_tx_resource	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	502	struct	mt7921_tx_resource	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	503	member	version	-	unmapped	-
@@ -4099,7 +4099,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	33	member	rsv1	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	34	variable	__packed	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	37	enum	__anone31f43910103	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	38	enumerator	MCU_EXT_EVENT_RATE_REPORT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	41	struct	mt7921_mcu_eeprom_info	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	41	struct	mt7921_mcu_eeprom_info	EepromBlock	exact	24-byte request/response fixtures
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	42	member	addr	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	43	member	valid	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.h	44	member	data	-	unmapped	-
@@ -4256,13 +4256,13 @@ drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	136	enum	__anonb4745fa00503	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	137	enumerator	MT7921_CLC_POWER	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	138	enumerator	MT7921_CLC_CHAN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	139	enumerator	MT7921_CLC_MAX_NUM	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	142	struct	mt7921_clc_rule	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	142	struct	mt7921_clc_rule	discover_clc rule parser	adapted	bounded local-artifact fixtures
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	143	member	alpha2	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	144	member	type	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	145	member	len	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	146	member	data	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	147	variable	__packed	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	149	struct	mt7921_clc	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	149	struct	mt7921_clc	discover_clc segment parser	adapted	length/index/hardware-encapsulation fixtures
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	150	member	len	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	151	member	idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	152	member	ver	-	unmapped	-
@@ -4276,9 +4276,9 @@ drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	160	enumerator	MT_EE_CHIP_ID	
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	161	enumerator	MT_EE_VERSION	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	162	enumerator	MT_EE_MAC_ADDR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	163	enumerator	MT_EE_WIFI_CONF	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	164	enumerator	MT_EE_HW_TYPE	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	164	enumerator	MT_EE_HW_TYPE	MT7921_EEPROM_HW_TYPE	exact	constant fixture
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	165	enumerator	__MT_EE_MAX	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	168	macro	MT_EE_HW_TYPE_ENCAP	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	168	macro	MT_EE_HW_TYPE_ENCAP	EepromHardwareInfo::encapsulated_calibration	exact	bit fixture
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	170	enum	__anonb4745fa00603	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	171	enumerator	TXPWR_USER	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	172	enumerator	TXPWR_EEPROM	-	unmapped	-

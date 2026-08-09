@@ -15,7 +15,7 @@ use mt7921_port_spike::{
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
     encode_download_command, load_mt7921_firmware, mask_ack_disabled_fwdl_interrupt,
-    parse_download_response, parse_nic_capability, prepare_global_rx_rings,
+    parse_download_response, parse_eeprom_block, parse_nic_capability, prepare_global_rx_rings,
     prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
     read_dynamic_identity_status, reset_wfsys, select_vfio_irq, stage_disabled_firmware_chunk,
 };
@@ -1299,6 +1299,15 @@ fn classify_mcu_completion(
             let capability = parse_nic_capability(body)
                 .map_err(|error| format!("parse NIC capability response: {error:?}"))?;
             Ok(FirmwareCommandCompletion::NicCapability(capability))
+        }
+        DownloadCommand::ReadEepromBlock { address } => {
+            let body = response
+                .bytes
+                .get(36..)
+                .ok_or("EEPROM response omitted MCU header")?;
+            let block = parse_eeprom_block(body, address)
+                .map_err(|error| format!("parse EEPROM response: {error:?}"))?;
+            Ok(FirmwareCommandCompletion::EepromBlock(block))
         }
         DownloadCommand::NicPowerControl => {
             Err("NIC power command unexpectedly requested RX classification".into())
@@ -3011,6 +3020,31 @@ mod tests {
                 }
             )
             .is_err()
+        );
+
+        let mut eeprom_bytes = vec![0; 60];
+        eeprom_bytes[36..40].copy_from_slice(&0x550u32.to_le_bytes());
+        eeprom_bytes[40..44].copy_from_slice(&1u32.to_le_bytes());
+        eeprom_bytes[55] = 1;
+        assert_eq!(
+            classify_mcu_completion(
+                DownloadCommand::ReadEepromBlock { address: 0x550 },
+                &ReceivedMcuResponse {
+                    event_id: 1,
+                    bytes: eeprom_bytes,
+                }
+            ),
+            Ok(FirmwareCommandCompletion::EepromBlock(
+                mt7921_port_spike::EepromBlock {
+                    address: 0x550,
+                    valid: 1,
+                    data: {
+                        let mut data = [0; 16];
+                        data[11] = 1;
+                        data
+                    },
+                }
+            ))
         );
     }
 

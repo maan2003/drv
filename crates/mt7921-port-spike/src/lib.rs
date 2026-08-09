@@ -461,6 +461,128 @@ impl FirmwareRegion<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClcDiscovery {
+    pub segment_count: u16,
+    pub selected_power_segments: u16,
+    pub selected_power_rules: u16,
+    pub channel_segments: u16,
+    pub channel_rules: u16,
+    pub unique_country_codes: u16,
+    pub world_domain_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClcDiscoveryError {
+    TruncatedSegmentHeader,
+    InvalidSegmentLength(u32),
+    UnsupportedSegmentIndex(u8),
+    TruncatedRule { segment: u16 },
+    CountOverflow,
+}
+
+/// Inventory the local CLC region exactly up to (but not including) Linux's
+/// mutating `SET_CLC` call. Power segment selection uses the EEPROM hardware
+/// encapsulation bit; channel rules remain opaque firmware input.
+pub fn discover_clc(
+    firmware: Firmware<'_>,
+    hardware: EepromHardwareInfo,
+) -> Result<ClcDiscovery, ClcDiscoveryError> {
+    let Some(region) = firmware.regions().find(FirmwareRegion::is_clc) else {
+        return Ok(ClcDiscovery::default());
+    };
+    let mut discovery = ClcDiscovery::default();
+    let mut countries = Vec::<[u8; 2]>::new();
+    let mut accepted = [false; 2];
+    let mut offset = 0usize;
+    while offset < region.payload.len() {
+        let header = region
+            .payload
+            .get(offset..offset + 16)
+            .ok_or(ClcDiscoveryError::TruncatedSegmentHeader)?;
+        let length = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+        let length_usize = length as usize;
+        if length_usize < 16
+            || offset
+                .checked_add(length_usize)
+                .is_none_or(|end| end > region.payload.len())
+        {
+            return Err(ClcDiscoveryError::InvalidSegmentLength(length));
+        }
+        let index = header[4];
+        if index > 1 {
+            return Err(ClcDiscoveryError::UnsupportedSegmentIndex(index));
+        }
+        discovery.segment_count = discovery
+            .segment_count
+            .checked_add(1)
+            .ok_or(ClcDiscoveryError::CountOverflow)?;
+        let selected = !accepted[index as usize]
+            && (index == 1 || ((header[7] & 1 != 0) == hardware.encapsulated_calibration));
+        if selected {
+            accepted[index as usize] = true;
+        }
+        if index == 0 && selected {
+            discovery.selected_power_segments = discovery
+                .selected_power_segments
+                .checked_add(1)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+        } else if index == 1 {
+            discovery.channel_segments = discovery
+                .channel_segments
+                .checked_add(1)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+        }
+        let end = offset + length_usize;
+        let mut rule_offset = offset + 16;
+        // Pinned Linux stops when no more than 16 bytes remain in a segment.
+        while end - rule_offset > 16 {
+            let rule = region.payload.get(rule_offset..rule_offset + 6).ok_or(
+                ClcDiscoveryError::TruncatedRule {
+                    segment: discovery.segment_count - 1,
+                },
+            )?;
+            let data_length = u16::from_le_bytes([rule[4], rule[5]]) as usize;
+            let rule_length = 6usize
+                .checked_add(data_length)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+            if rule_offset
+                .checked_add(rule_length)
+                .is_none_or(|rule_end| rule_end > end)
+            {
+                return Err(ClcDiscoveryError::TruncatedRule {
+                    segment: discovery.segment_count - 1,
+                });
+            }
+            if selected {
+                if index == 0 {
+                    discovery.selected_power_rules = discovery
+                        .selected_power_rules
+                        .checked_add(1)
+                        .ok_or(ClcDiscoveryError::CountOverflow)?;
+                } else {
+                    discovery.channel_rules = discovery
+                        .channel_rules
+                        .checked_add(1)
+                        .ok_or(ClcDiscoveryError::CountOverflow)?;
+                }
+                let alpha2 = [rule[0], rule[1]];
+                if alpha2 == *b"00" {
+                    discovery.world_domain_available = true;
+                }
+                if !countries.contains(&alpha2) {
+                    countries.push(alpha2);
+                }
+            }
+            rule_offset += rule_length;
+        }
+        offset = end;
+    }
+    discovery.unique_country_codes =
+        u16::try_from(countries.len()).map_err(|_| ClcDiscoveryError::CountOverflow)?;
+    Ok(discovery)
+}
+
 /// A bounds-checked view of the Connac2 RAM firmware layout consumed by
 /// `mt76_connac_mcu_send_ram_firmware` and `mt7921_load_clc`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2130,6 +2252,9 @@ pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError
 pub enum DownloadCommand {
     NicPowerControl,
     GetNicCapability,
+    ReadEepromBlock {
+        address: u32,
+    },
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
@@ -2154,6 +2279,7 @@ pub enum DownloadCommandError {
     InvalidSequence,
     InvalidLength,
     InvalidFirmwareStart,
+    InvalidEepromAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2200,6 +2326,65 @@ pub enum NicCapabilityError {
     TruncatedElementHeader { index: u16 },
     TruncatedElement { index: u16, length: u32 },
     InvalidKnownElement { index: u16, kind: u32 },
+}
+
+pub const MT7921_EEPROM_BLOCK_SIZE: usize = 16;
+pub const MT7921_EEPROM_HW_TYPE: u32 = 0x55b;
+pub const MT7921_EEPROM_HW_TYPE_BLOCK: u32 = 0x550;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EepromBlock {
+    pub address: u32,
+    pub valid: u32,
+    pub data: [u8; MT7921_EEPROM_BLOCK_SIZE],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EepromBlockError {
+    Truncated,
+    AddressMismatch { expected: u32, actual: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EepromHardwareInfo {
+    pub raw_type: u8,
+    pub encapsulated_calibration: bool,
+}
+
+impl EepromBlock {
+    pub fn hardware_info(&self) -> Result<EepromHardwareInfo, EepromBlockError> {
+        if self.address != MT7921_EEPROM_HW_TYPE_BLOCK {
+            return Err(EepromBlockError::AddressMismatch {
+                expected: MT7921_EEPROM_HW_TYPE_BLOCK,
+                actual: self.address,
+            });
+        }
+        let raw_type = self.data[(MT7921_EEPROM_HW_TYPE - MT7921_EEPROM_HW_TYPE_BLOCK) as usize];
+        Ok(EepromHardwareInfo {
+            raw_type,
+            encapsulated_calibration: raw_type & 1 != 0,
+        })
+    }
+}
+
+/// Parse pinned Linux `struct mt7921_mcu_eeprom_info` after the MCU RXD.
+pub fn parse_eeprom_block(
+    bytes: &[u8],
+    expected_address: u32,
+) -> Result<EepromBlock, EepromBlockError> {
+    let response = bytes.get(..24).ok_or(EepromBlockError::Truncated)?;
+    let address = u32::from_le_bytes(response[0..4].try_into().expect("fixed field"));
+    if address != expected_address {
+        return Err(EepromBlockError::AddressMismatch {
+            expected: expected_address,
+            actual: address,
+        });
+    }
+    Ok(EepromBlock {
+        address,
+        valid: u32::from_le_bytes(response[4..8].try_into().expect("fixed field")),
+        data: response[8..24].try_into().expect("fixed EEPROM block"),
+    })
 }
 
 /// Parse the TLV body returned by pinned Linux GET_NIC_CAPAB.
@@ -2301,12 +2486,20 @@ pub fn encode_download_command(
     if sequence == 0 || sequence > 15 {
         return Err(DownloadCommandError::InvalidSequence);
     }
-    let (cid, set_query, payload): (u8, u8, Vec<u8>) = match command {
-        DownloadCommand::NicPowerControl => (0x04, 3, vec![1, 0, 0, 0]),
-        DownloadCommand::GetNicCapability => (0x8a, 1, vec![]),
-        DownloadCommand::PatchSemaphoreGet => (0x10, 3, 1u32.to_le_bytes().to_vec()),
-        DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0u32.to_le_bytes().to_vec()),
-        DownloadCommand::PatchFinish => (0x07, 3, vec![0; 4]),
+    let (cid, set_query, ext_cid, ext_cid_ack, payload): (u8, u8, u8, u8, Vec<u8>) = match command {
+        DownloadCommand::NicPowerControl => (0x04, 3, 0, 0, vec![1, 0, 0, 0]),
+        DownloadCommand::GetNicCapability => (0x8a, 1, 0, 0, vec![]),
+        DownloadCommand::ReadEepromBlock { address } => {
+            if address & 0xf != 0 || address > 0x9f0 {
+                return Err(DownloadCommandError::InvalidEepromAddress);
+            }
+            let mut payload = vec![0; 24];
+            payload[..4].copy_from_slice(&address.to_le_bytes());
+            (0xed, 0, 0x01, 1, payload)
+        }
+        DownloadCommand::PatchSemaphoreGet => (0x10, 3, 0, 0, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0, 0, 0u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchFinish => (0x07, 3, 0, 0, vec![0; 4]),
         DownloadCommand::FirmwareStart { address, option } => {
             if address != 0x0091_5000 || option != 1 {
                 return Err(DownloadCommandError::InvalidFirmwareStart);
@@ -2314,7 +2507,7 @@ pub fn encode_download_command(
             let mut payload = Vec::with_capacity(8);
             payload.extend_from_slice(&option.to_le_bytes());
             payload.extend_from_slice(&address.to_le_bytes());
-            (0x02, 3, payload)
+            (0x02, 3, 0, 0, payload)
         }
         DownloadCommand::PatchStart {
             address,
@@ -2328,7 +2521,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x05, 3, payload)
+            (0x05, 3, 0, 0, payload)
         }
         DownloadCommand::TargetAddressLength {
             address,
@@ -2342,7 +2535,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x01, 3, payload)
+            (0x01, 3, 0, 0, payload)
         }
     };
     let total = CONNAC2_MCU_TXD_BYTES + payload.len();
@@ -2357,6 +2550,8 @@ pub fn encode_download_command(
     bytes[37] = 0xa0;
     bytes[38] = set_query;
     bytes[39] = sequence;
+    bytes[41] = ext_cid;
+    bytes[43] = ext_cid_ack;
     bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
     Ok(bytes)
 }
@@ -2379,6 +2574,8 @@ pub enum FirmwareLoaderState {
     RamDownloading,
     FirmwareStarted,
     N9Ready,
+    CapabilityDiscovered,
+    EepromDiscovered,
     Ready,
 }
 
@@ -2404,6 +2601,7 @@ pub enum FirmwareCommandCompletion {
     PatchSemaphore(PatchSemaphoreStatus),
     PatchFinish(u8),
     NicCapability(NicCapability),
+    EepromBlock(EepromBlock),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2483,6 +2681,7 @@ pub enum FirmwareLoaderFailure<E> {
     },
     MissingFirmwareOverride,
     N9ReadyTimeout,
+    Clc(ClcDiscoveryError),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2509,6 +2708,8 @@ pub struct FirmwareLoaderReport {
     pub scatter_chunks: usize,
     pub scatter_bytes: usize,
     pub nic_capability: NicCapability,
+    pub eeprom_hardware: EepromBlock,
+    pub clc: ClcDiscovery,
 }
 
 fn loader_command<T: FirmwareLoaderTransport>(
@@ -2604,6 +2805,12 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             chip_capability: None,
             unknown_elements: 0,
         },
+        eeprom_hardware: EepromBlock {
+            address: MT7921_EEPROM_HW_TYPE_BLOCK,
+            valid: 0,
+            data: [0; MT7921_EEPROM_BLOCK_SIZE],
+        },
+        clc: ClcDiscovery::default(),
     };
 
     let power = DownloadCommand::NicPowerControl;
@@ -2763,11 +2970,34 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     match loader_command(transport, capability_command)? {
         FirmwareCommandCompletion::NicCapability(capability) => {
             report.nic_capability = capability;
+            *state = FirmwareLoaderState::CapabilityDiscovered;
+        }
+        completion => {
+            return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                command: capability_command,
+                completion,
+            });
+        }
+    }
+    let eeprom_command = DownloadCommand::ReadEepromBlock {
+        address: MT7921_EEPROM_HW_TYPE_BLOCK,
+    };
+    match loader_command(transport, eeprom_command)? {
+        FirmwareCommandCompletion::EepromBlock(block) => {
+            report.eeprom_hardware = block;
+            *state = FirmwareLoaderState::EepromDiscovered;
+            report.clc = discover_clc(
+                firmware,
+                block
+                    .hardware_info()
+                    .expect("the fixed EEPROM hardware block was validated"),
+            )
+            .map_err(FirmwareLoaderFailure::Clc)?;
             *state = FirmwareLoaderState::Ready;
             Ok(report)
         }
         completion => Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
-            command: capability_command,
+            command: eeprom_command,
             completion,
         }),
     }
@@ -4288,6 +4518,21 @@ mod tests {
         assert_eq!(capability.len(), CONNAC2_MCU_TXD_BYTES);
         assert_eq!(&capability[34..36], &0x8000u16.to_le_bytes());
         assert_eq!(&capability[36..40], &[0x8a, 0xa0, 1, 4]);
+        let eeprom = encode_download_command(
+            DownloadCommand::ReadEepromBlock {
+                address: MT7921_EEPROM_HW_TYPE_BLOCK,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(eeprom.len(), CONNAC2_MCU_TXD_BYTES + 24);
+        assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 0, 5, 0, 1, 0, 1]);
+        assert_eq!(&eeprom[64..68], &MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
+        assert_eq!(&eeprom[68..], &[0; 20]);
+        assert_eq!(
+            encode_download_command(DownloadCommand::ReadEepromBlock { address: 0x551 }, 5),
+            Err(DownloadCommandError::InvalidEepromAddress)
+        );
 
         let patch = encode_download_command(
             DownloadCommand::PatchStart {
@@ -4708,6 +4953,39 @@ mod tests {
         )
     }
 
+    fn eeprom_hardware_fixture() -> (Vec<u8>, EepromBlock) {
+        let mut bytes = vec![0; 24];
+        bytes[0..4].copy_from_slice(&MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        bytes[8 + 11] = 1;
+        (
+            bytes,
+            EepromBlock {
+                address: MT7921_EEPROM_HW_TYPE_BLOCK,
+                valid: 1,
+                data: {
+                    let mut data = [0; MT7921_EEPROM_BLOCK_SIZE];
+                    data[11] = 1;
+                    data
+                },
+            },
+        )
+    }
+
+    fn clc_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 16];
+        bytes[0..4].copy_from_slice(&33u32.to_le_bytes());
+        bytes[4] = 0;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[7] = 1;
+        bytes.extend_from_slice(b"00");
+        bytes.extend_from_slice(b"-0");
+        bytes.extend_from_slice(&11u16.to_le_bytes());
+        bytes.extend_from_slice(&[0x5a; 11]);
+        bytes
+    }
+
     #[test]
     fn parses_bounded_nic_capability_tlvs() {
         let (bytes, expected) = nic_capability_fixture();
@@ -4722,6 +5000,70 @@ mod tests {
         assert_eq!(
             parse_nic_capability(&[1, 0, 0, 0]),
             Err(NicCapabilityError::TruncatedElementHeader { index: 0 })
+        );
+    }
+
+    #[test]
+    fn parses_bounded_eeprom_block_and_hardware_type() {
+        let (bytes, expected) = eeprom_hardware_fixture();
+        assert_eq!(
+            parse_eeprom_block(&bytes, MT7921_EEPROM_HW_TYPE_BLOCK),
+            Ok(expected)
+        );
+        assert_eq!(
+            expected.hardware_info(),
+            Ok(EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            })
+        );
+        assert_eq!(
+            parse_eeprom_block(&bytes[..23], MT7921_EEPROM_HW_TYPE_BLOCK),
+            Err(EepromBlockError::Truncated)
+        );
+        assert_eq!(
+            parse_eeprom_block(&bytes, 0),
+            Err(EepromBlockError::AddressMismatch {
+                expected: 0,
+                actual: MT7921_EEPROM_HW_TYPE_BLOCK,
+            })
+        );
+    }
+
+    #[test]
+    fn discovers_selected_clc_rules_without_sending_configuration() {
+        let clc = clc_fixture();
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc)]);
+        assert_eq!(
+            discover_clc(
+                Firmware::parse(&image).unwrap(),
+                EepromHardwareInfo {
+                    raw_type: 1,
+                    encapsulated_calibration: true,
+                }
+            ),
+            Ok(ClcDiscovery {
+                segment_count: 1,
+                selected_power_segments: 1,
+                selected_power_rules: 1,
+                channel_segments: 0,
+                channel_rules: 0,
+                unique_country_codes: 1,
+                world_domain_available: true,
+            })
+        );
+        let mut malformed = clc;
+        malformed[0..4].copy_from_slice(&34u32.to_le_bytes());
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &malformed)]);
+        assert_eq!(
+            discover_clc(
+                Firmware::parse(&image).unwrap(),
+                EepromHardwareInfo {
+                    raw_type: 1,
+                    encapsulated_calibration: true,
+                }
+            ),
+            Err(ClcDiscoveryError::InvalidSegmentLength(34))
         );
     }
 
@@ -4839,6 +5181,9 @@ mod tests {
                 DownloadCommand::GetNicCapability => {
                     FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
                 }
+                DownloadCommand::ReadEepromBlock { .. } => {
+                    FirmwareCommandCompletion::EepromBlock(eeprom_hardware_fixture().1)
+                }
                 DownloadCommand::PatchSemaphoreGet => {
                     FirmwareCommandCompletion::PatchSemaphore(self.semaphore_result.into())
                 }
@@ -4920,10 +5265,11 @@ mod tests {
     fn loader_images() -> (Vec<u8>, Vec<u8>) {
         let patch = patch_image(0x0004_0002, 160, 4097);
         let ram_large = vec![0x5a; 4097];
+        let clc = clc_fixture();
         let ram = firmware_image(&[
             (0x0091_5000, 1 << 5, 0, &ram_large),
             (0x0201_5c00, 0, 0, b"ram"),
-            (0, FW_FEATURE_NON_DL, FW_TYPE_CLC, b"clc"),
+            (0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc),
         ]);
         (patch, ram)
     }
@@ -4948,6 +5294,16 @@ mod tests {
                 scatter_chunks: 5,
                 scatter_bytes: 8197,
                 nic_capability: nic_capability_fixture().1,
+                eeprom_hardware: eeprom_hardware_fixture().1,
+                clc: ClcDiscovery {
+                    segment_count: 1,
+                    selected_power_segments: 1,
+                    selected_power_rules: 1,
+                    channel_segments: 0,
+                    channel_rules: 0,
+                    unique_country_codes: 1,
+                    world_domain_available: true,
+                },
             }
         );
         assert_eq!(
@@ -5005,6 +5361,12 @@ mod tests {
                 LoaderTrace::Sleep(10),
                 LoaderTrace::N9Ready,
                 LoaderTrace::Command(DownloadCommand::GetNicCapability, 14),
+                LoaderTrace::Command(
+                    DownloadCommand::ReadEepromBlock {
+                        address: MT7921_EEPROM_HW_TYPE_BLOCK,
+                    },
+                    15,
+                ),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
