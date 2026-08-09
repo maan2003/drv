@@ -38,3 +38,13 @@ wlan-statemachine = { path = "../../statemachine" }
 wlan-trace = { path = "../../trace" }
 zerocopy.workspace = true
 zx = { path = "../../../../../../sdk/rust/zx" }
+
+[[test]]
+name = "host-client-gate"
+path = "host_tests/client_gate.rs"
+
+[dev-dependencies]
+eapol = { path = "../../eapol" }
+fuchsia-inspect = { path = "../../../../../lib/diagnostics/inspect/rust" }
+wlan-rsn = { path = "../../rsn" }
+tokio.workspace = true
