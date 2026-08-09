@@ -327,6 +327,18 @@ struct ActiveVfioCapsule {
     conn: Option<ReadPage>,
     active: Option<ActiveVfioResources>,
     containment: Option<ContainmentLedger>,
+    #[cfg(test)]
+    drop_probe: Option<CapsuleDropProbe>,
+}
+
+#[cfg(test)]
+struct CapsuleDropProbe(std::path::PathBuf);
+
+#[cfg(test)]
+impl Drop for CapsuleDropProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"dropped");
+    }
 }
 
 impl ActiveVfioCapsule {
@@ -340,6 +352,8 @@ impl ActiveVfioCapsule {
             conn: None,
             active: None,
             containment,
+            #[cfg(test)]
+            drop_probe: None,
         }
     }
 
@@ -420,6 +434,10 @@ impl ActiveVfioCapsule {
             });
         }
         failures
+    }
+
+    fn retain_forever(self) -> ! {
+        park_retention_capsule(self)
     }
 }
 
@@ -2378,9 +2396,16 @@ fn verify_watchdog_status(status: &str, now: u64) -> Result<ArmedWatchdog, Strin
 }
 
 fn retain_mappings_for_watchdog(message: &str) -> ! {
-    eprintln!("mt7921-vfio-read: {message}; retaining device and every IOVA for watchdog reboot");
+    const MESSAGE: &[u8] =
+        b"mt7921-vfio-read: containment failed; resources pinned for reboot watchdog\n";
+    unsafe {
+        write_fd(2, MESSAGE.as_ptr(), MESSAGE.len());
+    }
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        std::hint::black_box(message);
+        unsafe {
+            pause();
+        }
     }
 }
 
@@ -5197,7 +5222,6 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn vfio_irq_payload_matches_linux_uapi_layout() {
@@ -5635,40 +5659,44 @@ mod tests {
         assert!(!trace.contains(&RunPhase::PassiveReady));
     }
 
-    struct ParkDropProbe(PathBuf);
-
-    impl Drop for ParkDropProbe {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.0, b"dropped");
-        }
-    }
-
     #[test]
     fn parked_capsule_helper() {
         let Ok(path) = std::env::var("DRV_TEST_PARK_DROP_PATH") else {
             return;
         };
-        park_retention_capsule(ParkDropProbe(path.into()));
+        let device = Arc::new(File::open("/dev/null").unwrap());
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        let mut ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
+        ledger.mark_possibly_active(Hazard::HostControl);
+        let mut capsule = ActiveVfioCapsule::new(device, iommu, Some(ledger));
+        capsule.drop_probe = Some(CapsuleDropProbe(path.into()));
+        if std::env::var("DRV_TEST_PARK_MODE").as_deref() == Ok("retain") {
+            capsule.retain_forever();
+        }
+        drop(capsule);
     }
 
     #[test]
     fn parked_capsule_never_runs_its_resource_destructor() {
-        let marker =
-            std::env::temp_dir().join(format!("mt7921-retention-drop-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::parked_capsule_helper", "--nocapture"])
-            .env("DRV_TEST_PARK_DROP_PATH", &marker)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(child.try_wait().unwrap().is_none(), "park helper returned");
-        assert!(!marker.exists(), "parked resource destructor ran");
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(!marker.exists(), "killed process ran Rust destructors");
+        for mode in ["drop", "retain"] {
+            let marker = std::env::temp_dir()
+                .join(format!("mt7921-retention-{mode}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::parked_capsule_helper", "--nocapture"])
+                .env("DRV_TEST_PARK_DROP_PATH", &marker)
+                .env("DRV_TEST_PARK_MODE", mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(child.try_wait().unwrap().is_none(), "park helper returned");
+            assert!(!marker.exists(), "parked resource destructor ran");
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(!marker.exists(), "killed process ran Rust destructors");
+        }
     }
 
     #[test]
