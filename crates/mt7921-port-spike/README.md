@@ -381,6 +381,16 @@ beacon. Cleanup and restore returned success; after the watchdog reboot,
 `mt7921e`, iwd, `wlan0`, and its default route were healthy on boot
 `1b50ae57-836e-4a88-9600-2a2692e5702d`. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T163223Z-0000_05_00.0.log`.
+
+The low-DFS passive group covered channels 52, 56, 60, and 64 under the same
+world/indoor `NO_IR`, zero-probe contract. All four channels returned matching
+successful completion with no local BSS, which is a valid empty scan result.
+Release SHA-256
+`df16b13016bf951a0e6d2c7a3db0dcfc0b36c7d7fde231b66d9e4ddbd8085d92`
+emitted `sequential_gate_passed`; cleanup and restoration returned success,
+and watchdog boot `3ea2362d-a0f7-4ac0-9313-8a0a6fbf8581` returned with native
+Wi-Fi and its default route healthy. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T164050Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
