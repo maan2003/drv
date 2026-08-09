@@ -5,6 +5,8 @@
 //! This crate contains no device, register, DMA, IRQ, firmware-loading, or host
 //! networking implementation. A caller must provide an explicit transport.
 
+pub mod client_device;
+
 use fuchsia_softmac_port::{
     AdvertisementKind, Bssid, CapabilityInfo, ChannelBandwidth, ChannelNumber, DiscoverySupport,
     HardwareScanEvent, ScanObservation, SoftmacHardware, TimeUnit, WlanBand, WlanPhyType,
