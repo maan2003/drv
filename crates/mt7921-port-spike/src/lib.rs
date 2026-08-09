@@ -4367,6 +4367,7 @@ pub enum Mt7921MgmtTxError {
     InvalidIova,
     InvalidToken,
     InvalidPid,
+    InvalidWcid,
     Descriptor(DescriptorError),
 }
 
@@ -4380,22 +4381,32 @@ pub fn encode_mt7921_5ghz_auth_tx(
     frame_iova: u64,
     token: u16,
     pid: u8,
+    wcid: u16,
 ) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
-    if frame.len() <= 14 || frame.len() > u16::MAX as usize || frame.len() < 24 {
+    if frame.len() < 30 || frame.len() > 0x7fff {
         return Err(Mt7921MgmtTxError::InvalidFrame);
     }
     let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
-    if frame_control & 0x000c != 0 || frame_control >> 4 & 0x0f != 0x0b {
+    if frame_control != 0x00b0 {
         return Err(Mt7921MgmtTxError::InvalidFrame);
     }
-    if txwi_iova > u64::from(u32::MAX) || frame_iova > u64::from(u32::MAX) {
+    let fits_low32 = |iova: u64, len: usize| {
+        len != 0
+            && iova
+                .checked_add(len as u64 - 1)
+                .is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    if !fits_low32(txwi_iova, MT7921_MGMT_TXWI_BYTES) || !fits_low32(frame_iova, frame.len()) {
         return Err(Mt7921MgmtTxError::InvalidIova);
     }
     if token >= 8192 {
         return Err(Mt7921MgmtTxError::InvalidToken);
     }
-    if pid < 3 {
+    if !(3..127).contains(&pid) {
         return Err(Mt7921MgmtTxError::InvalidPid);
+    }
+    if wcid >= 20 {
+        return Err(Mt7921MgmtTxError::InvalidWcid);
     }
 
     let mut txwi = [0u8; MT7921_MGMT_TXWI_BYTES];
@@ -4405,7 +4416,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
     // mt76_connac2_mac_write_txwi: CT packet, alternate TX queue, WCID/OMAC 0.
     word(0, (0x10 << 25) | ((frame.len() as u32 + 32) & 0xffff));
     // Long format, 802.11 header, 24-byte management header / 2.
-    word(1, (1 << 31) | (2 << 16) | (12 << 11));
+    word(1, (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid));
     // Authentication subtype, fixed legacy rate, and HTC-valid as in Linux.
     word(2, (1 << 31) | (1 << 13) | 0x0b);
     // 15 remaining attempts and BA disabled for fixed-rate management TX.
@@ -4459,6 +4470,11 @@ pub enum Mt7921TxCompletionError {
     InvalidFormat,
 }
 
+pub fn mt7921_packet_type(bytes: &[u8]) -> Option<u8> {
+    let header = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    Some(((header >> 27) & 0x1f) as u8)
+}
+
 pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxCompletionError> {
     let header = u32::from_le_bytes(
         bytes
@@ -4467,9 +4483,16 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
             .try_into()
             .expect("fixed field"),
     );
-    if header >> 27 & 0x1f != 1 {
+    if mt7921_packet_type(bytes) != Some(6) {
         return Err(Mt7921TxCompletionError::WrongPacketType);
     }
+    let reported_len = (header & 0xffff) as usize;
+    if reported_len != 12 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let bytes = bytes
+        .get(..reported_len)
+        .ok_or(Mt7921TxCompletionError::Truncated)?;
     if header >> 16 & 0x03ff != 1 {
         return Err(Mt7921TxCompletionError::MultipleOrPaired);
     }
@@ -4498,9 +4521,16 @@ pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCo
             .try_into()
             .expect("fixed field"),
     );
-    if header >> 27 & 0x1f != 0 {
+    if mt7921_packet_type(bytes) != Some(0) {
         return Err(Mt7921TxCompletionError::WrongPacketType);
     }
+    let reported_len = (header & 0xffff) as usize;
+    if reported_len != 40 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let bytes = bytes
+        .get(..reported_len)
+        .ok_or(Mt7921TxCompletionError::Truncated)?;
     let txs = bytes.get(8..40).ok_or(Mt7921TxCompletionError::Truncated)?;
     let dword = |index: usize| {
         u32::from_le_bytes(
@@ -4512,8 +4542,12 @@ pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCo
     if dword(0) >> 23 & 0x3 > 1 {
         return Err(Mt7921TxCompletionError::InvalidFormat);
     }
+    let wcid = ((dword(2) >> 16) & 0x03ff) as u16;
+    if wcid >= 20 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
     Ok(Mt7921TxStatus {
-        wcid: ((dword(2) >> 16) & 0x03ff) as u16,
+        wcid,
         pid: (dword(3) >> 24) as u8,
         acked: dword(0) & (0x7 << 16) == 0,
     })
@@ -4535,6 +4569,11 @@ pub struct Mt7921AuthRx {
 pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError> {
     let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
     let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let reported_len = (rxd0 & 0xffff) as usize;
+    let bytes = bytes.get(..reported_len).ok_or(PassiveRxError::Truncated)?;
+    if reported_len < 24 {
+        return Err(PassiveRxError::Truncated);
+    }
     let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
     let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
     let packet_type = rxd0 >> 27 & 0x1f;
@@ -4569,7 +4608,7 @@ pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError
     }
     offset += 2 * ((rxd2 >> 14) & 0x3) as usize;
     let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
-    if frame.len() < 30 || u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc != 0x00b0 {
+    if frame.len() < 30 || u16::from_le_bytes([frame[0], frame[1]]) != 0x00b0 {
         return Err(PassiveRxError::UnsupportedFrame);
     }
     Ok(Mt7921AuthRx {
@@ -4595,12 +4634,18 @@ mod tests {
     fn source_exact_connac2_sae_auth_txwi_and_txp() {
         let mut frame = vec![0u8; 30];
         frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
-        let tx = encode_mt7921_5ghz_auth_tx(&frame, 0x0102_0000, 0x0102_1000, 7, 3).unwrap();
+        frame[0..2].copy_from_slice(&0x80b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        let tx = encode_mt7921_5ghz_auth_tx(&frame, 0x0102_0000, 0x0102_1000, 7, 3, 19).unwrap();
         let word = |index: usize| {
             u32::from_le_bytes(tx.txwi[index * 4..index * 4 + 4].try_into().unwrap())
         };
         assert_eq!(word(0), (0x10 << 25) | 62);
-        assert_eq!(word(1), (1 << 31) | (2 << 16) | (12 << 11));
+        assert_eq!(word(1), (1 << 31) | (2 << 16) | (12 << 11) | 19);
         assert_eq!(word(2), (1 << 31) | (1 << 13) | 0x0b);
         assert_eq!(word(3), (1 << 28) | (15 << 11));
         assert_eq!(word(5), (1 << 10) | 3);
@@ -4625,24 +4670,46 @@ mod tests {
         let mut frame = vec![0u8; 30];
         frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
         assert_eq!(
-            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3),
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 19),
             Err(Mt7921MgmtTxError::InvalidFrame)
         );
         frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
         assert_eq!(
-            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 8192, 3),
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 8192, 3, 19),
             Err(Mt7921MgmtTxError::InvalidToken)
         );
         assert_eq!(
-            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 2),
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 2, 19),
             Err(Mt7921MgmtTxError::InvalidPid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 127, 19),
+            Err(Mt7921MgmtTxError::InvalidPid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 20),
+            Err(Mt7921MgmtTxError::InvalidWcid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, u32::MAX as u64 - 62, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidIova)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, u32::MAX as u64 - 28, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidIova)
+        );
+        let mut oversized = vec![0u8; 0x8000];
+        oversized[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&oversized, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
         );
     }
 
     #[test]
     fn parses_correlated_tx_free_and_txs_completion() {
         let mut free = [0u8; 12];
-        free[0..4].copy_from_slice(&((1u32 << 27) | (1 << 16)).to_le_bytes());
+        free[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 12).to_le_bytes());
         free[8..12].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
         assert_eq!(
             parse_mt7921_tx_free(&free),
@@ -4654,6 +4721,7 @@ mod tests {
         );
 
         let mut txs = [0u8; 40];
+        txs[0..4].copy_from_slice(&40u32.to_le_bytes());
         txs[16..20].copy_from_slice(&0u32.to_le_bytes());
         txs[20..24].copy_from_slice(&(3u32 << 24).to_le_bytes());
         assert_eq!(
@@ -4666,6 +4734,25 @@ mod tests {
         );
         txs[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
         assert_eq!(parse_mt7921_tx_status(&txs).unwrap().acked, false);
+
+        let mut batched = [0u8; 72];
+        batched[0..4].copy_from_slice(&72u32.to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&batched),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
+        let mut invalid_wcid = txs;
+        invalid_wcid[16..20].copy_from_slice(&(20u32 << 16).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&invalid_wcid),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
+        let mut stale_free_tail = [0u8; 16];
+        stale_free_tail[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_free(&stale_free_tail),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -6743,6 +6830,26 @@ mod tests {
                 status: 0,
                 fields: vec![9, 8, 7, 6],
             })
+        );
+        let mut stale_tail = rx.clone();
+        stale_tail[0..4].copy_from_slice(&((2u32 << 27) | 62).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_auth_rx(&stale_tail),
+            Ok(Mt7921AuthRx {
+                receiver: [2; 6],
+                transmitter: [6; 6],
+                bssid: [6; 6],
+                algorithm: 3,
+                sequence: 1,
+                status: 0,
+                fields: Vec::new(),
+            })
+        );
+        let mut ordered = rx.clone();
+        ordered[32..34].copy_from_slice(&0x80b0u16.to_le_bytes());
+        assert_eq!(
+            parse_mt7921_auth_rx(&ordered),
+            Err(PassiveRxError::UnsupportedFrame)
         );
     }
 

@@ -69,8 +69,9 @@ can expand this milestone's channel set.
 
 The only MT7921-owned pieces are firmware/MCU commands, DMA/IRQ/RX transport,
 calibration, reset containment, and conversion of device RX metadata into the
-pinned SoftMAC value types. Authentication/association are reachable only through
-the offline fake in this milestone; no MT7921 management-TX adapter exists.
+pinned SoftMAC value types. Authentication/association remain reachable only
+through the offline fake in this milestone; the dormant MT7921 management-TX
+adapter is rejected before VFIO is opened while the channel domain is `NO_IR`.
 
 ## Physical authentication gate inventory
 
@@ -82,6 +83,23 @@ Credential material may enter only through a root-only ephemeral handoff and
 must never be printed, persisted in reports, committed, or retained after reset.
 The first physical stage stops after SAE authentication and before association,
 EAPOL, key installation, or data.
+
+Read-only no-plastic evidence found kernel regulatory domain `00: DFS-UNSET`;
+its 5170--5250 MHz rule is `PASSIVE-SCAN`. The associated AP is on channel 36
+(5180 MHz), which is non-DFS, and advertises Country `IN`, channels 36--48 at
+30 dBm, but its environment byte is reported as invalid. Neither AP-controlled
+Country information nor the absence of DFS/CAC authorizes initiating radiation.
+
+The pinned Fuchsia authorization source is
+`wlancfg/regulatory_manager.rs`: a two-byte update from the authoritative
+`RegulatoryRegionWatcher` is passed to `IfaceManager::set_country`. The pinned
+ordering first stops client connections and APs, then calls
+`PhyManager::set_country_code`, which invokes `DeviceMonitor.SetCountry` for
+every PHY; failure remains a failure rather than falling through to TX. A host
+port therefore needs user/location authority, this stop/set/recreate ordering,
+successful country-specific firmware/channel programming, and an exact channel
+rule without `NO_IR` before enabling the dormant SAE adapter. Channel 36 needs
+no CAC, but it still needs explicit IR authorization.
 
 ## Source and license
 

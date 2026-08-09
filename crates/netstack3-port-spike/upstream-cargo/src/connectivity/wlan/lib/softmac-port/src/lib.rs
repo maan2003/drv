@@ -16,7 +16,7 @@ mod pinned_convert_beacon;
 pub use pinned_convert_beacon::construct_bss_description;
 
 pub use fidl_fuchsia_wlan_ieee80211::{
-    BssDescription, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
+    BssDescription, ChannelBandwidth, ChannelNumber, StatusCode, WlanBand, WlanPhyType,
 };
 pub use fidl_fuchsia_wlan_mlme::{ScanEnd, ScanRequest, ScanResult, ScanResultCode, ScanTypes};
 pub use fidl_fuchsia_wlan_softmac::{

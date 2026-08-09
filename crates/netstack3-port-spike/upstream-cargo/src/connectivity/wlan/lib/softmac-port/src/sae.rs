@@ -20,7 +20,7 @@ use wlan_rsn::{ProtectionInfo, PweMethod, Supplicant};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SaeHandshakeUpdate {
     TxFrame(SaeFrame),
-    ScheduleTimeout(u64),
+    ScheduleTimeout { id: u64, duration_millis: u64 },
     Authenticated,
     Rejected,
 }
@@ -29,8 +29,11 @@ pub enum SaeHandshakeUpdate {
 /// `Debug` and exposes only management-frame and timer updates.
 pub struct SaeHandshake {
     supplicant: Supplicant,
+    client: MacAddr,
     peer: MacAddr,
 }
+
+pub const SAE_RETRANSMISSION_TIMEOUT_MILLIS: u64 = 1000;
 
 impl SaeHandshake {
     /// Build the same SME-managed WPA3 supplicant selected by pinned
@@ -76,7 +79,11 @@ impl SaeHandshake {
             peer,
             ProtectionInfo::Rsne(authenticator),
         )?;
-        Ok(Self { supplicant, peer })
+        Ok(Self {
+            supplicant,
+            client,
+            peer,
+        })
     }
 
     /// Mirrors SME startup followed by MLME's `OnSaeHandshakeInd` event.
@@ -89,10 +96,21 @@ impl SaeHandshake {
 
     pub fn on_frame_rx(
         &mut self,
+        receiver: MacAddr,
+        transmitter: MacAddr,
+        bssid: MacAddr,
+        algorithm: u16,
         seq_num: u16,
         status_code: StatusCode,
         sae_fields: Vec<u8>,
     ) -> Result<Vec<SaeHandshakeUpdate>, wlan_rsn::Error> {
+        if receiver != self.client
+            || transmitter != self.peer
+            || bssid != self.peer
+            || algorithm != mac::AuthAlgorithmNumber::SAE.0
+        {
+            return Ok(vec![]);
+        }
         let mut sink = UpdateSink::default();
         self.supplicant.on_sae_frame_rx(
             &mut sink,
@@ -118,7 +136,10 @@ fn convert_updates(updates: UpdateSink) -> Vec<SaeHandshakeUpdate> {
         .into_iter()
         .filter_map(|update| match update {
             SecAssocUpdate::TxSaeFrame(frame) => Some(SaeHandshakeUpdate::TxFrame(frame)),
-            SecAssocUpdate::ScheduleSaeTimeout(id) => Some(SaeHandshakeUpdate::ScheduleTimeout(id)),
+            SecAssocUpdate::ScheduleSaeTimeout(id) => Some(SaeHandshakeUpdate::ScheduleTimeout {
+                id,
+                duration_millis: SAE_RETRANSMISSION_TIMEOUT_MILLIS,
+            }),
             SecAssocUpdate::SaeAuthStatus(AuthStatus::Success) => {
                 Some(SaeHandshakeUpdate::Authenticated)
             }
@@ -193,11 +214,13 @@ mod tests {
                 sae_fields,
             }) if *peer_sta_address == peer.to_array() && !sae_fields.is_empty()
         )));
-        assert!(
-            updates
-                .iter()
-                .any(|update| matches!(update, SaeHandshakeUpdate::ScheduleTimeout(_)))
-        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SaeHandshakeUpdate::ScheduleTimeout {
+                duration_millis: SAE_RETRANSMISSION_TIMEOUT_MILLIS,
+                ..
+            }
+        )));
         assert!(!updates.iter().any(|update| matches!(
             update,
             SaeHandshakeUpdate::Authenticated | SaeHandshakeUpdate::Rejected
@@ -217,6 +240,43 @@ mod tests {
         .unwrap();
         let _ = handshake.start().unwrap();
         assert!(handshake.on_timeout(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn foreign_or_non_sae_authentication_frames_never_reach_supplicant() {
+        let client = MacAddr::from([2; 6]);
+        let peer = MacAddr::from([6; 6]);
+        let mut handshake = SaeHandshake::new(
+            b"fixture".to_vec(),
+            b"fixture passphrase".to_vec(),
+            client,
+            peer,
+            WPA3_SAE_RSNE,
+            false,
+        )
+        .unwrap();
+        let _ = handshake.start().unwrap();
+        for (receiver, transmitter, bssid, algorithm) in [
+            (MacAddr::from([3; 6]), peer, peer, 3),
+            (client, MacAddr::from([4; 6]), peer, 3),
+            (client, peer, MacAddr::from([5; 6]), 3),
+            (client, peer, peer, 0),
+        ] {
+            assert!(
+                handshake
+                    .on_frame_rx(
+                        receiver,
+                        transmitter,
+                        bssid,
+                        algorithm,
+                        1,
+                        StatusCode::Success,
+                        vec![1, 2, 3],
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
