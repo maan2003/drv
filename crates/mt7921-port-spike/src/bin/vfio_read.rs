@@ -912,8 +912,8 @@ fn run() -> Result<(), String> {
                         &mut loader,
                         patch,
                         firmware,
-                        |loader, _report| {
-                            let mut mechanics = VfioPassiveMechanics {
+                        |loader, report| {
+                            let mechanics = VfioPassiveMechanics {
                                 loader,
                                 data: ActiveMcuRx {
                                     rx_ring: &mut data_rx_ring,
@@ -928,8 +928,11 @@ fn run() -> Result<(), String> {
                                 scan_started: None,
                                 advertisements: Vec::new(),
                             };
-                            let prerequisites = mechanics
-                                .prepare_passive_receive()
+                            let mut transport =
+                                SourceExactPassiveTransport::new(mechanics, report.nic_capability)
+                                    .map_err(|error| error.to_string())?;
+                            let prerequisites = transport
+                                .prepare_receive_only()
                                 .map_err(|error| error.to_string())?;
                             if prerequisites
                                 != (PassivePrerequisites {

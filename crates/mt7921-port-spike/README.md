@@ -220,8 +220,10 @@ pinned Fuchsia `SoftmacHardware` implementation. It retains Fuchsia scan IDs,
 bounded requested timing, advertisement conversion, and completion semantics.
 The lower mechanics edge must attest that the mask-zero channel domain,
 source-required MAC MMIO initialization, and separately owned data-RX ring are
-all present before the first MCU command; any missing mandatory dependency
-poisons the adapter before publication. This remained offline-only until the
+all present before MAC enable or channel configuration. Pinned Linux first
+sends `EFUSE_BUFFER_MODE`, then performs `mt7921_mac_init`; the adapter preserves
+that order and poisons on a failed prerequisite before any later command. This
+remained offline-only until the
 physical mechanics edge owns RX ring 2/interrupt bit 2 and ports the mandatory
 MAC MMIO sequence without weakening the existing dual-MCU-ring cleanup gate.
 

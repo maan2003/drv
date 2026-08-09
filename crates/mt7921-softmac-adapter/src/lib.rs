@@ -129,6 +129,7 @@ pub struct SourceExactPassiveTransport<M> {
     mcu_sequence: u8,
     scan_sequence: u8,
     selected: Option<CandidateChannel>,
+    receive_prepared: bool,
     initialized: bool,
     active: Option<(u64, u8, i64)>,
 }
@@ -151,6 +152,7 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
             mcu_sequence: 0,
             scan_sequence: 0,
             selected: None,
+            receive_prepared: false,
             initialized: false,
             active: None,
         })
@@ -158,6 +160,38 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
 
     pub fn into_mechanics(self) -> M {
         self.mechanics
+    }
+
+    /// Execute the source-ordered EEPROM-buffer command and mandatory receive
+    /// preparation without enabling MAC/channel/scan operation.
+    pub fn prepare_receive_only(
+        &mut self,
+    ) -> Result<PassivePrerequisites, SourceExactTransportError<M::Error>> {
+        if self.receive_prepared {
+            return Ok(PassivePrerequisites {
+                channel_domain_mask_zero: true,
+                mac_mmio_initialized: true,
+                data_rx_owned: true,
+            });
+        }
+        self.issue(PassiveMcuCommand::EepromBufferMode)?;
+        let prerequisites = self
+            .mechanics
+            .prepare_passive_receive()
+            .map_err(SourceExactTransportError::Mechanics)?;
+        if prerequisites
+            != (PassivePrerequisites {
+                channel_domain_mask_zero: true,
+                mac_mmio_initialized: true,
+                data_rx_owned: true,
+            })
+        {
+            return Err(SourceExactTransportError::MandatoryDependency(
+                prerequisites,
+            ));
+        }
+        self.receive_prepared = true;
+        Ok(prerequisites)
     }
 
     fn issue(
@@ -179,22 +213,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
 
     fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error> {
         if !self.initialized {
-            let prerequisites = self
-                .mechanics
-                .prepare_passive_receive()
-                .map_err(SourceExactTransportError::Mechanics)?;
-            if prerequisites
-                != (PassivePrerequisites {
-                    channel_domain_mask_zero: true,
-                    mac_mmio_initialized: true,
-                    data_rx_owned: true,
-                })
-            {
-                return Err(SourceExactTransportError::MandatoryDependency(
-                    prerequisites,
-                ));
-            }
-            self.issue(PassiveMcuCommand::EepromBufferMode)?;
+            self.prepare_receive_only()?;
             self.issue(PassiveMcuCommand::MacEnable)?;
             self.issue(PassiveMcuCommand::SetRxPath {
                 channel,
@@ -763,6 +782,7 @@ mod tests {
     struct ScriptedMechanics {
         prerequisites: Option<PassivePrerequisites>,
         commands: Vec<(PassiveMcuCommand, Vec<u8>, bool)>,
+        prepare_after_commands: Option<usize>,
         events: VecDeque<PassiveMechanicsEvent>,
     }
 
@@ -770,6 +790,7 @@ mod tests {
         type Error = ScriptError;
 
         fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+            self.prepare_after_commands = Some(self.commands.len());
             Ok(self.prerequisites.unwrap_or(PassivePrerequisites {
                 channel_domain_mask_zero: true,
                 mac_mmio_initialized: true,
@@ -899,6 +920,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.scan_id, Some(1));
         let commands = &adapter.transport.mechanics.commands;
+        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(1));
         assert_eq!(commands.len(), 8);
         assert!(matches!(commands[0].0, PassiveMcuCommand::EepromBufferMode));
         assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
@@ -961,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_passive_dependencies_fail_before_any_command() {
+    fn mandatory_passive_dependencies_fail_after_only_source_ordered_eeprom() {
         let capability = nic();
         let mechanics = ScriptedMechanics {
             prerequisites: Some(PassivePrerequisites {
@@ -989,7 +1011,11 @@ mod tests {
                 SourceExactTransportError::MandatoryDependency(_)
             ))
         ));
-        assert!(adapter.transport.mechanics.commands.is_empty());
+        assert_eq!(adapter.transport.mechanics.commands.len(), 1);
+        assert!(matches!(
+            adapter.transport.mechanics.commands[0].0,
+            PassiveMcuCommand::EepromBufferMode
+        ));
         assert_eq!(adapter.start_active_scan(), Err(AdapterError::Poisoned));
     }
 
