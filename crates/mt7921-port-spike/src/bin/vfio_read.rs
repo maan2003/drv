@@ -465,6 +465,15 @@ fn report_acquisition_failure(capsule: &mut ActiveVfioCapsule, primary: String) 
     }
 }
 
+macro_rules! finish_owned_acquisition {
+    ($capsule:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(primary) => return Err(report_acquisition_failure($capsule, primary)),
+        }
+    };
+}
+
 impl Drop for ActiveVfioResources {
     fn drop(&mut self) {
         // The IRQ contains the device raw fd, so release it before mappings and handles.
@@ -800,10 +809,7 @@ fn run() -> Result<(), String> {
         )?);
         Ok(info)
     })();
-    let info = match base_acquisition {
-        Ok(info) => info,
-        Err(primary) => return Err(report_acquisition_failure(&mut capsule, primary)),
-    };
+    let info = finish_owned_acquisition!(&mut capsule, base_acquisition);
 
     let device = &capsule.device;
     let iommu = &capsule.iommu;
@@ -1126,24 +1132,28 @@ fn run() -> Result<(), String> {
     }
     let mut active_terminal_error = None;
     if operation.is_active_mcu() {
-        verify_pci_dma_disabled(&bdf)?;
+        let active_preflight = (|| -> Result<_, String> {
+            verify_pci_dma_disabled(&bdf)?;
+            let selected = select_vfio_irq(&vfio_irq_capabilities(&device)?)
+                .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+            if selected.kind == PciIrqKind::Intx {
+                return Err("active MCU transaction requires MSI or MSI-X, not level INTx".into());
+            }
+            verify_vfio_reset_supported(&device)?;
+            println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
+            let firmware_images = if operation.loads_firmware() {
+                let patch = decompress_patch()?;
+                let ram = decompress_ram()?;
+                Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+                Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+                Some((patch, ram))
+            } else {
+                None
+            };
+            Ok((selected, firmware_images))
+        })();
+        let (selected, firmware_images) = finish_owned_acquisition!(&mut capsule, active_preflight);
         let pcie_mac = pcie_mac.as_ref().expect("operation mapped PCIe MAC page");
-        let selected = select_vfio_irq(&vfio_irq_capabilities(&device)?)
-            .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
-        if selected.kind == PciIrqKind::Intx {
-            return Err("active MCU transaction requires MSI or MSI-X, not level INTx".into());
-        }
-        verify_vfio_reset_supported(&device)?;
-        println!("{{\"vfio_irq_selected\":\"{selected:?}\"}}");
-        let firmware_images = if operation.loads_firmware() {
-            let patch = decompress_patch()?;
-            let ram = decompress_ram()?;
-            Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
-            Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
-            Some((patch, ram))
-        } else {
-            None
-        };
         let acquisition_ledger = &mut capsule.acquisition;
         capsule
             .containment
@@ -1164,14 +1174,14 @@ fn run() -> Result<(), String> {
                 .as_mut()
                 .expect("active MCU operation has containment ledger"),
         );
-        if let Err(primary) = active_acquisition {
-            return Err(report_acquisition_failure(&mut capsule, primary));
-        }
-        capsule
+        finish_owned_acquisition!(&mut capsule, active_acquisition);
+        let mapped_transition = capsule
             .containment
             .as_mut()
             .expect("active MCU operation has containment ledger")
-            .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled)?;
+            .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled);
+        finish_owned_acquisition!(&mut capsule, mapped_transition);
+        let signal = finish_owned_acquisition!(&mut capsule, ActiveSignalGuard::install());
         let resources = capsule
             .active
             .as_mut()
@@ -1219,8 +1229,6 @@ fn run() -> Result<(), String> {
         let data_rx_ring = data_rx_ring.as_mut().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
         let data_rx_buffers = data_rx_buffers.as_mut().expect("acquired");
-
-        let signal = ActiveSignalGuard::install()?;
         let ledger = capsule
             .containment
             .as_mut()
@@ -5898,7 +5906,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_acquisition_preserves_primary_and_observable_release_error() {
+    fn post_acquisition_failure_funnels_primary_and_observable_release_error() {
         let device = Arc::new(File::open("/dev/null").unwrap());
         let iommu = Arc::new(File::open("/dev/null").unwrap());
         let ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
@@ -5908,7 +5916,14 @@ mod tests {
             id: 1,
             destroyed: false,
         });
-        let error = report_acquisition_failure(&mut capsule, "primary".into());
+        let error = (|| -> Result<(), String> {
+            finish_owned_acquisition!(
+                &mut capsule,
+                Err::<(), _>("post-active-acquisition primary".into())
+            );
+            Ok(())
+        })()
+        .unwrap_err();
         assert!(error.contains("primary"));
         assert!(error.contains("SAFE acquisition release errors"));
         assert_eq!(
