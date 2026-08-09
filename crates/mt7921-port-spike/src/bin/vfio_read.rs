@@ -1438,6 +1438,7 @@ fn run() -> Result<(), String> {
                     extra_irq_mask: 0,
                     unsolicited: Vec::new(),
                     normal_rx_frames: Vec::new(),
+                    descriptor_provenance: DescriptorProvenance::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
                     mcu,
@@ -1778,6 +1779,7 @@ fn run() -> Result<(), String> {
                                 let _ = drain_data_rx_queue(
                                     mechanics.loader.mcu.wfdma,
                                     &mut mechanics.data,
+                                    &mut mechanics.loader.mcu.descriptor_provenance,
                                 )?;
                                 mechanics.loader.mcu.extra_irq_mask = 0;
                                 mechanics.loader.mcu.wfdma.write_active_wfdma(
@@ -1863,6 +1865,7 @@ fn run() -> Result<(), String> {
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
                 normal_rx_frames: Vec::new(),
+                descriptor_provenance: DescriptorProvenance::new(),
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -2558,6 +2561,333 @@ struct ActiveMcuRx<'a> {
     irq_bit: u32,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DescriptorOccurrenceRoute {
+    DataRx,
+    McuNormalRx,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DescriptorInvalidation {
+    Cancellation,
+    Teardown,
+    Interface,
+    Run,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DescriptorSlotState {
+    Vacant(u64),
+    Armed(u64),
+    Consumed(u64),
+}
+
+struct DescriptorRingProvenance {
+    route: DescriptorOccurrenceRoute,
+    ring: usize,
+    slots: Vec<DescriptorSlotState>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DescriptorOccurrenceIdentity {
+    interface_epoch: u64,
+    run_epoch: u64,
+    route: DescriptorOccurrenceRoute,
+    ring: usize,
+    slot: usize,
+    slot_epoch: u64,
+    occurrence: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DescriptorProvenanceEffect {
+    Mint(DescriptorOccurrenceIdentity),
+    Rearm {
+        route: DescriptorOccurrenceRoute,
+        ring: usize,
+        slot: usize,
+        slot_epoch: u64,
+    },
+    Invalidate(DescriptorInvalidation),
+    Poison,
+    DropUncovered,
+}
+
+struct DescriptorProvenance {
+    interface_epoch: u64,
+    run_epoch: u64,
+    next_occurrence: u64,
+    rings: Vec<DescriptorRingProvenance>,
+    revoked: bool,
+    poisoned: bool,
+    #[cfg(test)]
+    effects: Vec<DescriptorProvenanceEffect>,
+}
+
+struct PrivateRawFrameCarrier {
+    bytes: Vec<u8>,
+    identity: Option<DescriptorOccurrenceIdentity>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct PrivateRawAdvertisementCarrier {
+    advertisement: mt7921_port_spike::PassiveAdvertisement,
+    frame_bytes: Vec<u8>,
+    identity: Option<DescriptorOccurrenceIdentity>,
+}
+
+enum PrivateFrameSeal {
+    Carried(PrivateRawFrameCarrier),
+    Uncovered(Vec<u8>),
+}
+
+impl DescriptorProvenance {
+    fn new() -> Self {
+        let ring = |route, ring| DescriptorRingProvenance {
+            route,
+            ring,
+            slots: (0..8)
+                .map(|slot| {
+                    if slot < 7 {
+                        DescriptorSlotState::Armed(1)
+                    } else {
+                        DescriptorSlotState::Vacant(0)
+                    }
+                })
+                .collect(),
+        };
+        Self {
+            interface_epoch: 1,
+            run_epoch: 1,
+            next_occurrence: 0,
+            rings: vec![
+                ring(DescriptorOccurrenceRoute::McuNormalRx, 0),
+                ring(DescriptorOccurrenceRoute::McuNormalRx, 4),
+                ring(DescriptorOccurrenceRoute::DataRx, 2),
+            ],
+            revoked: false,
+            poisoned: false,
+            #[cfg(test)]
+            effects: Vec::new(),
+        }
+    }
+
+    fn ring_mut(
+        &mut self,
+        route: DescriptorOccurrenceRoute,
+        ring: usize,
+    ) -> Option<&mut DescriptorRingProvenance> {
+        self.rings
+            .iter_mut()
+            .find(|candidate| candidate.route == route && candidate.ring == ring)
+    }
+
+    fn poison<T>(&mut self) -> Result<T, String> {
+        self.poisoned = true;
+        self.revoked = true;
+        #[cfg(test)]
+        self.effects.push(DescriptorProvenanceEffect::Poison);
+        Err("descriptor provenance exhausted and was poisoned".into())
+    }
+
+    fn seal_frame(
+        &mut self,
+        route: DescriptorOccurrenceRoute,
+        ring: usize,
+        slot: usize,
+        bytes: Vec<u8>,
+    ) -> Result<PrivateFrameSeal, String> {
+        if self.poisoned || self.revoked {
+            #[cfg(test)]
+            self.effects.push(DescriptorProvenanceEffect::DropUncovered);
+            return Ok(PrivateFrameSeal::Uncovered(bytes));
+        }
+        if self.ring_mut(route, ring).is_none() {
+            #[cfg(test)]
+            self.effects.push(DescriptorProvenanceEffect::DropUncovered);
+            return Ok(PrivateFrameSeal::Uncovered(bytes));
+        }
+        let slot_epoch = match self
+            .ring_mut(route, ring)
+            .and_then(|ring| ring.slots.get(slot).copied())
+        {
+            Some(DescriptorSlotState::Armed(epoch)) => epoch,
+            Some(DescriptorSlotState::Vacant(_) | DescriptorSlotState::Consumed(_)) => {
+                #[cfg(test)]
+                self.effects.push(DescriptorProvenanceEffect::DropUncovered);
+                return Ok(PrivateFrameSeal::Uncovered(bytes));
+            }
+            None => {
+                #[cfg(test)]
+                self.effects.push(DescriptorProvenanceEffect::DropUncovered);
+                return Ok(PrivateFrameSeal::Uncovered(bytes));
+            }
+        };
+        let Some(occurrence) = self.next_occurrence.checked_add(1) else {
+            let _ = self.poison::<()>();
+            return Ok(PrivateFrameSeal::Uncovered(bytes));
+        };
+        self.next_occurrence = occurrence;
+        self.ring_mut(route, ring)
+            .expect("ring checked above")
+            .slots[slot] = DescriptorSlotState::Consumed(slot_epoch);
+        let identity = DescriptorOccurrenceIdentity {
+            interface_epoch: self.interface_epoch,
+            run_epoch: self.run_epoch,
+            route,
+            ring,
+            slot,
+            slot_epoch,
+            occurrence,
+        };
+        #[cfg(test)]
+        self.effects
+            .push(DescriptorProvenanceEffect::Mint(identity));
+        Ok(PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            bytes,
+            identity: Some(identity),
+        }))
+    }
+
+    fn rearm(
+        &mut self,
+        route: DescriptorOccurrenceRoute,
+        ring: usize,
+        slot: usize,
+    ) -> Result<(), String> {
+        if self.poisoned || self.revoked {
+            return Ok(());
+        }
+        let previous = match self
+            .ring_mut(route, ring)
+            .and_then(|ring| ring.slots.get(slot).copied())
+        {
+            Some(DescriptorSlotState::Vacant(epoch) | DescriptorSlotState::Consumed(epoch)) => {
+                epoch
+            }
+            Some(DescriptorSlotState::Armed(_)) => {
+                let _ = self.poison::<()>();
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
+        let Some(slot_epoch) = previous.checked_add(1) else {
+            let _ = self.poison::<()>();
+            return Ok(());
+        };
+        self.ring_mut(route, ring)
+            .expect("ring checked above")
+            .slots[slot] = DescriptorSlotState::Armed(slot_epoch);
+        #[cfg(test)]
+        self.effects.push(DescriptorProvenanceEffect::Rearm {
+            route,
+            ring,
+            slot,
+            slot_epoch,
+        });
+        Ok(())
+    }
+
+    fn consume_without_mint(&mut self, route: DescriptorOccurrenceRoute, ring: usize, slot: usize) {
+        if self.poisoned || self.revoked {
+            return;
+        }
+        let Some(state) = self
+            .ring_mut(route, ring)
+            .and_then(|ring| ring.slots.get(slot).copied())
+        else {
+            return;
+        };
+        match state {
+            DescriptorSlotState::Armed(epoch) => {
+                self.ring_mut(route, ring).expect("ring found above").slots[slot] =
+                    DescriptorSlotState::Consumed(epoch);
+            }
+            DescriptorSlotState::Vacant(_) | DescriptorSlotState::Consumed(_) => {
+                let _ = self.poison::<()>();
+            }
+        }
+    }
+
+    fn validate(&self, identity: &DescriptorOccurrenceIdentity) -> Result<(), String> {
+        if self.poisoned
+            || self.revoked
+            || identity.interface_epoch != self.interface_epoch
+            || identity.run_epoch != self.run_epoch
+        {
+            return Err("descriptor occurrence was revoked".into());
+        }
+        match self
+            .rings
+            .iter()
+            .find(|ring| ring.route == identity.route && ring.ring == identity.ring)
+            .and_then(|ring| ring.slots.get(identity.slot))
+        {
+            Some(DescriptorSlotState::Consumed(epoch)) if *epoch == identity.slot_epoch => Ok(()),
+            _ => Err("descriptor occurrence is stale".into()),
+        }
+    }
+
+    fn invalidate(&mut self, reason: DescriptorInvalidation) -> Result<(), String> {
+        if self.poisoned || self.revoked {
+            return Ok(());
+        }
+        let next = match reason {
+            DescriptorInvalidation::Interface => self.interface_epoch.checked_add(1),
+            DescriptorInvalidation::Cancellation
+            | DescriptorInvalidation::Teardown
+            | DescriptorInvalidation::Run => self.run_epoch.checked_add(1),
+        };
+        let Some(next) = next else {
+            let _ = self.poison::<()>();
+            return Ok(());
+        };
+        match reason {
+            DescriptorInvalidation::Interface => self.interface_epoch = next,
+            DescriptorInvalidation::Cancellation
+            | DescriptorInvalidation::Teardown
+            | DescriptorInvalidation::Run => self.run_epoch = next,
+        }
+        self.revoked = true;
+        #[cfg(test)]
+        self.effects
+            .push(DescriptorProvenanceEffect::Invalidate(reason));
+        Ok(())
+    }
+}
+
+impl Drop for DescriptorProvenance {
+    fn drop(&mut self) {
+        let _ = self.invalidate(DescriptorInvalidation::Teardown);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl PrivateRawFrameCarrier {
+    fn parse(self) -> Result<PrivateRawAdvertisementCarrier, String> {
+        let advertisement = parse_passive_advertisement(&self.bytes)
+            .map_err(|error| format!("reject routed passive RX frame: {error:?}"))?;
+        Ok(PrivateRawAdvertisementCarrier {
+            advertisement,
+            frame_bytes: self.bytes,
+            identity: self.identity,
+        })
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl PrivateRawAdvertisementCarrier {
+    fn into_unprovenanced(self) -> mt7921_port_spike::PassiveAdvertisement {
+        let Self {
+            advertisement,
+            frame_bytes: _,
+            identity: _,
+        } = self;
+        advertisement
+    }
+}
+
 struct ActiveMcuIo<'a> {
     wfdma: &'a ReadPage,
     irq: &'a mut VfioIrq,
@@ -2568,7 +2898,8 @@ struct ActiveMcuIo<'a> {
     wm2: Option<ActiveMcuRx<'a>>,
     extra_irq_mask: u32,
     unsolicited: Vec<ReceivedMcuResponse>,
-    normal_rx_frames: Vec<Vec<u8>>,
+    normal_rx_frames: Vec<PrivateRawFrameCarrier>,
+    descriptor_provenance: DescriptorProvenance,
 }
 
 struct VfioFirmwareLoader<'a> {
@@ -2784,12 +3115,18 @@ fn response_wait_timed_out(now: Instant, deadline: Instant) -> bool {
     now >= deadline
 }
 
+enum DrainedMcuRx {
+    Normal(PrivateRawFrameCarrier),
+    Response(Option<mt7921_port_spike::DownloadResponse>, Vec<u8>),
+}
+
 fn drain_rx_queue(
     wfdma: &ReadPage,
     queue: &mut ActiveMcuRx<'_>,
     expected_sequence: Option<u8>,
     unsolicited: &mut Vec<ReceivedMcuResponse>,
-    normal_rx_frames: &mut Vec<Vec<u8>>,
+    normal_rx_frames: &mut Vec<PrivateRawFrameCarrier>,
+    provenance: &mut DescriptorProvenance,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
     let mut matched = None;
     loop {
@@ -2801,8 +3138,18 @@ fn drain_rx_queue(
         let completed_index = queue.rx_tail;
         let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
         let parsed = if descriptor.ctrl & (1 << 30) == 0 {
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                queue.rx_ring_index,
+                completed_index,
+            );
             Err("fragmented MCU RX descriptor is unsupported".into())
         } else if !(36..=2048).contains(&response_len) {
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                queue.rx_ring_index,
+                completed_index,
+            );
             Err(format!(
                 "invalid MCU response descriptor length {response_len}"
             ))
@@ -2818,10 +3165,28 @@ fn drain_rx_queue(
             let packet_type = (rxd0 >> 27) & 0x1f;
             let packet_flag = (rxd0 >> 16) & 0x0f;
             if packet_type == 7 && packet_flag == 1 {
-                Ok((None, response))
+                match provenance.seal_frame(
+                    DescriptorOccurrenceRoute::McuNormalRx,
+                    queue.rx_ring_index,
+                    completed_index,
+                    response,
+                )? {
+                    PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
+                    PrivateFrameSeal::Uncovered(bytes) => {
+                        Ok(DrainedMcuRx::Normal(PrivateRawFrameCarrier {
+                            bytes,
+                            identity: None,
+                        }))
+                    }
+                }
             } else {
+                provenance.consume_without_mint(
+                    DescriptorOccurrenceRoute::McuNormalRx,
+                    queue.rx_ring_index,
+                    completed_index,
+                );
                 match parse_download_response(&response, actual_sequence) {
-                    Ok(parsed) => Ok((Some(parsed), response)),
+                    Ok(parsed) => Ok(DrainedMcuRx::Response(Some(parsed), response)),
                     Err(error) => {
                         let prefix = response
                             .iter()
@@ -2843,19 +3208,29 @@ fn drain_rx_queue(
             len: 2048,
         })
         .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
+        provenance.rearm(
+            DescriptorOccurrenceRoute::McuNormalRx,
+            queue.rx_ring_index,
+            refill_index,
+        )?;
         queue.rx_ring.write_descriptor_at(refill_index, refill);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
         wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)?;
         queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
 
-        let (parsed, response) = parsed?;
+        let (parsed, response) = match parsed? {
+            DrainedMcuRx::Normal(frame) => {
+                println!(
+                    "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
+                    queue.rx_ring_index
+                );
+                normal_rx_frames.push(frame);
+                continue;
+            }
+            DrainedMcuRx::Response(parsed, response) => (parsed, response),
+        };
         let Some(parsed) = parsed else {
-            println!(
-                "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
-                queue.rx_ring_index
-            );
-            normal_rx_frames.push(response);
             continue;
         };
         let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
@@ -2893,8 +3268,10 @@ impl ActiveMcuIo<'_> {
         self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit) | self.extra_irq_mask
     }
 
-    fn cancelled(&self) -> Result<(), String> {
+    fn cancelled(&mut self) -> Result<(), String> {
         if self.signal.stop_requested() {
+            self.descriptor_provenance
+                .invalidate(DescriptorInvalidation::Cancellation)?;
             Err("active MCU transaction cancelled by signal".into())
         } else {
             Ok(())
@@ -2940,6 +3317,7 @@ impl ActiveMcuIo<'_> {
             expected_sequence,
             &mut self.unsolicited,
             &mut self.normal_rx_frames,
+            &mut self.descriptor_provenance,
         )?;
         if let Some(wm2) = self.wm2.as_mut() {
             let wm2_match = drain_rx_queue(
@@ -2948,6 +3326,7 @@ impl ActiveMcuIo<'_> {
                 expected_sequence,
                 &mut self.unsolicited,
                 &mut self.normal_rx_frames,
+                &mut self.descriptor_provenance,
             )?;
             merge_matching_response(&mut matched, wm2_match)?;
         }
@@ -3668,7 +4047,8 @@ impl PassiveMacExecutor<'_> {
 fn drain_data_rx_queue(
     wfdma: &ReadPage,
     queue: &mut ActiveMcuRx<'_>,
-) -> Result<Vec<mt7921_port_spike::PassiveAdvertisement>, String> {
+    provenance: &mut DescriptorProvenance,
+) -> Result<Vec<PrivateRawAdvertisementCarrier>, String> {
     let mut advertisements = Vec::new();
     loop {
         let descriptor = queue.rx_ring.read_descriptor_at(queue.rx_tail);
@@ -3679,16 +4059,56 @@ fn drain_data_rx_queue(
         let completed_index = queue.rx_tail;
         let length = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
         let parsed = if descriptor.ctrl & (1 << 30) == 0 {
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::DataRx,
+                queue.rx_ring_index,
+                completed_index,
+            );
             Err("fragmented data RX descriptor is unsupported".into())
         } else if !(24..=2048).contains(&length) {
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::DataRx,
+                queue.rx_ring_index,
+                completed_index,
+            );
             Err(format!("invalid data RX descriptor length {length}"))
         } else {
             let bytes = queue
                 .rx_buffers
                 .read_bytes(completed_index * 2048, length)?;
-            parse_passive_advertisement(&bytes).map_err(|error| {
-                format!("reject passive RX descriptor {completed_index}: {error:?}")
-            })
+            match parse_passive_advertisement(&bytes) {
+                Ok(advertisement) => Ok(
+                    match provenance.seal_frame(
+                        DescriptorOccurrenceRoute::DataRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                        bytes,
+                    )? {
+                        PrivateFrameSeal::Carried(frame) => PrivateRawAdvertisementCarrier {
+                            advertisement,
+                            frame_bytes: frame.bytes,
+                            identity: frame.identity,
+                        },
+                        PrivateFrameSeal::Uncovered(frame_bytes) => {
+                            PrivateRawAdvertisementCarrier {
+                                advertisement,
+                                frame_bytes,
+                                identity: None,
+                            }
+                        }
+                    },
+                ),
+                Err(error) => {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::DataRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    Err(format!(
+                        "reject passive RX descriptor {completed_index}: {error:?}"
+                    ))
+                }
+            }
         };
 
         let refill_index = queue.rx_head;
@@ -3697,6 +4117,11 @@ fn drain_data_rx_queue(
             len: 2048,
         })
         .map_err(|error| format!("rearm data RX descriptor: {error:?}"))?;
+        provenance.rearm(
+            DescriptorOccurrenceRoute::DataRx,
+            queue.rx_ring_index,
+            refill_index,
+        )?;
         queue.rx_ring.write_descriptor_at(refill_index, refill);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
@@ -3715,7 +4140,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mac_pages: &'b [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
-    advertisements: Vec<mt7921_port_spike::PassiveAdvertisement>,
+    advertisements: Vec<PrivateRawAdvertisementCarrier>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -3807,6 +4232,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
+        if matches!(command, PassiveMcuCommand::CancelScan { .. }) {
+            self.loader
+                .mcu
+                .descriptor_provenance
+                .invalidate(DescriptorInvalidation::Cancellation)
+                .map_err(PhysicalPassiveError)?;
+        }
         if matches!(command, PassiveMcuCommand::StartScan { .. }) {
             self.ledger
                 .transition(RunPhase::PassiveReady, RunPhase::Scanning)
@@ -3830,19 +4262,21 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .handle_irq(None)
             .map_err(PhysicalPassiveError)?;
         self.advertisements.extend(
-            drain_data_rx_queue(self.loader.mcu.wfdma, &mut self.data)
-                .map_err(PhysicalPassiveError)?,
+            drain_data_rx_queue(
+                self.loader.mcu.wfdma,
+                &mut self.data,
+                &mut self.loader.mcu.descriptor_provenance,
+            )
+            .map_err(PhysicalPassiveError)?,
         );
         for frame in std::mem::take(&mut self.loader.mcu.normal_rx_frames) {
             self.advertisements
-                .push(parse_passive_advertisement(&frame).map_err(|error| {
-                    PhysicalPassiveError(format!("reject routed passive RX frame: {error:?}"))
-                })?);
+                .push(frame.parse().map_err(PhysicalPassiveError)?);
         }
         if let Some(advertisement) = self.advertisements.pop() {
             return Ok(Some(PassiveMechanicsEvent::Advertisement {
                 timestamp_nanos: self.loader.start.elapsed().as_nanos() as i64,
-                advertisement,
+                advertisement: advertisement.into_unprovenanced(),
             }));
         }
         if let Some(index) = self
@@ -5301,6 +5735,184 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn carried(seal: PrivateFrameSeal) -> PrivateRawFrameCarrier {
+        match seal {
+            PrivateFrameSeal::Carried(carrier) => carrier,
+            PrivateFrameSeal::Uncovered(_) => panic!("expected covered descriptor route"),
+        }
+    }
+
+    #[test]
+    fn descriptor_occurrences_are_minted_before_rearm_on_both_routes() {
+        let mut provenance = DescriptorProvenance::new();
+        let mcu = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![1, 2, 3])
+                .unwrap(),
+        );
+        provenance
+            .rearm(DescriptorOccurrenceRoute::McuNormalRx, 0, 7)
+            .unwrap();
+        let data = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 3, vec![4, 5])
+                .unwrap(),
+        );
+        provenance
+            .rearm(DescriptorOccurrenceRoute::DataRx, 2, 7)
+            .unwrap();
+
+        assert_eq!(mcu.bytes, [1, 2, 3]);
+        assert_eq!(data.bytes, [4, 5]);
+        let mcu_identity = mcu.identity.unwrap();
+        let data_identity = data.identity.unwrap();
+        assert!(mcu_identity.route == DescriptorOccurrenceRoute::McuNormalRx);
+        assert_eq!((mcu_identity.ring, mcu_identity.slot), (0, 0));
+        assert!(data_identity.route == DescriptorOccurrenceRoute::DataRx);
+        assert_eq!((data_identity.ring, data_identity.slot), (2, 3));
+        assert_eq!((mcu_identity.occurrence, data_identity.occurrence), (1, 2));
+        assert!(matches!(
+            provenance.effects.as_slice(),
+            [
+                DescriptorProvenanceEffect::Mint(first),
+                DescriptorProvenanceEffect::Rearm {
+                    route: DescriptorOccurrenceRoute::McuNormalRx,
+                    ring: 0,
+                    slot: 7,
+                    ..
+                },
+                DescriptorProvenanceEffect::Mint(second),
+                DescriptorProvenanceEffect::Rearm {
+                    route: DescriptorOccurrenceRoute::DataRx,
+                    ring: 2,
+                    slot: 7,
+                    ..
+                }
+            ] if *first == mcu_identity && *second == data_identity
+        ));
+    }
+
+    #[test]
+    fn duplicate_and_reused_slot_occurrences_are_rejected_as_stale() {
+        let mut provenance = DescriptorProvenance::new();
+        let original = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 1, vec![1])
+                .unwrap(),
+        );
+        let duplicate = provenance
+            .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 1, vec![2])
+            .unwrap();
+        assert!(matches!(duplicate, PrivateFrameSeal::Uncovered(bytes) if bytes == [2]));
+        let identity = original.identity.unwrap();
+        provenance.validate(&identity).unwrap();
+        provenance
+            .rearm(DescriptorOccurrenceRoute::McuNormalRx, 4, 1)
+            .unwrap();
+        assert!(provenance.validate(&identity).is_err());
+        let replacement = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 1, vec![3])
+                .unwrap(),
+        );
+        assert!(replacement.identity.unwrap().slot_epoch > identity.slot_epoch);
+    }
+
+    #[test]
+    fn non_advertisement_mcu_descriptors_advance_slots_without_minting() {
+        let mut provenance = DescriptorProvenance::new();
+        for (completed, refill) in (0..7).zip([7, 0, 1, 2, 3, 4, 5]) {
+            provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, 0, completed);
+            provenance
+                .rearm(DescriptorOccurrenceRoute::McuNormalRx, 0, refill)
+                .unwrap();
+        }
+        assert!(!provenance.poisoned);
+        assert!(
+            provenance
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, DescriptorProvenanceEffect::Mint(_)))
+        );
+        let advertisement = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 7, vec![8])
+                .unwrap(),
+        );
+        assert_eq!(advertisement.identity.unwrap().slot, 7);
+    }
+
+    #[test]
+    fn occurrence_and_slot_epoch_exhaustion_poison_without_reusing_identity() {
+        let mut occurrence_exhausted = DescriptorProvenance::new();
+        occurrence_exhausted.next_occurrence = u64::MAX;
+        let seal = occurrence_exhausted
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![9])
+            .unwrap();
+        assert!(matches!(seal, PrivateFrameSeal::Uncovered(bytes) if bytes == [9]));
+        assert!(occurrence_exhausted.poisoned);
+
+        let mut slot_exhausted = DescriptorProvenance::new();
+        slot_exhausted
+            .ring_mut(DescriptorOccurrenceRoute::DataRx, 2)
+            .unwrap()
+            .slots[7] = DescriptorSlotState::Vacant(u64::MAX);
+        slot_exhausted
+            .rearm(DescriptorOccurrenceRoute::DataRx, 2, 7)
+            .unwrap();
+        assert!(slot_exhausted.poisoned);
+        assert!(matches!(
+            slot_exhausted.effects.last(),
+            Some(DescriptorProvenanceEffect::Poison)
+        ));
+    }
+
+    #[test]
+    fn cancellation_teardown_interface_and_run_changes_revoke_occurrences() {
+        for reason in [
+            DescriptorInvalidation::Cancellation,
+            DescriptorInvalidation::Teardown,
+            DescriptorInvalidation::Interface,
+            DescriptorInvalidation::Run,
+        ] {
+            let mut provenance = DescriptorProvenance::new();
+            let carrier = carried(
+                provenance
+                    .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![7])
+                    .unwrap(),
+            );
+            let identity = carrier.identity.unwrap();
+            provenance.validate(&identity).unwrap();
+            provenance.invalidate(reason).unwrap();
+            assert!(provenance.validate(&identity).is_err());
+            assert!(matches!(
+                provenance.effects.last(),
+                Some(DescriptorProvenanceEffect::Invalidate(actual)) if *actual == reason
+            ));
+        }
+    }
+
+    #[test]
+    fn uncovered_descriptor_routes_preserve_bytes_but_drop_provenance() {
+        let mut provenance = DescriptorProvenance::new();
+        let seal = provenance
+            .seal_frame(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                9,
+                0,
+                vec![0xaa, 0xbb],
+            )
+            .unwrap();
+        assert!(matches!(
+            seal,
+            PrivateFrameSeal::Uncovered(bytes) if bytes == [0xaa, 0xbb]
+        ));
+        assert!(matches!(
+            provenance.effects.as_slice(),
+            [DescriptorProvenanceEffect::DropUncovered]
+        ));
+    }
 
     #[test]
     fn vfio_irq_payload_matches_linux_uapi_layout() {
