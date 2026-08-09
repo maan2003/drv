@@ -3058,7 +3058,19 @@ pub fn encode_passive_mcu_command(
                            switch_reason: u8,
                            channel_switch: bool|
      -> Result<Vec<u8>, PassiveMcuCommandError> {
-        if channel.band != PhysicalBand::Ghz2 || !(1..=14).contains(&channel.number) {
+        let channel_band = match channel.band {
+            PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 0,
+            PhysicalBand::Ghz5 if FUCHSIA_PASSIVE_5GHZ.contains(&channel.number) => 1,
+            _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
+        };
+        if channel.frequency_mhz
+            != match channel.band {
+                PhysicalBand::Ghz2 if channel.number == 14 => 2484,
+                PhysicalBand::Ghz2 => 2407 + 5 * channel.number,
+                PhysicalBand::Ghz5 => 5000 + 5 * channel.number,
+                PhysicalBand::Ghz6 => unreachable!("6 GHz rejected above"),
+            }
+        {
             return Err(PassiveMcuCommandError::UnsupportedChannel);
         }
         if antenna_mask != 3 {
@@ -3071,7 +3083,7 @@ pub fn encode_passive_mcu_command(
         payload[3] = 2;
         payload[4] = if channel_switch { 2 } else { antenna_mask };
         payload[5] = switch_reason;
-        payload[10] = 0;
+        payload[10] = channel_band;
         Ok(payload)
     };
     Ok(match command {
@@ -3127,16 +3139,18 @@ pub fn encode_passive_mcu_command(
             if *scan_sequence > 0x7f {
                 return Err(PassiveMcuCommandError::InvalidScanSequence);
             }
-            if channel.band != PhysicalBand::Ghz2 || !(1..=14).contains(&channel.number) {
-                return Err(PassiveMcuCommandError::UnsupportedChannel);
-            }
+            let scan_band = match channel.band {
+                PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 1,
+                PhysicalBand::Ghz5 if FUCHSIA_PASSIVE_5GHZ.contains(&channel.number) => 2,
+                _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
+            };
             let mut payload = vec![0; 1186];
             payload[0] = *scan_sequence;
             payload[3] = 1;
             payload[7] = 1;
             payload[158] = 4;
             payload[159] = 1;
-            payload[160] = 1;
+            payload[160] = scan_band;
             payload[161] = channel.number as u8;
             payload[6] = 1 << 5;
             encode_legacy_mcu(0x03, 0, &payload, sequence)
@@ -3165,6 +3179,7 @@ pub struct PassiveAdvertisement {
     pub beacon_interval_tu: u16,
     pub capability_info: u16,
     pub ies: Vec<u8>,
+    pub band: PhysicalBand,
     pub channel: u8,
     pub rssi_dbm: i8,
 }
@@ -3397,9 +3412,13 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
         return Err(PassiveRxError::HeaderTranslated);
     }
     let channel = ((rxd3 >> 8) & 0xff) as u8;
-    if !(1..=14).contains(&channel) {
+    let band = if (1..=14).contains(&channel) {
+        PhysicalBand::Ghz2
+    } else if FUCHSIA_PASSIVE_5GHZ.contains(&u16::from(channel)) {
+        PhysicalBand::Ghz5
+    } else {
         return Err(PassiveRxError::InvalidChannel);
-    }
+    };
     let mut offset = 24usize;
     if rxd1 & (1 << 14) != 0 {
         offset += 16;
@@ -3442,6 +3461,7 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
         beacon_interval_tu: u16::from_le_bytes([fixed[32], fixed[33]]),
         capability_info: u16::from_le_bytes([fixed[34], fixed[35]]),
         ies: frame[36..].to_vec(),
+        band,
         channel,
         rssi_dbm: strongest,
     })
@@ -6281,10 +6301,34 @@ mod tests {
             .expects_response()
         );
 
-        let forbidden = CandidateChannel {
+        let channel_5ghz = CandidateChannel {
             band: PhysicalBand::Ghz5,
             number: 36,
             frequency_mhz: 5180,
+        };
+        let switch_5ghz = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel: channel_5ghz,
+                antenna_mask: 3,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(&switch_5ghz[64..75], &[36, 36, 0, 2, 2, 9, 0, 0, 0, 0, 1]);
+        let scan_5ghz = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 2,
+                channel: channel_5ghz,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(&scan_5ghz[64 + 158..64 + 162], &[4, 1, 2, 36]);
+
+        let forbidden = CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number: 169,
+            frequency_mhz: 5845,
         };
         assert_eq!(
             encode_passive_mcu_command(
@@ -6338,6 +6382,7 @@ mod tests {
                 beacon_interval_tu: 100,
                 capability_info: 0x0431,
                 ies: vec![0, 3, b'a', b'p', b'1'],
+                band: PhysicalBand::Ghz2,
                 channel: 1,
                 rssi_dbm: -50,
             })
@@ -6349,6 +6394,12 @@ mod tests {
             parse_passive_advertisement(&normal_mcu),
             parse_passive_advertisement(&rx)
         );
+        let mut rx_5ghz = rx.clone();
+        rx_5ghz[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        let mut expected_5ghz = parse_passive_advertisement(&rx).unwrap();
+        expected_5ghz.band = PhysicalBand::Ghz5;
+        expected_5ghz.channel = 36;
+        assert_eq!(parse_passive_advertisement(&rx_5ghz), Ok(expected_5ghz));
         rx[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
         assert_eq!(
             parse_passive_advertisement(&rx),
