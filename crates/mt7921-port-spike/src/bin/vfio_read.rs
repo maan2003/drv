@@ -1713,14 +1713,20 @@ fn drain_rx_queue(
             let header_length = response
                 .get(24..26)
                 .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
-            parse_download_response(&response, actual_sequence)
-                .map(|parsed| (parsed, response))
-                .map_err(|error| {
-                    format!(
-                        "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?}",
+            match parse_download_response(&response, actual_sequence) {
+                Ok(parsed) => Ok((parsed, response)),
+                Err(error) => {
+                    let prefix = response
+                        .iter()
+                        .take(64)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    Err(format!(
+                        "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
                         queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
-                    )
-                })
+                    ))
+                }
+            }
         };
 
         let refill_index = queue.rx_head;
