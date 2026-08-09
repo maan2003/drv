@@ -1439,7 +1439,7 @@ fn run() -> Result<(), String> {
                     extra_irq_mask: 0,
                     unsolicited: Vec::new(),
                     normal_rx_frames: Vec::new(),
-                    descriptor_provenance: DescriptorProvenance::new()?,
+                    descriptor_provenance: DescriptorProvenance::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
                     mcu,
@@ -1866,7 +1866,7 @@ fn run() -> Result<(), String> {
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
                 normal_rx_frames: Vec::new(),
-                descriptor_provenance: DescriptorProvenance::new()?,
+                descriptor_provenance: DescriptorProvenance::new(),
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -2688,8 +2688,15 @@ fn next_descriptor_provenance_owner() -> Result<NonZeroU64, String> {
 }
 
 impl DescriptorProvenance {
-    fn new() -> Result<Self, String> {
-        let owner = next_descriptor_provenance_owner()?;
+    fn new() -> Self {
+        Self::from_owner_allocation(next_descriptor_provenance_owner())
+    }
+
+    fn from_owner_allocation(owner: Result<NonZeroU64, String>) -> Self {
+        let exhausted = owner.is_err();
+        // MAX is never returned by the allocator: reaching it makes
+        // `fetch_update` fail. It is only a non-minting poisoned sentinel.
+        let owner = owner.unwrap_or(NonZeroU64::MAX);
         let ring = |route, ring| DescriptorRingProvenance {
             route,
             ring,
@@ -2705,9 +2712,9 @@ impl DescriptorProvenance {
         };
         let lease = Arc::new(DescriptorOccurrenceLease {
             owner,
-            current: AtomicBool::new(true),
+            current: AtomicBool::new(!exhausted),
         });
-        Ok(Self {
+        Self {
             owner,
             interface_epoch: 1,
             device_epoch: 1,
@@ -2723,12 +2730,15 @@ impl DescriptorProvenance {
                 ring(DescriptorOccurrenceRoute::DataRx, 2),
             ],
             sealed: Vec::new(),
-            revoked: false,
-            poisoned: false,
+            revoked: exhausted,
+            poisoned: exhausted,
             lease,
             #[cfg(test)]
-            effects: Vec::new(),
-        })
+            effects: exhausted
+                .then_some(DescriptorProvenanceEffect::Poison)
+                .into_iter()
+                .collect(),
+        }
     }
 
     fn ring_mut(
@@ -3286,6 +3296,31 @@ fn publish_descriptor_rearm(
     publish(provenance)
 }
 
+fn publish_current_rearm_or_revoke<T>(
+    provenance: &mut DescriptorProvenance,
+    route: DescriptorOccurrenceRoute,
+    ring: usize,
+    slot: usize,
+    current: T,
+    refill: Result<DmaDescriptor, String>,
+    publish: impl FnOnce(&mut DescriptorProvenance, DmaDescriptor) -> Result<(), String>,
+) -> Result<T, String> {
+    let refill = match refill {
+        Ok(refill) => refill,
+        Err(error) => {
+            provenance.invalidate(DescriptorInvalidation::Run)?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_descriptor_rearm(provenance, route, ring, slot, |provenance| {
+        publish(provenance, refill)
+    }) {
+        provenance.invalidate(DescriptorInvalidation::Run)?;
+        return Err(error);
+    }
+    Ok(current)
+}
+
 enum DrainedMcuRx {
     Normal(PrivateRawFrameCarrier),
     Response(Option<mt7921_port_spike::DownloadResponse>, Vec<u8>),
@@ -3299,142 +3334,150 @@ fn drain_rx_queue(
     normal_rx_frames: &mut Vec<PrivateRawFrameCarrier>,
     provenance: &mut DescriptorProvenance,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
-    let mut matched = None;
-    loop {
-        let descriptor = queue.rx_ring.read_descriptor_at(queue.rx_tail);
-        if !descriptor.is_dma_done() {
-            break;
-        }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let completed_index = queue.rx_tail;
-        let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
-        let parsed = if descriptor.ctrl & (1 << 30) == 0 {
-            provenance.consume_without_mint(
-                DescriptorOccurrenceRoute::McuNormalRx,
-                queue.rx_ring_index,
-                completed_index,
-            );
-            Err("fragmented MCU RX descriptor is unsupported".into())
-        } else if !(36..=2048).contains(&response_len) {
-            provenance.consume_without_mint(
-                DescriptorOccurrenceRoute::McuNormalRx,
-                queue.rx_ring_index,
-                completed_index,
-            );
-            Err(format!(
-                "invalid MCU response descriptor length {response_len}"
-            ))
-        } else {
-            let response = queue
-                .rx_buffers
-                .read_bytes(completed_index * 2048, response_len)?;
-            let actual_sequence = response[29];
-            let header_length = response
-                .get(24..26)
-                .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
-            let rxd0 = u32::from_le_bytes(response[0..4].try_into().expect("bounded response"));
-            let packet_type = (rxd0 >> 27) & 0x1f;
-            let packet_flag = (rxd0 >> 16) & 0x0f;
-            if packet_type == 7 && packet_flag == 1 {
-                match provenance.seal_frame(
-                    DescriptorOccurrenceRoute::McuNormalRx,
-                    queue.rx_ring_index,
-                    completed_index,
-                    response,
-                )? {
-                    PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
-                    PrivateFrameSeal::Uncovered(bytes) => {
-                        Ok(DrainedMcuRx::Normal(PrivateRawFrameCarrier {
-                            bytes,
-                            occurrence: None,
-                        }))
-                    }
-                }
-            } else {
+    let result = (|| -> Result<Option<ReceivedMcuResponse>, String> {
+        let mut matched = None;
+        loop {
+            let descriptor = queue.rx_ring.read_descriptor_at(queue.rx_tail);
+            if !descriptor.is_dma_done() {
+                break;
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let completed_index = queue.rx_tail;
+            let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
+            let parsed = if descriptor.ctrl & (1 << 30) == 0 {
                 provenance.consume_without_mint(
                     DescriptorOccurrenceRoute::McuNormalRx,
                     queue.rx_ring_index,
                     completed_index,
                 );
-                match parse_download_response(&response, actual_sequence) {
-                    Ok(parsed) => Ok(DrainedMcuRx::Response(Some(parsed), response)),
-                    Err(error) => {
-                        let prefix = response
-                            .iter()
-                            .take(64)
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<String>();
-                        Err(format!(
-                            "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
-                            queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
-                        ))
+                Err("fragmented MCU RX descriptor is unsupported".into())
+            } else if !(36..=2048).contains(&response_len) {
+                provenance.consume_without_mint(
+                    DescriptorOccurrenceRoute::McuNormalRx,
+                    queue.rx_ring_index,
+                    completed_index,
+                );
+                Err(format!(
+                    "invalid MCU response descriptor length {response_len}"
+                ))
+            } else {
+                let response = queue
+                    .rx_buffers
+                    .read_bytes(completed_index * 2048, response_len)?;
+                let actual_sequence = response[29];
+                let header_length = response
+                    .get(24..26)
+                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
+                let rxd0 = u32::from_le_bytes(response[0..4].try_into().expect("bounded response"));
+                let packet_type = (rxd0 >> 27) & 0x1f;
+                let packet_flag = (rxd0 >> 16) & 0x0f;
+                if packet_type == 7 && packet_flag == 1 {
+                    match provenance.seal_frame(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                        response,
+                    )? {
+                        PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
+                        PrivateFrameSeal::Uncovered(bytes) => {
+                            Ok(DrainedMcuRx::Normal(PrivateRawFrameCarrier {
+                                bytes,
+                                occurrence: None,
+                            }))
+                        }
+                    }
+                } else {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    match parse_download_response(&response, actual_sequence) {
+                        Ok(parsed) => Ok(DrainedMcuRx::Response(Some(parsed), response)),
+                        Err(error) => {
+                            let prefix = response
+                                .iter()
+                                .take(64)
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>();
+                            Err(format!(
+                                "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
+                                queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
+                            ))
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        let refill_index = queue.rx_head;
-        let refill = DmaDescriptor::rx(DmaSegment {
-            iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
-            len: 2048,
-        })
-        .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
-        publish_descriptor_rearm(
-            provenance,
-            DescriptorOccurrenceRoute::McuNormalRx,
-            queue.rx_ring_index,
-            refill_index,
-            |_| {
-                queue.rx_ring.write_descriptor_at(refill_index, refill);
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
-                wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)
-            },
-        )?;
-        queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
+            let refill_index = queue.rx_head;
+            let refill = DmaDescriptor::rx(DmaSegment {
+                iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
+                len: 2048,
+            })
+            .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"));
+            let parsed = publish_current_rearm_or_revoke(
+                provenance,
+                DescriptorOccurrenceRoute::McuNormalRx,
+                queue.rx_ring_index,
+                refill_index,
+                parsed,
+                refill,
+                |_, refill| {
+                    queue.rx_ring.write_descriptor_at(refill_index, refill);
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                    queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
+                    wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)
+                },
+            )?;
+            queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
 
-        let (parsed, response) = match parsed? {
-            DrainedMcuRx::Normal(frame) => {
-                println!(
-                    "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
-                    queue.rx_ring_index
-                );
-                normal_rx_frames.push(frame);
+            let (parsed, response) = match parsed? {
+                DrainedMcuRx::Normal(frame) => {
+                    println!(
+                        "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
+                        queue.rx_ring_index
+                    );
+                    normal_rx_frames.push(frame);
+                    continue;
+                }
+                DrainedMcuRx::Response(parsed, response) => (parsed, response),
+            };
+            let Some(parsed) = parsed else {
                 continue;
+            };
+            let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
+            if candidate.is_some() {
+                if matched.is_some() {
+                    return Err(format!(
+                        "duplicate MCU sequence {} on RX ring {}",
+                        parsed.sequence, queue.rx_ring_index
+                    ));
+                }
+                println!(
+                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
+                    parsed.sequence, parsed.event_id, parsed.length, queue.rx_ring_index
+                );
+                matched = candidate;
+            } else {
+                if parsed.sequence == 0 {
+                    unsolicited.push(ReceivedMcuResponse {
+                        event_id: parsed.event_id,
+                        option: parsed.option,
+                        bytes: response.clone(),
+                    });
+                }
+                println!(
+                    "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}",
+                    parsed.sequence, parsed.event_id, queue.rx_ring_index
+                );
             }
-            DrainedMcuRx::Response(parsed, response) => (parsed, response),
-        };
-        let Some(parsed) = parsed else {
-            continue;
-        };
-        let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
-        if candidate.is_some() {
-            if matched.is_some() {
-                return Err(format!(
-                    "duplicate MCU sequence {} on RX ring {}",
-                    parsed.sequence, queue.rx_ring_index
-                ));
-            }
-            println!(
-                "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
-                parsed.sequence, parsed.event_id, parsed.length, queue.rx_ring_index
-            );
-            matched = candidate;
-        } else {
-            if parsed.sequence == 0 {
-                unsolicited.push(ReceivedMcuResponse {
-                    event_id: parsed.event_id,
-                    option: parsed.option,
-                    bytes: response.clone(),
-                });
-            }
-            println!(
-                "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}",
-                parsed.sequence, parsed.event_id, queue.rx_ring_index
-            );
         }
+        Ok(matched)
+    })();
+    if result.is_err() {
+        revoke_before_local_carrier_release(provenance, normal_rx_frames)?;
     }
-    Ok(matched)
+    result
 }
 
 impl ActiveMcuIo<'_> {
@@ -3476,40 +3519,49 @@ impl ActiveMcuIo<'_> {
             &mut self.descriptor_provenance,
             self.signal.stop_requested(),
         )?;
-        let Some(count) = self.irq.try_read()? else {
-            return Ok(None);
-        };
-        self.wfdma.write_active_wfdma(0xd4204, 0)?;
-        let interrupt_status = self.wfdma.read(0xd4200)?;
-        let irq_mask = self.rx_irq_mask();
-        let acknowledged = rx_irq_acknowledge(interrupt_status, irq_mask);
-        if acknowledged != 0 {
-            self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
-        }
-        println!(
-            "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
-        );
-        let mut matched = drain_rx_queue(
-            self.wfdma,
-            &mut self.wm,
-            expected_sequence,
-            &mut self.unsolicited,
-            &mut self.normal_rx_frames,
-            &mut self.descriptor_provenance,
-        )?;
-        if let Some(wm2) = self.wm2.as_mut() {
-            let wm2_match = drain_rx_queue(
+        let result = (|| -> Result<Option<ReceivedMcuResponse>, String> {
+            let Some(count) = self.irq.try_read()? else {
+                return Ok(None);
+            };
+            self.wfdma.write_active_wfdma(0xd4204, 0)?;
+            let interrupt_status = self.wfdma.read(0xd4200)?;
+            let irq_mask = self.rx_irq_mask();
+            let acknowledged = rx_irq_acknowledge(interrupt_status, irq_mask);
+            if acknowledged != 0 {
+                self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
+            }
+            println!(
+                "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
+            );
+            let mut matched = drain_rx_queue(
                 self.wfdma,
-                wm2,
+                &mut self.wm,
                 expected_sequence,
                 &mut self.unsolicited,
                 &mut self.normal_rx_frames,
                 &mut self.descriptor_provenance,
             )?;
-            merge_matching_response(&mut matched, wm2_match)?;
+            if let Some(wm2) = self.wm2.as_mut() {
+                let wm2_match = drain_rx_queue(
+                    self.wfdma,
+                    wm2,
+                    expected_sequence,
+                    &mut self.unsolicited,
+                    &mut self.normal_rx_frames,
+                    &mut self.descriptor_provenance,
+                )?;
+                merge_matching_response(&mut matched, wm2_match)?;
+            }
+            self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
+            Ok(matched)
+        })();
+        if result.is_err() {
+            revoke_before_local_carrier_release(
+                &mut self.descriptor_provenance,
+                &mut self.normal_rx_frames,
+            )?;
         }
-        self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
-        Ok(matched)
+        result
     }
 
     fn wait_tx_consumed(&mut self, expected_dma_index: u32) -> Result<(), String> {
@@ -4295,13 +4347,15 @@ fn drain_data_rx_queue(
                 iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
                 len: 2048,
             })
-            .map_err(|error| format!("rearm data RX descriptor: {error:?}"))?;
-            publish_descriptor_rearm(
+            .map_err(|error| format!("rearm data RX descriptor: {error:?}"));
+            let parsed = publish_current_rearm_or_revoke(
                 provenance,
                 DescriptorOccurrenceRoute::DataRx,
                 queue.rx_ring_index,
                 refill_index,
-                |_| {
+                parsed,
+                refill,
+                |_, refill| {
                     queue.rx_ring.write_descriptor_at(refill_index, refill);
                     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                     queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
@@ -6008,7 +6062,7 @@ mod tests {
 
     #[test]
     fn descriptor_occurrences_are_minted_before_rearm_on_both_routes() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let mcu = carried(
             provenance
                 .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![1, 2, 3])
@@ -6087,7 +6141,7 @@ mod tests {
         };
         let mut unsolicited = Vec::new();
         let mut normal = Vec::new();
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         assert!(
             drain_rx_queue(
                 &page,
@@ -6120,6 +6174,65 @@ mod tests {
             queue.rx_ring.read_descriptor_at(7).buf0,
             buffers.iova as u32 + 7 * 2048
         );
+    }
+
+    #[test]
+    fn actual_mcu_drain_revokes_current_and_queued_carriers_before_later_error() {
+        let ring_mapping = TestMapping::new(PAGE);
+        let buffer_mapping = TestMapping::new(8 * 2048);
+        let page_mapping = TestMapping::new(PAGE);
+        let mut ring = ring_mapping.dma(0x0104_0000);
+        let mut buffers = buffer_mapping.dma(0x0105_0000);
+        let page = page_mapping.read_page();
+        let mut frame = vec![0; 40];
+        frame[0..4].copy_from_slice(&((7u32 << 27) | (1 << 16)).to_le_bytes());
+        buffers.write_bytes_at(0, &frame).unwrap();
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: buffers.iova as u32,
+                ctrl: (1 << 31) | (1 << 30) | (frame.len() as u32) << 16,
+                buf1: 0,
+                info: 0,
+            },
+        );
+        ring.write_descriptor_at(
+            1,
+            DmaDescriptor {
+                buf0: buffers.iova as u32 + 2048,
+                ctrl: (1 << 31) | (1 << 30) | (35 << 16),
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let mut queue = ActiveMcuRx {
+            rx_ring: &mut ring,
+            rx_buffers: &buffers,
+            rx_tail: 0,
+            rx_head: 7,
+            rx_ring_index: 0,
+            rx_count: 8,
+            irq_bit: WM_RX_IRQ_BIT,
+        };
+        let mut unsolicited = Vec::new();
+        let mut normal = Vec::new();
+        let mut provenance = DescriptorProvenance::new();
+        let lease = Arc::clone(&provenance.lease);
+        let error = match drain_rx_queue(
+            &page,
+            &mut queue,
+            None,
+            &mut unsolicited,
+            &mut normal,
+            &mut provenance,
+        ) {
+            Ok(_) => panic!("later invalid MCU descriptor unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("invalid MCU response descriptor length"));
+        assert!(normal.is_empty());
+        assert!(provenance.sealed.is_empty());
+        assert!(!lease.current.load(Ordering::Acquire));
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -6177,7 +6290,7 @@ mod tests {
             rx_count: 8,
             irq_bit: DATA_RX_IRQ_BIT,
         };
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
         let error = match drain_data_rx_queue(&page, &mut queue, &mut provenance) {
             Ok(_) => panic!("later invalid descriptor unexpectedly succeeded"),
@@ -6199,7 +6312,7 @@ mod tests {
 
     #[test]
     fn duplicate_is_rejected_but_sealed_occurrence_survives_slot_reuse() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let original = carried(
             provenance
                 .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 1, vec![1])
@@ -6228,7 +6341,7 @@ mod tests {
 
     #[test]
     fn early_carriers_remain_sealed_across_a_multi_descriptor_wrap() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let mut sealed = Vec::new();
         for (completed, refill) in (0..7).zip([7, 0, 1, 2, 3, 4, 5]) {
             let carrier = carried(
@@ -6274,7 +6387,7 @@ mod tests {
 
     #[test]
     fn non_advertisement_mcu_descriptors_advance_slots_without_minting() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         for (completed, refill) in (0..7).zip([7, 0, 1, 2, 3, 4, 5]) {
             provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, 0, completed);
             provenance
@@ -6298,7 +6411,7 @@ mod tests {
 
     #[test]
     fn occurrence_and_slot_epoch_exhaustion_poison_without_reusing_identity() {
-        let mut occurrence_exhausted = DescriptorProvenance::new().unwrap();
+        let mut occurrence_exhausted = DescriptorProvenance::new();
         occurrence_exhausted.next_occurrence = u64::MAX;
         let seal = occurrence_exhausted
             .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![9])
@@ -6306,7 +6419,7 @@ mod tests {
         assert!(matches!(seal, PrivateFrameSeal::Uncovered(bytes) if bytes == [9]));
         assert!(occurrence_exhausted.poisoned);
 
-        let mut slot_exhausted = DescriptorProvenance::new().unwrap();
+        let mut slot_exhausted = DescriptorProvenance::new();
         slot_exhausted
             .ring_mut(DescriptorOccurrenceRoute::DataRx, 2)
             .unwrap()
@@ -6322,9 +6435,23 @@ mod tests {
     }
 
     #[test]
+    fn owner_allocator_exhaustion_keeps_mechanics_available_without_minting() {
+        let mut provenance =
+            DescriptorProvenance::from_owner_allocation(Err("injected owner exhaustion".into()));
+        assert!(provenance.poisoned && provenance.revoked);
+        let seal = provenance
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1, 2])
+            .unwrap();
+        assert!(matches!(seal, PrivateFrameSeal::Uncovered(bytes) if bytes == [1, 2]));
+        provenance
+            .rearm(DescriptorOccurrenceRoute::DataRx, 2, 7)
+            .unwrap();
+    }
+
+    #[test]
     fn owners_are_unique_and_outstanding_carriers_observe_durable_revocation() {
-        let mut first = DescriptorProvenance::new().unwrap();
-        let second = DescriptorProvenance::new().unwrap();
+        let mut first = DescriptorProvenance::new();
+        let second = DescriptorProvenance::new();
         let occurrence = occurrence(carried(
             first
                 .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1])
@@ -6339,7 +6466,7 @@ mod tests {
 
     #[test]
     fn b1_drop_boundary_retires_sealed_entries_without_waiting_for_teardown() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         for slot in 0..7 {
             let occurrence = occurrence(carried(
                 provenance
@@ -6360,7 +6487,7 @@ mod tests {
             DescriptorInvalidation::Interface,
             DescriptorInvalidation::Run,
         ] {
-            let mut provenance = DescriptorProvenance::new().unwrap();
+            let mut provenance = DescriptorProvenance::new();
             let occurrence = occurrence(carried(
                 provenance
                     .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1])
@@ -6380,7 +6507,7 @@ mod tests {
 
     #[test]
     fn shared_rearm_seam_orders_mint_before_descriptor_and_index_publication() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let _carrier = carried(
             provenance
                 .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1])
@@ -6418,8 +6545,37 @@ mod tests {
     }
 
     #[test]
+    fn both_rearm_seams_revoke_current_carrier_before_refill_error_drop() {
+        for (route, ring) in [
+            (DescriptorOccurrenceRoute::McuNormalRx, 0),
+            (DescriptorOccurrenceRoute::DataRx, 2),
+        ] {
+            let mut provenance = DescriptorProvenance::new();
+            let drops = std::rc::Rc::new(Cell::new(0));
+            let current = LocalCarrierDropProbe {
+                occurrence: Some(occurrence(carried(
+                    provenance.seal_frame(route, ring, 0, vec![1]).unwrap(),
+                ))),
+                drops: std::rc::Rc::clone(&drops),
+            };
+            let result = publish_current_rearm_or_revoke(
+                &mut provenance,
+                route,
+                ring,
+                7,
+                current,
+                Err("injected refill construction failure".into()),
+                |_, _| unreachable!(),
+            );
+            assert!(result.is_err());
+            assert_eq!(drops.get(), 1);
+            assert!(provenance.sealed.is_empty());
+        }
+    }
+
+    #[test]
     fn production_signal_hook_revokes_before_later_delivery() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let occurrence = occurrence(carried(
             provenance
                 .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![1])
@@ -6432,7 +6588,12 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn production_cancel_scan_hook_revokes_and_start_scan_binds_generation() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
+        let prior_scan = occurrence(carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![0])
+                .unwrap(),
+        ));
         observe_passive_command_provenance(
             &mut provenance,
             &PassiveMcuCommand::StartScan {
@@ -6445,17 +6606,20 @@ mod tests {
             },
         )
         .unwrap();
+        provenance.validate(&prior_scan).unwrap();
         let occurrence = occurrence(carried(
             provenance
-                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1])
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 1, vec![1])
                 .unwrap(),
         ));
         assert_eq!(occurrence.identity.scan_id, 17);
+        assert!(occurrence.identity.scan_epoch > prior_scan.identity.scan_epoch);
         observe_passive_command_provenance(
             &mut provenance,
             &PassiveMcuCommand::CancelScan { scan_sequence: 17 },
         )
         .unwrap();
+        assert!(!prior_scan.is_current());
         assert!(!occurrence.is_current());
     }
 
@@ -6467,7 +6631,7 @@ mod tests {
             DescriptorInvalidation::Interface,
             DescriptorInvalidation::Run,
         ] {
-            let mut provenance = DescriptorProvenance::new().unwrap();
+            let mut provenance = DescriptorProvenance::new();
             let carrier = carried(
                 provenance
                     .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![7])
@@ -6515,7 +6679,7 @@ mod tests {
         let revoked = std::rc::Rc::new(Cell::new(false));
         let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut owner = EnclosingOwner {
-            provenance: DescriptorProvenance::new().unwrap(),
+            provenance: DescriptorProvenance::new(),
             _queue: QueueDropProbe {
                 revoked: std::rc::Rc::clone(&revoked),
                 order: std::rc::Rc::clone(&order),
@@ -6553,7 +6717,7 @@ mod tests {
 
     #[test]
     fn later_data_descriptor_error_revokes_before_earlier_local_carrier_drop() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let drops = std::rc::Rc::new(Cell::new(0));
         let earlier = occurrence(carried(
             provenance
@@ -6573,7 +6737,7 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn routed_parse_error_revokes_failed_and_remaining_taken_carriers_before_drop() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
         let failed = carried(
             provenance
@@ -6600,7 +6764,7 @@ mod tests {
 
     #[test]
     fn uncovered_descriptor_routes_preserve_bytes_but_drop_provenance() {
-        let mut provenance = DescriptorProvenance::new().unwrap();
+        let mut provenance = DescriptorProvenance::new();
         let seal = provenance
             .seal_frame(
                 DescriptorOccurrenceRoute::McuNormalRx,
