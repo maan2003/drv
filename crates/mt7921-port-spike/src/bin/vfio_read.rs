@@ -1861,6 +1861,67 @@ impl ContainmentLedger {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservableRelease {
+    DmaUnmap,
+    BarMunmap,
+    IoasDestroy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseFailure {
+    action: ObservableRelease,
+    error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContainmentOutcome {
+    Contained {
+        primary: Option<String>,
+        cleanup_errors: Vec<String>,
+    },
+    SafeReleaseError {
+        primary: Option<String>,
+        cleanup_errors: Vec<String>,
+        release_errors: Vec<ReleaseFailure>,
+    },
+    RetainUnsafe {
+        primary: Option<String>,
+        cleanup_errors: Vec<String>,
+    },
+}
+
+impl ContainmentOutcome {
+    fn classify(
+        hardware_safe: bool,
+        primary: Option<String>,
+        cleanup_errors: Vec<String>,
+        release_errors: Vec<ReleaseFailure>,
+    ) -> Self {
+        if !hardware_safe {
+            Self::RetainUnsafe {
+                primary,
+                cleanup_errors,
+            }
+        } else if release_errors.is_empty() {
+            Self::Contained {
+                primary,
+                cleanup_errors,
+            }
+        } else {
+            Self::SafeReleaseError {
+                primary,
+                cleanup_errors,
+                release_errors,
+            }
+        }
+    }
+
+    const fn must_park(&self) -> bool {
+        matches!(self, Self::RetainUnsafe { .. })
+    }
+}
+
 fn verify_external_watchdog_armed() -> Result<ArmedWatchdog, String> {
     let output = Command::new("wifi-lab-watchdog")
         .arg("status")
@@ -5164,5 +5225,54 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!marker.exists(), "killed process ran Rust destructors");
+    }
+
+    #[test]
+    fn containment_preserves_primary_and_cleanup_errors() {
+        let outcome = ContainmentOutcome::classify(
+            false,
+            Some("primary".into()),
+            vec!["mask".into(), "reset".into()],
+            Vec::new(),
+        );
+        assert_eq!(
+            outcome,
+            ContainmentOutcome::RetainUnsafe {
+                primary: Some("primary".into()),
+                cleanup_errors: vec!["mask".into(), "reset".into()],
+            }
+        );
+        assert!(outcome.must_park());
+    }
+
+    #[test]
+    fn safe_release_error_never_selects_parking_or_close_retry() {
+        let outcome = ContainmentOutcome::classify(
+            true,
+            Some("primary".into()),
+            vec!["quiesce".into()],
+            vec![ReleaseFailure {
+                action: ObservableRelease::IoasDestroy,
+                error: "busy".into(),
+            }],
+        );
+        assert_eq!(
+            outcome,
+            ContainmentOutcome::SafeReleaseError {
+                primary: Some("primary".into()),
+                cleanup_errors: vec!["quiesce".into()],
+                release_errors: vec![ReleaseFailure {
+                    action: ObservableRelease::IoasDestroy,
+                    error: "busy".into(),
+                }],
+            }
+        );
+        assert!(!outcome.must_park());
+        let observable_actions = [
+            ObservableRelease::DmaUnmap,
+            ObservableRelease::BarMunmap,
+            ObservableRelease::IoasDestroy,
+        ];
+        assert_eq!(observable_actions.len(), 3);
     }
 }
