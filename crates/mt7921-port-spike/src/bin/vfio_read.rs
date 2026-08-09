@@ -896,6 +896,7 @@ fn run() -> Result<(), String> {
                     }),
                     extra_irq_mask: 0,
                     unsolicited: Vec::new(),
+                    normal_rx_frames: Vec::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
                     mcu,
@@ -1082,6 +1083,7 @@ fn run() -> Result<(), String> {
                 wm2: None,
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
+                normal_rx_frames: Vec::new(),
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -1469,6 +1471,7 @@ struct ActiveMcuIo<'a, 'b> {
     wm2: Option<ActiveMcuRx<'a, 'b>>,
     extra_irq_mask: u32,
     unsolicited: Vec<ReceivedMcuResponse>,
+    normal_rx_frames: Vec<Vec<u8>>,
 }
 
 struct VfioFirmwareLoader<'a, 'b> {
@@ -1689,6 +1692,7 @@ fn drain_rx_queue(
     queue: &mut ActiveMcuRx<'_, '_>,
     expected_sequence: Option<u8>,
     unsolicited: &mut Vec<ReceivedMcuResponse>,
+    normal_rx_frames: &mut Vec<Vec<u8>>,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
     let mut matched = None;
     loop {
@@ -1713,18 +1717,25 @@ fn drain_rx_queue(
             let header_length = response
                 .get(24..26)
                 .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
-            match parse_download_response(&response, actual_sequence) {
-                Ok(parsed) => Ok((parsed, response)),
-                Err(error) => {
-                    let prefix = response
-                        .iter()
-                        .take(64)
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>();
-                    Err(format!(
-                        "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
-                        queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
-                    ))
+            let rxd0 = u32::from_le_bytes(response[0..4].try_into().expect("bounded response"));
+            let packet_type = (rxd0 >> 27) & 0x1f;
+            let packet_flag = (rxd0 >> 16) & 0x0f;
+            if packet_type == 7 && packet_flag == 1 {
+                Ok((None, response))
+            } else {
+                match parse_download_response(&response, actual_sequence) {
+                    Ok(parsed) => Ok((Some(parsed), response)),
+                    Err(error) => {
+                        let prefix = response
+                            .iter()
+                            .take(64)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        Err(format!(
+                            "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
+                            queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
+                        ))
+                    }
                 }
             }
         };
@@ -1742,6 +1753,14 @@ fn drain_rx_queue(
         queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
 
         let (parsed, response) = parsed?;
+        let Some(parsed) = parsed else {
+            println!(
+                "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
+                queue.rx_ring_index
+            );
+            normal_rx_frames.push(response);
+            continue;
+        };
         let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
         if candidate.is_some() {
             if matched.is_some() {
@@ -1823,10 +1842,16 @@ impl ActiveMcuIo<'_, '_> {
             &mut self.wm,
             expected_sequence,
             &mut self.unsolicited,
+            &mut self.normal_rx_frames,
         )?;
         if let Some(wm2) = self.wm2.as_mut() {
-            let wm2_match =
-                drain_rx_queue(self.wfdma, wm2, expected_sequence, &mut self.unsolicited)?;
+            let wm2_match = drain_rx_queue(
+                self.wfdma,
+                wm2,
+                expected_sequence,
+                &mut self.unsolicited,
+                &mut self.normal_rx_frames,
+            )?;
             merge_matching_response(&mut matched, wm2_match)?;
         }
         self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
@@ -2590,6 +2615,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             drain_data_rx_queue(self.loader.mcu.wfdma, &mut self.data)
                 .map_err(PhysicalPassiveError)?,
         );
+        for frame in std::mem::take(&mut self.loader.mcu.normal_rx_frames) {
+            self.advertisements
+                .push(parse_passive_advertisement(&frame).map_err(|error| {
+                    PhysicalPassiveError(format!("reject routed passive RX frame: {error:?}"))
+                })?);
+        }
         if let Some(advertisement) = self.advertisements.pop() {
             return Ok(Some(PassiveMechanicsEvent::Advertisement {
                 timestamp_nanos: self.loader.start.elapsed().as_nanos() as i64,

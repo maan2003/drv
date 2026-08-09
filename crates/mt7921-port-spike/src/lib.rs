@@ -3383,7 +3383,9 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
     let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
     let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
     let rxd3 = u32::from_le_bytes(header[12..16].try_into().expect("fixed field"));
-    if rxd0 >> 27 & 0x1f != 2 {
+    let packet_type = rxd0 >> 27 & 0x1f;
+    let packet_flag = rxd0 >> 16 & 0x0f;
+    if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
     if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
@@ -6339,6 +6341,13 @@ mod tests {
                 channel: 1,
                 rssi_dbm: -50,
             })
+        );
+        let mut normal_mcu = rx.clone();
+        let rxd0 = (7u32 << 27) | (1 << 16) | normal_mcu.len() as u32;
+        normal_mcu[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&normal_mcu),
+            parse_passive_advertisement(&rx)
         );
         rx[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
         assert_eq!(
