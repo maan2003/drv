@@ -2327,14 +2327,14 @@ impl VfioFirmwareLoader<'_, '_> {
         let response = self
             .mcu
             .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
-        if response.event_id != 0x02 || response.option & (1 << 2) != 0 {
-            return Err(format!(
-                "PSE REG_READ response envelope mismatch eid={} option={:#04x}",
-                response.event_id, response.option
-            ));
-        }
-        let value = parse_pse_reg_read_response(&response.bytes)
-            .map_err(|error| format!("parse PSE REG_READ response: {error:?}"))?;
+        let value =
+            parse_pse_reg_read_response(response.event_id, response.option, &response.bytes)
+                .map_err(|error| {
+                    format!(
+                        "parse PSE REG_READ response eid={} option={:#04x}: {error:?}",
+                        response.event_id, response.option
+                    )
+                })?;
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());

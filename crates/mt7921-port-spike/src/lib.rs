@@ -4383,7 +4383,16 @@ pub fn encode_pse_reg_read_command(sequence: u8) -> Result<Vec<u8>, RateTxPowerE
     Ok(bytes)
 }
 
-pub fn parse_pse_reg_read_response(bytes: &[u8]) -> Result<u32, RateTxPowerError> {
+pub fn parse_pse_reg_read_response(
+    event_id: u8,
+    option: u8,
+    bytes: &[u8],
+) -> Result<u32, RateTxPowerError> {
+    // Pinned mt76 names the legacy CE REG_READ response
+    // MCU_EVENT_REG_ACCESS (0x05); MCU_EVENT_ACCESS_REG (0x02) is distinct.
+    if event_id != 0x05 || option & (1 << 2) != 0 {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
     let length = u16::from_le_bytes(
         bytes
             .get(24..26)
@@ -4921,7 +4930,22 @@ mod tests {
         response[24..26].copy_from_slice(&20u16.to_le_bytes());
         response[36..40].copy_from_slice(&MT7921_PSE_BASE.to_le_bytes());
         response[40..44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        assert_eq!(parse_pse_reg_read_response(&response), Ok(0x1234_5678));
+        assert_eq!(
+            parse_pse_reg_read_response(0x05, 0, &response),
+            Ok(0x1234_5678)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0x02, 0, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0xed, 0, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0x05, 1 << 2, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
         let capability = NicCapability {
             element_count: 0,
             mac_address: None,
