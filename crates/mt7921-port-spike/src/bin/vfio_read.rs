@@ -78,6 +78,10 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const BAR0_REGION: u32 = 0;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
+const MCU_TX_RING_COUNT: usize = 256;
+const MCU_COMMAND_SLOT_BYTES: usize = 256;
+const MCU_COMMAND_PAYLOAD_BYTES: usize = MCU_TX_RING_COUNT * MCU_COMMAND_SLOT_BYTES;
+const MCU_COMMAND_PAYLOAD_IOVA: u64 = 0x0102_0000;
 const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
@@ -690,7 +694,12 @@ fn run() -> Result<(), String> {
         let mut rx_guard = DmaArena::map(&iommu, ioas.id, 0x0100_3000)?;
         let mut mcu_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_4000)?;
         let mut mcu_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_5000, 4 * PAGE)?;
-        let mut command_payload = DmaArena::map(&iommu, ioas.id, 0x0100_9000)?;
+        let mut command_payload = DmaArena::map_len(
+            &iommu,
+            ioas.id,
+            MCU_COMMAND_PAYLOAD_IOVA,
+            MCU_COMMAND_PAYLOAD_BYTES,
+        )?;
         let mut fwdl_payload = DmaArena::map(&iommu, ioas.id, 0x0100_a000)?;
         let mut mcu_wa_rx_ring = DmaArena::map(&iommu, ioas.id, 0x0100_b000)?;
         let mut mcu_wa_rx_buffers = DmaArena::map_len(&iommu, ioas.id, 0x0100_c000, 4 * PAGE)?;
@@ -704,7 +713,7 @@ fn run() -> Result<(), String> {
         rx_guard.initialize_descriptor_page()?;
         mcu_rx_ring.initialize_descriptor_page()?;
         mcu_rx_buffers.zero_bytes(4 * PAGE)?;
-        command_payload.zero_bytes(PAGE)?;
+        command_payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         fwdl_payload.zero_bytes(PAGE)?;
         mcu_wa_rx_ring.initialize_descriptor_page()?;
         mcu_wa_rx_buffers.zero_bytes(4 * PAGE)?;
@@ -1408,7 +1417,7 @@ fn publish_mcu_bytes(
     sequence: u8,
     descriptor_index: usize,
 ) -> Result<(), String> {
-    let payload_offset = descriptor_index * 256;
+    let payload_offset = descriptor_index * MCU_COMMAND_SLOT_BYTES;
     if payload_offset + bytes.len() > payload.len {
         return Err("MCU command payload arena exhausted".into());
     }
@@ -1430,7 +1439,10 @@ fn publish_mcu_bytes(
     .map_err(|error| format!("encode MCU command DMA descriptor: {error:?}"))?;
     tx_ring.write_descriptor_at(descriptor_index, descriptor);
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    wfdma.write_active_wfdma(0xd4418, next_dma_index(descriptor_index, 256) as u32)?;
+    wfdma.write_active_wfdma(
+        0xd4418,
+        next_dma_index(descriptor_index, MCU_TX_RING_COUNT) as u32,
+    )?;
     println!(
         "{{\"active_mcu_event\":\"command_published\",\"sequence\":{sequence},\"tx_descriptor\":{descriptor_index}}}"
     );
@@ -1908,7 +1920,7 @@ impl VfioFirmwareLoader<'_, '_> {
             return Err("passive response policy disagreed with encoded command".into());
         }
         let descriptor_index = self.command_index;
-        let next = next_dma_index(descriptor_index, 256);
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
@@ -1968,7 +1980,7 @@ impl VfioFirmwareLoader<'_, '_> {
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        self.mcu.payload.zero_bytes(PAGE)?;
+        self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         println!(
             r#"{{"passive_scan_event":"command_completed","command":"{command:?}","sequence":{sequence}}}"#
         );
@@ -2002,7 +2014,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             );
         }
         let descriptor_index = self.command_index;
-        let next = next_dma_index(descriptor_index, 256);
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         let expects_response = command != DownloadCommand::NicPowerControl;
         if expects_response {
             self.mcu
@@ -2043,7 +2055,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        self.mcu.payload.zero_bytes(PAGE)?;
+        self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         Ok(completion)
     }
 
@@ -2061,7 +2073,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             self.mcu.verify_post_n9_dual_rx()?;
         }
         let descriptor_index = self.command_index;
-        let next = next_dma_index(descriptor_index, 256);
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
@@ -2098,7 +2110,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        self.mcu.payload.zero_bytes(PAGE)?;
+        self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         Ok(response)
     }
 
@@ -2117,7 +2129,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             return Err("SET_CHAN_DOMAIN escaped the world/indoor mask-zero allowlist".into());
         }
         let descriptor_index = self.command_index;
-        let next = next_dma_index(descriptor_index, 256);
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
@@ -2146,7 +2158,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        self.mcu.payload.zero_bytes(PAGE)?;
+        self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         println!(
             "{{\"active_mcu_event\":\"set_channel_domain_tx_complete\",\"sequence\":{sequence},\"channels\":{}}}",
             command.channels.len()
