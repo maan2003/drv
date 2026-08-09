@@ -31,7 +31,8 @@ use mt7921_port_spike::{
 use mt7921_port_spike::{
     PassiveMacMmioOperation, PassiveMcuCommand, candidate_channels,
     load_mt7921_firmware_with_passive_boundary, parse_passive_advertisement,
-    parse_passive_scan_done, passive_mac_mmio_plan,
+    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
+    validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
@@ -923,7 +924,6 @@ fn run() -> Result<(), String> {
                                     rx_count: 8,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
-                                selector: &selector_page,
                                 mac_pages: &passive_window_pages,
                                 scan_started: None,
                                 advertisements: Vec::new(),
@@ -963,7 +963,6 @@ fn run() -> Result<(), String> {
                                     rx_count: 8,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
-                                selector: &selector_page,
                                 mac_pages: &passive_window_pages,
                                 scan_started: None,
                                 advertisements: Vec::new(),
@@ -1514,7 +1513,9 @@ const WM_RX_IRQ_BIT: u32 = 1 << 0;
 const DATA_RX_IRQ_BIT: u32 = 1 << 2;
 const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
-const PASSIVE_MAC_BAR_PAGES: [usize; 5] = [0x44000, 0x45000, 0x47000, 0x49000, 0x4d000];
+const PASSIVE_MAC_BAR_PAGES: [usize; 8] = [
+    0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0xa1000, 0xa3000, 0xa4000,
+];
 
 const fn firmware_bootstrap_rx_irq_mask() -> u32 {
     WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
@@ -2319,9 +2320,7 @@ impl std::error::Error for PhysicalPassiveError {}
 
 #[cfg(feature = "fuchsia-passive")]
 struct PassiveMacExecutor<'a> {
-    selector: &'a ReadPage,
     pages: &'a [ReadPage],
-    saved_selector: u32,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -2355,100 +2354,65 @@ fn run_passive_prepare_steps<E>(
 #[cfg(feature = "fuchsia-passive")]
 impl PassiveMacExecutor<'_> {
     fn page(&self, address: u32) -> Result<&ReadPage, String> {
-        let bar_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
+        let offset = passive_mac_bar_offset(address)
+            .map_err(|error| format!("translate passive MAC address: {error:?}"))?;
+        let bar_page = offset & !(PAGE - 1);
         self.pages
             .iter()
             .find(|page| page.bar_page == bar_page)
             .ok_or_else(|| format!("passive MAC address {address:#010x} has no mapped page"))
     }
 
-    fn select(&self, address: u32) -> Result<(), String> {
-        if !passive_mac_address_allowed(address) {
-            return Err(format!("passive MAC selector {address:#010x} escaped plan"));
-        }
-        let value = (self.saved_selector & !0xffff) | address >> 16;
-        self.selector.write_remap_selector(value)?;
-        let actual = self.selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
-        if actual != value {
-            return Err(format!(
-                "passive MAC selector readback {actual:#010x}, expected {value:#010x}"
-            ));
-        }
-        Ok(())
-    }
-
     fn read(&self, address: u32) -> Result<u32, String> {
-        self.select(address)?;
-        let value = self
-            .page(address)?
-            .read_passive_mac(self.selector, address)?;
-        if value == u32::MAX {
-            return Err(format!(
-                "passive MAC read {address:#010x} returned all ones"
-            ));
-        }
-        Ok(value)
+        self.page(address)?.read_passive_mac(address)
     }
 
     fn write(&self, address: u32, value: u32) -> Result<(), String> {
-        self.select(address)?;
-        self.page(address)?
-            .write_passive_mac(self.selector, address, value)
+        self.page(address)?.write_passive_mac(address, value)
     }
 
     fn execute(&self) -> Result<(), String> {
-        let result = (|| {
-            for operation in passive_mac_mmio_plan() {
-                match operation {
-                    PassiveMacMmioOperation::Rmw {
-                        address,
-                        mask,
-                        value,
-                    } => {
-                        let initial = self.read(address)?;
-                        let programmed = (initial & !mask) | (value & mask);
-                        self.write(address, programmed)?;
-                        let readback = self.read(address)?;
-                        if readback & mask != value & mask {
-                            return Err(format!(
-                                "passive MAC {address:#010x} masked readback {readback:#010x}, expected {value:#010x}/{mask:#010x}"
-                            ));
-                        }
+        for operation in passive_mac_mmio_plan() {
+            match operation {
+                PassiveMacMmioOperation::Rmw {
+                    address,
+                    mask,
+                    value,
+                } => {
+                    let initial = self.read(address)?;
+                    let programmed = (initial & !mask) | (value & mask);
+                    self.write(address, programmed)?;
+                    let readback = self.read(address)?;
+                    if readback & mask != value & mask {
+                        return Err(format!(
+                            "passive MAC {address:#010x} masked readback {readback:#010x}, expected {value:#010x}/{mask:#010x}"
+                        ));
                     }
-                    PassiveMacMmioOperation::WtblClear {
-                        index,
-                        address,
-                        value,
-                        busy_mask,
-                        timeout_us,
-                    } => {
-                        self.write(address, value)?;
-                        let deadline = Instant::now()
-                            + std::time::Duration::from_micros(u64::from(timeout_us));
-                        loop {
-                            let readback = self.read(address)?;
-                            if readback & busy_mask == 0 {
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                return Err(format!("WTBL clear {index} busy timeout"));
-                            }
-                            std::thread::sleep(std::time::Duration::from_micros(10));
+                }
+                PassiveMacMmioOperation::WtblClear {
+                    index,
+                    address,
+                    value,
+                    busy_mask,
+                    timeout_us,
+                } => {
+                    self.write(address, value)?;
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_micros(u64::from(timeout_us));
+                    loop {
+                        let readback = self.read(address)?;
+                        if readback & busy_mask == 0 {
+                            break;
                         }
+                        if Instant::now() >= deadline {
+                            return Err(format!("WTBL clear {index} busy timeout"));
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(10));
                     }
                 }
             }
-            Ok(())
-        })();
-        let restore = self.selector.write_remap_selector(self.saved_selector);
-        match (result, restore) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(format!("restore passive MAC selector: {error}")),
-            (Err(error), Err(restore)) => Err(format!(
-                "{error}; restore passive MAC selector also failed: {restore}"
-            )),
         }
+        Ok(())
     }
 }
 
@@ -2499,7 +2463,6 @@ fn drain_data_rx_queue(
 struct VfioPassiveMechanics<'a, 'b, 'c> {
     loader: &'a mut VfioFirmwareLoader<'b, 'c>,
     data: ActiveMcuRx<'b, 'c>,
-    selector: &'b ReadPage,
     mac_pages: &'b [ReadPage],
     scan_started: Option<Instant>,
     advertisements: Vec<mt7921_port_spike::PassiveAdvertisement>,
@@ -2522,14 +2485,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         run_passive_prepare_steps(|step| -> Result<(), PhysicalPassiveError> {
             match step {
                 PassivePrepareStep::MacMmio => {
-                    let saved_selector = self
-                        .selector
-                        .read(MT_HIF_REMAP_L1_BAR_OFFSET)
-                        .map_err(PhysicalPassiveError)?;
                     PassiveMacExecutor {
-                        selector: self.selector,
                         pages: self.mac_pages,
-                        saved_selector,
                     }
                     .execute()
                     .map_err(PhysicalPassiveError)?;
@@ -3099,41 +3056,39 @@ impl ReadPage {
         Ok(())
     }
     #[cfg(feature = "fuchsia-passive")]
-    fn read_passive_mac(&self, selector: &ReadPage, address: u32) -> Result<u32, String> {
+    fn read_passive_mac(&self, address: u32) -> Result<u32, String> {
         if !passive_mac_address_allowed(address) {
             return Err(format!(
                 "passive MAC read {address:#010x} escaped exact plan"
             ));
         }
-        let expected_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
-        if self.bar_page != expected_page
-            || selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff != address >> 16
-        {
-            return Err(format!("passive MAC read {address:#010x} used wrong remap"));
+        let offset = passive_mac_bar_offset(address)
+            .map_err(|error| format!("translate passive MAC read: {error:?}"))?;
+        if self.bar_page != offset & !(PAGE - 1) {
+            return Err(format!(
+                "passive MAC read {address:#010x} used wrong fixed BAR page"
+            ));
         }
-        self.read(self.bar_page + (address as usize & 0xfff))
+        let value = self.read(offset)?;
+        validate_passive_mac_bar_read(address, value)
+            .map(|(_, value)| value)
+            .map_err(|error| format!("validate passive MAC read: {error:?}"))
     }
     #[cfg(feature = "fuchsia-passive")]
-    fn write_passive_mac(
-        &self,
-        selector: &ReadPage,
-        address: u32,
-        value: u32,
-    ) -> Result<(), String> {
+    fn write_passive_mac(&self, address: u32, value: u32) -> Result<(), String> {
         if !passive_mac_address_allowed(address) {
             return Err(format!(
                 "passive MAC write {address:#010x} escaped exact plan"
             ));
         }
-        let expected_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
-        if self.bar_page != expected_page
-            || selector.read(MT_HIF_REMAP_L1_BAR_OFFSET)? & 0xffff != address >> 16
-        {
+        let offset = passive_mac_bar_offset(address)
+            .map_err(|error| format!("translate passive MAC write: {error:?}"))?;
+        if self.bar_page != offset & !(PAGE - 1) {
             return Err(format!(
-                "passive MAC write {address:#010x} used wrong remap"
+                "passive MAC write {address:#010x} used wrong fixed BAR page"
             ));
         }
-        let within = address as usize & 0xfff;
+        let within = offset - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
         Ok(())
     }
@@ -4064,7 +4019,7 @@ mod tests {
             .map(|operation| match operation {
                 PassiveMacMmioOperation::Rmw { address, .. }
                 | PassiveMacMmioOperation::WtblClear { address, .. } => {
-                    MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000)
+                    passive_mac_bar_offset(address).unwrap() & !(PAGE - 1)
                 }
             })
             .collect::<Vec<_>>();

@@ -267,6 +267,27 @@ the interrupt mask, and stops. It emits no device/BSS/channel-switch/scan MCU
 commands and therefore performs no radio dwell. Each ordered prepare step has
 failure-injection coverage, while the loader fixture verifies passive-hook
 failure still reaches mandatory cleanup.
+
+The single prepare-only physical run from commit `e7d92d2c` (release SHA-256
+`d416c420917c2a7c682d92ad8007194a94d1e76894492cecb9f9191fe5e10d6c`)
+proved the restored bootstrap ordering: firmware, CLC, and channel-domain setup
+completed under IRQ mask `0x00400001`. The hook then stopped on its first MAC
+read because the attempted L1-remap path returned all ones for `0x820cd004`.
+Ring 2 and bit 2 were therefore untouched. Cleanup/reset/unmap and supervisor
+restore succeeded, and the watchdog rebooted to healthy boot
+`07997fa0-bcf0-46d8-b3bc-32aaf9b4c49f`. The report is
+`/var/lib/wifi-driver-lab/reports/20260809T152843Z-0000_05_00.0.log`.
+
+Pinned `__mt7921_reg_addr` explains the failure: every address in the mandatory
+MAC plan matches a fixed-map entry before the L1 fallback. In particular,
+`0x820cd004` translates through `0x820cd000 -> BAR 0x0f000` to BAR offset
+`0x0f004`; changing `MT_HIF_REMAP_L1` was incorrect. The offline executor now
+uses exact fixed-map fixtures for every plan address, maps only the eight BAR
+pages those fixtures require, rejects addresses outside the plan, and treats
+all-ones reads as typed failures. It does not touch or restore the remap
+selector; the existing top-ownership transaction remains responsible for its
+own earlier save/restore. This correction is not physically validated and no
+further hardware run is authorized by this evidence alone.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed

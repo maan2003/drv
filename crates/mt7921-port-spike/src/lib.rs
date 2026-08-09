@@ -3294,6 +3294,64 @@ pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
     plan
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMacBarError {
+    UnsupportedAddress(u32),
+    AllOnes { address: u32 },
+}
+
+/// Translate only the fixed-map regions touched by the mandatory passive MAC
+/// plan. Pinned `__mt7921_reg_addr` resolves these before its L1-remap fallback;
+/// callers must not mutate `MT_HIF_REMAP_L1` for any address accepted here.
+pub fn passive_mac_bar_offset(address: u32) -> Result<usize, PassiveMacBarError> {
+    const FIXED: [(u32, u32, u32); 12] = [
+        (0x820d_0000, 0x0003_0000, 0x0001_0000),
+        (0x820e_d000, 0x0002_4800, 0x0000_0800),
+        (0x820e_4000, 0x0002_1000, 0x0000_0400),
+        (0x820e_7000, 0x0002_1e00, 0x0000_0200),
+        (0x820e_5000, 0x0002_1400, 0x0000_0800),
+        (0x820c_d000, 0x0000_f000, 0x0000_1000),
+        (0x820e_9000, 0x0002_3400, 0x0000_0200),
+        (0x820f_4000, 0x000a_1000, 0x0000_0400),
+        (0x820f_5000, 0x000a_1400, 0x0000_0800),
+        (0x820f_7000, 0x000a_1e00, 0x0000_0200),
+        (0x820f_9000, 0x000a_3400, 0x0000_0200),
+        (0x820f_d000, 0x000a_4800, 0x0000_0800),
+    ];
+    if !passive_mac_mmio_plan()
+        .iter()
+        .any(|operation| match operation {
+            PassiveMacMmioOperation::Rmw {
+                address: expected, ..
+            }
+            | PassiveMacMmioOperation::WtblClear {
+                address: expected, ..
+            } => *expected == address,
+        })
+    {
+        return Err(PassiveMacBarError::UnsupportedAddress(address));
+    }
+    for (physical, mapped, size) in FIXED {
+        if let Some(offset) = address.checked_sub(physical)
+            && offset <= size
+        {
+            return Ok((mapped + offset) as usize);
+        }
+    }
+    Err(PassiveMacBarError::UnsupportedAddress(address))
+}
+
+pub fn validate_passive_mac_bar_read(
+    address: u32,
+    value: u32,
+) -> Result<(usize, u32), PassiveMacBarError> {
+    let offset = passive_mac_bar_offset(address)?;
+    if value == u32::MAX {
+        return Err(PassiveMacBarError::AllOnes { address });
+    }
+    Ok((offset, value))
+}
+
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
     let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
     if response.event_id != 0x0d || response.sequence != 0 {
@@ -6324,6 +6382,53 @@ mod tests {
                 mask: (3 << 30) | (3 << 24),
                 value: 3 << 24,
             })
+        );
+    }
+
+    #[test]
+    fn passive_mac_addresses_use_exact_fixed_bar_map_and_fail_closed() {
+        let fixtures = [
+            (0x820c_d000, 0x0f000),
+            (0x820c_d004, 0x0f004),
+            (0x820d_4230, 0x34230),
+            (0x820e_40f4, 0x210f4),
+            (0x820e_5380, 0x21780),
+            (0x820e_53c4, 0x217c4),
+            (0x820e_7000, 0x21e00),
+            (0x820e_9008, 0x23408),
+            (0x820e_d004, 0x24804),
+            (0x820f_40f4, 0xa10f4),
+            (0x820f_5380, 0xa1780),
+            (0x820f_53c4, 0xa17c4),
+            (0x820f_7000, 0xa1e00),
+            (0x820f_9008, 0xa3408),
+            (0x820f_d004, 0xa4804),
+        ];
+        for &(physical, bar) in &fixtures {
+            assert_eq!(passive_mac_bar_offset(physical), Ok(bar));
+            assert_eq!(
+                validate_passive_mac_bar_read(physical, 0x1234_5678),
+                Ok((bar, 0x1234_5678))
+            );
+            assert_eq!(
+                validate_passive_mac_bar_read(physical, u32::MAX),
+                Err(PassiveMacBarError::AllOnes { address: physical })
+            );
+        }
+        for operation in passive_mac_mmio_plan() {
+            let address = match operation {
+                PassiveMacMmioOperation::Rmw { address, .. }
+                | PassiveMacMmioOperation::WtblClear { address, .. } => address,
+            };
+            assert!(fixtures.iter().any(|fixture| fixture.0 == address));
+        }
+        assert_eq!(
+            passive_mac_bar_offset(0x820e_40f8),
+            Err(PassiveMacBarError::UnsupportedAddress(0x820e_40f8))
+        );
+        assert_eq!(
+            passive_mac_bar_offset(0x1800_0000),
+            Err(PassiveMacBarError::UnsupportedAddress(0x1800_0000))
         );
     }
 
