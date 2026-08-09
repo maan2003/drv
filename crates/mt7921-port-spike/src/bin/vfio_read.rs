@@ -1181,6 +1181,12 @@ fn run() -> Result<(), String> {
             .expect("active MCU operation has containment ledger")
             .transition(RunPhase::Acquiring, RunPhase::MappedDmaDisabled);
         finish_owned_acquisition!(&mut capsule, mapped_transition);
+        let host_control_transition = capsule
+            .containment
+            .as_mut()
+            .expect("active MCU operation has containment ledger")
+            .transition(RunPhase::MappedDmaDisabled, RunPhase::AcquiringHostControl);
+        finish_owned_acquisition!(&mut capsule, host_control_transition);
         let signal = finish_owned_acquisition!(&mut capsule, ActiveSignalGuard::install());
         let resources = capsule
             .active
@@ -1233,7 +1239,6 @@ fn run() -> Result<(), String> {
             .containment
             .as_mut()
             .expect("active MCU operation has containment ledger");
-        ledger.transition(RunPhase::MappedDmaDisabled, RunPhase::AcquiringHostControl)?;
         ledger.mark_possibly_active(Hazard::LabMutated);
         ledger.mark_possibly_active(Hazard::HostControl);
         let active = (|| -> Result<(), String> {
