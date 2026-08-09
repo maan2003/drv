@@ -273,6 +273,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channels-1-6") => Operation::RunOneShotPassiveChannels1And6,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-2ghz") => Operation::RunOneShotPassive2Ghz,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
@@ -965,6 +967,7 @@ fn run() -> Result<(), String> {
                     operation,
                     Operation::RunOneShotPassiveChannel1
                         | Operation::RunOneShotPassiveChannels1And6
+                        | Operation::RunOneShotPassive2Ghz
                 ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -990,23 +993,19 @@ fn run() -> Result<(), String> {
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
                             let candidates = candidate_channels(report.nic_capability);
-                            let channels = if operation == Operation::RunOneShotPassiveChannel1 {
-                                vec![ChannelNumber {
-                                    band: WlanBand::TwoGhz,
-                                    number: 1,
-                                }]
-                            } else {
-                                vec![
-                                    ChannelNumber {
-                                        band: WlanBand::TwoGhz,
-                                        number: 1,
-                                    },
-                                    ChannelNumber {
-                                        band: WlanBand::TwoGhz,
-                                        number: 6,
-                                    },
-                                ]
+                            let channel_numbers: Vec<u8> = match operation {
+                                Operation::RunOneShotPassiveChannel1 => vec![1],
+                                Operation::RunOneShotPassiveChannels1And6 => vec![1, 6],
+                                Operation::RunOneShotPassive2Ghz => (1..=14).collect(),
+                                _ => unreachable!("passive scan operation matched above"),
                             };
+                            let channels = channel_numbers
+                                .into_iter()
+                                .map(|number| ChannelNumber {
+                                    band: WlanBand::TwoGhz,
+                                    number,
+                                })
+                                .collect::<Vec<_>>();
                             let mut adapter = Mt7921SoftmacAdapter::new(
                                 transport,
                                 report.nic_capability,
@@ -3532,6 +3531,8 @@ enum Operation {
     RunOneShotPassiveChannel1,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassiveChannels1And6,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassive2Ghz,
 }
 
 impl Operation {
@@ -3543,6 +3544,7 @@ impl Operation {
                 Self::RunOneShotPassivePrepare
                     | Self::RunOneShotPassiveChannel1
                     | Self::RunOneShotPassiveChannels1And6
+                    | Self::RunOneShotPassive2Ghz
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -4104,6 +4106,9 @@ mod tests {
         assert!(Operation::RunOneShotPassiveChannels1And6.wfdma_writable());
         assert!(Operation::RunOneShotPassiveChannels1And6.conn_writable());
         assert!(Operation::RunOneShotPassiveChannels1And6.loads_firmware());
+        assert!(Operation::RunOneShotPassive2Ghz.wfdma_writable());
+        assert!(Operation::RunOneShotPassive2Ghz.conn_writable());
+        assert!(Operation::RunOneShotPassive2Ghz.loads_firmware());
         assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
         assert!(Operation::RunOneShotPassivePrepare.conn_writable());
         assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
