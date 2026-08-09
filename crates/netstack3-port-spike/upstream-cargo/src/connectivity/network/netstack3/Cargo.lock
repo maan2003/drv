@@ -3497,6 +3497,7 @@ dependencies = [
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-sme",
  "fuchsia-async",
  "fuchsia-inspect",
@@ -3506,6 +3507,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "wlan-common",
+ "wlan-sme",
  "zx",
 ]
 
