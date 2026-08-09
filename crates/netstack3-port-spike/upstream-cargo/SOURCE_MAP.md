@@ -105,6 +105,150 @@ it should not recreate FIDL channels or bypass SME by duplicating MLME policy.
 | Rate/SAR power tables, MCU commands, WFDMA descriptors, completion and key programming | MT7921 backend | The backend consumes already-authorized channel/power inputs and reports mechanics completion; it owns no country, scan-selection, credential, retry, or connect policy. |
 | Direct VFIO orchestration | Temporary no-plastic lab harness | Bounded evidence collection only. It is not a production service boundary and must not accumulate WLAN policy. |
 
+### Staged WLAN selection gates
+
+Gate A is complete at commit `d97e1fd8`. The host package compiles the exact
+pinned `wlancfg` connection-selection sources and returns their ordinary
+`ScannedCandidate`; it adds no provenance or authority. A fresh materialization
+of Fuchsia pin `1e1219e3fac944c9a906aea9646939746b6062b3` and a fresh Pigweed
+checkout completed `prepare-upstream`, including exact patch application with
+zero fuzz/offset. The focused selector, SME, MLME, and RSN results were
+respectively 6/6, 2/2, 2/2, and 187/187. Advisor `adv-m21s` and source reviewer
+`eng-xqca` approved the gate as preserving pinned filtering, scoring, stable
+ordering, active augmentation, cancellation, and ordinary output without
+introducing Gate B/C or live/hardware authority.
+
+Gate B is private provenance plumbing only. It must carry exact descriptor
+occurrence identities into the structured aggregate/lineage selected by the
+pinned policy; it must not infer an identity from a `BssDescription`, BSSID,
+SSID, channel, signal, serialized bytes, or any other value after the fact.
+Comparisons already made by pinned scan/selection policy remain policy, but
+each element carries its structured lineage through those comparisons. Gate B
+ends at an interface/request-bound selected provenance aggregate. It does not
+perform a final scan, mint beacon or power authority, issue Connect/Join,
+publish a frame, or make any live device operation reachable.
+
+#### Private identity and lifetime contract
+
+The RX owner is the sole mint. After observing a CPU-owned completed descriptor
+and the acquire fence, it validates the descriptor, copies the bounded frame,
+and mints the occurrence before writing or publishing the replacement
+descriptor. The stable identity is the tuple
+`(interface-owner, interface-epoch, device/reset/ownership epochs, scan-id,
+scan-epoch, ring-id, descriptor-slot, slot-epoch, occurrence-sequence)`. The
+slot epoch advances on every arm or rearm; all counters advance with checked
+arithmetic and exhaustion poisons the interface rather than wrapping. A copied
+occurrence can survive physical slot reuse because its sealed identity records
+the pre-rearm slot epoch, while no later bytes in that slot can acquire that
+identity.
+
+B1 must cover both accepted descriptor routes in the current backend:
+`vfio_read.rs::drain_data_rx_queue`, which parses the data RX ring directly,
+and the normal-frame branch of `vfio_read.rs::drain_rx_queue`, which routes a
+frame from an MCU RX ring. Each route mints with its actual ring and slot before
+that route rearms. If a future implementation does not carry one route, that
+route is explicitly provenance-dropping and its advertisements are ineligible
+for Gate B selection rather than being upgraded later.
+
+The identity is held in a host-private carrier whose minting constructor and
+fields are inaccessible to ordinary scan, policy, SME, and service callers.
+Cloning a carrier copies the same identity and never mints a new one. Public
+FIDL schemas and pinned value types do not gain a caller-settable token. At a
+clone or value conversion the private carrier moves with the exact element. At
+a FIDL-shaped seam it remains in a trusted, in-process sidecar paired by the
+message occurrence and vector position; it is never encoded, accepted from the
+wire, or reattached by comparing values. Any boundary that cannot preserve
+this structural pairing is an explicit provenance-dropping boundary and may
+produce only an ordinary, unprovenanced result.
+
+After B1, the descriptor-backed occurrence is only an input identity. Gate B
+removes or bypasses the custom MT7921 strongest-per-BSSID aggregation: every
+accepted raw occurrence reaches pinned client MLME/SME in receive order. Equal
+and weaker observations are not dropped at this boundary; pinned SME owns the
+first aggregation and deduplication policy. Each later aggregate retains a
+structured private lineage that records representative/contributor roles and
+the disposition of inputs dropped by pinned policy:
+
+* pinned SME `maybe_insert_bss` separately records the fixed-field
+  representative and the ordered IE contributors. The rejected weaker
+  cross-channel echo is a dropped input and leaves both roles unchanged;
+  otherwise the exact incoming input becomes the fixed-field representative
+  when it overwrites `existing_bss`, while accepted IE contributors remain in
+  the merge lineage. The synthesized merged IE value does not claim to be the
+  bytes of one descriptor;
+* pinned `wlancfg` `bss_to_network_map` keeps the first unique BSSID aggregate
+  it accepts for each detailed network and records later duplicate aggregates
+  as dropped. HashMap draining or network regrouping moves that whole aggregate
+  with the element rather than recovering it by key;
+* filtering and stable score sorting move or clone the entire structured
+  lineage embedded in the candidate. Equal scores therefore preserve the
+  pinned input-order aggregate. Successful active augmentation carries the
+  complete active-scan structured aggregate--its SME fixed-field
+  representative, IE contributors, and later grouping lineage--as the source
+  of the replacement `bss_description`, while the discovery lineage remains
+  the source of the candidate's retained signal, channel, timestamp,
+  observation, compatibility, and other `Bss` fields. Missing active sidecar
+  lineage is a provenance transport failure, not an unprovenanced replacement.
+  Augmentation never recovers either lineage by looking up a sidecar with
+  BSSID/SSID values.
+
+No individual occurrence identity claims to identify the synthesized SME
+value, the `wlancfg` candidate, or the selected aggregate as a whole. Neither
+an input identity nor the composite lineage grants authority.
+
+The terminal selected aggregate remains bound to the interface owner/epoch and
+the selector request generation. Interface removal or rebinding, device reset,
+firmware reload, DMA-ownership loss, RX teardown, a failed or mismatched scan
+terminal, scan cancellation, selector cancellation, or provenance transport
+failure revokes the affected generation before buffers or queued results are
+released. Late events from a revoked generation are discarded and cannot
+restore it. Rearm revokes only the live descriptor-slot lease after the sealed
+copy exists; scan or interface invalidation revokes its derived lineage too. A
+successful matching scan terminal seals the structured lineage for selection
+but grants no connection capability. An ordinary caller can construct or
+serialize only unprovenanced values, and the private interface binding rejects
+those values rather than upgrading them.
+
+#### Gate B review splits and admission blockers
+
+The previously recorded advisor blockers are admission criteria, not deferred
+cleanup: provenance must be minted from exact descriptor consumption before
+rearm; stable identity must not be reconstructed by value matching; every
+clone, conversion, FIDL-shaped seam, aggregation, deduplication, reorder, tie,
+and cancellation path must have an explicit carrier rule; slot and interface
+epochs must revoke stale occurrences; ordinary callers must be unable to forge
+or deserialize provenance; and the actual pinned selector, rather than a
+parallel selector, must choose the carried aggregate. An individual occurrence
+identity must never be presented as the identity of a synthesized candidate. A
+design that reaches a final observation, Connect/Join, frame publication, or
+live authority in the same change is outside Gate B.
+
+Those obligations are not independently reviewable as one implementation, so
+future code is split further:
+
+1. **B1 -- descriptor occurrence:** mint the private identity at exact RX
+   consumption on both data-RX and MCU-RX normal-frame routes, copy before
+   rearm, advance per-slot epochs, and prove stale, duplicate, overflow,
+   teardown, uncovered-route, and cancellation rejection. Stop at the raw
+   advertisement carrier.
+2. **B2 -- scan lineage:** carry B1 identities through pinned beacon
+   conversion and FIDL-shaped value seams, remove/bypass MT7921
+   strongest-BSSID pre-aggregation, and let pinned SME/`wlancfg` own
+   aggregation and deduplication. Prove equal/weaker raw inputs reach SME, then
+   test pinned echo rejection, overwrite, IE merge, first-unique behavior, and
+   reorder handling. Stop at structured, provenanced `wlancfg` scan aggregates.
+3. **B3 -- policy selection and binding:** feed those candidates to the actual
+   pinned `wlancfg` selector, move the whole lineage through filtering, stable
+   score ties and augmentation, and return a private interface/request-bound
+   selected provenance aggregate. Prove ordinary selector/FIDL callers cannot
+   mint or submit it and prove cancellation/invalidation. Stop before any final
+   scan or Connect/Join call.
+
+Each subgate requires its own source/advisor approval and negative tests before
+the next begins. Gate C, if separately approved later, owns fresh final
+observation and any live authorization; no Gate B token is itself such
+authority.
+
 ### Smallest staged closure
 
 1. Package and test the decision core: `client/types.rs`,
