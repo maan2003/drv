@@ -263,6 +263,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
         Some("--run-one-shot-channel-domain") => Operation::RunOneShotChannelDomain,
         #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
+        #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
@@ -802,12 +804,6 @@ fn run() -> Result<(), String> {
                 )
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
-                #[cfg(feature = "fuchsia-passive")]
-                if operation == Operation::RunOneShotPassiveChannel1 {
-                    wfdma.write_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
-                    wfdma.verify_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
-                    wfdma.authorize_passive_data_rx_irq()?;
-                }
             }
             let installed = VfioIrq::install(&device, selected)?;
             if installed.try_read()?.is_some() {
@@ -910,7 +906,47 @@ fn run() -> Result<(), String> {
                 let firmware = Firmware::parse(ram_bytes)
                     .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
                 #[cfg(feature = "fuchsia-passive")]
-                let result = if operation == Operation::RunOneShotPassiveChannel1 {
+                let result = if operation == Operation::RunOneShotPassivePrepare {
+                    load_mt7921_firmware_with_passive_boundary(
+                        &mut loader,
+                        patch,
+                        firmware,
+                        |loader, _report| {
+                            let mut mechanics = VfioPassiveMechanics {
+                                loader,
+                                data: ActiveMcuRx {
+                                    rx_ring: &mut data_rx_ring,
+                                    rx_buffers: &data_rx_buffers,
+                                    rx_tail: 0,
+                                    rx_head: 7,
+                                    rx_ring_index: 2,
+                                    rx_count: 8,
+                                    irq_bit: DATA_RX_IRQ_BIT,
+                                },
+                                selector: &selector_page,
+                                mac_pages: &passive_window_pages,
+                                scan_started: None,
+                                advertisements: Vec::new(),
+                            };
+                            let prerequisites = mechanics
+                                .prepare_passive_receive()
+                                .map_err(|error| error.to_string())?;
+                            if prerequisites
+                                != (PassivePrerequisites {
+                                    channel_domain_mask_zero: true,
+                                    mac_mmio_initialized: true,
+                                    data_rx_owned: true,
+                                })
+                            {
+                                return Err(format!(
+                                    "passive prepare prerequisites mismatch: {prerequisites:?}"
+                                ));
+                            }
+                            println!(r#"{{"passive_prepare_event":"gate_passed"}}"#);
+                            Ok(())
+                        },
+                    )
+                } else if operation == Operation::RunOneShotPassiveChannel1 {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
                         patch,
@@ -2289,6 +2325,34 @@ struct PassiveMacExecutor<'a> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PassivePrepareStep {
+    MacMmio,
+    ProgramDataRing,
+    VerifyDataRing,
+    AuthorizeDataIrq,
+    EnableDataIrq,
+    VerifyDataIrq,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn run_passive_prepare_steps<E>(
+    mut execute: impl FnMut(PassivePrepareStep) -> Result<(), E>,
+) -> Result<(), E> {
+    for step in [
+        PassivePrepareStep::MacMmio,
+        PassivePrepareStep::ProgramDataRing,
+        PassivePrepareStep::VerifyDataRing,
+        PassivePrepareStep::AuthorizeDataIrq,
+        PassivePrepareStep::EnableDataIrq,
+        PassivePrepareStep::VerifyDataIrq,
+    ] {
+        execute(step)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl PassiveMacExecutor<'_> {
     fn page(&self, address: u32) -> Result<&ReadPage, String> {
         let bar_page = MT_HIF_REMAP_WINDOW_BAR_OFFSET + (address as usize & 0xf000);
@@ -2455,36 +2519,67 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "data RX ring 2 identity mismatch".into(),
             ));
         }
-        let saved_selector = self
-            .selector
-            .read(MT_HIF_REMAP_L1_BAR_OFFSET)
-            .map_err(PhysicalPassiveError)?;
-        PassiveMacExecutor {
-            selector: self.selector,
-            pages: self.mac_pages,
-            saved_selector,
-        }
-        .execute()
-        .map_err(PhysicalPassiveError)?;
-        self.loader.mcu.extra_irq_mask = DATA_RX_IRQ_BIT;
-        let passive_irq_mask = self.loader.mcu.rx_irq_mask();
-        self.loader
-            .mcu
-            .wfdma
-            .write_active_wfdma(0xd4204, passive_irq_mask)
-            .map_err(PhysicalPassiveError)?;
-        let irq_readback = self
-            .loader
-            .mcu
-            .wfdma
-            .read(0xd4204)
-            .map_err(PhysicalPassiveError)?;
-        if irq_readback != passive_irq_mask {
-            return Err(PhysicalPassiveError(format!(
-                "passive RX interrupt mask readback {irq_readback:#010x}, expected {passive_irq_mask:#010x}"
-            )));
-        }
-        println!(r#"{{"passive_scan_event":"mac_mmio_plan_completed","operations":41}}"#);
+        run_passive_prepare_steps(|step| -> Result<(), PhysicalPassiveError> {
+            match step {
+                PassivePrepareStep::MacMmio => {
+                    let saved_selector = self
+                        .selector
+                        .read(MT_HIF_REMAP_L1_BAR_OFFSET)
+                        .map_err(PhysicalPassiveError)?;
+                    PassiveMacExecutor {
+                        selector: self.selector,
+                        pages: self.mac_pages,
+                        saved_selector,
+                    }
+                    .execute()
+                    .map_err(PhysicalPassiveError)?;
+                }
+                PassivePrepareStep::ProgramDataRing => {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                    self.loader
+                        .mcu
+                        .wfdma
+                        .write_rx_ring_slot(2, self.data.rx_ring.iova as u32, 8, 7, 0)
+                        .map_err(PhysicalPassiveError)?;
+                }
+                PassivePrepareStep::VerifyDataRing => self
+                    .loader
+                    .mcu
+                    .wfdma
+                    .verify_rx_ring_slot(2, self.data.rx_ring.iova as u32, 8, 7, 0)
+                    .map_err(PhysicalPassiveError)?,
+                PassivePrepareStep::AuthorizeDataIrq => self
+                    .loader
+                    .mcu
+                    .wfdma
+                    .authorize_passive_data_rx_irq()
+                    .map_err(PhysicalPassiveError)?,
+                PassivePrepareStep::EnableDataIrq => {
+                    self.loader.mcu.extra_irq_mask = DATA_RX_IRQ_BIT;
+                    self.loader
+                        .mcu
+                        .wfdma
+                        .write_active_wfdma(0xd4204, self.loader.mcu.rx_irq_mask())
+                        .map_err(PhysicalPassiveError)?;
+                }
+                PassivePrepareStep::VerifyDataIrq => {
+                    let expected = self.loader.mcu.rx_irq_mask();
+                    let actual = self
+                        .loader
+                        .mcu
+                        .wfdma
+                        .read(0xd4204)
+                        .map_err(PhysicalPassiveError)?;
+                    if actual != expected {
+                        return Err(PhysicalPassiveError(format!(
+                            "passive RX interrupt mask readback {actual:#010x}, expected {expected:#010x}"
+                        )));
+                    }
+                }
+            }
+            println!(r#"{{"passive_prepare_step":"{step:?}"}}"#);
+            Ok(())
+        })?;
         Ok(PassivePrerequisites {
             channel_domain_mask_zero: true,
             mac_mmio_initialized: true,
@@ -3390,6 +3485,8 @@ enum Operation {
     RunOneShotFirmware,
     RunOneShotChannelDomain,
     #[cfg(feature = "fuchsia-passive")]
+    RunOneShotPassivePrepare,
+    #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassiveChannel1,
 }
 
@@ -3397,7 +3494,10 @@ impl Operation {
     fn is_passive(self) -> bool {
         #[cfg(feature = "fuchsia-passive")]
         {
-            self == Self::RunOneShotPassiveChannel1
+            matches!(
+                self,
+                Self::RunOneShotPassivePrepare | Self::RunOneShotPassiveChannel1
+            )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
         {
@@ -3955,6 +4055,9 @@ mod tests {
         assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
         assert!(Operation::RunOneShotPassiveChannel1.conn_writable());
         assert!(Operation::RunOneShotPassiveChannel1.loads_firmware());
+        assert!(Operation::RunOneShotPassivePrepare.wfdma_writable());
+        assert!(Operation::RunOneShotPassivePrepare.conn_writable());
+        assert!(Operation::RunOneShotPassivePrepare.loads_firmware());
 
         let mut required = passive_mac_mmio_plan()
             .into_iter()
@@ -3970,6 +4073,40 @@ mod tests {
         assert_eq!(required, PASSIVE_MAC_BAR_PAGES);
         assert!(!passive_mac_address_allowed(0x820e_4000));
         assert!(!passive_mac_address_allowed(0x820e_40f8));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn passive_prepare_order_stops_at_every_injected_failure() {
+        let expected = [
+            PassivePrepareStep::MacMmio,
+            PassivePrepareStep::ProgramDataRing,
+            PassivePrepareStep::VerifyDataRing,
+            PassivePrepareStep::AuthorizeDataIrq,
+            PassivePrepareStep::EnableDataIrq,
+            PassivePrepareStep::VerifyDataIrq,
+        ];
+        let mut success = Vec::new();
+        run_passive_prepare_steps::<()>(|step| {
+            success.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(success, expected);
+
+        for fail_at in 0..expected.len() {
+            let mut attempted = Vec::new();
+            let result = run_passive_prepare_steps(|step| {
+                attempted.push(step);
+                if attempted.len() - 1 == fail_at {
+                    Err(step)
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err(expected[fail_at]));
+            assert_eq!(attempted, expected[..=fail_at]);
+        }
     }
 
     #[test]

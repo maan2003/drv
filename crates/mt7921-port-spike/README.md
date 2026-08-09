@@ -257,6 +257,16 @@ loader reaches the channel-domain boundary and the MAC plan completes. Parse
 failures now retain descriptor control, descriptor length, and MCU header
 length for a future authorized diagnostic run. No retry has validated this
 fixture-backed ordering fix, so physical passive reception remains unproven.
+
+The narrower `--run-one-shot-passive-prepare` diagnostic is the only next
+physical gate. It retains the proven WM/WM2-only bootstrap through firmware,
+CLC, and channel-domain setup; then, inside the mandatory passive hook, it
+executes the MAC plan, replaces inert RX slot 2 with its dedicated descriptor
+ring, verifies base/count/CPU/DMA words, authorizes and enables bit 2, verifies
+the interrupt mask, and stops. It emits no device/BSS/channel-switch/scan MCU
+commands and therefore performs no radio dwell. Each ordered prepare step has
+failure-injection coverage, while the loader fixture verifies passive-hook
+failure still reaches mandatory cleanup.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
