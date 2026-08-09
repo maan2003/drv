@@ -223,7 +223,7 @@ impl Drop for ActiveSignalGuard {
     }
 }
 
-fn main() {
+pub fn main() {
     if let Err(message) = run() {
         eprintln!("mt7921-vfio-read: {message}");
         std::process::exit(1);
