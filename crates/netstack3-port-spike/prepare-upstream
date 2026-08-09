@@ -42,6 +42,7 @@ host_patches=(
   "$patch_dir/wlan-fidl-ext-host.patch"
   "$patch_dir/wlan-rsn-host.patch"
   "$patch_dir/wlan-sme-host.patch"
+  "$patch_dir/wlancfg-selection-host.patch"
   "$patch_dir/wlan-trace-host.patch"
   "$patch_dir/wlan-timer-host.patch"
   "$patch_dir/wlan-mlme-host.patch"
@@ -119,5 +120,6 @@ cargo test --locked --manifest-path "$manifest" -p fuchsia-sync --lib
 cargo test --locked --manifest-path "$manifest" -p wlan-rsn --lib
 cargo check --locked --manifest-path "$manifest" -p wlan-sme
 cargo test --locked --manifest-path "$manifest" -p wlan-sme --test host-client-policy
+cargo test --locked --manifest-path "$manifest" -p wlancfg-selection --test host-selection
 cargo check --locked --manifest-path "$manifest" -p netstack3_core --features testutils
 cargo test --locked --manifest-path "$manifest" -p netstack3-port-integration --tests

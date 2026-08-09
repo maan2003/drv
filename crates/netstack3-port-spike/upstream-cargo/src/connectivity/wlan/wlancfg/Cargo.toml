@@ -1,0 +1,38 @@
+[package]
+name = "wlancfg-selection"
+autobins = false
+workspace = "../../network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/host.rs"
+test = false
+doctest = false
+
+[[test]]
+name = "host-selection"
+path = "host_tests/selection.rs"
+
+[dependencies]
+anyhow.workspace = true
+arbitrary.workspace = true
+async-trait.workspace = true
+fidl-fuchsia-wlan-common = { path = "../../../../sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../../../../sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-sme = { path = "../../../../sdk/fidl/fuchsia.wlan.sme" }
+fuchsia-async = { path = "../../../lib/fuchsia-async-host" }
+fuchsia-inspect = { path = "../../../lib/diagnostics/inspect/rust" }
+fuchsia-inspect-contrib = { path = "../../../lib/diagnostics/inspect/contrib/rust" }
+futures.workspace = true
+ieee80211.workspace = true
+log.workspace = true
+rand.workspace = true
+wlan-common = { path = "../lib/common/rust" }
+zx = { path = "../../../../sdk/rust/zx" }
+
+[features]
+default = ["host-selection"]
+host-selection = []

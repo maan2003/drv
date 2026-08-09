@@ -6,6 +6,7 @@ members = [
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",
   "../../wlan/lib/bitfield", "../../wlan/lib/bitfield/wlan-bitfield-tests",
   "../../wlan/lib/common/rust", "../../wlan/lib/mlme/rust", "../../wlan/lib/softmac-port", "../../wlan/lib/eapol", "../../wlan/lib/fcg-crypto", "../../wlan/lib/frame_writer", "../../wlan/lib/ieee80211", "../../wlan/lib/rsn", "../../wlan/lib/sme",
+  "../../wlan/wlancfg",
   "../../../lib/mundane",
   "../../../lib/fuchsia-sync",
   "../../../lib/diagnostics/inspect/rust", "../../../lib/diagnostics/inspect/contrib/rust",
