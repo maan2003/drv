@@ -420,6 +420,34 @@ end. Cleanup and restoration returned success. The watchdog rebooted after the
 expected SSH loss; boot `0a4aa41e-1202-4228-bc1b-a0a0738d214d` restored
 `mt7921e`, iwd, `wlan0`, and its default route. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T165608Z-0000_05_00.0.log`.
+
+The no-frame power setup gate then bound rate-power programming to a fresh,
+exact channel-36 direct-beacon observation for the configured BSSID and SSID.
+The first run failed closed after a source-exact scan returned no observation;
+report `/var/lib/wifi-driver-lab/reports/20260809T182415Z-0000_05_00.0.log`
+has SHA-256
+`a337221f451f6b2cbeb50c81dc43d74c1098c8dc73b4b5c480a9ecb22ce77073`.
+A bounded follow-up proved that a fresh second scan could authorize the target,
+then exposed the incorrect use of `MCU_EVENT_ACCESS_REG` (`0x02`) for the
+legacy CE register response; report
+`/var/lib/wifi-driver-lab/reports/20260809T183545Z-0000_05_00.0.log` has
+SHA-256
+`cd4f36e96a842beec26acb7f5a58667f572d6817932e99dbd5d4f7d2ed71b271`.
+Both runs reset and restored cleanly before any frame-publish path.
+
+Release SHA-256
+`a65b97d2d8d8484fc4dfb71fbd8e6489f533eee95f0afba23756dd7246eefe75`
+completed the corrected setup gate. It authorized the exact direct ESS beacon,
+consumed all eight conservative rate-power batches, and accepted each
+sequence-correlated, solicited `MCU_EVENT_REG_ACCESS` (`0x05`) response with
+reported length 20 and exact `MT_PSE_BASE`. It emitted
+`no_frame_gate_passed` with beacon authorization and rate-power consumption
+true and management-frame publication unreachable. Cleanup, supervisor
+restore, native `mt7921e`/iwd reconnection, and watchdog disarm all succeeded
+without reboot. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T184307Z-0000_05_00.0.log` (SHA-256
+`2afbe77624cfb25da68c52223891fbcf39aeb20193aa65883c2d77b93b6dfe21`).
+
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
