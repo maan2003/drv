@@ -313,6 +313,9 @@ fn run() -> Result<(), String> {
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
+    if operation.is_active_mcu() {
+        verify_external_watchdog_armed()?;
+    }
 
     let device = OpenOptions::new()
         .read(true)
@@ -1630,6 +1633,52 @@ fn set_lab_safety(value: &str) -> Result<(), String> {
         .map_err(|_| "DRV_LAB_SAFETY_STATE is required for mutating operations")?;
     std::fs::write(&path, format!("{value}\n"))
         .map_err(|error| format!("write lab safety state {path}: {error}"))
+}
+
+fn verify_external_watchdog_armed() -> Result<(), String> {
+    let output = Command::new("wifi-lab-watchdog")
+        .arg("status")
+        .output()
+        .map_err(|error| format!("query external reboot watchdog: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "external reboot watchdog status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let status = String::from_utf8(output.stdout)
+        .map_err(|_| "external reboot watchdog status was not UTF-8".to_string())?;
+    verify_watchdog_status(&status, unix_time_seconds()?)
+}
+
+fn unix_time_seconds() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| format!("read wall clock for reboot watchdog: {error}"))
+}
+
+fn verify_watchdog_status(status: &str, now: u64) -> Result<(), String> {
+    let mut lines = status.lines();
+    let first = lines.next().unwrap_or_default();
+    let deadline = first
+        .strip_prefix("armed deadline=")
+        .ok_or_else(|| "external reboot watchdog is not armed".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "external reboot watchdog deadline is invalid".to_string())?;
+    if deadline <= now {
+        return Err("external reboot watchdog deadline has expired".into());
+    }
+    let mut active = false;
+    let mut waiting = false;
+    for line in lines {
+        active |= line == "ActiveState=active";
+        waiting |= line == "SubState=waiting";
+    }
+    if !active || !waiting {
+        return Err("external reboot watchdog timer is not active and waiting".into());
+    }
+    Ok(())
 }
 
 fn retain_mappings_for_watchdog(message: &str) -> ! {
@@ -4741,5 +4790,30 @@ mod tests {
         region.flags &= !VFIO_REGION_INFO_FLAG_MMAP;
         assert!(validate_region_mapping(&region, false).is_err());
         assert!(validate_region_mapping(&region, true).is_err());
+    }
+
+    #[test]
+    fn watchdog_must_be_armed_active_waiting_and_unexpired() {
+        assert!(
+            verify_watchdog_status(
+                "armed deadline=200\nActiveState=active\nSubState=waiting\n",
+                100,
+            )
+            .is_ok()
+        );
+        for status in [
+            "disarmed\n",
+            "armed deadline=200\nActiveState=inactive\nSubState=dead\n",
+            "armed deadline=invalid\nActiveState=active\nSubState=waiting\n",
+        ] {
+            assert!(verify_watchdog_status(status, 100).is_err());
+        }
+        assert!(
+            verify_watchdog_status(
+                "armed deadline=100\nActiveState=active\nSubState=waiting\n",
+                100,
+            )
+            .is_err()
+        );
     }
 }
