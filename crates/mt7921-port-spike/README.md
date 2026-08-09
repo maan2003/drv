@@ -350,6 +350,15 @@ disarmed without reboot. On unchanged boot
 `34c7207e-885b-4d1c-987c-e691c079285c`, `mt7921e` and iwd were active and
 `wlan1` held the default route. The durable report is
 `/var/lib/wifi-driver-lab/reports/20260809T161754Z-0000_05_00.0.log`.
+
+A subsequent bounded gate reused the same initialized adapter for sequential
+passive dwells on channels 1 and 6. Release SHA-256
+`dde2f8f05a5d93bf6a9d1d09a32c238ba7845db1a7441d6f3c2fd818ddf921c2`
+matched both scan completions and accepted one beacon on each channel before
+emitting `sequential_gate_passed`. Cleanup, restoration, and watchdog disarm
+all succeeded without reboot; `mt7921e`, iwd, and the default route remained
+healthy on the same boot. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T162215Z-0000_05_00.0.log`.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
