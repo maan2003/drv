@@ -3181,6 +3181,119 @@ pub enum PassiveRxError {
     InvalidChannel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMacMmioOperation {
+    Rmw {
+        address: u32,
+        mask: u32,
+        value: u32,
+    },
+    WtblClear {
+        index: u8,
+        address: u32,
+        value: u32,
+        busy_mask: u32,
+        timeout_us: u32,
+    },
+}
+
+/// Exact ordered MMIO closure from pinned `mt7921_mac_init` and
+/// `mt792x_mac_init_band`. Physical code must execute and verify every entry;
+/// partial support is not sufficient to attest `mac_mmio_initialized`.
+pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
+    let mut plan = vec![
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d004,
+            mask: 0x0000_fff8,
+            value: 1536 << 3,
+        },
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d000,
+            mask: 1 << 15,
+            value: 1 << 15,
+        },
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d000,
+            mask: 1 << 19,
+            value: 1 << 19,
+        },
+    ];
+    plan.extend((0..20).map(|index| PassiveMacMmioOperation::WtblClear {
+        index,
+        address: 0x820d_4230,
+        value: u32::from(index) | (1 << 12),
+        busy_mask: 1 << 31,
+        timeout_us: 5000,
+    }));
+    for band in 0..2 {
+        let (tmac, dma, rmac, mib, wtbloff) = if band == 0 {
+            (
+                0x820e_4000,
+                0x820e_7000,
+                0x820e_5000,
+                0x820e_d000,
+                0x820e_9000,
+            )
+        } else {
+            (
+                0x820f_4000,
+                0x820f_7000,
+                0x820f_5000,
+                0x820f_d000,
+                0x820f_9000,
+            )
+        };
+        plan.extend([
+            PassiveMacMmioOperation::Rmw {
+                address: tmac + 0x0f4,
+                mask: 0x3f,
+                value: 0x3f,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: tmac + 0x0f4,
+                mask: (1 << 17) | (1 << 18),
+                value: (1 << 17) | (1 << 18),
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: rmac + 0x03c4,
+                mask: 1 << 30,
+                value: 1 << 30,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: rmac + 0x0380,
+                mask: 1 << 30,
+                value: 1 << 30,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: mib + 0x004,
+                mask: 1 << 8,
+                value: 1 << 8,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: mib + 0x004,
+                mask: 1 << 9,
+                value: 1 << 9,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: dma,
+                mask: 0x0000_fff8,
+                value: 1536 << 3,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: dma,
+                mask: 1 << 23,
+                value: 0,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: wtbloff + 0x008,
+                mask: (3 << 30) | (3 << 24),
+                value: 3 << 24,
+            },
+        ]);
+    }
+    plan
+}
+
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
     let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
     if response.event_id != 0x0d || response.sequence != 0 {
@@ -6165,6 +6278,52 @@ mod tests {
         assert_eq!(
             parse_passive_advertisement(&rx),
             Err(PassiveRxError::UnsupportedFrame)
+        );
+    }
+
+    #[test]
+    fn passive_mac_mmio_plan_covers_every_mandatory_source_write() {
+        let plan = passive_mac_mmio_plan();
+        assert_eq!(plan.len(), 41);
+        assert_eq!(
+            &plan[..3],
+            &[
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d004,
+                    mask: 0xfff8,
+                    value: 1536 << 3,
+                },
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d000,
+                    mask: 1 << 15,
+                    value: 1 << 15,
+                },
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d000,
+                    mask: 1 << 19,
+                    value: 1 << 19,
+                },
+            ]
+        );
+        for (index, operation) in plan[3..23].iter().enumerate() {
+            assert_eq!(
+                *operation,
+                PassiveMacMmioOperation::WtblClear {
+                    index: index as u8,
+                    address: 0x820d_4230,
+                    value: index as u32 | (1 << 12),
+                    busy_mask: 1 << 31,
+                    timeout_us: 5000,
+                }
+            );
+        }
+        assert_eq!(
+            plan.last(),
+            Some(&PassiveMacMmioOperation::Rmw {
+                address: 0x820f_9008,
+                mask: (3 << 30) | (3 << 24),
+                value: 3 << 24,
+            })
         );
     }
 
