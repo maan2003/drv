@@ -95,6 +95,16 @@ and events to its `MlmeRequest`/`MlmeEvent` state-machine boundary. Therefore a
 host port should adapt `wlancfg` to an in-process SME command/event interface;
 it should not recreate FIDL channels or bypass SME by duplicating MLME policy.
 
+### WLAN authority map
+
+| State or operation | Sole owner | Host/backend boundary |
+|---|---|---|
+| Country and regulatory lifecycle | Pinned `wlancfg/regulatory_manager.rs` plus `IfaceManager`/`PhyManager` | The host supplies authoritative location and `DeviceMonitor.SetCountry/ClearCountry`; stop/recreate/reconnect ordering remains Fuchsia policy. |
+| World-domain beacon hint | Narrow regulatory capability adapter at the scan boundary | A direct error-free ESS beacon may mint only a run/scoped channel capability. It does not set country, interpret AP Country IE as authority, or become MT7921 policy. |
+| Client authentication, association, SAE timers/retries, RSN and connect result | Full pinned client MLME plus `wlan-sme`/`wlan-rsn` | Package the production state machine and adapt its existing request/event seam. The extracted `open_client` and VFIO SAE loop are offline scaffolding, not a second connect implementation. |
+| Rate/SAR power tables, MCU commands, WFDMA descriptors, completion and key programming | MT7921 backend | The backend consumes already-authorized channel/power inputs and reports mechanics completion; it owns no country, scan-selection, credential, retry, or connect policy. |
+| Direct VFIO orchestration | Temporary no-plastic lab harness | Bounded evidence collection only. It is not a production service boundary and must not accumulate WLAN policy. |
+
 ### Smallest staged closure
 
 1. Package and test the decision core: `client/types.rs`,
