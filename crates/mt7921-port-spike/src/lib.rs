@@ -4929,6 +4929,1234 @@ pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError
     })
 }
 
+#[allow(dead_code)]
+mod active_authority {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GenerationAxis {
+        Device,
+        Reset,
+        Firmware,
+        Ownership,
+        Domain,
+        Channel,
+        Power,
+        Scan,
+        Target,
+        Attempt,
+    }
+
+    impl GenerationAxis {
+        const COUNT: usize = 10;
+
+        const fn index(self) -> usize {
+            self as usize
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AxisState {
+        Current,
+        Pending,
+        Unknown,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AuthorityError {
+        GenerationExhausted(GenerationAxis),
+        InvalidTransition,
+        StaleObservation,
+        TerminalAlreadySelected,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Invalidation {
+        Device,
+        Reset,
+        Firmware,
+        Ownership,
+        Domain,
+        Channel,
+        Power,
+        Scan,
+        Target,
+    }
+
+    #[derive(Clone, Copy)]
+    struct InvalidationRule {
+        cause: Invalidation,
+        axes: &'static [GenerationAxis],
+        clears: EvidenceMask,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EvidenceMask(u8);
+
+    impl EvidenceMask {
+        const DISCOVERY: Self = Self(1 << 0);
+        const FINAL_OBSERVATION: Self = Self(1 << 1);
+        const BEACON: Self = Self(1 << 2);
+        const POWER: Self = Self(1 << 3);
+        const LEASE: Self = Self(1 << 4);
+        const ATTEMPT: Self = Self(1 << 5);
+        const ALL: Self = Self(u8::MAX);
+
+        const fn union(self, other: Self) -> Self {
+            Self(self.0 | other.0)
+        }
+
+        const fn contains(self, other: Self) -> bool {
+            self.0 & other.0 != 0
+        }
+    }
+
+    const INVALIDATION_RULES: &[InvalidationRule] = &[
+        InvalidationRule {
+            cause: Invalidation::Device,
+            axes: &[
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Reset,
+            axes: &[
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Firmware,
+            axes: &[GenerationAxis::Firmware],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Ownership,
+            axes: &[GenerationAxis::Ownership],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Domain,
+            axes: &[
+                GenerationAxis::Domain,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Channel,
+            axes: &[
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+            ],
+            // TargetPending deliberately survives the retune that starts its
+            // final verification lineage; observations do not.
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::POWER)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Power,
+            axes: &[GenerationAxis::Power],
+            clears: EvidenceMask::POWER
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Scan,
+            axes: &[GenerationAxis::Scan],
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Target,
+            axes: &[GenerationAxis::Target],
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::POWER)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+    ];
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ObservationId(u64);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TargetFingerprint(u64);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Observation {
+        id: ObservationId,
+        fingerprint: TargetFingerprint,
+        device: u64,
+        reset: u64,
+        firmware: u64,
+        ownership: u64,
+        domain: u64,
+        channel: u64,
+        scan: u64,
+        target: Option<u64>,
+        slot_epoch: u64,
+        sealed: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TargetState {
+        None,
+        Pending {
+            generation: u64,
+            discovery: ObservationId,
+            fingerprint: TargetFingerprint,
+        },
+        Current {
+            generation: u64,
+            discovery: ObservationId,
+            final_observation: ObservationId,
+        },
+        Unknown {
+            generation: u64,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AttemptState {
+        None,
+        Live {
+            generation: u64,
+        },
+        Staged {
+            generation: u64,
+        },
+        Committing {
+            generation: u64,
+            abort_requested: bool,
+        },
+        InFlight {
+            generation: u64,
+            abort_requested: bool,
+        },
+        Spent {
+            generation: u64,
+        },
+        Revoked {
+            generation: u64,
+            may_have_transmitted: bool,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TerminalResult {
+        CancelledBeforePublish,
+        Completed,
+        MayHaveTransmitted,
+        Contained,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CancellationDisposition {
+        NoAttempt,
+        CancelledBeforePublish,
+        AbortInFlight,
+        AlreadyTerminal,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReleaseClassification {
+        Released,
+        HardwareSafeReleaseError,
+        ParkUnsafe,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum InvalidationStep {
+        Revoked,
+        Advanced(GenerationAxis),
+        Pending(GenerationAxis),
+        Faulted,
+    }
+
+    #[derive(Debug)]
+    struct AuthorityModel {
+        generations: [u64; GenerationAxis::COUNT],
+        axis_states: [AxisState; GenerationAxis::COUNT],
+        discovery: Option<Observation>,
+        final_observation: Option<Observation>,
+        beacon_evidence: bool,
+        power_evidence: bool,
+        lease: bool,
+        target: TargetState,
+        attempt: AttemptState,
+        terminal: Option<TerminalResult>,
+        next_observation: u64,
+        faulted: bool,
+        attempt_authorized: bool,
+        invalidation_trace: [Option<InvalidationStep>; 24],
+        invalidation_trace_len: usize,
+    }
+
+    impl AuthorityModel {
+        #[cfg(test)]
+        fn new_for_test() -> Self {
+            Self {
+                generations: [0; GenerationAxis::COUNT],
+                axis_states: [AxisState::Current; GenerationAxis::COUNT],
+                discovery: None,
+                final_observation: None,
+                beacon_evidence: false,
+                power_evidence: false,
+                lease: false,
+                target: TargetState::None,
+                attempt: AttemptState::None,
+                terminal: None,
+                next_observation: 1,
+                faulted: false,
+                attempt_authorized: false,
+                invalidation_trace: [None; 24],
+                invalidation_trace_len: 0,
+            }
+        }
+
+        fn generation(&self, axis: GenerationAxis) -> u64 {
+            self.generations[axis.index()]
+        }
+
+        fn advance(&mut self, axis: GenerationAxis) -> Result<u64, AuthorityError> {
+            let Some(generation) = self.generations[axis.index()].checked_add(1) else {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(axis));
+            };
+            self.generations[axis.index()] = generation;
+            Ok(generation)
+        }
+
+        fn fault(&mut self) {
+            self.clear(EvidenceMask::ALL);
+            self.axis_states.fill(AxisState::Unknown);
+            self.faulted = true;
+            self.trace(InvalidationStep::Faulted);
+        }
+
+        fn trace(&mut self, step: InvalidationStep) {
+            self.invalidation_trace[self.invalidation_trace_len] = Some(step);
+            self.invalidation_trace_len += 1;
+        }
+
+        fn rule(cause: Invalidation) -> &'static InvalidationRule {
+            INVALIDATION_RULES
+                .iter()
+                .find(|rule| rule.cause == cause)
+                .expect("every invalidation has an explicit rule")
+        }
+
+        fn begin_invalidation(&mut self, cause: Invalidation) -> Result<(), AuthorityError> {
+            if self.faulted {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let rule = *Self::rule(cause);
+            self.invalidation_trace.fill(None);
+            self.invalidation_trace_len = 0;
+            if let Some(axis) = rule
+                .axes
+                .iter()
+                .copied()
+                .find(|axis| self.generation(*axis) == u64::MAX)
+            {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(axis));
+            }
+            // Revocation is deliberately encoded before generation/state
+            // mutation. Preflight above makes the remaining updates infallible.
+            self.clear(rule.clears);
+            self.trace(InvalidationStep::Revoked);
+            for axis in rule.axes {
+                self.advance(*axis)?;
+                self.trace(InvalidationStep::Advanced(*axis));
+                self.axis_states[axis.index()] = AxisState::Pending;
+                self.trace(InvalidationStep::Pending(*axis));
+            }
+            Ok(())
+        }
+
+        fn confirm(&mut self, axis: GenerationAxis) -> Result<(), AuthorityError> {
+            if self.faulted
+                || axis == GenerationAxis::Target
+                || self.axis_states[axis.index()] != AxisState::Pending
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.axis_states[axis.index()] = AxisState::Current;
+            Ok(())
+        }
+
+        fn fail(&mut self, axis: GenerationAxis) -> Result<(), AuthorityError> {
+            if self.faulted || self.axis_states[axis.index()] != AxisState::Pending {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.fault();
+            Ok(())
+        }
+
+        fn clear(&mut self, mask: EvidenceMask) {
+            if mask.contains(EvidenceMask::DISCOVERY) {
+                self.discovery = None;
+            }
+            if mask.contains(EvidenceMask::FINAL_OBSERVATION) {
+                self.final_observation = None;
+            }
+            if mask.contains(EvidenceMask::BEACON) {
+                self.beacon_evidence = false;
+            }
+            if mask.contains(EvidenceMask::POWER) {
+                self.power_evidence = false;
+            }
+            if mask.contains(EvidenceMask::LEASE) {
+                self.lease = false;
+                self.attempt_authorized = false;
+            }
+            if mask.contains(EvidenceMask::ATTEMPT) {
+                self.revoke_attempt();
+            }
+            if mask.0 == EvidenceMask::ALL.0 {
+                self.target = TargetState::None;
+            }
+        }
+
+        fn current_for_observation(&self) -> bool {
+            [
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Scan,
+            ]
+            .into_iter()
+            .all(|axis| self.axis_states[axis.index()] == AxisState::Current)
+        }
+
+        fn observation_is_current(&self, observation: Observation) -> bool {
+            observation.device == self.generation(GenerationAxis::Device)
+                && observation.reset == self.generation(GenerationAxis::Reset)
+                && observation.firmware == self.generation(GenerationAxis::Firmware)
+                && observation.ownership == self.generation(GenerationAxis::Ownership)
+                && observation.domain == self.generation(GenerationAxis::Domain)
+                && observation.channel == self.generation(GenerationAxis::Channel)
+                && observation.scan == self.generation(GenerationAxis::Scan)
+                && observation.slot_epoch == observation.scan
+                && self.current_for_observation()
+        }
+
+        fn make_observation(
+            &mut self,
+            fingerprint: TargetFingerprint,
+            target: Option<u64>,
+            slot_epoch: u64,
+        ) -> Result<Observation, AuthorityError> {
+            if !self.current_for_observation()
+                || slot_epoch != self.generation(GenerationAxis::Scan)
+            {
+                return Err(AuthorityError::StaleObservation);
+            }
+            let id = ObservationId(self.next_observation);
+            let Some(next_observation) = self.next_observation.checked_add(1) else {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(GenerationAxis::Scan));
+            };
+            self.next_observation = next_observation;
+            Ok(Observation {
+                id,
+                fingerprint,
+                device: self.generation(GenerationAxis::Device),
+                reset: self.generation(GenerationAxis::Reset),
+                firmware: self.generation(GenerationAxis::Firmware),
+                ownership: self.generation(GenerationAxis::Ownership),
+                domain: self.generation(GenerationAxis::Domain),
+                channel: self.generation(GenerationAxis::Channel),
+                scan: self.generation(GenerationAxis::Scan),
+                target,
+                slot_epoch,
+                sealed: false,
+            })
+        }
+
+        fn record_discovery(
+            &mut self,
+            fingerprint: TargetFingerprint,
+        ) -> Result<ObservationId, AuthorityError> {
+            let observation =
+                self.make_observation(fingerprint, None, self.generation(GenerationAxis::Scan))?;
+            self.discovery = Some(observation);
+            Ok(observation.id)
+        }
+
+        fn begin_final_target(&mut self, discovery: ObservationId) -> Result<u64, AuthorityError> {
+            let observation = self
+                .discovery
+                .filter(|observation| observation.id == discovery)
+                .ok_or(AuthorityError::StaleObservation)?;
+            self.begin_invalidation(Invalidation::Target)?;
+            let generation = self.generation(GenerationAxis::Target);
+            self.target = TargetState::Pending {
+                generation,
+                discovery,
+                fingerprint: observation.fingerprint,
+            };
+            Ok(generation)
+        }
+
+        fn record_final_observation(
+            &mut self,
+            fingerprint: TargetFingerprint,
+            slot_epoch: u64,
+        ) -> Result<ObservationId, AuthorityError> {
+            let (generation, discovery) = match self.target {
+                TargetState::Pending {
+                    generation,
+                    discovery,
+                    ..
+                } => (generation, discovery),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let discovery_scan = self
+                .discovery
+                .filter(|observation| observation.id == discovery)
+                .map(|observation| observation.scan)
+                .ok_or(AuthorityError::StaleObservation)?;
+            if !self.power_evidence || self.generation(GenerationAxis::Scan) <= discovery_scan {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let observation = self.make_observation(fingerprint, Some(generation), slot_epoch)?;
+            self.final_observation = Some(observation);
+            Ok(observation.id)
+        }
+
+        fn seal_final_observation(
+            &mut self,
+            observation: ObservationId,
+            matching_terminal: bool,
+            ring_drained: bool,
+            irq_drained: bool,
+        ) -> Result<(), AuthorityError> {
+            let current_scan = self.generation(GenerationAxis::Scan);
+            let current_target = self.generation(GenerationAxis::Target);
+            let candidate = self
+                .final_observation
+                .filter(|candidate| candidate.id == observation)
+                .ok_or(AuthorityError::StaleObservation)?;
+            if !matching_terminal
+                || !ring_drained
+                || !irq_drained
+                || candidate.scan != current_scan
+                || candidate.slot_epoch != current_scan
+                || candidate.target != Some(current_target)
+                || !self.observation_is_current(candidate)
+            {
+                return Err(AuthorityError::StaleObservation);
+            }
+            self.final_observation
+                .as_mut()
+                .filter(|candidate| candidate.id == observation)
+                .expect("candidate was checked above")
+                .sealed = true;
+            Ok(())
+        }
+
+        fn matching_join(
+            &mut self,
+            final_observation: ObservationId,
+        ) -> Result<(), AuthorityError> {
+            let (generation, discovery, fingerprint) = match self.target {
+                TargetState::Pending {
+                    generation,
+                    discovery,
+                    fingerprint,
+                } => (generation, discovery, fingerprint),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let observation = self.final_observation.filter(|observation| {
+                observation.id == final_observation
+                    && observation.sealed
+                    && observation.fingerprint == fingerprint
+                    && observation.target == Some(generation)
+                    && self.observation_is_current(*observation)
+            });
+            let Some(observation) = observation else {
+                self.reject_join()?;
+                return Err(AuthorityError::StaleObservation);
+            };
+            self.beacon_evidence = true;
+            self.target = TargetState::Current {
+                generation,
+                discovery,
+                final_observation: observation.id,
+            };
+            self.axis_states[GenerationAxis::Target.index()] = AxisState::Current;
+            Ok(())
+        }
+
+        fn reject_join(&mut self) -> Result<(), AuthorityError> {
+            self.begin_invalidation(Invalidation::Target)?;
+            let generation = self.generation(GenerationAxis::Target);
+            self.target = TargetState::Unknown { generation };
+            self.axis_states[GenerationAxis::Target.index()] = AxisState::Unknown;
+            Ok(())
+        }
+
+        fn install_power_evidence(&mut self) -> Result<(), AuthorityError> {
+            if self.axis_states[GenerationAxis::Power.index()] != AxisState::Current
+                || !matches!(
+                    self.target,
+                    TargetState::Pending { .. } | TargetState::Current { .. }
+                )
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.power_evidence = true;
+            Ok(())
+        }
+
+        fn reserve_attempt(&mut self) -> Result<u64, AuthorityError> {
+            if self.faulted
+                || !self.attempt_authorized
+                || !self.beacon_evidence
+                || !self.power_evidence
+                || !matches!(self.target, TargetState::Current { .. })
+                || !matches!(
+                    self.attempt,
+                    AttemptState::None | AttemptState::Spent { .. } | AttemptState::Revoked { .. }
+                )
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let generation = self.advance(GenerationAxis::Attempt)?;
+            self.axis_states[GenerationAxis::Attempt.index()] = AxisState::Current;
+            self.attempt_authorized = false;
+            self.lease = true;
+            self.terminal = None;
+            self.attempt = AttemptState::Live { generation };
+            Ok(generation)
+        }
+
+        fn authorize_attempt(&mut self) -> Result<(), AuthorityError> {
+            let lineage_closed = matches!(
+                self.attempt,
+                AttemptState::None | AttemptState::Spent { .. }
+            ) || matches!(self.attempt, AttemptState::Revoked { .. })
+                && self.terminal.is_some();
+            if self.faulted
+                || self.attempt_authorized
+                || !lineage_closed
+                || !self.beacon_evidence
+                || !self.power_evidence
+                || !matches!(self.target, TargetState::Current { .. })
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.attempt_authorized = true;
+            Ok(())
+        }
+
+        fn stage(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Live { generation } => AttemptState::Staged { generation },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            Ok(())
+        }
+
+        fn commit(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Staged { generation } => AttemptState::Committing {
+                    generation,
+                    abort_requested: false,
+                },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn submitted(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Committing {
+                    generation,
+                    abort_requested,
+                } => AttemptState::InFlight {
+                    generation,
+                    abort_requested,
+                },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<CancellationDisposition, AuthorityError> {
+            match self.attempt {
+                AttemptState::None => Ok(CancellationDisposition::NoAttempt),
+                AttemptState::Live { generation } | AttemptState::Staged { generation } => {
+                    self.attempt = AttemptState::Revoked {
+                        generation,
+                        may_have_transmitted: false,
+                    };
+                    self.lease = false;
+                    self.select_terminal(TerminalResult::CancelledBeforePublish)?;
+                    Ok(CancellationDisposition::CancelledBeforePublish)
+                }
+                AttemptState::Committing { generation, .. } => {
+                    // The publication linearization decision won. The caller
+                    // cannot be told that no effect occurred.
+                    self.attempt = AttemptState::Committing {
+                        generation,
+                        abort_requested: true,
+                    };
+                    Ok(CancellationDisposition::AbortInFlight)
+                }
+                AttemptState::InFlight { generation, .. } => {
+                    self.attempt = AttemptState::InFlight {
+                        generation,
+                        abort_requested: true,
+                    };
+                    Ok(CancellationDisposition::AbortInFlight)
+                }
+                AttemptState::Spent { .. } | AttemptState::Revoked { .. } => {
+                    Ok(CancellationDisposition::AlreadyTerminal)
+                }
+            }
+        }
+
+        fn finish_attempt(&mut self, result: TerminalResult) -> Result<(), AuthorityError> {
+            let generation = match (self.attempt, result) {
+                (
+                    AttemptState::Committing { generation, .. },
+                    TerminalResult::MayHaveTransmitted | TerminalResult::Contained,
+                )
+                | (AttemptState::InFlight { generation, .. }, TerminalResult::Completed)
+                | (
+                    AttemptState::InFlight { generation, .. },
+                    TerminalResult::MayHaveTransmitted | TerminalResult::Contained,
+                ) => generation,
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.select_terminal(result)?;
+            self.attempt = AttemptState::Spent { generation };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn finish_revoked_attempt(&mut self) -> Result<TerminalResult, AuthorityError> {
+            let (generation, may_have_transmitted) = match self.attempt {
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted,
+                } => (generation, may_have_transmitted),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let result = if may_have_transmitted {
+                TerminalResult::MayHaveTransmitted
+            } else {
+                TerminalResult::Contained
+            };
+            self.select_terminal(result)?;
+            self.attempt = AttemptState::Spent { generation };
+            Ok(result)
+        }
+
+        fn select_terminal(&mut self, result: TerminalResult) -> Result<(), AuthorityError> {
+            if self.terminal.is_some() {
+                return Err(AuthorityError::TerminalAlreadySelected);
+            }
+            self.terminal = Some(result);
+            Ok(())
+        }
+
+        fn revoke_attempt(&mut self) {
+            let revoked = match self.attempt {
+                AttemptState::Live { generation } | AttemptState::Staged { generation } => {
+                    Some((generation, false))
+                }
+                AttemptState::Committing { generation, .. }
+                | AttemptState::InFlight { generation, .. } => Some((generation, true)),
+                AttemptState::None | AttemptState::Spent { .. } | AttemptState::Revoked { .. } => {
+                    None
+                }
+            };
+            if let Some((generation, may_have_transmitted)) = revoked {
+                self.attempt = AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted,
+                };
+            }
+            self.lease = false;
+        }
+
+        const fn classify_release(
+            hardware_safe: bool,
+            observable_release_failed: bool,
+        ) -> ReleaseClassification {
+            if !hardware_safe {
+                ReleaseClassification::ParkUnsafe
+            } else if observable_release_failed {
+                ReleaseClassification::HardwareSafeReleaseError
+            } else {
+                ReleaseClassification::Released
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn seed_ready_model() -> AuthorityModel {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(7)).unwrap();
+            let target = model.begin_final_target(discovery).unwrap();
+            assert_eq!(target, 1);
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let final_observation = model
+                .record_final_observation(TargetFingerprint(7), 1)
+                .unwrap();
+            model
+                .seal_final_observation(final_observation, true, true, true)
+                .unwrap();
+            model.matching_join(final_observation).unwrap();
+            model
+        }
+
+        fn reserve_authorized_attempt(model: &mut AuthorityModel) -> u64 {
+            model.authorize_attempt().unwrap();
+            model.reserve_attempt().unwrap()
+        }
+
+        #[test]
+        fn invalidation_table_is_complete_and_revoke_first() {
+            let all_causes = [
+                Invalidation::Device,
+                Invalidation::Reset,
+                Invalidation::Firmware,
+                Invalidation::Ownership,
+                Invalidation::Domain,
+                Invalidation::Channel,
+                Invalidation::Power,
+                Invalidation::Scan,
+                Invalidation::Target,
+            ];
+            assert_eq!(INVALIDATION_RULES.len(), all_causes.len());
+            for cause in all_causes {
+                let mut model = seed_ready_model();
+                let _ = reserve_authorized_attempt(&mut model);
+                let before = model.generations;
+                let rule = *AuthorityModel::rule(cause);
+                model.begin_invalidation(cause).unwrap();
+                for axis in rule.axes {
+                    assert_eq!(model.generation(*axis), before[axis.index()] + 1);
+                    assert_eq!(model.axis_states[axis.index()], AxisState::Pending);
+                }
+                if rule.clears.contains(EvidenceMask::LEASE) {
+                    assert!(!model.lease);
+                }
+                if rule.clears.contains(EvidenceMask::ATTEMPT) {
+                    assert!(matches!(model.attempt, AttemptState::Revoked { .. }));
+                }
+                assert_eq!(model.invalidation_trace[0], Some(InvalidationStep::Revoked));
+                for (index, axis) in rule.axes.iter().copied().enumerate() {
+                    assert_eq!(
+                        model.invalidation_trace[1 + index * 2],
+                        Some(InvalidationStep::Advanced(axis))
+                    );
+                    assert_eq!(
+                        model.invalidation_trace[2 + index * 2],
+                        Some(InvalidationStep::Pending(axis))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn failed_transition_never_restores_authority() {
+            let mut model = seed_ready_model();
+            model.begin_invalidation(Invalidation::Firmware).unwrap();
+            model.fail(GenerationAxis::Firmware).unwrap();
+            assert_eq!(
+                model.axis_states[GenerationAxis::Firmware.index()],
+                AxisState::Unknown
+            );
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(!model.lease);
+            assert!(model.faulted);
+            assert_eq!(
+                model.confirm(GenerationAxis::Firmware),
+                Err(AuthorityError::InvalidTransition)
+            );
+            assert_eq!(
+                model.begin_invalidation(Invalidation::Firmware),
+                Err(AuthorityError::InvalidTransition)
+            );
+        }
+
+        #[test]
+        fn generation_exhaustion_fails_before_wrap() {
+            for axis in [
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+                GenerationAxis::Attempt,
+            ] {
+                let mut model = AuthorityModel::new_for_test();
+                model.generations[axis.index()] = u64::MAX;
+                assert_eq!(
+                    model.advance(axis),
+                    Err(AuthorityError::GenerationExhausted(axis))
+                );
+                assert_eq!(model.generation(axis), u64::MAX);
+                assert!(model.faulted);
+                assert!(
+                    model
+                        .axis_states
+                        .iter()
+                        .all(|state| *state == AxisState::Unknown)
+                );
+            }
+        }
+
+        #[test]
+        fn multi_axis_invalidation_is_atomic_at_generation_exhaustion() {
+            let mut model = seed_ready_model();
+            model.generations[GenerationAxis::Ownership.index()] = u64::MAX;
+            let generations = model.generations;
+            assert_eq!(
+                model.begin_invalidation(Invalidation::Reset),
+                Err(AuthorityError::GenerationExhausted(
+                    GenerationAxis::Ownership
+                ))
+            );
+            assert_eq!(model.generations, generations);
+            assert!(model.faulted);
+            assert!(
+                model
+                    .axis_states
+                    .iter()
+                    .all(|state| *state == AxisState::Unknown)
+            );
+            assert_eq!(model.target, TargetState::None);
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(!model.lease);
+        }
+
+        #[test]
+        fn observation_and_attempt_exhaustion_poison_authority() {
+            let mut observation = seed_ready_model();
+            observation.next_observation = u64::MAX;
+            assert_eq!(
+                observation.record_discovery(TargetFingerprint(17)),
+                Err(AuthorityError::GenerationExhausted(GenerationAxis::Scan))
+            );
+            assert!(observation.faulted);
+            assert!(!observation.beacon_evidence);
+
+            let mut attempt = seed_ready_model();
+            attempt.generations[GenerationAxis::Attempt.index()] = u64::MAX;
+            attempt.authorize_attempt().unwrap();
+            assert_eq!(
+                attempt.reserve_attempt(),
+                Err(AuthorityError::GenerationExhausted(GenerationAxis::Attempt))
+            );
+            assert!(attempt.faulted);
+            assert!(!attempt.beacon_evidence);
+            assert!(!attempt.power_evidence);
+        }
+
+        #[test]
+        fn invalidation_revokes_without_replacing_attempt_generation() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.begin_invalidation(Invalidation::Channel).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(
+                model.attempt,
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted: false,
+                }
+            );
+        }
+
+        #[test]
+        fn post_commit_invalidation_remains_may_have_transmitted() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            model.begin_invalidation(Invalidation::Reset).unwrap();
+            assert_eq!(
+                model.attempt,
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted: true,
+                }
+            );
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(model.terminal, None);
+            assert_eq!(
+                model.finish_revoked_attempt().unwrap(),
+                TerminalResult::MayHaveTransmitted
+            );
+            assert_eq!(model.terminal, Some(TerminalResult::MayHaveTransmitted));
+            assert_eq!(
+                model.finish_revoked_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+        }
+
+        #[test]
+        fn final_observation_requires_current_slot_and_terminal_proof() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(9)).unwrap();
+            model.begin_final_target(discovery).unwrap();
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            assert_eq!(
+                model.record_final_observation(TargetFingerprint(9), 0),
+                Err(AuthorityError::StaleObservation)
+            );
+            let observation = model
+                .record_final_observation(TargetFingerprint(9), 1)
+                .unwrap();
+            assert_eq!(
+                model.seal_final_observation(observation, true, false, true),
+                Err(AuthorityError::StaleObservation)
+            );
+            assert!(!model.final_observation.unwrap().sealed);
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+        }
+
+        #[test]
+        fn target_generation_spans_final_scan_and_matching_join() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(11)).unwrap();
+            let generation = model.begin_final_target(discovery).unwrap();
+            assert_eq!(
+                model.axis_states[GenerationAxis::Target.index()],
+                AxisState::Pending
+            );
+            assert_eq!(
+                model.confirm(GenerationAxis::Target),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let observation = model
+                .record_final_observation(TargetFingerprint(11), 1)
+                .unwrap();
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+            model.matching_join(observation).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Target), generation);
+            assert_eq!(
+                model.axis_states[GenerationAxis::Target.index()],
+                AxisState::Current
+            );
+            assert!(matches!(
+                model.target,
+                TargetState::Current { generation: current, .. } if current == generation
+            ));
+        }
+
+        #[test]
+        fn conflicting_final_observation_cannot_promote() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(13)).unwrap();
+            model.begin_final_target(discovery).unwrap();
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let observation = model
+                .record_final_observation(TargetFingerprint(14), 1)
+                .unwrap();
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+            assert_eq!(
+                model.matching_join(observation),
+                Err(AuthorityError::StaleObservation)
+            );
+            assert!(matches!(
+                model.target,
+                TargetState::Unknown { generation: 2 }
+            ));
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(model.final_observation.is_none());
+        }
+
+        #[test]
+        fn attempt_generation_is_reserved_once_and_consumed_unchanged() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            assert!(matches!(
+                model.attempt,
+                AttemptState::InFlight { generation: current, .. } if current == generation
+            ));
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(
+                model.reserve_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.authorize_attempt().unwrap();
+            let replacement = model.reserve_attempt().unwrap();
+            assert_eq!(replacement, generation + 1);
+        }
+
+        #[test]
+        fn replacement_cannot_be_preauthorized_before_terminal_close() {
+            let mut model = seed_ready_model();
+            model.authorize_attempt().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.reserve_attempt().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            model.authorize_attempt().unwrap();
+        }
+
+        #[test]
+        fn cancellation_and_publish_have_unambiguous_ordering() {
+            let mut before = seed_ready_model();
+            reserve_authorized_attempt(&mut before);
+            before.stage().unwrap();
+            assert_eq!(
+                before.cancel().unwrap(),
+                CancellationDisposition::CancelledBeforePublish
+            );
+            assert_eq!(
+                before.terminal,
+                Some(TerminalResult::CancelledBeforePublish)
+            );
+            assert_eq!(before.commit(), Err(AuthorityError::InvalidTransition));
+
+            let mut after = seed_ready_model();
+            reserve_authorized_attempt(&mut after);
+            after.stage().unwrap();
+            after.commit().unwrap();
+            assert!(!after.lease);
+            assert_eq!(
+                after.cancel().unwrap(),
+                CancellationDisposition::AbortInFlight
+            );
+            assert!(matches!(
+                after.attempt,
+                AttemptState::Committing {
+                    abort_requested: true,
+                    ..
+                }
+            ));
+            after.submitted().unwrap();
+            assert!(matches!(
+                after.attempt,
+                AttemptState::InFlight {
+                    abort_requested: true,
+                    ..
+                }
+            ));
+            assert_eq!(after.terminal, None);
+            after
+                .finish_attempt(TerminalResult::MayHaveTransmitted)
+                .unwrap();
+            assert_eq!(after.terminal, Some(TerminalResult::MayHaveTransmitted));
+        }
+
+        #[test]
+        fn terminal_result_is_selected_exactly_once() {
+            let mut model = seed_ready_model();
+            reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            assert_eq!(
+                model.select_terminal(TerminalResult::Contained),
+                Err(AuthorityError::TerminalAlreadySelected)
+            );
+            assert_eq!(model.terminal, Some(TerminalResult::Completed));
+        }
+
+        #[test]
+        fn release_classification_parks_only_when_hardware_is_unproven() {
+            assert_eq!(
+                AuthorityModel::classify_release(false, false),
+                ReleaseClassification::ParkUnsafe
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(false, true),
+                ReleaseClassification::ParkUnsafe
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(true, true),
+                ReleaseClassification::HardwareSafeReleaseError
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(true, false),
+                ReleaseClassification::Released
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
