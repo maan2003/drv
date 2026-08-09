@@ -38,10 +38,19 @@ error output; tests use only a documented synthetic key pattern.
 
 The internal live constructor requires `LiveBeaconPowerAuthorization`.
 Acquiring that capability is explicitly **UNIMPLEMENTED** and returns
-`ZX_ERR_NOT_SUPPORTED`: a later gate must bind a live beacon-derived channel
-authorization to completed MT7921 rate/SAR power authorization. The offline
-fake constructor exists only under this crate's unit-test configuration, so the
-current adapter cannot enable physical TX, VFIO, MMIO, DMA doorbells, or any
+`ZX_ERR_NOT_SUPPORTED`. The beacon and rate-power authorizers reject tokens
+from other authorizer instances, but those separate owner identities prove only
+which authorizer minted each token. They do not prove a shared device,
+transport, reset epoch, or physical run and therefore cannot be composed into
+the live prerequisite.
+
+Before that prerequisite can be implemented, the actual VFIO device and its
+scan, power, reset, regulatory-domain, and channel lifecycle must be extracted
+into one authoritative owner. Only that owner can mint a shared revocable live
+lease after checking both existing authorizations, and the lease must be
+revalidated at the final management-frame publish point. Until then, the
+offline fake constructor exists only under this crate's unit-test configuration
+and the adapter cannot enable physical TX, VFIO, MMIO, DMA doorbells, or any
 other transport.
 
 The offline mechanics gate is complete: tests pass exact query, channel, join,
