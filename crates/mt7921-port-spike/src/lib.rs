@@ -626,7 +626,11 @@ pub fn world_clc_commands(
     firmware: Firmware<'_>,
     hardware: EepromHardwareInfo,
     chip_capability: u64,
+    acpi_configuration: u8,
 ) -> Result<Vec<ClcSetCommand>, ClcDiscoveryError> {
+    if acpi_configuration > 1 {
+        return Err(ClcDiscoveryError::RuleTooLarge);
+    }
     let Some(region) = firmware.regions().find(FirmwareRegion::is_clc) else {
         return Err(ClcDiscoveryError::MissingWorldRule);
     };
@@ -676,7 +680,7 @@ pub fn world_clc_commands(
                 commands.push(ClcSetCommand {
                     index,
                     environment: 1,
-                    acpi_configuration: 0,
+                    acpi_configuration,
                     capability: u8::from(chip_capability & 1 != 0),
                     alpha2: *b"00",
                     rule_type: [rule[2], rule[3]],
@@ -2850,7 +2854,7 @@ pub fn encode_clc_set_command(
     }
     if command.index > 1
         || command.environment != 1
-        || command.acpi_configuration != 0
+        || command.acpi_configuration > 1
         || command.capability & !1 != 0
         || command.alpha2 != *b"00"
         || command.environment_6ghz != 0
@@ -3554,6 +3558,7 @@ pub trait FirmwareLoaderTransport {
     /// Allocate the next persistent nonzero four-bit MCU sequence. Linux keeps
     /// this counter on the device and consumes a value for scatter messages.
     fn next_sequence(&mut self) -> u8;
+    fn acpi_configuration(&self) -> u8;
     fn command(
         &mut self,
         command: DownloadCommand,
@@ -3972,6 +3977,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                     .hardware_info()
                     .expect("the fixed EEPROM hardware block was validated"),
                 chip_capability,
+                transport.acpi_configuration(),
             )
             .map_err(FirmwareLoaderFailure::Clc)?;
             *state = FirmwareLoaderState::ClcConfigured;
@@ -4359,6 +4365,45 @@ impl ReadOnlyStatus {
 pub const MT7921_MGMT_TXWI_BYTES: usize = 64;
 
 pub const MT7921_SKU_RATE_COUNT: usize = 161;
+pub const MT7921_PSE_BASE: u32 = 0x820c_8000;
+
+pub fn encode_pse_reg_read_command(sequence: u8) -> Result<Vec<u8>, RateTxPowerError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(RateTxPowerError::InvalidSequence);
+    }
+    let total = CONNAC2_MCU_TXD_BYTES + 8;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0xc0, 0xa0, 0, sequence]);
+    bytes[CONNAC2_MCU_TXD_BYTES..CONNAC2_MCU_TXD_BYTES + 4]
+        .copy_from_slice(&MT7921_PSE_BASE.to_le_bytes());
+    Ok(bytes)
+}
+
+pub fn parse_pse_reg_read_response(bytes: &[u8]) -> Result<u32, RateTxPowerError> {
+    let length = u16::from_le_bytes(
+        bytes
+            .get(24..26)
+            .ok_or(RateTxPowerError::InvalidPseResponse)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if length != 20 || bytes.len() < 24 + usize::from(length) {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
+    let event = bytes
+        .get(36..44)
+        .ok_or(RateTxPowerError::InvalidPseResponse)?;
+    if u32::from_le_bytes(event[..4].try_into().expect("fixed field")) != MT7921_PSE_BASE {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
+    Ok(u32::from_le_bytes(
+        event[4..8].try_into().expect("fixed field"),
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConservativePowerLimits {
@@ -4378,14 +4423,15 @@ pub enum RateTxPowerError {
     InvalidRegulatoryLimit,
     InvalidSequence,
     Unsupported6Ghz,
+    InvalidPseResponse,
 }
 
 pub trait RateTxPowerTransport {
     type Error;
     /// Return after DMA consumption. This CE command has no response payload.
     fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error>;
-    /// Mandatory pinned read after every batch to prevent PSE underflow.
-    fn read_pse_base(&mut self) -> Result<u32, Self::Error>;
+    /// Mandatory pinned CE REG_READ query after every batch to prevent PSE underflow.
+    fn query_pse_base(&mut self) -> Result<u32, Self::Error>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4483,7 +4529,7 @@ fn submit_conservative_rate_tx_power<T: RateTxPowerTransport>(
             }
         })?;
         transport
-            .read_pse_base()
+            .query_pse_base()
             .map_err(|error| RateTxPowerInstallError::Transport {
                 command: index as u8,
                 error,
@@ -4865,6 +4911,17 @@ mod tests {
 
     #[test]
     fn source_exact_conservative_rate_power_batches_fail_closed() {
+        let reg_read = encode_pse_reg_read_command(9).unwrap();
+        assert_eq!(&reg_read[36..40], &[0xc0, 0xa0, 0, 9]);
+        assert_eq!(
+            &reg_read[CONNAC2_MCU_TXD_BYTES..CONNAC2_MCU_TXD_BYTES + 8],
+            &[0x00, 0x80, 0x0c, 0x82, 0, 0, 0, 0]
+        );
+        let mut response = [0u8; 44];
+        response[24..26].copy_from_slice(&20u16.to_le_bytes());
+        response[36..40].copy_from_slice(&MT7921_PSE_BASE.to_le_bytes());
+        response[40..44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        assert_eq!(parse_pse_reg_read_response(&response), Ok(0x1234_5678));
         let capability = NicCapability {
             element_count: 0,
             mac_address: None,
@@ -4951,7 +5008,7 @@ mod tests {
                 self.completed += 1;
                 Ok(())
             }
-            fn read_pse_base(&mut self) -> Result<u32, Self::Error> {
+            fn query_pse_base(&mut self) -> Result<u32, Self::Error> {
                 self.pse_reads += 1;
                 Ok(0)
             }
@@ -6894,6 +6951,7 @@ mod tests {
                 encapsulated_calibration: true,
             },
             19,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -6918,6 +6976,18 @@ mod tests {
         assert_eq!(&encoded[76..78], &[0, 0xff]);
         assert_eq!(&encoded[140..], &[0x5a; 11]);
         assert!(commands[0].expects_response());
+        let acpi_commands = world_clc_commands(
+            Firmware::parse(&image).unwrap(),
+            EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            },
+            19,
+            1,
+        )
+        .unwrap();
+        assert_eq!(acpi_commands[0].acpi_configuration, 1);
+        assert_eq!(encode_clc_set_command(&acpi_commands[0], 6).unwrap()[70], 1);
 
         let mut no_event_capability = commands[0].clone();
         no_event_capability.capability = 0;
@@ -7417,6 +7487,10 @@ mod tests {
                 self.sequence = 1;
             }
             self.sequence
+        }
+
+        fn acpi_configuration(&self) -> u8 {
+            0
         }
 
         fn command(
