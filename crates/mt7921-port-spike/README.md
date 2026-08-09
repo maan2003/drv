@@ -179,10 +179,17 @@ individually completed chunks (795,264 bytes), skipped the CLC region, reached
 N9 `Ready`, switched to WM2 ring 4, and received a 528-byte capability response.
 The typed result reports 23 elements, MAC `50:5a:65:f6:f9:89`, HT/VHT/HE,
 5 GHz, two spatial streams, no 6 GHz, chip capability 19, and 19 preserved
-unknown elements. It then disabled DMA and PCI bus mastering, reset while all
-mappings were pinned, and released every mapping. The lab restored `mt7921e`,
+unknown elements. A later guarded extension received the 24-byte EFUSE payload
+on WM2 ring 4 (event `0xed`): address `0x550`, `valid=0`, and zero data, so the
+source-consumed hardware-enclosure bit is clear. The installed CLC artifact has
+one selected power segment, 196 rules, 152 unique country codes including
+`00`, and no separate channel segment. Combined with NIC caps, the exact mt76
+candidate universe is 14 2.4-GHz and 28 5-GHz channels, with no 6-GHz
+candidates; regulatory validity remains intentionally unknown. It then disabled
+DMA and PCI bus mastering, reset while all mappings were pinned, and released
+every mapping. The lab restored `mt7921e`,
 iwd, network, and SSH with `failed=0`. The durable root-only report is
-`/var/lib/wifi-driver-lab/reports/20260809T123315Z-0000_05_00.0.log`.
+`/var/lib/wifi-driver-lab/reports/20260809T124531Z-0000_05_00.0.log`.
 
 The earlier `--run-one-shot-fwdl` rejection identified that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,

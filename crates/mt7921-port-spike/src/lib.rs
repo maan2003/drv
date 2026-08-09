@@ -2321,6 +2321,81 @@ pub struct NicCapability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalBand {
+    Ghz2,
+    Ghz5,
+    Ghz6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateChannel {
+    pub band: PhysicalBand,
+    pub number: u16,
+    pub frequency_mhz: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateChannelSummary {
+    pub ghz2: u16,
+    pub ghz5: u16,
+    pub ghz6: u16,
+}
+
+/// Build the physical candidate universe installed by pinned mt76. These are
+/// not regulatory-valid channels until regdb, platform limits and CLC output
+/// have been applied.
+pub fn candidate_channels(capability: NicCapability) -> Vec<CandidateChannel> {
+    const CHANNELS_5GHZ: [u16; 28] = [
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165, 169, 173, 177,
+    ];
+    let mut channels = Vec::new();
+    let Some(phy) = capability.phy else {
+        return channels;
+    };
+    if phy.hardware_path & 1 != 0 {
+        for number in 1..=14 {
+            channels.push(CandidateChannel {
+                band: PhysicalBand::Ghz2,
+                number,
+                frequency_mhz: if number == 14 {
+                    2484
+                } else {
+                    2407 + 5 * number
+                },
+            });
+        }
+    }
+    if phy.hardware_path & 2 != 0 {
+        channels.extend(CHANNELS_5GHZ.into_iter().map(|number| CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number,
+            frequency_mhz: 5000 + 5 * number,
+        }));
+    }
+    if capability.has_6ghz == Some(true) {
+        channels.extend((1..=233).step_by(4).map(|number| CandidateChannel {
+            band: PhysicalBand::Ghz6,
+            number,
+            frequency_mhz: 5950 + 5 * number,
+        }));
+    }
+    channels
+}
+
+pub fn candidate_channel_summary(capability: NicCapability) -> CandidateChannelSummary {
+    let mut summary = CandidateChannelSummary::default();
+    for channel in candidate_channels(capability) {
+        match channel.band {
+            PhysicalBand::Ghz2 => summary.ghz2 += 1,
+            PhysicalBand::Ghz5 => summary.ghz5 += 1,
+            PhysicalBand::Ghz6 => summary.ghz6 += 1,
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NicCapabilityError {
     TruncatedHeader,
     TruncatedElementHeader { index: u16 },
@@ -2708,6 +2783,7 @@ pub struct FirmwareLoaderReport {
     pub scatter_chunks: usize,
     pub scatter_bytes: usize,
     pub nic_capability: NicCapability,
+    pub candidate_channels: CandidateChannelSummary,
     pub eeprom_hardware: EepromBlock,
     pub clc: ClcDiscovery,
 }
@@ -2805,6 +2881,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             chip_capability: None,
             unknown_elements: 0,
         },
+        candidate_channels: CandidateChannelSummary::default(),
         eeprom_hardware: EepromBlock {
             address: MT7921_EEPROM_HW_TYPE_BLOCK,
             valid: 0,
@@ -2970,6 +3047,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     match loader_command(transport, capability_command)? {
         FirmwareCommandCompletion::NicCapability(capability) => {
             report.nic_capability = capability;
+            report.candidate_channels = candidate_channel_summary(capability);
             *state = FirmwareLoaderState::CapabilityDiscovered;
         }
         completion => {
@@ -4990,6 +5068,19 @@ mod tests {
     fn parses_bounded_nic_capability_tlvs() {
         let (bytes, expected) = nic_capability_fixture();
         assert_eq!(parse_nic_capability(&bytes), Ok(expected));
+        let channels = candidate_channels(expected);
+        assert_eq!(
+            candidate_channel_summary(expected),
+            CandidateChannelSummary {
+                ghz2: 14,
+                ghz5: 28,
+                ghz6: 59,
+            }
+        );
+        assert_eq!(channels.first().unwrap().frequency_mhz, 2412);
+        assert_eq!(channels[13].frequency_mhz, 2484);
+        assert_eq!(channels[14].number, 36);
+        assert_eq!(channels.last().unwrap().number, 233);
         assert_eq!(
             parse_nic_capability(&bytes[..bytes.len() - 1]),
             Err(NicCapabilityError::TruncatedElement {
@@ -5294,6 +5385,11 @@ mod tests {
                 scatter_chunks: 5,
                 scatter_bytes: 8197,
                 nic_capability: nic_capability_fixture().1,
+                candidate_channels: CandidateChannelSummary {
+                    ghz2: 14,
+                    ghz5: 28,
+                    ghz6: 59,
+                },
                 eeprom_hardware: eeprom_hardware_fixture().1,
                 clc: ClcDiscovery {
                     segment_count: 1,
