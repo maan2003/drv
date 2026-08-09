@@ -2619,6 +2619,7 @@ struct DescriptorProvenance {
     run_epoch: u64,
     next_occurrence: u64,
     rings: Vec<DescriptorRingProvenance>,
+    sealed: Vec<DescriptorOccurrenceIdentity>,
     revoked: bool,
     poisoned: bool,
     #[cfg(test)]
@@ -2666,6 +2667,7 @@ impl DescriptorProvenance {
                 ring(DescriptorOccurrenceRoute::McuNormalRx, 4),
                 ring(DescriptorOccurrenceRoute::DataRx, 2),
             ],
+            sealed: Vec::new(),
             revoked: false,
             poisoned: false,
             #[cfg(test)]
@@ -2684,6 +2686,7 @@ impl DescriptorProvenance {
     }
 
     fn poison<T>(&mut self) -> Result<T, String> {
+        self.sealed.clear();
         self.poisoned = true;
         self.revoked = true;
         #[cfg(test)]
@@ -2744,6 +2747,7 @@ impl DescriptorProvenance {
         #[cfg(test)]
         self.effects
             .push(DescriptorProvenanceEffect::Mint(identity));
+        self.sealed.push(identity);
         Ok(PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
             bytes,
             identity: Some(identity),
@@ -2818,14 +2822,10 @@ impl DescriptorProvenance {
         {
             return Err("descriptor occurrence was revoked".into());
         }
-        match self
-            .rings
-            .iter()
-            .find(|ring| ring.route == identity.route && ring.ring == identity.ring)
-            .and_then(|ring| ring.slots.get(identity.slot))
-        {
-            Some(DescriptorSlotState::Consumed(epoch)) if *epoch == identity.slot_epoch => Ok(()),
-            _ => Err("descriptor occurrence is stale".into()),
+        if self.sealed.contains(identity) {
+            Ok(())
+        } else {
+            Err("descriptor occurrence is stale".into())
         }
     }
 
@@ -2849,6 +2849,7 @@ impl DescriptorProvenance {
             | DescriptorInvalidation::Teardown
             | DescriptorInvalidation::Run => self.run_epoch = next,
         }
+        self.sealed.clear();
         self.revoked = true;
         #[cfg(test)]
         self.effects
@@ -2859,8 +2860,12 @@ impl DescriptorProvenance {
 
 impl Drop for DescriptorProvenance {
     fn drop(&mut self) {
-        let _ = self.invalidate(DescriptorInvalidation::Teardown);
+        revoke_descriptor_provenance_before_release(self);
     }
+}
+
+fn revoke_descriptor_provenance_before_release(provenance: &mut DescriptorProvenance) {
+    let _ = provenance.invalidate(DescriptorInvalidation::Teardown);
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -2900,6 +2905,14 @@ struct ActiveMcuIo<'a> {
     unsolicited: Vec<ReceivedMcuResponse>,
     normal_rx_frames: Vec<PrivateRawFrameCarrier>,
     descriptor_provenance: DescriptorProvenance,
+}
+
+impl Drop for ActiveMcuIo<'_> {
+    fn drop(&mut self) {
+        // Drop bodies run before fields. Revoke sealed identities before
+        // `normal_rx_frames` or any DMA/resource field can be released.
+        revoke_descriptor_provenance_before_release(&mut self.descriptor_provenance);
+    }
 }
 
 struct VfioFirmwareLoader<'a> {
@@ -4141,6 +4154,15 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for VfioPassiveMechanics<'_, '_, '_> {
+    fn drop(&mut self) {
+        // The tracker is borrowed through `loader`; revoke it before this
+        // owner's queued advertisement carriers are released.
+        revoke_descriptor_provenance_before_release(&mut self.loader.mcu.descriptor_provenance);
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -5794,7 +5816,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_reused_slot_occurrences_are_rejected_as_stale() {
+    fn duplicate_is_rejected_but_sealed_occurrence_survives_slot_reuse() {
         let mut provenance = DescriptorProvenance::new();
         let original = carried(
             provenance
@@ -5810,13 +5832,66 @@ mod tests {
         provenance
             .rearm(DescriptorOccurrenceRoute::McuNormalRx, 4, 1)
             .unwrap();
-        assert!(provenance.validate(&identity).is_err());
+        provenance.validate(&identity).unwrap();
         let replacement = carried(
             provenance
                 .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 1, vec![3])
                 .unwrap(),
         );
-        assert!(replacement.identity.unwrap().slot_epoch > identity.slot_epoch);
+        let replacement = replacement.identity.unwrap();
+        assert!(replacement.slot_epoch > identity.slot_epoch);
+        provenance.validate(&identity).unwrap();
+        provenance.validate(&replacement).unwrap();
+    }
+
+    #[test]
+    fn early_carriers_remain_sealed_across_a_multi_descriptor_wrap() {
+        let mut provenance = DescriptorProvenance::new();
+        let mut sealed = Vec::new();
+        for (completed, refill) in (0..7).zip([7, 0, 1, 2, 3, 4, 5]) {
+            let carrier = carried(
+                provenance
+                    .seal_frame(
+                        DescriptorOccurrenceRoute::DataRx,
+                        2,
+                        completed,
+                        vec![completed as u8],
+                    )
+                    .unwrap(),
+            );
+            sealed.push(carrier.identity.unwrap());
+            provenance
+                .rearm(DescriptorOccurrenceRoute::DataRx, 2, refill)
+                .unwrap();
+        }
+        for identity in &sealed {
+            provenance.validate(identity).unwrap();
+        }
+
+        let wrapped = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 7, vec![7])
+                .unwrap(),
+        )
+        .identity
+        .unwrap();
+        provenance
+            .rearm(DescriptorOccurrenceRoute::DataRx, 2, 6)
+            .unwrap();
+        provenance.validate(&sealed[0]).unwrap();
+        provenance.validate(&wrapped).unwrap();
+
+        let replacement = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![8])
+                .unwrap(),
+        )
+        .identity
+        .unwrap();
+        assert_eq!(replacement.slot, sealed[0].slot);
+        assert!(replacement.slot_epoch > sealed[0].slot_epoch);
+        provenance.validate(&sealed[0]).unwrap();
+        provenance.validate(&replacement).unwrap();
     }
 
     #[test]
@@ -5891,6 +5966,57 @@ mod tests {
                 Some(DescriptorProvenanceEffect::Invalidate(actual)) if *actual == reason
             ));
         }
+    }
+
+    #[test]
+    fn enclosing_teardown_revokes_before_queued_carriers_are_released() {
+        struct QueueDropProbe {
+            revoked: std::rc::Rc<Cell<bool>>,
+            order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+        impl Drop for QueueDropProbe {
+            fn drop(&mut self) {
+                assert!(self.revoked.get(), "queue released before revocation");
+                self.order.borrow_mut().push("queue");
+            }
+        }
+        struct EnclosingOwner {
+            provenance: DescriptorProvenance,
+            _queue: QueueDropProbe,
+            revoked: std::rc::Rc<Cell<bool>>,
+            order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+        impl Drop for EnclosingOwner {
+            fn drop(&mut self) {
+                revoke_descriptor_provenance_before_release(&mut self.provenance);
+                assert!(self.provenance.sealed.is_empty());
+                self.revoked.set(true);
+                self.order.borrow_mut().push("revoke");
+            }
+        }
+
+        let revoked = std::rc::Rc::new(Cell::new(false));
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut owner = EnclosingOwner {
+            provenance: DescriptorProvenance::new(),
+            _queue: QueueDropProbe {
+                revoked: std::rc::Rc::clone(&revoked),
+                order: std::rc::Rc::clone(&order),
+            },
+            revoked,
+            order: std::rc::Rc::clone(&order),
+        };
+        let identity = carried(
+            owner
+                .provenance
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1])
+                .unwrap(),
+        )
+        .identity
+        .unwrap();
+        owner.provenance.validate(&identity).unwrap();
+        drop(owner);
+        assert_eq!(*order.borrow(), ["revoke", "queue"]);
     }
 
     #[test]
