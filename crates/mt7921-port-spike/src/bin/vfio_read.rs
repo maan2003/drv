@@ -842,13 +842,7 @@ fn run() -> Result<(), String> {
             pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
             wfdma.write_active_wfdma(0xd4208, global)?;
             let response_irq_mask = if operation.loads_firmware() {
-                WM_RX_IRQ_BIT
-                    | WM2_RX_IRQ_BIT
-                    | if operation.is_passive() {
-                        DATA_RX_IRQ_BIT
-                    } else {
-                        0
-                    }
+                firmware_bootstrap_rx_irq_mask()
             } else {
                 1 << 0
             };
@@ -894,11 +888,7 @@ fn run() -> Result<(), String> {
                         rx_count: 8,
                         irq_bit: WM2_RX_IRQ_BIT,
                     }),
-                    extra_irq_mask: if operation.is_passive() {
-                        DATA_RX_IRQ_BIT
-                    } else {
-                        0
-                    },
+                    extra_irq_mask: 0,
                     unsolicited: Vec::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
@@ -1490,6 +1480,10 @@ const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
 const PASSIVE_MAC_BAR_PAGES: [usize; 5] = [0x44000, 0x45000, 0x47000, 0x49000, 0x4d000];
 
+const fn firmware_bootstrap_rx_irq_mask() -> u32 {
+    WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
+}
+
 fn merge_matching_response(
     matched: &mut Option<ReceivedMcuResponse>,
     candidate: Option<ReceivedMcuResponse>,
@@ -1664,9 +1658,17 @@ fn drain_rx_queue(
                 .rx_buffers
                 .read_bytes(completed_index * 2048, response_len)?;
             let actual_sequence = response[29];
+            let header_length = response
+                .get(24..26)
+                .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
             parse_download_response(&response, actual_sequence)
                 .map(|parsed| (parsed, response))
-                .map_err(|error| format!("parse MCU response: {error:?}"))
+                .map_err(|error| {
+                    format!(
+                        "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?}",
+                        queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
+                    )
+                })
         };
 
         let refill_index = queue.rx_head;
@@ -2447,7 +2449,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if self.data.rx_ring_index != 2
             || self.data.irq_bit != DATA_RX_IRQ_BIT
             || self.data.rx_count != 8
-            || self.loader.mcu.extra_irq_mask != DATA_RX_IRQ_BIT
+            || self.loader.mcu.extra_irq_mask != 0
         {
             return Err(PhysicalPassiveError(
                 "data RX ring 2 identity mismatch".into(),
@@ -2464,6 +2466,24 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         }
         .execute()
         .map_err(PhysicalPassiveError)?;
+        self.loader.mcu.extra_irq_mask = DATA_RX_IRQ_BIT;
+        let passive_irq_mask = self.loader.mcu.rx_irq_mask();
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4204, passive_irq_mask)
+            .map_err(PhysicalPassiveError)?;
+        let irq_readback = self
+            .loader
+            .mcu
+            .wfdma
+            .read(0xd4204)
+            .map_err(PhysicalPassiveError)?;
+        if irq_readback != passive_irq_mask {
+            return Err(PhysicalPassiveError(format!(
+                "passive RX interrupt mask readback {irq_readback:#010x}, expected {passive_irq_mask:#010x}"
+            )));
+        }
         println!(r#"{{"passive_scan_event":"mac_mmio_plan_completed","operations":41}}"#);
         Ok(PassivePrerequisites {
             channel_domain_mask_zero: true,
@@ -3919,6 +3939,8 @@ mod tests {
     fn passive_rx_irq_and_mac_pages_are_exactly_gated() {
         let base = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
         let passive = base | DATA_RX_IRQ_BIT;
+        assert_eq!(firmware_bootstrap_rx_irq_mask(), base);
+        assert_ne!(firmware_bootstrap_rx_irq_mask(), passive);
         assert!(!active_wfdma_write_allowed(
             0xd4204,
             DATA_RX_IRQ_BIT,

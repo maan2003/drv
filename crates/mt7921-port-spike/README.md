@@ -235,6 +235,28 @@ observations plus the matching scan-done event, and requires both a successful
 completion and at least one BSS. Its DMA mappings join the existing mandatory
 reset-while-pinned cleanup. This edge is offline-tested but not yet physically
 validated; no claim about channel-1 reception or restoration is made here.
+
+The first watchdog-contained physical attempt from commit `301cdcec` (release
+SHA-256
+`c8cd0b0a8c8278af1a8f0860bc7f8c8cb7ffae8f5c4b18ba2e8592d6580b00cb`)
+stopped before the passive boundary. It had unmasked data-RX interrupt bit 2
+during the firmware bootstrap and then rejected ring 0's first RX envelope as
+`InvalidLength` while waiting for `PatchSemaphoreGet`. Status `0x08000001` was
+not itself novel: pinned Linux identifies bit 27 as TX-ring-17 MCU completion
+and bit 0 as WM RX, and both prior successful channel-domain runs observed that
+same status before draining the NIC-power event and semaphore response. Cleanup
+disabled DMA, reset while pinned, released all mappings, and supervisor restore
+reported `failed=0`; the armed watchdog rebooted to healthy boot
+`32459d23-ec4c-4455-9d12-392763f8307f`. The durable report is
+`/var/lib/wifi-driver-lab/reports/20260809T151850Z-0000_05_00.0.log`.
+
+The offline follow-up restores the previously proven WM/WM2-only interrupt
+mask throughout bootstrap. Ring 2 remains prepared and readback-verified, but
+bit 2 is unmasked and verified only inside `prepare_passive_receive`, after the
+loader reaches the channel-domain boundary and the MAC plan completes. Parse
+failures now retain descriptor control, descriptor length, and MCU header
+length for a future authorized diagnostic run. No retry has validated this
+fixture-backed ordering fix, so physical passive reception remains unproven.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
