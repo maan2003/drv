@@ -1780,7 +1780,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	1163	function	mt76_connac2_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	1198	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	1200	function	mt76_connac2_tx_token_put	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	1219	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	9	function	mt76_connac_mcu_start_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	9	function	mt76_connac_mcu_start_firmware	DownloadCommand::FirmwareStart	adapted	offline pinned-format fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	11	struct	__anone60253870108	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	12	member	option	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	13	member	addr	-	unmapped	-
@@ -3590,7 +3590,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1991	prototype	mt76_connac_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1993	prototype	mt76_connac_mcu_init_download	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1995	prototype	mt76_connac_mcu_start_patch	DownloadCommand::PatchFinish	adapted	pinned-format unit fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1996	prototype	mt76_connac_mcu_patch_sem_ctrl	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1997	prototype	mt76_connac_mcu_start_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1997	prototype	mt76_connac_mcu_start_firmware	DownloadCommand::FirmwareStart	adapted	offline pinned-format fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1999	prototype	mt76_connac_mcu_build_rnr_scan_param	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2001	prototype	mt76_connac_mcu_hw_scan	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	2003	prototype	mt76_connac_mcu_cancel_hw_scan	-	unmapped	-

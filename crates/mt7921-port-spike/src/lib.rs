@@ -2070,6 +2070,7 @@ pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
 pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
 pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
 pub const PATCH_FINISH_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+pub const FIRMWARE_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 8;
 pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
 pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
 pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
@@ -2113,6 +2114,10 @@ pub enum DownloadCommand {
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
+    FirmwareStart {
+        address: u32,
+        option: u32,
+    },
     PatchStart {
         address: u32,
         length: u32,
@@ -2129,6 +2134,7 @@ pub enum DownloadCommand {
 pub enum DownloadCommandError {
     InvalidSequence,
     InvalidLength,
+    InvalidFirmwareStart,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2196,6 +2202,15 @@ pub fn encode_download_command(
         DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchSemaphoreRelease => (0x10, 0u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchFinish => (0x07, vec![0; 4]),
+        DownloadCommand::FirmwareStart { address, option } => {
+            if address != 0x0091_5000 || option != 1 {
+                return Err(DownloadCommandError::InvalidFirmwareStart);
+            }
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&option.to_le_bytes());
+            payload.extend_from_slice(&address.to_le_bytes());
+            (0x02, payload)
+        }
         DownloadCommand::PatchStart {
             address,
             length,
@@ -2232,6 +2247,7 @@ pub fn encode_download_command(
     bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
     bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
     bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
     bytes[36] = cid;
     bytes[37] = 0xa0;
     bytes[38] = 3;
@@ -3718,6 +3734,7 @@ mod tests {
             0x8001_0000
         );
         assert_eq!(&semaphore[32..34], &36u16.to_le_bytes());
+        assert_eq!(&semaphore[34..36], &0x8000u16.to_le_bytes());
         assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
         assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
         let release = encode_download_command(DownloadCommand::PatchSemaphoreRelease, 2).unwrap();
@@ -3749,6 +3766,33 @@ mod tests {
         assert_eq!(finish.len(), PATCH_FINISH_REQUEST_BYTES);
         assert_eq!(&finish[36..40], &[0x07, 0xa0, 3, 3]);
         assert_eq!(&finish[64..68], &[0; 4]);
+        let start = encode_download_command(
+            DownloadCommand::FirmwareStart {
+                address: 0x0091_5000,
+                option: 1,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(start.len(), FIRMWARE_START_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(start[0..4].try_into().unwrap()),
+            0x4100_0048
+        );
+        assert_eq!(&start[34..36], &0x8000u16.to_le_bytes());
+        assert_eq!(&start[36..40], &[0x02, 0xa0, 3, 4]);
+        assert_eq!(&start[64..68], &1u32.to_le_bytes());
+        assert_eq!(&start[68..72], &0x0091_5000u32.to_le_bytes());
+        assert_eq!(
+            encode_download_command(
+                DownloadCommand::FirmwareStart {
+                    address: 0,
+                    option: 0,
+                },
+                4,
+            ),
+            Err(DownloadCommandError::InvalidFirmwareStart)
+        );
         assert_eq!(
             encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
             Err(DownloadCommandError::InvalidSequence)

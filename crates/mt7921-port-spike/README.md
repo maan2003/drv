@@ -124,6 +124,10 @@ The offline patch-protocol slice now derives Linux's Connac2 download mode
 from each parsed section security word and encodes the `PATCH_FINISH_REQ` that
 must follow all scatter chunks. Unknown encryption modes fail closed. These
 helpers are fixture-tested only and are not connected to MMIO or active DMA.
+The same pure encoder now includes the terminal `FW_START_REQ` used after the
+exact installed RAM regions, rejects an address/option pair other than their
+derived `0x00915000`/override values, and emits Linux's required legacy command
+queue ID (`0x8000`) in every command TXD.
 
 `--run-one-shot-fwdl` is intentionally rejected. Safety review found that the
 global TX-DMA enable can fetch every TX ring, including stale kernel ring bases,
@@ -169,8 +173,8 @@ pinned, and then unmapped them. The root-only report is
 `/var/lib/wifi-driver-lab/reports/20260802T165342Z-0000_05_00.0.log`.
 
 `encode_download_command` ports the exact 64-byte legacy Connac2 command TXD
-and request bodies for patch-semaphore acquisition, `PATCH_START`, and
-`TARGET_ADDRESS_LEN`. It rejects sequence zero/outside the four-bit firmware
+and request bodies for patch-semaphore acquisition, `PATCH_START`,
+`TARGET_ADDRESS_LEN`, and `FW_START_REQ`. It rejects sequence zero/outside the four-bit firmware
 range, an empty download, and a patch-start address other than MT7961's
 `0x00900000`. Encoding these commands is not permission to send them: an owned
 MCU TX ring, RX response ring, parsed matching response, VFIO IRQ, and safe

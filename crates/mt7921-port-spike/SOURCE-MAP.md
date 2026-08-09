@@ -55,6 +55,7 @@ explicitly marked; the initial majority is `unmapped`.
 | `mt76_connac2_mcu_fill_message` download subset | `mt76_connac_mcu.c` | `encode_download_command` | adapted, tested | pinned-format fixtures |
 | `mt76_connac2_get_data_mode` | `mt76_connac_mcu.c` | `patch_download_mode` | adapted, tested | plain/AES/scramble/unsupported fixtures; unsupported encryption fails closed |
 | `mt76_connac_mcu_start_patch` request | `mt76_connac_mcu.c` | `DownloadCommand::PatchFinish` | adapted, tested | pinned-format fixture; not wired to active DMA |
+| `mt76_connac_mcu_start_firmware` request | `mt76_connac_mcu.c` | `DownloadCommand::FirmwareStart` | adapted, tested | pinned-format fixture; not wired to active DMA |
 | connac2 patch header/sections | `mt76_connac_mcu.h` | `Patch` parser | adapted, tested | malformed/bounded fixtures |
 | `mt792x_wfsys_reset` | `mt7921/pci.c` | `reset_wfsys`, dynamic-L1 adapter | adapted, tested | ordering/timeout tests; physical ready at 57 ms |
 | driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests; physical first-attempt CLR_OWN response |
