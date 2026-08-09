@@ -2954,6 +2954,318 @@ pub fn encode_channel_domain_command(
     Ok(bytes)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PassiveMcuCommand {
+    EepromBufferMode,
+    MacEnable,
+    SetRxPath {
+        channel: CandidateChannel,
+        antenna_mask: u8,
+    },
+    ChannelSwitch {
+        channel: CandidateChannel,
+        antenna_mask: u8,
+    },
+    AddDevice {
+        mac: [u8; 6],
+    },
+    AddBss,
+    SetPassiveRxFilter,
+    StartScan {
+        scan_sequence: u8,
+        channel: CandidateChannel,
+    },
+    CancelScan {
+        scan_sequence: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMcuCommandError {
+    InvalidSequence,
+    UnsupportedChannel,
+    InvalidAntennaMask,
+    InvalidScanSequence,
+    ActiveScanMaterial,
+}
+
+impl PassiveMcuCommand {
+    pub fn expects_response(&self) -> bool {
+        matches!(
+            self,
+            Self::EepromBufferMode
+                | Self::MacEnable
+                | Self::SetRxPath { .. }
+                | Self::ChannelSwitch { .. }
+                | Self::AddDevice { .. }
+                | Self::AddBss
+        )
+    }
+}
+
+fn encode_legacy_mcu(cid: u8, ext_cid: u8, payload: &[u8], sequence: u8) -> Vec<u8> {
+    let total = CONNAC2_MCU_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..44].copy_from_slice(&[
+        cid,
+        0xa0,
+        1,
+        sequence,
+        0,
+        ext_cid,
+        0,
+        u8::from(ext_cid != 0),
+    ]);
+    bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(payload);
+    bytes
+}
+
+fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
+    const UNI_TXD_BYTES: usize = 48;
+    let total = UNI_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&cid.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 0x07;
+    bytes[UNI_TXD_BYTES..].copy_from_slice(payload);
+    bytes
+}
+
+/// Encode only the pinned Linux commands required by the conservative passive
+/// one-channel milestone. START_HW_SCAN has no SSID, probe, IE, random-MAC, or
+/// transmit material and uses Connac2's firmware-selected dwell fields (zero).
+pub fn encode_passive_mcu_command(
+    command: &PassiveMcuCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, PassiveMcuCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(PassiveMcuCommandError::InvalidSequence);
+    }
+    let channel_payload = |channel: CandidateChannel,
+                           antenna_mask: u8,
+                           switch_reason: u8,
+                           channel_switch: bool|
+     -> Result<Vec<u8>, PassiveMcuCommandError> {
+        if channel.band != PhysicalBand::Ghz2 || !(1..=14).contains(&channel.number) {
+            return Err(PassiveMcuCommandError::UnsupportedChannel);
+        }
+        if antenna_mask != 3 {
+            return Err(PassiveMcuCommandError::InvalidAntennaMask);
+        }
+        let mut payload = vec![0; 76];
+        payload[0] = channel.number as u8;
+        payload[1] = channel.number as u8;
+        payload[2] = 0;
+        payload[3] = 2;
+        payload[4] = if channel_switch { 2 } else { antenna_mask };
+        payload[5] = switch_reason;
+        payload[10] = 0;
+        Ok(payload)
+    };
+    Ok(match command {
+        PassiveMcuCommand::EepromBufferMode => {
+            encode_legacy_mcu(0xed, 0x21, &[1, 0, 0, 0], sequence)
+        }
+        PassiveMcuCommand::MacEnable => encode_legacy_mcu(0xed, 0x46, &[1, 0, 0, 0], sequence),
+        PassiveMcuCommand::SetRxPath {
+            channel,
+            antenna_mask,
+        } => encode_legacy_mcu(
+            0xed,
+            0x4e,
+            &channel_payload(*channel, *antenna_mask, 0, false)?,
+            sequence,
+        ),
+        PassiveMcuCommand::ChannelSwitch {
+            channel,
+            antenna_mask,
+        } => encode_legacy_mcu(
+            0xed,
+            0x08,
+            &channel_payload(*channel, *antenna_mask, 9, true)?,
+            sequence,
+        ),
+        PassiveMcuCommand::AddDevice { mac } => {
+            let mut payload = vec![0; 16];
+            payload[4..8].copy_from_slice(&[0, 0, 12, 0]);
+            payload[8] = 1;
+            payload[10..16].copy_from_slice(mac);
+            encode_uni_mcu(1, &payload, sequence)
+        }
+        PassiveMcuCommand::AddBss => {
+            let mut payload = vec![0; 36];
+            payload[4..8].copy_from_slice(&[0, 0, 32, 0]);
+            payload[8] = 1;
+            payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+            payload[16] = 1;
+            payload[24..26].copy_from_slice(&19u16.to_le_bytes());
+            payload[30..32].copy_from_slice(&19u16.to_le_bytes());
+            encode_uni_mcu(2, &payload, sequence)
+        }
+        PassiveMcuCommand::SetPassiveRxFilter => {
+            let mut payload = vec![0; 68];
+            payload[4] = 1;
+            payload[8..12].copy_from_slice(&0x8000_0040u32.to_le_bytes());
+            encode_legacy_mcu(0x0a, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::StartScan {
+            scan_sequence,
+            channel,
+        } => {
+            if *scan_sequence > 0x7f {
+                return Err(PassiveMcuCommandError::InvalidScanSequence);
+            }
+            if channel.band != PhysicalBand::Ghz2 || !(1..=14).contains(&channel.number) {
+                return Err(PassiveMcuCommandError::UnsupportedChannel);
+            }
+            let mut payload = vec![0; 1186];
+            payload[0] = *scan_sequence;
+            payload[3] = 1;
+            payload[7] = 1;
+            payload[158] = 4;
+            payload[159] = 1;
+            payload[160] = 1;
+            payload[161] = channel.number as u8;
+            payload[6] = 1 << 5;
+            encode_legacy_mcu(0x03, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::CancelScan { scan_sequence } => {
+            if *scan_sequence > 0x7f {
+                return Err(PassiveMcuCommandError::InvalidScanSequence);
+            }
+            encode_legacy_mcu(0x1b, 0, &[*scan_sequence, 0, 0, 0], sequence)
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassiveScanDone {
+    pub scan_sequence: u8,
+    pub completed_channels: u8,
+    pub beacon_scan_count: u32,
+    pub alpha2: [u8; 2],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassiveAdvertisement {
+    pub probe_response: bool,
+    pub bssid: [u8; 6],
+    pub beacon_interval_tu: u16,
+    pub capability_info: u16,
+    pub ies: Vec<u8>,
+    pub channel: u8,
+    pub rssi_dbm: i8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveRxError {
+    Truncated,
+    WrongEvent,
+    WrongPacketType,
+    RxError,
+    HeaderTranslated,
+    MissingRxVector,
+    UnsupportedFrame,
+    InvalidChannel,
+}
+
+pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
+    let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
+    if response.event_id != 0x0d || response.sequence != 0 {
+        return Err(PassiveRxError::WrongEvent);
+    }
+    let body = bytes.get(36..56).ok_or(PassiveRxError::Truncated)?;
+    Ok(PassiveScanDone {
+        scan_sequence: body[0] & 0x7f,
+        completed_channels: body[4],
+        beacon_scan_count: u32::from_le_bytes(body[8..12].try_into().expect("fixed field")),
+        alpha2: [body[17], body[18]],
+    })
+}
+
+/// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
+/// beacon/probe-response material to pinned Fuchsia. Data/control frames,
+/// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
+pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
+    let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
+    let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
+    let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
+    let rxd3 = u32::from_le_bytes(header[12..16].try_into().expect("fixed field"));
+    if rxd0 >> 27 & 0x1f != 2 {
+        return Err(PassiveRxError::WrongPacketType);
+    }
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
+    {
+        return Err(PassiveRxError::RxError);
+    }
+    if rxd2 & (1 << 13) != 0 {
+        return Err(PassiveRxError::HeaderTranslated);
+    }
+    let channel = ((rxd3 >> 8) & 0xff) as u8;
+    if !(1..=14).contains(&channel) {
+        return Err(PassiveRxError::InvalidChannel);
+    }
+    let mut offset = 24usize;
+    if rxd1 & (1 << 14) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 11) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 12) != 0 {
+        offset += 8;
+    }
+    if rxd1 & (1 << 13) == 0 {
+        return Err(PassiveRxError::MissingRxVector);
+    }
+    let rxv = bytes
+        .get(offset..offset + 8)
+        .ok_or(PassiveRxError::Truncated)?;
+    let rcpi = u32::from_le_bytes(rxv[4..8].try_into().expect("fixed field"));
+    let strongest = (0..2)
+        .map(|chain| ((rcpi >> (chain * 8)) & 0xff) as i16)
+        .map(|value| (value - 220) / 2)
+        .max()
+        .unwrap_or(-128)
+        .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+    offset += 8;
+    if rxd1 & (1 << 15) != 0 {
+        offset += 72;
+    }
+    offset += 2 * ((rxd2 >> 14) & 0x3) as usize;
+    let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
+    let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
+    let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
+    let probe_response = match frame_control & 0x00fc {
+        0x0080 => false,
+        0x0050 => true,
+        _ => return Err(PassiveRxError::UnsupportedFrame),
+    };
+    Ok(PassiveAdvertisement {
+        probe_response,
+        bssid: fixed[16..22].try_into().expect("fixed field"),
+        beacon_interval_tu: u16::from_le_bytes([fixed[32], fixed[33]]),
+        capability_info: u16::from_le_bytes([fixed[34], fixed[35]]),
+        ies: frame[36..].to_vec(),
+        channel,
+        rssi_dbm: strongest,
+    })
+}
+
 pub const FIRMWARE_POLL_INTERVAL_MS: u64 = 10;
 pub const DOWNLOAD_READY_TIMEOUT_MS: u64 = 1000;
 pub const N9_READY_TIMEOUT_MS: u64 = 1500;
@@ -5714,6 +6026,119 @@ mod tests {
         assert_eq!(
             encode_channel_domain_command(&command, 1),
             Err(ChannelDomainError::InvalidChannelSet)
+        );
+    }
+
+    #[test]
+    fn passive_command_closure_is_source_exact_and_has_no_tx_material() {
+        let channel = CandidateChannel {
+            band: PhysicalBand::Ghz2,
+            number: 1,
+            frequency_mhz: 2412,
+        };
+        let eeprom = encode_passive_mcu_command(&PassiveMcuCommand::EepromBufferMode, 1).unwrap();
+        assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 1, 1, 0, 0x21, 0, 1]);
+        assert_eq!(&eeprom[64..], &[1, 0, 0, 0]);
+        let switch = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel,
+                antenna_mask: 3,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 2, 0, 8, 0, 1]);
+        assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
+
+        let scan = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channel,
+            },
+            3,
+        )
+        .unwrap();
+        let request = &scan[64..];
+        assert_eq!(request.len(), 1186);
+        assert_eq!(&request[..8], &[1, 0, 0, 1, 0, 0, 1 << 5, 1]);
+        assert_eq!(&request[152..160], &[0, 0, 0, 0, 0, 0, 4, 1]);
+        assert_eq!(&request[160..162], &[1, 1]);
+        assert_eq!(request[224..826].iter().copied().sum::<u8>(), 0);
+        assert_eq!(request[826], 0);
+        assert_eq!(request[1185], 0);
+        assert!(
+            !PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channel
+            }
+            .expects_response()
+        );
+
+        let forbidden = CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number: 36,
+            frequency_mhz: 5180,
+        };
+        assert_eq!(
+            encode_passive_mcu_command(
+                &PassiveMcuCommand::StartScan {
+                    scan_sequence: 1,
+                    channel: forbidden,
+                },
+                1,
+            ),
+            Err(PassiveMcuCommandError::UnsupportedChannel)
+        );
+    }
+
+    #[test]
+    fn parses_only_passive_scan_done_and_beacon_advertisements() {
+        let mut done = vec![0; 56];
+        done[24..26].copy_from_slice(&32u16.to_le_bytes());
+        done[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        done[28] = 0x0d;
+        done[36] = 1;
+        done[40] = 1;
+        done[44..48].copy_from_slice(&3u32.to_le_bytes());
+        done[53..55].copy_from_slice(b"00");
+        assert_eq!(
+            parse_passive_scan_done(&done),
+            Ok(PassiveScanDone {
+                scan_sequence: 1,
+                completed_channels: 1,
+                beacon_scan_count: 3,
+                alpha2: *b"00",
+            })
+        );
+
+        let mut rx = vec![0; 24 + 8 + 36 + 5];
+        let rxd0 = (2u32 << 27) | rx.len() as u32;
+        rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        let frame = &mut rx[32..];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        frame[16..22].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+        frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
+        frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
+        assert_eq!(
+            parse_passive_advertisement(&rx),
+            Ok(PassiveAdvertisement {
+                probe_response: false,
+                bssid: [1, 2, 3, 4, 5, 6],
+                beacon_interval_tu: 100,
+                capability_info: 0x0431,
+                ies: vec![0, 3, b'a', b'p', b'1'],
+                channel: 1,
+                rssi_dbm: -50,
+            })
+        );
+        rx[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&rx),
+            Err(PassiveRxError::UnsupportedFrame)
         );
     }
 

@@ -14,7 +14,9 @@ use fuchsia_softmac_port::{
     WlanSoftmacQueryResponse, construct_bss_description,
 };
 use mt7921_port_spike::{
-    CandidateChannel, NicCapability, PhysicalBand, candidate_channels as capability_channels,
+    CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
+    PassiveMcuCommandError, PassiveScanDone, PhysicalBand,
+    candidate_channels as capability_channels, encode_passive_mcu_command,
 };
 use std::error::Error;
 use std::fmt;
@@ -59,6 +61,242 @@ pub trait Mt7921PassiveTransport {
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error>;
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error>;
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassivePrerequisites {
+    pub channel_domain_mask_zero: bool,
+    pub mac_mmio_initialized: bool,
+    pub data_rx_owned: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PassiveMechanicsEvent {
+    Advertisement {
+        timestamp_nanos: i64,
+        advertisement: PassiveAdvertisement,
+    },
+    ScanDone(PassiveScanDone),
+}
+
+/// Device edge below the real Fuchsia adapter. Implementations own the exact
+/// MMIO/data-RX setup and matched MCU completion mechanics, but receive only
+/// already encoded source-exact commands.
+pub trait SourceExactPassiveMechanics {
+    type Error: Error + 'static;
+
+    fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error>;
+    fn command(
+        &mut self,
+        command: &PassiveMcuCommand,
+        encoded: &[u8],
+        wait_response: bool,
+    ) -> Result<(), Self::Error>;
+    fn next_event(
+        &mut self,
+        deadline_nanos: i64,
+    ) -> Result<Option<PassiveMechanicsEvent>, Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SourceExactTransportError<E> {
+    MissingNicIdentity,
+    UnsupportedSpatialStreams,
+    MandatoryDependency(PassivePrerequisites),
+    InvalidSequence,
+    InvalidDwell,
+    UnsupportedMultiChannelScan,
+    ChannelNotSelected,
+    ScanIdMismatch { expected: u8, actual: u8 },
+    Encode(PassiveMcuCommandError),
+    Mechanics(E),
+}
+
+impl<E: fmt::Display + fmt::Debug> fmt::Display for SourceExactTransportError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "source-exact passive transport failed: {self:?}")
+    }
+}
+
+impl<E: Error + 'static> Error for SourceExactTransportError<E> {}
+
+/// Concrete transport used by `Mt7921SoftmacAdapter`. It emits initialization,
+/// tune, and passive scan commands only; there is no general TX API.
+pub struct SourceExactPassiveTransport<M> {
+    mechanics: M,
+    mac: [u8; 6],
+    antenna_mask: u8,
+    mcu_sequence: u8,
+    scan_sequence: u8,
+    selected: Option<CandidateChannel>,
+    initialized: bool,
+    active: Option<(u64, u8, i64)>,
+}
+
+impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
+    pub fn new(
+        mechanics: M,
+        capability: NicCapability,
+    ) -> Result<Self, SourceExactTransportError<M::Error>> {
+        let mac = capability
+            .mac_address
+            .ok_or(SourceExactTransportError::MissingNicIdentity)?;
+        if capability.phy.map(|phy| phy.spatial_streams) != Some(2) {
+            return Err(SourceExactTransportError::UnsupportedSpatialStreams);
+        }
+        Ok(Self {
+            mechanics,
+            mac,
+            antenna_mask: 3,
+            mcu_sequence: 0,
+            scan_sequence: 0,
+            selected: None,
+            initialized: false,
+            active: None,
+        })
+    }
+
+    pub fn into_mechanics(self) -> M {
+        self.mechanics
+    }
+
+    fn issue(
+        &mut self,
+        command: PassiveMcuCommand,
+    ) -> Result<(), SourceExactTransportError<M::Error>> {
+        self.mcu_sequence = self.mcu_sequence % 15 + 1;
+        let encoded = encode_passive_mcu_command(&command, self.mcu_sequence)
+            .map_err(SourceExactTransportError::Encode)?;
+        let wait = command.expects_response();
+        self.mechanics
+            .command(&command, &encoded, wait)
+            .map_err(SourceExactTransportError::Mechanics)
+    }
+}
+
+impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassiveTransport<M> {
+    type Error = SourceExactTransportError<M::Error>;
+
+    fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error> {
+        if !self.initialized {
+            let prerequisites = self
+                .mechanics
+                .prepare_passive_receive()
+                .map_err(SourceExactTransportError::Mechanics)?;
+            if prerequisites
+                != (PassivePrerequisites {
+                    channel_domain_mask_zero: true,
+                    mac_mmio_initialized: true,
+                    data_rx_owned: true,
+                })
+            {
+                return Err(SourceExactTransportError::MandatoryDependency(
+                    prerequisites,
+                ));
+            }
+            self.issue(PassiveMcuCommand::EepromBufferMode)?;
+            self.issue(PassiveMcuCommand::MacEnable)?;
+            self.issue(PassiveMcuCommand::SetRxPath {
+                channel,
+                antenna_mask: self.antenna_mask,
+            })?;
+            self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
+            self.issue(PassiveMcuCommand::AddBss)?;
+            self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
+            self.initialized = true;
+        }
+        self.issue(PassiveMcuCommand::ChannelSwitch {
+            channel,
+            antenna_mask: self.antenna_mask,
+        })?;
+        self.selected = Some(channel);
+        Ok(())
+    }
+
+    fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error> {
+        if command.channels.len() != 1 {
+            return Err(SourceExactTransportError::UnsupportedMultiChannelScan);
+        }
+        let channel = command.channels[0];
+        if self.selected != Some(channel) {
+            return Err(SourceExactTransportError::ChannelNotSelected);
+        }
+        if command.min_channel_time_nanos < 0
+            || command.max_channel_time_nanos < command.min_channel_time_nanos
+            || command.max_channel_time_nanos > 500_000_000
+        {
+            return Err(SourceExactTransportError::InvalidDwell);
+        }
+        self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
+        self.issue(PassiveMcuCommand::StartScan {
+            scan_sequence: self.scan_sequence,
+            channel,
+        })?;
+        self.active = Some((
+            command.scan_id,
+            self.scan_sequence,
+            command.max_channel_time_nanos,
+        ));
+        Ok(())
+    }
+
+    fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error> {
+        let (expected, scan_sequence, _) = self
+            .active
+            .ok_or(SourceExactTransportError::InvalidSequence)?;
+        if scan_id != expected {
+            return Err(SourceExactTransportError::InvalidSequence);
+        }
+        self.issue(PassiveMcuCommand::CancelScan { scan_sequence })
+    }
+
+    fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error> {
+        let Some((scan_id, scan_sequence, deadline)) = self.active else {
+            return Ok(None);
+        };
+        match self
+            .mechanics
+            .next_event(deadline)
+            .map_err(SourceExactTransportError::Mechanics)?
+        {
+            None => Ok(None),
+            Some(PassiveMechanicsEvent::Advertisement {
+                timestamp_nanos,
+                advertisement,
+            }) => Ok(Some(TransportEvent::Advertisement(RawAdvertisement {
+                scan_id,
+                kind: if advertisement.probe_response {
+                    AdvertisementKind::ProbeResponse
+                } else {
+                    AdvertisementKind::Beacon
+                },
+                timestamp_nanos,
+                bssid: advertisement.bssid,
+                beacon_interval_tu: advertisement.beacon_interval_tu,
+                capability_info: advertisement.capability_info,
+                ies: advertisement.ies,
+                channel: CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: advertisement.channel.into(),
+                    frequency_mhz: 2407 + 5 * u16::from(advertisement.channel),
+                },
+                rssi_dbm: advertisement.rssi_dbm,
+            }))),
+            Some(PassiveMechanicsEvent::ScanDone(done)) => {
+                if done.scan_sequence != scan_sequence {
+                    return Err(SourceExactTransportError::ScanIdMismatch {
+                        expected: scan_sequence,
+                        actual: done.scan_sequence,
+                    });
+                }
+                self.active = None;
+                Ok(Some(TransportEvent::Complete {
+                    scan_id,
+                    success: done.completed_channels == 1 && done.alpha2 == *b"00",
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -185,6 +423,7 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
     /// Explicit rejection surface for callers that otherwise have active scan
     /// request material. No transport operation is attempted.
     pub fn start_active_scan(&mut self) -> Result<u64, AdapterError<T::Error>> {
+        self.ensure_live()?;
         Err(AdapterError::ActiveScanUnsupported)
     }
 
@@ -520,6 +759,43 @@ mod tests {
         fail_cancel: bool,
     }
 
+    #[derive(Default)]
+    struct ScriptedMechanics {
+        prerequisites: Option<PassivePrerequisites>,
+        commands: Vec<(PassiveMcuCommand, Vec<u8>, bool)>,
+        events: VecDeque<PassiveMechanicsEvent>,
+    }
+
+    impl SourceExactPassiveMechanics for ScriptedMechanics {
+        type Error = ScriptError;
+
+        fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+            Ok(self.prerequisites.unwrap_or(PassivePrerequisites {
+                channel_domain_mask_zero: true,
+                mac_mmio_initialized: true,
+                data_rx_owned: true,
+            }))
+        }
+
+        fn command(
+            &mut self,
+            command: &PassiveMcuCommand,
+            encoded: &[u8],
+            wait_response: bool,
+        ) -> Result<(), Self::Error> {
+            self.commands
+                .push((command.clone(), encoded.to_vec(), wait_response));
+            Ok(())
+        }
+
+        fn next_event(
+            &mut self,
+            _deadline_nanos: i64,
+        ) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
+            Ok(self.events.pop_front())
+        }
+    }
+
     impl Mt7921PassiveTransport for ScriptedTransport {
         type Error = ScriptError;
         fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error> {
@@ -592,6 +868,129 @@ mod tests {
             max_channel_time: Some(20),
             min_home_time: Some(0),
         }
+    }
+
+    #[test]
+    fn real_fuchsia_adapter_drives_source_exact_passive_closure() {
+        let capability = nic();
+        let transport =
+            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let mut adapter = Mt7921SoftmacAdapter::new(
+            transport,
+            capability,
+            capability_channels(capability),
+            vec![channel(1)],
+        )
+        .unwrap();
+        adapter
+            .set_channel(WlanSoftmacBaseSetChannelRequest {
+                primary: Some(channel(1)),
+                bandwidth: Some(ChannelBandwidth::Cbw20),
+                vht_secondary_80_channel: Some(channel(0)),
+            })
+            .unwrap();
+        let response = adapter
+            .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+                channels: Some(vec![channel(1)]),
+                min_channel_time: Some(50_000_000),
+                max_channel_time: Some(120_000_000),
+                min_home_time: Some(0),
+            })
+            .unwrap();
+        assert_eq!(response.scan_id, Some(1));
+        let commands = &adapter.transport.mechanics.commands;
+        assert_eq!(commands.len(), 8);
+        assert!(matches!(commands[0].0, PassiveMcuCommand::EepromBufferMode));
+        assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
+        assert!(matches!(commands[2].0, PassiveMcuCommand::SetRxPath { .. }));
+        assert!(matches!(commands[3].0, PassiveMcuCommand::AddDevice { .. }));
+        assert!(matches!(commands[4].0, PassiveMcuCommand::AddBss));
+        assert!(matches!(
+            commands[5].0,
+            PassiveMcuCommand::SetPassiveRxFilter
+        ));
+        assert!(matches!(
+            commands[6].0,
+            PassiveMcuCommand::ChannelSwitch { .. }
+        ));
+        assert!(matches!(commands[7].0, PassiveMcuCommand::StartScan { .. }));
+        assert!(!commands[7].2);
+        let scan_request = &commands[7].1[64..];
+        assert_eq!(scan_request[2], 0);
+        assert_eq!(scan_request[4], 0);
+        assert_eq!(scan_request[5], 0);
+        assert!(scan_request[224..826].iter().all(|byte| *byte == 0));
+
+        adapter
+            .transport
+            .mechanics
+            .events
+            .push_back(PassiveMechanicsEvent::Advertisement {
+                timestamp_nanos: 10,
+                advertisement: PassiveAdvertisement {
+                    probe_response: false,
+                    bssid: [1, 2, 3, 4, 5, 6],
+                    beacon_interval_tu: 100,
+                    capability_info: 0x0431,
+                    ies: vec![0, 3, b'a', b'p', b'1'],
+                    channel: 1,
+                    rssi_dbm: -50,
+                },
+            });
+        adapter
+            .transport
+            .mechanics
+            .events
+            .push_back(PassiveMechanicsEvent::ScanDone(PassiveScanDone {
+                scan_sequence: 1,
+                completed_channels: 1,
+                beacon_scan_count: 1,
+                alpha2: *b"00",
+            }));
+        assert!(matches!(
+            adapter.next_scan_event(),
+            Ok(Some(HardwareScanEvent::Observation(_)))
+        ));
+        assert_eq!(
+            adapter.next_scan_event(),
+            Ok(Some(HardwareScanEvent::Complete {
+                scan_id: 1,
+                success: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn mandatory_passive_dependencies_fail_before_any_command() {
+        let capability = nic();
+        let mechanics = ScriptedMechanics {
+            prerequisites: Some(PassivePrerequisites {
+                channel_domain_mask_zero: true,
+                mac_mmio_initialized: false,
+                data_rx_owned: true,
+            }),
+            ..Default::default()
+        };
+        let transport = SourceExactPassiveTransport::new(mechanics, capability).unwrap();
+        let mut adapter = Mt7921SoftmacAdapter::new(
+            transport,
+            capability,
+            capability_channels(capability),
+            vec![channel(1)],
+        )
+        .unwrap();
+        assert!(matches!(
+            adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
+                primary: Some(channel(1)),
+                bandwidth: Some(ChannelBandwidth::Cbw20),
+                vht_secondary_80_channel: Some(channel(0)),
+            }),
+            Err(AdapterError::Transport(
+                SourceExactTransportError::MandatoryDependency(_)
+            ))
+        ));
+        assert!(adapter.transport.mechanics.commands.is_empty());
+        assert_eq!(adapter.start_active_scan(), Err(AdapterError::Poisoned));
     }
 
     #[test]

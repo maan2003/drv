@@ -202,6 +202,28 @@ watchdog reboot restored boot `361cd83b-d30d-4f3c-abdd-2954758326c2` with
 `wlan0` up, its default route present, iwd active, and `failed=0`. The durable
 report is
 `/var/lib/wifi-driver-lab/reports/20260809T143339Z-0000_05_00.0.log`.
+
+The next offline slice inventories the smallest pinned-Linux passive-scan
+closure after channel-domain configuration. It encodes EFUSE buffer mode, MAC
+enable, 2x2 `SET_RX_PATH`, unified device/BSS activation, an other-BSS
+management receive filter, passive off-channel tuning, and one-channel
+`START_HW_SCAN`. The Connac2 scan request is fixed to passive type, zero SSIDs,
+zero probe requests, zero IEs, no random MAC, and no general transmit API; its
+only scan function bit is Linux's split-scan bit. Typed parsers accept only the
+matching unsolicited scan-done event and normal-RX beacon/probe-response
+envelopes. Data/control frames, translated headers, RX errors, missing P-RXV
+RSSI, and channels outside 2.4 GHz 1-14 fail closed. TX-only RTS/SAR/LED setup
+is deliberately outside this receive-only closure.
+
+`mt7921-softmac-adapter` now drives these exact encoders through the real
+pinned Fuchsia `SoftmacHardware` implementation. It retains Fuchsia scan IDs,
+bounded requested timing, advertisement conversion, and completion semantics.
+The lower mechanics edge must attest that the mask-zero channel domain,
+source-required MAC MMIO initialization, and separately owned data-RX ring are
+all present before the first MCU command; any missing mandatory dependency
+poisons the adapter before publication. This remains offline-only until the
+physical mechanics edge owns RX ring 2/interrupt bit 2 and ports the mandatory
+MAC MMIO sequence without weakening the existing dual-MCU-ring cleanup gate.
 Pinned PCI Linux changes normal post-N9 MCU responses to the WM2 receive queue.
 It nevertheless keeps both WM ring 0 (interrupt bit 0) and WM2 ring 4
 (interrupt bit 22) allocated, enabled, and drained. The exact installed
