@@ -1272,6 +1272,7 @@ struct VfioFirmwareLoader<'a, 'b> {
 
 struct ReceivedMcuResponse {
     event_id: u8,
+    option: u8,
     bytes: Vec<u8>,
 }
 
@@ -1327,6 +1328,23 @@ fn classify_mcu_completion(
             Err("NIC power command unexpectedly requested RX classification".into())
         }
     }
+}
+
+fn classify_clc_response(response: &ReceivedMcuResponse) -> Result<ClcSetResponse, String> {
+    if response.event_id != 0x80 {
+        return Err(format!(
+            "SET_CLC response event was {:#04x}, expected 0x80",
+            response.event_id
+        ));
+    }
+    if response.option & (1 << 2) != 0 {
+        return Err("SET_CLC response was marked as an unsolicited event".into());
+    }
+    let body = response
+        .bytes
+        .get(36..)
+        .ok_or("SET_CLC response omitted MCU header")?;
+    parse_clc_set_response(body).map_err(|error| format!("parse SET_CLC response: {error:?}"))
 }
 
 const fn next_dma_index(index: usize, count: usize) -> usize {
@@ -1419,6 +1437,7 @@ impl ActiveMcuIo<'_, '_> {
                 );
                 matched = Some(ReceivedMcuResponse {
                     event_id: parsed.event_id,
+                    option: parsed.option,
                     bytes: response,
                 });
             } else {
@@ -1630,18 +1649,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         let response = self
             .mcu
             .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
-        if response.event_id != 0x80 {
-            return Err(format!(
-                "SET_CLC response event was {:#04x}, expected 0x80",
-                response.event_id
-            ));
-        }
-        let body = response
-            .bytes
-            .get(36..)
-            .ok_or("SET_CLC response omitted MCU header")?;
-        let parsed = parse_clc_set_response(body)
-            .map_err(|error| format!("parse SET_CLC response: {error:?}"))?;
+        let parsed = classify_clc_response(&response)?;
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
@@ -3043,6 +3051,7 @@ mod tests {
         bytes[32] = 2;
         let response = ReceivedMcuResponse {
             event_id: 0x04,
+            option: 0,
             bytes,
         };
         assert_eq!(
@@ -3053,11 +3062,13 @@ mod tests {
         );
         let wrong_event = ReceivedMcuResponse {
             event_id: 3,
+            option: 0,
             bytes: response.bytes.clone(),
         };
         assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &wrong_event).is_err());
         let truncated = ReceivedMcuResponse {
             event_id: 4,
+            option: 0,
             bytes: vec![0; 32],
         };
         assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &truncated).is_err());
@@ -3067,6 +3078,7 @@ mod tests {
 
         let capability_response = ReceivedMcuResponse {
             event_id: 1,
+            option: 0,
             bytes: vec![0; 40],
         };
         assert_eq!(
@@ -3087,6 +3099,7 @@ mod tests {
                 DownloadCommand::GetNicCapability,
                 &ReceivedMcuResponse {
                     event_id: 1,
+                    option: 0,
                     bytes: vec![0; 39],
                 }
             )
@@ -3102,6 +3115,7 @@ mod tests {
                 DownloadCommand::ReadEepromBlock { address: 0x550 },
                 &ReceivedMcuResponse {
                     event_id: 1,
+                    option: 0,
                     bytes: eeprom_bytes,
                 }
             ),
@@ -3116,6 +3130,31 @@ mod tests {
                     },
                 }
             ))
+        );
+
+        let mut clc_bytes = vec![0; 108];
+        clc_bytes[42..44].copy_from_slice(&68u16.to_le_bytes());
+        clc_bytes[44] = 0x1f;
+        let clc = ReceivedMcuResponse {
+            event_id: 0x80,
+            option: 0,
+            bytes: clc_bytes.clone(),
+        };
+        assert_eq!(
+            classify_clc_response(&clc),
+            Ok(ClcSetResponse {
+                tag: 0,
+                length: 68,
+                special_unii_mask: 0x1f,
+            })
+        );
+        assert!(
+            classify_clc_response(&ReceivedMcuResponse {
+                event_id: 0x80,
+                option: 1 << 2,
+                bytes: clc_bytes,
+            })
+            .is_err()
         );
     }
 
