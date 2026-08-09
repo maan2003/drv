@@ -65,3 +65,7 @@ All ten patches applied exactly. From that clean root,
 `cargo test --locked --manifest-path <root>/src/connectivity/network/netstack3/Cargo.toml -p wlan-mlme --test host-client-gate`
 passed both tests, and the corresponding `-p fdf` arena test passed. Evidence
 from a previously materialized reference is not accepted for this gate.
+`prepare-upstream` enforces the same rule: it either applies each patch exactly
+with zero fuzz/offset or proves by an exact reverse dry-run that it is already
+applied. A content hash stamps the complete patch set, so a changed patch
+requires a fresh reference root instead of reusing contaminated material.

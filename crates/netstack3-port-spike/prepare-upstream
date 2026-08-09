@@ -33,18 +33,57 @@ cp -R "$here/upstream-cargo/sdk" "$refroot/"
 cp -R "$here/upstream-cargo/third_party" "$refroot/"
 cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 
-# Gate the sole Fuchsia-runtime convenience impl in the otherwise portable
-# upstream DHCP core. The source and minimal host patch remain separate.
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/dhcp-client-core-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/trust-dns-workspace.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-common-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-frame-writer-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-fidl-ext-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-rsn-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-sme-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-trace-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-timer-host.patch" || true
-patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-mlme-host.patch" || true
+patch_dir="$here/upstream-cargo/patches"
+host_patches=(
+  "$patch_dir/dhcp-client-core-host.patch"
+  "$patch_dir/trust-dns-workspace.patch"
+  "$patch_dir/wlan-common-host.patch"
+  "$patch_dir/wlan-frame-writer-host.patch"
+  "$patch_dir/wlan-fidl-ext-host.patch"
+  "$patch_dir/wlan-rsn-host.patch"
+  "$patch_dir/wlan-sme-host.patch"
+  "$patch_dir/wlan-trace-host.patch"
+  "$patch_dir/wlan-timer-host.patch"
+  "$patch_dir/wlan-mlme-host.patch"
+)
+patch_set=$(cat "${host_patches[@]}" | sha256sum | cut -d' ' -f1)
+patch_stamp="$refroot/.drv-host-patch-set"
+if [[ -f $patch_stamp && $(cat "$patch_stamp") != "$patch_set" ]]; then
+  printf 'host patch set changed for materialized reference: %s\n' "$refroot" >&2
+  printf 'materialize a fresh DRV_FUCHSIA_REFERENCE_ROOT before applying it\n' >&2
+  exit 2
+fi
+
+apply_host_patch() {
+  local patch_file=$1 forward reverse
+  if forward=$(patch --dry-run --fuzz=0 -d "$refroot" -p1 --forward < "$patch_file" 2>&1); then
+    if [[ $forward =~ fuzz|offset ]]; then
+      printf 'non-exact patch dry-run for %s:\n%s\n' "$patch_file" "$forward" >&2
+      return 1
+    fi
+    forward=$(patch --fuzz=0 -d "$refroot" -p1 --forward < "$patch_file" 2>&1)
+    if [[ $forward =~ fuzz|offset ]]; then
+      printf 'non-exact patch application for %s:\n%s\n' "$patch_file" "$forward" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if reverse=$(patch --dry-run --fuzz=0 -d "$refroot" -p1 --reverse < "$patch_file" 2>&1); then
+    if [[ $reverse =~ fuzz|offset ]]; then
+      printf 'non-exact reverse patch proof for %s:\n%s\n' "$patch_file" "$reverse" >&2
+      return 1
+    fi
+    return 0
+  fi
+  printf 'patch is neither exactly applicable nor exactly applied: %s\n' "$patch_file" >&2
+  printf 'forward dry-run:\n%s\nreverse dry-run:\n%s\n' "$forward" "$reverse" >&2
+  return 1
+}
+
+for patch_file in "${host_patches[@]}"; do
+  apply_host_patch "$patch_file"
+done
+printf '%s\n' "$patch_set" > "$patch_stamp"
 
 manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
 cargo check --locked --manifest-path "$manifest" -p netstack3_core
