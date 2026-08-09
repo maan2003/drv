@@ -823,8 +823,12 @@ fn run() -> Result<(), String> {
                     payload: &mut command_payload,
                     rx_ring: &mut mcu_rx_ring,
                     rx_buffers: &mcu_rx_buffers,
-                    wa_rx_ring: Some(&mut mcu_wa_rx_ring),
-                    wa_rx_buffers: Some(&mcu_wa_rx_buffers),
+                    alternate_rx_ring: Some(&mut mcu_wa_rx_ring),
+                    alternate_rx_buffers: Some(&mcu_wa_rx_buffers),
+                    alternate_rx_tail: 0,
+                    alternate_rx_head: 7,
+                    alternate_rx_ring_index: 4,
+                    alternate_irq_bit: 1 << 27,
                     rx_tail: 0,
                     rx_head: 7,
                     rx_ring_index: 0,
@@ -864,8 +868,12 @@ fn run() -> Result<(), String> {
                 payload: &mut command_payload,
                 rx_ring: &mut mcu_rx_ring,
                 rx_buffers: &mcu_rx_buffers,
-                wa_rx_ring: None,
-                wa_rx_buffers: None,
+                alternate_rx_ring: None,
+                alternate_rx_buffers: None,
+                alternate_rx_tail: 0,
+                alternate_rx_head: 0,
+                alternate_rx_ring_index: 0,
+                alternate_irq_bit: 0,
                 rx_tail: 0,
                 rx_head: 7,
                 rx_ring_index: 0,
@@ -1234,8 +1242,12 @@ struct ActiveMcuIo<'a, 'b> {
     payload: &'a mut DmaArena<'b>,
     rx_ring: &'a mut DmaArena<'b>,
     rx_buffers: &'a DmaArena<'b>,
-    wa_rx_ring: Option<&'a mut DmaArena<'b>>,
-    wa_rx_buffers: Option<&'a DmaArena<'b>>,
+    alternate_rx_ring: Option<&'a mut DmaArena<'b>>,
+    alternate_rx_buffers: Option<&'a DmaArena<'b>>,
+    alternate_rx_tail: usize,
+    alternate_rx_head: usize,
+    alternate_rx_ring_index: usize,
+    alternate_irq_bit: u32,
     rx_tail: usize,
     rx_head: usize,
     rx_ring_index: usize,
@@ -1326,22 +1338,27 @@ const fn dma_index_completed(actual: u32, expected: u32) -> bool {
 }
 
 impl ActiveMcuIo<'_, '_> {
-    fn switch_to_wa_rx(&mut self) -> Result<(), String> {
+    fn switch_rx_ring(&mut self) -> Result<(), String> {
         let ring = self
-            .wa_rx_ring
+            .alternate_rx_ring
             .take()
-            .ok_or("post-N9 MCU RX ring is unavailable")?;
+            .ok_or("alternate MCU RX ring is unavailable")?;
         let buffers = self
-            .wa_rx_buffers
+            .alternate_rx_buffers
             .take()
-            .ok_or("post-N9 MCU RX buffers are unavailable")?;
-        self.rx_ring = ring;
-        self.rx_buffers = buffers;
-        self.rx_tail = 0;
-        self.rx_head = 7;
-        self.rx_ring_index = 4;
-        self.irq_bit = 1 << 27;
-        println!(r#"{{"active_mcu_event":"post_n9_rx_ring_selected","ring":4}}"#);
+            .ok_or("alternate MCU RX buffers are unavailable")?;
+        let previous_ring = std::mem::replace(&mut self.rx_ring, ring);
+        let previous_buffers = std::mem::replace(&mut self.rx_buffers, buffers);
+        self.alternate_rx_ring = Some(previous_ring);
+        self.alternate_rx_buffers = Some(previous_buffers);
+        std::mem::swap(&mut self.rx_tail, &mut self.alternate_rx_tail);
+        std::mem::swap(&mut self.rx_head, &mut self.alternate_rx_head);
+        std::mem::swap(&mut self.rx_ring_index, &mut self.alternate_rx_ring_index);
+        std::mem::swap(&mut self.irq_bit, &mut self.alternate_irq_bit);
+        println!(
+            "{{\"active_mcu_event\":\"mcu_rx_ring_selected\",\"ring\":{}}}",
+            self.rx_ring_index
+        );
         Ok(())
     }
     fn cancelled(&self) -> Result<(), String> {
@@ -1532,7 +1549,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
     ) -> Result<FirmwareCommandCompletion, Self::Error> {
         self.mcu.cancelled()?;
         if command == DownloadCommand::GetNicCapability {
-            self.mcu.switch_to_wa_rx()?;
+            self.mcu.switch_rx_ring()?;
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, 256);
@@ -1590,6 +1607,12 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         if command.alpha2 != *b"00" || command.environment != 1 || command.index > 1 {
             return Err("SET_CLC escaped the world/indoor allowlist".into());
         }
+        // Pinned Linux names EID 0x80 as a WM CLC event. Normal post-N9
+        // command replies use WM2/ring 4, while this event returns on the
+        // original WM/ring 0 queue.
+        if self.mcu.rx_ring_index != 0 {
+            self.mcu.switch_rx_ring()?;
+        }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, 256);
         self.mcu
@@ -1607,6 +1630,12 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         let response = self
             .mcu
             .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
+        if response.event_id != 0x80 {
+            return Err(format!(
+                "SET_CLC response event was {:#04x}, expected 0x80",
+                response.event_id
+            ));
+        }
         let body = response
             .bytes
             .get(36..)
