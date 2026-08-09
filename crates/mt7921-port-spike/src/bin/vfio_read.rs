@@ -797,9 +797,14 @@ fn run() -> Result<(), String> {
                 | (1 << 30);
             pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
             wfdma.write_active_wfdma(0xd4208, global)?;
-            wfdma.write_active_wfdma(0xd4204, 1 << 0)?;
+            let response_irq_mask = if operation == Operation::RunOneShotFirmware {
+                WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
+            } else {
+                1 << 0
+            };
+            wfdma.write_active_wfdma(0xd4204, response_irq_mask)?;
             println!(
-                "{{\"active_mcu_event\":\"dma_and_response_irq_enabled\",\"global\":\"{global:#010x}\"}}"
+                "{{\"active_mcu_event\":\"dma_and_response_irq_enabled\",\"global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\"}}"
             );
             let mut top = VfioTopOwnership {
                 selector: &selector_page,
@@ -821,19 +826,24 @@ fn run() -> Result<(), String> {
                     signal: &signal,
                     tx_ring: &mut mcu_tx_ring,
                     payload: &mut command_payload,
-                    rx_ring: &mut mcu_rx_ring,
-                    rx_buffers: &mcu_rx_buffers,
-                    alternate_rx_ring: Some(&mut mcu_wa_rx_ring),
-                    alternate_rx_buffers: Some(&mcu_wa_rx_buffers),
-                    alternate_rx_tail: 0,
-                    alternate_rx_head: 7,
-                    alternate_rx_ring_index: 4,
-                    alternate_irq_bit: 1 << 27,
-                    rx_tail: 0,
-                    rx_head: 7,
-                    rx_ring_index: 0,
-                    rx_count: 8,
-                    irq_bit: 1 << 0,
+                    wm: ActiveMcuRx {
+                        rx_ring: &mut mcu_rx_ring,
+                        rx_buffers: &mcu_rx_buffers,
+                        rx_tail: 0,
+                        rx_head: 7,
+                        rx_ring_index: 0,
+                        rx_count: 8,
+                        irq_bit: WM_RX_IRQ_BIT,
+                    },
+                    wm2: Some(ActiveMcuRx {
+                        rx_ring: &mut mcu_wa_rx_ring,
+                        rx_buffers: &mcu_wa_rx_buffers,
+                        rx_tail: 0,
+                        rx_head: 7,
+                        rx_ring_index: 4,
+                        rx_count: 8,
+                        irq_bit: WM2_RX_IRQ_BIT,
+                    }),
                 };
                 let mut loader = VfioFirmwareLoader {
                     mcu,
@@ -866,19 +876,16 @@ fn run() -> Result<(), String> {
                 signal: &signal,
                 tx_ring: &mut mcu_tx_ring,
                 payload: &mut command_payload,
-                rx_ring: &mut mcu_rx_ring,
-                rx_buffers: &mcu_rx_buffers,
-                alternate_rx_ring: None,
-                alternate_rx_buffers: None,
-                alternate_rx_tail: 0,
-                alternate_rx_head: 0,
-                alternate_rx_ring_index: 0,
-                alternate_irq_bit: 0,
-                rx_tail: 0,
-                rx_head: 7,
-                rx_ring_index: 0,
-                rx_count: 8,
-                irq_bit: 1 << 0,
+                wm: ActiveMcuRx {
+                    rx_ring: &mut mcu_rx_ring,
+                    rx_buffers: &mcu_rx_buffers,
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 0,
+                    rx_count: 8,
+                    irq_bit: WM_RX_IRQ_BIT,
+                },
+                wm2: None,
             };
             mcu_io.cancelled()?;
             publish_mcu_command(
@@ -984,20 +991,25 @@ fn run() -> Result<(), String> {
                 "post-reset containment verification failed: active={active:?} cleanup={cleanup_errors:?} error={error}"
             ));
         }
-        for arena in [
-            &mut mcu_wa_rx_buffers,
-            &mut mcu_wa_rx_ring,
-            &mut fwdl_payload,
-            &mut command_payload,
-            &mut mcu_rx_buffers,
-            &mut mcu_rx_ring,
-            &mut rx_guard,
-            &mut mcu_tx_ring,
-            &mut fwdl_ring,
-            &mut tx_guard,
-        ] {
-            arena.teardown()?;
-        }
+        cleanup_errors.extend(attempt_all_cleanup(
+            [
+                (ActiveArenaKind::Wm2Buffers, &mut mcu_wa_rx_buffers),
+                (ActiveArenaKind::Wm2Ring, &mut mcu_wa_rx_ring),
+                (ActiveArenaKind::FwdlPayload, &mut fwdl_payload),
+                (ActiveArenaKind::CommandPayload, &mut command_payload),
+                (ActiveArenaKind::WmBuffers, &mut mcu_rx_buffers),
+                (ActiveArenaKind::WmRing, &mut mcu_rx_ring),
+                (ActiveArenaKind::RxGuard, &mut rx_guard),
+                (ActiveArenaKind::McuTxRing, &mut mcu_tx_ring),
+                (ActiveArenaKind::FwdlRing, &mut fwdl_ring),
+                (ActiveArenaKind::TxGuard, &mut tx_guard),
+            ],
+            |(kind, arena)| {
+                arena
+                    .teardown()
+                    .map_err(|error| format!("teardown {kind:?}: {error}"))
+            },
+        ));
         println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
         active?;
         if !cleanup_errors.is_empty() {
@@ -1234,25 +1246,24 @@ fn publish_mcu_bytes(
     Ok(())
 }
 
+struct ActiveMcuRx<'a, 'b> {
+    rx_ring: &'a mut DmaArena<'b>,
+    rx_buffers: &'a DmaArena<'b>,
+    rx_tail: usize,
+    rx_head: usize,
+    rx_ring_index: usize,
+    rx_count: usize,
+    irq_bit: u32,
+}
+
 struct ActiveMcuIo<'a, 'b> {
     wfdma: &'a ReadPage,
     irq: &'a mut VfioIrq,
     signal: &'a ActiveSignalGuard,
     tx_ring: &'a mut DmaArena<'b>,
     payload: &'a mut DmaArena<'b>,
-    rx_ring: &'a mut DmaArena<'b>,
-    rx_buffers: &'a DmaArena<'b>,
-    alternate_rx_ring: Option<&'a mut DmaArena<'b>>,
-    alternate_rx_buffers: Option<&'a DmaArena<'b>>,
-    alternate_rx_tail: usize,
-    alternate_rx_head: usize,
-    alternate_rx_ring_index: usize,
-    alternate_irq_bit: u32,
-    rx_tail: usize,
-    rx_head: usize,
-    rx_ring_index: usize,
-    rx_count: usize,
-    irq_bit: u32,
+    wm: ActiveMcuRx<'a, 'b>,
+    wm2: Option<ActiveMcuRx<'a, 'b>>,
 }
 
 struct VfioFirmwareLoader<'a, 'b> {
@@ -1272,12 +1283,89 @@ struct VfioFirmwareLoader<'a, 'b> {
 
 struct ReceivedMcuResponse {
     event_id: u8,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used after dual-ring CLC receive is implemented")
-    )]
     option: u8,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveArenaKind {
+    Wm2Buffers,
+    Wm2Ring,
+    FwdlPayload,
+    CommandPayload,
+    WmBuffers,
+    WmRing,
+    RxGuard,
+    McuTxRing,
+    FwdlRing,
+    TxGuard,
+}
+
+fn attempt_all_cleanup<I, F>(items: I, mut cleanup: F) -> Vec<String>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Result<(), String>,
+{
+    let mut errors = Vec::new();
+    for item in items {
+        if let Err(error) = cleanup(item) {
+            errors.push(error);
+        }
+    }
+    errors
+}
+
+const WM_RX_IRQ_BIT: u32 = 1 << 0;
+const WM2_RX_IRQ_BIT: u32 = 1 << 22;
+
+fn merge_matching_response(
+    matched: &mut Option<ReceivedMcuResponse>,
+    candidate: Option<ReceivedMcuResponse>,
+) -> Result<(), String> {
+    if candidate.is_some() && matched.is_some() {
+        return Err("matching MCU sequence appeared on both receive rings".into());
+    }
+    if matched.is_none() {
+        *matched = candidate;
+    }
+    Ok(())
+}
+
+fn response_for_sequence(
+    expected_sequence: Option<u8>,
+    parsed: mt7921_port_spike::DownloadResponse,
+    bytes: Vec<u8>,
+) -> Option<ReceivedMcuResponse> {
+    (Some(parsed.sequence) == expected_sequence).then_some(ReceivedMcuResponse {
+        event_id: parsed.event_id,
+        option: parsed.option,
+        bytes,
+    })
+}
+
+const fn rx_irq_acknowledge(status: u32, mask: u32) -> u32 {
+    status & mask
+}
+
+const fn active_wfdma_write_allowed(offset: usize, value: u32) -> bool {
+    match offset {
+        0xd4200 => value & !(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT) == 0,
+        0xd4204 => {
+            value == 0
+                || value == WM_RX_IRQ_BIT
+                || value == WM2_RX_IRQ_BIT
+                || value == (WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT)
+        }
+        0xd4208 | 0xd4100 | 0xd42b0 => true,
+        0xd42f0 => value == 0,
+        0xd4680 => value == 4,
+        0xd4690 => value == 0x00c0_0004,
+        0xd4640 => value == 0x0340_0004,
+        0xd4644 => value == 0x0380_0004,
+        0xd4408 => value < 128,
+        0xd4418 => value < 256,
+        _ => false,
+    }
 }
 
 fn classify_mcu_completion(
@@ -1334,10 +1422,6 @@ fn classify_mcu_completion(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used after dual-ring CLC receive is implemented")
-)]
 fn classify_clc_response(response: &ReceivedMcuResponse) -> Result<ClcSetResponse, String> {
     if response.event_id != 0x80 {
         return Err(format!(
@@ -1363,30 +1447,81 @@ const fn dma_index_completed(actual: u32, expected: u32) -> bool {
     actual == expected
 }
 
-impl ActiveMcuIo<'_, '_> {
-    fn switch_rx_ring(&mut self) -> Result<(), String> {
-        let ring = self
-            .alternate_rx_ring
-            .take()
-            .ok_or("alternate MCU RX ring is unavailable")?;
-        let buffers = self
-            .alternate_rx_buffers
-            .take()
-            .ok_or("alternate MCU RX buffers are unavailable")?;
-        let previous_ring = std::mem::replace(&mut self.rx_ring, ring);
-        let previous_buffers = std::mem::replace(&mut self.rx_buffers, buffers);
-        self.alternate_rx_ring = Some(previous_ring);
-        self.alternate_rx_buffers = Some(previous_buffers);
-        std::mem::swap(&mut self.rx_tail, &mut self.alternate_rx_tail);
-        std::mem::swap(&mut self.rx_head, &mut self.alternate_rx_head);
-        std::mem::swap(&mut self.rx_ring_index, &mut self.alternate_rx_ring_index);
-        std::mem::swap(&mut self.irq_bit, &mut self.alternate_irq_bit);
-        println!(
-            "{{\"active_mcu_event\":\"mcu_rx_ring_selected\",\"ring\":{}}}",
-            self.rx_ring_index
-        );
-        Ok(())
+fn response_wait_timed_out(now: Instant, deadline: Instant) -> bool {
+    now >= deadline
+}
+
+fn drain_rx_queue(
+    wfdma: &ReadPage,
+    queue: &mut ActiveMcuRx<'_, '_>,
+    expected_sequence: Option<u8>,
+) -> Result<Option<ReceivedMcuResponse>, String> {
+    let mut matched = None;
+    loop {
+        let descriptor = queue.rx_ring.read_descriptor_at(queue.rx_tail);
+        if !descriptor.is_dma_done() {
+            break;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let completed_index = queue.rx_tail;
+        let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
+        let parsed = if descriptor.ctrl & (1 << 30) == 0 {
+            Err("fragmented MCU RX descriptor is unsupported".into())
+        } else if !(36..=2048).contains(&response_len) {
+            Err(format!(
+                "invalid MCU response descriptor length {response_len}"
+            ))
+        } else {
+            let response = queue
+                .rx_buffers
+                .read_bytes(completed_index * 2048, response_len)?;
+            let actual_sequence = response[29];
+            parse_download_response(&response, actual_sequence)
+                .map(|parsed| (parsed, response))
+                .map_err(|error| format!("parse MCU response: {error:?}"))
+        };
+
+        let refill_index = queue.rx_head;
+        let refill = DmaDescriptor::rx(DmaSegment {
+            iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
+            len: 2048,
+        })
+        .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
+        queue.rx_ring.write_descriptor_at(refill_index, refill);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
+        wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)?;
+        queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
+
+        let (parsed, response) = parsed?;
+        let candidate = response_for_sequence(expected_sequence, parsed, response);
+        if candidate.is_some() {
+            if matched.is_some() {
+                return Err(format!(
+                    "duplicate MCU sequence {} on RX ring {}",
+                    parsed.sequence, queue.rx_ring_index
+                ));
+            }
+            println!(
+                "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
+                parsed.sequence, parsed.event_id, parsed.length, queue.rx_ring_index
+            );
+            matched = candidate;
+        } else {
+            println!(
+                "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}",
+                parsed.sequence, parsed.event_id, queue.rx_ring_index
+            );
+        }
     }
+    Ok(matched)
+}
+
+impl ActiveMcuIo<'_, '_> {
+    fn rx_irq_mask(&self) -> u32 {
+        self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit)
+    }
+
     fn cancelled(&self) -> Result<(), String> {
         if self.signal.stop_requested() {
             Err("active MCU transaction cancelled by signal".into())
@@ -1395,67 +1530,20 @@ impl ActiveMcuIo<'_, '_> {
         }
     }
 
-    fn drain_rx(
-        &mut self,
-        expected_sequence: Option<u8>,
-    ) -> Result<Option<ReceivedMcuResponse>, String> {
-        let mut matched = None;
-        loop {
-            let descriptor = self.rx_ring.read_descriptor_at(self.rx_tail);
-            if !descriptor.is_dma_done() {
-                break;
-            }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            let completed_index = self.rx_tail;
-            let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
-            let parsed = if descriptor.ctrl & (1 << 30) == 0 {
-                Err("fragmented MCU RX descriptor is unsupported".into())
-            } else if !(36..=2048).contains(&response_len) {
-                Err(format!(
-                    "invalid MCU response descriptor length {response_len}"
-                ))
-            } else {
-                let response = self
-                    .rx_buffers
-                    .read_bytes(completed_index * 2048, response_len)?;
-                let actual_sequence = response[29];
-                parse_download_response(&response, actual_sequence)
-                    .map(|parsed| (parsed, response))
-                    .map_err(|error| format!("parse MCU response: {error:?}"))
-            };
-
-            let refill_index = self.rx_head;
-            let refill = DmaDescriptor::rx(DmaSegment {
-                iova: self.rx_buffers.iova + (refill_index * 2048) as u64,
-                len: 2048,
-            })
-            .map_err(|error| format!("rearm MCU RX descriptor: {error:?}"))?;
-            self.rx_ring.write_descriptor_at(refill_index, refill);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            self.rx_head = (self.rx_head + 1) % self.rx_count;
-            self.wfdma
-                .write_rx_cpu_index(self.rx_ring_index, self.rx_head as u32)?;
-            self.rx_tail = (self.rx_tail + 1) % self.rx_count;
-
-            let (parsed, response) = parsed?;
-            if Some(parsed.sequence) == expected_sequence {
-                println!(
-                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
-                    parsed.sequence, parsed.event_id, parsed.length, self.rx_ring_index
-                );
-                matched = Some(ReceivedMcuResponse {
-                    event_id: parsed.event_id,
-                    option: parsed.option,
-                    bytes: response,
-                });
-            } else {
-                println!(
-                    "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_descriptor\":{completed_index}}}",
-                    parsed.sequence, parsed.event_id
-                );
-            }
+    fn verify_post_n9_dual_rx(&self) -> Result<(), String> {
+        let Some(wm2) = self.wm2.as_ref() else {
+            return Err("post-N9 MCU receive requires WM2 ring 4".into());
+        };
+        if self.wm.rx_ring_index != 0
+            || self.wm.irq_bit != WM_RX_IRQ_BIT
+            || wm2.rx_ring_index != 4
+            || wm2.irq_bit != WM2_RX_IRQ_BIT
+            || self.wm.rx_count != 8
+            || wm2.rx_count != 8
+        {
+            return Err("post-N9 MCU dual-ring identity mismatch".into());
         }
-        Ok(matched)
+        Ok(())
     }
 
     fn handle_irq(
@@ -1467,17 +1555,20 @@ impl ActiveMcuIo<'_, '_> {
         };
         self.wfdma.write_active_wfdma(0xd4204, 0)?;
         let interrupt_status = self.wfdma.read(0xd4200)?;
-        let acknowledged = interrupt_status & self.irq_bit;
+        let irq_mask = self.rx_irq_mask();
+        let acknowledged = rx_irq_acknowledge(interrupt_status, irq_mask);
         if acknowledged != 0 {
             self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
         }
         println!(
             "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
         );
-        let matched = self.drain_rx(expected_sequence)?;
-        if matched.is_none() {
-            self.wfdma.write_active_wfdma(0xd4204, self.irq_bit)?;
+        let mut matched = drain_rx_queue(self.wfdma, &mut self.wm, expected_sequence)?;
+        if let Some(wm2) = self.wm2.as_mut() {
+            let wm2_match = drain_rx_queue(self.wfdma, wm2, expected_sequence)?;
+            merge_matching_response(&mut matched, wm2_match)?;
         }
+        self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
         Ok(matched)
     }
 
@@ -1510,7 +1601,7 @@ impl ActiveMcuIo<'_, '_> {
             if let Some(response) = self.handle_irq(Some(sequence))? {
                 return Ok(response);
             }
-            if Instant::now() >= deadline {
+            if response_wait_timed_out(Instant::now(), deadline) {
                 return Err(format!("MCU response timed out for sequence {sequence}"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1524,7 +1615,7 @@ impl ActiveMcuIo<'_, '_> {
         tx_descriptor_index: usize,
     ) -> Result<u8, String> {
         self.cancelled()?;
-        self.wfdma.write_active_wfdma(0xd4204, self.irq_bit)?;
+        self.wfdma.write_active_wfdma(0xd4204, self.rx_irq_mask())?;
         publish_mcu_command(
             self.wfdma,
             self.tx_ring,
@@ -1576,7 +1667,11 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
     ) -> Result<FirmwareCommandCompletion, Self::Error> {
         self.mcu.cancelled()?;
         if command == DownloadCommand::GetNicCapability {
-            self.mcu.switch_rx_ring()?;
+            self.mcu.verify_post_n9_dual_rx()?;
+            println!(
+                "{{\"active_mcu_event\":\"post_n9_dual_rx_verified\",\"rings\":[0,4],\"irq_mask\":\"{:#010x}\"}}",
+                self.mcu.rx_irq_mask()
+            );
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, 256);
@@ -1584,7 +1679,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
         if expects_response {
             self.mcu
                 .wfdma
-                .write_active_wfdma(0xd4204, self.mcu.irq_bit)?;
+                .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
         }
         publish_mcu_bytes(
             self.mcu.wfdma,
@@ -1635,22 +1730,13 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             return Err("SET_CLC escaped the world/indoor allowlist".into());
         }
         if command.expects_response() {
-            return Err(
-                "response-enabled SET_CLC requires simultaneous WM ring 0 and WM2 ring 4 receive"
-                    .into(),
-            );
-        }
-        // Pinned Linux names EID 0x80 as a WM CLC event. Normal post-N9
-        // command replies use WM2/ring 4, while this event returns on the
-        // original WM/ring 0 queue.
-        if self.mcu.rx_ring_index != 0 {
-            self.mcu.switch_rx_ring()?;
+            self.mcu.verify_post_n9_dual_rx()?;
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, 256);
         self.mcu
             .wfdma
-            .write_active_wfdma(0xd4204, self.mcu.irq_bit)?;
+            .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
         publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
@@ -1660,24 +1746,32 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_, '_> {
             descriptor_index,
         )?;
         self.command_index = next;
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            self.mcu.cancelled()?;
-            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
-                break;
+        let response = if command.expects_response() {
+            let response = self
+                .mcu
+                .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
+            Some(classify_clc_response(&response)?)
+        } else {
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                self.mcu.cancelled()?;
+                if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "SET_CLC TX completion timed out at descriptor {descriptor_index}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "SET_CLC TX completion timed out at descriptor {descriptor_index}"
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+            None
+        };
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(PAGE)?;
-        Ok(None)
+        Ok(response)
     }
 
     fn publish_scatter(
@@ -2427,28 +2521,10 @@ impl ReadPage {
         if self.bar_page != 0xd4000 {
             return Err("active WFDMA write escaped BAR page".into());
         }
-        match offset {
-            0xd4200 if value & !((1 << 0) | (1 << 27)) == 0 => {}
-            0xd4204
-                if value == 0
-                    || value == (1 << 0)
-                    || value == (1 << 27)
-                    || value == ((1 << 0) | (1 << 27)) => {}
-            0xd4208 => {}
-            0xd4100 => {}
-            0xd42b0 => {}
-            0xd42f0 if value == 0 => {}
-            0xd4680 if value == 4 => {}
-            0xd4690 if value == 0x00c0_0004 => {}
-            0xd4640 if value == 0x0340_0004 => {}
-            0xd4644 if value == 0x0380_0004 => {}
-            0xd4408 if value < 128 => {}
-            0xd4418 if value < 256 => {}
-            _ => {
-                return Err(format!(
-                    "active WFDMA write {offset:#x}={value:#x} escaped allowlist"
-                ));
-            }
+        if !active_wfdma_write_allowed(offset, value) {
+            return Err(format!(
+                "active WFDMA write {offset:#x}={value:#x} escaped allowlist"
+            ));
         }
         let within = offset - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
@@ -3049,6 +3125,92 @@ mod tests {
         request_stop(SIGTERM);
         assert!(STOP_REQUESTED.load(Ordering::Acquire));
         STOP_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn dual_rx_correlates_interleaved_responses_and_wraps_independently() {
+        let envelope = |sequence, event_id| mt7921_port_spike::DownloadResponse {
+            length: 12,
+            packet_type: 0xe000,
+            event_id,
+            sequence,
+            option: 0,
+            extended_event_id: 0,
+        };
+        let unrelated_wm = response_for_sequence(Some(7), envelope(3, 1), vec![3]);
+        let matching_wm2 = response_for_sequence(Some(7), envelope(7, 0x80), vec![7]);
+        assert!(unrelated_wm.is_none());
+        let mut matched = None;
+        merge_matching_response(&mut matched, unrelated_wm).unwrap();
+        merge_matching_response(&mut matched, matching_wm2).unwrap();
+        assert_eq!(matched.unwrap().event_id, 0x80);
+
+        let mut duplicate = Some(ReceivedMcuResponse {
+            event_id: 1,
+            option: 0,
+            bytes: vec![],
+        });
+        assert!(
+            merge_matching_response(
+                &mut duplicate,
+                Some(ReceivedMcuResponse {
+                    event_id: 0x80,
+                    option: 0,
+                    bytes: vec![],
+                })
+            )
+            .is_err()
+        );
+
+        let mut wm_head = 7;
+        let mut wm_tail = 6;
+        let mut wm2_head = 3;
+        let mut wm2_tail = 7;
+        wm_head = next_dma_index(wm_head, 8);
+        wm_tail = next_dma_index(wm_tail, 8);
+        wm2_head = next_dma_index(wm2_head, 8);
+        wm2_tail = next_dma_index(wm2_tail, 8);
+        assert_eq!((wm_head, wm_tail), (0, 7));
+        assert_eq!((wm2_head, wm2_tail), (4, 0));
+    }
+
+    #[test]
+    fn dual_rx_irq_ack_and_wait_deadline_are_bounded() {
+        let mask = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
+        assert_eq!(rx_irq_acknowledge(mask | (1 << 27), mask), mask);
+        assert_eq!(rx_irq_acknowledge(1 << 27, mask), 0);
+        assert!(active_wfdma_write_allowed(0xd4200, mask));
+        assert!(active_wfdma_write_allowed(0xd4204, mask));
+        assert!(active_wfdma_write_allowed(0xd4204, WM2_RX_IRQ_BIT));
+        assert!(!active_wfdma_write_allowed(0xd4200, 1 << 27));
+        assert!(!active_wfdma_write_allowed(0xd4204, 1 << 27));
+        let deadline = Instant::now() + std::time::Duration::from_millis(10);
+        assert!(!response_wait_timed_out(
+            deadline - std::time::Duration::from_nanos(1),
+            deadline
+        ));
+        assert!(response_wait_timed_out(deadline, deadline));
+    }
+
+    #[test]
+    fn dual_rx_cleanup_attempts_both_rings_after_injected_failures() {
+        let items = [
+            ActiveArenaKind::Wm2Buffers,
+            ActiveArenaKind::Wm2Ring,
+            ActiveArenaKind::WmBuffers,
+            ActiveArenaKind::WmRing,
+        ];
+        let mut attempted = Vec::new();
+        let errors = attempt_all_cleanup(items, |kind| {
+            attempted.push(kind);
+            if matches!(kind, ActiveArenaKind::Wm2Buffers | ActiveArenaKind::WmRing) {
+                Err(format!("injected {kind:?}"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempted, items);
+        assert_eq!(errors.len(), 2);
     }
 
     #[test]

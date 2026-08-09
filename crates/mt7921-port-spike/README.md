@@ -186,9 +186,18 @@ sends it on `MT_MCUQ_WM` (WFDMA TX ring 17, TXD Q index `0x20`). A capability
 without `CLC_CAP_EVT_EN` instead passes `wait_resp=false`; enqueue success
 advances to the next rule without an IRQ or response, leaving the UNII mask
 unchanged. `mt7921-firmware-inspect` emits this rule-by-rule fixture directly
-from the installed artifact. The VFIO adapter now rejects response-enabled CLC
-before publication until it can monitor both Linux receive rings concurrently;
-choosing either ring in isolation is not source-equivalent.
+from the installed artifact. The VFIO adapter now owns, enables, acknowledges,
+and drains both receive rings concurrently, with independent producer wrap and
+sequence matching; choosing either ring in isolation is not source-equivalent.
+This path is release-built and fixture-tested but has not received a new live
+authorization.
+The focused containment review verifies that both descriptor/buffer arenas are
+initialized before bus mastering, the active MMIO allowlist admits exactly RX
+bits 0 and 22 (not the TX-done bit 27), IRQ handling masks then acknowledges
+only those asserted sources and rearms both rings, and every exit masks host
+interrupts, disables DMA and bus mastering, disables VFIO IRQ delivery, resets
+while all mappings remain pinned, then attempts teardown of every arena even
+after an injected unmap failure.
 The stock driver exposes only `mt76` register/IRQ/TX-done tracepoints and
 current debugfs queue counters on no-plastic; `fw_debug` is disabled and the
 boot log contains firmware identity but no CLC command envelope or completion.
