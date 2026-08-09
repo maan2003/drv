@@ -1146,64 +1146,75 @@ fn run() -> Result<(), String> {
                                         vht_secondary_80_channel: None,
                                     })
                                     .map_err(|error| error.to_string())?;
-                                let response = adapter
-                                    .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
-                                        channels: Some(vec![*channel]),
-                                        min_channel_time: Some(50_000_000),
-                                        max_channel_time: Some(120_000_000),
-                                        min_home_time: Some(0),
-                                    })
-                                    .map_err(|error| error.to_string())?;
-                                let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
-                                if let Some(authorizer) = beacon_authorizer.as_mut() {
-                                    authorizer.begin_passive_scan(scan_id, *channel);
-                                }
-                                let mut observations = 0usize;
-                                let success = loop {
-                                    match adapter
-                                        .next_scan_event()
-                                        .map_err(|error| error.to_string())?
-                                    {
-                                        Some(HardwareScanEvent::Observation(observation)) => {
-                                            observations += 1;
-                                            if let Some(authorizer) = beacon_authorizer.as_mut()
-                                                && let Some(authorization) =
-                                                    authorizer.observe(scan_id, &observation)
-                                            {
-                                                beacon_authorization = Some(authorization);
-                                            }
-                                            println!(
-                                                r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
-                                            );
-                                        }
-                                        Some(HardwareScanEvent::Complete {
-                                            scan_id: completed,
-                                            success,
-                                        }) if completed == scan_id => break success,
-                                        Some(HardwareScanEvent::Complete {
-                                            scan_id: completed,
-                                            ..
-                                        }) => {
-                                            return Err(format!(
-                                                "passive completion id {completed} did not match {scan_id}"
-                                            ));
-                                        }
-                                        None => {
-                                            std::thread::sleep(std::time::Duration::from_millis(1))
-                                        }
+                                for attempt in 1..=operation.passive_scan_attempt_limit() {
+                                    let response = adapter
+                                        .start_passive_scan(
+                                            WlanSoftmacBaseStartPassiveScanRequest {
+                                                channels: Some(vec![*channel]),
+                                                min_channel_time: Some(50_000_000),
+                                                max_channel_time: Some(120_000_000),
+                                                min_home_time: Some(0),
+                                            },
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    let scan_id =
+                                        response.scan_id.ok_or("passive scan omitted id")?;
+                                    if let Some(authorizer) = beacon_authorizer.as_mut() {
+                                        authorizer.begin_passive_scan(scan_id, *channel);
                                     }
-                                };
-                                if !success {
-                                    return Err(format!(
-                                        "passive channel {} failed completion",
+                                    let mut observations = 0usize;
+                                    let success = loop {
+                                        match adapter
+                                            .next_scan_event()
+                                            .map_err(|error| error.to_string())?
+                                        {
+                                            Some(HardwareScanEvent::Observation(observation)) => {
+                                                observations += 1;
+                                                if let Some(authorizer) = beacon_authorizer.as_mut()
+                                                    && let Some(authorization) =
+                                                        authorizer.observe(scan_id, &observation)
+                                                {
+                                                    beacon_authorization = Some(authorization);
+                                                }
+                                                println!(
+                                                    r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
+                                                );
+                                            }
+                                            Some(HardwareScanEvent::Complete {
+                                                scan_id: completed,
+                                                success,
+                                            }) if completed == scan_id => break success,
+                                            Some(HardwareScanEvent::Complete {
+                                                scan_id: completed,
+                                                ..
+                                            }) => {
+                                                return Err(format!(
+                                                    "passive completion id {completed} did not match {scan_id}"
+                                                ));
+                                            }
+                                            None => std::thread::sleep(
+                                                std::time::Duration::from_millis(1),
+                                            ),
+                                        }
+                                    };
+                                    if !success {
+                                        return Err(format!(
+                                            "passive channel {} failed completion",
+                                            channel.number
+                                        ));
+                                    }
+                                    total_observations += observations;
+                                    println!(
+                                        r#"{{"passive_scan_event":"channel_gate_passed","scan_id":{scan_id},"channel":{},"attempt":{attempt},"observations":{observations}}}"#,
                                         channel.number
-                                    ));
+                                    );
+                                    if !operation.should_continue_passive_scans(
+                                        attempt,
+                                        beacon_authorization.is_some(),
+                                    ) {
+                                        break;
+                                    }
                                 }
-                                total_observations += observations;
-                                println!(
-                                    r#"{{"passive_scan_event":"channel_gate_passed","scan_id":{scan_id},"channel":{},"observations":{observations}}}"#,
-                                    channel.number
-                                );
                             }
                             let completion_only_group = matches!(
                                 operation,
@@ -3883,6 +3894,20 @@ enum Operation {
 }
 
 impl Operation {
+    #[cfg(feature = "fuchsia-passive")]
+    fn passive_scan_attempt_limit(self) -> usize {
+        if self == Self::RunOneShotPowerSetup {
+            5
+        } else {
+            1
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn should_continue_passive_scans(self, attempt: usize, authorized: bool) -> bool {
+        !authorized && attempt < self.passive_scan_attempt_limit()
+    }
+
     fn is_passive(self) -> bool {
         #[cfg(feature = "fuchsia-passive")]
         {
@@ -4479,7 +4504,6 @@ mod tests {
         assert!(Operation::RunOneShotPowerSetup.wfdma_writable());
         assert!(Operation::RunOneShotPowerSetup.conn_writable());
         assert!(Operation::RunOneShotPowerSetup.loads_firmware());
-
         let mut required = passive_mac_mmio_plan()
             .into_iter()
             .map(|operation| match operation {
@@ -4494,6 +4518,25 @@ mod tests {
         assert_eq!(required, PASSIVE_MAC_BAR_PAGES);
         assert!(!passive_mac_address_allowed(0x820e_4000));
         assert!(!passive_mac_address_allowed(0x820e_40f8));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn power_setup_scan_retries_stop_early_and_fail_closed_after_five() {
+        assert_eq!(
+            Operation::RunOneShotPowerSetup.passive_scan_attempt_limit(),
+            5
+        );
+        assert_eq!(
+            Operation::RunOneShotPassiveChannel1.passive_scan_attempt_limit(),
+            1
+        );
+        assert!(!Operation::RunOneShotPowerSetup.should_continue_passive_scans(1, true));
+        for attempt in 1..5 {
+            assert!(Operation::RunOneShotPowerSetup.should_continue_passive_scans(attempt, false));
+        }
+        assert!(!Operation::RunOneShotPowerSetup.should_continue_passive_scans(5, false));
+        assert!(!Operation::RunOneShotPassiveChannel1.should_continue_passive_scans(1, false));
     }
 
     #[cfg(feature = "fuchsia-passive")]
