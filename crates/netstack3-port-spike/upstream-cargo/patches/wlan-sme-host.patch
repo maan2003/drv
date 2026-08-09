@@ -3,7 +3,7 @@ index 8cc163a..e442b36 100644
 --- a/src/connectivity/wlan/lib/sme/src/lib.rs
 +++ b/src/connectivity/wlan/lib/sme/src/lib.rs
 @@ -17,6 +17,7 @@
- 
+
  pub mod ap;
  pub mod client;
 -pub mod serve;
@@ -39,4 +39,27 @@ diff --git a/src/connectivity/wlan/lib/sme/src/client/mod.rs b/src/connectivity/
              ConnectFailure::EstablishRsnaFailure(failure) => match failure {
                  EstablishRsnaFailure {
                      reason: EstablishRsnaFailureReason::RsnaResponseTimeout(_),
- 
+diff --git a/src/connectivity/wlan/lib/sme/src/client/scan.rs b/src/connectivity/wlan/lib/sme/src/client/scan.rs
+--- a/src/connectivity/wlan/lib/sme/src/client/scan.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/scan.rs
+@@ -219,9 +219,12 @@
+         security_support: &fidl_common::SecuritySupport,
+     ) {
+         if let Some(session) = self.scheduled_scan_receivers.get_mut(&txn_id) {
++            #[cfg(target_os = "fuchsia")]
+             let bss_map = std::mem::take(&mut session.bss_map);
++            #[cfg(target_os = "fuchsia")]
+             let bss_description_list = convert_bss_map(bss_map, None::<Ssid>, sme_inspect);
++            #[cfg(target_os = "fuchsia")]
+             let results_fidl = bss_description_list
+                 .into_iter()
+                 .map(|bss_description| {
+@@ -237,6 +240,7 @@
+                 .map(Into::into)
+                 .collect::<Vec<_>>();
+
++            #[cfg(target_os = "fuchsia")]
+             match wlan_common::scan::write_vmo(results_fidl) {
+                 Ok(vmo) => {
+                     let _ = session.scan_results_sender.unbounded_send(vmo);
+

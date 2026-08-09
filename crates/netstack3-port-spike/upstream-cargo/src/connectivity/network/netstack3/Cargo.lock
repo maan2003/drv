@@ -643,6 +643,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fdf"
+version = "0.1.0"
+
+[[package]]
 name = "fidl"
 version = "0.1.0"
 
@@ -753,6 +757,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuchsia-async"
+version = "0.1.0"
+dependencies = [
+ "zx",
+]
+
+[[package]]
 name = "fuchsia-cprng"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,11 +789,15 @@ name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_matches",
+ "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-softmac",
  "ieee80211",
  "wlan-common",
+ "wlan-frame-writer",
+ "wlan-rsn",
 ]
 
 [[package]]
@@ -3350,6 +3365,45 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "wlan-mlme"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eapol",
+ "fdf",
+ "fidl",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-minstrel",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fidl-fuchsia-wlan-softmac",
+ "fidl-fuchsia-wlan-stats",
+ "fuchsia-async",
+ "fuchsia-inspect",
+ "fuchsia-sync",
+ "fuchsia-trace",
+ "futures",
+ "ieee80211",
+ "log",
+ "paste",
+ "rand 0.9.4",
+ "thiserror 2.0.18",
+ "tokio",
+ "wlan-common",
+ "wlan-fidl-ext",
+ "wlan-frame-writer",
+ "wlan-rsn",
+ "wlan-sme",
+ "wlan-statemachine",
+ "wlan-trace",
+ "zerocopy",
+ "zx",
 ]
 
 [[package]]

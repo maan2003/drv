@@ -1,0 +1,40 @@
+[package]
+name = "wlan-mlme"
+workspace = "../../../../network/netstack3"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+test = false
+
+[dependencies]
+anyhow.workspace = true
+fdf = { path = "../../../../../lib/driver-runtime-host" }
+fidl = { path = "../../../../../lib/fidl/rust/fidl" }
+fidl-fuchsia-wlan-common = { path = "../../../../../../sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-driver = { path = "../../../../../../sdk/fidl/fuchsia.wlan.driver" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../../../../../../sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-minstrel = { path = "../../../../../../sdk/fidl/fuchsia.wlan.minstrel" }
+fidl-fuchsia-wlan-mlme = { path = "../../../../../../sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-sme = { path = "../../../../../../sdk/fidl/fuchsia.wlan.sme" }
+fidl-fuchsia-wlan-softmac = { path = "../../../../../../sdk/fidl/fuchsia.wlan.softmac" }
+fidl-fuchsia-wlan-stats = { path = "../../../../../../sdk/fidl/fuchsia.wlan.stats" }
+fuchsia-sync = { path = "../../../../../lib/fuchsia-sync" }
+fuchsia-trace = { path = "../../../../../lib/trace/rust" }
+futures.workspace = true
+fuchsia-async = { path = "../../../../../lib/fuchsia-async-host" }
+ieee80211 = { path = "../../ieee80211" }
+log.workspace = true
+paste.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+wlan-common = { path = "../../common/rust" }
+wlan-fidl-ext = { path = "../../fidl-ext" }
+wlan-frame-writer = { path = "../../frame_writer" }
+wlan-sme = { path = "../../sme" }
+wlan-statemachine = { path = "../../statemachine" }
+wlan-trace = { path = "../../trace" }
+zerocopy.workspace = true
+zx = { path = "../../../../../../sdk/rust/zx" }

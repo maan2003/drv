@@ -64,6 +64,10 @@ macro_rules! flexible_enum {
             pub const fn unknown() -> Self {
                 Self(<$raw>::MAX)
             }
+
+            pub const fn is_unknown(self) -> bool {
+                self.0 == <$raw>::MAX
+            }
         }
 
         #[macro_export]
@@ -133,6 +137,7 @@ flexible_code!(StatusCode, valid_status_code);
 impl ReasonCode {
     pub const UnspecifiedReason: Self = Self(1);
     pub const InvalidAuthentication: Self = Self(2);
+    pub const LeavingNetworkDeauth: Self = Self(3);
     pub const ReasonInvalidElement: Self = Self(13);
     pub const MicFailure: Self = Self(14);
     pub const FourwayHandshakeTimeout: Self = Self(15);
@@ -145,12 +150,16 @@ impl ReasonCode {
 impl StatusCode {
     pub const Success: Self = Self(0);
     pub const RefusedReasonUnspecified: Self = Self(1);
+    pub const NotInSameBss: Self = Self(7);
     pub const RefusedCapabilitiesMismatch: Self = Self(10);
+    pub const DeniedNoAssociationExists: Self = Self(11);
+    pub const UnsupportedAuthAlgorithm: Self = Self(13);
     pub const RejectedSequenceTimeout: Self = Self(16);
     pub const RefusedTemporarily: Self = Self(30);
     pub const RefusedUnauthenticatedAccessNotSupported: Self = Self(68);
     pub const AntiCloggingTokenRequired: Self = Self(76);
     pub const SaeHashToElement: Self = Self(126);
+    pub const JoinFailure: Self = Self(256);
     pub const SpuriousDeauthOrDisassoc: Self = Self(257);
     pub const Canceled: Self = Self(258);
     pub const EstablishRsnaFailure: Self = Self(259);

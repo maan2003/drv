@@ -57,6 +57,10 @@ impl ArgValue for &str {
 
 pub struct TraceCategoryContext;
 
+pub const fn is_enabled() -> bool {
+    false
+}
+
 impl TraceCategoryContext {
     pub fn acquire(_category: &'static str) -> Option<Self> {
         None

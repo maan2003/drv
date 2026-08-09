@@ -89,3 +89,10 @@ in upstream source and are exercised by host integration tests.
 Run `scripts/fetch-fuchsia-reference --print-commit` when another build tool
 needs the canonical revision. Do not introduce a second revision constant,
 archive convention, workspace, or lockfile for another Fuchsia subsystem.
+
+The `wlan-mlme` manifest at
+`src/connectivity/wlan/lib/mlme/rust/Cargo.toml` transcribes the pinned GN
+client dependency closure without modifying the materialized source.
+`HOST-PACKAGING.md` records every post-fetch host-selection hunk and its
+rationale. Host allocation and monotonic-time facades are separately licensed;
+protocol and client state remain pinned Fuchsia source.

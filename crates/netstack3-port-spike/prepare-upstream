@@ -2,7 +2,7 @@
 set -euo pipefail
 
 commit=1e1219e3fac944c9a906aea9646939746b6062b3
-closure=netstack3-port-v2-wlan-fidl-ext-1
+closure=netstack3-port-v2-wlan-mlme-1
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 refroot=${DRV_FUCHSIA_REFERENCE_ROOT:-$repo/reference/fuchsia-$commit}
@@ -15,6 +15,8 @@ if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]] |
    [[ $(cat "$refroot/.drv-source-closure") != "$closure" ]] ||
    [[ ! -f "$refroot/src/lib/mundane/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/lib/fuchsia-sync/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/src/lib/fuchsia-async/src/lib.rs" ]] ||
+   [[ ! -f "$refroot/sdk/lib/driver/runtime/rust/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/connectivity/wlan/lib/fcg-crypto/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/lib/trace/rust/src/lib.rs" ]] ||
    [[ ! -f "$refroot/src/lib/fidl/rust/fidl/src/lib.rs" ]] ||
@@ -42,6 +44,7 @@ patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-sme-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-trace-host.patch" || true
 patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-timer-host.patch" || true
+patch -d "$refroot" -p1 --forward --silent < "$here/upstream-cargo/patches/wlan-mlme-host.patch" || true
 
 manifest="$refroot/src/connectivity/network/netstack3/Cargo.toml"
 cargo check --locked --manifest-path "$manifest" -p netstack3_core
