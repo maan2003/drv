@@ -152,7 +152,11 @@ explicit completion for every chunk under a three-second deadline. Transport
 sequence allocation persists across transactions and skips zero on four-bit
 wrap. Fail-closed cleanup after `Ready` is lab transaction policy; Linux keeps
 the live device resources instead. The operation stops immediately after clean
-N9 readiness; it sends no capability or post-boot configuration command.
+N9 readiness and sends only the read-only `GET_NIC_CAPAB` query before cleanup.
+The bounds-checked response parser exposes MAC, PHY stream/band, 6 GHz, and chip
+capability TLVs while retaining the element/unknown counts. It rejects truncated
+headers, values, and undersized known elements. No radio, channel, regulatory,
+or scan command is encoded or sent.
 
 A watchdog-guarded physical run completed this boundary for the exact installed
 MT7961 artifacts. It downloaded one patch section and four RAM regions in 196

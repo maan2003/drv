@@ -2129,6 +2129,7 @@ pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
     NicPowerControl,
+    GetNicCapability,
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
@@ -2170,6 +2171,91 @@ pub enum DownloadResponseError {
     Truncated,
     InvalidLength,
     SequenceMismatch { expected: u8, actual: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NicPhyCapability {
+    pub ht: bool,
+    pub vht: bool,
+    pub has_5ghz: bool,
+    pub max_bandwidth: u8,
+    pub spatial_streams: u8,
+    pub hardware_path: u8,
+    pub he: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NicCapability {
+    pub element_count: u16,
+    pub mac_address: Option<[u8; 6]>,
+    pub phy: Option<NicPhyCapability>,
+    pub has_6ghz: Option<bool>,
+    pub chip_capability: Option<u64>,
+    pub unknown_elements: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NicCapabilityError {
+    TruncatedHeader,
+    TruncatedElementHeader { index: u16 },
+    TruncatedElement { index: u16, length: u32 },
+    InvalidKnownElement { index: u16, kind: u32 },
+}
+
+/// Parse the TLV body returned by pinned Linux GET_NIC_CAPAB.
+pub fn parse_nic_capability(bytes: &[u8]) -> Result<NicCapability, NicCapabilityError> {
+    let header = bytes.get(..4).ok_or(NicCapabilityError::TruncatedHeader)?;
+    let element_count = u16::from_le_bytes([header[0], header[1]]);
+    let mut offset = 4usize;
+    let mut capability = NicCapability {
+        element_count,
+        mac_address: None,
+        phy: None,
+        has_6ghz: None,
+        chip_capability: None,
+        unknown_elements: 0,
+    };
+    for index in 0..element_count {
+        let tlv = bytes
+            .get(offset..offset + 8)
+            .ok_or(NicCapabilityError::TruncatedElementHeader { index })?;
+        let kind = u32::from_le_bytes(tlv[0..4].try_into().expect("fixed field"));
+        let length = u32::from_le_bytes(tlv[4..8].try_into().expect("fixed field"));
+        offset += 8;
+        let end = offset
+            .checked_add(length as usize)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(NicCapabilityError::TruncatedElement { index, length })?;
+        let value = &bytes[offset..end];
+        offset = end;
+        match kind {
+            7 if value.len() >= 6 => {
+                capability.mac_address = Some(value[..6].try_into().expect("checked MAC length"));
+            }
+            8 if value.len() >= 12 => {
+                capability.phy = Some(NicPhyCapability {
+                    ht: value[0] != 0,
+                    vht: value[1] != 0,
+                    has_5ghz: value[2] != 0,
+                    max_bandwidth: value[3],
+                    spatial_streams: value[4],
+                    hardware_path: value[10],
+                    he: value[11] != 0,
+                });
+            }
+            0x18 if !value.is_empty() => capability.has_6ghz = Some(value[0] != 0),
+            0x20 if value.len() >= 8 => {
+                capability.chip_capability = Some(u64::from_le_bytes(
+                    value[..8].try_into().expect("checked u64"),
+                ));
+            }
+            7 | 8 | 0x18 | 0x20 => {
+                return Err(NicCapabilityError::InvalidKnownElement { index, kind });
+            }
+            _ => capability.unknown_elements += 1,
+        }
+    }
+    Ok(capability)
 }
 
 /// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
@@ -2215,11 +2301,12 @@ pub fn encode_download_command(
     if sequence == 0 || sequence > 15 {
         return Err(DownloadCommandError::InvalidSequence);
     }
-    let (cid, payload): (u8, Vec<u8>) = match command {
-        DownloadCommand::NicPowerControl => (0x04, vec![1, 0, 0, 0]),
-        DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
-        DownloadCommand::PatchSemaphoreRelease => (0x10, 0u32.to_le_bytes().to_vec()),
-        DownloadCommand::PatchFinish => (0x07, vec![0; 4]),
+    let (cid, set_query, payload): (u8, u8, Vec<u8>) = match command {
+        DownloadCommand::NicPowerControl => (0x04, 3, vec![1, 0, 0, 0]),
+        DownloadCommand::GetNicCapability => (0x8a, 1, vec![]),
+        DownloadCommand::PatchSemaphoreGet => (0x10, 3, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchFinish => (0x07, 3, vec![0; 4]),
         DownloadCommand::FirmwareStart { address, option } => {
             if address != 0x0091_5000 || option != 1 {
                 return Err(DownloadCommandError::InvalidFirmwareStart);
@@ -2227,7 +2314,7 @@ pub fn encode_download_command(
             let mut payload = Vec::with_capacity(8);
             payload.extend_from_slice(&option.to_le_bytes());
             payload.extend_from_slice(&address.to_le_bytes());
-            (0x02, payload)
+            (0x02, 3, payload)
         }
         DownloadCommand::PatchStart {
             address,
@@ -2241,7 +2328,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x05, payload)
+            (0x05, 3, payload)
         }
         DownloadCommand::TargetAddressLength {
             address,
@@ -2255,7 +2342,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x01, payload)
+            (0x01, 3, payload)
         }
     };
     let total = CONNAC2_MCU_TXD_BYTES + payload.len();
@@ -2268,7 +2355,7 @@ pub fn encode_download_command(
     bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
     bytes[36] = cid;
     bytes[37] = 0xa0;
-    bytes[38] = 3;
+    bytes[38] = set_query;
     bytes[39] = sequence;
     bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
     Ok(bytes)
@@ -2291,6 +2378,7 @@ pub enum FirmwareLoaderState {
     PatchComplete,
     RamDownloading,
     FirmwareStarted,
+    N9Ready,
     Ready,
 }
 
@@ -2315,6 +2403,7 @@ pub enum FirmwareCommandCompletion {
     Ack,
     PatchSemaphore(PatchSemaphoreStatus),
     PatchFinish(u8),
+    NicCapability(NicCapability),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2419,6 +2508,7 @@ pub struct FirmwareLoaderReport {
     pub ram_regions: usize,
     pub scatter_chunks: usize,
     pub scatter_bytes: usize,
+    pub nic_capability: NicCapability,
 }
 
 fn loader_command<T: FirmwareLoaderTransport>(
@@ -2506,6 +2596,14 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
         ram_regions: 0,
         scatter_chunks: 0,
         scatter_bytes: 0,
+        nic_capability: NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: None,
+            has_6ghz: None,
+            chip_capability: None,
+            unknown_elements: 0,
+        },
     };
 
     let power = DownloadCommand::NicPowerControl;
@@ -2653,13 +2751,25 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                 source,
             })?
         {
-            *state = FirmwareLoaderState::Ready;
-            return Ok(report);
+            *state = FirmwareLoaderState::N9Ready;
+            break;
         }
         if transport.now_ms() >= n9_deadline {
             return Err(FirmwareLoaderFailure::N9ReadyTimeout);
         }
         transport.sleep_ms(FIRMWARE_POLL_INTERVAL_MS);
+    }
+    let capability_command = DownloadCommand::GetNicCapability;
+    match loader_command(transport, capability_command)? {
+        FirmwareCommandCompletion::NicCapability(capability) => {
+            report.nic_capability = capability;
+            *state = FirmwareLoaderState::Ready;
+            Ok(report)
+        }
+        completion => Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+            command: capability_command,
+            completion,
+        }),
     }
 }
 
@@ -4174,6 +4284,10 @@ mod tests {
         let power = encode_download_command(DownloadCommand::NicPowerControl, 3).unwrap();
         assert_eq!(&power[36..40], &[0x04, 0xa0, 3, 3]);
         assert_eq!(&power[64..68], &[1, 0, 0, 0]);
+        let capability = encode_download_command(DownloadCommand::GetNicCapability, 4).unwrap();
+        assert_eq!(capability.len(), CONNAC2_MCU_TXD_BYTES);
+        assert_eq!(&capability[34..36], &0x8000u16.to_le_bytes());
+        assert_eq!(&capability[36..40], &[0x8a, 0xa0, 1, 4]);
 
         let patch = encode_download_command(
             DownloadCommand::PatchStart {
@@ -4560,6 +4674,57 @@ mod tests {
         image
     }
 
+    fn nic_capability_fixture() -> (Vec<u8>, NicCapability) {
+        let mut bytes = vec![0; 4];
+        bytes[0..2].copy_from_slice(&4u16.to_le_bytes());
+        for (kind, value) in [
+            (7u32, vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            (8, vec![1, 1, 1, 2, 2, 0, 1, 1, 1, 1, 3, 1]),
+            (0x18, vec![1]),
+            (0x20, 0x1122_3344_5566_7788u64.to_le_bytes().to_vec()),
+        ] {
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&value);
+        }
+        (
+            bytes,
+            NicCapability {
+                element_count: 4,
+                mac_address: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                phy: Some(NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz: true,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 3,
+                    he: true,
+                }),
+                has_6ghz: Some(true),
+                chip_capability: Some(0x1122_3344_5566_7788),
+                unknown_elements: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn parses_bounded_nic_capability_tlvs() {
+        let (bytes, expected) = nic_capability_fixture();
+        assert_eq!(parse_nic_capability(&bytes), Ok(expected));
+        assert_eq!(
+            parse_nic_capability(&bytes[..bytes.len() - 1]),
+            Err(NicCapabilityError::TruncatedElement {
+                index: 3,
+                length: 8,
+            })
+        );
+        assert_eq!(
+            parse_nic_capability(&[1, 0, 0, 0]),
+            Err(NicCapabilityError::TruncatedElementHeader { index: 0 })
+        );
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum LoaderTrace {
         Command(DownloadCommand, u8),
@@ -4671,6 +4836,9 @@ mod tests {
             }
             Ok(match command {
                 DownloadCommand::NicPowerControl => FirmwareCommandCompletion::NoResponse,
+                DownloadCommand::GetNicCapability => {
+                    FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
+                }
                 DownloadCommand::PatchSemaphoreGet => {
                     FirmwareCommandCompletion::PatchSemaphore(self.semaphore_result.into())
                 }
@@ -4779,6 +4947,7 @@ mod tests {
                 ram_regions: 2,
                 scatter_chunks: 5,
                 scatter_bytes: 8197,
+                nic_capability: nic_capability_fixture().1,
             }
         );
         assert_eq!(
@@ -4835,6 +5004,7 @@ mod tests {
                 LoaderTrace::N9Ready,
                 LoaderTrace::Sleep(10),
                 LoaderTrace::N9Ready,
+                LoaderTrace::Command(DownloadCommand::GetNicCapability, 14),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );

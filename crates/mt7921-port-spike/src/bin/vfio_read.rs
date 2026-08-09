@@ -15,9 +15,9 @@ use mt7921_port_spike::{
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
     encode_download_command, load_mt7921_firmware, mask_ack_disabled_fwdl_interrupt,
-    parse_download_response, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    parse_download_response, parse_nic_capability, prepare_global_rx_rings,
+    prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
+    read_dynamic_identity_status, reset_wfsys, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 use std::{
     cell::Cell,
@@ -1273,6 +1273,15 @@ fn classify_mcu_completion(
         DownloadCommand::PatchStart { .. }
         | DownloadCommand::TargetAddressLength { .. }
         | DownloadCommand::FirmwareStart { .. } => Ok(FirmwareCommandCompletion::Ack),
+        DownloadCommand::GetNicCapability => {
+            let body = response
+                .bytes
+                .get(36..)
+                .ok_or("NIC capability response omitted MCU header")?;
+            let capability = parse_nic_capability(body)
+                .map_err(|error| format!("parse NIC capability response: {error:?}"))?;
+            Ok(FirmwareCommandCompletion::NicCapability(capability))
+        }
         DownloadCommand::NicPowerControl => {
             Err("NIC power command unexpectedly requested RX classification".into())
         }
@@ -2932,6 +2941,34 @@ mod tests {
         assert_eq!(next_dma_index(127, 128), 0);
         assert!(dma_index_completed(0, 0));
         assert!(!dma_index_completed(127, 0));
+
+        let capability_response = ReceivedMcuResponse {
+            event_id: 1,
+            bytes: vec![0; 40],
+        };
+        assert_eq!(
+            classify_mcu_completion(DownloadCommand::GetNicCapability, &capability_response),
+            Ok(FirmwareCommandCompletion::NicCapability(
+                mt7921_port_spike::NicCapability {
+                    element_count: 0,
+                    mac_address: None,
+                    phy: None,
+                    has_6ghz: None,
+                    chip_capability: None,
+                    unknown_elements: 0,
+                }
+            ))
+        );
+        assert!(
+            classify_mcu_completion(
+                DownloadCommand::GetNicCapability,
+                &ReceivedMcuResponse {
+                    event_id: 1,
+                    bytes: vec![0; 39],
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

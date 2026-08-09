@@ -3189,7 +3189,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1353	enumerator	MCU_CE_CMD_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1354	enumerator	MCU_CE_CMD_SET_RATE_TX_POWER	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1355	enumerator	MCU_CE_CMD_SCHED_SCAN_ENABLE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1356	enumerator	MCU_CE_CMD_SCHED_SCAN_REQ	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1357	enumerator	MCU_CE_CMD_GET_NIC_CAPAB	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1357	enumerator	MCU_CE_CMD_GET_NIC_CAPAB	DownloadCommand::GetNicCapability	adapted	offline command fixture and bounded physical query
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1358	enumerator	MCU_CE_CMD_RSSI_MONITOR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1359	enumerator	MCU_CE_CMD_SET_MU_EDCA_PARMS	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1360	enumerator	MCU_CE_CMD_REG_WRITE	-	unmapped	-
@@ -3249,8 +3249,8 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1423	enumerator	MT_NIC_CAP_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1424	enumerator	MT_NIC_CAP_CSUM_OFFLOAD	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1425	enumerator	MT_NIC_CAP_HW_VER	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1426	enumerator	MT_NIC_CAP_SW_VER	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1427	enumerator	MT_NIC_CAP_MAC_ADDR	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1428	enumerator	MT_NIC_CAP_PHY	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1427	enumerator	MT_NIC_CAP_MAC_ADDR	NicCapability::mac_address	adapted	bounded TLV fixture
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1428	enumerator	MT_NIC_CAP_PHY	NicCapability::phy	adapted	bounded TLV fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1429	enumerator	MT_NIC_CAP_MAC	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1430	enumerator	MT_NIC_CAP_FRAME_BUF	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1431	enumerator	MT_NIC_CAP_BEAM_FORM	-	unmapped	-
@@ -3260,8 +3260,8 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1434	enumerator	MT_NIC_CAP_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1435	enumerator	MT_NIC_CAP_HW_ADIE_VERSION	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1436	enumerator	MT_NIC_CAP_ANTSWP	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1437	enumerator	MT_NIC_CAP_WFDMA_REALLOC	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1438	enumerator	MT_NIC_CAP_6G	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1439	enumerator	MT_NIC_CAP_CHIP_CAP	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1438	enumerator	MT_NIC_CAP_6G	NicCapability::has_6ghz	adapted	bounded TLV fixture
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1439	enumerator	MT_NIC_CAP_CHIP_CAP	NicCapability::chip_capability	adapted	bounded TLV fixture
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1440	enumerator	MT_NIC_CAP_EML_CAP	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1443	macro	UNI_WOW_DETECT_TYPE_MAGIC	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1444	macro	UNI_WOW_DETECT_TYPE_ANY	-	unmapped	-
@@ -3829,7 +3829,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	540	member	he	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	543	enum	__anone31f438c0303	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	544	enumerator	WF0_24G	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	545	enumerator	WF0_5G	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	556	function	mt7921_mcu_get_nic_capability	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	556	function	mt7921_mcu_get_nic_capability	parse_nic_capability	adapted	offline malformed/TLV fixtures and bounded physical query
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	558	struct	mt76_connac_cap_hdr	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	559	member	n_element	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	560	member	rsv	-	unmapped	-
