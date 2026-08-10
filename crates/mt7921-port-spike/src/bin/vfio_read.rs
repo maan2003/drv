@@ -27,21 +27,21 @@ use mt7921_port_spike::{
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
     DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
     DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
-    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
-    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
-    MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus, OwnershipError,
-    OwnershipEvent, OwnershipRoundTripEvent, OwnershipRoundTripTransport, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind,
-    ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
-    TxRingState, WfsysResetEvent, WfsysResetTransport, acquire_driver_ownership,
-    acquire_top_driver_ownership, encode_download_command, encode_mt7921_5ghz_auth_tx,
-    load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
-    mask_ack_disabled_fwdl_interrupt, mt7921_packet_type, parse_clc_set_response,
-    parse_download_response, parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status,
-    parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, FirmwareOwnershipEvent,
+    GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle,
+    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
+    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus,
+    OwnershipError, OwnershipEvent, OwnershipRoundTripEvent, OwnershipRoundTripTransport,
+    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability,
+    PciIrqKind, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
+    TopOwnershipTransport, TxRingState, WfsysResetEvent, WfsysResetTransport,
+    acquire_driver_ownership, acquire_top_driver_ownership, encode_download_command,
+    encode_mt7921_5ghz_auth_tx, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
+    mask_ack_disabled_fwdl_interrupt, mt76_pci_aspm_supported, mt7921_packet_type,
+    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
+    parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
+    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
@@ -1316,6 +1316,24 @@ fn run() -> Result<(), String> {
                     "post-identity PCI device is not in D0: PMCSR {pmcsr:#06x}"
                 ));
             }
+            let device_path = std::fs::canonicalize(format!("/sys/bus/pci/devices/{bdf}"))
+                .map_err(|error| format!("resolve PCI device path: {error}"))?;
+            let parent_path = device_path
+                .parent()
+                .ok_or("PCI endpoint has no parent bridge")?;
+            let parent_bdf = parent_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("PCI parent bridge path is invalid")?;
+            let mut parent_config = [0u8; 256];
+            File::open(parent_path.join("config"))
+                .and_then(|mut file| file.read_exact(&mut parent_config))
+                .map_err(|error| format!("read parent PCI config {parent_bdf}: {error}"))?;
+            let aspm_supported = mt76_pci_aspm_supported(&config, Some(&parent_config))
+                .map_err(|error| format!("parse PCIe Link Control: {error:?}"))?;
+            record_sae_stage(&format!(
+                "vfio_ownership_aspm_predicate endpoint={bdf} parent={parent_bdf} supported={aspm_supported}"
+            ));
 
             let selected_command = command | 0x0400;
             let intx_disable = (|| -> Result<(), String> {
@@ -1478,6 +1496,41 @@ fn run() -> Result<(), String> {
                     Ok(())
                 })();
 
+                let ownership = disable.as_ref().map_or(Ok(()), |_| {
+                    (|| -> Result<(), String> {
+                        record_sae_stage(
+                            "vfio_ownership_round_trip_begin page=0xe0000 offset=0xe0010",
+                        );
+                        let mut conn_page = ReadPage::map(&capsule.device, &bar0, 0xe0000, true)?;
+                        let result = {
+                            let mut transport = VfioOwnership {
+                                page: &conn_page,
+                                start: Instant::now(),
+                            };
+                            round_trip_driver_ownership(
+                                &mut transport,
+                                aspm_supported,
+                                record_ownership_round_trip_stage,
+                            )
+                            .map_err(|error| format!("ownership round trip: {error:?}"))
+                        };
+                        record_sae_stage("vfio_ownership_bar0_munmap_before page=0xe0000");
+                        let unmap = conn_page.teardown();
+                        match &unmap {
+                            Ok(()) => {
+                                record_sae_stage("vfio_ownership_bar0_munmap_after page=0xe0000")
+                            }
+                            Err(error) => record_sae_stage(&format!(
+                                "vfio_ownership_bar0_munmap_error page=0xe0000 error={error}"
+                            )),
+                        }
+                        unmap?;
+                        result?;
+                        record_sae_stage("vfio_ownership_round_trip_passed");
+                        Ok(())
+                    })()
+                });
+
                 record_sae_stage(&format!(
                     "vfio_pcie_mac_int_enable_restore_write_before offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
                 ));
@@ -1519,6 +1572,7 @@ fn run() -> Result<(), String> {
                 unmap?;
                 let restored_mac_interrupt_enable = restore?;
                 disable?;
+                ownership?;
                 record_sae_stage(&format!(
                     "vfio_pcie_mac_int_enable_round_trip_complete saved={saved_mac_interrupt_enable:#010x} disabled=0x00000000 restored={restored_mac_interrupt_enable:#010x}"
                 ));
@@ -7667,12 +7721,22 @@ fn record_ownership_round_trip_stage(event: OwnershipRoundTripEvent) {
         OwnershipRoundTripEvent::Snapshot { raw, state } => record_sae_stage(&format!(
             "vfio_ownership_snapshot_read_after offset=0xe0010 bytes=4 raw={raw:#010x} state={state:?}"
         )),
-        OwnershipRoundTripEvent::Driver(event) => {
-            record_sae_stage(&format!("vfio_ownership_driver_transition event={event:?}"))
-        }
-        OwnershipRoundTripEvent::Firmware(event) => record_sae_stage(&format!(
+        OwnershipRoundTripEvent::Driver(
+            event @ (OwnershipEvent::ClearOwnBefore { .. }
+            | OwnershipEvent::AspmDelay { .. }
+            | OwnershipEvent::AttemptExpired { .. }
+            | OwnershipEvent::Acquired { .. }
+            | OwnershipEvent::TimedOut { .. }),
+        ) => record_sae_stage(&format!("vfio_ownership_driver_transition event={event:?}")),
+        OwnershipRoundTripEvent::Firmware(
+            event @ (FirmwareOwnershipEvent::SetOwnBefore { .. }
+            | FirmwareOwnershipEvent::AttemptExpired { .. }
+            | FirmwareOwnershipEvent::Restored { .. }
+            | FirmwareOwnershipEvent::TimedOut { .. }),
+        ) => record_sae_stage(&format!(
             "vfio_ownership_rollback_transition event={event:?}"
         )),
+        OwnershipRoundTripEvent::Driver(_) | OwnershipRoundTripEvent::Firmware(_) => {}
         OwnershipRoundTripEvent::Complete { restored } => record_sae_stage(&format!(
             "vfio_ownership_round_trip_complete restored={restored:?}"
         )),
