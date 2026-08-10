@@ -138,13 +138,16 @@ for sample in $(seq 0 54); do
   for file in "${safety[@]}"; do
     [[ $(<"$file") == SAFE ]] || unsafe=true
   done
-  if ((experiment_rc == 0 && ${#states[@]} == 0)) && ! $unsafe \
+  if ((${#states[@]} == 0)) && ! $unsafe \
     && [[ $driver == mt7921e && $power == D0 && $iwd_active == active ]] \
     && $association && $dhcp && $default_route && $connectivity; then
     wifi-lab-watchdog disarm "$token"
     outcome=passed
     reason=none
-    if $association_failure; then
+    if ((experiment_rc != 0)); then
+      outcome=failed
+      reason=experiment_rc_$experiment_rc
+    elif $association_failure; then
       outcome=failed
       reason=association_failure
     elif ((connectivity_ms > 60000)); then
