@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 drv-audio-pipewire-spike = { path = "../audio-pipewire-spike" }
+drv-fuchsia-audio-processing = { path = "../fuchsia-audio-processing" }
 
 [[bin]]
 name = "amd-hda-enumerate"

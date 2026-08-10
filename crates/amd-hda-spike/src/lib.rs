@@ -255,9 +255,9 @@ impl<T: Transport> Controller<T> {
         codec: u8,
         pcm: &[u8],
     ) -> Result<PlaybackReport, Error<T::Error>> {
-        if pcm.len() != PCM_BYTES || !pcm.len().is_multiple_of(4) {
+        if pcm.is_empty() || pcm.len() > PCM_BYTES || !pcm.len().is_multiple_of(4) {
             return Err(Error::Unsupported(
-                "PCM period must be 7680 bytes of stereo S16LE",
+                "PCM period must be 1..7680 bytes of stereo S16LE",
             ));
         }
         let gcap = map_io(self.io.read16(0x00))?;
@@ -277,6 +277,7 @@ impl<T: Transport> Controller<T> {
         let quarter_db = (((amp_caps >> 16) & 0x7f) + 1) as u8;
         let attenuation_steps = 144_u16.div_ceil(u16::from(quarter_db.max(1))) as u8;
         let gain = offset.saturating_sub(attenuation_steps); // approximately -36 dB
+
         let ctl = (1 << 20) | (1 << 19);
         let playback = (|| {
             for node in [0x01, 0x02, pin] {
@@ -305,7 +306,7 @@ impl<T: Transport> Controller<T> {
             let pcm_iova = self.io.dma_iova() + PCM_OFFSET as u64;
             self.io.dma_write32(BDL_OFFSET, pcm_iova as u32);
             self.io.dma_write32(BDL_OFFSET + 4, (pcm_iova >> 32) as u32);
-            self.io.dma_write32(BDL_OFFSET + 8, PCM_BYTES as u32);
+            self.io.dma_write32(BDL_OFFSET + 8, pcm.len() as u32);
             self.io.dma_write32(BDL_OFFSET + 12, 1);
             self.io.fence();
 
@@ -314,7 +315,7 @@ impl<T: Transport> Controller<T> {
             let bdl_iova = self.io.dma_iova() + BDL_OFFSET as u64;
             map_io(self.io.write32(stream + 0x18, bdl_iova as u32))?;
             map_io(self.io.write32(stream + 0x1c, (bdl_iova >> 32) as u32))?;
-            map_io(self.io.write32(stream + 0x08, PCM_BYTES as u32))?;
+            map_io(self.io.write32(stream + 0x08, pcm.len() as u32))?;
             map_io(self.io.write16(stream + 0x0c, 0))?;
             map_io(self.io.write8(stream + 0x03, 0x1c))?;
             map_io(self.io.write32(0x20, 0xc000_0000 | (1 << stream_index)))?;

@@ -53,3 +53,16 @@ stream, disconnected converter and pin, disabled EAPD, and the wrapper verified
 kernel reported no IOMMU, FIFO, or descriptor fault. The private host adapter
 implements the already-present `drv_audio_pipewire_spike::PlaybackEndpoint`;
 this adds no public audio API.
+
+## Verified stock PipeWire to speaker slice
+
+The explicit `DRV_HDA_PHYSICAL_DAEMON=1` runner mode holds the proven VFIO HDA
+controller behind a private implementation of the existing `PlaybackEndpoint`.
+The ordinary audio daemon remains virtual by default. On no-plastic, an
+untargeted stock PipeWire 1.6.6 `pw-cat` played a 480-frame S16LE/48 kHz/stereo
+pattern through the persistent ADR device and exited 0 with empty stderr. The
+ADR timeline advanced to 960 frames (the pattern plus the client's final silent
+drain quantum); both physical periods completed on speaker stream 4 with LPIB
+advancement and exactly one post-command-drain IOC MSI each. The watchdog then
+restored `snd_hda_intel` and ALC256, while `wlan0` stayed the active route and
+no IOMMU, FIFO, or descriptor fault appeared.

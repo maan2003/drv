@@ -180,3 +180,14 @@ launch recreated it and passed stock Node discovery. Playback retained exact
 accounting for the 480-frame pattern (checksum 2,880,000) plus the stock silent
 drain quantum (final ring position 960). Package tests, service-unit validation,
 and all client probes succeeded.
+
+## Explicit physical HDA backend
+
+The virtual ADR endpoint remains the default for the daemon and all tests. The
+no-plastic-only HDA spike can explicitly start the same persistent native
+PipeWire/ADR daemon with a private physical PlaybackEndpoint. Stock,
+untargeted pw-cat S16LE/48 kHz/stereo quanta still pass through the registry
+worker, pinned Fuchsia mixing/gain processing and timeline accounting; the
+private sink then submits each processed quantum as one AMD HDA BDL period.
+No new application protocol or public hardware-selection API is exposed.
+

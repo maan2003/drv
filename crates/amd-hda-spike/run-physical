@@ -117,4 +117,5 @@ done
 
 operation=()
 [[ ${DRV_HDA_PLAYBACK:-0} == 1 ]] && operation=(--play-test-tone)
+[[ ${DRV_HDA_PHYSICAL_DAEMON:-0} == 1 ]] && operation=(--physical-daemon)
 timeout --signal=TERM "$((watchdog_seconds - 2))" "$binary" "${operation[@]}" "/dev/vfio/devices/$cdev"

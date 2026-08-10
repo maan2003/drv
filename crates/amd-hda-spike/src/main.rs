@@ -1,13 +1,19 @@
 #![cfg(target_os = "linux")]
 
 use amd_hda_spike::{Controller, Error as HdaError, Transport};
-use drv_audio_pipewire_spike::{EndpointError, PcmFormat, PlaybackEndpoint, VIRTUAL_SINK_FORMAT};
+use drv_audio_pipewire_spike::{
+    EndpointError, PcmFormat, PlaybackEndpoint, VIRTUAL_SINK_FORMAT, protocol,
+};
+use drv_fuchsia_audio_processing::apply_gain_s16;
 use std::{
     env,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::fs::FileExt,
+    os::unix::fs::PermissionsExt,
+    os::unix::net::UnixListener,
+    path::PathBuf,
     ptr::NonNull,
     sync::atomic::{Ordering, fence},
 };
@@ -188,6 +194,55 @@ struct VfioHda {
     original_command: u16,
     original_pmcsr: Option<(u64, u16)>,
     config_offset: u64,
+}
+unsafe impl Send for VfioHda {}
+
+struct PhysicalHdaEndpoint {
+    controller: Controller<VfioHda>,
+    frames: u64,
+}
+impl PlaybackEndpoint for PhysicalHdaEndpoint {
+    fn format(&self) -> PcmFormat {
+        VIRTUAL_SINK_FORMAT
+    }
+    fn write(&mut self, pcm: &[u8]) -> Result<(), EndpointError> {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(4) {
+            return Err(EndpointError::PartialFrame);
+        }
+        let mut samples = pcm
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes(sample.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        apply_gain_s16(&mut samples, drv_audio_pipewire_spike::VIRTUAL_SINK_GAIN_DB);
+        let processed = samples
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let report = self
+            .controller
+            .play_pcm_period(0, &processed)
+            .map_err(|error| {
+                eprintln!("physical HDA period failed: {error:?}");
+                EndpointError::PositionOverflow
+            })?;
+        self.frames = self
+            .frames
+            .checked_add((processed.len() / 4) as u64)
+            .ok_or(EndpointError::PositionOverflow)?;
+        println!(
+            "physical HDA {:?} stream={} LPIB={}..{} MSI={} frames={}",
+            report.route,
+            report.stream_index,
+            report.start_position,
+            report.end_position,
+            report.irq_count,
+            self.frames
+        );
+        Ok(())
+    }
+    fn frame_position(&self) -> u64 {
+        self.frames
+    }
 }
 impl VfioHda {
     fn region(device: &File, index: u32) -> io::Result<RegionInfo> {
@@ -454,9 +509,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let first = args.next();
     let playback = first.as_deref() == Some("--play-test-tone");
-    let path = (if playback { args.next() } else { first })
-        .or_else(|| env::var("DRV_VFIO_DEVICE").ok())
-        .ok_or("usage: amd-hda-enumerate [--play-test-tone] /dev/vfio/devices/vfioN")?;
+    let physical_daemon = first.as_deref() == Some("--physical-daemon");
+    let path = (if playback || physical_daemon {
+        args.next()
+    } else {
+        first
+    })
+    .or_else(|| env::var("DRV_VFIO_DEVICE").ok())
+    .ok_or(
+        "usage: amd-hda-enumerate [--play-test-tone|--physical-daemon] /dev/vfio/devices/vfioN",
+    )?;
     let backend = VfioHda::open(&path)?;
     let mut controller = Controller::new(backend);
     let state = controller.reset().map_err(format_hda)?;
@@ -476,6 +538,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "widget node={:#04x} capabilities={:#010x}",
             widget.node, widget.capabilities
         );
+    }
+    if physical_daemon {
+        let runtime_dir = env::var_os("PIPEWIRE_RUNTIME_DIR")
+            .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
+            .map(PathBuf::from)
+            .ok_or("PIPEWIRE_RUNTIME_DIR or XDG_RUNTIME_DIR must be set")?;
+        fs::create_dir_all(&runtime_dir)?;
+        let socket = runtime_dir.join("pipewire-0");
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
+        println!("physical ADR PipeWire daemon ready at {}", socket.display());
+        let endpoint = PhysicalHdaEndpoint {
+            controller,
+            frames: 0,
+        };
+        return protocol::serve_daemon_with_physical_sink(&listener, Box::new(endpoint))
+            .map_err(Into::into);
     }
     if playback {
         let mut period = AdrPcmPeriod::default();

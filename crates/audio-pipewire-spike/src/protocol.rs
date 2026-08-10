@@ -156,10 +156,27 @@ impl ActiveStream {
 
 /// Run the single-user compatibility daemon until its listener is closed.
 pub fn serve_daemon(listener: &UnixListener) -> io::Result<()> {
+    serve_daemon_with_sink(listener, None)
+}
+
+/// Internal host-driver hook used by the explicit physical spike. Application
+/// clients still see only the standard PipeWire protocol and ADR device.
+#[doc(hidden)]
+pub fn serve_daemon_with_physical_sink(
+    listener: &UnixListener,
+    sink: Box<dyn crate::PlaybackEndpoint + Send>,
+) -> io::Result<()> {
+    serve_daemon_with_sink(listener, Some(sink))
+}
+
+fn serve_daemon_with_sink(
+    listener: &UnixListener,
+    sink: Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+) -> io::Result<()> {
     let registry = DeviceRegistry::register_virtual_playback();
     let device = registry.playback().info().clone();
     let (event_tx, event_rx) = mpsc::channel();
-    thread::spawn(move || run_ring_buffer_worker(registry, event_rx));
+    thread::spawn(move || run_ring_buffer_worker(registry, event_rx, sink));
     let mut next_stream_id = 1;
 
     loop {
@@ -496,15 +513,21 @@ fn process_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) -> io::Result<Playback
     })
 }
 
-fn run_ring_buffer_worker(mut registry: DeviceRegistry, events: Receiver<StreamEvent>) {
+fn run_ring_buffer_worker(
+    mut registry: DeviceRegistry,
+    events: Receiver<StreamEvent>,
+    mut sink: Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+) {
     let mut active = BTreeMap::new();
     loop {
         match events.recv_timeout(Duration::from_millis(20)) {
-            Ok(event) => handle_stream_event(&mut registry, &mut active, event),
+            Ok(event) => {
+                handle_stream_event_with_sink(&mut registry, &mut active, &mut sink, event)
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if active.len() == 1 {
                     active.values_mut().for_each(|stream| stream.solo = true);
-                    drain_streams(&mut registry, &mut active);
+                    drain_streams(&mut registry, &mut active, &mut sink);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -512,16 +535,17 @@ fn run_ring_buffer_worker(mut registry: DeviceRegistry, events: Receiver<StreamE
                     stream.ended = true;
                     stream.solo = true;
                 });
-                drain_streams(&mut registry, &mut active);
+                drain_streams(&mut registry, &mut active, &mut sink);
                 return;
             }
         }
     }
 }
 
-fn handle_stream_event(
+fn handle_stream_event_with_sink(
     registry: &mut DeviceRegistry,
     active: &mut BTreeMap<u64, ActiveStream>,
+    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
     event: StreamEvent,
 ) {
     match event {
@@ -546,7 +570,16 @@ fn handle_stream_event(
             }
         }
     }
-    drain_streams(registry, active);
+    drain_streams(registry, active, sink);
+}
+
+#[cfg(test)]
+fn handle_stream_event(
+    registry: &mut DeviceRegistry,
+    active: &mut BTreeMap<u64, ActiveStream>,
+    event: StreamEvent,
+) {
+    handle_stream_event_with_sink(registry, active, &mut None, event);
 }
 
 fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
@@ -561,7 +594,11 @@ fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
         .map(|samples| samples.into_iter().flat_map(i16::to_le_bytes).collect())
 }
 
-fn drain_streams(registry: &mut DeviceRegistry, active: &mut BTreeMap<u64, ActiveStream>) {
+fn drain_streams(
+    registry: &mut DeviceRegistry,
+    active: &mut BTreeMap<u64, ActiveStream>,
+    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+) {
     loop {
         let ids = active.keys().copied().take(2).collect::<Vec<_>>();
         match ids.as_slice() {
@@ -576,7 +613,7 @@ fn drain_streams(registry: &mut DeviceRegistry, active: &mut BTreeMap<u64, Activ
                     }
                     return;
                 };
-                commit_pcm(registry, &pcm);
+                commit_pcm(registry, sink, &pcm);
                 if stream.ended && stream.quantums.is_empty() {
                     active.remove(id);
                 }
@@ -626,7 +663,7 @@ fn drain_streams(registry: &mut DeviceRegistry, active: &mut BTreeMap<u64, Activ
                         .push_front(remainder);
                 }
                 match mix_pcm(&first, &second) {
-                    Ok(pcm) => commit_pcm(registry, &pcm),
+                    Ok(pcm) => commit_pcm(registry, sink, &pcm),
                     Err(error) => eprintln!("PipeWire playback stopped: {error}"),
                 }
             }
@@ -636,10 +673,24 @@ fn drain_streams(registry: &mut DeviceRegistry, active: &mut BTreeMap<u64, Activ
     }
 }
 
-fn commit_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) {
+fn commit_pcm(
+    registry: &mut DeviceRegistry,
+    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    pcm: &[u8],
+) {
     match process_pcm(registry, pcm) {
         Ok(result) => report_playback(result),
         Err(error) => eprintln!("PipeWire playback stopped: {error}"),
+    }
+    if let Some(sink) = sink {
+        if let Err(error) = sink.write(pcm) {
+            eprintln!("Physical playback stopped: {error:?}");
+        } else {
+            println!(
+                "physical HDA ring frame position: {}",
+                sink.frame_position()
+            );
+        }
     }
 }
 
