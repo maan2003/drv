@@ -191,7 +191,6 @@ worker, pinned Fuchsia mixing/gain processing and timeline accounting; the
 private sink then submits each processed quantum as one AMD HDA BDL period.
 No new application protocol or public hardware-selection API is exposed.
 
-
 ## Position-managed 44.1 kHz physical input
 
 The private physical-daemon hook can now register a stereo S16 input format of
@@ -202,9 +201,17 @@ existing physical sink. The ordinary virtual daemon and 48 kHz physical path
 remain byte-for-byte paths with their previous fixed format and 480-frame
 quantum.
 
-This hook still accepts one input format for a daemon lifetime. A single daemon
-that alternates 48 kHz and 44.1 kHz clients needs the pending long-lived HDA
-lifecycle owner to expose client begin/end boundaries (or a rate-tagged quantum
-write) without releasing VFIO ownership. Until that interface lands, the audio
-layer does not duplicate controller/codec ownership merely to perform a mixed-
-rate physical test.
+Each ClientNode now retains its negotiated `PcmFormat`, and every produced
+quantum carries that format into the registry worker. Sequential 48 kHz and
+44.1 kHz clients can therefore share one daemon and one long-lived physical
+endpoint; conversion happens before the common 48 kHz mixing/timeline/sink
+boundary.
+
+On no-plastic boot `23efbca7-a0c8-4adb-bf4c-0a02617cd608`, one guarded daemon
+accepted 48 kHz, then 44.1 kHz, then 48 kHz stock `pw-cat` clients. All exited 0
+with empty stderr. The controller/codec initialized once, `vfio-pci` remained
+bound during the idle gap, and 33 input/drain quanta produced exactly 15,840
+48 kHz hardware frames. The period-25 checkpoint reported LPIB `1916..128`, 25
+IOC MSI events, and zero underruns. Service shutdown restored `snd_hda_intel`
+and ALC256; `wlan0` remained the active route and no IOMMU, FIFO, or descriptor
+fault was logged.

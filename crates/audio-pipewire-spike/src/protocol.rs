@@ -27,12 +27,12 @@ use nix::{
     unistd::ftruncate,
 };
 use pipewire_native_spa::{
-    param::ParamType,
+    param::{ParamType, format::Format},
     pod::{
         RawPod,
         builder::{Builder, StructBuilder},
         parser::Parser,
-        types::{Id, Type},
+        types::{Choice, Id, Type},
     },
 };
 
@@ -107,6 +107,7 @@ struct ClientNodeObject {
     port_updates: u8,
     transport: Option<ClientTransport>,
     buffers: Option<ClientBuffers>,
+    selected_format: Option<crate::PcmFormat>,
 }
 
 #[derive(Debug)]
@@ -131,7 +132,7 @@ pub struct PlaybackResult {
 #[derive(Debug)]
 enum StreamEvent {
     Started(u64),
-    Chunk(u64, Vec<u8>),
+    Chunk(u64, crate::PcmFormat, Vec<u8>),
     Ended(u64),
 }
 
@@ -202,12 +203,12 @@ fn serve_daemon_with_sink(
         let event_tx = event_tx.clone();
         thread::spawn(move || {
             let mut started = false;
-            let result = serve_connection_with(&mut stream, &device, true, &mut |pcm| {
+            let result = serve_connection_with(&mut stream, &device, true, &mut |format, pcm| {
                 if !started {
                     let _ = event_tx.send(StreamEvent::Started(stream_id));
                     started = true;
                 }
-                let _ = event_tx.send(StreamEvent::Chunk(stream_id, pcm));
+                let _ = event_tx.send(StreamEvent::Chunk(stream_id, format, pcm));
             });
             if started {
                 let _ = event_tx.send(StreamEvent::Ended(stream_id));
@@ -240,7 +241,7 @@ pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
 
 fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> io::Result<Vec<u8>> {
     let mut chunks = Vec::new();
-    serve_connection_with(stream, device, false, &mut |chunk| chunks.push(chunk))?;
+    serve_connection_with(stream, device, false, &mut |_, chunk| chunks.push(chunk))?;
     // Keep the legacy bounded probe result stable; persistent mode forwards
     // this stock-client drain quantum to the ring as a real timeline interval.
     if chunks.len() > 1
@@ -257,7 +258,7 @@ fn serve_connection_with(
     stream: &mut UnixStream,
     device: &RegisteredDeviceInfo,
     persistent: bool,
-    on_pcm: &mut impl FnMut(Vec<u8>),
+    on_pcm: &mut impl FnMut(crate::PcmFormat, Vec<u8>),
 ) -> io::Result<()> {
     let mut out_seq = 0;
     let mut registry_id = None;
@@ -337,16 +338,31 @@ fn serve_connection_with(
                             "ClientNode.PortUpdate arrived before Update",
                         ));
                     }
-                    let has_format = decode_client_node_port_update(&payload)?;
+                    let offered_format = decode_client_node_port_update(&payload)?;
                     if client_nodes[client_node_index].port_updates == 0 {
+                        let selected = offered_format.unwrap_or(device.format());
+                        if !matches!(selected.rate, 44_100 | 48_000)
+                            || selected.channels != 2
+                            || selected.sample_format != crate::SampleFormat::Signed16Le
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "client offered no supported PCM format",
+                            ));
+                        }
+                        client_nodes[client_node_index].selected_format = Some(selected);
+                        set_client_transport_format(
+                            client_nodes[client_node_index].transport.as_ref().unwrap(),
+                            selected,
+                        )?;
                         write_client_node_port_format(
                             stream,
-                            device,
+                            selected,
                             client_nodes[client_node_index].proxy_id,
                             &mut out_seq,
                         )?;
                         client_nodes[client_node_index].port_updates = 1;
-                    } else if has_format {
+                    } else if offered_format.is_some() {
                         let buffers = write_client_node_buffers(
                             stream,
                             client_nodes[client_node_index].proxy_id,
@@ -361,6 +377,7 @@ fn serve_connection_with(
                         drive_client_node(
                             client_nodes[client_node_index].transport.as_ref().unwrap(),
                             client_nodes[client_node_index].buffers.as_ref().unwrap(),
+                            client_nodes[client_node_index].selected_format.unwrap(),
                             on_pcm,
                         )?;
                         return Ok(());
@@ -570,7 +587,18 @@ fn handle_stream_event_with_sink(
                 active.values_mut().for_each(|stream| stream.solo = false);
             }
         }
-        StreamEvent::Chunk(id, pcm) => {
+        StreamEvent::Chunk(id, format, pcm) => {
+            let pcm = if let Some((physical, _)) = sink.as_ref() {
+                match physical_pcm_at_sink_rate(format, physical.format(), &pcm) {
+                    Ok(pcm) => pcm,
+                    Err(error) => {
+                        eprintln!("Physical SRC stopped: {error:?}");
+                        return;
+                    }
+                }
+            } else {
+                pcm
+            };
             let only_stream = active.len() == 1;
             if let Some(stream) = active.get_mut(&id) {
                 stream.quantums.push_back(pcm);
@@ -697,15 +725,8 @@ fn commit_pcm(
         Ok(result) => report_playback(result),
         Err(error) => eprintln!("PipeWire playback stopped: {error}"),
     }
-    if let Some((sink, input_format)) = sink {
-        let physical_pcm = match physical_pcm_at_sink_rate(*input_format, sink.format(), pcm) {
-            Ok(pcm) => pcm,
-            Err(error) => {
-                eprintln!("Physical SRC stopped: {error:?}");
-                return;
-            }
-        };
-        if let Err(error) = sink.write(&physical_pcm) {
+    if let Some((sink, _)) = sink {
+        if let Err(error) = sink.write(pcm) {
             eprintln!("Physical playback stopped: {error:?}");
         } else {
             println!(
@@ -814,6 +835,7 @@ fn decode_create_client_node(payload: &[u8]) -> io::Result<ClientNodeObject> {
                 port_updates: 0,
                 transport: None,
                 buffers: None,
+                selected_format: None,
             })
         })
         .map(|(object, _)| object)
@@ -865,7 +887,7 @@ fn decode_client_node_update(payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
         .transpose()
 }
 
-fn decode_client_node_port_update(payload: &[u8]) -> io::Result<bool> {
+fn decode_client_node_port_update(payload: &[u8]) -> io::Result<Option<crate::PcmFormat>> {
     let mut parser = Parser::new(payload);
     parser
         .pop_struct(|fields| {
@@ -893,14 +915,72 @@ fn decode_client_node_port_update(payload: &[u8]) -> io::Result<bool> {
                 require_empty(info, "ClientNode port info")
             })?;
             require_empty(fields, "ClientNode.PortUpdate")?;
-            Ok(params.iter().any(|param| {
-                param.get(12..16).is_some_and(|id| {
-                    u32::from_ne_bytes(id.try_into().unwrap()) == ParamType::Format as u32
-                })
-            }))
+            params
+                .iter()
+                .find_map(|param| decode_pcm_format(param).transpose())
+                .transpose()
         })
-        .map(|(has_format, _)| has_format)
+        .map(|(format, _)| format)
         .map_err(invalid_pod)
+}
+
+fn decode_pcm_format(
+    param: &[u8],
+) -> Result<Option<crate::PcmFormat>, pipewire_native_spa::pod::Error> {
+    let mut parser = Parser::new(param);
+    parser
+        .pop_object::<Format, ParamType, _>(|object, id| {
+            if !matches!(id, ParamType::EnumFormat | ParamType::Format) {
+                return Ok(None);
+            }
+            let mut rate = None;
+            let mut channels = None;
+            let mut sample_format = None;
+            for (key, _, value) in object {
+                match key {
+                    Format::AudioRate => rate = Some(decode_int_default(&value)? as u32),
+                    Format::AudioChannels => channels = Some(decode_int_default(&value)? as u32),
+                    Format::AudioFormat => {
+                        let format = if value.type_() == Type::Choice {
+                            choice_default(value.decode::<Choice<Id<u32>>>()?)
+                        } else {
+                            value.decode::<Id<u32>>()?
+                        };
+                        if format.0 == 0x103 {
+                            sample_format = Some(crate::SampleFormat::Signed16Le);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(match (sample_format, rate, channels) {
+                (Some(sample_format), Some(rate), Some(channels)) => Some(crate::PcmFormat {
+                    sample_format,
+                    rate,
+                    channels,
+                }),
+                _ => None,
+            })
+        })
+        .map(|(format, _)| format)
+}
+
+fn decode_int_default(value: &RawPod<'_>) -> Result<i32, pipewire_native_spa::pod::Error> {
+    if value.type_() == Type::Choice {
+        value.decode::<Choice<i32>>().map(choice_default)
+    } else {
+        value.decode::<i32>()
+    }
+}
+
+fn choice_default<T>(choice: Choice<T>) -> T {
+    match choice {
+        Choice::None(default)
+        | Choice::Range { default, .. }
+        | Choice::Step { default, .. }
+        | Choice::Enum { default, .. }
+        | Choice::Flags { default, .. } => default,
+    }
 }
 
 fn decode_client_node_set_active(payload: &[u8]) -> io::Result<bool> {
@@ -1456,12 +1536,12 @@ fn write_client_node_set_param(
 
 fn write_client_node_port_format(
     stream: &mut UnixStream,
-    device: &RegisteredDeviceInfo,
+    format: crate::PcmFormat,
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<()> {
     let mut storage = [0; 256];
-    let mut format = enum_format_pod_for(device.format(), &mut storage)
+    let mut format = enum_format_pod_for(format, &mut storage)
         .map_err(invalid_pod)?
         .to_vec();
     format[12..16].copy_from_slice(&(ParamType::Format as u32).to_ne_bytes());
@@ -1476,6 +1556,26 @@ fn write_client_node_port_format(
     })?;
     write_message(stream, client_node_id, 7, *out_seq, &body)?;
     *out_seq += 1;
+    Ok(())
+}
+
+fn set_client_transport_format(
+    transport: &ClientTransport,
+    format: crate::PcmFormat,
+) -> io::Result<()> {
+    let quantum = u64::from(format.rate / 100);
+    transport
+        .activation
+        .write_all_at(&format.rate.to_ne_bytes(), 644)?;
+    transport
+        .activation
+        .write_all_at(&quantum.to_ne_bytes(), 656)?;
+    transport
+        .activation
+        .write_all_at(&format.rate.to_ne_bytes(), 692)?;
+    transport
+        .activation
+        .write_all_at(&quantum.to_ne_bytes(), 696)?;
     Ok(())
 }
 
@@ -1609,7 +1709,8 @@ fn write_client_node_start(
 fn drive_client_node(
     transport: &ClientTransport,
     buffers: &ClientBuffers,
-    on_pcm: &mut impl FnMut(Vec<u8>),
+    format: crate::PcmFormat,
+    on_pcm: &mut impl FnMut(crate::PcmFormat, Vec<u8>),
 ) -> io::Result<()> {
     thread::sleep(Duration::from_millis(10));
     let mut recycled = u32::MAX;
@@ -1663,7 +1764,7 @@ fn drive_client_node(
                 let mut size = [0; 4];
                 buffers.memory.read_exact_at(&mut size, base + 4)?;
                 if u32::from_ne_bytes(size) != 0 {
-                    on_pcm(consume_client_buffer(buffers, buffer_id)?);
+                    on_pcm(format, consume_client_buffer(buffers, buffer_id)?);
                     produced = true;
                     break;
                 }
@@ -1702,10 +1803,10 @@ fn drive_client_node(
                     &0_u32.to_ne_bytes(),
                     u64::from(buffer_id) * BUFFER_STRIDE as u64 + 4,
                 )?;
-                on_pcm(pcm);
+                on_pcm(format, pcm);
                 produced = true;
                 recycled = buffer_id;
-                graph_position = graph_position.saturating_add(480);
+                graph_position = graph_position.saturating_add(u64::from(format.rate / 100));
                 consumed = true;
             } else if status & 2 != 0 {
                 return Err(io::Error::new(
@@ -1714,7 +1815,7 @@ fn drive_client_node(
                 ));
             }
             if !produced {
-                graph_position = graph_position.saturating_add(480);
+                graph_position = graph_position.saturating_add(u64::from(format.rate / 100));
             }
             if consumed || !produced {
                 thread::sleep(Duration::from_millis(10));
@@ -1728,7 +1829,7 @@ fn drive_client_node(
         } else {
             recycled = u32::MAX;
             if !produced {
-                graph_position = graph_position.saturating_add(480);
+                graph_position = graph_position.saturating_add(u64::from(format.rate / 100));
                 thread::sleep(Duration::from_millis(10));
             } else {
                 thread::yield_now();
@@ -2515,13 +2616,13 @@ mod tests {
         handle_stream_event(
             &mut registry,
             &mut active,
-            StreamEvent::Chunk(1, vec![0; 240 * 4]),
+            StreamEvent::Chunk(1, crate::VIRTUAL_SINK_FORMAT, vec![0; 240 * 4]),
         );
         assert_eq!(registry.playback().frame_position(), 240);
         handle_stream_event(
             &mut registry,
             &mut active,
-            StreamEvent::Chunk(1, vec![0; 240 * 4]),
+            StreamEvent::Chunk(1, crate::VIRTUAL_SINK_FORMAT, vec![0; 240 * 4]),
         );
         assert_eq!(registry.playback().frame_position(), 480);
 
@@ -2529,12 +2630,12 @@ mod tests {
         handle_stream_event(
             &mut registry,
             &mut active,
-            StreamEvent::Chunk(1, vec![0; 480 * 4]),
+            StreamEvent::Chunk(1, crate::VIRTUAL_SINK_FORMAT, vec![0; 480 * 4]),
         );
         handle_stream_event(
             &mut registry,
             &mut active,
-            StreamEvent::Chunk(2, vec![0; 480 * 4]),
+            StreamEvent::Chunk(2, crate::VIRTUAL_SINK_FORMAT, vec![0; 480 * 4]),
         );
         assert_eq!(registry.playback().frame_position(), 960);
     }
@@ -2574,5 +2675,9 @@ mod tests {
         registry.playback_mut().write_ring_buffer(&source).unwrap();
         assert_eq!(registry.playback().frame_position(), 441);
         assert_eq!(output.len() / 4, 480);
+
+        let mut storage = [0; 256];
+        let offered = enum_format_pod_for(format_441, &mut storage).unwrap();
+        assert_eq!(decode_pcm_format(offered).unwrap(), Some(format_441));
     }
 }
