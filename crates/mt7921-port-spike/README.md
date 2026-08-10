@@ -2303,3 +2303,33 @@ the slow recovery the kernel reported pool 22 with five inflight buffers at
 60 seconds and three at 120 seconds, while native connectivity was healthy at
 final collection. No rerun was attempted, and the physical deployment remains
 held unchanged pending the H2E cryptographic and frame KAT audit.
+
+The completed H2E cryptographic and frame KAT audit found no Direct SAE defect
+and justified no protocol change. Commit `7f705513` therefore added only a
+privacy-safe pre-DMA structural record: public 802.11/authentication fields,
+group and body size, SHA-256 of the scalar and element, scalar-range and P-256
+on-curve booleans, and tail IE IDs and lengths. It never records the
+credential, PT, rand, or mask. The physical transport suite passed 100 tests,
+and the freshly built feature-enabled release had SHA-256
+`4578a7508ad157c02d0a3d58b1d2f0e82c36a09f2906b4efa714297ddaeca01d`.
+
+One bounded native-capture attempt was launched as
+`wifi-sae-differential21`. A concurrent monitor interface was created before
+a native iwd reconnect, with a root-only analyzer that retained only the same
+public structural fields and hashes. The MT7921 monitor path exposed no local
+SAE transmission, and
+`/var/lib/wifi-driver-lab/native-sae-structure-20260810T201216Z.log`
+contains only `capture deadline`. The explicit native reconnect first reached
+authentication but failed association after temporary status 30 and
+deauthentication reason 9. The wrapper then stopped at its 30-second native
+reconnect bound, removed the monitor, and refused the VFIO handoff.
+
+Consequently the port artifact did not run, no DMA or VFIO resource was
+acquired, no lab report or port structural record was produced, and no
+watchdog was armed. Native iwd autoconnect succeeded about 82 seconds after
+the initial disconnect on `wlan2`, with WPA3 association, IPv4, the default
+route, and gateway connectivity healthy. The boot ID, system/profile, kernel,
+generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
+remained intact. No retry was attempted; further physical work is held until a
+public-only native iwd/nl80211 instrumentation method replaces the ineffective
+monitor approach.
