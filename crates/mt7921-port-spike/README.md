@@ -1746,3 +1746,32 @@ wrapper conservatively returned unknown status after losing SSH, but the
 durable report is complete. After recovery `mt7921e` was rebound, `iwd`
 was active, `wlan1` was connected, and the watchdog was inactive. No second
 attempt was made.
+
+### Contained passive EEPROM and CLC initialization
+
+The same consolidated transport now continues from NIC capability discovery
+through the next Linux-derived passive responsibility. It reads the fixed
+`0x550` eFuse/EEPROM hardware block, selects the installed CLC calibration
+record using that result and the discovered chip capability, and applies the
+single world/indoor rule. `SET_CLC` only supplies regulatory/calibration data;
+the separately gated channel-domain call remains unreachable, as do channel
+tuning, MAC/RF enable, scan, management TX, and SAE. Phase markers for eFuse
+acquisition and CLC configuration are flushed before the existing mandatory
+transport quiesce and outer containment.
+
+The single guarded attempt used binary SHA-256
+`4da54784290d782f05ed54e2c23c92e782fc258a844031dd8adab7a0a1866a47`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T141101Z-0000_05_00.0.log`.
+After the previously proved 23-element NIC capability response, eFuse event
+`0xed` returned on WM2 with `valid=0`. One response-bearing world/indoor
+CLC rule then completed as event `0x80`, with special-UNII mask zero. The
+summary records one patch section, four downloadable RAM regions, 196 scatter
+chunks, one applied CLC rule, and explicitly records channel, scan, management
+TX, SAE, and radio as false. Transport quiesce and outer containment cleared
+BME, released mappings before reset, and passed safe-state verification.
+Userspace ended with `rc=0` and supervisor restore with `failed=0`. The
+wrapper conservatively returned unknown after losing SSH, but the durable
+report is complete. Native `mt7921e` rebound, `iwd` was active, `wlan1`
+was connected, both watchdog units were inactive, and no lab state directory
+remained. No second attempt was made.
