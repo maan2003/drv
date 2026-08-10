@@ -4624,7 +4624,9 @@ pub trait WfsysResetTransport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WfsysResetEvent {
     Snapshot { raw: u32 },
+    AssertBefore { raw: u32 },
     Asserted { raw: u32, at_ms: u64 },
+    ReleaseBefore { raw: u32 },
     Released { raw: u32, at_ms: u64 },
     StatusRead { raw: u32, at_ms: u64 },
     Ready { raw: u32, at_ms: u64 },
@@ -4655,6 +4657,7 @@ where
         .map_err(WfsysResetError::Transport)?;
     event(WfsysResetEvent::Snapshot { raw: initial });
     let asserted = initial & !WFSYS_SW_RST_B;
+    event(WfsysResetEvent::AssertBefore { raw: asserted });
     transport
         .write_reset_control(asserted)
         .map_err(WfsysResetError::Transport)?;
@@ -4664,6 +4667,7 @@ where
     });
     transport.sleep_ms(WFSYS_ASSERT_MS);
     let released = asserted | WFSYS_SW_RST_B;
+    event(WfsysResetEvent::ReleaseBefore { raw: released });
     transport
         .write_reset_control(released)
         .map_err(WfsysResetError::Transport)?;
@@ -4699,6 +4703,134 @@ where
             return Err(WfsysResetError::Timeout);
         }
         transport.sleep_ms(DRIVER_OWN_POLL_MS.min(deadline - now));
+    }
+}
+
+pub trait IrqResetTransport: WfsysResetTransport {
+    fn install_irq(&mut self, capability: PciIrqCapability) -> Result<(), Self::Error>;
+    fn mask_host_irq(&mut self) -> Result<(), Self::Error>;
+    fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error>;
+    fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error>;
+    fn disable_irq(&mut self) -> Result<(), Self::Error>;
+    fn containment_reset(&mut self) -> Result<(), Self::Error>;
+    fn verify_contained(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrqResetPrimaryError<E> {
+    InvalidCapability,
+    Install(E),
+    Wfsys(WfsysResetError<E>),
+    MaskHost(E),
+    EnablePcieMac(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqResetCleanupStep {
+    DisablePcieMac,
+    MaskHost,
+    DisableIrq,
+    ContainmentReset,
+    VerifyContained,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrqResetError<E> {
+    pub primary: Option<IrqResetPrimaryError<E>>,
+    pub cleanup: Vec<(IrqResetCleanupStep, E)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrqResetEvent {
+    IrqInstallBefore { capability: PciIrqCapability },
+    IrqInstalled { capability: PciIrqCapability },
+    Wfsys(WfsysResetEvent),
+    HostIrqMaskBefore,
+    HostIrqMasked,
+    PcieMacIrqEnableBefore,
+    PcieMacIrqEnabled,
+    SetupComplete,
+    CleanupBefore { step: IrqResetCleanupStep },
+    CleanupComplete { step: IrqResetCleanupStep },
+}
+
+/// Prepare the Linux-derived reset/IRQ boundary, then contain it before any
+/// DMA mapping or firmware work. It preserves pinned Linux's reset, host-mask,
+/// MAC-gate, then IRQ-install order; all cleanup steps are attempted even after
+/// an ambiguous install error.
+pub fn exercise_irq_reset_boundary<T, F>(
+    transport: &mut T,
+    capability: PciIrqCapability,
+    mut event: F,
+) -> Result<(), IrqResetError<T::Error>>
+where
+    T: IrqResetTransport,
+    F: FnMut(IrqResetEvent),
+{
+    if capability.count == 0 || !capability.eventfd {
+        return Err(IrqResetError {
+            primary: Some(IrqResetPrimaryError::InvalidCapability),
+            cleanup: Vec::new(),
+        });
+    }
+    let primary = match reset_wfsys(transport, |item| event(IrqResetEvent::Wfsys(item))) {
+        Err(error) => Some(IrqResetPrimaryError::Wfsys(error)),
+        Ok(()) => {
+            event(IrqResetEvent::HostIrqMaskBefore);
+            match transport.mask_host_irq() {
+                Err(error) => Some(IrqResetPrimaryError::MaskHost(error)),
+                Ok(()) => {
+                    event(IrqResetEvent::HostIrqMasked);
+                    event(IrqResetEvent::PcieMacIrqEnableBefore);
+                    match transport.enable_pcie_mac_irq() {
+                        Err(error) => Some(IrqResetPrimaryError::EnablePcieMac(error)),
+                        Ok(()) => {
+                            event(IrqResetEvent::PcieMacIrqEnabled);
+                            event(IrqResetEvent::IrqInstallBefore { capability });
+                            match transport.install_irq(capability) {
+                                Err(error) => Some(IrqResetPrimaryError::Install(error)),
+                                Ok(()) => {
+                                    event(IrqResetEvent::IrqInstalled { capability });
+                                    event(IrqResetEvent::SetupComplete);
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let mut cleanup = Vec::new();
+    macro_rules! cleanup_step {
+        ($step:expr, $operation:expr) => {{
+            let step = $step;
+            event(IrqResetEvent::CleanupBefore { step });
+            match $operation {
+                Ok(()) => event(IrqResetEvent::CleanupComplete { step }),
+                Err(error) => cleanup.push((step, error)),
+            }
+        }};
+    }
+    cleanup_step!(IrqResetCleanupStep::MaskHost, transport.mask_host_irq());
+    cleanup_step!(
+        IrqResetCleanupStep::DisablePcieMac,
+        transport.disable_pcie_mac_irq()
+    );
+    cleanup_step!(IrqResetCleanupStep::DisableIrq, transport.disable_irq());
+    cleanup_step!(
+        IrqResetCleanupStep::ContainmentReset,
+        transport.containment_reset()
+    );
+    cleanup_step!(
+        IrqResetCleanupStep::VerifyContained,
+        transport.verify_contained()
+    );
+    if primary.is_none() && cleanup.is_empty() {
+        Ok(())
+    } else {
+        Err(IrqResetError { primary, cleanup })
     }
 }
 
@@ -7772,6 +7904,212 @@ mod tests {
                 at_ms: WFSYS_ASSERT_MS + WFSYS_READY_DEADLINE_MS
             })
         );
+    }
+
+    struct FakeIrqReset {
+        now: u64,
+        raw: u32,
+        fail_setup: Option<&'static str>,
+        fail_cleanup: Vec<&'static str>,
+        operations: Vec<&'static str>,
+    }
+    impl WfsysResetTransport for FakeIrqReset {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+            self.raw |= WFSYS_SW_INIT_DONE;
+            Ok(self.raw)
+        }
+        fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.operations.push("wfsys_write");
+            if self.fail_setup == Some("wfsys_write") {
+                return Err("wfsys_write");
+            }
+            self.raw = value;
+            Ok(())
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+    }
+    impl IrqResetTransport for FakeIrqReset {
+        fn install_irq(&mut self, _: PciIrqCapability) -> Result<(), Self::Error> {
+            self.operations.push("install_irq");
+            if self.fail_setup == Some("install_irq") {
+                Err("install")
+            } else {
+                Ok(())
+            }
+        }
+        fn mask_host_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("mask_host");
+            if self.fail_setup == Some("mask_host") {
+                Err("mask_host")
+            } else {
+                Ok(())
+            }
+        }
+        fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("enable_mac");
+            if self.fail_setup == Some("enable_mac") {
+                Err("enable_mac")
+            } else {
+                Ok(())
+            }
+        }
+        fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("disable_mac");
+            if self.fail_cleanup.contains(&"disable_mac") {
+                Err("disable_mac")
+            } else {
+                Ok(())
+            }
+        }
+        fn disable_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("disable_irq");
+            if self.fail_cleanup.contains(&"disable_irq") {
+                Err("disable_irq")
+            } else {
+                Ok(())
+            }
+        }
+        fn containment_reset(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("containment_reset");
+            if self.fail_cleanup.contains(&"containment_reset") {
+                Err("containment_reset")
+            } else {
+                Ok(())
+            }
+        }
+        fn verify_contained(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("verify_contained");
+            if self.fail_cleanup.contains(&"verify_contained") {
+                Err("verify_contained")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn irq_capability() -> PciIrqCapability {
+        PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 32,
+            eventfd: true,
+        }
+    }
+
+    #[test]
+    fn irq_reset_boundary_orders_setup_before_dma_and_contains_it() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: None,
+            fail_cleanup: Vec::new(),
+            operations: Vec::new(),
+        };
+        exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}).unwrap();
+        assert_eq!(
+            transport.operations,
+            [
+                "wfsys_write",
+                "wfsys_write",
+                "mask_host",
+                "enable_mac",
+                "install_irq",
+                "mask_host",
+                "disable_mac",
+                "disable_irq",
+                "containment_reset",
+                "verify_contained"
+            ]
+        );
+    }
+
+    #[test]
+    fn irq_reset_boundary_attempts_all_cleanup_after_ambiguous_install_error() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: Some("install_irq"),
+            fail_cleanup: vec!["disable_mac", "disable_irq"],
+            operations: Vec::new(),
+        };
+        assert_eq!(
+            exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}),
+            Err(IrqResetError {
+                primary: Some(IrqResetPrimaryError::Install("install")),
+                cleanup: vec![
+                    (IrqResetCleanupStep::DisablePcieMac, "disable_mac"),
+                    (IrqResetCleanupStep::DisableIrq, "disable_irq"),
+                ],
+            })
+        );
+        assert_eq!(
+            transport.operations,
+            [
+                "wfsys_write",
+                "wfsys_write",
+                "mask_host",
+                "enable_mac",
+                "install_irq",
+                "mask_host",
+                "disable_mac",
+                "disable_irq",
+                "containment_reset",
+                "verify_contained"
+            ]
+        );
+    }
+
+    #[test]
+    fn irq_reset_boundary_stops_setup_at_each_failure_and_still_contains() {
+        for failed in ["wfsys_write", "mask_host", "enable_mac", "install_irq"] {
+            let mut transport = FakeIrqReset {
+                now: 0,
+                raw: WFSYS_SW_RST_B,
+                fail_setup: Some(failed),
+                fail_cleanup: Vec::new(),
+                operations: Vec::new(),
+            };
+            assert!(exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}).is_err());
+            assert_eq!(
+                &transport.operations[transport.operations.len() - 5..],
+                [
+                    "mask_host",
+                    "disable_mac",
+                    "disable_irq",
+                    "containment_reset",
+                    "verify_contained"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn irq_reset_boundary_rejects_invalid_vector_before_mmio() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: None,
+            fail_cleanup: Vec::new(),
+            operations: Vec::new(),
+        };
+        let invalid = PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 0,
+            eventfd: true,
+        };
+        assert_eq!(
+            exercise_irq_reset_boundary(&mut transport, invalid, |_| {}),
+            Err(IrqResetError {
+                primary: Some(IrqResetPrimaryError::InvalidCapability),
+                cleanup: Vec::new(),
+            })
+        );
+        assert!(transport.operations.is_empty());
     }
 
     struct FakeInterrupt {

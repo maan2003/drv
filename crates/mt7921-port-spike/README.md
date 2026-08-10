@@ -1509,6 +1509,44 @@ post-CLR read failure with successful rollback, CLR timeout with successful
 rollback, SET timeout without a completion claim, rollback-read continuation,
 an ambiguous SET error whose status verifies restoration, and simultaneous
 primary and rollback transport errors. The VFIO adapter admits SET only on BAR0 page
-`0xe0000` at exact offset `0xe0010`, and the dormant durable-stage adapter maps
-every transaction event to the fsynced SAE stage channel. No physical path
-calls the transaction yet; the existing early return remains unchanged.
+`0xe0000` at exact offset `0xe0010`. The guarded SAE preflight now invokes the
+transaction immediately before its unchanged early return, while PCI INTx and
+the PCIe MAC interrupt latch are disabled. Its fsynced stage adapter retains
+only snapshot, command, delay, retry, terminal, and unmap milestones rather
+than logging every poll read.
+
+The single watchdog-contained run in
+`/var/lib/wifi-driver-lab/reports/20260810T124821Z-0000_05_00.0.log` completed
+with userspace `rc=0` and supervisor restore `failed=0`. Endpoint
+`0000:05:00.0` plus parent `0000:00:02.2` selected the ASPM delay. The snapshot
+was already driver-owned (`0x00000000`), so the source-correct transaction
+issued one CLR, settled for the maximum 3 ms, verified driver ownership at
+5 ms, and intentionally issued no SET. The PCIe MAC latch restored
+`0x000000ff`, PCI Command restored `0x0002`, and all BAR mappings were removed.
+The client lost SSH after launch, left the watchdog armed, and the watchdog
+rebooted the host; the durable report survived and proves the successful gate
+and native supervisor restoration. It does not physically prove SET because
+the saved initial state did not authorize that inverse command.
+
+### Next coherent boundary: reset plus IRQ ownership
+
+The pinned `mt7921_pci_probe` continuation is one responsibility rather than a
+sequence of more register gates: after identity it calls
+`mt792x_wfsys_reset`, writes the WFDMA host interrupt enable to zero, writes
+`MT_PCIE_MAC_INT_ENABLE = 0xff`, requests the PCI IRQ, and only then enters
+`mt7921_dma_init`. `exercise_irq_reset_boundary` now represents that complete
+pre-DMA boundary offline: it prevalidates the eventfd-capable vector, preserves
+Linux's reset, host-mask, MAC-gate, then IRQ-install order, and stops with the
+host interrupt mask still zero. It deliberately has no
+DMA mapping, ring setup, firmware loading, or MCU command surface.
+
+Containment is part of the same state machine: whether setup succeeds or an
+IRQ installation error is ambiguous, it attempts host IRQ mask, MAC-source
+disable, explicit VFIO IRQ disable, containment reset, and post-reset safe-state
+verification in that order.
+The primary error and every cleanup error remain separately visible. Durable
+events cover only IRQ installation, the existing reset milestones, host mask,
+MAC enable, setup completion, and each cleanup boundary. Focused fixtures prove
+the successful source-derived order and that all cleanup steps still run after
+an ambiguous install failure. This boundary is not connected to the physical
+early-return path yet.
