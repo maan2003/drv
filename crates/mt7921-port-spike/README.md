@@ -1963,3 +1963,18 @@ smallest correction moves the existing post-attach D0 check ahead of the
 contained/passive branch for both stage-recording paths; SAE now refuses the
 BAR query unless the same passing precondition holds and emits the existing
 marker.
+
+One guarded run of that correction was launched as `wifi-sae-exchange7` from
+commit `4c9474d3778e`; the release binary SHA-256 was
+`f57edddaf296df9c5713a3fc1d7b4f29ebe29166e2533453477f3b169fa2e4d1`.
+Report `/var/lib/wifi-driver-lab/reports/20260810T161611Z-0000_05_00.0.log`
+ended at `vfio_attached_d0_preflight_already_ready`. The shared post-attach
+MSE=1, BME=0, and D0 reread therefore passed, but there is no evidence for the
+following BAR-region query or mappings, firmware startup, beacon RX, SAE TX,
+or SAE RX. The kernel later reported a 60-second page-pool shutdown stall for
+pool 19 with six inflight buffers, and the watchdog rebooted before userspace
+end or supervisor restore could be recorded.
+
+After reboot, native `mt7921e` rebound, iwd was active, `wlan0` had carrier,
+all recovery and watchdog units were inactive, and `/run/wifi-driver-lab` was
+absent. No further physical mutation was attempted.
