@@ -125,6 +125,21 @@ const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc
 const PATCH_IMAGE_BYTES: usize = 92_192;
 const RAM_IMAGE_BYTES: usize = 792_036;
 const WATCHDOG_STATUS_PATH: &str = "/run/current-system/sw/bin/wifi-lab-watchdog";
+const SAE_STAGE_PATH: &str = "/var/lib/wifi-driver-lab/sae-stage";
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_sae_stage(event: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(SAE_STAGE_PATH)
+    {
+        let _ = writeln!(file, "{event}");
+        let _ = file.sync_all();
+    }
+    eprintln!(r#"{{"sae_auth_event":"{event}"}}"#);
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -797,6 +812,10 @@ fn run() -> Result<(), String> {
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     #[cfg(feature = "fuchsia-passive")]
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("process_enter");
+    }
+    #[cfg(feature = "fuchsia-passive")]
     let power_target = if matches!(
         operation,
         Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
@@ -819,6 +838,10 @@ fn run() -> Result<(), String> {
     let mut sae_credential = (operation == Operation::RunOneShotSaeAuth)
         .then(read_sae_credential)
         .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("credential_read");
+    }
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -826,11 +849,18 @@ fn run() -> Result<(), String> {
         .is_active_mcu()
         .then(verify_external_watchdog_armed)
         .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("watchdog_verified");
+    }
     let containment = operation
         .is_active_mcu()
         .then(|| ContainmentLedger::acquire(watchdog))
         .transpose()?;
 
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("vfio_cdev_open_before");
+    }
     let device = Arc::new(
         OpenOptions::new()
             .read(true)
@@ -838,6 +868,10 @@ fn run() -> Result<(), String> {
             .open(&vfio)
             .map_err(|error| format!("open {vfio}: {error}"))?,
     );
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("vfio_cdev_open_after");
+        record_sae_stage("iommufd_open_before");
+    }
     let iommu = Arc::new(
         OpenOptions::new()
             .read(true)
@@ -845,10 +879,19 @@ fn run() -> Result<(), String> {
             .open("/dev/iommu")
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("iommufd_open_after");
+    }
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("second_pci_identity_before");
+    }
     verify_pci_identity(&bdf)?;
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("second_pci_identity_after");
+    }
     if operation != Operation::RunOneShotSaeAuth {
         verify_pci_dma_disabled(&bdf)?;
     }
@@ -864,7 +907,7 @@ fn run() -> Result<(), String> {
             ledger.mark_possibly_active(Hazard::VfioBound);
         }
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"vfio_bind_iommufd_before"}}"#);
+            record_sae_stage("vfio_bind_iommufd_before");
         }
         ioctl_mut(
             capsule.device.as_raw_fd(),
@@ -873,7 +916,7 @@ fn run() -> Result<(), String> {
             "bind iommufd",
         )?;
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"vfio_bind_iommufd_after"}}"#);
+            record_sae_stage("vfio_bind_iommufd_after");
         }
         capsule
             .acquisition
@@ -886,7 +929,7 @@ fn run() -> Result<(), String> {
             ledger.mark_possibly_active(Hazard::IoasAllocated);
         }
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"ioas_allocate_before"}}"#);
+            record_sae_stage("ioas_allocate_before");
         }
         ioctl_mut(
             capsule.iommu.as_raw_fd(),
@@ -895,7 +938,7 @@ fn run() -> Result<(), String> {
             "allocate IOAS",
         )?;
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"ioas_allocate_after"}}"#);
+            record_sae_stage("ioas_allocate_after");
         }
         capsule.ioas = Some(Ioas {
             fd: Arc::clone(&capsule.iommu),
@@ -912,7 +955,7 @@ fn run() -> Result<(), String> {
             ledger.mark_possibly_active(Hazard::IoasAttached);
         }
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"vfio_attach_iommufd_pt_before"}}"#);
+            record_sae_stage("vfio_attach_iommufd_pt_before");
         }
         ioctl_mut(
             capsule.device.as_raw_fd(),
@@ -921,16 +964,14 @@ fn run() -> Result<(), String> {
             "attach IOAS",
         )?;
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"vfio_attach_iommufd_pt_after"}}"#);
+            record_sae_stage("vfio_attach_iommufd_pt_after");
         }
 
         if operation == Operation::RunOneShotSaeAuth {
             verify_pci_dma_disabled(&bdf).map_err(|error| {
                 format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
             })?;
-            println!(
-                r#"{{"sae_auth_event":"vfio_attached_d0_preflight_already_ready","pci_command":"mse_on_bme_off","power_state":"d0","reset":"skipped"}}"#
-            );
+            record_sae_stage("vfio_attached_d0_preflight_already_ready");
         }
 
         let mut info = RegionInfo {
