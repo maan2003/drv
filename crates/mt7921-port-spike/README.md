@@ -840,3 +840,27 @@ the watchdog deadline. Recovery therefore rebooted to
 in D0, iwd, and the default route were healthy. Thus the identical-value write
 is mechanically verified but, unlike the read-only boundary, does not yet
 prove reboot-free native-network recovery.
+
+Postmortem evidence from that boot is limited because the effective journald
+configuration ends with `Storage=volatile` and `RuntimeMaxUse=16M`; boot ID
+`87e137b8-3d23-493d-af4c-4c1ff447876a` has no entries after reboot, including
+no retained kernel, iwd, or watchdog messages. NetworkManager, networkd, and
+dhcpcd are not installed; iwd owns association and network configuration. The
+durable report was created at `2026-08-10 15:45:40 IST` and last written at
+`15:45:42.025815 IST` after `RESTORE end failed=0`. That restore result proves
+the PCI device reprobed as `mt7921e`, its override cleared, udev settled, iwd
+started active, and the state file was removed. The local health supervisor
+then checked those same facts plus a default route every two seconds for 60
+seconds; because it did not disarm, the missing fact was the route, not a
+reported reprobe or iwd service-start failure. The recovery kernel began at
+`15:47:50.972681 IST`, about 129 seconds after restore completed, consistent
+with expiry of the 120-second watchdog lease and reboot startup. Whether a new
+`wlanN` appeared but association/DHCP lagged or association failed cannot be
+recovered from the volatile journal.
+
+Before repeating the identical-value write, the supervisor should fsync a
+two-second post-restore timeline to `/var/lib/wifi-driver-lab`: driver link and
+PCI power state, every `wlan*` name/operstate/address, iwd state, default route,
+and kernel/iwd journal excerpts. That is the smallest rerun able to distinguish
+interface rename, firmware/reprobe failure, association failure, and route
+latency without changing the selector value.
