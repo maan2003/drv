@@ -519,6 +519,7 @@ dependencies = [
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",
