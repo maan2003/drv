@@ -2215,3 +2215,33 @@ generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
 remained intact. Sixty seconds later the kernel reported one
 `page_pool_release_retry` stall for pool 25 with one inflight buffer, while
 native connectivity remained healthy. No rerun was attempted.
+
+After replacing the global WFDMA logic reset with the bounded TX-ring-0 DTX
+pointer reset, one guarded run was launched as `wifi-sae-exchange18` from
+integrated commit `91a834f3f45f`. The explicitly feature-enabled release and
+staged artifact shared SHA-256
+`b3de64f27e6603529832a64948615259736cbcd527b536fd7a6147230290671e`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T191634Z-0000_05_00.0.log`
+records the dynamic target, firmware and beacon gates, SAE TX resource
+acquisition, commit publication, and the first post-publication IRQ evidence:
+`interrupt_status=0x0c400010`, including TX-done bit 4.
+
+Completion handling then misrouted RX-ring-4 descriptor 7 into the MCU
+response parser. Its control word was `0xc0280000`, descriptor length was 40,
+and the attempted MCU header length was 2039, producing
+`parse MCU response: InvalidLength`. No individual TX-free or TX-status
+correlation became durable, so commit acknowledgement remains unproven. There
+is no peer commit RX, confirm publication or RX, PMK derivation, or
+authenticated marker.
+
+Containment and cleanup quiesced the transport, released DMA mappings, reset
+VFIO, verified the post-reset safe state, and restored the native driver with
+`RESTORE end failed=0`. Native `mt7921e`, D0, and iwd returned, but
+association timed out throughout the bounded recovery window. The watchdog
+therefore remained armed and rebooted the host. The old boot also recorded one
+`page_pool_release_retry` stall for pool 28 with three inflight buffers.
+After reboot, the patched system, profile, kernel, generation-25 default, and
+`keep_d0_on_remove=Y` invariants remained intact; native WPA3 association,
+carrier, and connectivity were healthy on `wlan0`, with no lab state. No
+rerun was attempted.
