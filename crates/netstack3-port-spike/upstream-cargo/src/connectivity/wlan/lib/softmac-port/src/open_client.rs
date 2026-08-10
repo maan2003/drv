@@ -17,6 +17,7 @@ use std::fmt;
 use wlan_common::capabilities::{
     ApCapabilities, ClientCapabilities, StaCapabilities, intersect_with_ap_as_client,
 };
+use wlan_common::ie::rsn::rsne;
 use wlan_common::ie::{self, Id};
 use wlan_common::mac::{self, MgmtBody};
 use wlan_common::mgmt_writer;
@@ -59,6 +60,7 @@ pub trait ClientHardware {
 pub enum OpenConnectError<E> {
     Busy,
     NotOpenNetwork,
+    NotProtectedNetwork,
     MissingSsid,
     FrameWrite,
     Hardware(E),
@@ -69,6 +71,9 @@ impl<E: fmt::Display> fmt::Display for OpenConnectError<E> {
         match self {
             Self::Busy => f.write_str("client MLME is not joined"),
             Self::NotOpenNetwork => f.write_str("request is not open-system authentication"),
+            Self::NotProtectedNetwork => {
+                f.write_str("request is not SAE authentication with an RSNE")
+            }
             Self::MissingSsid => f.write_str("selected BSS has no valid SSID IE"),
             Self::FrameWrite => f.write_str("failed to construct management frame"),
             Self::Hardware(error) => write!(f, "client hardware operation failed: {error}"),
@@ -159,6 +164,44 @@ impl OpenClientMlme {
             return Err(OpenConnectError::Hardware(error));
         }
         self.state = OpenClientState::Authenticating;
+        Ok(())
+    }
+
+    /// Continue the pinned client closure after an external SME-managed SAE
+    /// exchange has authenticated the selected peer.
+    ///
+    /// This sends no second authentication frame and leaves the controlled
+    /// port closed after association; EAPOL traffic-key installation owns the
+    /// later transition to Ethernet-up.
+    pub fn start_protected_association<H: ClientHardware>(
+        &mut self,
+        hardware: &mut H,
+    ) -> Result<(), OpenConnectError<H::Error>> {
+        if self.state != OpenClientState::Joined {
+            return Err(OpenConnectError::Busy);
+        }
+        if self.request.auth_type != fidl_mlme::AuthenticationTypes::Sae
+            || self.request.security_ie.is_empty()
+            || self.request.security_ie[0] != Id::RSNE.0
+        {
+            return Err(OpenConnectError::NotProtectedNetwork);
+        }
+        if self.ssid().is_none() {
+            return Err(OpenConnectError::MissingSsid);
+        }
+        self.timer = Some(ConnectTimer {
+            id: 1,
+            duration_nanos: i64::from(self.request.selected_bss.beacon_period)
+                * i64::from(self.request.connect_failure_timeout)
+                * 1_024_000,
+        });
+        let frame = self
+            .association_request_frame()
+            .map_err(|()| OpenConnectError::FrameWrite)?;
+        hardware
+            .send_mgmt_frame(frame)
+            .map_err(OpenConnectError::Hardware)?;
+        self.state = OpenClientState::Associating;
         Ok(())
     }
 
@@ -267,6 +310,11 @@ impl OpenClientMlme {
         let rates: Vec<u8> = cap.rates.iter().map(|rate| rate.rate()).collect();
         let ht_cap = cap.ht_cap;
         let vht_cap = cap.vht_cap;
+        let rsne = (!self.request.security_ie.is_empty()
+            && self.request.security_ie[0] == Id::RSNE.0)
+            .then(|| rsne::from_bytes(&self.request.security_ie).map(|(_, rsne)| rsne))
+            .transpose()
+            .map_err(|_| ())?;
         write_frame!({
             headers: {
                 mac::MgmtHdr: &mgmt_writer::mgmt_hdr_to_ap(
@@ -288,6 +336,7 @@ impl OpenClientMlme {
                 ssid: ssid,
                 supported_rates: rates,
                 extended_supported_rates: {/* continue rates */},
+                rsne?: rsne,
                 ht_cap?: ht_cap,
                 vht_cap?: vht_cap,
             },
@@ -390,9 +439,11 @@ impl OpenClientMlme {
             )?;
             return Ok(());
         }
-        // Open networks do not require EAPOL, so the pinned MLME opens the
-        // controlled port immediately. Failure is intentionally non-fatal.
-        let _ = hardware.set_ethernet_up();
+        if self.request.security_ie.is_empty() {
+            // Open networks do not require EAPOL, so the pinned MLME opens the
+            // controlled port immediately. Failure is intentionally non-fatal.
+            let _ = hardware.set_ethernet_up();
+        }
         self.timer = None;
         self.state = OpenClientState::Associated;
         self.events.push_back(fidl_mlme::MlmeEvent::ConnectConf {
@@ -441,6 +492,9 @@ mod tests {
 
     const CLIENT: [u8; 6] = [2, 2, 2, 2, 2, 2];
     const AP: [u8; 6] = [6, 6, 6, 6, 6, 6];
+    const WPA3_SAE_RSNE: &[u8] = &[
+        48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 8, 204, 0,
+    ];
 
     #[derive(Debug)]
     struct FakeError;
@@ -669,6 +723,42 @@ mod tests {
             connect_status(&mut client),
             fidl_ieee80211::StatusCode::Success
         );
+    }
+
+    #[test]
+    fn sae_authenticated_client_associates_with_rsne_and_keeps_port_closed() {
+        let mut protected = request();
+        protected.auth_type = fidl_mlme::AuthenticationTypes::Sae;
+        protected.security_ie = WPA3_SAE_RSNE.to_vec();
+        let mut client =
+            OpenClientMlme::new(CLIENT.into(), protected, capabilities(vec![0x82, 0x84]));
+        let mut hardware = FakeHardware::default();
+
+        client.start_protected_association(&mut hardware).unwrap();
+        assert_eq!(client.state(), OpenClientState::Associating);
+        assert_eq!(hardware.frames.len(), 1);
+        let (_, Some(MgmtBody::AssociationReq(assoc))) =
+            mac::MgmtFrame::parse(&hardware.frames[0][..], false)
+                .unwrap()
+                .try_into_mgmt_body()
+        else {
+            panic!("not association request")
+        };
+        assert!(
+            assoc
+                .ies()
+                .any(|(id, body)| { id == Id::RSNE && body == &WPA3_SAE_RSNE[2..] })
+        );
+
+        client
+            .on_mac_frame(
+                &mut hardware,
+                &association_response(fidl_ieee80211::StatusCode::Success, &[0x82, 0x84]),
+            )
+            .unwrap();
+        assert_eq!(client.state(), OpenClientState::Associated);
+        assert_eq!(hardware.associations.len(), 1);
+        assert_eq!(hardware.ethernet_up, 0);
     }
 
     #[test]

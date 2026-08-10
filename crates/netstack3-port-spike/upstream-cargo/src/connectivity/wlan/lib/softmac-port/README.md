@@ -36,6 +36,13 @@ and invalid-auth input, AP rejection, capability mismatch, authentication and
 association timeout, management transport failure, and device-programming
 failure. It has no physical adapter and therefore cannot transmit.
 
+After SME-managed SAE succeeds, the same pinned client closure can now enter
+association directly without sending a second authentication frame. The
+request carries the negotiated RSNE using pinned `BoundClient` layout, the
+response retains the existing capability intersection and typed
+`WlanAssociationConfig`, and the controlled port remains closed for the later
+EAPOL/traffic-key milestone.
+
 `SaeHandshake` now packages the pinned Fuchsia SME-managed `wlan-rsn`
 supplicant for a management-auth-only WPA3 stage. It emits only pinned
 `SaeFrame`, timeout, authentication-status, and one non-printable PMK handoff;
@@ -62,7 +69,7 @@ can expand this milestone's channel set.
 | --- | --- | --- |
 | Passive scan request/state and regulatory candidate intersection | MLME `client/scanner.rs`, SME `client/scan.rs` | Packaged here over Fuchsia value types; hardware execution remains gated |
 | Beacon/probe IE and channel conversion | MLME `client/convert_beacon.rs`, `wlan-common` | The exact pinned `construct_bss_description` is re-exported directly and its upstream fixtures run on host |
-| MLME client open authentication/association and connect timer | MLME `client/{state,station,bound}.rs`, `auth.rs`, `device.rs` | Open-network closure packaged here over raw RX/TX bytes and typed device programming; protected networks and associated-state maintenance remain gated |
+| MLME client authentication/association and connect timer | MLME `client/{state,station,bound}.rs`, `auth.rs`, `device.rs` | Open-network closure plus post-SAE protected association packaged over raw RX/TX bytes and typed device programming; protected controlled-port opening and associated-state maintenance remain gated |
 | SME connect/scan policy | `wlan-sme` | Already packaged and host-tested; endpoint serving is the only excluded transport edge |
 | RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE auth and borrow-only PMK handoff are wrapped here; association/EAPOL/traffic-key progression remains gated |
 | Frame/IE parsing and serialization | `wlan-common`, `ieee80211`, `wlan-frame-writer` | Already packaged and tested; hardware supplies RX bytes/metadata only |
