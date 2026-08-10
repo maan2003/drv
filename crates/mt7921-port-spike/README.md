@@ -1072,3 +1072,30 @@ unchanged. The same verification limits apply: all 69 locked release-workspace
 tests and the locked release build passed with existing upstream warnings;
 the unrelated standalone default-feature and rustfmt failures remain as
 recorded above.
+
+The isolated INTx-disable round trip completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104952Z-0000_05_00.0.log` using
+release binary SHA-256
+`342f4692a9681349ea3485e2cbd998b6d616cb03e5c97322776f0c36b90b8bb5`.
+After the unchanged identity and PCI-preflight gates, the transaction saved
+full Command `0x0002`, wrote exactly two bytes at configuration offset `0x04`
+for selected value `0x0402`, and verified full readback equality. It then wrote
+the exact saved two bytes on the unconditional restore path and verified full
+equality with `0x0002` before publishing completion. The existing identity
+pages were then unmapped and VFIO released safely. No other PCI field, BAR
+mapping or dereference, VFIO IRQ/reset query, DMA mapping, firmware, WFDMA, or
+radio operation was admitted.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104952Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:19:53.966904 IST`; sample zero already saw mt7921e in D0 and iwd active.
+iwd announced usable `wlan6` at `16:19:55.332584`, authenticated and associated
+by `16:19:58.129848`, and reached connected state at `16:19:59.279892`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:20:00.108705`, 6.14 seconds after restore, and the watchdog
+disarmed at `16:20:00.171036`. Boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with the existing
+upstream warnings; the previously recorded standalone default-feature and
+rustfmt limitations remain unchanged.
