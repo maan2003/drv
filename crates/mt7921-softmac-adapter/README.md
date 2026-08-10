@@ -85,11 +85,23 @@ controlled-port effect succeeds, and bounds both directions. Reset/stop closes
 the port, revokes the address, drains both queues, and overwrites queued frame
 storage before release.
 
+The run loop retains the `Mt7921ScanRunner` after moving the device into the
+client MLME. It calls `runner.pump_client_rx(&mut mlme)` to deliver at most one
+descriptor-validated raw 802.11 RX frame, and
+`ethernet_tx.pump_one(&mut mlme)` to pass at most one Netstack3 Ethernet frame
+through the MLME's native encapsulation path. Both calls are bounded and
+preserve the single run-scoped effects owner.
+
 Offline tests cover MLME RX delivery into the Netstack3 device contract,
 outbound ARP, IPv4 (including DHCP/data), and IPv6 frames through the SoftMAC TX
 facade, backpressure/retry, MTU/MAC validation, link transitions, and teardown.
-The existing Netstack3 offline suite separately proves ARP/NDP, DHCPv4, IPv4,
-IPv6, DNS over UDP/TCP, TCP, and UDP through this exact `EthernetDevice` shape.
+An associated-link simulation additionally drives this exact adapter and a
+real userspace Netstack3 `Runtime` through DHCPv4 lease/route/DNS acquisition,
+Trust-DNS resolution, and a TCP HTTP request. Link loss atomically revokes the
+address, routes, resolver configuration, and retained frames; link return
+restarts DHCP and reacquires the lease. The existing Netstack3 offline suite
+separately proves ARP/NDP, IPv4, IPv6, DNS over UDP/TCP, TCP, and UDP through
+the same `EthernetDevice` shape.
 
 The remaining physical backend interface is deliberately small. After
 association it must make the existing `Mt7921ClientEffects` methods real:
@@ -140,4 +152,10 @@ After materializing the repository's pinned Fuchsia source closure:
 ```sh
 ./crates/netstack3-port-spike/prepare-upstream
 cargo test --locked --manifest-path crates/mt7921-softmac-adapter/Cargo.toml
+```
+
+The bounded DHCP/DNS/TCP/disconnect/reconnect proof can also be run alone:
+
+```sh
+cargo test --locked --offline --manifest-path crates/mt7921-softmac-adapter/Cargo.toml ethernet::associated_runtime_test::associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects -- --exact
 ```

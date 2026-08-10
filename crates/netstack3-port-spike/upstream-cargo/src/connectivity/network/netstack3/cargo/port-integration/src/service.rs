@@ -16,7 +16,7 @@ use dhcp_client_core::{
     parse::{OptionCodeMap, OptionRequested},
 };
 use dhcp_protocol::{DhcpOption, OptionCode};
-use futures::{channel::mpsc, executor::LocalPool, task::LocalSpawnExt as _};
+use futures::{StreamExt as _, channel::mpsc, executor::LocalPool, task::LocalSpawnExt as _};
 use net_types::{Witness as _, ethernet::Mac};
 use netstack3_port_spike::{
     EthernetDeviceEvent, EthernetFrame, NetworkServiceEndpoint, StackEthernetEndpoint,
@@ -234,7 +234,10 @@ pub struct DhcpService {
     wakes: Rc<RefCell<Wakes>>,
     effects: mpsc::UnboundedReceiver<Effect>,
     address: mpsc::UnboundedSender<AddressEvent<()>>,
+    stop: mpsc::UnboundedSender<()>,
+    resume: mpsc::UnboundedSender<()>,
     dhcp_enabled: bool,
+    link_up: bool,
     status: DhcpStatus,
 }
 impl DhcpService {
@@ -271,32 +274,46 @@ impl DhcpService {
         let (etx, effects) = mpsc::unbounded();
         let (address, mut arx) = mpsc::unbounded();
         let pool = LocalPool::new();
+        let (stop, mut stop_receiver) = mpsc::unbounded();
+        let (resume, mut resume_receiver) = mpsc::unbounded();
         pool.spawner()
             .spawn_local(async move {
                 let counters = Counters::default();
-                let (_stop, mut srx) = mpsc::unbounded();
                 let mut rng = NativeRng(rng);
-                let mut state = State::default();
                 loop {
-                    match state
-                        .run(
-                            &config, &packet, &udp, &mut rng, &clock, &mut srx, &mut arx, &counters,
-                        )
-                        .await
-                    {
-                        Ok(Step::NextState(t)) => {
-                            let (next, effect) = state.apply(&config, t);
-                            state = next;
-                            if let Some(e) = effect {
-                                if etx.unbounded_send(Effect::Transition(e)).is_err() {
-                                    break;
+                    let mut state = State::default();
+                    loop {
+                        match state
+                            .run(
+                                &config,
+                                &packet,
+                                &udp,
+                                &mut rng,
+                                &clock,
+                                &mut stop_receiver,
+                                &mut arx,
+                                &counters,
+                            )
+                            .await
+                        {
+                            Ok(Step::NextState(t)) => {
+                                let (next, effect) = state.apply(&config, t);
+                                state = next;
+                                if let Some(e) = effect {
+                                    if etx.unbounded_send(Effect::Transition(e)).is_err() {
+                                        return;
+                                    }
                                 }
                             }
+                            Ok(Step::Exit(_)) => break,
+                            Err(_) => {
+                                let _ = etx.unbounded_send(Effect::Failed);
+                                return;
+                            }
                         }
-                        _ => {
-                            let _ = etx.unbounded_send(Effect::Failed);
-                            break;
-                        }
+                    }
+                    if resume_receiver.next().await.is_none() {
+                        return;
                     }
                 }
             })
@@ -311,7 +328,10 @@ impl DhcpService {
             wakes,
             effects,
             address,
+            stop,
+            resume,
             dhcp_enabled: true,
+            link_up: true,
             status: DhcpStatus::Acquiring,
         }
     }
@@ -477,8 +497,31 @@ impl NetworkServiceEndpoint for DhcpService {
         n + effects + dns
     }
     fn on_device_event(&mut self, e: EthernetDeviceEvent) {
-        if e == EthernetDeviceEvent::TransmitReady {
-            self.rt.borrow_mut().service_tx(1);
+        match e {
+            EthernetDeviceEvent::TransmitReady => self.rt.borrow_mut().service_tx(1),
+            EthernetDeviceEvent::ReceiveReady => {}
+            EthernetDeviceEvent::LinkStateChanged(up) if up == self.link_up => {}
+            EthernetDeviceEvent::LinkStateChanged(false) => {
+                self.link_up = false;
+                self.clear_configuration(if self.dhcp_enabled {
+                    DhcpStatus::Acquiring
+                } else {
+                    DhcpStatus::Failed
+                });
+                if self.dhcp_enabled {
+                    let _ = self.stop.unbounded_send(());
+                    self.pool.run_until_stalled();
+                }
+                while self.rt.borrow_mut().take_tx().is_some() {}
+            }
+            EthernetDeviceEvent::LinkStateChanged(true) => {
+                self.link_up = true;
+                if self.dhcp_enabled {
+                    self.status = DhcpStatus::Acquiring;
+                    let _ = self.resume.unbounded_send(());
+                    self.pool.run_until_stalled();
+                }
+            }
         }
     }
 }
@@ -546,6 +589,49 @@ mod tests {
         let ihl = usize::from(bytes[14] & 0x0f) * 4;
         assert_eq!(&bytes[14 + ihl..14 + ihl + 4], &[0, 68, 0, 67]);
         assert_eq!(service.status(), DhcpStatus::Acquiring);
+    }
+
+    #[test]
+    fn link_loss_revokes_configuration_and_link_return_restarts_dhcp() {
+        let runtime = Runtime::new(
+            8,
+            [7; 1024],
+            NonZeroU64::new(1).unwrap(),
+            [0x02, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        let mut service = DhcpService::new(
+            runtime,
+            rand::rngs::StdRng::seed_from_u64(7),
+            [0x02, 0, 0, 0, 0, 1],
+        );
+        service.poll_at(Duration::ZERO, 8);
+        let _first_discover = service.take_transmit().unwrap();
+        service
+            .rt
+            .borrow_mut()
+            .apply_ipv4([192, 0, 2, 10], 24, Some([192, 0, 2, 1]))
+            .unwrap();
+        service
+            .rt
+            .borrow_mut()
+            .set_dns_servers([Some(StdIpv4Addr::new(192, 0, 2, 53)), None]);
+        assert!(service.configure_dns());
+        service.status = DhcpStatus::Bound;
+
+        service.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
+        assert_eq!(service.status(), DhcpStatus::Acquiring);
+        assert_eq!(service.runtime().ipv4_address(), None);
+        assert_eq!(service.runtime().dns_servers(), [None, None]);
+        assert!(service.dns.resolver().is_none());
+
+        service.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+        service.poll_at(Duration::from_secs(1), 8);
+        let restarted = service.take_transmit().expect("restarted DHCPDISCOVER");
+        let bytes = restarted.as_bytes();
+        let ihl = usize::from(bytes[14] & 0x0f) * 4;
+        assert_eq!(&bytes[14 + ihl..14 + ihl + 4], &[0, 68, 0, 67]);
     }
 
     #[test]

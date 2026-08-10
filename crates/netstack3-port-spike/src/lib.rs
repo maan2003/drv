@@ -228,6 +228,14 @@ where
     pub fn into_parts(self) -> (S, D) {
         (self.stack, self.device)
     }
+
+    /// Discards frames retained across a link generation. Call this before
+    /// forwarding link-down so an old association cannot transmit after a
+    /// later link-up.
+    pub fn discard_pending(&mut self) {
+        self.pending_ingress = None;
+        self.pending_egress = None;
+    }
 }
 
 /// Fair, bounded, single-owner event/time driver. The embedding decides how
@@ -253,18 +261,20 @@ where
 
     /// Processes at most `budget` items from each work class.
     pub fn drive_once(&mut self, budget: usize) -> DriveReport {
-        let mut report = DriveReport {
-            service_work: self.runner.stack_mut().poll_at(self.clock.now(), budget),
-            ..Default::default()
-        };
+        let mut report = DriveReport::default();
 
         for _ in 0..budget {
             let Some(event) = self.runner.device_mut().take_event() else {
                 break;
             };
+            if event == EthernetDeviceEvent::LinkStateChanged(false) {
+                self.runner.discard_pending();
+            }
             self.runner.stack_mut().on_device_event(event);
             report.device_events += 1;
         }
+
+        report.service_work = self.runner.stack_mut().poll_at(self.clock.now(), budget);
 
         for _ in 0..budget {
             let pumped = self.runner.pump();

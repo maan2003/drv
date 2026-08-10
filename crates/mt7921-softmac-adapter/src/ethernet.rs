@@ -202,6 +202,16 @@ impl MlmeEthernetSink {
         let mut state = self.state.lock().unwrap();
         if state.properties.is_some() && state.link_up != up {
             state.link_up = up;
+            if !up {
+                zeroize_frames(&mut state.ingress);
+                zeroize_frames(&mut state.egress);
+                state.events.retain(|event| {
+                    !matches!(
+                        event,
+                        EthernetDeviceEvent::ReceiveReady | EthernetDeviceEvent::TransmitReady
+                    )
+                });
+            }
             push_event(&mut state, EthernetDeviceEvent::LinkStateChanged(up));
         }
     }
@@ -217,14 +227,15 @@ impl MlmeEthernetSink {
         }
         state.link_up = false;
         state.properties = None;
-        for frame in state.ingress.drain(..) {
-            let mut bytes = frame.into_vec();
-            bytes.fill(0);
-        }
-        for frame in state.egress.drain(..) {
-            let mut bytes = frame.into_vec();
-            bytes.fill(0);
-        }
+        zeroize_frames(&mut state.ingress);
+        zeroize_frames(&mut state.egress);
+    }
+}
+
+fn zeroize_frames(frames: &mut VecDeque<EthernetFrame>) {
+    for frame in frames.drain(..) {
+        let mut bytes = frame.into_vec();
+        bytes.fill(0);
     }
 }
 
@@ -352,6 +363,27 @@ mod tests {
     }
 
     #[test]
+    fn link_down_discards_frames_and_stale_readiness_from_old_association() {
+        let (mut device, mut tx, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 2).unwrap();
+        sink.set_link(true);
+        sink.deliver(frame([0x08, 0x00], 1).as_bytes()).unwrap();
+        device.transmit(frame([0x08, 0x06], 2)).unwrap();
+
+        sink.set_link(false);
+
+        assert_eq!(
+            device.take_event(),
+            Some(EthernetDeviceEvent::LinkStateChanged(false))
+        );
+        assert_eq!(device.take_event(), None);
+        assert_eq!(device.receive(), None);
+        assert_eq!(
+            tx.pump_one(&mut TxTarget::default()),
+            Err(EthernetTxPumpError::LinkDown)
+        );
+    }
+
+    #[test]
     fn invalid_frames_and_addresses_do_not_cross_the_boundary() {
         assert!(matches!(
             ethernet_port([0; 6], 1),
@@ -373,3 +405,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "associated_runtime_test.rs"]
+mod associated_runtime_test;

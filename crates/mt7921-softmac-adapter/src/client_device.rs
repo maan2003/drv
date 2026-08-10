@@ -257,6 +257,22 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         Ok(event)
     }
 
+    /// Deliver at most one descriptor-validated raw 802.11 frame from the
+    /// run-scoped effects owner into the pinned client MLME. This remains
+    /// callable after `Mt7921ClientDevice` has moved into `ClientMlme`.
+    pub async fn pump_client_rx(
+        &self,
+        mlme: &mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
+    ) -> Result<bool, zx::Status> {
+        let frame = self.backend.lock().unwrap().effects.next_rx()?;
+        let Some(ClientRxFrame { bytes, status }) = frame else {
+            return Ok(false);
+        };
+        wlan_mlme::MlmeImpl::handle_mac_frame_rx(mlme, &bytes, status, fuchsia_trace::Id::new())
+            .await;
+        Ok(true)
+    }
+
     /// Notify the supplied backend that its hardware reset completed and
     /// abandon any in-process scan transaction.
     pub fn reset(&self) -> Result<(), zx::Status> {
@@ -633,6 +649,7 @@ mod tests {
     use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use wlan_mlme::MlmeImpl;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum PassiveCall {
@@ -1067,6 +1084,41 @@ mod tests {
             assert_eq!(rx.bytes, [8, 1, 2, 3]);
             assert_eq!(rx.status, status);
             assert!(device.next_rx().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn run_scoped_runner_pumps_rx_after_device_moves_into_mlme() {
+        futures::executor::block_on(async {
+            let mut effects = FakeEffects::default();
+            effects.rx.push_back(ClientRxFrame {
+                // A deliberately incomplete data frame is enough to prove the
+                // ownership path; the pinned MLME safely rejects its payload.
+                bytes: vec![8, 1, 2, 3],
+                status: rx_status(-47),
+            });
+            let transport = FakePassiveTransport::default();
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                transport,
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let (device, runner) = Mt7921ClientDevice::new(effects, passive, support());
+            let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
+            let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                .await
+                .unwrap();
+
+            assert!(runner.pump_client_rx(&mut mlme).await.unwrap());
+            assert!(!runner.pump_client_rx(&mut mlme).await.unwrap());
+            runner.backend.lock().unwrap().effects.fail_on = Some("rx");
+            assert_eq!(
+                runner.pump_client_rx(&mut mlme).await,
+                Err(zx::Status::IO_REFUSED)
+            );
         });
     }
 
