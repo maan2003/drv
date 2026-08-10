@@ -36,13 +36,19 @@ sync -f "$timeline"
 
 wifi-driver-lab "$bdf" 300 -- "$@"
 experiment_rc=$?
+restore_ns=$(date +%s%N)
 printf 'RESTORE_RETURN realtime=%s rc=%s\n' "$(date --iso-8601=ns)" "$experiment_rc" >> "$timeline"
 sync -f "$timeline"
 
+wiphy_ready=false
+interface_ready=false
 association=false
 dhcp=false
 default_route=false
 connectivity=false
+association_failure=false
+connectivity_ms=-1
+device_path=$(readlink -f "/sys/bus/pci/devices/$bdf")
 for sample in $(seq 0 54); do
   now=$(date --iso-8601=ns)
   driver=none
@@ -55,6 +61,18 @@ for sample in $(seq 0 54); do
   printf 'SAMPLE n=%s realtime=%s driver=%s power=%s runtime=%s iwd=%s/%s\n' \
     "$sample" "$now" "$driver" "$power" "$runtime" "$iwd_active" "$iwd_sub" >> "$timeline"
 
+  if ! $wiphy_ready; then
+    for phy in /sys/class/ieee80211/*; do
+      [[ -e $phy ]] || continue
+      if [[ $(readlink -f "$phy/device") == "$device_path" ]]; then
+        wiphy_ready=true
+        printf 'TRANSITION wiphy_ready realtime=%s phy=%s\n' \
+          "$now" "$(basename "$phy")" >> "$timeline"
+        break
+      fi
+    done
+  fi
+
   associated_if=""
   ipv4_if=""
   for net in /sys/class/net/wlan*; do
@@ -65,8 +83,16 @@ for sample in $(seq 0 54); do
     carrier=$(cat "$net/carrier" 2>/dev/null || printf 0)
     printf 'WLAN name=%s operstate=%s carrier=%s address=%s\n' \
       "$name" "$operstate" "$carrier" "$address" >> "$timeline"
-    timeout 2 iwctl station "$name" show 2>&1 | head -c 2048 | sed 's/^/IWD_STATION /' >> "$timeline" || true
+    station=$(timeout 2 iwctl station "$name" show 2>&1)
+    station_rc=$?
+    printf '%s' "$station" | head -c 2048 | sed 's/^/IWD_STATION /' >> "$timeline" || true
     printf '\n' >> "$timeline"
+    if ! $interface_ready && [[ $(readlink -f "$net/device") == "$device_path" ]] \
+      && ((station_rc == 0)); then
+      interface_ready=true
+      printf 'TRANSITION usable_interface_ready realtime=%s interface=%s\n' \
+        "$now" "$name" >> "$timeline"
+    fi
     [[ $carrier == 1 ]] && associated_if=$name
     if ip -4 -o address show dev "$name" scope global | grep -q .; then
       ipv4_if=$name
@@ -92,11 +118,18 @@ for sample in $(seq 0 54); do
   if ! $connectivity && [[ -n $associated_if && -n $ipv4_if && -n $route_if && -n $gateway ]] \
     && ping -c 1 -W 1 "$gateway" >/dev/null 2>&1; then
     connectivity=true
-    printf 'TRANSITION connectivity realtime=%s interface=%s gateway=%s\n' \
-      "$now" "$route_if" "$gateway" >> "$timeline"
+    connectivity_ms=$((($(date +%s%N) - restore_ns) / 1000000))
+    printf 'TRANSITION connectivity realtime=%s interface=%s gateway=%s restore_elapsed_ms=%s\n' \
+      "$now" "$route_if" "$gateway" "$connectivity_ms" >> "$timeline"
   fi
   sync -f "$timeline"
   sync -f "$messages" 2>/dev/null || true
+  if ! $association_failure && grep -Eq 'association-timeout|connect-failed' "$messages"; then
+    association_failure=true
+    printf 'TRANSITION association_failure realtime=%s evidence=association-timeout_or_connect-failed\n' \
+      "$now" >> "$timeline"
+    sync -f "$timeline"
+  fi
 
   shopt -s nullglob
   states=(/run/wifi-driver-lab/*.state)
@@ -109,14 +142,26 @@ for sample in $(seq 0 54); do
     && [[ $driver == mt7921e && $power == D0 && $iwd_active == active ]] \
     && $association && $dhcp && $default_route && $connectivity; then
     wifi-lab-watchdog disarm "$token"
-    printf 'COMPLETE realtime=%s watchdog=disarmed\n' "$(date --iso-8601=ns)" >> "$timeline"
+    outcome=passed
+    reason=none
+    if $association_failure; then
+      outcome=failed
+      reason=association_failure
+    elif ((connectivity_ms > 60000)); then
+      outcome=failed
+      reason=restore_to_connectivity_over_60s
+    fi
+    printf 'COMPLETE realtime=%s watchdog=disarmed outcome=%s reason=%s restore_elapsed_ms=%s\n' \
+      "$(date --iso-8601=ns)" "$outcome" "$reason" "$connectivity_ms" >> "$timeline"
     sync -f "$timeline"
-    exit 0
+    [[ $outcome == passed ]]
+    exit $?
   fi
   sleep 2
 done
 
-printf 'INCOMPLETE realtime=%s association=%s ipv4=%s default_route=%s connectivity=%s watchdog=armed\n' \
-  "$(date --iso-8601=ns)" "$association" "$dhcp" "$default_route" "$connectivity" >> "$timeline"
+printf 'INCOMPLETE realtime=%s wiphy_ready=%s usable_interface_ready=%s association=%s ipv4=%s default_route=%s connectivity=%s association_failure=%s watchdog=armed\n' \
+  "$(date --iso-8601=ns)" "$wiphy_ready" "$interface_ready" "$association" "$dhcp" \
+  "$default_route" "$connectivity" "$association_failure" >> "$timeline"
 sync -f "$timeline"
 exit "$experiment_rc"
