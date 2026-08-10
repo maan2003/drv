@@ -1856,3 +1856,20 @@ verification; userspace ended with `rc=1` and supervisor restore with
 `failed=0`. Native networking recovered on `wlan1` to the same BSSID,
 5180 MHz/channel 36, with RSSI -60 dBm (average -58 dBm); both watchdogs were
 inactive and the lab state directory was empty. No further attempt was made.
+
+### Source-exact RX ring lifecycle boundary
+
+The data RX arena is now prepared and fenced, and ring 2's base, count, CIDX,
+and DIDX are published while RX DMA is disabled. That identity remains live
+through firmware startup; passive preparation only verifies it and enables the
+data IRQ.
+
+The single guarded channel-36 run passed. Report
+`/var/lib/wifi-driver-lab/reports/20260810T145425Z-0000_05_00.0.log`
+records a 308-byte normal RX frame routed from ring 4 and a Fuchsia
+`ScanObservation::Beacon` for BSSID `42:50:fd:67:3a:88` on channel 36 at
+-52 dBm. Scan completion reported one observation with zero intentional TX.
+Transport cleanup quiesced DMA and IRQs, disabled BME, reset VFIO into the
+verified safe state, and returned `rc=0`; supervisor restore reported
+`failed=0`, with native `mt7921e` and iwd healthy on the same boot. No
+further physical run was made.
