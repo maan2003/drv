@@ -55,7 +55,12 @@ const PERMISSIONS_RWX: i32 = (1 << 8) | (1 << 7) | (1 << 6);
 const PARAM_INFO_READ: i32 = 1 << 1;
 const CLIENT_NODE_TRANSPORT: u8 = 0;
 const CLIENT_NODE_SET_PARAM: u8 = 1;
+const CLIENT_NODE_PORT_USE_BUFFERS: u8 = 8;
 const ACTIVATION_SIZE: i32 = 4096;
+const BUFFER_COUNT: i32 = 2;
+const BUFFER_STRIDE: i32 = 12 * 1024;
+const BUFFER_DATA_OFFSET: i32 = 16;
+const BUFFER_DATA_SIZE: i32 = 8 * 1024;
 
 const VIRTUAL_SINK_NODE_ID: i32 = 2;
 const VIRTUAL_SINK_PORT_ID: i32 = 3;
@@ -104,7 +109,9 @@ struct ClientNodeObject {
     proxy_id: u32,
     node_proxy_id: Option<u32>,
     node_updated: bool,
+    port_updates: u8,
     transport: Option<ClientTransport>,
+    buffers: Option<ClientBuffers>,
 }
 
 #[derive(Debug)]
@@ -112,6 +119,11 @@ struct ClientTransport {
     _activation: File,
     _read_event: EventFd,
     _write_event: EventFd,
+}
+
+#[derive(Debug)]
+struct ClientBuffers {
+    _memory: File,
 }
 
 /// Accept one standard PipeWire native client and finish after its post-registry sync.
@@ -204,11 +216,31 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                             "ClientNode.PortUpdate arrived before Update",
                         ));
                     }
-                    decode_client_node_port_update(&payload)?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "client-node format selection and buffer negotiation are the next unsupported PipeWire operations",
-                    ));
+                    let has_format = decode_client_node_port_update(&payload)?;
+                    if client_nodes[client_node_index].port_updates == 0 {
+                        write_client_node_port_format(
+                            stream,
+                            client_nodes[client_node_index].proxy_id,
+                            &mut out_seq,
+                        )?;
+                        client_nodes[client_node_index].port_updates = 1;
+                    } else if has_format {
+                        let buffers = write_client_node_buffers(
+                            stream,
+                            client_nodes[client_node_index].proxy_id,
+                            &mut out_seq,
+                        )?;
+                        client_nodes[client_node_index].buffers = Some(buffers);
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "client-node buffer I/O and activation scheduling are the next unsupported PipeWire operations",
+                        ));
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ClientNode.PortUpdate did not confirm the selected format",
+                        ));
+                    }
                 }
                 4 => decode_client_node_set_active(&payload)?,
                 opcode => {
@@ -364,7 +396,9 @@ fn decode_create_client_node(payload: &[u8]) -> io::Result<ClientNodeObject> {
                 proxy_id: proxy_id as u32,
                 node_proxy_id: None,
                 node_updated: false,
+                port_updates: 0,
                 transport: None,
+                buffers: None,
             })
         })
         .map(|(object, _)| object)
@@ -416,7 +450,7 @@ fn decode_client_node_update(payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
         .transpose()
 }
 
-fn decode_client_node_port_update(payload: &[u8]) -> io::Result<()> {
+fn decode_client_node_port_update(payload: &[u8]) -> io::Result<bool> {
     let mut parser = Parser::new(payload);
     parser
         .pop_struct(|fields| {
@@ -428,7 +462,7 @@ fn decode_client_node_port_update(payload: &[u8]) -> io::Result<()> {
                     "invalid playback ClientNode.PortUpdate header".into(),
                 ));
             }
-            let _ = parse_inline_params(fields)?;
+            let params = parse_inline_params(fields)?;
             fields.pop_struct(|info| {
                 let info_change_mask = info.pop_long()?;
                 let _flags = info.pop_long()?;
@@ -443,9 +477,14 @@ fn decode_client_node_port_update(payload: &[u8]) -> io::Result<()> {
                 parse_inline_param_info(info)?;
                 require_empty(info, "ClientNode port info")
             })?;
-            require_empty(fields, "ClientNode.PortUpdate")
+            require_empty(fields, "ClientNode.PortUpdate")?;
+            Ok(params.iter().any(|param| {
+                param.get(12..16).is_some_and(|id| {
+                    u32::from_ne_bytes(id.try_into().unwrap()) == ParamType::Format as u32
+                })
+            }))
         })
-        .map(|_| ())
+        .map(|(has_format, _)| has_format)
         .map_err(invalid_pod)
 }
 
@@ -893,6 +932,92 @@ fn write_client_node_set_param(
     Ok(())
 }
 
+fn write_client_node_port_format(
+    stream: &mut UnixStream,
+    client_node_id: u32,
+    out_seq: &mut u32,
+) -> io::Result<()> {
+    let mut storage = [0; 256];
+    let mut format = enum_format_pod(&mut storage).map_err(invalid_pod)?.to_vec();
+    format[12..16].copy_from_slice(&(ParamType::Format as u32).to_ne_bytes());
+    let format = RawPod::wrap(&format).map_err(invalid_pod)?;
+    let body = encode_struct(|builder| {
+        builder
+            .push_int(1)
+            .push_int(0)
+            .push_id(Id(ParamType::Format))
+            .push_int(0)
+            .push_pod(&format)
+    })?;
+    write_message(stream, client_node_id, 7, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
+fn write_client_node_buffers(
+    stream: &mut UnixStream,
+    client_node_id: u32,
+    out_seq: &mut u32,
+) -> io::Result<ClientBuffers> {
+    let memory = memfd_create(
+        "drv-client-node-buffers",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .map_err(io::Error::from)?;
+    ftruncate(&memory, i64::from(BUFFER_COUNT * BUFFER_STRIDE)).map_err(io::Error::from)?;
+    let memory = File::from(memory);
+
+    let add_mem = encode_struct(|builder| {
+        builder
+            .push_int(1)
+            .push_id(Id(2_u32))
+            .push_fd(0)
+            .push_int(3)
+    })?;
+    write_message_with_fds(
+        stream,
+        CORE_ID,
+        CORE_ADD_MEM,
+        *out_seq,
+        &add_mem,
+        &[memory.as_raw_fd()],
+    )?;
+    *out_seq += 1;
+
+    let buffers = encode_struct(|mut builder| {
+        builder = builder
+            .push_int(1)
+            .push_int(0)
+            .push_int(-1)
+            .push_int(0)
+            .push_int(BUFFER_COUNT);
+        for index in 0..BUFFER_COUNT {
+            builder = builder
+                .push_int(1)
+                .push_int(index * BUFFER_STRIDE)
+                .push_int(BUFFER_DATA_OFFSET + BUFFER_DATA_SIZE)
+                .push_int(0)
+                .push_int(1)
+                .push_id(Id(1_u32))
+                .push_int(BUFFER_DATA_OFFSET)
+                .push_int(3)
+                .push_int(0)
+                .push_int(BUFFER_DATA_SIZE);
+        }
+        builder
+    })?;
+    write_message(
+        stream,
+        client_node_id,
+        CLIENT_NODE_PORT_USE_BUFFERS,
+        *out_seq,
+        &buffers,
+    )?;
+    *out_seq += 1;
+
+    Ok(ClientBuffers { _memory: memory })
+}
+
 fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) -> io::Result<()> {
     let body = encode_struct(|builder| {
         builder
@@ -1022,7 +1147,13 @@ fn invalid_pod(error: pipewire_native_spa::pod::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, thread};
+    use std::{io::IoSliceMut, os::unix::net::UnixStream, thread};
+
+    use nix::{
+        cmsg_space,
+        sys::socket::{ControlMessageOwned, recvmsg},
+        unistd::close,
+    };
 
     use super::*;
 
@@ -1044,9 +1175,50 @@ mod tests {
         bytes
     }
 
-    fn read_message_with_fds(stream: &mut UnixStream) -> (Header, u32, Vec<u8>) {
-        let mut bytes = [0; HEADER_LEN];
-        stream.read_exact(&mut bytes).unwrap();
+    fn client_port_update(id: u32, param: &RawPod<'_>, param_id: ParamType) -> Vec<u8> {
+        request(id, 3, |b| {
+            b.push_int(1)
+                .push_int(0)
+                .push_int(3)
+                .push_int(1)
+                .push_pod(param)
+                .push_struct(|b| {
+                    b.push_long(0xf)
+                        .push_long(0)
+                        .push_int(0)
+                        .push_int(1)
+                        .push_int(1)
+                        .push_string("port.name")
+                        .push_string("output")
+                        .push_int(1)
+                        .push_id(Id(param_id))
+                        .push_int(PARAM_INFO_READ)
+                })
+        })
+    }
+
+    fn read_message_with_fds(stream: &mut UnixStream) -> (Header, Vec<RawFd>, Vec<u8>) {
+        let mut bytes = [0; 4096];
+        let mut iov = [IoSliceMut::new(&mut bytes)];
+        let mut control = cmsg_space!([RawFd; 2]);
+        let message = recvmsg::<()>(
+            stream.as_raw_fd(),
+            &mut iov,
+            Some(&mut control),
+            MsgFlags::empty(),
+        )
+        .unwrap();
+        let received = message.bytes;
+        let fds = message
+            .cmsgs()
+            .unwrap()
+            .flat_map(|message| match message {
+                ControlMessageOwned::ScmRights(fds) => fds,
+                _ => panic!("unexpected ancillary message"),
+            })
+            .collect::<Vec<_>>();
+        assert!(!message.flags.contains(MsgFlags::MSG_CTRUNC));
+
         let word = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
         let header = Header {
             id: u32::from_ne_bytes(bytes[0..4].try_into().unwrap()),
@@ -1054,9 +1226,20 @@ mod tests {
             size: (word & 0x00ff_ffff) as usize,
         };
         let n_fds = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
-        let mut payload = vec![0; header.size];
-        stream.read_exact(&mut payload).unwrap();
-        (header, n_fds, payload)
+        assert_eq!(fds.len(), n_fds as usize);
+        assert_eq!(received, HEADER_LEN + header.size);
+        (header, fds, bytes[HEADER_LEN..received].to_vec())
+    }
+
+    fn assert_received_fds(fds: Vec<RawFd>, expected: usize, expected_size: Option<u64>) {
+        assert_eq!(fds.len(), expected);
+        for fd in fds {
+            let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+            if let Some(expected_size) = expected_size {
+                assert_eq!(metadata.len(), expected_size);
+            }
+            close(fd).unwrap();
+        }
     }
 
     fn decode_global(payload: &[u8]) -> (i32, String, Vec<(String, String)>) {
@@ -1295,39 +1478,59 @@ mod tests {
             .unwrap();
 
         let (add_mem, add_mem_fds, _) = read_message_with_fds(&mut client);
-        assert_eq!((add_mem.id, add_mem.opcode, add_mem_fds), (CORE_ID, 6, 1));
+        assert_eq!((add_mem.id, add_mem.opcode), (CORE_ID, 6));
+        assert_received_fds(add_mem_fds, 1, Some(ACTIVATION_SIZE as u64));
         let (transport, transport_fds, _) = read_message_with_fds(&mut client);
-        assert_eq!((transport.id, transport.opcode, transport_fds), (8, 0, 2));
+        assert_eq!((transport.id, transport.opcode), (8, 0));
+        assert_received_fds(transport_fds, 2, None);
         client
             .write_all(&request(8, 4, |b| b.push_bool(true)))
             .unwrap();
 
         let mut format_storage = [0; 256];
         let format = RawPod::wrap(enum_format_pod(&mut format_storage).unwrap()).unwrap();
+        let port_update = client_port_update(8, &format, ParamType::EnumFormat);
+        client.write_all(&port_update).unwrap();
+        let (set_format, _) = read_message(&mut client).unwrap();
+        assert_eq!((set_format.id, set_format.opcode), (8, 7));
+        let mut selected_format = format.data().to_vec();
+        selected_format[12..16].copy_from_slice(&(ParamType::Format as u32).to_ne_bytes());
+        let selected_format = RawPod::wrap(&selected_format).unwrap();
         client
-            .write_all(&request(8, 3, |b| {
-                b.push_int(1)
-                    .push_int(0)
-                    .push_int(3)
-                    .push_int(1)
-                    .push_pod(&format)
-                    .push_struct(|b| {
-                        b.push_long(0xf)
-                            .push_long(0)
-                            .push_int(0)
-                            .push_int(1)
-                            .push_int(1)
-                            .push_string("port.name")
-                            .push_string("output")
-                            .push_int(1)
-                            .push_id(Id(ParamType::EnumFormat))
-                            .push_int(PARAM_INFO_READ)
-                    })
-            }))
+            .write_all(&client_port_update(8, &selected_format, ParamType::Format))
+            .unwrap();
+
+        let (buffer_mem, buffer_mem_fds, _) = read_message_with_fds(&mut client);
+        assert_eq!((buffer_mem.id, buffer_mem.opcode), (0, 6));
+        assert_received_fds(
+            buffer_mem_fds,
+            1,
+            Some((BUFFER_COUNT * BUFFER_STRIDE) as u64),
+        );
+        let (use_buffers, use_buffers_payload) = read_message(&mut client).unwrap();
+        assert_eq!((use_buffers.id, use_buffers.opcode), (8, 8));
+        let mut parser = Parser::new(&use_buffers_payload);
+        parser
+            .pop_struct(|fields| {
+                assert_eq!((fields.pop_int()?, fields.pop_int()?), (1, 0));
+                assert_eq!((fields.pop_int()?, fields.pop_int()?), (-1, 0));
+                assert_eq!(fields.pop_int()?, BUFFER_COUNT);
+                for index in 0..BUFFER_COUNT {
+                    assert_eq!(fields.pop_int()?, 1);
+                    assert_eq!(fields.pop_int()?, index * BUFFER_STRIDE);
+                    assert_eq!(fields.pop_int()?, BUFFER_DATA_OFFSET + BUFFER_DATA_SIZE);
+                    assert_eq!((fields.pop_int()?, fields.pop_int()?), (0, 1));
+                    assert_eq!(fields.pop_id::<u32>()?.0, 1);
+                    assert_eq!(fields.pop_int()?, BUFFER_DATA_OFFSET);
+                    assert_eq!((fields.pop_int()?, fields.pop_int()?), (3, 0));
+                    assert_eq!(fields.pop_int()?, BUFFER_DATA_SIZE);
+                }
+                require_empty(fields, "test PortUseBuffers")
+            })
             .unwrap();
 
         let error = worker.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("buffer negotiation"));
+        assert!(error.to_string().contains("activation scheduling"));
     }
 }

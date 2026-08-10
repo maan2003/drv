@@ -53,7 +53,9 @@ properties, versions, and collision-free client proxy IDs. A stock `pw-cat`
 playback now completes `ClientNode.Update` and `ClientNode.PortUpdate`. The
 server binds the exported stream, imports its stock PortConfig, selects a
 playback port, and sends standard `Core.AddMem` and `ClientNode.Transport`
-events carrying a shared activation memfd and two eventfds. The exact next
-boundary is client-node format selection and shared-buffer negotiation;
-activation scheduling, clock/quantum handling, and PCM processing remain
-unimplemented.
+events carrying a shared activation memfd and two eventfds. It accepts the
+stock port's advertised formats, selects the fixed S16LE/48 kHz/stereo Format,
+then exports two real memfd-backed PCM buffer descriptors with
+`ClientNode.PortUseBuffers`. The exact next boundary is buffer I/O and
+activation scheduling; clock/quantum handling and moving shared PCM bytes into
+the Fuchsia-backed endpoint remain unimplemented.
