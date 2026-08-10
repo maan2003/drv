@@ -1832,3 +1832,27 @@ passed safe-state verification. Userspace ended with `rc=1` and supervisor
 restore with `failed=0`; native `mt7921e` rebound, `iwd` was active,
 `wlan1` was connected, and both watchdog units were inactive. No further run
 was made.
+
+A later read-only native check, without VFIO detach, established that the
+currently connected AP was not on channel 1: iwd reported interface `wlan0`,
+BSSID `42:50:fd:67:3a:88`, 5180 MHz/channel 36, and RSSI -57 dBm. The same
+zero-TX contained operation was therefore minimally parameterized with a
+bounded channel argument and a 150--250 ms passive dwell. All 73 integrated
+tests and the release build passed; the unchanged-semantics binary SHA-256 was
+`9f5f96922b57d2c0941d27e5658bf956f886205cf61cfdf685cb423a564ae8f1`.
+
+The single environment-informed attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T143132Z-0000_05_00.0.log`.
+Every passive preparation and configuration command completed for channel 36
+at 5180 MHz, and the durable marker records the 150--250 ms dwell plus
+`intentional_tx=false`. Scan ID 1 again completed successfully but produced
+zero parsed beacon/probe-response observations, so the Fuchsia adapter has no
+physical RSSI evidence and the receive boundary remains unproved. No probe,
+management, data, or SAE frame was transmitted.
+
+The run stopped without retry. Transport quiesce and outer containment
+disabled WFDMA/IRQs/BME, released mappings before reset, and passed safe-state
+verification; userspace ended with `rc=1` and supervisor restore with
+`failed=0`. Native networking recovered on `wlan1` to the same BSSID,
+5180 MHz/channel 36, with RSSI -60 dBm (average -58 dBm); both watchdogs were
+inactive and the lab state directory was empty. No further attempt was made.
