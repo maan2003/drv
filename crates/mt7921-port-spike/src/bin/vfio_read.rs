@@ -1078,10 +1078,10 @@ fn run() -> Result<(), String> {
             let bar0 = bar0.ok_or("required BAR0 region was not discovered")?;
             let selector_page = MT_HIF_REMAP_L1_BAR_OFFSET & !(PAGE - 1);
             record_sae_stage(&format!(
-                "vfio_bar0_mmap_before page={selector_page:#x} length={} prot=read flags=shared region_size={} region_offset={}",
+                "vfio_bar0_mmap_before page={selector_page:#x} length={} prot=read_write flags=shared region_size={} region_offset={}",
                 PAGE, bar0.size, bar0.offset
             ));
-            let mut page = match ReadPage::map(&capsule.device, &bar0, selector_page, false) {
+            let mut page = match ReadPage::map(&capsule.device, &bar0, selector_page, true) {
                 Ok(page) => page,
                 Err(error) => {
                     record_sae_stage(&format!(
@@ -1096,7 +1096,7 @@ fn run() -> Result<(), String> {
             record_sae_stage(&format!(
                 "vfio_remap_selector_read_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
             ));
-            let selector = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
+            let saved_selector = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
                 Ok(value) => value,
                 Err(error) => {
                     record_sae_stage(&format!(
@@ -1106,8 +1106,41 @@ fn run() -> Result<(), String> {
                 }
             };
             record_sae_stage(&format!(
-                "vfio_remap_selector_read_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={selector:#010x}"
+                "vfio_remap_selector_saved offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
             ));
+            record_sae_stage(&format!(
+                "vfio_remap_selector_identity_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+            ));
+            if let Err(error) = page.write_remap_selector(saved_selector) {
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_identity_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                ));
+                return Err(error);
+            }
+            record_sae_stage(&format!(
+                "vfio_remap_selector_identity_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+            ));
+            record_sae_stage(&format!(
+                "vfio_remap_selector_readback_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+            ));
+            let readback = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
+                Ok(value) => value,
+                Err(error) => {
+                    record_sae_stage(&format!(
+                        "vfio_remap_selector_readback_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+            };
+            record_sae_stage(&format!(
+                "vfio_remap_selector_readback_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={readback:#010x} equal={}",
+                readback == saved_selector
+            ));
+            if readback != saved_selector {
+                return Err(format!(
+                    "L1 selector identity-write mismatch: saved={saved_selector:#010x} readback={readback:#010x}"
+                ));
+            }
             record_sae_stage(&format!(
                 "vfio_bar0_munmap_before page={selector_page:#x} length=4096"
             ));
