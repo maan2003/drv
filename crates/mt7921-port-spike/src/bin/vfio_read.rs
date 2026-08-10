@@ -846,6 +846,14 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
+    if operation == Operation::RunOneShotSaeAuth {
+        println!(r#"{{"sae_auth_event":"vfio_reset_d0_preflight_started"}}"#);
+        reset_vfio_device(&capsule.device)?;
+        set_pci_bus_master(&bdf, false)?;
+        println!(
+            r#"{{"sae_auth_event":"vfio_reset_d0_preflight_completed","pci_command":"mse_on_bme_off"}}"#
+        );
+    }
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
     verify_pci_identity(&bdf)?;
