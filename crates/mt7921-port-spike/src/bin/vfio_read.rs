@@ -22,8 +22,6 @@ use fuchsia_softmac_port::{
 use ieee80211::MacAddrBytes as _;
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
-#[cfg(feature = "fuchsia-passive")]
-use sha2::{Digest as _, Sha256};
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
@@ -8126,14 +8124,6 @@ struct ReceivedSaeAuth {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[cfg(feature = "fuchsia-passive")]
 fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
     let fixed = frame
         .get(..128)
@@ -8191,13 +8181,13 @@ fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
     let bssid = &frame[16..22];
     let sequence_control = u16::from_le_bytes(frame[22..24].try_into().unwrap());
     println!(
-        r#"{{"sae_commit_structure":{{"fc":"0x{:04x}","receiver":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","transmitter":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","bssid":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","seq_control":{},"algorithm":{},"transaction":{},"status":{},"group":{},"body_len":{},"scalar_sha256":"{}","element_sha256":"{}","scalar_range":{},"p256_on_curve":{},"tail_ies":"{}"}}}}"#,
+        r#"{{"sae_commit_structure":{{"fc":"0x{:04x}","receiver":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","transmitter":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","bssid":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","seq_control":{},"algorithm":{},"transaction":{},"status":{},"group":{},"body_len":{},"scalar_len":{},"element_len":{},"tail_len":{},"scalar_range":{},"p256_on_curve":{},"tail_ies":"{}"}}}}"#,
         u16::from_le_bytes(frame[0..2].try_into().unwrap()),
         receiver[0], receiver[1], receiver[2], receiver[3], receiver[4], receiver[5],
         transmitter[0], transmitter[1], transmitter[2], transmitter[3], transmitter[4], transmitter[5],
         bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
         sequence_control, algorithm, transaction, status, group, frame.len() - 30,
-        sha256_hex(scalar), sha256_hex(element), scalar_range, p256_on_curve,
+        scalar.len(), element.len(), frame.len() - 128, scalar_range, p256_on_curve,
         tail_ies.join(",")
     );
     Ok(())
