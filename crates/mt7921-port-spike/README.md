@@ -2138,3 +2138,29 @@ page-pool warning. The patched system closure remained selected after reboot,
 `keep_d0_on_remove` was `Y`, and native `mt7921e`, iwd, and carrier
 recovered. Further physical work is blocked on explicit non-secret target
 transport across the nested service boundary.
+
+After deploying explicit validated BSSID and channel forwarding into the
+nested transient service, one guarded run was launched as
+`wifi-sae-exchange15`. The run used commit `d73b1f4e462c`, release SHA-256
+`fc9d4b96230e24c61ccd27935404fea4da1c15ca19f406b0720190d4387ff5cf`,
+and freshly derived target `f2:a3:18:4f:30:76` on channel 36 at 5180 MHz.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T184002Z-0000_05_00.0.log`
+records `QUIESCE netdev=wlan0 vanished=true`, payload entry, firmware patch
+and RAM startup, passive receive preparation, a target beacon and channel-gate
+pass, and `sae_tx_resources_acquired after_beacon=true
+after_rate_power=true`. This establishes that the infrastructure and hardware
+path reaches target-gated SAE management-TX resource acquisition.
+
+The first SAE management-TX attempt was rejected locally with
+`DeviceOps SAE TX rejected: ACCESS_DENIED`, before actual SAE frame
+publication. No SAE commit or confirm was transmitted or received. Userspace
+returned status 1, then cleanup quiesced the transport, released DMA mappings,
+reset the VFIO device, verified the post-reset safe state, and restored the
+native driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd,
+association, IPv4, the default route, and gateway connectivity recovered in
+4155 ms on the renamed `wlan1`; the watchdog was disarmed without a reboot.
+There was no page-pool warning or kernel warning/oops. The patched system
+closure and profile remained selected, `keep_d0_on_remove` remained `Y`, and
+the persistent default remained generation 25. Further physical work is
+blocked solely on the pre-port SAE management-TX authorization/effect fix.
