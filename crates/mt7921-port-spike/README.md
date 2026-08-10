@@ -1348,3 +1348,42 @@ eventually disarms. The sampler should also record explicit wiphy/interface
 readiness separately from its PCI/iwd-process fields. Do not extend the
 watchdog merely to make this run appear routine; first determine whether the
 failure repeats in the zero-access control.
+
+The recovery-only control completed under the unchanged 120-second watchdog
+in report
+`/var/lib/wifi-driver-lab/reports/20260810T111422Z-0000_05_00.0.log` and
+timeline
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T111422Z.log`.
+Supervisor SHA-256 was
+`7149772f9be7d708150581f759babdfb176486d97202c368a95439d376d49030`.
+The native lab wrapper performed the same detach, VFIO acquisition and
+release, and native restore, but its sole userspace payload was
+`/run/current-system/sw/bin/true`; the report contains only payload begin/end
+with return code zero. The payload opened no VFIO device and performed no PCI
+configuration access, BAR mapping or MMIO, IRQ or reset query/action, DMA,
+firmware, WFDMA, or radio operation.
+
+Restore returned at `16:44:24.348499 IST`. The kernel had logged the ASIC at
+`16:44:24.227849`, HW/SW firmware at `16:44:24.302869`, and WM firmware at
+`16:44:24.313828`. iwd observed `phy10` at `16:44:25.136466` and final
+`wlan10` at `16:44:25.720022`. With the supervisor's two-second sampling
+resolution, the new durable BDF-owned `wiphy_ready` and BDF-owned,
+iwd-queryable `usable_interface_ready` transitions were both recorded at
+`16:44:26.391315`, 2.04 seconds after restore. Association, IPv4, default
+route, and gateway connectivity were all sampled at `16:44:30.498662`;
+measured restore-to-connectivity time was 6,197 ms. The watchdog disarmed with
+`outcome=passed reason=none` at `16:44:30.564992`.
+
+iwd's first attempt selected `ph1` at `16:44:28.378855`, completed the usual
+status-77 retry, authenticated, and associated at `16:44:29.548866`; the AP
+then immediately disassociated it with reason 2 (`PREV_AUTH_NOT_VALID`). iwd
+returned to `autoconnect_full` without logging `association-timeout` or
+`connect-failed`, selected the AP again after only 8 ms, and the second attempt
+associated at `16:44:29.818879` and reached `connected` at
+`16:44:29.959353`. Therefore neither strict failure condition fired: there was
+no association timeout/connect-failed event and recovery was well below 60
+seconds. Boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged;
+final state was mt7921e in D0/runtime-active, iwd active, rfkill unblocked,
+`wlan10` associated with IPv4/default route, gateway ping successful, and the
+watchdog inactive. This control clears the anomalous-backoff question only; it
+does not add evidence for any further hardware mutation.
