@@ -1334,7 +1334,7 @@ fn live_client_support(query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientS
             sae: Some(fidl_common::SaeFeature {
                 driver_handler_supported: Some(false),
                 sme_handler_supported: Some(true),
-                hash_to_element_supported: Some(false),
+                hash_to_element_supported: Some(true),
             }),
             ..Default::default()
         },
@@ -3553,6 +3553,7 @@ fn run() -> Result<(), String> {
                                         target_bss.as_ref().ok_or("target BSS was not retained")?;
                                     let rsne =
                                         find_ie(&bss.ies, 48).ok_or("target BSS omitted RSNE")?;
+                                    let rsnxe = find_ie(&bss.ies, 244);
                                     let client = report
                                         .nic_capability
                                         .mac_address
@@ -3566,7 +3567,8 @@ fn run() -> Result<(), String> {
                                         client.into(),
                                         power_target.as_ref().unwrap().0.into(),
                                         rsne,
-                                        false,
+                                        rsnxe,
+                                        true,
                                     )
                                     .map_err(|_| {
                                         "initialize pinned SAE supplicant failed".to_string()
@@ -11725,6 +11727,7 @@ mod tests {
             .unwrap();
         for required in [
             "SaeHandshake::new",
+            "find_ie(&bss.ies, 244)",
             "credential.0.fill(0)",
             ".start()",
             "transmit_one_sae_auth",

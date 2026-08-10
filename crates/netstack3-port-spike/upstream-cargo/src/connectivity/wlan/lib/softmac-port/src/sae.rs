@@ -8,6 +8,7 @@ use fidl_fuchsia_wlan_common::{MfpFeature, SaeFeature, SecuritySupport};
 use fidl_fuchsia_wlan_ieee80211::StatusCode;
 use fidl_fuchsia_wlan_mlme::{EapolResultCode, SaeFrame};
 use ieee80211::{MacAddr, MacAddrBytes, Ssid};
+use wlan_common::ie::parse_rsnxe;
 use wlan_common::ie::rsn::rsne;
 use wlan_common::mac;
 use wlan_common::mgmt_writer;
@@ -101,18 +102,28 @@ pub const SAE_RETRANSMISSION_TIMEOUT_MILLIS: u64 = 1000;
 
 impl SaeHandshake {
     /// Build the same SME-managed WPA3 supplicant selected by pinned
-    /// `client/protection.rs`. `authenticator_rsne` includes the IE id/length.
+    /// `client/protection.rs`. The authenticator IEs include their id/length.
     pub fn new(
         ssid: Vec<u8>,
         password: Vec<u8>,
         client: MacAddr,
         peer: MacAddr,
         authenticator_rsne: &[u8],
+        authenticator_rsnxe: Option<&[u8]>,
         hash_to_element_supported: bool,
     ) -> Result<Self, anyhow::Error> {
-        if hash_to_element_supported {
-            anyhow::bail!("SAE H2E requires peer RSNXE input, which this narrow wrapper omits");
-        }
+        let peer_hash_to_element_supported = match authenticator_rsnxe {
+            None => false,
+            Some(rsnxe)
+                if rsnxe.len() >= 3 && rsnxe[0] == 244 && rsnxe[1] as usize == rsnxe.len() - 2 =>
+            {
+                parse_rsnxe(&rsnxe[2..])
+                    .rsnxe_octet_1
+                    .map(|octet| octet.sae_hash_to_element())
+                    .unwrap_or(false)
+            }
+            Some(_) => anyhow::bail!("invalid authenticator RSNXE"),
+        };
         let password: Vec<u8> = Passphrase::try_from(password.as_slice())?.into();
         let (_, authenticator) = rsne::from_bytes(authenticator_rsne)
             .map_err(|error| anyhow::format_err!("invalid authenticator RSNE: {error:?}"))?;
@@ -128,7 +139,11 @@ impl SaeHandshake {
             ..Default::default()
         };
         let supplicant_rsne = authenticator.derive_wpa3_s_rsne(&support)?;
-        let pwe_method = PweMethod::Loop;
+        let pwe_method = if peer_hash_to_element_supported && hash_to_element_supported {
+            PweMethod::Direct
+        } else {
+            PweMethod::Loop
+        };
         let supplicant = Supplicant::new_wpa_personal(
             NonceReader::new(&client)?,
             auth::Config::Sae {
@@ -343,6 +358,7 @@ mod tests {
     const WPA3_SAE_RSNE: &[u8] = &[
         48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 8, 204, 0,
     ];
+    const SAE_H2E_RSNXE: &[u8] = &[244, 1, 0x20];
 
     #[test]
     fn pinned_supplicant_emits_sae_commit_and_timer_without_association_updates() {
@@ -353,6 +369,7 @@ mod tests {
             MacAddr::from([2; 6]),
             peer,
             WPA3_SAE_RSNE,
+            None,
             false,
         )
         .unwrap();
@@ -387,6 +404,7 @@ mod tests {
             MacAddr::from([2; 6]),
             MacAddr::from([6; 6]),
             WPA3_SAE_RSNE,
+            None,
             false,
         )
         .unwrap();
@@ -421,18 +439,70 @@ mod tests {
     }
 
     #[test]
-    fn h2e_is_rejected_until_peer_rsnxe_is_part_of_the_boundary() {
-        assert!(
-            SaeHandshake::new(
+    fn h2e_peer_and_local_support_emit_direct_group_19_commit() {
+        let mut handshake = SaeHandshake::new(
+            b"fixture".to_vec(),
+            b"fixture passphrase".to_vec(),
+            MacAddr::from([2; 6]),
+            MacAddr::from([6; 6]),
+            WPA3_SAE_RSNE,
+            Some(SAE_H2E_RSNXE),
+            true,
+        )
+        .unwrap();
+        let updates = handshake.start().unwrap();
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            SaeHandshakeUpdate::TxFrame(SaeFrame {
+                seq_num: 1,
+                status_code: StatusCode::SaeHashToElement,
+                sae_fields,
+                ..
+            }) if sae_fields.len() == 98 && sae_fields[..2] == [19, 0]
+        )));
+    }
+
+    #[test]
+    fn h2e_requires_both_peer_and_local_support() {
+        for (rsnxe, local_h2e) in [(Some(SAE_H2E_RSNXE), false), (None, true)] {
+            let mut handshake = SaeHandshake::new(
                 b"fixture".to_vec(),
                 b"fixture passphrase".to_vec(),
                 MacAddr::from([2; 6]),
                 MacAddr::from([6; 6]),
                 WPA3_SAE_RSNE,
-                true,
+                rsnxe,
+                local_h2e,
             )
-            .is_err()
-        );
+            .unwrap();
+            assert!(handshake.start().unwrap().iter().any(|update| matches!(
+                update,
+                SaeHandshakeUpdate::TxFrame(SaeFrame {
+                    seq_num: 1,
+                    status_code: StatusCode::Success,
+                    sae_fields,
+                    ..
+                }) if sae_fields.len() == 98 && sae_fields[..2] == [19, 0]
+            )));
+        }
+    }
+
+    #[test]
+    fn malformed_peer_rsnxe_is_rejected() {
+        for rsnxe in [&[244, 2, 0x20][..], &[48, 1, 0x20][..], &[244, 0][..]] {
+            assert!(
+                SaeHandshake::new(
+                    b"fixture".to_vec(),
+                    b"fixture passphrase".to_vec(),
+                    MacAddr::from([2; 6]),
+                    MacAddr::from([6; 6]),
+                    WPA3_SAE_RSNE,
+                    Some(rsnxe),
+                    true,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -445,6 +515,7 @@ mod tests {
             client,
             peer,
             WPA3_SAE_RSNE,
+            None,
             false,
         )
         .unwrap();
@@ -474,11 +545,13 @@ mod tests {
 
     #[test]
     fn sae_update_uses_pinned_bound_client_frame_shape() {
+        let mut sae_fields = vec![19, 0];
+        sae_fields.extend([9; 32 + 64]);
         let frame = SaeFrame {
             peer_sta_address: [6; 6],
-            status_code: StatusCode::Success,
+            status_code: StatusCode::SaeHashToElement,
             seq_num: 1,
-            sae_fields: vec![9, 8, 7],
+            sae_fields: sae_fields.clone(),
         };
         let bytes =
             build_sae_auth_frame(MacAddr::from([2; 6]), MacAddr::from([6; 6]), 1, &frame).unwrap();
@@ -490,8 +563,10 @@ mod tests {
         };
         let algorithm = auth.auth_hdr.auth_alg_num;
         let sequence = auth.auth_hdr.auth_txn_seq_num;
+        let status = auth.auth_hdr.status_code;
         assert_eq!(algorithm, mac::AuthAlgorithmNumber::SAE);
         assert_eq!(sequence, 1);
-        assert_eq!(auth.elements, &[9, 8, 7]);
+        assert_eq!(status, StatusCode::SaeHashToElement.into());
+        assert_eq!(auth.elements, sae_fields);
     }
 }
