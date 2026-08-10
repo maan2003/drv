@@ -10,3 +10,9 @@
 The host code is an explicit `1022:15e3` / `1043:1513` spike, not a new public
 audio or general VFIO API. Its eventual output endpoint must remain behind the
 existing Audio Device Registry/ring-buffer boundary in `audio-pipewire-spike`.
+
+The bounded playback path directly follows Fuchsia `intel-hda-stream.cc` for
+stream reset, format/BDL programming, RUN/interrupt control, and stop ordering.
+The ALC256 DAC `0x02`, speaker pin `0x14`, headphone pin `0x21`, connection,
+amp-mute, pin-control, and EAPD verbs are isolated host topology policy. PCM
+enters through the existing private ADR-compatible `PlaybackEndpoint` adapter.

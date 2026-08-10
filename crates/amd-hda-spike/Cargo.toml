@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+drv-audio-pipewire-spike = { path = "../audio-pipewire-spike" }
+
 [[bin]]
 name = "amd-hda-enumerate"
 path = "src/main.rs"

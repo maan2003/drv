@@ -115,4 +115,6 @@ for _ in {1..50}; do
 done
 [[ -n ${cdev:-} && -c /dev/vfio/devices/$cdev ]] || fail 'VFIO device cdev did not appear'
 
-timeout --signal=TERM "$((watchdog_seconds - 2))" "$binary" "/dev/vfio/devices/$cdev"
+operation=()
+[[ ${DRV_HDA_PLAYBACK:-0} == 1 ]] && operation=(--play-test-tone)
+timeout --signal=TERM "$((watchdog_seconds - 2))" "$binary" "${operation[@]}" "/dev/vfio/devices/$cdev"

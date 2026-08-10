@@ -35,3 +35,21 @@ DAC `0x02`, speaker pin `0x14`, and headphone pin `0x21` were present. The
 wrapper then verified native restoration to `snd_hda_intel`; the ALC256 proc
 node returned, `wlan0` remained the active route, and the kernel log showed no
 IOMMU fault. No converter, BDL playback stream, pin output, or EAPD was enabled.
+
+## Verified bounded speaker playback
+
+On the same no-plastic boot, no headphone jack was sensed, so the guarded
+playback operation selected the fallback speaker route DAC `0x02` to fixed pin
+`0x14`. It staged one 40 ms, 48 kHz stereo S16LE period through the existing
+`PlaybackEndpoint`/ADR PCM shape, containing a 440 Hz sine at only 256/32767
+peak, and additionally selected an output-amplifier step approximately 36 dB
+below 0 dB before unmuting. The pin was muted while configured; EAPD was enabled
+only for the bounded run.
+
+Output stream descriptor 4 advanced from LPIB 0 to 7576 and, after draining all
+codec-command events before RUN, the VFIO MSI eventfd reported exactly one IOC interrupt. The driver then muted the codec, stopped and reset the
+stream, disconnected converter and pin, disabled EAPD, and the wrapper verified
+`snd_hda_intel` restoration. `wlan0` remained the active default route and the
+kernel reported no IOMMU, FIFO, or descriptor fault. The private host adapter
+implements the already-present `drv_audio_pipewire_spike::PlaybackEndpoint`;
+this adds no public audio API.

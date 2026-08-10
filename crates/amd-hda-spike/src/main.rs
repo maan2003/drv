@@ -1,10 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use amd_hda_spike::{Controller, Error as HdaError, Transport};
+use drv_audio_pipewire_spike::{EndpointError, PcmFormat, PlaybackEndpoint, VIRTUAL_SINK_FORMAT};
 use std::{
     env,
     fs::{File, OpenOptions},
-    io,
+    io::{self, Read},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::fs::FileExt,
     ptr::NonNull,
@@ -31,6 +32,26 @@ const VFIO_PCI_BAR0_REGION_INDEX: u32 = 0;
 const VFIO_PCI_CONFIG_REGION_INDEX: u32 = 7;
 const VFIO_PCI_MSI_IRQ_INDEX: u32 = 1;
 const DMA_IOVA: u64 = 0x0100_0000;
+
+#[derive(Default)]
+struct AdrPcmPeriod {
+    pcm: Vec<u8>,
+}
+impl PlaybackEndpoint for AdrPcmPeriod {
+    fn format(&self) -> PcmFormat {
+        VIRTUAL_SINK_FORMAT
+    }
+    fn write(&mut self, pcm: &[u8]) -> Result<(), EndpointError> {
+        if !pcm.len().is_multiple_of(4) {
+            return Err(EndpointError::PartialFrame);
+        }
+        self.pcm.extend_from_slice(pcm);
+        Ok(())
+    }
+    fn frame_position(&self) -> u64 {
+        (self.pcm.len() / 4) as u64
+    }
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -279,8 +300,8 @@ impl VfioHda {
             len: bar_info.size as usize,
         };
         let dma = Mapping {
-            ptr: map(4096, -1, 0, 2 | 0x20)?,
-            len: 4096,
+            ptr: map(16 * 1024, -1, 0, 2 | 0x20)?,
+            len: 16 * 1024,
         };
         unsafe {
             std::ptr::write_bytes(dma.ptr.as_ptr(), 0, dma.len);
@@ -392,6 +413,14 @@ impl Transport for VfioHda {
     fn fence(&self) {
         fence(Ordering::SeqCst)
     }
+    fn take_irq_count(&mut self) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        match self.irq.read_exact(&mut bytes) {
+            Ok(()) => Ok(u64::from_ne_bytes(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
 }
 impl Drop for VfioHda {
     fn drop(&mut self) {
@@ -422,10 +451,12 @@ impl Drop for VfioHda {
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args()
-        .nth(1)
+    let mut args = env::args().skip(1);
+    let first = args.next();
+    let playback = first.as_deref() == Some("--play-test-tone");
+    let path = (if playback { args.next() } else { first })
         .or_else(|| env::var("DRV_VFIO_DEVICE").ok())
-        .ok_or("usage: amd-hda-enumerate /dev/vfio/devices/vfioN")?;
+        .ok_or("usage: amd-hda-enumerate [--play-test-tone] /dev/vfio/devices/vfioN")?;
     let backend = VfioHda::open(&path)?;
     let mut controller = Controller::new(backend);
     let state = controller.reset().map_err(format_hda)?;
@@ -444,6 +475,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "widget node={:#04x} capabilities={:#010x}",
             widget.node, widget.capabilities
+        );
+    }
+    if playback {
+        let mut period = AdrPcmPeriod::default();
+        let mut tone = Vec::with_capacity(7680);
+        for frame in 0..1920 {
+            let phase = 2.0 * std::f64::consts::PI * 440.0 * frame as f64 / 48_000.0;
+            let sample = (phase.sin() * 256.0) as i16;
+            tone.extend_from_slice(&sample.to_le_bytes());
+            tone.extend_from_slice(&sample.to_le_bytes());
+        }
+        period
+            .write(&tone)
+            .map_err(|error| io::Error::other(format!("ADR PCM period: {error:?}")))?;
+        let report = controller
+            .play_pcm_period(0, &period.pcm)
+            .map_err(format_hda)?;
+        println!(
+            "playback route={:?} stream={} position={}..{} irq_count={} amp_gain_step={}",
+            report.route,
+            report.stream_index,
+            report.start_position,
+            report.end_position,
+            report.irq_count,
+            report.amp_gain_step
         );
     }
     controller.shutdown();
