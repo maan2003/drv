@@ -2164,3 +2164,24 @@ There was no page-pool warning or kernel warning/oops. The patched system
 closure and profile remained selected, `keep_d0_on_remove` remained `Y`, and
 the persistent default remained generation 25. Further physical work is
 blocked solely on the pre-port SAE management-TX authorization/effect fix.
+
+The next guarded attempt, launched as `wifi-sae-exchange16`, did not exercise
+the authorization change. Although the integrated transport, adapter, and
+netstack tests passed, the staged release artifact was the
+`mt7921-passive-scan` package binary (SHA-256
+`cad2920e1e176b13c59803fc6cf4d68d34a57428c34ba8c3183f72cf9dc79c52`)
+rather than the feature-enabled `mt7921-vfio-read` artifact expected by the
+launcher. Report
+`/var/lib/wifi-driver-lab/reports/20260810T185109Z-0000_05_00.0.log`
+records the correct dynamic target and
+`QUIESCE netdev=wlan1 vanished=true`, followed by
+`unknown argument --run-one-shot-sae-auth` and userspace status 1. There is
+no payload, firmware, beacon, SAE commit or confirm TX/RX, or PMK evidence.
+
+Restoration completed with `RESTORE end failed=0`. Native `mt7921e`, D0,
+iwd, WPA3 association, IPv4, the default route, and gateway connectivity
+recovered in 6224 ms on the renamed `wlan2`; the watchdog was disarmed
+without a reboot. There was no page-pool warning or kernel warning/oops, lab
+state was empty, and the patched system, profile, kernel, generation-25
+default, and `keep_d0_on_remove=Y` invariants remained intact. No rerun was
+attempted.
