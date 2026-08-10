@@ -1629,10 +1629,7 @@ fn run() -> Result<(), String> {
             None
         };
 
-        if operation.uses_contained_transport_gate() {
-            let device_info = active_device_info
-                .as_ref()
-                .expect("contained transport recorded VFIO device info");
+        let active_bar0 = if let Some(device_info) = active_device_info.as_ref() {
             let mut bar0 = None;
             for index in 0..device_info.num_regions {
                 let mut region = RegionInfo {
@@ -1676,7 +1673,13 @@ fn run() -> Result<(), String> {
                 }
             }
             record_sae_stage("vfio_region_discovery_complete");
-            let bar0 = bar0.ok_or("required BAR0 region was not discovered")?;
+            Some(bar0.ok_or("required BAR0 region was not discovered")?)
+        } else {
+            None
+        };
+
+        if operation.uses_contained_transport_gate() {
+            let bar0 = active_bar0.expect("contained transport discovered BAR0");
             let selector_page = MT_HIF_REMAP_L1_BAR_OFFSET & !(PAGE - 1);
             record_sae_stage(&format!(
                 "vfio_bar0_mmap_before page={selector_page:#x} length={} prot=read_write flags=shared region_size={} region_offset={}",
@@ -2315,17 +2318,22 @@ fn run() -> Result<(), String> {
             return Ok(None);
         }
 
-        let mut info = RegionInfo {
-            argsz: size::<RegionInfo>(),
-            index: BAR0_REGION,
-            ..Default::default()
+        let info = if let Some(info) = active_bar0 {
+            info
+        } else {
+            let mut info = RegionInfo {
+                argsz: size::<RegionInfo>(),
+                index: BAR0_REGION,
+                ..Default::default()
+            };
+            ioctl_mut(
+                capsule.device.as_raw_fd(),
+                VFIO_DEVICE_GET_REGION_INFO,
+                &mut info,
+                "query BAR 0",
+            )?;
+            info
         };
-        ioctl_mut(
-            capsule.device.as_raw_fd(),
-            VFIO_DEVICE_GET_REGION_INFO,
-            &mut info,
-            "query BAR 0",
-        )?;
 
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::BarMapping);
@@ -10433,10 +10441,18 @@ mod tests {
             .find("vfio_attached_d0_preflight_already_ready")
             .unwrap();
         let device_info = post_attach.find("vfio_device_get_info_before").unwrap();
+        let region_info = post_attach
+            .find("vfio_device_get_region_info_before")
+            .unwrap();
         let contained = post_attach
             .find("if operation.uses_contained_transport_gate()")
             .unwrap();
-        assert!(d0 < d0_marker && d0_marker < device_info && device_info < contained);
+        assert!(
+            d0 < d0_marker
+                && d0_marker < device_info
+                && device_info < region_info
+                && region_info < contained
+        );
     }
 
     #[test]
