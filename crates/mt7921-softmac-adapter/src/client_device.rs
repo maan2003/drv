@@ -15,6 +15,9 @@ use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use futures::channel::mpsc;
 use wlan_mlme::device::{DeviceOps, LinkStatus};
 
+use crate::Mt7921SoftmacAdapter;
+use fuchsia_softmac_port::SoftmacHardware;
+
 /// Immutable values reported through the pinned `DeviceOps` query seams.
 #[derive(Clone)]
 pub struct ClientSupport {
@@ -29,7 +32,7 @@ pub struct ClientSupport {
 ///
 /// This intentionally has no `Debug` implementation: an 802.11 frame can
 /// contain SAE, RSN, EAPOL, or other secret-adjacent material.
-pub(crate) struct ClientRxFrame {
+pub struct ClientRxFrame {
     pub bytes: Vec<u8>,
     pub status: fidl_softmac::WlanRxInfo,
 }
@@ -38,7 +41,7 @@ pub(crate) struct ClientRxFrame {
 ///
 /// Errors are already-mapped Zircon statuses. The adapter forwards them
 /// unchanged and never retries or interprets them.
-pub(crate) trait Mt7921ClientEffects {
+pub trait Mt7921ClientEffects {
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -67,6 +70,79 @@ pub(crate) trait Mt7921ClientEffects {
     fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status>;
 }
 
+trait Mt7921ClientScan {
+    fn set_channel(
+        &mut self,
+        primary: fidl_ieee80211::ChannelNumber,
+        bandwidth: fidl_ieee80211::ChannelBandwidth,
+        secondary: fidl_ieee80211::ChannelNumber,
+    ) -> Result<(), zx::Status>;
+    fn start_passive_scan(
+        &mut self,
+        request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+    ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>;
+    fn cancel_scan(
+        &mut self,
+        request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
+    ) -> Result<(), zx::Status>;
+}
+
+struct NoClientScan;
+
+impl Mt7921ClientScan for NoClientScan {
+    fn set_channel(
+        &mut self,
+        _: fidl_ieee80211::ChannelNumber,
+        _: fidl_ieee80211::ChannelBandwidth,
+        _: fidl_ieee80211::ChannelNumber,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn start_passive_scan(
+        &mut self,
+        _: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+    ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn cancel_scan(
+        &mut self,
+        _: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+}
+
+impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter<T> {
+    fn set_channel(
+        &mut self,
+        primary: fidl_ieee80211::ChannelNumber,
+        bandwidth: fidl_ieee80211::ChannelBandwidth,
+        secondary: fidl_ieee80211::ChannelNumber,
+    ) -> Result<(), zx::Status> {
+        SoftmacHardware::set_channel(
+            self,
+            fidl_softmac::WlanSoftmacBaseSetChannelRequest {
+                primary: Some(primary),
+                bandwidth: Some(bandwidth),
+                vht_secondary_80_channel: Some(secondary),
+            },
+        )
+        .map_err(|_| zx::Status::IO)
+    }
+    fn start_passive_scan(
+        &mut self,
+        request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+    ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
+        SoftmacHardware::start_passive_scan(self, request).map_err(|_| zx::Status::IO)
+    }
+    fn cancel_scan(
+        &mut self,
+        request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
+    ) -> Result<(), zx::Status> {
+        SoftmacHardware::cancel_scan(self, request).map_err(|_| zx::Status::IO)
+    }
+}
+
 /// Explicit boundary for the live TX prerequisite.
 ///
 /// UNIMPLEMENTED: production construction requires both a live beacon-derived
@@ -85,19 +161,21 @@ pub fn acquire_live_beacon_power_authorization() -> Result<LiveBeaconPowerAuthor
 ///
 /// Construction is deliberately offline-only. It grants no VFIO, MMIO, DMA,
 /// doorbell, TX-enablement, physical-transport, or live authorization access.
-pub struct Mt7921ClientDevice<E> {
+pub struct Mt7921ClientDevice<E, S> {
     effects: E,
+    scan: S,
     support: ClientSupport,
     event_sink: mpsc::UnboundedSender<fidl_mlme::MlmeEvent>,
     event_stream: Option<mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>>,
     minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
-impl<E> Mt7921ClientDevice<E> {
-    fn new(effects: E, support: ClientSupport) -> Self {
+impl<E, S> Mt7921ClientDevice<E, S> {
+    fn new(effects: E, scan: S, support: ClientSupport) -> Self {
         let (event_sink, event_stream) = mpsc::unbounded();
         Self {
             effects,
+            scan,
             support,
             event_sink,
             event_stream: Some(event_stream),
@@ -109,31 +187,44 @@ impl<E> Mt7921ClientDevice<E> {
     /// beacon-and-power gate has supplied its unforgeable capability.
     pub fn new_live(
         effects: E,
+        scan: S,
         support: ClientSupport,
         _authorization: LiveBeaconPowerAuthorization,
     ) -> Self {
-        Self::new(effects, support)
+        Self::new(effects, scan, support)
     }
 
-    #[cfg(test)]
-    fn new_offline_fake(effects: E, support: ClientSupport) -> Self {
-        Self::new(effects, support)
-    }
-
-    pub(crate) fn effects(&self) -> &E {
+    pub fn effects(&self) -> &E {
         &self.effects
     }
-
 }
 
-impl<E: Mt7921ClientEffects> Mt7921ClientDevice<E> {
+impl<E> Mt7921ClientDevice<E, NoClientScan> {
+    #[cfg(test)]
+    fn new_offline_fake(effects: E, support: ClientSupport) -> Self {
+        Self::new(effects, NoClientScan, support)
+    }
+}
+
+impl<E, T: crate::Mt7921PassiveTransport> Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>> {
+    #[cfg(test)]
+    fn new_offline_with_passive(
+        effects: E,
+        scan: Mt7921SoftmacAdapter<T>,
+        support: ClientSupport,
+    ) -> Self {
+        Self::new(effects, scan, support)
+    }
+}
+
+impl<E: Mt7921ClientEffects, S> Mt7921ClientDevice<E, S> {
     /// Pop exactly one frame/status pair from the injected RX effect queue.
-    pub(crate) fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+    pub fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
         self.effects.next_rx()
     }
 }
 
-impl<E: Mt7921ClientEffects> DeviceOps for Mt7921ClientDevice<E> {
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevice<E, S> {
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
@@ -183,8 +274,16 @@ impl<E: Mt7921ClientEffects> DeviceOps for Mt7921ClientDevice<E> {
         bandwidth: fidl_ieee80211::ChannelBandwidth,
         vht_secondary_80_channel: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
-        self.effects
+        match self
+            .scan
             .set_channel(primary, bandwidth, vht_secondary_80_channel)
+        {
+            Err(zx::Status::NOT_SUPPORTED) => {
+                self.effects
+                    .set_channel(primary, bandwidth, vht_secondary_80_channel)
+            }
+            result => result,
+        }
     }
 
     async fn set_mac_address(&mut self, _mac_addr: [u8; 6]) -> Result<(), zx::Status> {
@@ -193,9 +292,9 @@ impl<E: Mt7921ClientEffects> DeviceOps for Mt7921ClientDevice<E> {
 
     async fn start_passive_scan(
         &mut self,
-        _request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+        request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        self.scan.start_passive_scan(request.clone())
     }
 
     async fn start_active_scan(
@@ -207,9 +306,9 @@ impl<E: Mt7921ClientEffects> DeviceOps for Mt7921ClientDevice<E> {
 
     async fn cancel_scan(
         &mut self,
-        _request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
+        request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        self.scan.cancel_scan(request.clone())
     }
 
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
@@ -279,6 +378,76 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum PassiveCall {
+        Channel(mt7921_port_spike::CandidateChannel),
+        Start(crate::PassiveScanCommand),
+        Cancel(u64),
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePassiveTransport(Arc<Mutex<Vec<PassiveCall>>>);
+
+    #[derive(Debug)]
+    struct FakePassiveError;
+
+    impl std::fmt::Display for FakePassiveError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("fake passive transport error")
+        }
+    }
+
+    impl std::error::Error for FakePassiveError {}
+
+    impl crate::Mt7921PassiveTransport for FakePassiveTransport {
+        type Error = FakePassiveError;
+
+        fn set_channel(
+            &mut self,
+            channel: mt7921_port_spike::CandidateChannel,
+        ) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push(PassiveCall::Channel(channel));
+            Ok(())
+        }
+
+        fn start_passive_scan(
+            &mut self,
+            command: crate::PassiveScanCommand,
+        ) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push(PassiveCall::Start(command));
+            Ok(())
+        }
+
+        fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push(PassiveCall::Cancel(scan_id));
+            Ok(())
+        }
+
+        fn next_event(&mut self) -> Result<Option<crate::TransportEvent>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn nic() -> mt7921_port_spike::NicCapability {
+        mt7921_port_spike::NicCapability {
+            element_count: 2,
+            mac_address: Some([2, 0, 0, 0, 0, 1]),
+            phy: Some(mt7921_port_spike::NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 3,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        }
+    }
 
     const BSSID: [u8; 6] = [2, 4, 6, 8, 10, 12];
     // Public, synthetic test pattern. This is not key material from a network.
@@ -631,6 +800,67 @@ mod tests {
             .unwrap_err();
         assert_eq!(format!("{error}"), "MLME event queue closed");
         assert_eq!(format!("{error:?}"), "MLME event queue closed");
+    }
+
+    #[test]
+    fn device_ops_composes_existing_passive_mechanics_for_scan_and_cancel() {
+        futures::executor::block_on(async {
+            let transport = FakePassiveTransport::default();
+            let calls = Arc::clone(&transport.0);
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                transport,
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let mut support = support();
+            support.discovery.scan_offload = Some(fidl_softmac::ScanOffloadExtension {
+                supported: Some(true),
+                scan_cancel_supported: Some(true),
+            });
+            let mut device = Mt7921ClientDevice::new_offline_with_passive(
+                FakeEffects::default(),
+                passive,
+                support,
+            );
+
+            device
+                .set_channel(
+                    channel(36),
+                    fidl_ieee80211::ChannelBandwidth::Cbw20,
+                    channel(0),
+                )
+                .await
+                .unwrap();
+            let response = device
+                .start_passive_scan(&fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest {
+                    channels: Some(vec![channel(36)]),
+                    min_channel_time: Some(10),
+                    max_channel_time: Some(20),
+                    min_home_time: Some(0),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.scan_id, Some(1));
+            device
+                .cancel_scan(&fidl_softmac::WlanSoftmacBaseCancelScanRequest {
+                    scan_id: response.scan_id,
+                })
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                calls.lock().unwrap().as_slice(),
+                [
+                    PassiveCall::Channel(_),
+                    PassiveCall::Start(crate::PassiveScanCommand { scan_id: 1, .. }),
+                    PassiveCall::Cancel(1),
+                ]
+            ));
+            assert!(device.effects().order.is_empty());
+        });
     }
 
     #[test]
