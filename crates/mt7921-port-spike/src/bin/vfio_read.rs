@@ -130,20 +130,22 @@ const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc
 const PATCH_IMAGE_BYTES: usize = 92_192;
 const RAM_IMAGE_BYTES: usize = 792_036;
 const WATCHDOG_STATUS_PATH: &str = "/run/current-system/sw/bin/wifi-lab-watchdog";
-const SAE_STAGE_PATH: &str = "/var/lib/wifi-driver-lab/sae-stage";
+#[cfg(feature = "fuchsia-passive")]
+fn emit_sae_stage_best_effort(
+    event: &str,
+    emit: impl FnOnce(&str) -> std::io::Result<()>,
+) {
+    // Diagnostic output must never become an ownership or cleanup gate. In
+    // production the supervisor already captures stderr into the run report.
+    let _ = emit(event);
+}
 
 #[cfg(feature = "fuchsia-passive")]
 fn record_sae_stage(event: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(SAE_STAGE_PATH)
-    {
-        let _ = writeln!(file, "{event}");
-        let _ = file.sync_all();
-    }
-    eprintln!(r#"{{"sae_auth_event":"{event}"}}"#);
+    emit_sae_stage_best_effort(event, |event| {
+        eprintln!(r#"{{"sae_auth_event":"{event}"}}"#);
+        Ok(())
+    });
 }
 
 #[repr(C)]
@@ -8016,10 +8018,18 @@ impl Mt7921ClientEffects for LiveClientEffects {
         Ok(())
     }
     fn reset(&mut self) -> Result<(), zx::Status> {
-        Ok(())
+        if self.firmware.firmware_uncertain {
+            Err(zx::Status::IO)
+        } else {
+            Ok(())
+        }
     }
     fn stop(&mut self) -> Result<(), zx::Status> {
-        Ok(())
+        if self.firmware.firmware_uncertain {
+            Err(zx::Status::IO)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -11114,6 +11124,28 @@ mod tests {
         assert!(!exchange.contains("install_key("));
         assert!(!exchange.contains("notify_association_complete("));
         assert!(!exchange.contains("set_link_up("));
+    }
+
+    #[test]
+    fn sae_stage_reporting_cannot_gate_following_cleanup() {
+        let cleaned = std::cell::Cell::new(false);
+        emit_sae_stage_best_effort("simulated_would_block", |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        });
+        cleaned.set(true);
+        assert!(cleaned.get());
+
+        let source = include_str!("vfio_read.rs");
+        let recorder = source
+            .split("fn record_sae_stage(event: &str) {")
+            .nth(1)
+            .unwrap()
+            .split("#[repr(C)]")
+            .next()
+            .unwrap();
+        for forbidden in ["OpenOptions", "File::", "sync_all", "SAE_STAGE_PATH"] {
+            assert!(!recorder.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]
