@@ -13,10 +13,13 @@ use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
 use fidl_fuchsia_wlan_mlme as fidl_mlme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use futures::channel::mpsc;
+#[cfg(test)]
+use std::sync::MutexGuard;
+use std::sync::{Arc, Mutex};
 use wlan_mlme::device::{DeviceOps, LinkStatus};
 
 use crate::Mt7921SoftmacAdapter;
-use fuchsia_softmac_port::SoftmacHardware;
+use fuchsia_softmac_port::{HardwareScanEvent, SoftmacHardware};
 
 /// Immutable values reported through the pinned `DeviceOps` query seams.
 #[derive(Clone)]
@@ -68,6 +71,29 @@ pub trait Mt7921ClientEffects {
     ) -> Result<(), zx::Status>;
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
     fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status>;
+
+    /// Begin one device-owned passive scan transaction.
+    fn begin_passive_scan(
+        &mut self,
+        scan_id: u64,
+        channels: &[fidl_ieee80211::ChannelNumber],
+    ) -> Result<(), zx::Status>;
+
+    /// Observe one source-preserving passive scan advertisement.
+    fn observe_passive_scan(
+        &mut self,
+        scan_id: u64,
+        observation: &fuchsia_softmac_port::ScanObservation,
+    ) -> Result<(), zx::Status>;
+
+    /// Complete or revoke scan-derived authorization in the TX backend.
+    fn complete_passive_scan(&mut self, scan_id: u64, success: bool) -> Result<(), zx::Status>;
+
+    /// Revoke all run-scoped TX state after reset.
+    fn reset(&mut self) -> Result<(), zx::Status>;
+
+    /// Revoke all run-scoped TX state after stop.
+    fn stop(&mut self) -> Result<(), zx::Status>;
 }
 
 trait Mt7921ClientScan {
@@ -143,39 +169,83 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter
     }
 }
 
-/// Explicit boundary for the live TX prerequisite.
-///
-/// UNIMPLEMENTED: production construction requires both a live beacon-derived
-/// channel authorization and completed MT7921 rate/SAR power authorization.
-/// This offline gate cannot mint that capability.
-pub struct LiveBeaconPowerAuthorization {
-    _private: (),
+/// Cloneable physical scan edge retained after the device enters `ClientMlme`.
+/// Polling updates the same TX backend owned by the device; a beacon alone
+/// cannot authorize TX without its matching successful completion.
+pub struct Mt7921ScanRunner<E, T> {
+    backend: Arc<Mutex<ComposedBackend<E, Mt7921SoftmacAdapter<T>>>>,
 }
 
-pub fn acquire_live_beacon_power_authorization() -> Result<LiveBeaconPowerAuthorization, zx::Status>
-{
-    Err(zx::Status::NOT_SUPPORTED)
+impl<E, T> Clone for Mt7921ScanRunner<E, T> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
+    pub fn poll(&self) -> Result<Option<HardwareScanEvent>, zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        let event = backend.scan.next_scan_event().map_err(|_| zx::Status::IO)?;
+        if let Some(event) = &event {
+            match event {
+                HardwareScanEvent::Observation(observation) => {
+                    let scan_id = backend.active_scan_id.ok_or(zx::Status::BAD_STATE)?;
+                    backend.effects.observe_passive_scan(scan_id, observation)?;
+                }
+                HardwareScanEvent::Complete { scan_id, success } => {
+                    if backend.active_scan_id != Some(*scan_id) {
+                        return Err(zx::Status::BAD_STATE);
+                    }
+                    backend.effects.complete_passive_scan(*scan_id, *success)?;
+                    backend.active_scan_id = None;
+                }
+            }
+        }
+        Ok(event)
+    }
+
+    /// Notify the supplied backend that its hardware reset completed and
+    /// abandon any in-process scan transaction.
+    pub fn reset(&self) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.active_scan_id = None;
+        backend.effects.reset()
+    }
+
+    /// Notify the supplied backend that it stopped and abandon any in-process
+    /// scan transaction.
+    pub fn stop(&self) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.active_scan_id = None;
+        backend.effects.stop()
+    }
 }
 
 /// One-way adapter from production `ClientMlme` effects to MT7921 mechanics.
 ///
-/// Construction is deliberately offline-only. It grants no VFIO, MMIO, DMA,
-/// doorbell, TX-enablement, physical-transport, or live authorization access.
+/// Construction composes caller-supplied mechanics but grants no TX authority;
+/// the backend validates current physical state at every submission.
 pub struct Mt7921ClientDevice<E, S> {
-    effects: E,
-    scan: S,
+    backend: Arc<Mutex<ComposedBackend<E, S>>>,
     support: ClientSupport,
     event_sink: mpsc::UnboundedSender<fidl_mlme::MlmeEvent>,
     event_stream: Option<mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>>,
     minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
+struct ComposedBackend<E, S> {
+    effects: E,
+    scan: S,
+    active_scan_id: Option<u64>,
+}
+
 impl<E, S> Mt7921ClientDevice<E, S> {
-    fn new(effects: E, scan: S, support: ClientSupport) -> Self {
+    fn from_parts(backend: Arc<Mutex<ComposedBackend<E, S>>>, support: ClientSupport) -> Self {
         let (event_sink, event_stream) = mpsc::unbounded();
         Self {
-            effects,
-            scan,
+            backend,
             support,
             event_sink,
             event_stream: Some(event_stream),
@@ -183,44 +253,52 @@ impl<E, S> Mt7921ClientDevice<E, S> {
         }
     }
 
-    /// Construct the production adapter only after the separate live
-    /// beacon-and-power gate has supplied its unforgeable capability.
-    pub fn new_live(
-        effects: E,
-        scan: S,
-        support: ClientSupport,
-        _authorization: LiveBeaconPowerAuthorization,
-    ) -> Self {
-        Self::new(effects, scan, support)
-    }
-
-    pub fn effects(&self) -> &E {
-        &self.effects
+    #[cfg(test)]
+    fn backend(&self) -> MutexGuard<'_, ComposedBackend<E, S>> {
+        self.backend.lock().unwrap()
     }
 }
 
 impl<E> Mt7921ClientDevice<E, NoClientScan> {
     #[cfg(test)]
     fn new_offline_fake(effects: E, support: ClientSupport) -> Self {
-        Self::new(effects, NoClientScan, support)
+        Self::from_parts(
+            Arc::new(Mutex::new(ComposedBackend {
+                effects,
+                scan: NoClientScan,
+                active_scan_id: None,
+            })),
+            support,
+        )
     }
 }
 
-impl<E, T: crate::Mt7921PassiveTransport> Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>> {
-    #[cfg(test)]
-    fn new_offline_with_passive(
+impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
+    Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>
+{
+    /// Construct the usable production boundary. TX authorization is checked
+    /// by `effects` at every submission; construction grants no authority.
+    pub fn new(
         effects: E,
         scan: Mt7921SoftmacAdapter<T>,
         support: ClientSupport,
-    ) -> Self {
-        Self::new(effects, scan, support)
+    ) -> (Self, Mt7921ScanRunner<E, T>) {
+        let backend = Arc::new(Mutex::new(ComposedBackend {
+            effects,
+            scan,
+            active_scan_id: None,
+        }));
+        let runner = Mt7921ScanRunner {
+            backend: backend.clone(),
+        };
+        (Self::from_parts(backend, support), runner)
     }
 }
 
 impl<E: Mt7921ClientEffects, S> Mt7921ClientDevice<E, S> {
     /// Pop exactly one frame/status pair from the injected RX effect queue.
     pub fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-        self.effects.next_rx()
+        self.backend.lock().unwrap().effects.next_rx()
     }
 }
 
@@ -261,11 +339,19 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         tx_flags: fidl_softmac::WlanTxInfoFlags,
         _async_id: Option<fuchsia_trace::Id>,
     ) -> Result<(), zx::Status> {
-        self.effects.send_wlan_frame(&buffer, tx_flags)
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .send_wlan_frame(&buffer, tx_flags)
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
-        self.effects.set_link_up(status == LinkStatus::UP)
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .set_link_up(status == LinkStatus::UP)
     }
 
     async fn set_channel(
@@ -274,16 +360,20 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         bandwidth: fidl_ieee80211::ChannelBandwidth,
         vht_secondary_80_channel: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
-        match self
+        let mut backend = self.backend.lock().unwrap();
+        let tuned = backend
             .scan
-            .set_channel(primary, bandwidth, vht_secondary_80_channel)
-        {
-            Err(zx::Status::NOT_SUPPORTED) => {
-                self.effects
-                    .set_channel(primary, bandwidth, vht_secondary_80_channel)
-            }
-            result => result,
+            .set_channel(primary, bandwidth, vht_secondary_80_channel);
+        match tuned {
+            Err(zx::Status::NOT_SUPPORTED) => {}
+            Err(status) => return Err(status),
+            Ok(()) => {}
         }
+        // Publish the channel to the TX backend only after physical tuning
+        // succeeds (or when this explicitly has no physical scan backend).
+        backend
+            .effects
+            .set_channel(primary, bandwidth, vht_secondary_80_channel)
     }
 
     async fn set_mac_address(&mut self, _mac_addr: [u8; 6]) -> Result<(), zx::Status> {
@@ -294,7 +384,24 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        self.scan.start_passive_scan(request.clone())
+        let mut backend = self.backend.lock().unwrap();
+        let response = backend.scan.start_passive_scan(request.clone())?;
+        let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
+        backend.active_scan_id = Some(scan_id);
+        if let Err(status) = backend
+            .effects
+            .begin_passive_scan(scan_id, request.channels.as_deref().unwrap_or_default())
+        {
+            let _ = backend
+                .scan
+                .cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest {
+                    scan_id: Some(scan_id),
+                });
+            let _ = backend.effects.complete_passive_scan(scan_id, false);
+            backend.active_scan_id = None;
+            return Err(status);
+        }
+        Ok(response)
     }
 
     async fn start_active_scan(
@@ -308,11 +415,15 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
-        self.scan.cancel_scan(request.clone())
+        self.backend
+            .lock()
+            .unwrap()
+            .scan
+            .cancel_scan(request.clone())
     }
 
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
-        self.effects.join_bss(request)
+        self.backend.lock().unwrap().effects.join_bss(request)
     }
 
     async fn enable_beaconing(
@@ -330,21 +441,33 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         &mut self,
         configuration: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
-        self.effects.install_key(configuration)
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .install_key(configuration)
     }
 
     async fn notify_association_complete(
         &mut self,
         configuration: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
-        self.effects.notify_association_complete(&configuration)
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .notify_association_complete(&configuration)
     }
 
     async fn clear_association(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        self.effects.clear_association(request)
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .clear_association(request)
     }
 
     async fn update_wmm_parameters(
@@ -568,6 +691,34 @@ mod tests {
             }
             Ok(self.rx.pop_front())
         }
+
+        fn begin_passive_scan(
+            &mut self,
+            _: u64,
+            _: &[fidl_ieee80211::ChannelNumber],
+        ) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn observe_passive_scan(
+            &mut self,
+            _: u64,
+            _: &fuchsia_softmac_port::ScanObservation,
+        ) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn complete_passive_scan(&mut self, _: u64, _: bool) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn reset(&mut self) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), zx::Status> {
+            Ok(())
+        }
     }
 
     fn support() -> ClientSupport {
@@ -703,7 +854,8 @@ mod tests {
             device.set_ethernet_status(LinkStatus::UP).await.unwrap();
             device.set_ethernet_status(LinkStatus::DOWN).await.unwrap();
 
-            let effects = device.effects();
+            let effects = device.backend();
+            let effects = &effects.effects;
             assert_eq!(
                 effects.order,
                 [
@@ -751,8 +903,8 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(device.install_key(&key).await, Err(zx::Status::IO_REFUSED));
-            assert!(device.effects().order.is_empty());
-            assert!(device.effects().key.is_none());
+            assert!(device.backend().effects.order.is_empty());
+            assert!(device.backend().effects.key.is_none());
         });
     }
 
@@ -820,12 +972,20 @@ mod tests {
                 supported: Some(true),
                 scan_cancel_supported: Some(true),
             });
-            let mut device = Mt7921ClientDevice::new_offline_with_passive(
-                FakeEffects::default(),
-                passive,
-                support,
-            );
+            let (mut device, _runner) =
+                Mt7921ClientDevice::new(FakeEffects::default(), passive, support);
 
+            assert_eq!(
+                device
+                    .set_channel(
+                        channel(40),
+                        fidl_ieee80211::ChannelBandwidth::Cbw20,
+                        channel(0),
+                    )
+                    .await,
+                Err(zx::Status::IO)
+            );
+            assert!(device.backend().effects.order.is_empty());
             device
                 .set_channel(
                     channel(36),
@@ -859,17 +1019,13 @@ mod tests {
                     PassiveCall::Cancel(1),
                 ]
             ));
-            assert!(device.effects().order.is_empty());
+            assert_eq!(device.backend().effects.order, ["channel"]);
         });
     }
 
     #[test]
-    fn live_prerequisite_and_all_unretained_operations_are_unsupported() {
+    fn all_unretained_operations_are_unsupported() {
         futures::executor::block_on(async {
-            assert_eq!(
-                acquire_live_beacon_power_authorization().err(),
-                Some(zx::Status::NOT_SUPPORTED)
-            );
             let mut device =
                 Mt7921ClientDevice::new_offline_fake(FakeEffects::default(), support());
             assert_eq!(

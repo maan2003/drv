@@ -195,6 +195,64 @@ pub mod client {
                 channels: Vec<types::WlanChan>,
             ) -> Result<Vec<types::ScanResult>, types::ScanError>;
         }
+
+        /// Host exposure of the pinned production `bss_to_network_map` and
+        /// `network_map_to_scan_result` conversion used before selection.
+        pub fn selection_scan_results(
+            results: Vec<wlan_common::scan::ScanResult>,
+            target_ssids: &[types::Ssid],
+        ) -> Vec<types::ScanResult> {
+            let mut by_network: std::collections::HashMap<
+                types::NetworkIdentifierDetailed,
+                Vec<types::Bss>,
+            > = std::collections::HashMap::new();
+            for result in results {
+                let security_type = result.bss_description.protection().into();
+                let entry = by_network
+                    .entry(types::NetworkIdentifierDetailed {
+                        ssid: result.bss_description.ssid.clone(),
+                        security_type,
+                    })
+                    .or_default();
+                if !entry.iter().any(|bss| bss.bssid == result.bss_description.bssid) {
+                    entry.push(types::Bss {
+                        bssid: result.bss_description.bssid,
+                        signal: types::Signal {
+                            rssi_dbm: result.bss_description.rssi_dbm,
+                            snr_db: result.bss_description.snr_db,
+                        },
+                        channel: result.bss_description.channel,
+                        timestamp: result.timestamp,
+                        observation: if target_ssids.contains(&result.bss_description.ssid) {
+                            types::ScanObservation::Active
+                        } else {
+                            types::ScanObservation::Passive
+                        },
+                        compatibility: result.compatibility,
+                        bss_description: wlan_common::sequestered::Sequestered::from(
+                            fidl_fuchsia_wlan_ieee80211::BssDescription::from(
+                                result.bss_description,
+                            ),
+                        ),
+                    });
+                }
+            }
+            let mut results = by_network
+                .into_iter()
+                .map(|(network, entries)| types::ScanResult {
+                    ssid: network.ssid,
+                    security_type_detailed: network.security_type,
+                    compatibility: if entries.iter().any(types::Bss::is_compatible) {
+                        crate::fidl_fuchsia_wlan_policy::Compatibility::Supported
+                    } else {
+                        crate::fidl_fuchsia_wlan_policy::Compatibility::DisallowedNotSupported
+                    },
+                    entries,
+                })
+                .collect::<Vec<_>>();
+            results.sort_by(|a, b| a.ssid.cmp(&b.ssid));
+            results
+        }
     }
 
     #[path = "connection_selection/mod.rs"]

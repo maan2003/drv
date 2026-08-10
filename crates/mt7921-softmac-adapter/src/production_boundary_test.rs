@@ -4,7 +4,7 @@ use super::*;
 use async_trait::async_trait;
 use fidl_fuchsia_wlan_common as fidl_common;
 use fidl_fuchsia_wlan_sme as fidl_sme;
-use fuchsia_softmac_port::{MlmeScanEvent, PassiveScanner, ScanRequest};
+use fuchsia_softmac_port::HardwareScanEvent;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::lock::Mutex as AsyncMutex;
@@ -12,16 +12,13 @@ use mt7921_port_spike::{CandidateChannel, NicCapability, NicPhyCapability, Physi
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use wlan_common::channel::{Bandwidth, Channel};
-use wlan_common::scan::Compatible;
-use wlan_common::security::SecurityDescriptor;
 use wlan_common::sequestered::Sequestered;
 use wlan_mlme::{MlmeImpl, client::ClientMlme};
 use wlan_sme::client::{ClientConfig, ClientSme};
 use wlan_sme::{MlmeRequest, Station};
 use wlancfg_selection::client::connection_selection::{ConnectionSelector, ConnectionSelectorApi};
-use wlancfg_selection::client::scan::{ScanReason, ScanRequestApi};
-use wlancfg_selection::client::types::{self, Bss, ScanObservation, ScanResult, Signal};
+use wlancfg_selection::client::scan::{ScanReason, ScanRequestApi, selection_scan_results};
+use wlancfg_selection::client::types::{self, Bss, ScanObservation, ScanResult};
 use wlancfg_selection::config_management::{
     Credential, NetworkConfig, NetworkConfigError, PastConnectionData, PastConnectionList,
     SavedNetworksManagerApi,
@@ -58,21 +55,18 @@ impl crate::Mt7921PassiveTransport for PhysicalScan {
     fn set_channel(&mut self, _: CandidateChannel) -> Result<(), Self::Error> {
         Ok(())
     }
-
     fn start_passive_scan(&mut self, _: crate::PassiveScanCommand) -> Result<(), Self::Error> {
         Ok(())
     }
-
     fn cancel_passive_scan(&mut self, _: u64) -> Result<(), Self::Error> {
         Ok(())
     }
-
     fn next_event(&mut self) -> Result<Option<crate::TransportEvent>, Self::Error> {
         Ok(self.events.pop_front())
     }
 }
 
-fn physical_scan() -> fidl_ieee80211::BssDescription {
+fn physical_adapter() -> crate::Mt7921SoftmacAdapter<PhysicalScan> {
     let candidate = CandidateChannel {
         band: PhysicalBand::Ghz2,
         number: 6,
@@ -94,61 +88,36 @@ fn physical_scan() -> fidl_ieee80211::BssDescription {
         chip_capability: None,
         unknown_elements: 0,
     };
-    let transport = PhysicalScan {
-        events: [
-            crate::TransportEvent::Advertisement(crate::RawAdvertisement {
-                scan_id: 1,
-                kind: fuchsia_softmac_port::AdvertisementKind::Beacon,
-                timestamp_nanos: 10,
-                bssid: AP,
-                beacon_interval_tu: 100,
-                capability_info: 0x11,
-                ies: wpa3_ies(),
-                channel: candidate,
-                rssi_dbm: -40,
-            }),
-            crate::TransportEvent::Complete {
-                scan_id: 1,
-                success: true,
-            },
-        ]
-        .into(),
-    };
-    let mut adapter =
-        crate::Mt7921SoftmacAdapter::new(transport, nic, vec![candidate], vec![channel(6)])
-            .unwrap();
-    let mut scanner = PassiveScanner::default();
-    scanner
-        .start(
-            &mut adapter,
-            ScanRequest {
-                txn_id: 41,
-                scan_type: fidl_mlme::ScanTypes::Passive,
-                channel_list: vec![channel(6)],
-                ssid_list: vec![],
-                probe_delay: 0,
-                min_channel_time: 50,
-                max_channel_time: 100,
-            },
-        )
-        .unwrap();
-    let result = match scanner.poll(&mut adapter).unwrap() {
-        Some(MlmeScanEvent::Result { result, .. }) => result,
-        other => panic!("physical beacon did not produce a scan result: {other:?}"),
-    };
-    assert!(matches!(
-        scanner.poll(&mut adapter).unwrap(),
-        Some(MlmeScanEvent::End(fidl_mlme::ScanEnd {
-            txn_id: 41,
-            code: fidl_mlme::ScanResultCode::Success,
-        }))
-    ));
-    result.bss
+    crate::Mt7921SoftmacAdapter::new(
+        PhysicalScan {
+            events: [
+                crate::TransportEvent::Advertisement(crate::RawAdvertisement {
+                    scan_id: 1,
+                    kind: fuchsia_softmac_port::AdvertisementKind::Beacon,
+                    timestamp_nanos: 10,
+                    bssid: AP,
+                    beacon_interval_tu: 100,
+                    capability_info: 0x11,
+                    ies: wpa3_ies(),
+                    channel: candidate,
+                    rssi_dbm: -40,
+                }),
+                crate::TransportEvent::Complete {
+                    scan_id: 1,
+                    success: true,
+                },
+            ]
+            .into(),
+        },
+        nic,
+        vec![candidate],
+        vec![channel(6)],
+    )
+    .unwrap()
 }
 
 struct ScanSource {
-    result: AsyncMutex<Option<ScanResult>>,
-    reasons: AsyncMutex<Vec<ScanReason>>,
+    result: AsyncMutex<Option<Vec<ScanResult>>>,
 }
 
 #[async_trait(?Send)]
@@ -159,12 +128,11 @@ impl ScanRequestApi for ScanSource {
         _: Vec<types::Ssid>,
         _: Vec<types::WlanChan>,
     ) -> Result<Vec<ScanResult>, types::ScanError> {
-        self.reasons.lock().await.push(reason);
+        assert_eq!(reason, ScanReason::BssSelection);
         self.result
             .lock()
             .await
             .take()
-            .map(|result| vec![result])
             .ok_or(wlancfg_selection::fidl_fuchsia_wlan_policy::ScanErrorCode::GeneralError)
     }
 }
@@ -249,6 +217,12 @@ impl SavedNetworksManagerApi for SavedNetwork {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Applied {
+    Power(i8),
+    Rate(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Reject {
     AlreadyTransmitted,
     Revoked,
@@ -256,31 +230,33 @@ enum Reject {
 
 #[derive(Default)]
 struct BackendState {
-    channel: Option<fidl_ieee80211::ChannelNumber>,
+    active_scan_id: Option<u64>,
+    pending_scan_channel: Option<fidl_ieee80211::ChannelNumber>,
     regulatory_channel: Option<fidl_ieee80211::ChannelNumber>,
-    sar_power_dbm: Option<i8>,
-    transmitted: usize,
+    current_channel: Option<fidl_ieee80211::ChannelNumber>,
+    tx_power_dbm: Option<i8>,
+    tx_rate_mbps: Option<u16>,
+    applied: Vec<Applied>,
+    frames: Vec<Vec<u8>>,
     rejects: Vec<Reject>,
 }
 
-impl BackendState {
-    fn authorize(&mut self) {
-        self.regulatory_channel = Some(channel(6));
-        self.sar_power_dbm = Some(16);
+#[derive(Clone, Default)]
+struct ProductionBackend(Arc<Mutex<BackendState>>);
+
+impl ProductionBackend {
+    fn apply_tx_power(&self, power_dbm: i8) {
+        let mut state = self.0.lock().unwrap();
+        state.tx_power_dbm = Some(power_dbm);
+        state.applied.push(Applied::Power(power_dbm));
     }
 
-    fn reset(&mut self) {
-        self.regulatory_channel = None;
-        self.sar_power_dbm = None;
-    }
-
-    fn stop(&mut self) {
-        self.reset();
+    fn apply_tx_rate(&self, rate_mbps: u16) {
+        let mut state = self.0.lock().unwrap();
+        state.tx_rate_mbps = Some(rate_mbps);
+        state.applied.push(Applied::Rate(rate_mbps));
     }
 }
-
-#[derive(Clone)]
-struct ProductionBackend(Arc<Mutex<BackendState>>);
 
 impl Mt7921ClientEffects for ProductionBackend {
     fn set_channel(
@@ -289,35 +265,33 @@ impl Mt7921ClientEffects for ProductionBackend {
         _: fidl_ieee80211::ChannelBandwidth,
         _: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
-        self.0.lock().unwrap().channel = Some(primary);
+        self.0.lock().unwrap().current_channel = Some(primary);
         Ok(())
     }
-
     fn join_bss(&mut self, _: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
         Ok(())
     }
-
     fn send_wlan_frame(
         &mut self,
-        _: &[u8],
+        bytes: &[u8],
         _: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
-        if state.channel != Some(channel(6))
-            || state.regulatory_channel != state.channel
-            || state.sar_power_dbm != Some(16)
+        if state.current_channel != Some(channel(6))
+            || state.regulatory_channel != state.current_channel
+            || state.tx_power_dbm != Some(16)
+            || state.tx_rate_mbps != Some(6)
         {
             state.rejects.push(Reject::Revoked);
             return Err(zx::Status::ACCESS_DENIED);
         }
-        if state.transmitted != 0 {
+        if !state.frames.is_empty() {
             state.rejects.push(Reject::AlreadyTransmitted);
             return Err(zx::Status::ALREADY_EXISTS);
         }
-        state.transmitted += 1;
+        state.frames.push(bytes.to_vec());
         Ok(())
     }
-
     fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
@@ -339,6 +313,51 @@ impl Mt7921ClientEffects for ProductionBackend {
     fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
         Ok(None)
     }
+    fn begin_passive_scan(
+        &mut self,
+        scan_id: u64,
+        _: &[fidl_ieee80211::ChannelNumber],
+    ) -> Result<(), zx::Status> {
+        self.0.lock().unwrap().active_scan_id = Some(scan_id);
+        Ok(())
+    }
+    fn observe_passive_scan(
+        &mut self,
+        scan_id: u64,
+        observation: &fuchsia_softmac_port::ScanObservation,
+    ) -> Result<(), zx::Status> {
+        let mut state = self.0.lock().unwrap();
+        if state.active_scan_id != Some(scan_id)
+            || observation.kind != fuchsia_softmac_port::AdvertisementKind::Beacon
+        {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        state.pending_scan_channel = Some(observation.bss.primary);
+        Ok(())
+    }
+    fn complete_passive_scan(&mut self, scan_id: u64, success: bool) -> Result<(), zx::Status> {
+        let mut state = self.0.lock().unwrap();
+        state.regulatory_channel = if state.active_scan_id == Some(scan_id) && success {
+            state.pending_scan_channel
+        } else {
+            None
+        };
+        state.active_scan_id = None;
+        state.pending_scan_channel = None;
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), zx::Status> {
+        let mut state = self.0.lock().unwrap();
+        state.regulatory_channel = None;
+        state.active_scan_id = None;
+        state.current_channel = None;
+        state.tx_power_dbm = None;
+        state.tx_rate_mbps = None;
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), zx::Status> {
+        self.reset()
+    }
 }
 
 fn client_support() -> ClientSupport {
@@ -356,7 +375,13 @@ fn client_support() -> ClientSupport {
             }]),
             ..Default::default()
         },
-        discovery: Default::default(),
+        discovery: fidl_softmac::DiscoverySupport {
+            scan_offload: Some(fidl_softmac::ScanOffloadExtension {
+                supported: Some(true),
+                scan_cancel_supported: Some(true),
+            }),
+            ..Default::default()
+        },
         mac_sublayer: fidl_common::MacSublayerSupport {
             device: Some(fidl_common::DeviceExtension {
                 mac_implementation_type: Some(fidl_common::MacImplementationType::Softmac),
@@ -379,34 +404,94 @@ fn client_support() -> ClientSupport {
     }
 }
 
+fn device_info() -> fidl_mlme::DeviceInfo {
+    fidl_mlme::DeviceInfo {
+        sta_addr: CLIENT,
+        factory_addr: CLIENT,
+        role: fidl_common::WlanMacRole::Client,
+        bands: vec![fidl_mlme::BandCapability {
+            band: fidl_ieee80211::WlanBand::TwoGhz,
+            basic_rates: vec![0x82, 0x84, 0x8b, 0x96],
+            ht_cap: None,
+            vht_cap: None,
+            primary_channels: vec![channel(6)],
+        }],
+        softmac_hardware_capability: 0,
+        qos_capable: false,
+    }
+}
+
 #[test]
 fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
     futures::executor::block_on(async {
-        let description = physical_scan();
+        let backend = ProductionBackend::default();
+        let (mut device, runner) =
+            Mt7921ClientDevice::new(backend.clone(), physical_adapter(), client_support());
+        let mut events = device.take_mlme_event_stream().unwrap();
+        let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
+        let mut mlme = ClientMlme::new(Default::default(), device, timer)
+            .await
+            .unwrap();
+
+        let inspector = fuchsia_inspect::Inspector::default();
+        let mut config = ClientConfig::default();
+        config.wpa3_supported = true;
+        let (mut sme, _sink, mut requests, _timers) = ClientSme::new(
+            config,
+            device_info(),
+            inspector.clone(),
+            inspector.root().create_child("sme"),
+            client_support().security,
+            Default::default(),
+        );
+        let mut scanned = sme.on_scan_command(fidl_sme::ScanRequest::Passive(
+            fidl_sme::PassiveScanRequest { channels: vec![6] },
+        ));
+        let scan_request = requests.try_recv().expect("SME passive scan request");
+        let txn_id = match &scan_request {
+            MlmeRequest::Scan(request) => request.txn_id,
+            other => panic!("expected scan, got {}", other.name()),
+        };
+        mlme.handle_mlme_request(scan_request).await.unwrap();
+
+        let observation = match runner.poll().unwrap() {
+            Some(HardwareScanEvent::Observation(observation)) => observation,
+            other => panic!("expected physical observation, got {other:?}"),
+        };
+        Station::on_mlme_event(
+            &mut sme,
+            fidl_mlme::MlmeEvent::OnScanResult {
+                result: fidl_mlme::ScanResult {
+                    txn_id,
+                    timestamp_nanos: observation.timestamp_nanos,
+                    bss: observation.bss,
+                },
+            },
+        );
+        let (scan_id, success) = match runner.poll().unwrap() {
+            Some(HardwareScanEvent::Complete { scan_id, success }) => (scan_id, success),
+            other => panic!("expected matching physical completion, got {other:?}"),
+        };
+        assert!(success);
+        mlme.handle_scan_complete(zx::Status::OK, scan_id).await;
+        Station::on_mlme_event(
+            &mut sme,
+            events.next().await.expect("ClientMlme scan completion"),
+        );
+        let sme_results = scanned.try_recv().unwrap().unwrap().unwrap();
+        let converted = selection_scan_results(sme_results, &[]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].security_type_detailed,
+            fidl_sme::Protection::Wpa3Personal
+        );
+        assert_eq!(
+            converted[0].entries[0].observation,
+            ScanObservation::Passive
+        );
+
         let scan = Arc::new(ScanSource {
-            result: AsyncMutex::new(Some(ScanResult {
-                ssid: types::Ssid::from_bytes_unchecked(SSID.to_vec()),
-                security_type_detailed: fidl_sme::Protection::Wpa3Personal,
-                entries: vec![Bss {
-                    bssid: AP.into(),
-                    signal: Signal {
-                        rssi_dbm: description.rssi_dbm,
-                        snr_db: description.snr_db,
-                    },
-                    channel: Channel {
-                        primary: 6,
-                        bandwidth: Bandwidth::Cbw20,
-                        band: fidl_ieee80211::WlanBand::TwoGhz,
-                    },
-                    timestamp: zx::MonotonicInstant::from_nanos(10),
-                    observation: ScanObservation::Passive,
-                    compatibility: Compatible::expect_ok([SecurityDescriptor::WPA3_PERSONAL]),
-                    bss_description: Sequestered::from(description),
-                }],
-                compatibility:
-                    wlancfg_selection::fidl_fuchsia_wlan_policy::Compatibility::Supported,
-            })),
-            reasons: AsyncMutex::new(vec![]),
+            result: AsyncMutex::new(Some(converted)),
         });
         let network = types::NetworkIdentifier::new(
             types::Ssid::from_bytes_unchecked(SSID.to_vec()),
@@ -425,7 +510,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         let (telemetry, _) = mpsc::channel::<TelemetryEvent>(8);
         let selector = ConnectionSelector::new(
             saved,
-            scan.clone(),
+            scan,
             inspector.root().create_child("selection"),
             TelemetrySender::new(telemetry),
         );
@@ -433,32 +518,9 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             .find_and_select_connection_candidate(Some(network), ConnectReason::FidlConnectRequest)
             .await
             .expect("pinned selector must select the physical WPA3 BSS");
-        assert_eq!(*scan.reasons.lock().await, [ScanReason::BssSelection]);
 
-        let inspector = fuchsia_inspect::Inspector::default();
-        let mut config = ClientConfig::default();
-        config.wpa3_supported = true;
-        let (mut sme, _sink, mut requests, _timers) = ClientSme::new(
-            config,
-            fidl_mlme::DeviceInfo {
-                sta_addr: CLIENT,
-                factory_addr: CLIENT,
-                role: fidl_common::WlanMacRole::Client,
-                bands: vec![fidl_mlme::BandCapability {
-                    band: fidl_ieee80211::WlanBand::TwoGhz,
-                    basic_rates: vec![0x82, 0x84, 0x8b, 0x96],
-                    ht_cap: None,
-                    vht_cap: None,
-                    primary_channels: vec![channel(6)],
-                }],
-                softmac_hardware_capability: 0,
-                qos_capable: false,
-            },
-            inspector.clone(),
-            inspector.root().create_child("sme"),
-            client_support().security,
-            Default::default(),
-        );
+        backend.apply_tx_power(16);
+        backend.apply_tx_rate(6);
         let _transaction = sme.on_connect_command(fidl_sme::ConnectRequest {
             ssid: SSID.to_vec(),
             bss_description: Sequestered::release(selected.bss.bss_description),
@@ -471,18 +533,6 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             other => panic!("expected connect, got {}", other.name()),
         };
         assert_eq!(connect.auth_type, fidl_mlme::AuthenticationTypes::Sae);
-
-        let state = Arc::new(Mutex::new(BackendState::default()));
-        state.lock().unwrap().authorize();
-        let mut device = Mt7921ClientDevice::new_offline_fake(
-            ProductionBackend(state.clone()),
-            client_support(),
-        );
-        let mut events = device.take_mlme_event_stream().unwrap();
-        let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
-        let mut mlme = ClientMlme::new(Default::default(), device, timer)
-            .await
-            .unwrap();
         mlme.handle_mlme_request(MlmeRequest::Connect(connect))
             .await
             .unwrap();
@@ -496,42 +546,41 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             MlmeRequest::SaeFrameTx(frame) => frame,
             other => panic!("expected SAE frame, got {}", other.name()),
         };
-
-        mlme.handle_mlme_request(MlmeRequest::SaeFrameTx(sae_tx.clone()))
+        mlme.handle_mlme_request(MlmeRequest::SaeFrameTx(sae_tx))
             .await
             .unwrap();
-        assert_eq!(state.lock().unwrap().transmitted, 1);
-        let _ = mlme
-            .handle_mlme_request(MlmeRequest::SaeFrameTx(sae_tx.clone()))
-            .await;
-        assert_eq!(
-            state.lock().unwrap().rejects,
-            [Reject::AlreadyTransmitted],
-            "the backend must reject a second TX even though ClientMlme consumes the status"
-        );
+
         {
-            let mut state = state.lock().unwrap();
-            state.reset();
+            let state = backend.0.lock().unwrap();
+            assert_eq!(state.applied, [Applied::Power(16), Applied::Rate(6)]);
+            assert_eq!(state.frames.len(), 1);
+            let frame = &state.frames[0];
+            assert_eq!(&frame[0..2], &[0xb0, 0]);
+            assert_eq!(&frame[4..10], &AP);
+            assert_eq!(&frame[10..16], &CLIENT);
+            assert_eq!(&frame[16..22], &AP);
+            assert_eq!(&frame[24..28], &[3, 0, 1, 0]);
         }
-        let mut backend = ProductionBackend(state.clone());
+
+        let mut clone = backend.clone();
         assert_eq!(
-            backend.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            Err(zx::Status::ALREADY_EXISTS)
+        );
+        runner.reset().unwrap();
+        assert_eq!(
+            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
             Err(zx::Status::ACCESS_DENIED)
         );
-        assert_eq!(state.lock().unwrap().rejects.last(), Some(&Reject::Revoked));
-        {
-            let mut state = state.lock().unwrap();
-            state.authorize();
-            state.stop();
-        }
+        backend.apply_tx_power(16);
+        backend.apply_tx_rate(6);
+        runner.stop().unwrap();
         assert_eq!(
-            backend.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
             Err(zx::Status::ACCESS_DENIED)
         );
-        let state = state.lock().unwrap();
-        assert_eq!(state.transmitted, 1);
         assert_eq!(
-            state.rejects,
+            backend.0.lock().unwrap().rejects,
             [Reject::AlreadyTransmitted, Reject::Revoked, Reject::Revoked]
         );
     });
