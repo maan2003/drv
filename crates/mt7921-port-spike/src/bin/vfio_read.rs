@@ -952,14 +952,17 @@ fn run_contained_dma_resource_round_trip(
                 .map_err(|error| format!("parse patch for contained loader: {error:?}"))?;
             let firmware = Firmware::parse(ram_bytes)
                 .map_err(|error| format!("parse RAM for contained loader: {error:?}"))?;
-            let report = load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
-                .map_err(|error| format!("contained firmware bootstrap: {error:?}"))?;
+            let report = load_mt7921_firmware(&mut loader, patch, firmware)
+                .map_err(|error| format!("contained passive firmware initialization: {error:?}"))?;
             record_sae_stage(&format!(
-                "vfio_firmware_bootstrap_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom=false calibration=false radio=false",
+                "vfio_firmware_passive_init_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom_valid={} clc_rules={} special_unii_mask={:#04x} channel=false scan=false management_tx=false sae=false radio=false",
                 report.patch_sections,
                 report.ram_regions,
                 report.scatter_chunks,
                 report.nic_capability.element_count,
+                report.eeprom_hardware.valid,
+                report.clc_rules_applied,
+                report.special_unii_mask,
             ));
         }
         Ok(())
@@ -6277,6 +6280,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             DownloadCommand::PatchFinish => Some("patch_published_and_finished"),
             DownloadCommand::FirmwareStart { .. } => Some("ram_published_firmware_start_acked"),
             DownloadCommand::GetNicCapability => Some("nic_capability_response"),
+            DownloadCommand::ReadEepromBlock { .. } => Some("eeprom_efuse_acquired"),
             _ => None,
         };
         if let Some(event) = milestone {
@@ -6340,6 +6344,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        println!(
+            "{{\"firmware_bootstrap_event\":\"clc_calibration_configured\",\"sequence\":{sequence},\"rule_index\":{},\"response\":{}}}",
+            command.index,
+            response.is_some(),
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush CLC/calibration milestone: {error}"))?;
         Ok(response)
     }
 
@@ -9394,7 +9406,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_bootstrap_reuses_contained_transport_source_shape() {
+    fn passive_firmware_init_reuses_contained_transport_source_shape() {
         assert!(Operation::RunOneShotFirmware.uses_contained_transport_gate());
         let source = include_str!("vfio_read.rs");
         let boundary = source
@@ -9406,9 +9418,14 @@ mod tests {
             .unwrap();
         let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
         let ready = boundary.find("vfio_firmware_transport_ready").unwrap();
-        let loader = boundary.find("load_mt7921_firmware_bootstrap").unwrap();
+        let loader = boundary.find("load_mt7921_firmware(&mut loader").unwrap();
+        let eeprom = source.find("eeprom_efuse_acquired").unwrap();
+        let clc = source.find("clc_calibration_configured").unwrap();
         let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
         assert!(activated < ready && ready < loader && loader < cleanup);
+        assert!(eeprom < clc);
+        assert!(!boundary.contains("load_mt7921_firmware_through_channel_domain(&mut loader"));
+        assert!(!boundary.contains("load_mt7921_firmware_with_passive_boundary(&mut loader"));
 
         let run = source
             .split("fn run() -> Result<(), String>")
