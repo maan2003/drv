@@ -972,6 +972,7 @@ fn run_contained_dma_resource_round_trip(
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
                 normal_rx_frames: Vec::new(),
+                tx_completions: Vec::new(),
                 descriptor_provenance: DescriptorProvenance::new(),
             };
             let mut loader = VfioFirmwareLoader {
@@ -3077,6 +3078,7 @@ fn run() -> Result<(), String> {
                     extra_irq_mask: 0,
                     unsolicited: Vec::new(),
                     normal_rx_frames: Vec::new(),
+                    tx_completions: Vec::new(),
                     descriptor_provenance: DescriptorProvenance::new(),
                 };
                 let mut loader = VfioFirmwareLoader {
@@ -3803,6 +3805,7 @@ fn run() -> Result<(), String> {
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
                 normal_rx_frames: Vec::new(),
+                tx_completions: Vec::new(),
                 descriptor_provenance: DescriptorProvenance::new(),
             };
             mcu_io.cancelled()?;
@@ -5831,6 +5834,7 @@ struct ActiveMcuIo<'a> {
     extra_irq_mask: u32,
     unsolicited: Vec<ReceivedMcuResponse>,
     normal_rx_frames: Vec<PrivateRawFrameCarrier>,
+    tx_completions: Vec<MgmtTxCompletion>,
     descriptor_provenance: DescriptorProvenance,
 }
 
@@ -6807,6 +6811,7 @@ fn publish_current_rearm_or_revoke<T>(
 enum DrainedMcuRx {
     Normal(PrivateRawFrameCarrier),
     Response(Option<mt7921_port_spike::DownloadResponse>, Vec<u8>),
+    Completion(MgmtTxCompletion),
 }
 
 fn drain_rx_queue(
@@ -6815,6 +6820,7 @@ fn drain_rx_queue(
     expected_sequence: Option<u8>,
     unsolicited: &mut Vec<ReceivedMcuResponse>,
     normal_rx_frames: &mut Vec<PrivateRawFrameCarrier>,
+    tx_completions: &mut Vec<MgmtTxCompletion>,
     provenance: &mut DescriptorProvenance,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
     let result = (|| -> Result<Option<ReceivedMcuResponse>, String> {
@@ -6834,7 +6840,7 @@ fn drain_rx_queue(
                     completed_index,
                 );
                 Err("fragmented MCU RX descriptor is unsupported".into())
-            } else if !(36..=2048).contains(&response_len) {
+            } else if !(12..=2048).contains(&response_len) {
                 provenance.consume_without_mint(
                     DescriptorOccurrenceRoute::McuNormalRx,
                     queue.rx_ring_index,
@@ -6847,14 +6853,39 @@ fn drain_rx_queue(
                 let response = queue
                     .rx_buffers
                     .read_bytes(completed_index * 2048, response_len)?;
-                let actual_sequence = response[29];
-                let header_length = response
-                    .get(24..26)
-                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
                 let rxd0 = u32::from_le_bytes(response[0..4].try_into().expect("bounded response"));
                 let packet_type = (rxd0 >> 27) & 0x1f;
                 let packet_flag = (rxd0 >> 16) & 0x0f;
-                if packet_type == 7 && packet_flag == 1 {
+                let completion = match packet_type {
+                    6 => Some(
+                        parse_mt7921_tx_free(&response)
+                            .map(MgmtTxCompletion::Free)
+                            .map_err(|error| format!("parse TX_FREE: {error:?}")),
+                    ),
+                    0 if response_len >= 40 && (rxd0 & 0xffff) as usize == response_len => Some(
+                        parse_mt7921_tx_status(&response)
+                            .map(MgmtTxCompletion::Status)
+                            .map_err(|error| format!("parse TXS: {error:?}")),
+                    ),
+                    _ => None,
+                };
+                if let Some(completion) = completion {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    completion.map(DrainedMcuRx::Completion)
+                } else if response_len < 36 {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    Err(format!(
+                        "invalid MCU response descriptor length {response_len}"
+                    ))
+                } else if packet_type == 7 && packet_flag == 1 {
                     match provenance.seal_frame(
                         DescriptorOccurrenceRoute::McuNormalRx,
                         queue.rx_ring_index,
@@ -6870,6 +6901,10 @@ fn drain_rx_queue(
                         }
                     }
                 } else {
+                    let actual_sequence = response[29];
+                    let header_length = response
+                        .get(24..26)
+                        .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
                     provenance.consume_without_mint(
                         DescriptorOccurrenceRoute::McuNormalRx,
                         queue.rx_ring_index,
@@ -6924,6 +6959,14 @@ fn drain_rx_queue(
                     continue;
                 }
                 DrainedMcuRx::Response(parsed, response) => (parsed, response),
+                DrainedMcuRx::Completion(completion) => {
+                    record_sae_stage(&format!(
+                        "management_tx_completion_routed rx_ring={} completion={completion:?}",
+                        queue.rx_ring_index
+                    ));
+                    tx_completions.push(completion);
+                    continue;
+                }
             };
             let Some(parsed) = parsed else {
                 continue;
@@ -7022,6 +7065,7 @@ impl ActiveMcuIo<'_> {
                 expected_sequence,
                 &mut self.unsolicited,
                 &mut self.normal_rx_frames,
+                &mut self.tx_completions,
                 &mut self.descriptor_provenance,
             )?;
             if let Some(wm2) = self.wm2.as_mut() {
@@ -7031,6 +7075,7 @@ impl ActiveMcuIo<'_> {
                     expected_sequence,
                     &mut self.unsolicited,
                     &mut self.normal_rx_frames,
+                    &mut self.tx_completions,
                     &mut self.descriptor_provenance,
                 )?;
                 merge_matching_response(&mut matched, wm2_match)?;
@@ -8020,7 +8065,6 @@ fn drain_data_rx_queue(
     Ok(advertisements)
 }
 
-#[cfg(feature = "fuchsia-passive")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MgmtTxCompletion {
     Free(Mt7921TxFree),
@@ -8419,7 +8463,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         frame_arena: &mut DmaArena,
         frame: &[u8],
     ) -> Result<(), String> {
-        if !self.tx_completions.is_empty() {
+        if !self.tx_completions.is_empty() || !self.loader.mcu.tx_completions.is_empty() {
             return Err("management TX began with stale completion state".into());
         }
         self.configure_mgmt_tx_ring(ring)?;
@@ -8434,8 +8478,24 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
+                let didx = self.loader.mcu.wfdma.read(0xd430c)?;
+                let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
+                if didx == 1 && descriptor_done {
+                    record_sae_stage("sae_tx_ring0_consumed didx=1 descriptor_done=true");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "SAE management TX descriptor consumption timed out; didx={didx} descriptor_done={descriptor_done}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            loop {
                 self.loader.mcu.cancelled()?;
                 self.loader.mcu.handle_irq(None)?;
+                self.tx_completions
+                    .append(&mut self.loader.mcu.tx_completions);
                 let _ = drain_data_rx_queue(
                     self.loader.mcu.wfdma,
                     &mut self.data,
@@ -12946,6 +13006,90 @@ mod tests {
     }
 
     #[test]
+    fn ring4_demuxes_exchange18_txs_and_paired_tx_free_before_mcu_parsing() {
+        let ring_mapping = TestMapping::new(PAGE);
+        let buffer_mapping = TestMapping::new(8 * 2048);
+        let page_mapping = TestMapping::new(PAGE);
+        let mut ring = ring_mapping.dma(0x0100_0000);
+        let mut buffers = buffer_mapping.dma(0x0101_0000);
+        let page = page_mapping.read_page();
+        let txs = [
+            0x28, 0x00, 0x01, 0x00, 0x00, 0x00, 0x36, 0x00, 0x4b, 0x80, 0x00, 0x80, 0x00, 0x03,
+            0x0b, 0x00, 0x09, 0x00, 0x13, 0x04, 0x00, 0x00, 0x00, 0x03, 0xf7, 0x07, 0x1c, 0x00,
+            0xfd, 0xe7, 0x00, 0x82, 0xff, 0xff, 0xff, 0xff, 0x63, 0x62, 0xff, 0xff,
+        ];
+        buffers.write_bytes_at(0, &txs).unwrap();
+        let mut tx_free = [0u8; 16];
+        tx_free[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        tx_free[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+        tx_free[12..16].copy_from_slice(&1u32.to_le_bytes());
+        buffers.write_bytes_at(2048, &tx_free).unwrap();
+        ring.write_descriptor_at(
+            1,
+            DmaDescriptor {
+                buf0: buffers.iova as u32 + 2048,
+                ctrl: (1 << 31) | (1 << 30) | (16 << 16),
+                buf1: 0,
+                info: 0,
+            },
+        );
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: buffers.iova as u32,
+                ctrl: 0xc028_0000,
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let mut queue = ActiveMcuRx {
+            rx_ring: &mut ring,
+            rx_buffers: &buffers,
+            rx_tail: 0,
+            rx_head: 7,
+            rx_ring_index: 4,
+            rx_count: 8,
+            irq_bit: WM2_RX_IRQ_BIT,
+        };
+        let mut unsolicited = Vec::new();
+        let mut normal = Vec::new();
+        let mut completions = Vec::new();
+        let mut provenance = DescriptorProvenance::new();
+        assert!(
+            drain_rx_queue(
+                &page,
+                &mut queue,
+                None,
+                &mut unsolicited,
+                &mut normal,
+                &mut completions,
+                &mut provenance,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            completions,
+            [
+                MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid: 3,
+                    acked: true,
+                }),
+                MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(19),
+                    token: 0,
+                    dropped: false,
+                    attempts: 1,
+                }),
+            ]
+        );
+        assert!(unsolicited.is_empty());
+        assert!(normal.is_empty());
+        assert_eq!(queue.rx_tail, 2);
+    }
+
+    #[test]
     fn actual_mcu_normal_drain_mints_before_physical_rearm_and_index_publish() {
         let ring_mapping = TestMapping::new(PAGE);
         let buffer_mapping = TestMapping::new(8 * 2048);
@@ -12976,6 +13120,7 @@ mod tests {
         };
         let mut unsolicited = Vec::new();
         let mut normal = Vec::new();
+        let mut completions = Vec::new();
         let mut provenance = DescriptorProvenance::new();
         assert!(
             drain_rx_queue(
@@ -12984,6 +13129,7 @@ mod tests {
                 None,
                 &mut unsolicited,
                 &mut normal,
+                &mut completions,
                 &mut provenance,
             )
             .unwrap()
@@ -13051,6 +13197,7 @@ mod tests {
         };
         let mut unsolicited = Vec::new();
         let mut normal = Vec::new();
+        let mut completions = Vec::new();
         let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
         let error = match drain_rx_queue(
@@ -13059,6 +13206,7 @@ mod tests {
             None,
             &mut unsolicited,
             &mut normal,
+            &mut completions,
             &mut provenance,
         ) {
             Ok(_) => panic!("later invalid MCU descriptor unexpectedly succeeded"),
@@ -14272,6 +14420,27 @@ mod tests {
             .unwrap();
         assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
         assert!(!reset.contains("write_active_wfdma(0xd4100"));
+        assert!(!reset.contains("write_rx_ring_slot"));
+        assert!(!reset.contains("write_rx_cpu_index"));
+        assert!(!reset.contains("0xd45"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn management_tx_proves_descriptor_consumption_before_rx_completion() {
+        let source = include_str!("vfio_read.rs");
+        let transmit = source
+            .split("fn transmit_one_sae_auth(")
+            .nth(1)
+            .unwrap()
+            .split("fn receive_one_sae_auth(")
+            .next()
+            .unwrap();
+        let publish = transmit.find("write_active_wfdma(0xd4308, 1)").unwrap();
+        let didx = transmit.find("read(0xd430c)").unwrap();
+        let descriptor_done = transmit.find("is_dma_done()").unwrap();
+        let drain = transmit.find("drain_data_rx_queue(").unwrap();
+        assert!(publish < didx && didx < descriptor_done && descriptor_done < drain);
     }
 
     #[cfg(feature = "fuchsia-passive")]
