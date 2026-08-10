@@ -1130,7 +1130,7 @@ fn run() -> Result<(), String> {
                 "vfio_remap_selector_saved offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
             ));
             let selected = (saved_selector & !0xffff) | 0x7001;
-            let identity = (|| -> Result<(u32, u32), String> {
+            let identity = (|| -> Result<(u32, u32, u32, u32, u32), String> {
                 record_sae_stage(&format!(
                     "vfio_remap_selector_select_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} saved={saved_selector:#010x} value={selected:#010x} base=0x7001"
                 ));
@@ -1173,6 +1173,34 @@ fn run() -> Result<(), String> {
                 record_sae_stage(&format!(
                     "vfio_dynamic_identity_read_after name=chip_id physical=0x70010200 bar_offset={chip_offset:#x} value={chip_id:#010x}"
                 ));
+                if chip_id == u32::MAX {
+                    return Err("MT_HW_CHIPID returned all ones".into());
+                }
+                if chip_id != 0x7961 {
+                    return Err(format!(
+                        "MT_HW_CHIPID is {chip_id:#010x}, expected 0x00007961"
+                    ));
+                }
+
+                let bound_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0020;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x}"
+                ));
+                let hardware_bound = match window.read(bound_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x} value={hardware_bound:#010x}"
+                ));
+                if hardware_bound == u32::MAX {
+                    return Err("MT_HW_BOUND returned all ones".into());
+                }
 
                 let revision_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0204;
                 record_sae_stage(&format!(
@@ -1190,7 +1218,22 @@ fn run() -> Result<(), String> {
                 record_sae_stage(&format!(
                     "vfio_dynamic_identity_read_after name=revision physical=0x70010204 bar_offset={revision_offset:#x} value={revision:#010x}"
                 ));
-                Ok((chip_id, revision))
+                if revision == u32::MAX {
+                    return Err("MT_HW_REV returned all ones".into());
+                }
+                let effective_chip_id = if hardware_bound & (1 << 7) != 0 {
+                    0x7920
+                } else {
+                    chip_id
+                };
+                let composite_revision = (effective_chip_id << 16) | (revision & 0xff);
+                Ok((
+                    chip_id,
+                    hardware_bound,
+                    revision,
+                    effective_chip_id,
+                    composite_revision,
+                ))
             })();
 
             record_sae_stage(&format!(
@@ -1219,9 +1262,10 @@ fn run() -> Result<(), String> {
                     "L1 selector restore mismatch: saved={saved_selector:#010x} restored={restored:#010x}"
                 ));
             }
-            let (chip_id, revision) = identity?;
+            let (chip_id, hardware_bound, revision, effective_chip_id, composite_revision) =
+                identity?;
             record_sae_stage(&format!(
-                "vfio_dynamic_identity_complete chip_id={chip_id:#010x} revision={revision:#010x}"
+                "vfio_dynamic_identity_complete chip_id={chip_id:#010x} hardware_bound={hardware_bound:#010x} revision={revision:#010x} effective_chip_id={effective_chip_id:#010x} composite_revision={composite_revision:#010x}"
             ));
 
             record_sae_stage(&format!(
