@@ -33,6 +33,8 @@ use pipewire_native_spa::{
     },
 };
 
+use drv_fuchsia_audio_processing::mix_stereo_s16;
+
 use crate::{PlaybackEndpoint, VirtualPcmEndpoint, enum_format_pod};
 
 const HEADER_LEN: usize = 16;
@@ -139,15 +141,39 @@ pub struct PlaybackResult {
 /// Serve one native client and return its Fuchsia-derived playback frame position.
 pub fn serve_one(listener: &UnixListener) -> io::Result<PlaybackResult> {
     let (mut stream, _) = listener.accept()?;
-    serve_connection(&mut stream)
+    let pcm = serve_connection(&mut stream)?;
+    process_pcm(&pcm)
 }
 
-fn serve_connection(stream: &mut UnixStream) -> io::Result<PlaybackResult> {
+/// Serve two bounded stock streams and mix them into one endpoint result.
+pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
+    let (mut first_stream, _) = listener.accept()?;
+    let first = serve_connection(&mut first_stream)?;
+    let (mut second_stream, _) = listener.accept()?;
+    let second = serve_connection(&mut second_stream)?;
+    if first.len() != second.len() || !first.len().is_multiple_of(4) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded mixer inputs must have equal complete stereo frames",
+        ));
+    }
+    let first = decode_s16(&first);
+    let second = decode_s16(&second);
+    let mixed = mix_stereo_s16(&first, &second)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
+    let mixed = mixed
+        .into_iter()
+        .flat_map(i16::to_le_bytes)
+        .collect::<Vec<_>>();
+    process_pcm(&mixed)
+}
+
+fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
     let mut client_nodes: Vec<ClientNodeObject> = Vec::new();
-    let mut endpoint = VirtualPcmEndpoint::default();
+    let mut pcm = Vec::new();
 
     loop {
         let (header, payload) = match read_message(stream) {
@@ -162,7 +188,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<PlaybackResult> {
                             | io::ErrorKind::ConnectionReset
                     ) =>
             {
-                return Ok(playback_result(&endpoint));
+                return Ok(pcm);
             }
             Err(error) => return Err(error),
         };
@@ -242,11 +268,11 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<PlaybackResult> {
                             &mut out_seq,
                         )?;
                         drive_client_node(
-                            &mut endpoint,
+                            &mut pcm,
                             client_nodes[client_node_index].transport.as_ref().unwrap(),
                             client_nodes[client_node_index].buffers.as_ref().unwrap(),
                         )?;
-                        return Ok(playback_result(&endpoint));
+                        return Ok(pcm);
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -366,11 +392,21 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<PlaybackResult> {
     }
 }
 
-fn playback_result(endpoint: &VirtualPcmEndpoint) -> PlaybackResult {
-    PlaybackResult {
+fn process_pcm(pcm: &[u8]) -> io::Result<PlaybackResult> {
+    let mut endpoint = VirtualPcmEndpoint::default();
+    endpoint
+        .write(pcm)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
+    Ok(PlaybackResult {
         frame_position: endpoint.frame_position(),
         processed_sample_checksum: endpoint.processed_sample_checksum(),
-    }
+    })
+}
+
+fn decode_s16(pcm: &[u8]) -> Vec<i16> {
+    pcm.chunks_exact(2)
+        .map(|sample| i16::from_le_bytes(sample.try_into().unwrap()))
+        .collect()
 }
 
 fn proxy_id_in_use(
@@ -1128,7 +1164,7 @@ fn write_client_node_start(
 }
 
 fn drive_client_node(
-    endpoint: &mut VirtualPcmEndpoint,
+    pcm: &mut Vec<u8>,
     transport: &ClientTransport,
     buffers: &ClientBuffers,
 ) -> io::Result<()> {
@@ -1166,11 +1202,11 @@ fn drive_client_node(
                 let mut size = [0; 4];
                 buffers.memory.read_exact_at(&mut size, base + 4)?;
                 if u32::from_ne_bytes(size) != 0 {
-                    consume_client_buffer(endpoint, buffers, buffer_id)?;
+                    consume_client_buffer(pcm, buffers, buffer_id)?;
                     break;
                 }
             }
-            if endpoint.frame_position() != 0 {
+            if !pcm.is_empty() {
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -1190,7 +1226,7 @@ fn drive_client_node(
                     "client produced an invalid buffer id",
                 ));
             }
-            consume_client_buffer(endpoint, buffers, buffer_id)?;
+            consume_client_buffer(pcm, buffers, buffer_id)?;
             recycled = buffer_id;
         } else if status & 8 != 0 {
             return Ok(());
@@ -1208,7 +1244,7 @@ fn drive_client_node(
 }
 
 fn consume_client_buffer(
-    endpoint: &mut VirtualPcmEndpoint,
+    output: &mut Vec<u8>,
     buffers: &ClientBuffers,
     buffer_id: u32,
 ) -> io::Result<()> {
@@ -1235,9 +1271,8 @@ fn consume_client_buffer(
             .memory
             .read_exact_at(&mut pcm[first..], base + BUFFER_DATA_OFFSET as u64)?;
     }
-    endpoint
-        .write(&pcm)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))
+    output.extend(pcm);
+    Ok(())
 }
 
 fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) -> io::Result<()> {
@@ -1716,7 +1751,7 @@ mod tests {
         let (set_format, _) = read_message(&mut client).unwrap();
         assert_eq!((set_format.id, set_format.opcode), (8, 7));
         drop(client);
-        assert_eq!(worker.join().unwrap().unwrap().frame_position, 0);
+        assert!(worker.join().unwrap().unwrap().is_empty());
     }
 
     #[test]
@@ -1775,8 +1810,8 @@ mod tests {
             .memory
             .write_all_at(&[0; 1920], BUFFER_DATA_OFFSET as u64)
             .unwrap();
-        let mut endpoint = VirtualPcmEndpoint::default();
-        consume_client_buffer(&mut endpoint, &buffers, 0).unwrap();
-        assert_eq!(endpoint.frame_position(), 480);
+        let mut pcm = Vec::new();
+        consume_client_buffer(&mut pcm, &buffers, 0).unwrap();
+        assert_eq!(process_pcm(&pcm).unwrap().frame_position, 480);
     }
 }

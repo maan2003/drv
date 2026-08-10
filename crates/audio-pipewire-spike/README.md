@@ -22,6 +22,15 @@ S16 representation conversion are host-owned; no pinned processing source is
 patched. A post-gain sample checksum makes the processing observable in
 stock-client probes rather than a decorative dependency.
 
+`serve-two` accepts two ordinary stock playback clients through independent
+native-protocol transports and shared buffer pools. Their equal fixed-format
+chunks are accumulated through the unchanged pinned Fuchsia `ChannelStrip`
+planar processing component and sampler `MixSample` accumulation primitive
+before entering the gain and timeline endpoint.
+For two 480-frame streams containing `{10000, 2000}` and `{4000, 6000}`, both
+stock clients and the server exit successfully and the mixed post-gain checksum
+is 5,280,000 at frame position 480.
+
 ## Rust PipeWire libraries
 
 `pipewire` (`pipewire-rs`) is a safe wrapper over the installed C
