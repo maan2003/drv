@@ -1894,3 +1894,30 @@ TX evidence. The process did not return before recovery; the kernel recorded a
 watchdog rebooted the host. After reboot, native `mt7921e` was rebound, `iwd`
 was active, both watchdog units were inactive, and no lab state remained. This
 is not an SAE pass and no second attempt was made.
+
+### Deferred-DMA SAE prerequisite result
+
+The deferred management-DMA correction was content-transplanted onto the
+newer passive-RX and Netstack host lineage in commit `5846e550244a`. All 77
+physical-transport tests and the locked release build passed; the integrated
+binary SHA-256 was
+`a6f6cac8ed4241a428bd6073c078255488e2e00844a347b8c5660d2e4accde5a`.
+
+The first guarded launch, `wifi-sae-exchange4`, did not execute the binary:
+the reviewed inner launcher's `/usr/bin/env bash` shebang was incompatible
+with the recovery wrapper's sanitized payload environment. Report
+`/var/lib/wifi-driver-lab/reports/20260810T154601Z-0000_05_00.0.log` records
+`USERSPACE end rc=127` and `RESTORE end failed=0`. Native networking recovered,
+and no firmware or radio claim follows from that launcher failure.
+
+One launcher-only corrected retry used the same binary, credential FD, and
+supervisor with absolute `/run/current-system/sw/bin/bash`. Report
+`/var/lib/wifi-driver-lab/reports/20260810T155130Z-0000_05_00.0.log` reached
+`USERSPACE begin`; the last durable SAE stage was only `credential_read`.
+There is no `watchdog_verified`, firmware, passive-RX, SAE-commit, or RF-TX
+evidence. The kernel then reported a 60-second page-pool shutdown stall for
+pool 19 with six inflight buffers, and the external watchdog rebooted the host
+before userspace end or supervisor restore could be recorded. After reboot,
+native `mt7921e` rebound, iwd was active, `wlan0` had carrier, all recovery and
+watchdog units were inactive, and `/run/wifi-driver-lab` was absent. The
+corrected retry is not an SAE pass, and no further attempt was made.
