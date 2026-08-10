@@ -2333,3 +2333,57 @@ generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
 remained intact. No retry was attempted; further physical work is held until a
 public-only native iwd/nl80211 instrumentation method replaces the ineffective
 monitor approach.
+
+A source-local iwd 3.12 probe was added in NixOS commit
+`6ceafb1b78c8` immediately after native commit construction and before the
+netlink authentication-data send. The opt-in probe records only public
+protocol identifiers, lengths, and optional-field counts; it does not retain
+credentials, PT, rand, mask, scalar, element, PMK, or raw frames. The
+instrumented system was activated temporarily without changing the boot
+default. Root-only log
+`/var/lib/wifi-driver-lab/native-iwd-sae-public-20260810T205051Z.log`
+records the successful native exchange's first commit as H2E, transaction 1,
+status 126, group 20, authentication-data length 150, scalar length 48,
+element length 96, no tail, and zero rejected-group, token, and password-ID
+fields.
+
+The AP rejected that group, after which native iwd selected group 19 and sent
+another transaction-1/status-126 commit with authentication-data length 107,
+scalar length 32, element length 64, a five-byte tail, one rejected group, and
+no token or password ID. This establishes the concrete differential: native
+starts with group 20/P-384 and implements Rejected Groups fallback, whereas
+the pinned Fuchsia port supports only group 19/P-256 and sends no tail. Raw
+randomized scalar or element values and hashes were neither collected nor
+compared.
+
+Port commit `810453fb7ab5` narrowed the pre-DMA record to public structure,
+independent scalar-range and P-256 on-curve booleans, and tail IE metadata.
+The physical suite passed 100 tests. The freshly built and staged release had
+SHA-256
+`1db65eff733e7e5599aebebf039ffdee44909eb899afdf53d8875f4f779afea6`.
+A preliminary handoff under the temporary Nix closure stopped before invoking
+the artifact because that repository revision's lab wrapper did not forward
+the dynamic SAE environment. It acquired no artifact-side VFIO/DMA resources,
+restored native operation in 20599 ms, and was not treated as a port run. The
+known-good physical system closure was then restored before the one artifact
+attempt.
+
+That guarded attempt, `wifi-sae-differential23`, is recorded in
+`/var/lib/wifi-driver-lab/reports/20260810T205419Z-0000_05_00.0.log`.
+The port emitted H2E transaction 1/status 126 in group 19 with SAE-fields
+length 98, scalar length 32, element length 64, no tail, a valid scalar range,
+and an on-curve P-256 element. Descriptor consumption, IRQ `0x0c400010`,
+acknowledged WCID-19/PID-3 TX status, and non-dropped token-0 TX-free again
+proved local transmission. The AP gave no peer commit and the bounded receive
+wait timed out, consistent with the now-observed missing group-20 negotiation
+rather than a Fuchsia group-19 cryptographic defect.
+
+Cleanup quiesced the transport, released DMA mappings, reset VFIO, verified
+the safe state, and restored native `mt7921e` with `RESTORE end failed=0`.
+Native iwd, WPA3 association, IPv4, the default route, and gateway
+connectivity recovered in 6206 ms on `wlan4`; the watchdog was disarmed
+without a reboot. The original `c5md7...` system closure, unchanged boot ID,
+generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
+were restored. The kernel later reported pool 28 with four inflight page-pool
+buffers at both 60 and 120 seconds while native connectivity remained healthy.
+No further physical attempt was made.
