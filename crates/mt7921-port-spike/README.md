@@ -2185,3 +2185,33 @@ without a reboot. There was no page-pool warning or kernel warning/oops, lab
 state was empty, and the patched system, profile, kernel, generation-25
 default, and `keep_d0_on_remove=Y` invariants remained intact. No rerun was
 attempted.
+
+A corrected guarded attempt was launched exactly once as
+`wifi-sae-exchange17` from integrated commit `e0a1b02053bf`. The explicitly
+feature-enabled physical artifact had matching local and staged SHA-256
+`c7f71a61c84ffa706e9521be3e174522c1fa73d56bcc6d7fcdf1f83fff61f6c5`;
+before handoff, that exact staged binary passed a no-hardware CLI gate by
+recognizing `--run-one-shot-sae-auth` and stopping at its missing-BSSID
+validation. Report
+`/var/lib/wifi-driver-lab/reports/20260810T185758Z-0000_05_00.0.log`
+records the dynamic target, race-safe quiesce, payload and firmware startup,
+target beacon and channel gate, and SAE TX resource acquisition.
+
+The client-authorized SAE commit frame and descriptor were published to
+management ring 0 and its producer index was advanced. No correlated TX-free
+and TX-status completion arrived within the three-second bound, so the run
+stopped with `SAE management TX completion timed out; frame may have
+transmitted`. Commit transmission over the air and acknowledgement are
+therefore unproven. There is no commit RX, confirm publication or RX, PMK
+derivation, or authenticated marker. The management ring was stopped and
+reset, then cleanup quiesced the transport, released DMA mappings, reset VFIO,
+verified the post-reset safe state, and restored the native driver with
+`RESTORE end failed=0`.
+
+Native `mt7921e`, D0, iwd, WPA3 association, IPv4, the default route, and
+gateway connectivity recovered in 20590 ms on the renamed `wlan3`; the
+watchdog was disarmed without a reboot. The patched system, profile, kernel,
+generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
+remained intact. Sixty seconds later the kernel reported one
+`page_pool_release_retry` stall for pool 25 with one inflight buffer, while
+native connectivity remained healthy. No rerun was attempted.
