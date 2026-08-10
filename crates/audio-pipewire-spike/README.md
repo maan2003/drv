@@ -36,17 +36,16 @@ and independently check its native object type and parameter ID.
 The `serve` mode binds the standard `$PIPEWIRE_RUNTIME_DIR/pipewire-0` Unix
 socket, handles native `Core.GetRegistry`, and advertises the virtual sink Node
 and its input Port with `Registry.Global`. It also handles the mandatory Hello,
-client-property, and Sync/Done bootstrap around discovery, then exits after one
-client. No alternate application protocol is exposed.
+client-property, and Sync/Done bootstrap around discovery. The bounded probe
+serves one client and exits after that client's post-sync activity becomes idle.
+No alternate application protocol is exposed.
 
 For example, start `PIPEWIRE_RUNTIME_DIR=/tmp/drv-pw cargo run -p
 drv-audio-pipewire-spike -- serve`, then use the unmodified `pw-cli ls Node` or
-`pw-cli ls Port` with the same environment. Both globals are listed. Since this
-probe intentionally closes after the post-registry Sync, `pw-cli` can also print
-a remote-disconnect diagnostic on stderr after the successful listing.
+`pw-cli info 2` or `pw-cli enum-params 3 EnumFormat` with the same environment.
 
-An unmodified client can connect and discover both globals, but cannot bind the
-Node or Port yet. The next frontend operation is `Registry.Bind`, followed by
-Node/Port Info and `EnumParams` for the already implemented `EnumFormat` POD.
-Stream use subsequently requires link creation, shared-buffer negotiation,
+An unmodified client can connect, discover, and bind both globals. `pw-cli info
+2`, `pw-cli info 3`, and `pw-cli enum-params 2 EnumFormat` (or object 3) receive
+standard Node/Port Info and the S16LE/48 kHz/stereo format POD. The next frontend
+gap is stream object/link creation, followed by shared-buffer negotiation,
 activation, clock/quantum scheduling, and processing.

@@ -96,7 +96,7 @@ impl PlaybackEndpoint for VirtualPcmEndpoint {
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SpaAudioFormat {
-    S16Le = 4,
+    S16Le = 0x103,
 }
 
 impl From<SpaAudioFormat> for u32 {
@@ -110,7 +110,7 @@ impl TryFrom<u32> for SpaAudioFormat {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            4 => Ok(Self::S16Le),
+            0x103 => Ok(Self::S16Le),
             _ => Err(()),
         }
     }
@@ -212,7 +212,15 @@ mod tests {
             .pop_object::<Format, ParamType, _>(|object, id| {
                 assert_eq!(id, ParamType::EnumFormat);
                 Ok(object
-                    .map(|(key, _, value)| (key, value.type_()))
+                    .map(|(key, _, value)| {
+                        if key == Format::AudioFormat {
+                            assert_eq!(
+                                value.decode::<Id<SpaAudioFormat>>().unwrap(),
+                                Id(SpaAudioFormat::S16Le)
+                            );
+                        }
+                        (key, value.type_())
+                    })
                     .collect::<Vec<_>>())
             })
             .unwrap();
