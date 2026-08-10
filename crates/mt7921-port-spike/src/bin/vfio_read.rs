@@ -86,6 +86,7 @@ const VFIO_DEVICE_SET_IRQS: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 10);
 const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
+const VFIO_DEVICE_DETACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 20);
 const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
 const IOMMU_IOAS_ALLOC: u64 = (VFIO_TYPE << 8) | 0x81;
 const IOMMU_IOAS_MAP: u64 = (VFIO_TYPE << 8) | 0x85;
@@ -155,6 +156,13 @@ struct Attach {
     argsz: u32,
     flags: u32,
     pt_id: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct Detach {
+    argsz: u32,
+    flags: u32,
+    pasid: u32,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -364,6 +372,7 @@ struct ActiveVfioCapsule {
     device: Arc<File>,
     iommu: Arc<File>,
     ioas: Option<Ioas>,
+    ioas_attached: bool,
     wfdma: Option<ReadPage>,
     pcie_mac: Option<ReadPage>,
     conn: Option<ReadPage>,
@@ -390,6 +399,7 @@ impl ActiveVfioCapsule {
             device,
             iommu,
             ioas: None,
+            ioas_attached: false,
             wfdma: None,
             pcie_mac: None,
             conn: None,
@@ -473,7 +483,27 @@ impl ActiveVfioCapsule {
         for slot in [&mut self.conn, &mut self.pcie_mac, &mut self.wfdma] {
             release_bar(slot, &mut failures);
         }
-        if let Some(ioas) = self.ioas.as_mut()
+        if self.ioas_attached {
+            let mut detach = Detach {
+                argsz: size::<Detach>(),
+                ..Default::default()
+            };
+            if let Err(error) = ioctl_mut(
+                self.device.as_raw_fd(),
+                VFIO_DEVICE_DETACH_IOMMUFD_PT,
+                &mut detach,
+                "detach VFIO device from IOAS",
+            ) {
+                failures.push(ReleaseFailure {
+                    action: ObservableRelease::IoasDetach,
+                    error,
+                });
+            } else {
+                self.ioas_attached = false;
+            }
+        }
+        if !self.ioas_attached
+            && let Some(ioas) = self.ioas.as_mut()
             && let Err(error) = ioas.teardown()
         {
             failures.push(ReleaseFailure {
@@ -963,6 +993,7 @@ fn run() -> Result<(), String> {
             &mut attach,
             "attach IOAS",
         )?;
+        capsule.ioas_attached = true;
         if operation == Operation::RunOneShotSaeAuth {
             record_sae_stage("vfio_attach_iommufd_pt_after");
         }
@@ -1011,12 +1042,23 @@ fn run() -> Result<(), String> {
                     "vfio_device_get_region_info_before index={index} argsz={}",
                     region.argsz
                 ));
-                if let Err(error) = ioctl_mut(
-                    capsule.device.as_raw_fd(),
-                    VFIO_DEVICE_GET_REGION_INFO,
-                    &mut region,
-                    "query VFIO region",
-                ) {
+                if unsafe {
+                    ioctl(
+                        capsule.device.as_raw_fd(),
+                        VFIO_DEVICE_GET_REGION_INFO,
+                        &mut region,
+                    )
+                } < 0
+                {
+                    let io_error = std::io::Error::last_os_error();
+                    if io_error.raw_os_error() == Some(22) && index != 0 && index != 7 {
+                        record_sae_stage(&format!(
+                            "vfio_device_get_region_info_absent index={index} argsz={} errno=22",
+                            region.argsz
+                        ));
+                        continue;
+                    }
+                    let error = format!("query VFIO region: {io_error}");
                     record_sae_stage(&format!(
                         "vfio_device_get_region_info_error index={index} argsz={} error={error}",
                         region.argsz
@@ -1083,7 +1125,6 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.phase = RunPhase::Contained;
         }
-        set_lab_safety("SAFE")?;
         record_sae_stage("vfio_region_discovery_released_safe");
         return Ok(());
     }
@@ -2825,6 +2866,7 @@ impl ContainmentLedger {
 enum ObservableRelease {
     DmaUnmap,
     BarMunmap,
+    IoasDetach,
     IoasDestroy,
 }
 
@@ -10275,9 +10317,10 @@ mod tests {
         let observable_actions = [
             ObservableRelease::DmaUnmap,
             ObservableRelease::BarMunmap,
+            ObservableRelease::IoasDetach,
             ObservableRelease::IoasDestroy,
         ];
-        assert_eq!(observable_actions.len(), 3);
+        assert_eq!(observable_actions.len(), 4);
     }
 
     #[test]
