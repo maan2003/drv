@@ -864,3 +864,32 @@ PCI power state, every `wlan*` name/operstate/address, iwd state, default route,
 and kernel/iwd journal excerpts. That is the smallest rerun able to distinguish
 interface rename, firmware/reprobe failure, association failure, and route
 latency without changing the selector value.
+
+That instrumented identical-value rerun completed without a failed recovery
+transition. Report
+`/var/lib/wifi-driver-lab/reports/20260810T102304Z-0000_05_00.0.log` again
+records saved selector `0x18451800`, one write of the same runtime value, equal
+readback, and safe release. The fsynced timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T102304Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`.
+
+Restore returned zero at `15:53:05.966697 IST`. By then mt7921e had logged
+ASIC revision `79610010` at `15:53:05.856833`, firmware versions by
+`15:53:05.941854`, and iwd started at `15:53:05.957059`; there was no reprobe
+or firmware-init error. iwd first announced `wlan0` at `15:53:06.798926`, then
+the usable interface `wlan1` at `15:53:07.352426`. The timeline therefore saw
+no WLAN at sample 0, disconnected/scanning `wlan1` at `15:53:08.010741`, and
+connecting `wlan1` without an address at `15:53:10.059721`. The AP rejected
+the first authentication attempt with status 77 at `15:53:10.062851`, but the
+immediate retry authenticated and associated by `15:53:10.147843`. iwd entered
+netconfig at `15:53:11.217967` and connected at `15:53:11.284564`.
+
+At `15:53:12.117522`, 6.15 seconds after restore returned, the timeline
+separately recorded association, IPv4 `192.168.235.6/24`, the default route on
+`wlan1`, and successful gateway reachability. The all-interface check was not
+fooled by the rename. The watchdog disarmed at `15:53:12.180541`, and boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. Thus no required
+transition failed in this rerun; the only error was the recovered initial
+status-77 authentication response. The earlier watchdog recovery remains an
+unreproduced association/netconfig failure rather than evidence of failed
+mt7921e reprobe or a deterministic selector identity-write side effect.
