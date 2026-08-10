@@ -187,19 +187,43 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
     pub fn poll(&self) -> Result<Option<HardwareScanEvent>, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        let event = backend.scan.next_scan_event().map_err(|_| zx::Status::IO)?;
+        let event = match backend.scan.next_scan_event() {
+            Ok(event) => event,
+            Err(_) => {
+                backend.revoked = true;
+                if let Some(scan_id) = backend.active_scan_id.take() {
+                    let _ = backend.effects.complete_passive_scan(scan_id, false);
+                }
+                return Err(zx::Status::IO);
+            }
+        };
         if let Some(event) = &event {
             match event {
                 HardwareScanEvent::Observation(observation) => {
                     let scan_id = backend.active_scan_id.ok_or(zx::Status::BAD_STATE)?;
-                    backend.effects.observe_passive_scan(scan_id, observation)?;
+                    if let Err(status) = backend.effects.observe_passive_scan(scan_id, observation)
+                    {
+                        backend.revoked = true;
+                        backend.active_scan_id = None;
+                        let _ = backend.effects.complete_passive_scan(scan_id, false);
+                        return Err(status);
+                    }
                 }
                 HardwareScanEvent::Complete { scan_id, success } => {
                     if backend.active_scan_id != Some(*scan_id) {
+                        backend.revoked = true;
                         return Err(zx::Status::BAD_STATE);
                     }
-                    backend.effects.complete_passive_scan(*scan_id, *success)?;
+                    if !success {
+                        backend.revoked = true;
+                    }
+                    if let Err(status) = backend.effects.complete_passive_scan(*scan_id, *success) {
+                        backend.revoked = true;
+                        backend.active_scan_id = None;
+                        return Err(status);
+                    }
                     backend.active_scan_id = None;
+                    backend.revoked = !success;
                 }
             }
         }
@@ -210,6 +234,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     /// abandon any in-process scan transaction.
     pub fn reset(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
+        backend.revoked = true;
         backend.active_scan_id = None;
         backend.effects.reset()
     }
@@ -218,6 +243,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     /// scan transaction.
     pub fn stop(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
+        backend.revoked = true;
         backend.active_scan_id = None;
         backend.effects.stop()
     }
@@ -239,6 +265,7 @@ struct ComposedBackend<E, S> {
     effects: E,
     scan: S,
     active_scan_id: Option<u64>,
+    revoked: bool,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
@@ -267,6 +294,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 effects,
                 scan: NoClientScan,
                 active_scan_id: None,
+                revoked: false,
             })),
             support,
         )
@@ -287,6 +315,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             effects,
             scan,
             active_scan_id: None,
+            revoked: true,
         }));
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
@@ -339,11 +368,11 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         tx_flags: fidl_softmac::WlanTxInfoFlags,
         _async_id: Option<fuchsia_trace::Id>,
     ) -> Result<(), zx::Status> {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .send_wlan_frame(&buffer, tx_flags)
+        let mut backend = self.backend.lock().unwrap();
+        if backend.revoked {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        backend.effects.send_wlan_frame(&buffer, tx_flags)
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
@@ -392,6 +421,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
             .effects
             .begin_passive_scan(scan_id, request.channels.as_deref().unwrap_or_default())
         {
+            backend.revoked = true;
             let _ = backend
                 .scan
                 .cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest {

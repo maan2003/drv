@@ -234,26 +234,39 @@ struct BackendState {
     pending_scan_channel: Option<fidl_ieee80211::ChannelNumber>,
     regulatory_channel: Option<fidl_ieee80211::ChannelNumber>,
     current_channel: Option<fidl_ieee80211::ChannelNumber>,
-    tx_power_dbm: Option<i8>,
-    tx_rate_mbps: Option<u16>,
+    regulatory_max_dbm: Option<i8>,
+    sar_cap_dbm: Option<i8>,
+    programmed_power_dbm: Option<i8>,
+    programmed_rate_mbps: Option<u16>,
     applied: Vec<Applied>,
     frames: Vec<Vec<u8>>,
     rejects: Vec<Reject>,
+    fail_reset: bool,
+    fail_stop: bool,
 }
 
 #[derive(Clone, Default)]
 struct ProductionBackend(Arc<Mutex<BackendState>>);
 
 impl ProductionBackend {
-    fn apply_tx_power(&self, power_dbm: i8) {
+    fn set_regulatory_max(&self, power_dbm: i8) {
         let mut state = self.0.lock().unwrap();
-        state.tx_power_dbm = Some(power_dbm);
+        state.regulatory_max_dbm = Some(power_dbm);
+    }
+
+    fn set_sar_cap(&self, power_dbm: i8) {
+        self.0.lock().unwrap().sar_cap_dbm = Some(power_dbm);
+    }
+
+    fn complete_power_programming(&self, power_dbm: i8) {
+        let mut state = self.0.lock().unwrap();
+        state.programmed_power_dbm = Some(power_dbm);
         state.applied.push(Applied::Power(power_dbm));
     }
 
-    fn apply_tx_rate(&self, rate_mbps: u16) {
+    fn complete_rate_programming(&self, rate_mbps: u16) {
         let mut state = self.0.lock().unwrap();
-        state.tx_rate_mbps = Some(rate_mbps);
+        state.programmed_rate_mbps = Some(rate_mbps);
         state.applied.push(Applied::Rate(rate_mbps));
     }
 }
@@ -277,10 +290,14 @@ impl Mt7921ClientEffects for ProductionBackend {
         _: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
+        let power_authorized = state.programmed_power_dbm.is_some_and(|power| {
+            state.regulatory_max_dbm.is_some_and(|limit| power <= limit)
+                && state.sar_cap_dbm.is_some_and(|limit| power <= limit)
+        });
         if state.current_channel != Some(channel(6))
             || state.regulatory_channel != state.current_channel
-            || state.tx_power_dbm != Some(16)
-            || state.tx_rate_mbps != Some(6)
+            || !power_authorized
+            || state.programmed_rate_mbps.is_none()
         {
             state.rejects.push(Reject::Revoked);
             return Err(zx::Status::ACCESS_DENIED);
@@ -348,14 +365,20 @@ impl Mt7921ClientEffects for ProductionBackend {
     }
     fn reset(&mut self) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
+        if state.fail_reset {
+            return Err(zx::Status::IO);
+        }
         state.regulatory_channel = None;
         state.active_scan_id = None;
         state.current_channel = None;
-        state.tx_power_dbm = None;
-        state.tx_rate_mbps = None;
+        state.programmed_power_dbm = None;
+        state.programmed_rate_mbps = None;
         Ok(())
     }
     fn stop(&mut self) -> Result<(), zx::Status> {
+        if self.0.lock().unwrap().fail_stop {
+            return Err(zx::Status::IO);
+        }
         self.reset()
     }
 }
@@ -519,8 +542,22 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             .await
             .expect("pinned selector must select the physical WPA3 BSS");
 
-        backend.apply_tx_power(16);
-        backend.apply_tx_rate(6);
+        let mut backend_clone = backend.clone();
+        assert_eq!(
+            backend_clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            Err(zx::Status::ACCESS_DENIED),
+            "missing regulatory, SAR, and programming inputs must reject"
+        );
+        backend.set_regulatory_max(18);
+        backend.set_sar_cap(16);
+        backend.complete_power_programming(17);
+        backend.complete_rate_programming(6);
+        assert_eq!(
+            backend_clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            Err(zx::Status::ACCESS_DENIED),
+            "descriptor power above SAR must reject"
+        );
+        backend.complete_power_programming(16);
         let _transaction = sme.on_connect_command(fidl_sme::ConnectRequest {
             ssid: SSID.to_vec(),
             bss_description: Sequestered::release(selected.bss.bss_description),
@@ -552,7 +589,10 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
 
         {
             let state = backend.0.lock().unwrap();
-            assert_eq!(state.applied, [Applied::Power(16), Applied::Rate(6)]);
+            assert_eq!(
+                state.applied,
+                [Applied::Power(17), Applied::Rate(6), Applied::Power(16)]
+            );
             assert_eq!(state.frames.len(), 1);
             let frame = &state.frames[0];
             assert_eq!(&frame[0..2], &[0xb0, 0]);
@@ -567,21 +607,28 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
             Err(zx::Status::ALREADY_EXISTS)
         );
-        runner.reset().unwrap();
-        assert_eq!(
-            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
-            Err(zx::Status::ACCESS_DENIED)
-        );
-        backend.apply_tx_power(16);
-        backend.apply_tx_rate(6);
-        runner.stop().unwrap();
-        assert_eq!(
-            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
-            Err(zx::Status::ACCESS_DENIED)
-        );
+        backend.0.lock().unwrap().fail_reset = true;
+        assert_eq!(runner.reset(), Err(zx::Status::IO));
+        assert!(runner.backend.lock().unwrap().revoked);
+
+        // Re-establish every effect-side prerequisite before independently
+        // proving write-ahead stop revocation on its own failure path.
+        {
+            let mut state = backend.0.lock().unwrap();
+            state.fail_reset = false;
+            state.fail_stop = true;
+            state.regulatory_channel = state.current_channel;
+            state.regulatory_max_dbm = Some(18);
+            state.sar_cap_dbm = Some(16);
+            state.programmed_power_dbm = Some(16);
+            state.programmed_rate_mbps = Some(6);
+        }
+        runner.backend.lock().unwrap().revoked = false;
+        assert_eq!(runner.stop(), Err(zx::Status::IO));
+        assert!(runner.backend.lock().unwrap().revoked);
         assert_eq!(
             backend.0.lock().unwrap().rejects,
-            [Reject::AlreadyTransmitted, Reject::Revoked, Reject::Revoked]
+            [Reject::Revoked, Reject::Revoked, Reject::AlreadyTransmitted]
         );
     });
 }

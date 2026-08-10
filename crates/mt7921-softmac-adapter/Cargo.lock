@@ -1171,6 +1171,7 @@ dependencies = [
  "fuchsia-inspect-contrib",
  "futures",
  "ieee80211",
+ "itertools",
  "log",
  "rand 0.9.4",
  "wlan-common",

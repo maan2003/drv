@@ -29,6 +29,7 @@ fuchsia-inspect = { path = "../../../lib/diagnostics/inspect/rust" }
 fuchsia-inspect-contrib = { path = "../../../lib/diagnostics/inspect/contrib/rust" }
 futures.workspace = true
 ieee80211.workspace = true
+itertools.workspace = true
 log.workspace = true
 rand.workspace = true
 wlan-common = { path = "../lib/common/rust" }
