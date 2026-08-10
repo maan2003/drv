@@ -4116,6 +4116,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
     state: &mut FirmwareLoaderState,
     configure_channel_domain: bool,
+    stop_after_capability: bool,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
     let mut report = FirmwareLoaderReport {
         download_ready_observed: false,
@@ -4310,6 +4311,10 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             });
         }
     }
+    if stop_after_capability {
+        *state = FirmwareLoaderState::Ready;
+        return Ok(report);
+    }
     let eeprom_command = DownloadCommand::ReadEepromBlock {
         address: MT7921_EEPROM_HW_TYPE_BLOCK,
     };
@@ -4374,7 +4379,7 @@ pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, false);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -4386,7 +4391,7 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, true);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -4404,14 +4409,29 @@ where
     F: FnOnce(&mut T, &FirmwareLoaderReport) -> Result<(), T::Error>,
 {
     let mut state = FirmwareLoaderState::Powering;
-    let result =
-        run_firmware_loader(transport, patch, firmware, &mut state, true).and_then(|report| {
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false).and_then(
+        |report| {
             passive(transport, &report).map_err(|source| FirmwareLoaderFailure::Transport {
                 operation: FirmwareLoaderOperation::PassiveBoundary,
                 source,
             })?;
             Ok(report)
-        });
+        },
+    );
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Load and start the pinned patch and RAM firmware, prove N9 readiness, and
+/// complete one bounded GET_NIC_CAPABILITY response. This deliberately stops
+/// before the first EEPROM read, CLC/calibration, channel-domain, or radio
+/// command and then runs the same mandatory fail-closed cleanup transaction.
+pub fn load_mt7921_firmware_bootstrap<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, true);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -10122,6 +10142,36 @@ mod tests {
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
+    }
+
+    #[test]
+    fn firmware_bootstrap_stops_after_n9_capability_before_eeprom_or_clc() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader::default();
+        let report = load_mt7921_firmware_bootstrap(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+
+        assert!(report.download_ready_observed);
+        assert_eq!(report.nic_capability, nic_capability_fixture().1);
+        assert_eq!(report.eeprom_hardware.valid, 0);
+        assert!(transport.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::GetNicCapability, _)
+        )));
+        assert!(!transport.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::ReadEepromBlock { .. }, _)
+                | LoaderTrace::SetClc(..)
+                | LoaderTrace::SetChannelDomain(..)
+        )));
+        assert!(matches!(
+            transport.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        ));
     }
 
     #[test]

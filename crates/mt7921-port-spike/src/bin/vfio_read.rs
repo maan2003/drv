@@ -37,11 +37,12 @@ use mt7921_port_spike::{
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
     encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
-    load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
-    mask_ack_disabled_fwdl_interrupt, mt76_pci_aspm_supported, mt7921_packet_type,
-    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
-    parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
-    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    load_mt7921_firmware, load_mt7921_firmware_bootstrap,
+    load_mt7921_firmware_through_channel_domain, mask_ack_disabled_fwdl_interrupt,
+    mt76_pci_aspm_supported, mt7921_packet_type, parse_clc_set_response, parse_download_response,
+    parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability,
+    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
     round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
@@ -2554,7 +2555,6 @@ fn run() -> Result<(), String> {
                     mcu,
                     conn: &conn,
                     pcie_mac,
-                    device: &device,
                     bdf: &bdf,
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
@@ -2568,8 +2568,24 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("parse patch for loader: {error:?}"))?;
                 let firmware = Firmware::parse(ram_bytes)
                     .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
+                if operation == Operation::RunOneShotFirmware {
+                    println!(
+                        r#"{{"firmware_bootstrap_event":"begin","patch_version":"{:#010x}","patch_build":"{}","ram_version":"{}","ram_build":"{}","downloadable_regions":{}}}"#,
+                        patch.header.patch_version,
+                        String::from_utf8_lossy(patch.header.build_date).trim_end_matches('\0'),
+                        String::from_utf8_lossy(firmware.trailer.firmware_version)
+                            .trim_end_matches('\0'),
+                        String::from_utf8_lossy(firmware.trailer.build_date).trim_end_matches('\0'),
+                        firmware
+                            .regions()
+                            .filter(|region| region.is_downloadable())
+                            .count(),
+                    );
+                }
                 #[cfg(feature = "fuchsia-passive")]
-                let result = if operation == Operation::RunOneShotPassivePrepare {
+                let result = if operation == Operation::RunOneShotFirmware {
+                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotPassivePrepare {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
                         patch,
@@ -3118,13 +3134,27 @@ fn run() -> Result<(), String> {
                     load_mt7921_firmware(&mut loader, patch, firmware)
                 };
                 #[cfg(not(feature = "fuchsia-passive"))]
-                let result = if operation == Operation::RunOneShotChannelDomain {
+                let result = if operation == Operation::RunOneShotFirmware {
+                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotChannelDomain {
                     load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
                 } else {
                     load_mt7921_firmware(&mut loader, patch, firmware)
                 };
                 let report =
                     result.map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
+                if operation == Operation::RunOneShotFirmware {
+                    println!(
+                        r#"{{"firmware_bootstrap_event":"n9_ready_and_capability_response","download_ready":{},"patch":"{:?}","patch_sections":{},"ram_regions":{},"scatter_chunks":{},"scatter_bytes":{},"capability_elements":{},"eeprom_read":false,"calibration":false,"radio":false}}"#,
+                        report.download_ready_observed,
+                        report.patch,
+                        report.patch_sections,
+                        report.ram_regions,
+                        report.scatter_chunks,
+                        report.scatter_bytes,
+                        report.nic_capability.element_count,
+                    );
+                }
                 println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
                 return Ok(());
             }
@@ -3249,27 +3279,6 @@ fn run() -> Result<(), String> {
         {
             cleanup_errors.push(error);
         }
-        let reset = reset_vfio_device(&device);
-        if reset.is_err() {
-            retain_mappings_for_watchdog("reset while pinned failed");
-        }
-        println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
-        if verify_pci_dma_disabled(&bdf)
-            .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
-            .and_then(|()| set_lab_safety("SAFE"))
-            .is_err()
-        {
-            retain_mappings_for_watchdog("post-reset containment verification failed");
-        }
-        for hazard in [
-            Hazard::HostControl,
-            Hazard::DeviceIrq,
-            Hazard::Wfdma,
-            Hazard::BusMaster,
-            Hazard::LabMutated,
-        ] {
-            ledger.confirm_inactive(hazard);
-        }
         let release_errors = attempt_all_cleanup(
             [
                 #[cfg(feature = "fuchsia-passive")]
@@ -3293,8 +3302,43 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("teardown {kind:?}: {error}"))
             },
         );
-        ledger.confirm_inactive(Hazard::DmaMapping);
-        println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
+        if release_errors.is_empty() {
+            ledger.confirm_inactive(Hazard::DmaMapping);
+            println!("{{\"active_mcu_event\":\"dma_mappings_released_before_reset\"}}");
+        } else {
+            println!(
+                "{{\"active_mcu_event\":\"dma_mapping_release_errors_before_reset\",\"count\":{}}}",
+                release_errors.len()
+            );
+        }
+        match reset_vfio_device(&device) {
+            Ok(()) => println!("{{\"active_mcu_event\":\"vfio_device_reset_after_unmap\"}}"),
+            Err(error) => {
+                cleanup_errors.push(format!("VFIO reset after DMA unmap: {error}"));
+                retain_mappings_for_watchdog("reset after DMA unmap failed");
+            }
+        }
+        match verify_pci_dma_disabled(&bdf)
+            .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
+            .and_then(|()| set_lab_safety("SAFE"))
+        {
+            Ok(()) => {
+                println!("{{\"active_mcu_event\":\"post_reset_safe_state_verified\"}}");
+                for hazard in [
+                    Hazard::HostControl,
+                    Hazard::DeviceIrq,
+                    Hazard::Wfdma,
+                    Hazard::BusMaster,
+                    Hazard::LabMutated,
+                ] {
+                    ledger.confirm_inactive(hazard);
+                }
+            }
+            Err(error) => {
+                cleanup_errors.push(format!("post-reset safe-state verification: {error}"));
+                retain_mappings_for_watchdog("post-reset containment verification failed");
+            }
+        }
         if !release_errors.is_empty() {
             ledger.phase = RunPhase::SafeReleaseError;
             active_terminal_error = Some(match active {
@@ -5144,7 +5188,6 @@ struct VfioFirmwareLoader<'a> {
     mcu: ActiveMcuIo<'a>,
     conn: &'a ReadPage,
     pcie_mac: &'a ReadPage,
-    device: &'a File,
     bdf: &'a str,
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
@@ -6241,17 +6284,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             errors.push(error);
         }
         if errors.is_empty() {
-            if reset_vfio_device(self.device).is_err() {
-                retain_mappings_for_watchdog("loader reset while pinned failed");
-            }
-            if verify_pci_dma_disabled(self.bdf)
-                .and_then(|()| verify_active_reset_containment(self.mcu.wfdma, self.pcie_mac))
-                .and_then(|()| set_lab_safety("SAFE"))
-                .is_err()
-            {
-                retain_mappings_for_watchdog("loader post-reset containment verification failed");
-            }
-            println!(r#"{{"active_fwdl_event":"reset_while_pinned"}}"#);
+            println!(r#"{{"active_fwdl_event":"transport_quiesced"}}"#);
             Ok(())
         } else {
             Err(format!("loader cleanup failed before reset: {errors:?}"))
@@ -9061,6 +9094,36 @@ mod tests {
         assert!(!boundary.contains("publish_mcu_command"));
         assert!(!boundary.contains("dma_and_response_irq_enabled"));
         assert!(!boundary.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
+    }
+
+    #[test]
+    fn firmware_bootstrap_boundary_and_cleanup_source_shape() {
+        let source = include_str!("vfio_read.rs");
+        let dispatch = source
+            .split("let result = if operation == Operation::RunOneShotFirmware")
+            .nth(1)
+            .unwrap()
+            .split("let report =")
+            .next()
+            .unwrap();
+        assert!(dispatch.starts_with(" {\n                    load_mt7921_firmware_bootstrap"));
+
+        let cleanup = source
+            .split("ledger.phase = RunPhase::Containing;")
+            .nth(1)
+            .unwrap()
+            .split("if !release_errors.is_empty()")
+            .next()
+            .unwrap();
+        let mask = cleanup.find("write_active_wfdma(0xd4204, 0)").unwrap();
+        let disable_dma = cleanup.find("write_active_wfdma(0xd4208, disabled)").unwrap();
+        let bme = cleanup.find("set_pci_bus_master(&bdf, false)").unwrap();
+        let irq = cleanup.find("installed.disable()").unwrap();
+        let unmap = cleanup.find("attempt_all_cleanup(").unwrap();
+        let reset = cleanup.find("reset_vfio_device(&device)").unwrap();
+        let verify = cleanup.find("verify_active_reset_containment").unwrap();
+        assert!(mask < disable_dma && disable_dma < bme && bme < irq);
+        assert!(irq < unmap && unmap < reset && reset < verify);
     }
 
     #[cfg(feature = "fuchsia-passive")]
