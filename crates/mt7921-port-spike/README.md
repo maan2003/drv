@@ -1602,3 +1602,45 @@ verification, and ended with userspace `rc=0` and supervisor restore
 unknown status, but the durable report contains every completion marker.
 Afterward `mt7921e` was rebound, `iwd` was active, and `wlan1` was connected;
 the reboot watchdog was inactive. No second attempt was made.
+
+### Firmware-bootstrap boundary
+
+The Linux-derived loader is separable immediately after N9 readiness and the
+bounded `GET_NIC_CAPABILITY` response. `load_mt7921_firmware_bootstrap` follows
+the existing NIC-power, download-ready, patch semaphore, patch scatter, RAM
+scatter, firmware-start, and N9-ready sequence, then accepts exactly that one
+post-N9 capability response and returns. The next command in the full path is
+the EEPROM hardware-block read, so the bootstrap boundary issues no EEPROM,
+CLC/calibration, channel-domain, scan, management-frame, or radio command.
+
+The `--run-one-shot-fwdl` transport uses the established ownership, WFSYS
+reset, global-ring, MSI eventfd, BME, WFDMA TX/RX, and dual MCU-response-ring
+path. Its cleanup masks PCIe MAC and WFDMA interrupts, disables WFDMA, waits
+for DMA idle, clears BME, disables the IRQ, unmaps every DMA arena, resets the
+VFIO device, and verifies the established BME/WFDMA/host/MAC safe state before
+releasing the remaining BAR and IOAS resources. Bootstrap dispatch and this
+cleanup order have focused source-shape coverage; the loader fixture proves
+that `GET_NIC_CAPABILITY` is followed by cleanup rather than EEPROM or CLC.
+
+The pinned artifacts are patch SHA-256
+`a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6`
+(build `20260224110909a`, platform `ALPS`, patch version `0xffffffff`) and RAM
+SHA-256
+`b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9`
+(firmware `____010000`, build `20260224110949`, chip `0x0d`, five regions).
+
+The single guarded attempt used release binary SHA-256
+`281077fd9d258bd6c392d1a30b2e2dcd341f55365a63fb4eaa57c58d9f1ae797`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T132637Z-0000_05_00.0.log`.
+The host stopped responding and the reboot watchdog recovered it, but the
+report ends after `USERSPACE begin`: the existing general-path JSON output was
+still buffered, so no firmware, DMA/IRQ, ready, or cleanup milestone became
+durable. This attempt is therefore inconclusive and does not physically prove
+firmware publication, an MCU response, or userspace cleanup. No second attempt
+was made. After watchdog recovery `mt7921e` rebound, `iwd` was active, `wlan0`
+was connected, and the watchdog was inactive. The native driver independently
+reported the same patch build and WM firmware version during recovery, but
+that is recovery evidence, not proof of the userspace bootstrap. The coherent
+bootstrap and cleanup markers now explicitly flush stdout for any future
+authorized run.

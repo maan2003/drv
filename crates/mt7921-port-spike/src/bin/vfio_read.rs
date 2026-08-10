@@ -2581,6 +2581,9 @@ fn run() -> Result<(), String> {
                             .filter(|region| region.is_downloadable())
                             .count(),
                     );
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|error| format!("flush firmware bootstrap begin: {error}"))?;
                 }
                 #[cfg(feature = "fuchsia-passive")]
                 let result = if operation == Operation::RunOneShotFirmware {
@@ -3154,6 +3157,9 @@ fn run() -> Result<(), String> {
                         report.scatter_bytes,
                         report.nic_capability.element_count,
                     );
+                    std::io::stdout().flush().map_err(|error| {
+                        format!("flush firmware bootstrap ready milestone: {error}")
+                    })?;
                 }
                 println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
                 return Ok(());
@@ -3338,6 +3344,9 @@ fn run() -> Result<(), String> {
                 cleanup_errors.push(format!("post-reset safe-state verification: {error}"));
                 retain_mappings_for_watchdog("post-reset containment verification failed");
             }
+        }
+        if let Err(error) = std::io::stdout().flush() {
+            cleanup_errors.push(format!("flush containment milestones: {error}"));
         }
         if !release_errors.is_empty() {
             ledger.phase = RunPhase::SafeReleaseError;
@@ -6285,6 +6294,9 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         }
         if errors.is_empty() {
             println!(r#"{{"active_fwdl_event":"transport_quiesced"}}"#);
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush firmware transport cleanup milestone: {error}"))?;
             Ok(())
         } else {
             Err(format!("loader cleanup failed before reset: {errors:?}"))
