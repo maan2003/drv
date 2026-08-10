@@ -13,6 +13,9 @@ existing Audio Device Registry/ring-buffer boundary in `audio-pipewire-spike`.
 
 The bounded playback path directly follows Fuchsia `intel-hda-stream.cc` for
 stream reset, format/BDL programming, RUN/interrupt control, and stop ordering.
+Its all-exit quiesce preserves that stop/reset ordering and the Realtek mute,
+pin-control, and EAPD verbs even when VFIO MMIO or eventfd access fails; the
+failure-path structure is local Rust code rather than copied upstream code.
 The ALC256 DAC `0x02`, speaker pin `0x14`, headphone pin `0x21`, connection,
 amp-mute, pin-control, and EAPD verbs are isolated host topology policy. PCM
 enters through the existing private ADR-compatible `PlaybackEndpoint` adapter.

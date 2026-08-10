@@ -69,6 +69,12 @@ fn map_io<R, E>(value: Result<R, E>) -> Result<R, Error<E>> {
     value.map_err(Error::Io)
 }
 
+fn retain_first_error<E>(result: &mut Result<(), E>, next: Result<(), E>) {
+    if result.is_ok() {
+        *result = next;
+    }
+}
+
 pub struct Controller<T: Transport> {
     io: T,
     corb_wp: u16,
@@ -271,106 +277,149 @@ impl<T: Transport> Controller<T> {
         let quarter_db = (((amp_caps >> 16) & 0x7f) + 1) as u8;
         let attenuation_steps = 144_u16.div_ceil(u16::from(quarter_db.max(1))) as u8;
         let gain = offset.saturating_sub(attenuation_steps); // approximately -36 dB
-        for node in [0x01, 0x02, pin] {
-            self.command(codec, node, 0x0705, 0)?;
-        }
-        thread::sleep(Duration::from_millis(2));
-        self.command_long(codec, 0x02, 0x3, 0xb080)?;
-        self.command_long(codec, pin, 0x3, 0xb080)?;
-        self.command(codec, pin, 0x0701, 0)?;
-        self.command_long(codec, 0x02, 0x2, 0x0011)?;
-        self.command(codec, 0x02, 0x0706, 0x10)?;
-        let pin_ctl = if route == OutputRoute::Headphone {
-            0xc0
-        } else {
-            0x40
-        };
-        self.command(codec, pin, 0x0707, pin_ctl)?;
-        self.command(codec, pin, 0x070c, 0x02)?;
-
-        for (index, word) in pcm.chunks_exact(4).enumerate() {
-            self.io.dma_write32(
-                PCM_OFFSET + index * 4,
-                u32::from_le_bytes(word.try_into().unwrap()),
-            );
-        }
-        let pcm_iova = self.io.dma_iova() + PCM_OFFSET as u64;
-        self.io.dma_write32(BDL_OFFSET, pcm_iova as u32);
-        self.io.dma_write32(BDL_OFFSET + 4, (pcm_iova >> 32) as u32);
-        self.io.dma_write32(BDL_OFFSET + 8, PCM_BYTES as u32);
-        self.io.dma_write32(BDL_OFFSET + 12, 1);
-        self.io.fence();
-
         let ctl = (1 << 20) | (1 << 19);
-        map_io(self.io.write32(stream, ctl))?;
-        map_io(self.io.write16(stream + 0x12, 0x0011))?;
-        let bdl_iova = self.io.dma_iova() + BDL_OFFSET as u64;
-        map_io(self.io.write32(stream + 0x18, bdl_iova as u32))?;
-        map_io(self.io.write32(stream + 0x1c, (bdl_iova >> 32) as u32))?;
-        map_io(self.io.write32(stream + 0x08, PCM_BYTES as u32))?;
-        map_io(self.io.write16(stream + 0x0c, 0))?;
-        map_io(self.io.write8(stream + 0x03, 0x1c))?;
-        map_io(self.io.write32(0x20, 0xc000_0000 | (1 << stream_index)))?;
-        self.command_long(codec, 0x02, 0x3, 0xb000 | u16::from(gain))?;
-        self.command_long(codec, pin, 0x3, 0xb000)?;
-        // Drain command-response MSI counts before RUN. Any later eventfd
-        // count therefore comes from the stream IOC entry, not a codec verb.
-        while map_io(self.io.take_irq_count())? != 0 {}
-        let start_position = map_io(self.io.read32(stream + 0x04))?;
-        map_io(self.io.write32(stream, ctl | 0x1e))?;
-        self.io.fence();
+        let playback = (|| {
+            for node in [0x01, 0x02, pin] {
+                self.command(codec, node, 0x0705, 0)?;
+            }
+            thread::sleep(Duration::from_millis(2));
+            self.command_long(codec, 0x02, 0x3, 0xb080)?;
+            self.command_long(codec, pin, 0x3, 0xb080)?;
+            self.command(codec, pin, 0x0701, 0)?;
+            self.command_long(codec, 0x02, 0x2, 0x0011)?;
+            self.command(codec, 0x02, 0x0706, 0x10)?;
+            let pin_ctl = if route == OutputRoute::Headphone {
+                0xc0
+            } else {
+                0x40
+            };
+            self.command(codec, pin, 0x0707, pin_ctl)?;
+            self.command(codec, pin, 0x070c, 0x02)?;
 
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let mut irq_count = 0;
-        let mut end_position = start_position;
-        let mut position_changed = false;
-        let mut stream_fault = false;
-        while Instant::now() < deadline {
-            irq_count += map_io(self.io.take_irq_count())?;
-            let position = map_io(self.io.read32(stream + 0x04))?;
-            if position != start_position {
-                end_position = position;
-                position_changed = true;
+            for (index, word) in pcm.chunks_exact(4).enumerate() {
+                self.io.dma_write32(
+                    PCM_OFFSET + index * 4,
+                    u32::from_le_bytes(word.try_into().unwrap()),
+                );
             }
-            if map_io(self.io.read8(stream + 0x03))? & 0x18 != 0 {
-                stream_fault = true;
-                break;
-            }
-            if irq_count != 0 && position_changed {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+            let pcm_iova = self.io.dma_iova() + PCM_OFFSET as u64;
+            self.io.dma_write32(BDL_OFFSET, pcm_iova as u32);
+            self.io.dma_write32(BDL_OFFSET + 4, (pcm_iova >> 32) as u32);
+            self.io.dma_write32(BDL_OFFSET + 8, PCM_BYTES as u32);
+            self.io.dma_write32(BDL_OFFSET + 12, 1);
+            self.io.fence();
 
-        self.command_long(codec, 0x02, 0x3, 0xb080)?;
-        self.command_long(codec, pin, 0x3, 0xb080)?;
-        map_io(self.io.write32(stream, ctl))?;
-        self.poll("stop playback stream", |io| Ok(io.read32(stream)? & 2 == 0))?;
-        map_io(self.io.write32(stream, ctl | 1))?;
-        self.poll("assert playback stream reset", |io| {
-            Ok(io.read32(stream)? & 1 != 0)
-        })?;
-        map_io(self.io.write32(stream, 0))?;
-        self.poll("deassert playback stream reset", |io| {
-            Ok(io.read32(stream)? & 1 == 0)
-        })?;
-        self.command(codec, 0x02, 0x0706, 0)?;
-        self.command(codec, pin, 0x0707, 0)?;
-        self.command(codec, pin, 0x070c, 0)?;
-        if stream_fault {
-            return Err(Error::Unsupported("stream FIFO/descriptor error"));
+            map_io(self.io.write32(stream, ctl))?;
+            map_io(self.io.write16(stream + 0x12, 0x0011))?;
+            let bdl_iova = self.io.dma_iova() + BDL_OFFSET as u64;
+            map_io(self.io.write32(stream + 0x18, bdl_iova as u32))?;
+            map_io(self.io.write32(stream + 0x1c, (bdl_iova >> 32) as u32))?;
+            map_io(self.io.write32(stream + 0x08, PCM_BYTES as u32))?;
+            map_io(self.io.write16(stream + 0x0c, 0))?;
+            map_io(self.io.write8(stream + 0x03, 0x1c))?;
+            map_io(self.io.write32(0x20, 0xc000_0000 | (1 << stream_index)))?;
+            self.command_long(codec, 0x02, 0x3, 0xb000 | u16::from(gain))?;
+            self.command_long(codec, pin, 0x3, 0xb000)?;
+            // Drain command-response MSI counts before RUN. Any later eventfd
+            // count therefore comes from the stream IOC entry, not a codec verb.
+            while map_io(self.io.take_irq_count())? != 0 {}
+            let start_position = map_io(self.io.read32(stream + 0x04))?;
+            map_io(self.io.write32(stream, ctl | 0x1e))?;
+            self.io.fence();
+
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let mut irq_count = 0;
+            let mut end_position = start_position;
+            let mut position_changed = false;
+            let mut stream_fault = false;
+            while Instant::now() < deadline {
+                irq_count += map_io(self.io.take_irq_count())?;
+                let position = map_io(self.io.read32(stream + 0x04))?;
+                if position != start_position {
+                    end_position = position;
+                    position_changed = true;
+                }
+                if map_io(self.io.read8(stream + 0x03))? & 0x18 != 0 {
+                    stream_fault = true;
+                    break;
+                }
+                if irq_count != 0 && position_changed {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            if stream_fault {
+                return Err(Error::Unsupported("stream FIFO/descriptor error"));
+            }
+            if irq_count == 0 || !position_changed {
+                return Err(Error::Timeout("stream MSI/position completion"));
+            }
+            Ok(PlaybackReport {
+                route,
+                stream_index,
+                start_position,
+                end_position,
+                irq_count,
+                amp_gain_step: gain,
+            })
+        })();
+
+        // Once route setup begins, quiesce it on every exit. In particular,
+        // eventfd/MMIO errors after unmute must not leave EAPD or DMA active.
+        let cleanup = self.quiesce_playback(codec, pin, stream, ctl);
+        match playback {
+            Err(error) => Err(error),
+            Ok(report) => cleanup.map(|()| report),
         }
-        if irq_count == 0 || !position_changed {
-            return Err(Error::Timeout("stream MSI/position completion"));
+    }
+    fn quiesce_playback(
+        &mut self,
+        codec: u8,
+        pin: u8,
+        stream: usize,
+        ctl: u32,
+    ) -> Result<(), Error<T::Error>> {
+        let mut result = Ok(());
+        retain_first_error(
+            &mut result,
+            self.command_long(codec, 0x02, 0x3, 0xb080).map(|_| ()),
+        );
+        retain_first_error(
+            &mut result,
+            self.command_long(codec, pin, 0x3, 0xb080).map(|_| ()),
+        );
+        match map_io(self.io.write32(stream, ctl)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("stop playback stream", |io| Ok(io.read32(stream)? & 2 == 0)),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
         }
-        Ok(PlaybackReport {
-            route,
-            stream_index,
-            start_position,
-            end_position,
-            irq_count,
-            amp_gain_step: gain,
-        })
+        match map_io(self.io.write32(stream, ctl | 1)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("assert playback stream reset", |io| {
+                    Ok(io.read32(stream)? & 1 != 0)
+                }),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
+        }
+        match map_io(self.io.write32(stream, 0)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("deassert playback stream reset", |io| {
+                    Ok(io.read32(stream)? & 1 == 0)
+                }),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
+        }
+        retain_first_error(
+            &mut result,
+            self.command(codec, 0x02, 0x0706, 0).map(|_| ()),
+        );
+        retain_first_error(&mut result, self.command(codec, pin, 0x0707, 0).map(|_| ()));
+        retain_first_error(&mut result, self.command(codec, pin, 0x070c, 0).map(|_| ()));
+        result
     }
     pub fn shutdown(&mut self) {
         let _ = self.io.write32(0x20, 0);
@@ -394,7 +443,9 @@ mod tests {
     struct Fake {
         regs: RefCell<Vec<u8>>,
         dma: RefCell<Vec<u8>>,
+        commands: RefCell<Vec<u32>>,
         irq: u64,
+        fail_irq: bool,
     }
     impl Fake {
         fn new() -> Self {
@@ -409,7 +460,9 @@ mod tests {
             Self {
                 regs: RefCell::new(regs),
                 dma: RefCell::new(vec![0; 16 * 1024]),
+                commands: RefCell::new(Vec::new()),
                 irq: 0,
+                fail_irq: false,
             }
         }
         fn response(command: u32) -> u32 {
@@ -450,6 +503,7 @@ mod tests {
             self.regs.borrow_mut()[o..o + 2].copy_from_slice(&v.to_le_bytes());
             if o == 0x48 {
                 let command = self.dma_read32(v as usize * 4);
+                self.commands.borrow_mut().push(command);
                 let response = Self::response(command);
                 let next = ((self.read16(0x58)? & 0xff) + 1) & 0xff;
                 self.dma.borrow_mut()
@@ -479,6 +533,9 @@ mod tests {
         }
         fn fence(&self) {}
         fn take_irq_count(&mut self) -> Result<u64, ()> {
+            if self.fail_irq {
+                return Err(());
+            }
             let count = self.irq;
             self.irq = 0;
             Ok(count)
@@ -509,5 +566,29 @@ mod tests {
         assert_eq!(report.stream_index, 1);
         assert!(report.end_position > report.start_position);
         assert_eq!(report.irq_count, 1);
+    }
+
+    #[test]
+    fn playback_io_error_still_mutes_disconnects_and_resets_stream() {
+        let mut fake = Fake::new();
+        fake.fail_irq = true;
+        let mut controller = Controller::new(fake);
+        controller.reset().unwrap();
+        controller.start_command_rings().unwrap();
+
+        assert!(matches!(
+            controller.play_pcm_period(0, &[0; PCM_BYTES]),
+            Err(Error::Io(()))
+        ));
+        assert_eq!(controller.io.read32(0xa0).unwrap(), 0);
+        let commands = controller.io.commands.borrow();
+        assert_eq!(
+            &commands[commands.len() - 3..],
+            &[
+                (0x02 << 20) | 0x070600, // disconnect converter
+                (0x14 << 20) | 0x070700, // disable speaker pin output
+                (0x14 << 20) | 0x070c00, // disable speaker EAPD
+            ]
+        );
     }
 }
