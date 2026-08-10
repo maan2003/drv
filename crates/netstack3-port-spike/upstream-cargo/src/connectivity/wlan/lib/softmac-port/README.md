@@ -38,9 +38,10 @@ failure. It has no physical adapter and therefore cannot transmit.
 
 `SaeHandshake` now packages the pinned Fuchsia SME-managed `wlan-rsn`
 supplicant for a management-auth-only WPA3 stage. It emits only pinned
-`SaeFrame`, timeout, and authentication-status updates; association, EAPOL,
-keys, and data are intentionally discarded at this boundary. The wrapper has
-no `Debug` implementation so its secret-bearing state cannot enter reports.
+`SaeFrame`, timeout, authentication-status, and one non-printable PMK handoff;
+association, EAPOL, traffic keys, and data remain outside this boundary. PMK
+bytes are borrow-only and overwritten on drop. The wrapper and its updates have
+no `Debug` implementation so secret-bearing state cannot enter reports.
 `build_sae_auth_frame` retains the exact pinned MLME management-frame layout.
 Focused fixtures derived from the upstream MLME scanner run against the fake:
 
@@ -63,7 +64,7 @@ can expand this milestone's channel set.
 | Beacon/probe IE and channel conversion | MLME `client/convert_beacon.rs`, `wlan-common` | The exact pinned `construct_bss_description` is re-exported directly and its upstream fixtures run on host |
 | MLME client open authentication/association and connect timer | MLME `client/{state,station,bound}.rs`, `auth.rs`, `device.rs` | Open-network closure packaged here over raw RX/TX bytes and typed device programming; protected networks and associated-state maintenance remain gated |
 | SME connect/scan policy | `wlan-sme` | Already packaged and host-tested; endpoint serving is the only excluded transport edge |
-| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE auth updates are now wrapped here; association/EAPOL/key progression remains gated |
+| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE auth and borrow-only PMK handoff are wrapped here; association/EAPOL/traffic-key progression remains gated |
 | Frame/IE parsing and serialization | `wlan-common`, `ieee80211`, `wlan-frame-writer` | Already packaged and tested; hardware supplies RX bytes/metadata only |
 | Rate control and diagnostics | MLME `minstrel.rs`, FIDL Minstrel/stats values, Inspect facades | Values/diagnostic facades are packaged; the MLME algorithm remains in the future client-closure package |
 

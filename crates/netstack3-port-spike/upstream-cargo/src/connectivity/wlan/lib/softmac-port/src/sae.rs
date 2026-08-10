@@ -14,16 +14,37 @@ use wlan_common::mgmt_writer;
 use wlan_common::security::wpa::credential::Passphrase;
 use wlan_frame_writer::write_frame;
 use wlan_rsn::auth;
+use wlan_rsn::key::exchange::Key;
 use wlan_rsn::nonce::NonceReader;
 use wlan_rsn::rsna::{AuthStatus, SecAssocUpdate, UpdateSink};
 use wlan_rsn::{ProtectionInfo, PweMethod, Supplicant};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SaeHandshakeUpdate {
     TxFrame(SaeFrame),
     ScheduleTimeout { id: u64, duration_millis: u64 },
     Authenticated,
+    Pmk(SaePmk),
     Rejected,
+}
+
+/// One secret-bearing PMK produced by the pinned SAE supplicant.
+///
+/// The key is deliberately neither clonable nor printable. Callers may expose
+/// it only for the duration of a closure, and dropping it overwrites the
+/// retained allocation before release.
+pub struct SaePmk(Vec<u8>);
+
+impl SaePmk {
+    pub fn expose<T>(&self, use_key: impl FnOnce(&[u8]) -> T) -> T {
+        use_key(&self.0)
+    }
+}
+
+impl Drop for SaePmk {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Owns secret-bearing pinned SAE state. This type deliberately implements no
@@ -145,6 +166,7 @@ fn convert_updates(updates: UpdateSink) -> Vec<SaeHandshakeUpdate> {
                 Some(SaeHandshakeUpdate::Authenticated)
             }
             SecAssocUpdate::SaeAuthStatus(_) => Some(SaeHandshakeUpdate::Rejected),
+            SecAssocUpdate::Key(Key::Pmk(pmk)) => Some(SaeHandshakeUpdate::Pmk(SaePmk(pmk))),
             // Association/EAPOL/key updates are outside this boundary and are
             // intentionally unreachable before SAE authentication succeeds.
             _ => None,
@@ -241,6 +263,16 @@ mod tests {
         .unwrap();
         let _ = handshake.start().unwrap();
         assert!(handshake.on_timeout(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pmk_update_is_secret_bearing_and_available_only_by_borrow() {
+        let updates = convert_updates(vec![SecAssocUpdate::Key(Key::Pmk(vec![7; 32]))]);
+        let Some(SaeHandshakeUpdate::Pmk(pmk)) = updates.into_iter().next() else {
+            panic!("PMK update was discarded")
+        };
+        assert_eq!(pmk.expose(|bytes| bytes.len()), 32);
+        assert!(pmk.expose(|bytes| bytes.iter().all(|byte| *byte == 7)));
     }
 
     #[test]
