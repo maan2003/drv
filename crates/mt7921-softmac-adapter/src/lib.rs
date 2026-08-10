@@ -6,6 +6,7 @@
 //! networking implementation. A caller must provide an explicit transport.
 
 pub mod client_device;
+pub mod ethernet;
 
 use fuchsia_softmac_port::{
     AdvertisementKind, Bssid, CapabilityInfo, ChannelBandwidth, ChannelNumber, DiscoverySupport,

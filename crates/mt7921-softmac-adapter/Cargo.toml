@@ -19,6 +19,7 @@ fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a9
 fuchsia-trace = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/trace/rust" }
 futures = "=0.3.32"
 mt7921-port-spike = { path = "../mt7921-port-spike" }
+netstack3-port-spike = { path = "../netstack3-port-spike" }
 fuchsia-softmac-port = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/softmac-port" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }

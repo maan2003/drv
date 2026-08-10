@@ -19,6 +19,10 @@ use std::sync::{Arc, Mutex};
 use wlan_mlme::device::{DeviceOps, LinkStatus};
 
 use crate::Mt7921SoftmacAdapter;
+use crate::ethernet::{
+    EthernetIngressError, EthernetPortConfigError, MlmeEthernetSink, Mt7921EthernetDevice,
+    Mt7921EthernetTx, ethernet_port,
+};
 use fuchsia_softmac_port::{HardwareScanEvent, SoftmacHardware};
 
 /// Immutable values reported through the pinned `DeviceOps` query seams.
@@ -261,6 +265,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         backend.lifecycle_poisoned = true;
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.teardown();
+        }
         backend.effects.reset()
     }
 
@@ -272,6 +279,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         backend.lifecycle_poisoned = true;
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.teardown();
+        }
         backend.effects.stop()
     }
 }
@@ -294,6 +304,7 @@ struct ComposedBackend<E, S> {
     active_scan_id: Option<u64>,
     revoked: bool,
     lifecycle_poisoned: bool,
+    ethernet: Option<MlmeEthernetSink>,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
@@ -324,6 +335,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 active_scan_id: None,
                 revoked: false,
                 lifecycle_poisoned: false,
+                ethernet: None,
             })),
             support,
         )
@@ -347,11 +359,53 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             active_scan_id: None,
             revoked: true,
             lifecycle_poisoned: false,
+            ethernet: None,
         }));
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
         };
         (Self::from_parts(backend, support), runner)
+    }
+
+    /// Construct the production client boundary with the existing Netstack3
+    /// Ethernet-II port attached. The query MAC is the single address source.
+    pub fn new_with_ethernet(
+        mut effects: E,
+        scan: Mt7921SoftmacAdapter<T>,
+        support: ClientSupport,
+        queue_capacity: usize,
+    ) -> Result<
+        (
+            Self,
+            Mt7921ScanRunner<E, T>,
+            Mt7921EthernetDevice,
+            Mt7921EthernetTx,
+        ),
+        EthernetPortConfigError,
+    > {
+        let mac = support
+            .query
+            .sta_addr
+            .ok_or(EthernetPortConfigError::InvalidMacAddress)?;
+        let (ethernet_device, ethernet_tx, ethernet_sink) = ethernet_port(mac, queue_capacity)?;
+        effects.revoke_scan();
+        let backend = Arc::new(Mutex::new(ComposedBackend {
+            effects,
+            scan,
+            active_scan_id: None,
+            revoked: true,
+            lifecycle_poisoned: false,
+            ethernet: Some(ethernet_sink),
+        }));
+        let runner = Mt7921ScanRunner {
+            backend: backend.clone(),
+        };
+        Ok((
+            Self::from_parts(backend, support),
+            runner,
+            ethernet_device,
+            ethernet_tx,
+        ))
     }
 }
 
@@ -389,8 +443,20 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         Ok(self.support.spectrum_management.clone())
     }
 
-    fn deliver_eth_frame(&mut self, _packet: &[u8]) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn deliver_eth_frame(&mut self, packet: &[u8]) -> Result<(), zx::Status> {
+        self.backend
+            .lock()
+            .unwrap()
+            .ethernet
+            .as_mut()
+            .ok_or(zx::Status::NOT_SUPPORTED)?
+            .deliver(packet)
+            .map_err(|error| match error {
+                EthernetIngressError::Closed => zx::Status::CANCELED,
+                EthernetIngressError::LinkDown => zx::Status::BAD_STATE,
+                EthernetIngressError::Backpressure => zx::Status::SHOULD_WAIT,
+                EthernetIngressError::InvalidFrame(_) => zx::Status::IO_DATA_INTEGRITY,
+            })
     }
 
     fn send_wlan_frame(
@@ -407,11 +473,13 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .set_link_up(status == LinkStatus::UP)
+        let mut backend = self.backend.lock().unwrap();
+        let up = status == LinkStatus::UP;
+        backend.effects.set_link_up(up)?;
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.set_link(up);
+        }
+        Ok(())
     }
 
     async fn set_channel(

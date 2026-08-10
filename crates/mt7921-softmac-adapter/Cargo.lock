@@ -543,6 +543,7 @@ dependencies = [
  "fuchsia-trace",
  "futures",
  "mt7921-port-spike",
+ "netstack3-port-spike",
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
@@ -556,6 +557,10 @@ version = "0.1.0"
 dependencies = [
  "bssl-sys",
 ]
+
+[[package]]
+name = "netstack3-port-spike"
+version = "0.1.0"
 
 [[package]]
 name = "nom"

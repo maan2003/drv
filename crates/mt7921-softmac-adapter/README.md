@@ -60,6 +60,55 @@ without later effects. The internal effects seam has no public consumer API,
 and the pristine production SME/MLME/RSN gate remains green. This is not
 evidence for management-frame transmission or a production backend.
 
+## Netstack3 Ethernet boundary
+
+`Mt7921ClientDevice::new_with_ethernet` attaches the existing
+`netstack3-port-spike::EthernetDevice` contract at the pinned Fuchsia client
+MLME's native Ethernet seam. There is no second packet stack or Wi-Fi data
+converter:
+
+```text
+MT7921 RX (802.11, firmware-decrypted) -> Fuchsia client MLME
+  -> Ethernet II without FCS -> bounded Mt7921EthernetDevice -> Netstack3
+
+Netstack3 -> Ethernet II without FCS -> bounded Mt7921EthernetTx
+  -> Fuchsia client MLME -> protected 802.11 data -> MT7921 TX
+```
+
+The MLME continues to own LLC/SNAP conversion, address mapping, EAPOL routing,
+the RSN controlled port, 802.11 sequence/QoS fields, and the Protected bit.
+Firmware/device effects continue to own installed-key slots and actual
+encryption/decryption. The adapter accepts only the existing 14--1514 byte
+Ethernet-II frame contract (1500-byte IP MTU), takes the interface MAC directly
+from the SoftMAC query response, reports link-up only after the MLME's
+controlled-port effect succeeds, and bounds both directions. Reset/stop closes
+the port, revokes the address, drains both queues, and overwrites queued frame
+storage before release.
+
+Offline tests cover MLME RX delivery into the Netstack3 device contract,
+outbound ARP, IPv4 (including DHCP/data), and IPv6 frames through the SoftMAC TX
+facade, backpressure/retry, MTU/MAC validation, link transitions, and teardown.
+The existing Netstack3 offline suite separately proves ARP/NDP, DHCPv4, IPv4,
+IPv6, DNS over UDP/TCP, TCP, and UDP through this exact `EthernetDevice` shape.
+
+The remaining physical backend interface is deliberately small. After
+association it must make the existing `Mt7921ClientEffects` methods real:
+
+1. `install_key` programs the MLME-provided key configuration into firmware and
+   does not retain an extra plaintext copy;
+2. `notify_association_complete` and `clear_association` publish/revoke the
+   firmware station/WCID association state;
+3. `send_wlan_frame` accepts the exact MLME-produced 802.11 frame and flags with
+   bounded backpressure, using the installed firmware key for protected data;
+4. `next_rx` yields descriptor-validated, firmware-decrypted raw 802.11 frames
+   plus `WlanRxInfo`; and
+5. `set_link_up`, `reset`, and `stop` preserve ordering and revocation. Link-up
+   must occur only after association, key installation, and controlled-port
+   opening; reset/stop must make later TX impossible.
+
+No VFIO, firmware boot, SAE, association, or physical execution is added by
+this host-side integration.
+
 ## Physical transport contract
 
 Any physical transport must supply these exact MT7921 mechanics before this
