@@ -1042,3 +1042,33 @@ non-semantic, although one reported hunk is nearby in the device-info marker
 and the other is in the unreachable discovery-release continuation. A future
 implementation should format only its changed lines or separately fix that
 pre-existing drift; neither issue authorizes weakening the boundary.
+
+The read-only post-identity PCI gate completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104636Z-0000_05_00.0.log` using
+release binary SHA-256
+`fb1c1c19ed3de71e8b15fe91246437172865695256d4c9098f259e8355427325`.
+After the unchanged identity sequence restored and verified selector
+`0x18451800`, one 256-byte configuration read returned full PCI Command
+`0x0002`, PM capability offset `0xf8`, and raw PMCSR `0x0008`. Thus MSE was set,
+BME was clear, and PMCSR power-state bits were zero (D0). INTx Disable bit 10
+was also clear; a future disable boundary would change Command from `0x0002`
+to `0x0402`, not perform an identical-value write. The gate then unmapped only
+the two existing identity pages and reached safe release. It did not map the
+full continuation's WFDMA, PCIe-MAC, or CONN pages and performed no PCI write,
+BAR dereference beyond the proven identity closure, IRQ/reset query, DMA
+mapping, firmware, WFDMA, or radio operation.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104636Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:16:38.365253 IST`; sample zero already observed native mt7921e in D0 and
+iwd active. iwd announced usable `wlan5` at `16:16:39.743045` and reached
+connected state at `16:16:43.992928`. The AP briefly disassociated the first
+association with reason 2, then the retry succeeded. Association, IPv4
+`192.168.235.6/24`, default route, and gateway ping were all observed at
+`16:16:44.509745`, 6.14 seconds after restore, and the watchdog disarmed at
+`16:16:44.570324`. Boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained
+unchanged. The same verification limits apply: all 69 locked release-workspace
+tests and the locked release build passed with existing upstream warnings;
+the unrelated standalone default-feature and rustfmt failures remain as
+recorded above.
