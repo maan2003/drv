@@ -50,7 +50,10 @@ standard Node/Port Info and the S16LE/48 kHz/stereo format POD. The server also
 accepts the stock playback client's standard
 `Core.CreateObject("client-node")` and `ClientNode.GetNode`, including bounded
 properties, versions, and collision-free client proxy IDs. A stock `pw-cat`
-playback now reaches `ClientNode.Update`, which is the exact next unsupported
-operation. That update and subsequent PortUpdate must describe the client
-stream before transport FDs, shared-buffer negotiation, activation,
-clock/quantum scheduling, and PCM processing can be implemented.
+playback now completes `ClientNode.Update` and `ClientNode.PortUpdate`. The
+server binds the exported stream, imports its stock PortConfig, selects a
+playback port, and sends standard `Core.AddMem` and `ClientNode.Transport`
+events carrying a shared activation memfd and two eventfds. The exact next
+boundary is client-node format selection and shared-buffer negotiation;
+activation scheduling, clock/quantum handling, and PCM processing remain
+unimplemented.

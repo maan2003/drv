@@ -1,18 +1,34 @@
 //! Minimal server side of the PipeWire native discovery protocol.
 
 use std::{
+    fs::File,
+    io::IoSlice,
     io::{self, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::{
+            fs::FileExt,
+            net::{UnixListener, UnixStream},
+        },
+    },
     time::Duration,
 };
 
+use nix::{
+    sys::{
+        eventfd::{EfdFlags, EventFd},
+        memfd::{MFdFlags, memfd_create},
+        socket::{ControlMessage, MsgFlags, sendmsg},
+    },
+    unistd::ftruncate,
+};
 use pipewire_native_spa::{
     param::ParamType,
     pod::{
         RawPod,
         builder::{Builder, StructBuilder},
         parser::Parser,
-        types::Id,
+        types::{Id, Type},
     },
 };
 
@@ -25,6 +41,8 @@ const CLIENT_ID: u32 = 1;
 const CORE_SYNC: u8 = 2;
 const CORE_GET_REGISTRY: u8 = 5;
 const CORE_CREATE_OBJECT: u8 = 6;
+const CORE_ADD_MEM: u8 = 6;
+const CORE_BOUND_PROPS: u8 = 8;
 const CLIENT_UPDATE_PROPERTIES: u8 = 2;
 const CORE_DONE: u8 = 1;
 const REGISTRY_GLOBAL: u8 = 0;
@@ -35,9 +53,13 @@ const OBJECT_SUBSCRIBE_PARAMS: u8 = 1;
 const OBJECT_ENUM_PARAMS: u8 = 2;
 const PERMISSIONS_RWX: i32 = (1 << 8) | (1 << 7) | (1 << 6);
 const PARAM_INFO_READ: i32 = 1 << 1;
+const CLIENT_NODE_TRANSPORT: u8 = 0;
+const CLIENT_NODE_SET_PARAM: u8 = 1;
+const ACTIVATION_SIZE: i32 = 4096;
 
 const VIRTUAL_SINK_NODE_ID: i32 = 2;
 const VIRTUAL_SINK_PORT_ID: i32 = 3;
+const CLIENT_NODE_GLOBAL_ID: i32 = 4;
 
 const NODE_PROPERTIES: &[(&str, &str)] = &[
     ("object.serial", "2"),
@@ -77,10 +99,19 @@ struct BoundObject {
     kind: BoundKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct ClientNodeObject {
     proxy_id: u32,
     node_proxy_id: Option<u32>,
+    node_updated: bool,
+    transport: Option<ClientTransport>,
+}
+
+#[derive(Debug)]
+struct ClientTransport {
+    _activation: File,
+    _read_event: EventFd,
+    _write_event: EventFd,
 }
 
 /// Accept one standard PipeWire native client and finish after its post-registry sync.
@@ -149,11 +180,37 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                     client_nodes[client_node_index].node_proxy_id = Some(node_proxy_id);
                 }
                 2 => {
+                    let port_config = decode_client_node_update(&payload)?;
+                    client_nodes[client_node_index].node_updated = true;
+                    let transport = write_client_transport(
+                        stream,
+                        client_nodes[client_node_index].proxy_id,
+                        &mut out_seq,
+                    )?;
+                    client_nodes[client_node_index].transport = Some(transport);
+                    if let Some(port_config) = port_config {
+                        write_client_node_set_param(
+                            stream,
+                            client_nodes[client_node_index].proxy_id,
+                            &mut out_seq,
+                            &port_config,
+                        )?;
+                    }
+                }
+                3 => {
+                    if !client_nodes[client_node_index].node_updated {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ClientNode.PortUpdate arrived before Update",
+                        ));
+                    }
+                    decode_client_node_port_update(&payload)?;
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "ClientNode.Update is the next unsupported PipeWire operation",
+                        "client-node format selection and buffer negotiation are the next unsupported PipeWire operations",
                     ));
                 }
+                4 => decode_client_node_set_active(&payload)?,
                 opcode => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -221,7 +278,9 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                         "duplicate ClientNode proxy id",
                     ));
                 }
+                write_bound_props(stream, client_node.proxy_id, &mut out_seq)?;
                 client_nodes.push(client_node);
+                stream.set_read_timeout(None)?;
             }
             (CORE_ID, CORE_SYNC) => {
                 let (id, seq) = decode_sync(&payload)?;
@@ -304,10 +363,188 @@ fn decode_create_client_node(payload: &[u8]) -> io::Result<ClientNodeObject> {
             Ok(ClientNodeObject {
                 proxy_id: proxy_id as u32,
                 node_proxy_id: None,
+                node_updated: false,
+                transport: None,
             })
         })
         .map(|(object, _)| object)
         .map_err(invalid_pod)
+}
+
+fn decode_client_node_update(payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            let change_mask = fields.pop_int()?;
+            if change_mask & !0x3 != 0 {
+                return Err(pipewire_native_spa::pod::Error::Invalid(
+                    "invalid ClientNode.Update change mask".into(),
+                ));
+            }
+            let params = parse_inline_params(fields)?;
+            fields.pop_struct(|info| {
+                let max_input_ports = info.pop_int()?;
+                let max_output_ports = info.pop_int()?;
+                let info_change_mask = info.pop_long()?;
+                let _flags = info.pop_long()?;
+                if !(0..=1024).contains(&max_input_ports)
+                    || !(1..=1024).contains(&max_output_ports)
+                    || info_change_mask & !0x7 != 0
+                {
+                    return Err(pipewire_native_spa::pod::Error::Invalid(
+                        format!(
+                            "invalid ClientNode node info input={max_input_ports} output={max_output_ports} mask={info_change_mask:#x}"
+                        ),
+                    ));
+                }
+                parse_inline_dict(info)?;
+                parse_inline_param_info(info)?;
+                require_empty(info, "ClientNode node info")
+            })?;
+            require_empty(fields, "ClientNode.Update")?;
+            Ok(params.into_iter().find(|param| {
+                param
+                    .get(12..16)
+                    .is_some_and(|id| {
+                        u32::from_ne_bytes(id.try_into().unwrap()) == ParamType::PortConfig as u32
+                    })
+            }))
+        })
+        .map(|(port_config, _)| port_config)
+        .map_err(invalid_pod)?
+        .map(configure_playback_port)
+        .transpose()
+}
+
+fn decode_client_node_port_update(payload: &[u8]) -> io::Result<()> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            let direction = fields.pop_int()?;
+            let port_id = fields.pop_int()?;
+            let change_mask = fields.pop_int()?;
+            if direction != 1 || port_id != 0 || change_mask & !0x3 != 0 {
+                return Err(pipewire_native_spa::pod::Error::Invalid(
+                    "invalid playback ClientNode.PortUpdate header".into(),
+                ));
+            }
+            let _ = parse_inline_params(fields)?;
+            fields.pop_struct(|info| {
+                let info_change_mask = info.pop_long()?;
+                let _flags = info.pop_long()?;
+                let _rate_num = info.pop_int()?;
+                let rate_denom = info.pop_int()?;
+                if info_change_mask & !0xf != 0 || rate_denom == 0 {
+                    return Err(pipewire_native_spa::pod::Error::Invalid(
+                        "invalid ClientNode port info".into(),
+                    ));
+                }
+                parse_inline_dict(info)?;
+                parse_inline_param_info(info)?;
+                require_empty(info, "ClientNode port info")
+            })?;
+            require_empty(fields, "ClientNode.PortUpdate")
+        })
+        .map(|_| ())
+        .map_err(invalid_pod)
+}
+
+fn decode_client_node_set_active(payload: &[u8]) -> io::Result<()> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            fields.pop_bool()?;
+            require_empty(fields, "ClientNode.SetActive")
+        })
+        .map(|_| ())
+        .map_err(invalid_pod)
+}
+
+fn parse_inline_params(
+    parser: &mut Parser<'_>,
+) -> Result<Vec<Vec<u8>>, pipewire_native_spa::pod::Error> {
+    let count = parser.pop_int()?;
+    if !(0..=64).contains(&count) {
+        return Err(pipewire_native_spa::pod::Error::Invalid(
+            "invalid ClientNode parameter count".into(),
+        ));
+    }
+    let mut params = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let pod = parser.pop_raw_pod()?;
+        params.push(pod.data().to_vec());
+    }
+    Ok(params)
+}
+
+fn configure_playback_port(mut config: Vec<u8>) -> io::Result<Vec<u8>> {
+    let mut position = 16;
+    while position + 16 <= config.len() {
+        let key = u32::from_ne_bytes(config[position..position + 4].try_into().unwrap());
+        let size =
+            u32::from_ne_bytes(config[position + 8..position + 12].try_into().unwrap()) as usize;
+        let pod_type = u32::from_ne_bytes(config[position + 12..position + 16].try_into().unwrap());
+        let padding = (8 - size % 8) % 8;
+        let next = position
+            .checked_add(8 + 8 + size + padding)
+            .filter(|next| *next <= config.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid PortConfig pod"))?;
+        if key == 2 {
+            if size != 4 || pod_type != Type::Id as u32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid PortConfig mode",
+                ));
+            }
+            config[position + 16..position + 20].copy_from_slice(&2_u32.to_ne_bytes());
+            return Ok(config);
+        }
+        position = next;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "PortConfig has no mode",
+    ))
+}
+
+fn parse_inline_dict(parser: &mut Parser<'_>) -> Result<(), pipewire_native_spa::pod::Error> {
+    let count = parser.pop_int()?;
+    if !(0..=128).contains(&count) {
+        return Err(pipewire_native_spa::pod::Error::Invalid(
+            "invalid ClientNode dictionary count".into(),
+        ));
+    }
+    for _ in 0..count {
+        parser.pop_string()?;
+        parser.pop_string()?;
+    }
+    Ok(())
+}
+
+fn parse_inline_param_info(parser: &mut Parser<'_>) -> Result<(), pipewire_native_spa::pod::Error> {
+    let count = parser.pop_int()?;
+    if !(0..=128).contains(&count) {
+        return Err(pipewire_native_spa::pod::Error::Invalid(
+            "invalid ClientNode parameter-info count".into(),
+        ));
+    }
+    for _ in 0..count {
+        parser.pop_id::<u32>()?;
+        parser.pop_int()?;
+    }
+    Ok(())
+}
+
+fn require_empty(
+    parser: &Parser<'_>,
+    context: &str,
+) -> Result<(), pipewire_native_spa::pod::Error> {
+    if parser.available() != 0 {
+        return Err(pipewire_native_spa::pod::Error::Invalid(format!(
+            "trailing {context} fields"
+        )));
+    }
+    Ok(())
 }
 
 fn decode_get_node(payload: &[u8]) -> io::Result<u32> {
@@ -571,6 +808,103 @@ fn write_enum_format(
     Ok(())
 }
 
+fn write_client_transport(
+    stream: &mut UnixStream,
+    client_node_id: u32,
+    out_seq: &mut u32,
+) -> io::Result<ClientTransport> {
+    let activation = memfd_create(
+        "drv-client-node-activation",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .map_err(io::Error::from)?;
+    ftruncate(&activation, i64::from(ACTIVATION_SIZE)).map_err(io::Error::from)?;
+    let activation = File::from(activation);
+    // `PW_NODE_ACTIVATION_INACTIVE`; the remaining activation page starts zeroed.
+    activation.write_all_at(&4_u32.to_ne_bytes(), 0)?;
+
+    let event_flags = EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK;
+    let read_event = EventFd::from_value_and_flags(0, event_flags).map_err(io::Error::from)?;
+    let write_event = EventFd::from_value_and_flags(0, event_flags).map_err(io::Error::from)?;
+
+    let add_mem = encode_struct(|builder| {
+        builder
+            .push_int(0)
+            .push_id(Id(2_u32))
+            .push_fd(0)
+            .push_int(3)
+    })?;
+    write_message_with_fds(
+        stream,
+        CORE_ID,
+        CORE_ADD_MEM,
+        *out_seq,
+        &add_mem,
+        &[activation.as_raw_fd()],
+    )?;
+    *out_seq += 1;
+
+    let transport = encode_struct(|builder| {
+        builder
+            .push_fd(0)
+            .push_fd(1)
+            .push_int(0)
+            .push_int(0)
+            .push_int(ACTIVATION_SIZE)
+    })?;
+    write_message_with_fds(
+        stream,
+        client_node_id,
+        CLIENT_NODE_TRANSPORT,
+        *out_seq,
+        &transport,
+        &[read_event.as_raw_fd(), write_event.as_raw_fd()],
+    )?;
+    *out_seq += 1;
+
+    Ok(ClientTransport {
+        _activation: activation,
+        _read_event: read_event,
+        _write_event: write_event,
+    })
+}
+
+fn write_client_node_set_param(
+    stream: &mut UnixStream,
+    client_node_id: u32,
+    out_seq: &mut u32,
+    param: &[u8],
+) -> io::Result<()> {
+    let param = RawPod::wrap(param).map_err(invalid_pod)?;
+    let body = encode_struct(|builder| {
+        builder
+            .push_id(Id(ParamType::PortConfig))
+            .push_int(0)
+            .push_pod(&param)
+    })?;
+    write_message(
+        stream,
+        client_node_id,
+        CLIENT_NODE_SET_PARAM,
+        *out_seq,
+        &body,
+    )?;
+    *out_seq += 1;
+    Ok(())
+}
+
+fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) -> io::Result<()> {
+    let body = encode_struct(|builder| {
+        builder
+            .push_int(proxy_id as i32)
+            .push_int(CLIENT_NODE_GLOBAL_ID)
+            .push_struct(|builder| builder.push_int(0))
+    })?;
+    write_message(stream, CORE_ID, CORE_BOUND_PROPS, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
 fn push_properties<'a>(
     builder: StructBuilder<'a>,
     properties: &[(&str, &str)],
@@ -645,6 +979,43 @@ fn write_message(
     stream.write_all(payload)
 }
 
+fn write_message_with_fds(
+    stream: &mut UnixStream,
+    id: u32,
+    opcode: u8,
+    seq: u32,
+    payload: &[u8],
+    fds: &[RawFd],
+) -> io::Result<()> {
+    let size = u32::try_from(payload.len())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let n_fds = u32::try_from(fds.len())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if fds.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file-descriptor message has no descriptors",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+    bytes.extend(id.to_ne_bytes());
+    bytes.extend(((u32::from(opcode) << 24) | size).to_ne_bytes());
+    bytes.extend(seq.to_ne_bytes());
+    bytes.extend(n_fds.to_ne_bytes());
+    bytes.extend(payload);
+
+    let sent = sendmsg::<()>(
+        stream.as_raw_fd(),
+        &[IoSlice::new(&bytes)],
+        &[ControlMessage::ScmRights(fds)],
+        MsgFlags::empty(),
+        None,
+    )
+    .map_err(io::Error::from)?;
+    stream.write_all(&bytes[sent..])
+}
+
 fn invalid_pod(error: pipewire_native_spa::pod::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"))
 }
@@ -671,6 +1042,21 @@ mod tests {
         bytes.extend(0_u32.to_ne_bytes());
         bytes.extend(payload);
         bytes
+    }
+
+    fn read_message_with_fds(stream: &mut UnixStream) -> (Header, u32, Vec<u8>) {
+        let mut bytes = [0; HEADER_LEN];
+        stream.read_exact(&mut bytes).unwrap();
+        let word = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+        let header = Header {
+            id: u32::from_ne_bytes(bytes[0..4].try_into().unwrap()),
+            opcode: (word >> 24) as u8,
+            size: (word & 0x00ff_ffff) as usize,
+        };
+        let n_fds = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+        let mut payload = vec![0; header.size];
+        stream.read_exact(&mut payload).unwrap();
+        (header, n_fds, payload)
     }
 
     fn decode_global(payload: &[u8]) -> (i32, String, Vec<(String, String)>) {
@@ -849,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_client_node_and_accepts_get_node_before_update_boundary() {
+    fn emits_client_transport_and_accepts_client_node_updates() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || serve_connection(&mut server));
 
@@ -888,13 +1274,60 @@ mod tests {
                     .push_int(8)
             }))
             .unwrap();
+        let (bound, _) = read_message(&mut client).unwrap();
+        assert_eq!((bound.id, bound.opcode), (CORE_ID, CORE_BOUND_PROPS));
         client
             .write_all(&request(8, 1, |b| b.push_int(3).push_int(9)))
             .unwrap();
-        client.write_all(&request(8, 2, |b| b.push_int(0))).unwrap();
+        client
+            .write_all(&request(8, 2, |b| {
+                b.push_int(3).push_int(0).push_struct(|b| {
+                    b.push_int(0)
+                        .push_int(1)
+                        .push_long(7)
+                        .push_long(0)
+                        .push_int(1)
+                        .push_string("node.name")
+                        .push_string("pw-cat")
+                        .push_int(0)
+                })
+            }))
+            .unwrap();
+
+        let (add_mem, add_mem_fds, _) = read_message_with_fds(&mut client);
+        assert_eq!((add_mem.id, add_mem.opcode, add_mem_fds), (CORE_ID, 6, 1));
+        let (transport, transport_fds, _) = read_message_with_fds(&mut client);
+        assert_eq!((transport.id, transport.opcode, transport_fds), (8, 0, 2));
+        client
+            .write_all(&request(8, 4, |b| b.push_bool(true)))
+            .unwrap();
+
+        let mut format_storage = [0; 256];
+        let format = RawPod::wrap(enum_format_pod(&mut format_storage).unwrap()).unwrap();
+        client
+            .write_all(&request(8, 3, |b| {
+                b.push_int(1)
+                    .push_int(0)
+                    .push_int(3)
+                    .push_int(1)
+                    .push_pod(&format)
+                    .push_struct(|b| {
+                        b.push_long(0xf)
+                            .push_long(0)
+                            .push_int(0)
+                            .push_int(1)
+                            .push_int(1)
+                            .push_string("port.name")
+                            .push_string("output")
+                            .push_int(1)
+                            .push_id(Id(ParamType::EnumFormat))
+                            .push_int(PARAM_INFO_READ)
+                    })
+            }))
+            .unwrap();
 
         let error = worker.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("ClientNode.Update"));
+        assert!(error.to_string().contains("buffer negotiation"));
     }
 }
