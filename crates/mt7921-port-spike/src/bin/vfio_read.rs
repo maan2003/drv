@@ -1270,7 +1270,10 @@ fn run() -> Result<(), String> {
 
             record_sae_stage("vfio_post_identity_pci_preflight_before config_bytes=256");
             let config_path = format!("/sys/bus/pci/devices/{bdf}/config");
-            let mut config_file = File::open(&config_path)
+            let mut config_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config_path)
                 .map_err(|error| format!("open post-identity PCI config: {error}"))?;
             let mut config = [0u8; 256];
             config_file
@@ -1312,6 +1315,74 @@ fn run() -> Result<(), String> {
                     "post-identity PCI device is not in D0: PMCSR {pmcsr:#06x}"
                 ));
             }
+
+            let selected_command = command | 0x0400;
+            let intx_disable = (|| -> Result<(), String> {
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_write_before offset=0x04 bytes=2 saved={command:#06x} value={selected_command:#06x}"
+                ));
+                config_file
+                    .seek(SeekFrom::Start(4))
+                    .and_then(|_| config_file.write_all(&selected_command.to_le_bytes()))
+                    .map_err(|error| format!("write PCI INTx disable: {error}"))?;
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_write_after offset=0x04 bytes=2 value={selected_command:#06x}"
+                ));
+                record_sae_stage("vfio_pci_intx_disable_verify_before offset=0x04 bytes=2");
+                let mut raw = [0u8; 2];
+                config_file
+                    .seek(SeekFrom::Start(4))
+                    .and_then(|_| config_file.read_exact(&mut raw))
+                    .map_err(|error| format!("read PCI INTx disable: {error}"))?;
+                let readback = u16::from_le_bytes(raw);
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_verify_after offset=0x04 bytes=2 value={readback:#06x} expected={selected_command:#06x} equal={}",
+                    readback == selected_command
+                ));
+                if readback != selected_command {
+                    return Err(format!(
+                        "PCI INTx disable mismatch: expected {selected_command:#06x}, read {readback:#06x}"
+                    ));
+                }
+                Ok(())
+            })();
+
+            record_sae_stage(&format!(
+                "vfio_pci_command_restore_write_before offset=0x04 bytes=2 value={command:#06x}"
+            ));
+            let restore_write = config_file
+                .seek(SeekFrom::Start(4))
+                .and_then(|_| config_file.write_all(&command.to_le_bytes()))
+                .map_err(|error| format!("restore PCI Command: {error}"));
+            match &restore_write {
+                Ok(()) => record_sae_stage(&format!(
+                    "vfio_pci_command_restore_write_after offset=0x04 bytes=2 value={command:#06x}"
+                )),
+                Err(error) => record_sae_stage(&format!(
+                    "vfio_pci_command_restore_write_error offset=0x04 bytes=2 error={error}"
+                )),
+            }
+            restore_write?;
+            record_sae_stage("vfio_pci_command_restore_verify_before offset=0x04 bytes=2");
+            let mut restored_raw = [0u8; 2];
+            config_file
+                .seek(SeekFrom::Start(4))
+                .and_then(|_| config_file.read_exact(&mut restored_raw))
+                .map_err(|error| format!("verify restored PCI Command: {error}"))?;
+            let restored_command = u16::from_le_bytes(restored_raw);
+            record_sae_stage(&format!(
+                "vfio_pci_command_restore_verify_after offset=0x04 bytes=2 value={restored_command:#06x} expected={command:#06x} equal={}",
+                restored_command == command
+            ));
+            if restored_command != command {
+                return Err(format!(
+                    "PCI Command restore mismatch: saved={command:#06x} restored={restored_command:#06x}"
+                ));
+            }
+            intx_disable?;
+            record_sae_stage(&format!(
+                "vfio_pci_intx_disable_complete selected={selected_command:#06x} restored={restored_command:#06x}"
+            ));
 
             record_sae_stage(&format!(
                 "vfio_bar0_munmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
