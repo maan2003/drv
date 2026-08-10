@@ -6,7 +6,7 @@
 
 use fidl_fuchsia_wlan_common::{MfpFeature, SaeFeature, SecuritySupport};
 use fidl_fuchsia_wlan_ieee80211::StatusCode;
-use fidl_fuchsia_wlan_mlme::SaeFrame;
+use fidl_fuchsia_wlan_mlme::{EapolResultCode, SaeFrame};
 use ieee80211::{MacAddr, MacAddrBytes, Ssid};
 use wlan_common::ie::rsn::rsne;
 use wlan_common::mac;
@@ -14,6 +14,7 @@ use wlan_common::mgmt_writer;
 use wlan_common::security::wpa::credential::Passphrase;
 use wlan_frame_writer::write_frame;
 use wlan_rsn::auth;
+use wlan_rsn::key::Tk;
 use wlan_rsn::key::exchange::Key;
 use wlan_rsn::nonce::NonceReader;
 use wlan_rsn::rsna::{AuthStatus, SecAssocUpdate, UpdateSink};
@@ -21,9 +22,18 @@ use wlan_rsn::{ProtectionInfo, PweMethod, Supplicant};
 
 pub enum SaeHandshakeUpdate {
     TxFrame(SaeFrame),
-    ScheduleTimeout { id: u64, duration_millis: u64 },
+    ScheduleTimeout {
+        id: u64,
+        duration_millis: u64,
+    },
     Authenticated,
     Pmk(SaePmk),
+    TxEapolKeyFrame {
+        frame: Vec<u8>,
+        expect_response: bool,
+    },
+    TrafficKey(SaeTrafficKey),
+    EssSaEstablished,
     Rejected,
 }
 
@@ -43,6 +53,38 @@ impl SaePmk {
 impl Drop for SaePmk {
     fn drop(&mut self) {
         self.0.fill(0);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaeTrafficKeyKind {
+    Pairwise,
+    Group,
+    IntegrityGroup,
+}
+
+/// A non-printable traffic-key installation request from the pinned
+/// supplicant. Metadata is public; key bytes remain borrow-only and are
+/// overwritten on drop.
+pub struct SaeTrafficKey {
+    bytes: Vec<u8>,
+    pub kind: SaeTrafficKeyKind,
+    pub cipher_oui: [u8; 3],
+    pub cipher_type: u8,
+    pub key_id: u16,
+    pub rsc: u64,
+}
+
+impl SaeTrafficKey {
+    pub fn expose<T>(&self, use_key: impl FnOnce(&[u8]) -> T) -> T {
+        use_key(&self.bytes)
+    }
+}
+
+impl Drop for SaeTrafficKey {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -151,6 +193,35 @@ impl SaeHandshake {
         self.supplicant.on_sae_timeout(&mut sink, id)?;
         Ok(convert_updates(sink))
     }
+
+    /// Process one EAPOL-Key PDU after association. SAE uses a 128-bit MIC in
+    /// the controlled WPA3-Personal closure packaged here.
+    pub fn on_eapol_frame(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<SaeHandshakeUpdate>, anyhow::Error> {
+        let frame = eapol::KeyFrameRx::parse(16, bytes)?;
+        let mut sink = UpdateSink::default();
+        self.supplicant
+            .on_eapol_frame(&mut sink, eapol::Frame::Key(frame))?;
+        Ok(convert_updates(sink))
+    }
+
+    pub fn on_eapol_tx_confirm(
+        &mut self,
+        success: bool,
+    ) -> Result<Vec<SaeHandshakeUpdate>, wlan_rsn::Error> {
+        let mut sink = UpdateSink::default();
+        self.supplicant.on_eapol_conf(
+            &mut sink,
+            if success {
+                EapolResultCode::Success
+            } else {
+                EapolResultCode::TransmissionFailure
+            },
+        )?;
+        Ok(convert_updates(sink))
+    }
 }
 
 fn convert_updates(updates: UpdateSink) -> Vec<SaeHandshakeUpdate> {
@@ -167,8 +238,66 @@ fn convert_updates(updates: UpdateSink) -> Vec<SaeHandshakeUpdate> {
             }
             SecAssocUpdate::SaeAuthStatus(_) => Some(SaeHandshakeUpdate::Rejected),
             SecAssocUpdate::Key(Key::Pmk(pmk)) => Some(SaeHandshakeUpdate::Pmk(SaePmk(pmk))),
-            // Association/EAPOL/key updates are outside this boundary and are
-            // intentionally unreachable before SAE authentication succeeds.
+            SecAssocUpdate::TxEapolKeyFrame {
+                frame,
+                expect_response,
+            } => Some(SaeHandshakeUpdate::TxEapolKeyFrame {
+                frame: frame.into(),
+                expect_response,
+            }),
+            SecAssocUpdate::Key(Key::Ptk(mut ptk)) => {
+                let bytes = ptk.tk().to_vec();
+                let cipher_oui = ptk.cipher.oui.into();
+                let cipher_type = ptk.cipher.suite_type;
+                ptk.ptk.fill(0);
+                Some(SaeHandshakeUpdate::TrafficKey(SaeTrafficKey {
+                    bytes,
+                    kind: SaeTrafficKeyKind::Pairwise,
+                    cipher_oui,
+                    cipher_type,
+                    key_id: 0,
+                    rsc: 0,
+                }))
+            }
+            SecAssocUpdate::Key(Key::Gtk(mut gtk)) => {
+                let bytes = gtk.tk().to_vec();
+                let cipher_oui = gtk.cipher().oui.into();
+                let cipher_type = gtk.cipher().suite_type;
+                let key_id = u16::from(gtk.key_id());
+                let rsc = gtk.key_rsc();
+                gtk.bytes.fill(0);
+                Some(SaeHandshakeUpdate::TrafficKey(SaeTrafficKey {
+                    bytes,
+                    kind: SaeTrafficKeyKind::Group,
+                    cipher_oui,
+                    cipher_type,
+                    key_id,
+                    rsc,
+                }))
+            }
+            SecAssocUpdate::Key(Key::Igtk(mut igtk)) => {
+                let bytes = igtk.tk().to_vec();
+                let cipher_oui = igtk.cipher.oui.into();
+                let cipher_type = igtk.cipher.suite_type;
+                let key_id = igtk.key_id;
+                let mut rsc_bytes = [0; 8];
+                rsc_bytes[2..].copy_from_slice(&igtk.ipn);
+                let rsc = u64::from_be_bytes(rsc_bytes);
+                igtk.igtk.fill(0);
+                Some(SaeHandshakeUpdate::TrafficKey(SaeTrafficKey {
+                    bytes,
+                    kind: SaeTrafficKeyKind::IntegrityGroup,
+                    cipher_oui,
+                    cipher_type,
+                    key_id,
+                    rsc,
+                }))
+            }
+            SecAssocUpdate::Status(wlan_rsn::rsna::SecAssocStatus::EssSaEstablished) => {
+                Some(SaeHandshakeUpdate::EssSaEstablished)
+            }
+            // Unsupported status and key families remain outside this narrow
+            // WPA3-Personal client boundary.
             _ => None,
         })
         .collect()
@@ -273,6 +402,22 @@ mod tests {
         };
         assert_eq!(pmk.expose(|bytes| bytes.len()), 32);
         assert!(pmk.expose(|bytes| bytes.iter().all(|byte| *byte == 7)));
+    }
+
+    #[test]
+    fn traffic_key_handoff_separates_metadata_from_borrow_only_bytes() {
+        let key = SaeTrafficKey {
+            bytes: vec![9; 16],
+            kind: SaeTrafficKeyKind::Pairwise,
+            cipher_oui: [0, 15, 172],
+            cipher_type: 4,
+            key_id: 0,
+            rsc: 0,
+        };
+        assert_eq!(key.kind, SaeTrafficKeyKind::Pairwise);
+        assert_eq!(key.cipher_oui, [0, 15, 172]);
+        assert_eq!(key.expose(|bytes| bytes.len()), 16);
+        assert!(key.expose(|bytes| bytes.iter().all(|byte| *byte == 9)));
     }
 
     #[test]

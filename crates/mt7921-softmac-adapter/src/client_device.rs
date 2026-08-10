@@ -44,6 +44,116 @@ pub struct ClientRxFrame {
     pub status: fidl_softmac::WlanRxInfo,
 }
 
+/// Hardware-owned association/WCID and controlled-port ordering state.
+///
+/// This retains only public metadata. Traffic-key bytes are consumed by the
+/// injected effect and must never be copied into this state.
+#[derive(Default)]
+pub struct Mt7921AssociationState {
+    peer: Option<[u8; 6]>,
+    wcid: Option<u16>,
+    mfp_required: bool,
+    pairwise_key: bool,
+    group_key: bool,
+    integrity_group_key: bool,
+    link_up: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssociationTeardown {
+    pub peer: [u8; 6],
+    pub wcid: u16,
+    pub close_link: bool,
+    pub remove_pairwise_key: bool,
+    pub remove_group_key: bool,
+    pub remove_integrity_group_key: bool,
+}
+
+impl Mt7921AssociationState {
+    pub fn program(
+        &mut self,
+        configuration: &fidl_softmac::WlanAssociationConfig,
+        wcid: u16,
+        mfp_required: bool,
+    ) -> Result<(), zx::Status> {
+        if self.wcid.is_some() || wcid >= 20 {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        if configuration.aid.is_none_or(|aid| aid == 0) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        self.peer = Some(peer);
+        self.wcid = Some(wcid);
+        self.mfp_required = mfp_required;
+        Ok(())
+    }
+
+    /// Validate one key after the firmware effect has installed it, then
+    /// publish only its non-secret readiness bit.
+    pub fn key_installed(
+        &mut self,
+        configuration: &fidl_softmac::WlanKeyConfiguration,
+    ) -> Result<(), zx::Status> {
+        let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+        if configuration.key.as_ref().is_none_or(Vec::is_empty)
+            || configuration.protection != Some(fidl_softmac::WlanProtection::RxTx)
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
+            fidl_ieee80211::KeyType::Pairwise => {
+                if configuration.peer_addr != Some(peer) || configuration.key_idx != Some(0) {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                self.pairwise_key = true;
+            }
+            fidl_ieee80211::KeyType::Group => {
+                if configuration.peer_addr != Some([0xff; 6]) {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                self.group_key = true;
+            }
+            fidl_ieee80211::KeyType::Igtk => {
+                if configuration.peer_addr != Some([0xff; 6]) {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                self.integrity_group_key = true;
+            }
+            _ => return Err(zx::Status::NOT_SUPPORTED),
+        }
+        Ok(())
+    }
+
+    pub fn set_link_up(&mut self) -> Result<(), zx::Status> {
+        if !self.pairwise_key || !self.group_key || (self.mfp_required && !self.integrity_group_key)
+        {
+            return Err(zx::Status::BAD_STATE);
+        }
+        self.link_up = true;
+        Ok(())
+    }
+
+    pub fn wcid(&self) -> Option<u16> {
+        self.wcid
+    }
+
+    /// Revoke readiness synchronously and return the exact hardware teardown
+    /// effects in close-port, remove-keys, remove-WCID order.
+    pub fn clear(&mut self) -> Option<AssociationTeardown> {
+        let teardown = AssociationTeardown {
+            peer: self.peer?,
+            wcid: self.wcid?,
+            close_link: self.link_up,
+            remove_pairwise_key: self.pairwise_key,
+            remove_group_key: self.group_key,
+            remove_integrity_group_key: self.integrity_group_key,
+        };
+        *self = Self::default();
+        Some(teardown)
+    }
+}
+
 /// Firmware/DMA effects retained by the offline client boundary.
 ///
 /// Errors are already-mapped Zircon statuses. The adapter forwards them
@@ -1244,6 +1354,64 @@ mod tests {
                 Err(zx::Status::NOT_SUPPORTED)
             );
         });
+    }
+
+    #[test]
+    fn association_state_orders_wcid_keys_port_and_zero_state_teardown() {
+        let mut state = Mt7921AssociationState::default();
+        state
+            .program(
+                &fidl_softmac::WlanAssociationConfig {
+                    bssid: Some(BSSID),
+                    aid: Some(42),
+                    ..Default::default()
+                },
+                7,
+                true,
+            )
+            .unwrap();
+        assert_eq!(state.wcid(), Some(7));
+        assert_eq!(state.set_link_up(), Err(zx::Status::BAD_STATE));
+
+        let key = |key_type, peer_addr, key_idx| fidl_softmac::WlanKeyConfiguration {
+            protection: Some(fidl_softmac::WlanProtection::RxTx),
+            cipher_oui: Some([0, 15, 172]),
+            cipher_type: Some(4),
+            key_type: Some(key_type),
+            peer_addr: Some(peer_addr),
+            key_idx: Some(key_idx),
+            key: Some(FAKE_KEY.to_vec()),
+            rsc: Some(0),
+        };
+        state
+            .key_installed(&key(fidl_ieee80211::KeyType::Pairwise, BSSID, 0))
+            .unwrap();
+        assert_eq!(state.set_link_up(), Err(zx::Status::BAD_STATE));
+        state
+            .key_installed(&key(fidl_ieee80211::KeyType::Group, [0xff; 6], 1))
+            .unwrap();
+        assert_eq!(state.set_link_up(), Err(zx::Status::BAD_STATE));
+        state
+            .key_installed(&key(fidl_ieee80211::KeyType::Igtk, [0xff; 6], 4))
+            .unwrap();
+        state.set_link_up().unwrap();
+
+        assert_eq!(
+            state.clear(),
+            Some(AssociationTeardown {
+                peer: BSSID,
+                wcid: 7,
+                close_link: true,
+                remove_pairwise_key: true,
+                remove_group_key: true,
+                remove_integrity_group_key: true,
+            })
+        );
+        assert_eq!(state.wcid(), None);
+        assert_eq!(
+            state.key_installed(&key(fidl_ieee80211::KeyType::Pairwise, BSSID, 0)),
+            Err(zx::Status::BAD_STATE)
+        );
     }
 }
 

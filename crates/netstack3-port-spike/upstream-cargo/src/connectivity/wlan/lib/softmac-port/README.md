@@ -47,8 +47,12 @@ EAPOL/traffic-key milestone.
 supplicant for a management-auth-only WPA3 stage. It emits only pinned
 `SaeFrame`, timeout, authentication-status, and one non-printable PMK handoff;
 association, EAPOL, traffic keys, and data remain outside this boundary. PMK
-bytes are borrow-only and overwritten on drop. The wrapper and its updates have
-no `Debug` implementation so secret-bearing state cannot enter reports.
+bytes are borrow-only and overwritten on drop. After association it also
+accepts pinned EAPOL-Key PDUs and emits EAPOL TX, PTK/GTK/IGTK installation,
+and ESS-SA-established updates. Traffic-key bytes are likewise borrow-only and
+zeroized on drop; discarded source key hierarchies are overwritten during
+conversion. The wrapper and its updates have no `Debug` implementation so
+secret-bearing state cannot enter reports.
 `build_sae_auth_frame` retains the exact pinned MLME management-frame layout.
 Focused fixtures derived from the upstream MLME scanner run against the fake:
 
@@ -71,7 +75,7 @@ can expand this milestone's channel set.
 | Beacon/probe IE and channel conversion | MLME `client/convert_beacon.rs`, `wlan-common` | The exact pinned `construct_bss_description` is re-exported directly and its upstream fixtures run on host |
 | MLME client authentication/association and connect timer | MLME `client/{state,station,bound}.rs`, `auth.rs`, `device.rs` | Open-network closure plus post-SAE protected association packaged over raw RX/TX bytes and typed device programming; protected controlled-port opening and associated-state maintenance remain gated |
 | SME connect/scan policy | `wlan-sme` | Already packaged and host-tested; endpoint serving is the only excluded transport edge |
-| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE auth and borrow-only PMK handoff are wrapped here; association/EAPOL/traffic-key progression remains gated |
+| RSN, SAE/OWE, EAPOL | `wlan-rsn`, `wlan-fcg-crypto`, `eapol` | Pinned SME-managed SAE, borrow-only PMK, EAPOL RX/TX, and zeroizing PTK/GTK/IGTK handoffs are wrapped here; hardware key programming remains injected |
 | Frame/IE parsing and serialization | `wlan-common`, `ieee80211`, `wlan-frame-writer` | Already packaged and tested; hardware supplies RX bytes/metadata only |
 | Rate control and diagnostics | MLME `minstrel.rs`, FIDL Minstrel/stats values, Inspect facades | Values/diagnostic facades are packaged; the MLME algorithm remains in the future client-closure package |
 

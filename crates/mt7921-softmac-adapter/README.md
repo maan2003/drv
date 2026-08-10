@@ -36,6 +36,13 @@ host-retained `DeviceOps` method returns `ZX_ERR_NOT_SUPPORTED` rather than fake
 success. Frames and key-bearing values are never included in adapter Debug or
 error output; tests use only a documented synthetic key pattern.
 
+`Mt7921AssociationState` is the hardware-side ordering guard for those
+effects. Association publishes one bounded WCID, traffic-key effects retain
+only non-secret readiness bits, the controlled port cannot open before
+PTK/GTK (and IGTK when MFP is required), and clear synchronously revokes
+readiness before returning close-port/remove-keys/remove-WCID teardown
+metadata.
+
 The internal live constructor requires `LiveBeaconPowerAuthorization`.
 Acquiring that capability is explicitly **UNIMPLEMENTED** and returns
 `ZX_ERR_NOT_SUPPORTED`. The beacon and rate-power authorizers reject tokens

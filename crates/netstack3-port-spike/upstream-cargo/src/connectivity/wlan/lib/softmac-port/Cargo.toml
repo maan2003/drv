@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+eapol = { path = "../eapol" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-common = { path = "../../../../../sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-mlme = { path = "../../../../../sdk/fidl/fuchsia.wlan.mlme" }
