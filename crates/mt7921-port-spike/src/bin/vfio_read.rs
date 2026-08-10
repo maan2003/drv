@@ -725,6 +725,7 @@ fn run_contained_dma_resource_round_trip(
     pcie_mac: &ReadPage,
     selected_irq: PciIrqCapability,
     firmware_images: Option<(&[u8], &[u8])>,
+    passive_channel: Option<ChannelNumber>,
 ) -> Result<(), String> {
     record_sae_stage("vfio_dma_resource_round_trip_begin");
     capsule.active = Some(ActiveVfioResources::default());
@@ -1005,10 +1006,8 @@ fn run_contained_dma_resource_round_trip(
                         let transport =
                             SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                 .map_err(|error| error.to_string())?;
-                        let channel = ChannelNumber {
-                            band: WlanBand::TwoGhz,
-                            number: 1,
-                        };
+                        let channel = passive_channel
+                            .ok_or("contained passive scan omitted its selected channel")?;
                         let mut adapter = Mt7921SoftmacAdapter::new(
                             transport,
                             report.nic_capability,
@@ -1024,13 +1023,25 @@ fn run_contained_dma_resource_round_trip(
                             })
                             .map_err(|error| error.to_string())?;
                         record_sae_stage(
-                            "vfio_passive_receive_setup_ready channel=1 intentional_tx=false",
+                            &format!(
+                                "vfio_passive_receive_setup_ready channel={} frequency_mhz={} dwell_min_ms=150 dwell_max_ms=250 intentional_tx=false",
+                                channel.number,
+                                if channel.band == WlanBand::TwoGhz {
+                                    if channel.number == 14 {
+                                        2484
+                                    } else {
+                                        2407 + u16::from(channel.number) * 5
+                                    }
+                                } else {
+                                    5000 + u16::from(channel.number) * 5
+                                },
+                            ),
                         );
                         let response = adapter
                             .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
                                 channels: Some(vec![channel]),
-                                min_channel_time: Some(50_000_000),
-                                max_channel_time: Some(120_000_000),
+                                min_channel_time: Some(150_000_000),
+                                max_channel_time: Some(250_000_000),
                                 min_home_time: Some(0),
                             })
                             .map_err(|error| error.to_string())?;
@@ -1063,11 +1074,13 @@ fn run_contained_dma_resource_round_trip(
                         };
                         if !success || observations == 0 {
                             return Err(format!(
-                                "passive channel 1 result success={success} observations={observations}"
+                                "passive channel {} result success={success} observations={observations}",
+                                channel.number,
                             ));
                         }
                         record_sae_stage(&format!(
-                            "vfio_passive_observation_ready channel=1 scan_id={scan_id} observations={observations}"
+                            "vfio_passive_observation_ready channel={} scan_id={scan_id} observations={observations}",
+                            channel.number,
                         ));
                         Ok(())
                     },
@@ -1274,7 +1287,8 @@ fn live_client_support(query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientS
 }
 
 fn run() -> Result<(), String> {
-    let operation = match env::args().nth(1).as_deref() {
+    let operation_argument = env::args().nth(1);
+    let operation = match operation_argument.as_deref() {
         None => Operation::ReadFixed,
         Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
         Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
@@ -1292,6 +1306,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-channel") => Operation::RunOneShotPassiveChannel1,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channels-1-6") => Operation::RunOneShotPassiveChannels1And6,
         #[cfg(feature = "fuchsia-passive")]
@@ -1311,6 +1327,54 @@ fn run() -> Result<(), String> {
         #[cfg(not(feature = "fuchsia-passive"))]
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
+    };
+    #[cfg(feature = "fuchsia-passive")]
+    let contained_passive_channel = if operation == Operation::RunOneShotPassiveChannel1 {
+        let number = if operation_argument.as_deref() == Some("--run-one-shot-passive-channel") {
+            env::args()
+                .nth(2)
+                .ok_or("--run-one-shot-passive-channel requires a channel")?
+                .parse::<u8>()
+                .map_err(|_| "invalid passive channel")?
+        } else {
+            1
+        };
+        let band = if (1..=14).contains(&number) {
+            WlanBand::TwoGhz
+        } else if matches!(
+            number,
+            36 | 40
+                | 44
+                | 48
+                | 52
+                | 56
+                | 60
+                | 64
+                | 100
+                | 104
+                | 108
+                | 112
+                | 116
+                | 120
+                | 124
+                | 128
+                | 132
+                | 136
+                | 140
+                | 144
+                | 149
+                | 153
+                | 157
+                | 161
+                | 165
+        ) {
+            WlanBand::FiveGhz
+        } else {
+            return Err(format!("unsupported bounded passive channel {number}"));
+        };
+        Some(ChannelNumber { band, number })
+    } else {
+        None
     };
     #[cfg(feature = "fuchsia-passive")]
     if operation.uses_contained_transport_gate() {
@@ -2081,6 +2145,7 @@ fn run() -> Result<(), String> {
                                 contained_firmware_images
                                     .as_ref()
                                     .map(|(patch, ram)| (patch.as_slice(), ram.as_slice())),
+                                contained_passive_channel,
                             )
                         });
                         record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
@@ -9607,8 +9672,9 @@ mod tests {
                 && scan < observed
                 && observed < cleanup
         );
-        assert!(boundary.contains("min_channel_time: Some(50_000_000)"));
-        assert!(boundary.contains("max_channel_time: Some(120_000_000)"));
+        assert!(boundary.contains("min_channel_time: Some(150_000_000)"));
+        assert!(boundary.contains("max_channel_time: Some(250_000_000)"));
+        assert!(boundary.contains("passive_channel"));
         for forbidden in [
             "transmit_one_sae_auth",
             "configure_mgmt_tx_ring",
