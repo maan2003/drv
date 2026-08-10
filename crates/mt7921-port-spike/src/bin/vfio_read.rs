@@ -984,6 +984,7 @@ fn run_contained_dma_resource_round_trip(
                 fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
                 sequence: 0,
                 command_index: 0,
+                uni_terminal_poisoned: false,
                 fwdl_index: 0,
                 pending_scatter: None,
                 start: Instant::now(),
@@ -1165,9 +1166,13 @@ fn run_contained_dma_resource_round_trip(
             }
         }
     }
-    if let Err(error) = set_pci_bus_master(bdf, false) {
-        cleanup.push(format!("disable BME: {error}"));
-    }
+    let bme_disabled = match set_pci_bus_master(bdf, false) {
+        Ok(()) => true,
+        Err(error) => {
+            cleanup.push(format!("disable BME: {error}"));
+            false
+        }
+    };
     if let Some(irq) = capsule
         .active
         .as_mut()
@@ -1175,6 +1180,17 @@ fn run_contained_dma_resource_round_trip(
         && let Err(error) = irq.disable()
     {
         cleanup.push(format!("disable MSI: {error}"));
+    }
+    // A verified BME clear is the terminal ownership boundary even when an
+    // internally busy WFDMA engine failed to report idle.
+    if bme_disabled
+        && let Some(command_payload) = capsule
+            .active
+            .as_mut()
+            .and_then(|active| active.command_payload.as_mut())
+        && let Err(error) = command_payload.secure_zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)
+    {
+        cleanup.push(format!("secure wipe command payload: {error}"));
     }
     record_sae_stage("vfio_dma_cleanup_masks_and_bme_disabled");
     let release_errors = capsule.release_observable();
@@ -3017,6 +3033,7 @@ fn run() -> Result<(), String> {
                     fwdl_payload: &mut *fwdl_payload,
                     sequence: 0,
                     command_index: 0,
+                    uni_terminal_poisoned: false,
                     fwdl_index: 0,
                     pending_scatter: None,
                     start: Instant::now(),
@@ -3806,13 +3823,24 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        if let Err(error) = set_pci_bus_master(&bdf, false) {
-            cleanup_errors.push(error);
-        }
+        let bme_disabled = match set_pci_bus_master(&bdf, false) {
+            Ok(()) => true,
+            Err(error) => {
+                cleanup_errors.push(error);
+                false
+            }
+        };
         if let Some(installed) = irq.as_mut()
             && let Err(error) = installed.disable()
         {
             cleanup_errors.push(error);
+        }
+        // BME readback makes the command arena host-owned even if WFDMA's
+        // internal busy indication did not clear before the deadline.
+        if bme_disabled {
+            if let Err(error) = command_payload.secure_zero_bytes(MCU_COMMAND_PAYLOAD_BYTES) {
+                cleanup_errors.push(format!("secure wipe command payload: {error}"));
+            }
         }
         #[cfg(feature = "fuchsia-passive")]
         let mut release_errors = attempt_all_cleanup(
@@ -5748,6 +5776,7 @@ struct VfioFirmwareLoader<'a> {
     fwdl_payload: &'a mut DmaArena,
     sequence: u8,
     command_index: usize,
+    uni_terminal_poisoned: bool,
     fwdl_index: usize,
     pending_scatter: Option<(FirmwareImagePart, u8, usize, u32)>,
     start: Instant,
@@ -5779,6 +5808,36 @@ fn classify_uni_ack(expected_cid: u8, response: &ReceivedMcuResponse) -> Result<
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn validate_uni_request(expected_cid: u8, encoded: &[u8]) -> Result<u8, String> {
+    let sequence = *encoded
+        .get(39)
+        .filter(|sequence| (1..=15).contains(*sequence))
+        .ok_or("unified command omitted valid sequence")?;
+    let total = u16::try_from(encoded.len()).map_err(|_| "unified command exceeded u16 length")?;
+    let expected_txd0 = u32::from(total) | (2 << 23) | (0x20 << 25);
+    let expected_txd1 = (1u32 << 31) | (1 << 16);
+    if encoded.len() < 48
+        || u32::from_le_bytes(encoded[0..4].try_into().expect("checked envelope"))
+            != expected_txd0
+        || u32::from_le_bytes(encoded[4..8].try_into().expect("checked envelope"))
+            != expected_txd1
+        || u16::from_le_bytes(encoded[32..34].try_into().expect("checked envelope"))
+            != total - 32
+        || u16::from_le_bytes(encoded[34..36].try_into().expect("checked envelope"))
+            != u16::from(expected_cid)
+        || encoded[36] != 0
+        || encoded[37] != 0xa0
+        || encoded[38] != 0
+        || encoded[40..43] != [0, 0, 0]
+        || encoded[43] != 0x07
+        || encoded[44..48] != [0, 0, 0, 0]
+    {
+        return Err("unified command envelope, CID, or length mismatch".into());
+    }
+    Ok(sequence)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UniCommandReclaim {
     ResetAndZero,
@@ -5794,6 +5853,16 @@ const fn uni_command_reclaim(tx_consumed: bool) -> UniCommandReclaim {
     }
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn reclaim_uni_dma_slot(
+    tx_ring: &mut DmaArena,
+    payload: &mut DmaArena,
+    descriptor_index: usize,
+) -> Result<(), String> {
+    tx_ring.write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+    payload.secure_zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)
+}
+
 /// Encode pinned Linux's smallest STA_REC_UPDATE: disconnect WCID and reset
 /// its WTBL entry. This deliberately contains no key or capability material.
 #[cfg(feature = "fuchsia-passive")]
@@ -5803,6 +5872,7 @@ fn encode_remove_wcid_command(
     wcid: u8,
     aid: u16,
     peer: [u8; 6],
+    negotiated_qos: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence) {
         return Err("WCID removal omitted valid sequence".into());
@@ -5811,7 +5881,8 @@ fn encode_remove_wcid_command(
     body[0..8].copy_from_slice(&[bss_index, wcid, 2, 0, 1, 0, 0, 0]);
     body[8..12].copy_from_slice(&[0, 0, 20, 0]);
     body[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
-    body[16..18].copy_from_slice(&0u16.to_le_bytes());
+    body[16] = 0;
+    body[17] = u8::from(negotiated_qos);
     body[18..20].copy_from_slice(&aid.to_le_bytes());
     body[20..26].copy_from_slice(&peer);
     body[26..28].copy_from_slice(&1u16.to_le_bytes());
@@ -6393,24 +6464,35 @@ impl VfioFirmwareLoader<'_> {
         expected_cid: u8,
         encoded: &[u8],
     ) -> Result<(), String> {
+        if self.uni_terminal_poisoned {
+            return Err("unified MCU transport is terminally poisoned; containment required".into());
+        }
         self.mcu.cancelled()?;
-        let sequence = *encoded
-            .get(39)
-            .filter(|sequence| (1..=15).contains(*sequence))
-            .ok_or("unified command omitted valid sequence")?;
+        let sequence = validate_uni_request(expected_cid, encoded)?;
+        if encoded.len() > MCU_COMMAND_SLOT_BYTES {
+            return Err("unified command exceeded one DMA slot".into());
+        }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
-        publish_mcu_bytes(
+        if let Err(error) = publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
             self.mcu.payload,
             encoded,
             sequence,
             descriptor_index,
-        )?;
+        ) {
+            // Envelope/descriptor failures were excluded before DMA. The
+            // remaining failure is producer publication, where ownership is
+            // uncertain and the slot must not be reused or overwritten.
+            self.uni_terminal_poisoned = true;
+            return Err(format!(
+                "unified MCU publication failed with uncertain DMA ownership; containment required: {error}"
+            ));
+        }
         self.command_index = next;
         let response = self
             .mcu
@@ -6420,7 +6502,16 @@ impl VfioFirmwareLoader<'_> {
         // boundary: never overwrite a slot while WFDMA may still read it.
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         let consumed = loop {
-            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+            let didx = match self.mcu.wfdma.read(0xd441c) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.uni_terminal_poisoned = true;
+                    return Err(format!(
+                        "unified MCU ownership read failed; containment required: {error}"
+                    ));
+                }
+            };
+            if dma_index_completed(didx, next as u32) {
                 break true;
             }
             if Instant::now() >= deadline {
@@ -6429,6 +6520,7 @@ impl VfioFirmwareLoader<'_> {
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
         if uni_command_reclaim(consumed) == UniCommandReclaim::ContainWithDmaOwned {
+            self.uni_terminal_poisoned = true;
             return Err(format!(
                 "unified MCU command sequence {sequence} timed out with DMA slot still device-owned; containment required"
             ));
@@ -6436,11 +6528,7 @@ impl VfioFirmwareLoader<'_> {
 
         // Key-bearing CID3 commands will use this same boundary. Once DIDX
         // proves reclamation safe, cleanup runs for timeout and negative ACK.
-        self.mcu
-            .tx_ring
-            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        let payload_zeroed = self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES);
-        payload_zeroed?;
+        reclaim_uni_dma_slot(self.mcu.tx_ring, self.mcu.payload, descriptor_index)?;
         classify_uni_ack(expected_cid, &response?)
     }
 
@@ -7984,6 +8072,16 @@ impl DmaArena {
         unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, length) };
         Ok(())
     }
+    fn secure_zero_bytes(&mut self, length: usize) -> Result<(), String> {
+        if length > self.len {
+            return Err("DMA secure zero exceeds arena".into());
+        }
+        for offset in 0..length {
+            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(offset), 0) };
+        }
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        Ok(())
+    }
     fn write_descriptor(&mut self, descriptor: DmaDescriptor) {
         self.write_descriptor_at(0, descriptor)
     }
@@ -9439,7 +9537,7 @@ mod tests {
     #[test]
     fn remove_wcid_matches_pinned_linux_cid3_fixture() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
-        let encoded = encode_remove_wcid_command(9, 0, 7, 42, peer).unwrap();
+        let encoded = encode_remove_wcid_command(9, 0, 7, 42, peer, false).unwrap();
         assert_eq!(
             encoded,
             [
@@ -9449,6 +9547,83 @@ mod tests {
                 12, 0, 7, 1, 0, 0, 0, 0, 0, 0,
             ]
         );
+        assert_eq!(validate_uni_request(3, &encoded).unwrap(), 9);
+        assert!(validate_uni_request(2, &encoded).is_err());
+        let mut wrong_length = encoded.clone();
+        wrong_length[32] -= 1;
+        assert!(validate_uni_request(3, &wrong_length).is_err());
+        let mut wrong_txd = encoded.clone();
+        wrong_txd[3] ^= 4;
+        assert!(validate_uni_request(3, &wrong_txd).is_err());
+        let qos = encode_remove_wcid_command(9, 0, 7, 42, peer, true).unwrap();
+        assert_eq!(qos[65], 1);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn unified_request_binding_precedes_any_dma_or_mmio_publication() {
+        let source = include_str!("vfio_read.rs");
+        let submit = source
+            .split("fn send_acknowledged_uni_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn send_passive_command(")
+            .next()
+            .unwrap();
+        let validate = submit.find("validate_uni_request(expected_cid, encoded)").unwrap();
+        let irq = submit.find("write_active_wfdma(0xd4204").unwrap();
+        let publish = submit.find("publish_mcu_bytes(").unwrap();
+        assert!(validate < irq && irq < publish);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn consumed_uni_slot_resets_descriptor_and_securely_wipes_payload() {
+        fn arena(fill: u8, len: usize) -> DmaArena {
+            let ptr = NonNull::new(unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            })
+            .filter(|pointer| pointer.as_ptr() as isize != -1)
+            .unwrap();
+            unsafe { std::ptr::write_bytes(ptr.as_ptr(), fill, len) };
+            DmaArena {
+                iommu: Arc::new(File::open("/dev/null").unwrap()),
+                ioas: 0,
+                ptr,
+                len,
+                iova: 0,
+                mapped: false,
+            }
+        }
+        let mut ring = arena(0x5a, PAGE);
+        let mut payload = arena(0xa5, MCU_COMMAND_PAYLOAD_BYTES);
+        ring.write_descriptor_at(
+            2,
+            DmaDescriptor::tx(
+                DmaSegment { iova: 0x1000, len: 8 },
+                None,
+                0,
+            )
+            .unwrap(),
+        );
+        reclaim_uni_dma_slot(&mut ring, &mut payload, 2).unwrap();
+        assert_eq!(ring.read_descriptor_at(2), DmaDescriptor::reset());
+        assert!(payload
+            .read_bytes(0, MCU_COMMAND_PAYLOAD_BYTES)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
+        unsafe {
+            munmap(ring.ptr.as_ptr(), ring.len);
+            munmap(payload.ptr.as_ptr(), payload.len);
+        }
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -9459,6 +9634,16 @@ mod tests {
             uni_command_reclaim(false),
             UniCommandReclaim::ContainWithDmaOwned
         );
+        let source = include_str!("vfio_read.rs");
+        let submit = source
+            .split("fn send_acknowledged_uni_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn send_passive_command(")
+            .next()
+            .unwrap();
+        assert!(submit.contains("self.uni_terminal_poisoned = true"));
+        assert!(submit.contains("containment required"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
