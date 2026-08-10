@@ -1997,3 +1997,21 @@ supervisor restore could be recorded. After reboot, native `mt7921e` rebound,
 iwd was active, `wlan0` had carrier, all recovery and watchdog units were
 inactive, and `/run/wifi-driver-lab` was absent. No further physical mutation
 was attempted.
+
+Region enumeration was then moved into the same shared active path, with both
+later branches reusing the discovered BAR0 descriptor. One guarded run of that
+correction was launched as `wifi-sae-exchange9` from commit `feb3e9fe6456`;
+the release binary SHA-256 was
+`5e8f9026c83312f7c4854ed6216df3f757985bd8a911e13c2bc7192f739a424c`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T163738Z-0000_05_00.0.log`
+ended at `vfio_region_discovery_complete`. All nine advertised regions were
+therefore queried and BAR0 was identified, but there is no evidence for the
+following BAR mappings, firmware startup, beacon RX, SAE TX, or SAE RX. The
+offline UNI/key transport was not exercised.
+
+The watchdog rebooted before userspace end or supervisor restore could be
+recorded. After reboot, native `mt7921e` rebound, iwd was active, `wlan0` had
+carrier, all recovery and watchdog units were inactive, and
+`/run/wifi-driver-lab` was absent. No further physical mutation was
+attempted.
