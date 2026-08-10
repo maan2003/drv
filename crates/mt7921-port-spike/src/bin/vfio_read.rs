@@ -1606,10 +1606,7 @@ fn run() -> Result<(), String> {
             }
             record_sae_stage(&format!(
                 "vfio_device_get_info_after argsz={} flags={:#x} num_regions={} num_irqs={}",
-                device_info.argsz,
-                device_info.flags,
-                device_info.num_regions,
-                device_info.num_irqs
+                device_info.argsz, device_info.flags, device_info.num_regions, device_info.num_irqs
             ));
 
             let mut bar0 = None;
@@ -2339,7 +2336,9 @@ fn run() -> Result<(), String> {
     if info.is_none() {
         let release_errors = capsule.release_observable();
         if !release_errors.is_empty() {
-            record_sae_stage(&format!("vfio_region_discovery_release_error errors={release_errors:?}"));
+            record_sae_stage(&format!(
+                "vfio_region_discovery_release_error errors={release_errors:?}"
+            ));
             return Err(format!("VFIO discovery release failed: {release_errors:?}"));
         }
         if let Some(ledger) = capsule.containment.as_mut() {
@@ -5752,6 +5751,78 @@ struct ReceivedMcuResponse {
     bytes: Vec<u8>,
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn classify_uni_ack(expected_cid: u8, response: &ReceivedMcuResponse) -> Result<(), String> {
+    if response.option & (1 << 2) != 0 {
+        return Err("unified MCU response was unsolicited".into());
+    }
+    let body = response
+        .bytes
+        .get(36..44)
+        .ok_or("unified MCU response omitted result")?;
+    let status = u32::from_le_bytes(body[4..8].try_into().expect("fixed field"));
+    if response.event_id != 1 || body[0] != expected_cid || status != 0 {
+        return Err(format!(
+            "unified MCU response mismatch: eid={} cid={} status={status}",
+            response.event_id, body[0]
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UniCommandReclaim {
+    ResetAndZero,
+    ContainWithDmaOwned,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+const fn uni_command_reclaim(tx_consumed: bool) -> UniCommandReclaim {
+    if tx_consumed {
+        UniCommandReclaim::ResetAndZero
+    } else {
+        UniCommandReclaim::ContainWithDmaOwned
+    }
+}
+
+/// Encode pinned Linux's smallest STA_REC_UPDATE: disconnect WCID and reset
+/// its WTBL entry. This deliberately contains no key or capability material.
+#[cfg(feature = "fuchsia-passive")]
+fn encode_remove_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    aid: u16,
+    peer: [u8; 6],
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) {
+        return Err("WCID removal omitted valid sequence".into());
+    }
+    let mut body = vec![0; 40];
+    body[0..8].copy_from_slice(&[bss_index, wcid, 2, 0, 1, 0, 0, 0]);
+    body[8..12].copy_from_slice(&[0, 0, 20, 0]);
+    body[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
+    body[16..18].copy_from_slice(&0u16.to_le_bytes());
+    body[18..20].copy_from_slice(&aid.to_le_bytes());
+    body[20..26].copy_from_slice(&peer);
+    body[26..28].copy_from_slice(&1u16.to_le_bytes());
+    body[28..32].copy_from_slice(&[13, 0, 12, 0]);
+    body[32..40].copy_from_slice(&[wcid, 1, 0, 0, 0, 0, 0, 0]);
+
+    let total = 48 + body.len();
+    let mut bytes = vec![0; total];
+    bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&3u16.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 0x07;
+    bytes[48..].copy_from_slice(&body);
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveArenaKind {
     #[cfg(feature = "fuchsia-passive")]
@@ -6309,6 +6380,62 @@ impl ActiveMcuIo<'_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioFirmwareLoader<'_> {
+    fn send_acknowledged_uni_command(
+        &mut self,
+        expected_cid: u8,
+        encoded: &[u8],
+    ) -> Result<(), String> {
+        self.mcu.cancelled()?;
+        let sequence = *encoded
+            .get(39)
+            .filter(|sequence| (1..=15).contains(*sequence))
+            .ok_or("unified command omitted valid sequence")?;
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+        self.mcu
+            .wfdma
+            .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+        let response = self
+            .mcu
+            .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3));
+
+        // A response normally implies consumption, but DIDX is the ownership
+        // boundary: never overwrite a slot while WFDMA may still read it.
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let consumed = loop {
+            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        if uni_command_reclaim(consumed) == UniCommandReclaim::ContainWithDmaOwned {
+            return Err(format!(
+                "unified MCU command sequence {sequence} timed out with DMA slot still device-owned; containment required"
+            ));
+        }
+
+        // Key-bearing CID3 commands will use this same boundary. Once DIDX
+        // proves reclamation safe, cleanup runs for timeout and negative ACK.
+        self.mcu
+            .tx_ring
+            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
+        let payload_zeroed = self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES);
+        payload_zeroed?;
+        classify_uni_ack(expected_cid, &response?)
+    }
+
     fn send_passive_command(
         &mut self,
         command: &PassiveMcuCommand,
@@ -6322,6 +6449,17 @@ impl VfioFirmwareLoader<'_> {
             .ok_or("passive command omitted valid sequence")?;
         if wait_response != command.expects_response() {
             return Err("passive response policy disagreed with encoded command".into());
+        }
+        if let Some(expected_cid) = match command {
+            PassiveMcuCommand::AddDevice { .. } => Some(1),
+            PassiveMcuCommand::AddBss => Some(2),
+            _ => None,
+        } {
+            self.send_acknowledged_uni_command(expected_cid, encoded)?;
+            println!(
+                r#"{{"passive_scan_event":"command_completed","command":"{command:?}","sequence":{sequence}}}"#
+            );
+            return Ok(());
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
@@ -6343,27 +6481,6 @@ impl VfioFirmwareLoader<'_> {
                 .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
             if response.option & (1 << 2) != 0 {
                 return Err("passive command response was unsolicited".into());
-            }
-            match command {
-                PassiveMcuCommand::AddDevice { .. } | PassiveMcuCommand::AddBss => {
-                    let expected_cid = if matches!(command, PassiveMcuCommand::AddDevice { .. }) {
-                        1
-                    } else {
-                        2
-                    };
-                    let body = response
-                        .bytes
-                        .get(36..44)
-                        .ok_or("unified passive response omitted result")?;
-                    let status = u32::from_le_bytes(body[4..8].try_into().expect("fixed field"));
-                    if response.event_id != 1 || body[0] != expected_cid || status != 0 {
-                        return Err(format!(
-                            "unified passive response mismatch: eid={} cid={} status={status}",
-                            response.event_id, body[0]
-                        ));
-                    }
-                }
-                _ => {}
             }
         } else {
             let deadline = Instant::now() + std::time::Duration::from_secs(1);
@@ -9311,6 +9428,63 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn remove_wcid_matches_pinned_linux_cid3_fixture() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let encoded = encode_remove_wcid_command(9, 0, 7, 42, peer).unwrap();
+        assert_eq!(
+            encoded,
+            [
+                88, 0, 0, 65, 0, 0, 1, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 56, 0, 3, 0, 0, 160, 0, 9, 0, 0, 0, 7, 0, 0, 0, 0, 0, 7, 2, 0, 1,
+                0, 0, 0, 0, 0, 20, 0, 2, 0, 1, 0, 0, 0, 42, 0, 16, 32, 48, 64, 80, 96, 1, 0, 13, 0,
+                12, 0, 7, 1, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn unified_command_timeout_reclaims_consumed_slot_but_contains_owned_slot() {
+        assert_eq!(uni_command_reclaim(true), UniCommandReclaim::ResetAndZero);
+        assert_eq!(
+            uni_command_reclaim(false),
+            UniCommandReclaim::ContainWithDmaOwned
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn unified_ack_rejects_wrong_envelope_cid_status_and_truncation() {
+        let response = |event_id, option, cid, status: u32| {
+            let mut bytes = vec![0; 44];
+            bytes[36] = cid;
+            bytes[40..44].copy_from_slice(&status.to_le_bytes());
+            ReceivedMcuResponse {
+                event_id,
+                option,
+                bytes,
+            }
+        };
+        assert!(classify_uni_ack(3, &response(1, 0, 3, 0)).is_ok());
+        assert!(classify_uni_ack(3, &response(2, 0, 3, 0)).is_err());
+        assert!(classify_uni_ack(3, &response(1, 1 << 2, 3, 0)).is_err());
+        assert!(classify_uni_ack(3, &response(1, 0, 2, 0)).is_err());
+        assert!(classify_uni_ack(3, &response(1, 0, 3, 5)).is_err());
+        assert!(
+            classify_uni_ack(
+                3,
+                &ReceivedMcuResponse {
+                    event_id: 1,
+                    option: 0,
+                    bytes: vec![0; 43],
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     struct B2aFakeDevice {
         events: Arc<std::sync::Mutex<Vec<fidl_fuchsia_wlan_mlme::MlmeEvent>>>,
         event_tx: futures::channel::mpsc::UnboundedSender<fidl_fuchsia_wlan_mlme::MlmeEvent>,
@@ -10043,8 +10217,12 @@ mod tests {
         let bdf = startup.find("DRV_PCI_BDF").unwrap();
         let identity = startup.find("verify_pci_identity(&bdf)").unwrap();
         let watchdog = startup.find("verify_external_watchdog_armed").unwrap();
-        let marker = startup.find("record_sae_stage(\"watchdog_verified\")").unwrap();
-        let vfio = startup.find("record_sae_stage(\"vfio_cdev_open_before\")").unwrap();
+        let marker = startup
+            .find("record_sae_stage(\"watchdog_verified\")")
+            .unwrap();
+        let vfio = startup
+            .find("record_sae_stage(\"vfio_cdev_open_before\")")
+            .unwrap();
         assert!(bdf < identity && identity < watchdog && watchdog < marker && marker < vfio);
         assert!(startup.matches("records_active_transport_stages()").count() >= 6);
 
