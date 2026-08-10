@@ -1181,3 +1181,57 @@ restore. The watchdog disarmed at `16:24:19.917976`, and boot ID
 release-workspace tests and the locked release build passed with existing
 upstream warnings; previously recorded standalone default-feature and rustfmt
 limitations remain unchanged.
+
+### PCIe MAC interrupt-gate boundary
+
+After persistent PCI INTx disable, the literal next active-path device access
+is `write_pcie_mac_interrupt_enable_zero`, a volatile 32-bit zero write at BAR0
+`0x10188`. Pinned Linux commit
+`e8efe09d4f378992c890d181d65e2ed8d8cb1194` defines
+`MT_PCIE_MAC_BASE = 0x10000` and
+`MT_PCIE_MAC_INT_ENABLE = MT_PCIE_MAC(0x188)` in `mt792x_regs.h`, producing
+`0x10188`. `mt7921/pci.c:__mt7921_reg_addr` returns every address below
+`0x100000` unchanged, so this is a direct BAR0 offset, not an L1-remapped
+register. The same function's fixed map also translates silicon address
+`0x74030188` through PCIE_MAC_IREG base `0x74030000` to BAR0 `0x10188`; that
+alternate expression still requires no selector transaction.
+
+Linux accesses the register through `mt76_wr`, hence one aligned volatile
+32-bit little-endian MMIO store. Probe/resume and WPDMA reinitialization write
+`0x000000ff`; suspend, MAC reset, and WPDMA reinitialization write
+`0x00000000`. These paired enable/disable values establish interrupt-enable
+latch semantics rather than status acknowledgement or W1C command semantics.
+Pinned source defines no individual bit names and never reads the register, so
+it does not establish that immediate readback is architecturally required for
+success or that bits outside the low byte are reserved. Existing lab code has
+successfully used ordinary volatile reads for precondition and containment
+checks, but the native value at the new D0 handoff boundary has not been
+durably recorded.
+
+Native teardown does not justify hard-coding zero or `0xff`.
+`mt7921e_unregister_device` unregisters mt76, disables NAPI, takes driver
+ownership, cleans DMA, and resets WFSYS, but has no local
+`MT_PCIE_MAC_INT_ENABLE` write. Deeper generic teardown or hardware reset may
+affect the latch, so its exact post-remove value is an observation, not an
+invariant. The only safe initial checks are that the read succeeds and is not
+all ones; interpretation should preserve the complete raw word.
+
+The smallest next boundary is therefore read-only. Retain the current identity,
+PCI, INTx, and VFIO-query sequence with temporary Command `0x0402`; map only
+one additional BAR0 page, page `0x10000`, with read permission; perform exactly
+one volatile 32-bit read at `0x10188`; durably record the raw value; reject
+`0xffffffff`; unmap that page; then run the already-unconditional exact Command
+restore/readback and early release. No other active-path BAR pages (`0xd4000`,
+`0xe0000`, `0x9f000`, or `0xd6000`) are needed. The page is required only
+because VFIO BAR MMIO is exposed by `mmap`; it is not required by the preceding
+capability ioctls.
+
+A later mutation must remain a separate gate. Save the exact 32-bit snapshot,
+write only `0x00000000`, and use one ordinary volatile read to verify full zero
+while treating that read as lab rollback evidence rather than a pinned-Linux
+success condition. On every exit, write back the complete saved word and read
+back full equality before unmapping; do not synthesize `0xff` or discard
+unknown high bits. Command must likewise restore exactly from `0x0402` to
+`0x0002`. That gate must still stop before `SET_IRQS`, reset, WFDMA/DMA,
+firmware, or radio. Pinned Fuchsia does not own this PCIe interrupt latch; it
+remains Linux-derived transport mechanics below SoftMAC.
