@@ -1921,3 +1921,16 @@ before userspace end or supervisor restore could be recorded. After reboot,
 native `mt7921e` rebound, iwd was active, `wlan0` had carrier, all recovery and
 watchdog units were inactive, and `/run/wifi-driver-lab` was absent. The
 corrected retry is not an SAE pass, and no further attempt was made.
+
+An offline audit found that `credential_read` did not bound the failure to the
+following host checks. SAE and the passing passive operation execute the same
+BDF/VFIO environment parsing, synchronous sysfs identity reads, and external
+watchdog status command in the same order. When SAE was removed from the early
+contained-transport gate, however, the same predicate also accidentally
+suppressed `watchdog_verified` and the VFIO open/bind/attach stage markers.
+Those checks remain inside the payload because watchdog state must be verified
+at the handoff point and each call is locally bounded by a regular file read or
+the supervisor's local status operation. A separate stage-recording predicate
+now includes SAE without restoring the early return, so future durable
+evidence can distinguish host preflight from VFIO acquisition without adding
+new instrumentation.

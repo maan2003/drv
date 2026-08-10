@@ -1461,7 +1461,7 @@ fn run() -> Result<(), String> {
         .then(verify_external_watchdog_armed)
         .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("watchdog_verified");
     }
     let containment = operation
@@ -1469,7 +1469,7 @@ fn run() -> Result<(), String> {
         .then(|| ContainmentLedger::acquire(watchdog))
         .transpose()?;
 
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("vfio_cdev_open_before");
     }
     let device = Arc::new(
@@ -1479,7 +1479,7 @@ fn run() -> Result<(), String> {
             .open(&vfio)
             .map_err(|error| format!("open {vfio}: {error}"))?,
     );
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("vfio_cdev_open_after");
         record_sae_stage("iommufd_open_before");
     }
@@ -1490,17 +1490,17 @@ fn run() -> Result<(), String> {
             .open("/dev/iommu")
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("iommufd_open_after");
     }
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("second_pci_identity_before");
     }
     verify_pci_identity(&bdf)?;
-    if operation.uses_contained_transport_gate() {
+    if operation.records_active_transport_stages() {
         record_sae_stage("second_pci_identity_after");
     }
     if !operation.uses_contained_transport_gate() {
@@ -1517,7 +1517,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::VfioBound);
         }
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("vfio_bind_iommufd_before");
         }
         ioctl_mut(
@@ -1526,7 +1526,7 @@ fn run() -> Result<(), String> {
             &mut bind,
             "bind iommufd",
         )?;
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("vfio_bind_iommufd_after");
         }
         capsule
@@ -1539,7 +1539,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAllocated);
         }
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("ioas_allocate_before");
         }
         ioctl_mut(
@@ -1548,7 +1548,7 @@ fn run() -> Result<(), String> {
             &mut alloc,
             "allocate IOAS",
         )?;
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("ioas_allocate_after");
         }
         capsule.ioas = Some(Ioas {
@@ -1565,7 +1565,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAttached);
         }
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("vfio_attach_iommufd_pt_before");
         }
         ioctl_mut(
@@ -1575,7 +1575,7 @@ fn run() -> Result<(), String> {
             "attach IOAS",
         )?;
         capsule.ioas_attached = true;
-        if operation.uses_contained_transport_gate() {
+        if operation.records_active_transport_stages() {
             record_sae_stage("vfio_attach_iommufd_pt_after");
         }
 
@@ -8727,6 +8727,20 @@ impl Operation {
         )
     }
 
+    fn records_active_transport_stages(self) -> bool {
+        if self.uses_contained_transport_gate() {
+            return true;
+        }
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            self == Self::RunOneShotSaeAuth
+        }
+        #[cfg(not(feature = "fuchsia-passive"))]
+        {
+            false
+        }
+    }
+
     #[cfg(feature = "fuchsia-passive")]
     fn passive_scan_attempt_limit(self) -> usize {
         if matches!(self, Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth) {
@@ -9991,6 +10005,7 @@ mod tests {
     #[test]
     fn sae_routes_to_consolidated_firmware_transport_not_early_dma_gate() {
         assert!(!Operation::RunOneShotSaeAuth.uses_contained_transport_gate());
+        assert!(Operation::RunOneShotSaeAuth.records_active_transport_stages());
         assert!(Operation::RunOneShotSaeAuth.loads_firmware());
         assert!(Operation::RunOneShotSaeAuth.is_active_mcu());
 
@@ -10014,6 +10029,25 @@ mod tests {
         ] {
             assert!(consolidated.contains(required), "{required}");
         }
+    }
+
+    #[test]
+    fn sae_records_the_shared_host_preflight_and_vfio_boundaries() {
+        let source = include_str!("vfio_read.rs");
+        let startup = source
+            .split("record_sae_stage(\"credential_read\");")
+            .nth(1)
+            .unwrap()
+            .split("let base_acquisition")
+            .next()
+            .unwrap();
+        let bdf = startup.find("DRV_PCI_BDF").unwrap();
+        let identity = startup.find("verify_pci_identity(&bdf)").unwrap();
+        let watchdog = startup.find("verify_external_watchdog_armed").unwrap();
+        let marker = startup.find("record_sae_stage(\"watchdog_verified\")").unwrap();
+        let vfio = startup.find("record_sae_stage(\"vfio_cdev_open_before\")").unwrap();
+        assert!(bdf < identity && identity < watchdog && watchdog < marker && marker < vfio);
+        assert!(startup.matches("records_active_transport_stages()").count() >= 6);
     }
 
     #[test]
