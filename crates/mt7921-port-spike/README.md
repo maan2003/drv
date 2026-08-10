@@ -796,3 +796,14 @@ index 8 as absent, then reaches both `vfio_region_discovery_complete` and
 restoration ended with `failed=0`; there was no BAR mapping and no watchdog
 reboot. The boot ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`, and the
 native driver returned in D0 with iwd and the default route active.
+
+The next guarded boundary mapped only BAR0 page zero for read access and
+immediately unmapped it without dereferencing the mapping. Report
+`/var/lib/wifi-driver-lab/reports/20260810T100928Z-0000_05_00.0.log` durably
+records `vfio_bar0_mmap_before`, `vfio_bar0_mmap_after`,
+`vfio_bar0_munmap_before`, and `vfio_bar0_munmap_after`, followed by
+`vfio_region_discovery_released_safe`. No MMIO read or write, firmware action,
+or DMA mapping occurred. Userspace returned zero, restoration ended with
+`failed=0`, and the watchdog disarmed automatically after its absolute-path
+health checks observed the native driver, iwd, and the default route. The boot
+ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`.
