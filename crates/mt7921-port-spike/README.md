@@ -766,3 +766,23 @@ The reboot watchdog recovered into the same patched closure with `mt7921e`
 bound in D0, iwd active, `wlan0` up, and the default route restored. The
 on-disk stage file and forced syncs are deliberately spike-only crash-tracing
 instrumentation, not a production logging contract.
+
+A discovery-only follow-up from commit `2f0df96d` reached device info
+`argsz=24 flags=0x3 num_regions=9 num_irqs=5` and completed region-info
+queries for indices 0 through 7 without mapping any region. Index 0 reported
+the 1 MiB read/write/mmap BAR, indices 2 and 4 reported 16 KiB and 4 KiB
+read/write/mmap regions, and index 7 reported a 4 KiB read/write region.
+Indices 1, 3, 5, and 6 reported zero-size/zero-flag regions. The exact last
+durable marker was
+`vfio_device_get_region_info_error index=8 argsz=32 error=query VFIO region:
+Invalid argument (os error 22)`. IOAS destruction while the device remained
+attached returned `EBUSY`; process close and the supervisor nevertheless
+restored `mt7921e` with `RESTORE end failed=0`. Report
+`/var/lib/wifi-driver-lab/reports/20260810T095455Z-0000_05_00.0.log` contains
+the complete per-ioctl trace. Watchdog recovery again returned to the patched
+kernel with the native adapter in D0, iwd active, and the default route healthy.
+Index 8 is the fixed VFIO PCI VGA-region ABI slot, so `EINVAL` is the expected
+absence result for this non-VGA function; useful discovery completed through
+the PCI configuration region at index 7. The `EBUSY` result separately shows
+that discovery cleanup must close or detach the VFIO device before destroying
+its attached IOAS.
