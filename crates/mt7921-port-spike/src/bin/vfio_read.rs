@@ -165,7 +165,7 @@ struct Detach {
     pasid: u32,
 }
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct RegionInfo {
     argsz: u32,
     flags: u32,
@@ -1032,6 +1032,7 @@ fn run() -> Result<(), String> {
                 device_info.num_irqs
             ));
 
+            let mut bar0 = None;
             for index in 0..device_info.num_regions {
                 let mut region = RegionInfo {
                     argsz: size::<RegionInfo>(),
@@ -1069,8 +1070,30 @@ fn run() -> Result<(), String> {
                     "vfio_device_get_region_info_after index={index} argsz={} flags={:#x} cap_offset={} size={} offset={}",
                     region.argsz, region.flags, region.cap_offset, region.size, region.offset
                 ));
+                if index == BAR0_REGION {
+                    bar0 = Some(region);
+                }
             }
             record_sae_stage("vfio_region_discovery_complete");
+            let bar0 = bar0.ok_or("required BAR0 region was not discovered")?;
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_before page=0 length={} prot=read flags=shared region_size={} region_offset={}",
+                PAGE, bar0.size, bar0.offset
+            ));
+            let mut page = match ReadPage::map(&capsule.device, &bar0, 0, false) {
+                Ok(page) => page,
+                Err(error) => {
+                    record_sae_stage(&format!("vfio_bar0_mmap_error page=0 error={error}"));
+                    return Err(error);
+                }
+            };
+            record_sae_stage("vfio_bar0_mmap_after page=0 length=4096");
+            record_sae_stage("vfio_bar0_munmap_before page=0 length=4096");
+            if let Err(error) = page.teardown() {
+                record_sae_stage(&format!("vfio_bar0_munmap_error page=0 error={error}"));
+                return Err(error);
+            }
+            record_sae_stage("vfio_bar0_munmap_after page=0 length=4096");
             return Ok(None);
         }
 
