@@ -3397,9 +3397,23 @@ fn run() -> Result<(), String> {
                                 }
                                 if operation == Operation::RunOneShotSaeAuth {
                                     let shared = Arc::new(Mutex::new(LiveClientState::default()));
+                                    let target_rcpi = target_bss
+                                        .as_ref()
+                                        .map(|bss| {
+                                            ((i16::from(bss.rssi_dbm) + 110) * 2)
+                                                .clamp(0, 220)
+                                                as u8
+                                        })
+                                        .ok_or("target BSS was not retained")?;
                                     let effects = LiveClientEffects {
                                         state: shared.clone(),
                                         target: power_target.as_ref().expect("SAE target").0,
+                                        rcpi: target_rcpi,
+                                        firmware: ClientFirmwareEffectsState::default(),
+                                        // Deliberately no physical key/WCID enable: mechanics is
+                                        // co-owned by the scan adapter. Only a future synchronous,
+                                        // lock-safe acknowledged sender may populate this seam.
+                                        uni_submit: None,
                                     };
                                     let support = live_client_support(query_from_capabilities(
                                         report.nic_capability,
@@ -5939,7 +5953,7 @@ fn encode_legacy_wme_add_wcid_command(
         0, 0, 0, 0, 13, 0, 60, 0, wcid, 1, 4, 0, 0, 0, 0, 0,
         0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0,
-        6, 0, 8, 0, 1, 0, 1, 0, 13, 0, 8, 0, 0, 0, 0, 0,
+        6, 0, 8, 0, 1, 0, 1, 0, 13, 0, 8, 0, 1, 0, 1, 0,
     ];
     bytes[66..68].copy_from_slice(&aid.to_le_bytes());
     bytes[68..74].copy_from_slice(&peer);
@@ -6110,8 +6124,10 @@ struct ClientFirmwareEffectsState {
     association: Option<LegacyWmeAssociation>,
     sequence: u8,
     ptk_installed: bool,
+    ptk_dirty: bool,
     gtk: Option<RetainedGtk>,
     igtk_installed: bool,
+    broadcast_keys_dirty: bool,
     controlled_port_open: bool,
     firmware_uncertain: bool,
 }
@@ -6169,6 +6185,9 @@ impl ClientFirmwareEffectsState {
             association.peer_wcid,
             key,
         )?;
+        // A timeout can hide a successful firmware install. Record the
+        // target before publication so teardown cannot skip its disable.
+        self.ptk_dirty = true;
         if let Err(error) = submit(command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
@@ -6187,6 +6206,7 @@ impl ClientFirmwareEffectsState {
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
         let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
+        self.broadcast_keys_dirty = true;
         if let Err(error) = submit(command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
@@ -6217,6 +6237,7 @@ impl ClientFirmwareEffectsState {
             gtk.id,
             &gtk.bytes,
         )?;
+        self.broadcast_keys_dirty = true;
         if let Err(error) = submit(command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
@@ -6252,35 +6273,38 @@ impl ClientFirmwareEffectsState {
         let Some(association) = self.association else {
             self.gtk = None;
             self.ptk_installed = false;
+            self.ptk_dirty = false;
             self.igtk_installed = false;
+            self.broadcast_keys_dirty = false;
             return Ok(());
         };
-        let mut errors = Vec::new();
-        if self.gtk.is_some() || self.igtk_installed {
-            match encode_disable_keys_command(self.next_sequence(), association.bss_index, 19, 0x0e)
+        if self.broadcast_keys_dirty {
+            encode_disable_keys_command(self.next_sequence(), association.bss_index, 19, 0x0e)
                 .and_then(|command| submit(command.as_bytes()))
-            {
-                Ok(()) => {
-                    self.gtk = None;
-                    self.igtk_installed = false;
-                }
-                Err(error) => errors.push(error),
-            }
+                .map_err(|error| {
+                    self.firmware_uncertain = true;
+                    format!("client firmware broadcast-key teardown failed: {error}")
+                })?;
+            self.gtk = None;
+            self.igtk_installed = false;
+            self.broadcast_keys_dirty = false;
         }
-        if self.ptk_installed {
-            match encode_disable_keys_command(
+        if self.ptk_dirty {
+            encode_disable_keys_command(
                 self.next_sequence(),
                 association.bss_index,
                 association.peer_wcid,
                 0,
             )
             .and_then(|command| submit(command.as_bytes()))
-            {
-                Ok(()) => self.ptk_installed = false,
-                Err(error) => errors.push(error),
-            }
+            .map_err(|error| {
+                self.firmware_uncertain = true;
+                format!("client firmware pairwise-key teardown failed: {error}")
+            })?;
+            self.ptk_installed = false;
+            self.ptk_dirty = false;
         }
-        match encode_remove_wcid_command(
+        encode_remove_wcid_command(
             self.next_sequence(),
             association.bss_index,
             association.peer_wcid,
@@ -6289,17 +6313,13 @@ impl ClientFirmwareEffectsState {
             association.negotiated_qos,
         )
         .and_then(|command| submit(&command))
-        {
-            Ok(()) => self.association = None,
-            Err(error) => errors.push(error),
-        }
-        if errors.is_empty() {
-            self.firmware_uncertain = false;
-            Ok(())
-        } else {
+        .map_err(|error| {
             self.firmware_uncertain = true;
-            Err(format!("client firmware teardown failed: {errors:?}"))
-        }
+            format!("client firmware WCID teardown failed: {error}")
+        })?;
+        self.association = None;
+        self.firmware_uncertain = false;
+        Ok(())
     }
 }
 
@@ -7820,6 +7840,13 @@ struct LiveClientState {
 struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
+    rcpi: u8,
+    firmware: ClientFirmwareEffectsState,
+    /// Injectable only: the physical SAE path deliberately leaves this
+    /// absent because effects and mechanics share the adapter backend lock.
+    /// A future owner must provide a genuinely synchronous ACK boundary, not
+    /// a raw loader pointer or deferred command pump.
+    uni_submit: Option<Box<dyn FnMut(&[u8]) -> Result<(), String>>>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -7829,6 +7856,11 @@ impl Mt7921ClientEffects for LiveClientEffects {
     }
     fn revoke_lifecycle(&mut self) {
         *self.state.lock().unwrap() = LiveClientState::default();
+        if let Some(submit) = self.uni_submit.as_mut() {
+            let _ = self.firmware.teardown(|command| submit(command));
+        } else {
+            self.firmware = ClientFirmwareEffectsState::default();
+        }
     }
     fn set_channel(
         &mut self,
@@ -7858,23 +7890,104 @@ impl Mt7921ClientEffects for LiveClientEffects {
         state.frame = Some(bytes.to_vec());
         Ok(())
     }
-    fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn install_key(
+        &mut self,
+        configuration: &fidl_softmac::WlanKeyConfiguration,
+    ) -> Result<(), zx::Status> {
+        if configuration.protection != Some(fidl_softmac::WlanProtection::RxTx)
+            || configuration.cipher_oui != Some([0, 15, 172])
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let association = self
+            .firmware
+            .association
+            .ok_or(zx::Status::BAD_STATE)?;
+        let key = configuration
+            .key
+            .as_deref()
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
+        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
+        let result = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
+            fidl_ieee80211::KeyType::Pairwise
+                if configuration.peer_addr == Some(association.peer)
+                    && key_id == 0
+                    && configuration.cipher_type == Some(4) =>
+            {
+                self.firmware.install_ptk(key, |command| submit(command))
+            }
+            fidl_ieee80211::KeyType::Group
+                if configuration.peer_addr == Some([0xff; 6])
+                    && (1..=3).contains(&key_id)
+                    && configuration.cipher_type == Some(4) =>
+            {
+                self.firmware
+                    .install_gtk(key_id, key, |command| submit(command))
+            }
+            fidl_ieee80211::KeyType::Igtk
+                if configuration.peer_addr == Some([0xff; 6])
+                    && (4..=5).contains(&key_id)
+                    && configuration.cipher_type == Some(6) =>
+            {
+                self.firmware
+                    .install_igtk(key_id, key, |command| submit(command))
+            }
+            _ => return Err(zx::Status::INVALID_ARGS),
+        };
+        result.map_err(|_| zx::Status::IO)
     }
     fn notify_association_complete(
         &mut self,
-        _: &fidl_softmac::WlanAssociationConfig,
+        configuration: &fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        let aid = configuration
+            .aid
+            .filter(|aid| *aid != 0)
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        if peer != self.target {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
+        self.firmware
+            .associate(
+                LegacyWmeAssociation {
+                    bss_index: 0,
+                    peer_wcid: 7,
+                    aid,
+                    peer,
+                    rcpi: self.rcpi,
+                    negotiated_qos: configuration.qos.unwrap_or(false),
+                    // This FIDL association seam does not carry RSN MFP
+                    // negotiation. IGTK installation remains supported but
+                    // cannot become a mandatory readiness predicate here.
+                    mfp_required: false,
+                },
+                |command| submit(command),
+            )
+            .map_err(|_| zx::Status::IO)
     }
     fn clear_association(
         &mut self,
-        _: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+        request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        Ok(())
+        let association = self
+            .firmware
+            .association
+            .ok_or(zx::Status::BAD_STATE)?;
+        if request.peer_addr != Some(association.peer) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
+        self.firmware
+            .teardown(|command| submit(command))
+            .map_err(|_| zx::Status::IO)
     }
-    fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
+        self.firmware
+            .set_controlled_port(up)
+            .map_err(|_| zx::Status::BAD_STATE)
     }
     fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
         Ok(None)
@@ -9990,6 +10103,7 @@ mod tests {
         assert_eq!(&encoded[56..76], &[0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 3, 0]);
         assert_eq!(&encoded[116..124], &[13, 0, 60, 0, 7, 1, 4, 0]);
         assert_eq!(&encoded[128..148], &[0, 0, 20, 0, 16, 32, 48, 64, 80, 96, 0, 0, 0, 1, 0, 0, 42, 0, 0, 0]);
+        assert_eq!(&encoded[168..176], &[13, 0, 8, 0, 1, 0, 1, 0]);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -10089,6 +10203,76 @@ mod tests {
         state.teardown(|_| Ok(())).unwrap();
         assert!(!state.firmware_uncertain);
         assert!(state.association.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn live_client_effects_submit_cid3_synchronously_and_keep_physical_path_disabled() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let submitted = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let submitted_for_effect = submitted.clone();
+        let mut effects = LiveClientEffects {
+            state: Arc::new(Mutex::new(LiveClientState::default())),
+            target: peer,
+            rcpi: 100,
+            firmware: ClientFirmwareEffectsState::default(),
+            uni_submit: Some(Box::new(move |command| {
+                validate_uni_request(3, command)?;
+                submitted_for_effect.lock().unwrap().push(command.to_vec());
+                Ok(())
+            })),
+        };
+        let association = fidl_softmac::WlanAssociationConfig {
+            bssid: Some(peer),
+            aid: Some(42),
+            qos: Some(true),
+            ..Default::default()
+        };
+        effects.notify_association_complete(&association).unwrap();
+        assert_eq!(submitted.lock().unwrap().len(), 1);
+        assert!(!effects.firmware.controlled_port_open);
+
+        let key = |key_type, peer_addr, key_idx, cipher_type, byte| {
+            fidl_softmac::WlanKeyConfiguration {
+                protection: Some(fidl_softmac::WlanProtection::RxTx),
+                cipher_oui: Some([0, 15, 172]),
+                cipher_type: Some(cipher_type),
+                key_type: Some(key_type),
+                peer_addr: Some(peer_addr),
+                key_idx: Some(key_idx),
+                key: Some(vec![byte; 16]),
+                rsc: Some(0),
+            }
+        };
+        effects
+            .install_key(&key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11))
+            .unwrap();
+        assert_eq!(effects.set_link_up(true), Err(zx::Status::BAD_STATE));
+        effects
+            .install_key(&key(fidl_ieee80211::KeyType::Group, [0xff; 6], 2, 4, 0x22))
+            .unwrap();
+        effects.set_link_up(true).unwrap();
+        assert!(effects.firmware.controlled_port_open);
+        effects
+            .clear_association(&fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
+                peer_addr: Some(peer),
+            })
+            .unwrap();
+        assert_eq!(submitted.lock().unwrap().len(), 6);
+        assert!(effects.firmware.association.is_none());
+
+        let mut physically_unbound = LiveClientEffects {
+            state: Arc::new(Mutex::new(LiveClientState::default())),
+            target: peer,
+            rcpi: 100,
+            firmware: ClientFirmwareEffectsState::default(),
+            uni_submit: None,
+        };
+        assert_eq!(
+            physically_unbound.notify_association_complete(&association),
+            Err(zx::Status::NOT_SUPPORTED)
+        );
+        assert!(physically_unbound.firmware.association.is_none());
     }
 
     #[cfg(feature = "fuchsia-passive")]
