@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bdf=0000:67:00.6
+dev=/sys/bus/pci/devices/$bdf
+group=/sys/kernel/iommu_groups/27
+watchdog_seconds=${DRV_HDA_WATCHDOG_SECONDS:-20}
+
+fail() { printf 'amd-hda physical guard: %s\n' "$*" >&2; exit 2; }
+[[ -d $dev ]] || fail "$bdf is absent on this boot"
+[[ $(cat "$dev/vendor") == 0x1022 && $(cat "$dev/device") == 0x15e3 ]] || fail 'PCI identity mismatch'
+[[ $(cat "$dev/subsystem_vendor") == 0x1043 && $(cat "$dev/subsystem_device") == 0x1513 ]] || fail 'PCI subsystem mismatch'
+[[ $(readlink -f "$dev/iommu_group") == $(readlink -f "$group") ]] || fail 'device is not in IOMMU group 27'
+mapfile -t members < <(find "$group/devices" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+[[ ${#members[@]} == 1 && ${members[0]} == "$bdf" ]] || fail "group 27 is not isolated: ${members[*]}"
+[[ $(basename "$(readlink -f "$dev/driver")") == snd_hda_intel ]] || fail 'snd_hda_intel does not own the function'
+[[ $EUID == 0 ]] || fail 'rerun as root after this preflight succeeds'
+[[ -e /dev/iommu ]] || fail '/dev/iommu is unavailable'
+
+cargo build -p amd-hda-spike --bin amd-hda-enumerate
+modprobe vfio-pci
+modprobe iommufd
+restored=0
+watchdog_pid=
+restore() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -n ${watchdog_pid:-} ]]; then kill "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; fi
+  if [[ -e $dev/driver && $(basename "$(readlink -f "$dev/driver")") == vfio-pci ]]; then echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind || true; fi
+  echo snd_hda_intel > "$dev/driver_override" || true
+  modprobe snd_hda_intel || true
+  echo "$bdf" > /sys/bus/pci/drivers/snd_hda_intel/bind || true
+  printf '\n' > "$dev/driver_override" || true
+  if [[ ! -e $dev/driver || $(basename "$(readlink -f "$dev/driver")") != snd_hda_intel ]]; then
+    printf 'amd-hda: native driver restoration failed; reboot is required\n' >&2
+    status=1
+  else
+    restored=1
+  fi
+  exit "$status"
+}
+trap restore EXIT INT TERM
+
+# The independent watchdog first attempts native recovery. If the process and
+# EXIT trap are wedged and VFIO still owns this no-FLR function, force reboot.
+(
+  sleep "$watchdog_seconds"
+  printf 'amd-hda: watchdog expired; attempting native recovery\n' >&2
+  if [[ -e $dev/driver && $(basename "$(readlink -f "$dev/driver")") == vfio-pci ]]; then
+    echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo snd_hda_intel > "$dev/driver_override" 2>/dev/null || true
+    modprobe snd_hda_intel 2>/dev/null || true
+    echo "$bdf" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
+  fi
+  sleep 2
+  if [[ ! -e $dev/driver || $(basename "$(readlink -f "$dev/driver")") != snd_hda_intel ]]; then
+    systemctl reboot --force --force
+  fi
+) & watchdog_pid=$!
+
+echo vfio-pci > "$dev/driver_override"
+echo "$bdf" > "$dev/driver/unbind"
+echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/bind
+for _ in {1..50}; do
+  cdev=$(find "$dev/vfio-dev" -mindepth 1 -maxdepth 1 -printf '%f' 2>/dev/null || true)
+  [[ -n $cdev && -c /dev/vfio/devices/$cdev ]] && break
+  sleep .02
+done
+[[ -n ${cdev:-} && -c /dev/vfio/devices/$cdev ]] || fail 'VFIO device cdev did not appear'
+
+timeout --signal=TERM "$((watchdog_seconds - 2))" target/debug/amd-hda-enumerate "/dev/vfio/devices/$cdev"
