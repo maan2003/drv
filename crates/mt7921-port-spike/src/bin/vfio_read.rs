@@ -28,15 +28,16 @@ use mt7921_port_spike::{
     DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
     DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
     FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, FirmwareOwnershipEvent,
-    GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle,
-    MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN,
-    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus,
-    OwnershipError, OwnershipEvent, OwnershipRoundTripEvent, OwnershipRoundTripTransport,
-    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability,
-    PciIrqKind, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
-    TopOwnershipTransport, TxRingState, WfsysResetEvent, WfsysResetTransport,
-    acquire_driver_ownership, acquire_top_driver_ownership, encode_download_command,
-    encode_mt7921_5ghz_auth_tx, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
+    GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, IrqResetCleanupStep,
+    IrqResetEvent, IrqResetTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxRegisters,
+    Mt7921TxFree, Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
+    OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
+    PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
+    WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
+    load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
     mask_ack_disabled_fwdl_interrupt, mt76_pci_aspm_supported, mt7921_packet_type,
     parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
     parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
@@ -1095,14 +1096,14 @@ fn run() -> Result<(), String> {
                 "vfio_bar0_mmap_after page={selector_page:#x} length=4096"
             ));
             record_sae_stage(&format!(
-                "vfio_bar0_mmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length={} prot=read flags=shared region_size={} region_offset={}",
+                "vfio_bar0_mmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length={} prot=read_write flags=shared region_size={} region_offset={}",
                 PAGE, bar0.size, bar0.offset
             ));
             let mut window = match ReadPage::map(
                 &capsule.device,
                 &bar0,
                 MT_HIF_REMAP_WINDOW_BAR_OFFSET,
-                false,
+                true,
             ) {
                 Ok(page) => page,
                 Err(error) => {
@@ -1531,36 +1532,96 @@ fn run() -> Result<(), String> {
                     })()
                 });
 
-                record_sae_stage(&format!(
-                    "vfio_pcie_mac_int_enable_restore_write_before offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
-                ));
-                let restore = (|| -> Result<u32, String> {
-                    if let Err(error) =
-                        pcie_mac_page.restore_pcie_mac_interrupt_enable(saved_mac_interrupt_enable)
-                    {
+                let irq_reset = ownership.as_ref().map_or(Ok(()), |_| {
+                    (|| -> Result<(), String> {
+                        record_sae_stage("vfio_irq_reset_boundary_begin");
+                        let mut wfdma_page = ReadPage::map(&capsule.device, &bar0, 0xd4000, true)?;
+                        let result = {
+                            let ledger = capsule
+                                .containment
+                                .as_mut()
+                                .expect("guarded gate has containment ledger");
+                            for hazard in [
+                                Hazard::HostControl,
+                                Hazard::DeviceIrq,
+                                Hazard::Wfdma,
+                                Hazard::LabMutated,
+                            ] {
+                                ledger.mark_possibly_active(hazard);
+                            }
+                            let mut transport = VfioIrqResetBoundary {
+                                wfsys: VfioWfsysReset {
+                                    selector: &page,
+                                    window: &window,
+                                    start: Instant::now(),
+                                    saved: saved_selector,
+                                },
+                                device: &capsule.device,
+                                wfdma: &wfdma_page,
+                                pcie_mac: &pcie_mac_page,
+                                irq: None,
+                                selected: selected_irq,
+                                bdf: &bdf,
+                                ledger,
+                            };
+                            exercise_irq_reset_boundary(
+                                &mut transport,
+                                selected_irq,
+                                record_irq_reset_stage,
+                            )
+                        };
+                        if result.as_ref().is_err_and(|error| {
+                            error
+                                .cleanup
+                                .iter()
+                                .any(|(step, _)| *step == IrqResetCleanupStep::VerifyContained)
+                        }) {
+                            record_sae_stage("vfio_irq_reset_boundary_unsafe_retaining_resources");
+                            park_retention_capsule_ref(&mut capsule);
+                        }
+                        record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
+                        wfdma_page.teardown()?;
+                        record_sae_stage("vfio_irq_reset_wfdma_munmap_after page=0xd4000");
+                        result.map_err(|error| format!("IRQ/reset boundary: {error:?}"))?;
+                        record_sae_stage("vfio_irq_reset_boundary_passed_contained");
+                        Ok(())
+                    })()
+                });
+
+                let restore = if ownership.is_err() {
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_restore_write_before offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                    ));
+                    (|| -> Result<Option<u32>, String> {
+                        if let Err(error) = pcie_mac_page
+                            .restore_pcie_mac_interrupt_enable(saved_mac_interrupt_enable)
+                        {
+                            record_sae_stage(&format!(
+                                "vfio_pcie_mac_int_enable_restore_write_error offset=0x10188 bytes=4 error={error}"
+                            ));
+                            return Err(error);
+                        }
                         record_sae_stage(&format!(
-                            "vfio_pcie_mac_int_enable_restore_write_error offset=0x10188 bytes=4 error={error}"
+                            "vfio_pcie_mac_int_enable_restore_write_after offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
                         ));
-                        return Err(error);
-                    }
-                    record_sae_stage(&format!(
-                        "vfio_pcie_mac_int_enable_restore_write_after offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
-                    ));
-                    record_sae_stage(
-                        "vfio_pcie_mac_int_enable_restore_verify_before offset=0x10188 bytes=4",
-                    );
-                    let restored = pcie_mac_page.read(0x10188)?;
-                    record_sae_stage(&format!(
-                        "vfio_pcie_mac_int_enable_restore_verify_after offset=0x10188 bytes=4 value={restored:#010x} expected={saved_mac_interrupt_enable:#010x} equal={}",
-                        restored == saved_mac_interrupt_enable
-                    ));
-                    if restored != saved_mac_interrupt_enable {
-                        return Err(format!(
-                            "MT_PCIE_MAC_INT_ENABLE restore mismatch: saved={saved_mac_interrupt_enable:#010x} restored={restored:#010x}"
+                        record_sae_stage(
+                            "vfio_pcie_mac_int_enable_restore_verify_before offset=0x10188 bytes=4",
+                        );
+                        let restored = pcie_mac_page.read(0x10188)?;
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_restore_verify_after offset=0x10188 bytes=4 value={restored:#010x} expected={saved_mac_interrupt_enable:#010x} equal={}",
+                            restored == saved_mac_interrupt_enable
                         ));
-                    }
-                    Ok(restored)
-                })();
+                        if restored != saved_mac_interrupt_enable {
+                            return Err(format!(
+                                "MT_PCIE_MAC_INT_ENABLE restore mismatch: saved={saved_mac_interrupt_enable:#010x} restored={restored:#010x}"
+                            ));
+                        }
+                        Ok(Some(restored))
+                    })()
+                } else {
+                    Ok(None)
+                };
                 record_sae_stage("vfio_bar0_munmap_before page=0x10000 length=4096");
                 let unmap = pcie_mac_page.teardown();
                 match &unmap {
@@ -1573,8 +1634,9 @@ fn run() -> Result<(), String> {
                 let restored_mac_interrupt_enable = restore?;
                 disable?;
                 ownership?;
+                irq_reset?;
                 record_sae_stage(&format!(
-                    "vfio_pcie_mac_int_enable_round_trip_complete saved={saved_mac_interrupt_enable:#010x} disabled=0x00000000 restored={restored_mac_interrupt_enable:#010x}"
+                    "vfio_irq_reset_cleanup_complete saved_mac={saved_mac_interrupt_enable:#010x} restored_on_pre_reset_error={restored_mac_interrupt_enable:?} safe_mac=0x00000000"
                 ));
                 Ok(())
             })();
@@ -7178,6 +7240,27 @@ impl Drop for VfioIrq {
     }
 }
 
+fn disable_vfio_irq_index(device: &File, capability: PciIrqCapability) -> Result<(), String> {
+    let index = match capability.kind {
+        PciIrqKind::Intx => 0,
+        PciIrqKind::Msi => 1,
+        PciIrqKind::Msix => 2,
+    };
+    let mut set = IrqSetHeader {
+        argsz: size::<IrqSetHeader>(),
+        flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+        index,
+        start: 0,
+        count: 0,
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_SET_IRQS,
+        &mut set,
+        "explicitly disable VFIO IRQ index",
+    )
+}
+
 struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
@@ -8003,6 +8086,96 @@ impl WfsysResetTransport for VfioWfsysReset<'_> {
 
 fn log_wfsys_reset_event(event: WfsysResetEvent) {
     println!("{{\"wfsys_reset_event\":\"{event:?}\"}}")
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct VfioIrqResetBoundary<'a> {
+    wfsys: VfioWfsysReset<'a>,
+    device: &'a Arc<File>,
+    wfdma: &'a ReadPage,
+    pcie_mac: &'a ReadPage,
+    irq: Option<VfioIrq>,
+    selected: PciIrqCapability,
+    bdf: &'a str,
+    ledger: &'a mut ContainmentLedger,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl WfsysResetTransport for VfioIrqResetBoundary<'_> {
+    type Error = String;
+    fn now_ms(&self) -> u64 {
+        self.wfsys.now_ms()
+    }
+    fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+        self.wfsys.read_reset_control()
+    }
+    fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.wfsys.write_reset_control(value)
+    }
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        self.wfsys.sleep_ms(milliseconds)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl IrqResetTransport for VfioIrqResetBoundary<'_> {
+    fn install_irq(&mut self, capability: PciIrqCapability) -> Result<(), Self::Error> {
+        self.ledger.mark_possibly_active(Hazard::DeviceIrq);
+        self.irq = Some(VfioIrq::install(self.device, capability)?);
+        Ok(())
+    }
+    fn mask_host_irq(&mut self) -> Result<(), Self::Error> {
+        self.wfdma.write_active_wfdma(0xd4204, 0)
+    }
+    fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+        self.pcie_mac.write_pcie_mac_interrupt_enable(0xff)
+    }
+    fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+        self.pcie_mac.write_pcie_mac_interrupt_enable_zero()
+    }
+    fn disable_irq(&mut self) -> Result<(), Self::Error> {
+        let owner = match self.irq.as_mut() {
+            Some(irq) => irq.disable(),
+            None => Ok(()),
+        };
+        let explicit = disable_vfio_irq_index(self.device, self.selected);
+        match (owner, explicit) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(owner), Err(explicit)) => Err(format!(
+                "disable IRQ owner: {owner}; explicit index disable: {explicit}"
+            )),
+        }
+    }
+    fn containment_reset(&mut self) -> Result<(), Self::Error> {
+        reset_vfio_device(self.device)
+    }
+    fn verify_contained(&mut self) -> Result<(), Self::Error> {
+        verify_active_reset_containment(self.wfdma, self.pcie_mac)?;
+        verify_pci_dma_disabled(self.bdf)?;
+        for hazard in [
+            Hazard::HostControl,
+            Hazard::DeviceIrq,
+            Hazard::Wfdma,
+            Hazard::BusMaster,
+            Hazard::LabMutated,
+        ] {
+            self.ledger.confirm_inactive(hazard);
+        }
+        self.ledger.phase = RunPhase::Contained;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_irq_reset_stage(event: IrqResetEvent) {
+    if matches!(
+        event,
+        IrqResetEvent::Wfsys(WfsysResetEvent::StatusRead { .. })
+    ) {
+        return;
+    }
+    record_sae_stage(&format!("vfio_irq_reset_boundary event={event:?}"));
 }
 
 fn log_top_ownership_event(event: TopOwnershipEvent) {
