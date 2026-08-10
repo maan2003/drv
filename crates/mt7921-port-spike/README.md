@@ -747,3 +747,22 @@ advances from `wlan0` to `wlanN` after reprobe.
 
 RF-kill/wakeup wiring, ASPM quirks, and reset behavior beyond the repeatedly
 successful VFIO-reset-and-native-rebind boundary remain unverified.
+
+### Spike-only D0 handoff result
+
+The Linux 6.18.40 lab kernel patch keeps one runtime-PM reference after the
+native driver's DMA/IRQ teardown for exactly `14c3:7961` subsystem
+`1a3b:4680`. With `mt7921e.keep_d0_on_remove=1`, watchdog-guarded report
+`/var/lib/wifi-driver-lab/reports/20260810T094728Z-0000_05_00.0.log` reached
+the durable stage `vfio_attached_d0_preflight_already_ready`: the VFIO cdev
+opened, iommufd opened, the device bound to iommufd, an IOAS was allocated and
+attached, and the function still reported D0 with memory decoding enabled and
+bus mastering disabled. The host then wedged before a later durable stage,
+with `VFIO_DEVICE_GET_REGION_INFO` next in the acquisition sequence. No BAR
+mapping, firmware load, DMA publication, radio operation, or SAE MPDU is proven
+by this run.
+
+The reboot watchdog recovered into the same patched closure with `mt7921e`
+bound in D0, iwd active, `wlan0` up, and the default route restored. The
+on-disk stage file and forced syncs are deliberately spike-only crash-tracing
+instrumentation, not a production logging contract.
