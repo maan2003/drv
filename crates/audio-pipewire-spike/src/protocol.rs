@@ -11,7 +11,8 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use nix::{
@@ -32,7 +33,7 @@ use pipewire_native_spa::{
     },
 };
 
-use crate::enum_format_pod;
+use crate::{PlaybackEndpoint, VirtualPcmEndpoint, enum_format_pod};
 
 const HEADER_LEN: usize = 16;
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -56,10 +57,12 @@ const PARAM_INFO_READ: i32 = 1 << 1;
 const CLIENT_NODE_TRANSPORT: u8 = 0;
 const CLIENT_NODE_SET_PARAM: u8 = 1;
 const CLIENT_NODE_PORT_USE_BUFFERS: u8 = 8;
+const CLIENT_NODE_COMMAND: u8 = 4;
+const CLIENT_NODE_PORT_SET_IO: u8 = 9;
 const ACTIVATION_SIZE: i32 = 4096;
 const BUFFER_COUNT: i32 = 2;
 const BUFFER_STRIDE: i32 = 12 * 1024;
-const BUFFER_DATA_OFFSET: i32 = 16;
+const BUFFER_DATA_OFFSET: i32 = 64;
 const BUFFER_DATA_SIZE: i32 = 8 * 1024;
 
 const VIRTUAL_SINK_NODE_ID: i32 = 2;
@@ -116,27 +119,29 @@ struct ClientNodeObject {
 
 #[derive(Debug)]
 struct ClientTransport {
-    _activation: File,
-    _read_event: EventFd,
+    activation: File,
+    read_event: EventFd,
     _write_event: EventFd,
 }
 
 #[derive(Debug)]
 struct ClientBuffers {
-    _memory: File,
+    memory: File,
+    io: File,
 }
 
-/// Accept one standard PipeWire native client and finish after its post-registry sync.
-pub fn serve_one(listener: &UnixListener) -> io::Result<()> {
+/// Serve one native client and return its Fuchsia-derived playback frame position.
+pub fn serve_one(listener: &UnixListener) -> io::Result<u64> {
     let (mut stream, _) = listener.accept()?;
     serve_connection(&mut stream)
 }
 
-fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
+fn serve_connection(stream: &mut UnixStream) -> io::Result<u64> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
     let mut client_nodes: Vec<ClientNodeObject> = Vec::new();
+    let mut endpoint = VirtualPcmEndpoint::default();
 
     loop {
         let (header, payload) = match read_message(stream) {
@@ -151,7 +156,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                             | io::ErrorKind::ConnectionReset
                     ) =>
             {
-                return Ok(());
+                return Ok(endpoint.frame_position());
             }
             Err(error) => return Err(error),
         };
@@ -194,12 +199,6 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                 2 => {
                     let port_config = decode_client_node_update(&payload)?;
                     client_nodes[client_node_index].node_updated = true;
-                    let transport = write_client_transport(
-                        stream,
-                        client_nodes[client_node_index].proxy_id,
-                        &mut out_seq,
-                    )?;
-                    client_nodes[client_node_index].transport = Some(transport);
                     if let Some(port_config) = port_config {
                         write_client_node_set_param(
                             stream,
@@ -231,10 +230,17 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                             &mut out_seq,
                         )?;
                         client_nodes[client_node_index].buffers = Some(buffers);
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "client-node buffer I/O and activation scheduling are the next unsupported PipeWire operations",
-                        ));
+                        write_client_node_start(
+                            stream,
+                            client_nodes[client_node_index].proxy_id,
+                            &mut out_seq,
+                        )?;
+                        drive_client_node(
+                            &mut endpoint,
+                            client_nodes[client_node_index].transport.as_ref().unwrap(),
+                            client_nodes[client_node_index].buffers.as_ref().unwrap(),
+                        )?;
+                        return Ok(endpoint.frame_position());
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -242,7 +248,14 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                         ));
                     }
                 }
-                4 => decode_client_node_set_active(&payload)?,
+                4 => {
+                    let active = decode_client_node_set_active(&payload)?;
+                    if let Some(transport) = &client_nodes[client_node_index].transport {
+                        transport
+                            .activation
+                            .write_all_at(&(if active { 3_u32 } else { 4_u32 }).to_ne_bytes(), 0)?;
+                    }
+                }
                 opcode => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -298,7 +311,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                 registry_id = Some(new_registry_id);
             }
             (CORE_ID, CORE_CREATE_OBJECT) => {
-                let client_node = decode_create_client_node(&payload)?;
+                let mut client_node = decode_create_client_node(&payload)?;
                 if proxy_id_in_use(
                     client_node.proxy_id,
                     registry_id,
@@ -311,6 +324,11 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                     ));
                 }
                 write_bound_props(stream, client_node.proxy_id, &mut out_seq)?;
+                client_node.transport = Some(write_client_transport(
+                    stream,
+                    client_node.proxy_id,
+                    &mut out_seq,
+                )?);
                 client_nodes.push(client_node);
                 stream.set_read_timeout(None)?;
             }
@@ -488,14 +506,15 @@ fn decode_client_node_port_update(payload: &[u8]) -> io::Result<bool> {
         .map_err(invalid_pod)
 }
 
-fn decode_client_node_set_active(payload: &[u8]) -> io::Result<()> {
+fn decode_client_node_set_active(payload: &[u8]) -> io::Result<bool> {
     let mut parser = Parser::new(payload);
     parser
         .pop_struct(|fields| {
-            fields.pop_bool()?;
-            require_empty(fields, "ClientNode.SetActive")
+            let active = fields.pop_bool()?;
+            require_empty(fields, "ClientNode.SetActive")?;
+            Ok(active)
         })
-        .map(|_| ())
+        .map(|(active, _)| active)
         .map_err(invalid_pod)
 }
 
@@ -861,6 +880,20 @@ fn write_client_transport(
     let activation = File::from(activation);
     // `PW_NODE_ACTIVATION_INACTIVE`; the remaining activation page starts zeroed.
     activation.write_all_at(&4_u32.to_ne_bytes(), 0)?;
+    activation.write_all_at(&(CLIENT_NODE_GLOBAL_ID as u32).to_ne_bytes(), 564)?;
+    activation.write_all_at(&1_u32.to_ne_bytes(), 640)?;
+    activation.write_all_at(&48_000_u32.to_ne_bytes(), 644)?;
+    activation.write_all_at(&480_u64.to_ne_bytes(), 656)?;
+    activation.write_all_at(&1_u32.to_ne_bytes(), 688)?;
+    activation.write_all_at(&48_000_u32.to_ne_bytes(), 692)?;
+    activation.write_all_at(&480_u64.to_ne_bytes(), 696)?;
+    activation.write_all_at(&1_u32.to_ne_bytes(), 720)?;
+    activation.write_all_at(&i64::MIN.to_ne_bytes(), 760)?;
+    activation.write_all_at(&2_u32.to_ne_bytes(), 768)?;
+    activation.write_all_at(&1_u32.to_ne_bytes(), 772)?;
+    for segment in 0..8_u64 {
+        activation.write_all_at(&1_f64.to_ne_bytes(), 800 + segment * 184)?;
+    }
 
     let event_flags = EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK;
     let read_event = EventFd::from_value_and_flags(0, event_flags).map_err(io::Error::from)?;
@@ -902,8 +935,8 @@ fn write_client_transport(
     *out_seq += 1;
 
     Ok(ClientTransport {
-        _activation: activation,
-        _read_event: read_event,
+        activation,
+        read_event,
         _write_event: write_event,
     })
 }
@@ -1015,7 +1048,183 @@ fn write_client_node_buffers(
     )?;
     *out_seq += 1;
 
-    Ok(ClientBuffers { _memory: memory })
+    let io = memfd_create(
+        "drv-client-node-buffer-io",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .map_err(io::Error::from)?;
+    ftruncate(&io, 8).map_err(io::Error::from)?;
+    let io = File::from(io);
+    io.write_all_at(&1_i32.to_ne_bytes(), 0)?;
+    io.write_all_at(&u32::MAX.to_ne_bytes(), 4)?;
+
+    let add_io_mem = encode_struct(|builder| {
+        builder
+            .push_int(2)
+            .push_id(Id(2_u32))
+            .push_fd(0)
+            .push_int(3)
+    })?;
+    write_message_with_fds(
+        stream,
+        CORE_ID,
+        CORE_ADD_MEM,
+        *out_seq,
+        &add_io_mem,
+        &[io.as_raw_fd()],
+    )?;
+    *out_seq += 1;
+
+    let set_io = encode_struct(|builder| {
+        builder
+            .push_int(1)
+            .push_int(0)
+            .push_int(-1)
+            .push_id(Id(1_u32))
+            .push_int(2)
+            .push_int(0)
+            .push_int(8)
+    })?;
+    write_message(
+        stream,
+        client_node_id,
+        CLIENT_NODE_PORT_SET_IO,
+        *out_seq,
+        &set_io,
+    )?;
+    *out_seq += 1;
+
+    Ok(ClientBuffers { memory, io })
+}
+
+fn write_client_node_start(
+    stream: &mut UnixStream,
+    client_node_id: u32,
+    out_seq: &mut u32,
+) -> io::Result<()> {
+    let mut command = Vec::with_capacity(16);
+    command.extend(8_u32.to_ne_bytes());
+    command.extend((Type::Object as u32).to_ne_bytes());
+    command.extend(0x30002_u32.to_ne_bytes());
+    command.extend(2_u32.to_ne_bytes());
+    let command = RawPod::wrap(&command).map_err(invalid_pod)?;
+    let body = encode_struct(|builder| builder.push_pod(&command))?;
+    write_message(stream, client_node_id, CLIENT_NODE_COMMAND, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
+fn drive_client_node(
+    endpoint: &mut VirtualPcmEndpoint,
+    transport: &ClientTransport,
+    buffers: &ClientBuffers,
+) -> io::Result<()> {
+    thread::sleep(Duration::from_millis(10));
+    let mut recycled = u32::MAX;
+
+    for _ in 0..256 {
+        buffers.io.write_all_at(&1_i32.to_ne_bytes(), 0)?;
+        buffers.io.write_all_at(&recycled.to_ne_bytes(), 4)?;
+        transport.activation.write_all_at(&1_u32.to_ne_bytes(), 0)?;
+        transport.read_event.write(1).map_err(io::Error::from)?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let inactive = loop {
+            let mut status = [0; 4];
+            transport.activation.read_exact_at(&mut status, 0)?;
+            let status = u32::from_ne_bytes(status);
+            if status == 3 {
+                break false;
+            }
+            if status == 4 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("client did not complete an activation cycle (status {status})"),
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        if inactive {
+            for buffer_id in 0..BUFFER_COUNT as u32 {
+                let base = u64::from(buffer_id) * BUFFER_STRIDE as u64;
+                let mut size = [0; 4];
+                buffers.memory.read_exact_at(&mut size, base + 4)?;
+                if u32::from_ne_bytes(size) != 0 {
+                    consume_client_buffer(endpoint, buffers, buffer_id)?;
+                    break;
+                }
+            }
+            if endpoint.frame_position() != 0 {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client deactivated without producing PCM",
+            ));
+        }
+
+        let mut io_state = [0; 8];
+        buffers.io.read_exact_at(&mut io_state, 0)?;
+        let status = i32::from_ne_bytes(io_state[0..4].try_into().unwrap());
+        let buffer_id = u32::from_ne_bytes(io_state[4..8].try_into().unwrap());
+        if status & 2 != 0 {
+            if buffer_id >= BUFFER_COUNT as u32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "client produced an invalid buffer id",
+                ));
+            }
+            consume_client_buffer(endpoint, buffers, buffer_id)?;
+            recycled = buffer_id;
+        } else if status & 8 != 0 {
+            return Ok(());
+        } else if status < 0 {
+            return Err(io::Error::from_raw_os_error(-status));
+        } else {
+            recycled = u32::MAX;
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "client did not drain within the bounded scheduling loop",
+    ))
+}
+
+fn consume_client_buffer(
+    endpoint: &mut VirtualPcmEndpoint,
+    buffers: &ClientBuffers,
+    buffer_id: u32,
+) -> io::Result<()> {
+    let base = u64::from(buffer_id) * BUFFER_STRIDE as u64;
+    let mut chunk = [0; 16];
+    buffers.memory.read_exact_at(&mut chunk, base)?;
+    let offset = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()) as usize;
+    let size = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()) as usize;
+    if size > BUFFER_DATA_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "client produced an oversized PCM chunk",
+        ));
+    }
+    let offset = offset % BUFFER_DATA_SIZE as usize;
+    let first = size.min(BUFFER_DATA_SIZE as usize - offset);
+    let mut pcm = vec![0; size];
+    buffers.memory.read_exact_at(
+        &mut pcm[..first],
+        base + BUFFER_DATA_OFFSET as u64 + offset as u64,
+    )?;
+    if first < size {
+        buffers
+            .memory
+            .read_exact_at(&mut pcm[first..], base + BUFFER_DATA_OFFSET as u64)?;
+    }
+    endpoint
+        .write(&pcm)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))
 }
 
 fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) -> io::Result<()> {
@@ -1493,12 +1702,17 @@ mod tests {
         client.write_all(&port_update).unwrap();
         let (set_format, _) = read_message(&mut client).unwrap();
         assert_eq!((set_format.id, set_format.opcode), (8, 7));
-        let mut selected_format = format.data().to_vec();
-        selected_format[12..16].copy_from_slice(&(ParamType::Format as u32).to_ne_bytes());
-        let selected_format = RawPod::wrap(&selected_format).unwrap();
-        client
-            .write_all(&client_port_update(8, &selected_format, ParamType::Format))
-            .unwrap();
+        drop(client);
+        assert_eq!(worker.join().unwrap().unwrap(), 0);
+    }
+
+    #[test]
+    fn sends_real_shared_pcm_and_io_memory() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let mut seq = 0;
+            write_client_node_buffers(&mut server, 8, &mut seq).unwrap()
+        });
 
         let (buffer_mem, buffer_mem_fds, _) = read_message_with_fds(&mut client);
         assert_eq!((buffer_mem.id, buffer_mem.opcode), (0, 6));
@@ -1529,8 +1743,27 @@ mod tests {
             })
             .unwrap();
 
-        let error = worker.join().unwrap().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("activation scheduling"));
+        let (io_mem, io_mem_fds, _) = read_message_with_fds(&mut client);
+        assert_eq!((io_mem.id, io_mem.opcode), (0, 6));
+        assert_received_fds(io_mem_fds, 1, Some(8));
+        let (set_io, _) = read_message(&mut client).unwrap();
+        assert_eq!((set_io.id, set_io.opcode), (8, 9));
+        drop(client);
+        let buffers = worker.join().unwrap();
+        buffers
+            .memory
+            .write_all_at(&0_u32.to_ne_bytes(), 0)
+            .unwrap();
+        buffers
+            .memory
+            .write_all_at(&1920_u32.to_ne_bytes(), 4)
+            .unwrap();
+        buffers
+            .memory
+            .write_all_at(&[0; 1920], BUFFER_DATA_OFFSET as u64)
+            .unwrap();
+        let mut endpoint = VirtualPcmEndpoint::default();
+        consume_client_buffer(&mut endpoint, &buffers, 0).unwrap();
+        assert_eq!(endpoint.frame_position(), 480);
     }
 }

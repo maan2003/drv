@@ -56,6 +56,10 @@ playback port, and sends standard `Core.AddMem` and `ClientNode.Transport`
 events carrying a shared activation memfd and two eventfds. It accepts the
 stock port's advertised formats, selects the fixed S16LE/48 kHz/stereo Format,
 then exports two real memfd-backed PCM buffer descriptors with
-`ClientNode.PortUseBuffers`. The exact next boundary is buffer I/O and
-activation scheduling; clock/quantum handling and moving shared PCM bytes into
-the Fuchsia-backed endpoint remain unimplemented.
+`ClientNode.PortUseBuffers`. The bounded spike also supplies shared
+`SPA_IO_Buffers`, starts and activates the client node, recycles its buffers,
+and writes each finite PCM chunk into the Fuchsia TimelineFunction-backed
+endpoint. A 1,920-byte stock `pw-cat` playback exits successfully with a
+reported position of 480 frames. Production graph policy, realtime pacing,
+multi-node clock/quantum coordination, and long-running playback remain outside
+this spike.
