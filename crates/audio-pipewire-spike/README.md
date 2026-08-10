@@ -85,8 +85,8 @@ then exports two real memfd-backed PCM buffer descriptors with
 and writes each finite PCM chunk into the Fuchsia TimelineFunction-backed
 endpoint. A 1,920-byte stock `pw-cat` playback exits successfully with a
 reported position of 480 frames and a checksum of the post-gain samples.
-Production graph policy, realtime pacing, multi-node clock/quantum coordination,
-and long-running playback remain outside this spike.
+Production graph policy and multi-node clock/quantum coordination remain
+outside this spike.
 
 Stock `pw-cli ls Node` reports registry-projected `object.serial = "2"`,
 `device.api = "fuchsia.audio.device"`, `node.name =
@@ -98,12 +98,14 @@ registered ring-buffer endpoint to frame 480 and produce checksum 5,280,000.
 
 `daemon` keeps the native `pipewire-0` socket and the single registered ADR
 device alive across client disconnects. Each connection has independent native
-protocol, activation and shared-buffer state. Completed playback lifecycles are
-serialized into the one registry-owned ring-buffer worker. Non-overlapping
-streams advance separately; two connection lifecycles whose active intervals
-overlap are accumulated through the pinned Fuchsia mixer into one output frame
-interval. Discovery-only clients never mutate the ring state, and malformed or
-disconnected clients do not stop the listener.
+protocol, activation and shared-buffer state. Every produced PipeWire buffer is
+consumed, recycled, and sent as a separate quantum to the one registry-owned
+ring-buffer worker; a stream is not retained as one completed PCM blob.
+Non-overlapping streams advance separately. While two streams are active, their
+queued quantum slices are incrementally accumulated through the pinned Fuchsia
+sampler before each result is written to the ADR ring. Discovery-only clients
+never mutate ring state, and malformed or disconnected clients do not stop the
+listener.
 
 A stock PipeWire 1.6.6 probe ran `pw-cli ls Node` concurrently with playback,
 then two sequential stock `pw-cat` sessions followed by two overlapping stock
@@ -111,3 +113,12 @@ then two sequential stock `pw-cat` sessions followed by two overlapping stock
 480, 960 and 1440, with cumulative post-Fuchsia-processing checksums 2,880,000,
 5,280,000 and 10,560,000. All five clients exited successfully with empty
 stderr; the daemon remained alive until the probe explicitly terminated it.
+
+A three-second stock `pw-cat` stream (576,000 bytes, far larger than the 8 KiB
+shared-buffer data area) produced 300 patterned 480-frame quanta plus the stock
+client's final 480-frame silent drain quantum. The daemon reported 301 monotonic
+ring writes and final position 144,480 with exact patterned checksum
+864,000,000. `pw-cli` discovery succeeded while this stream was active and all
+stderr was empty. Two concurrent three-second streams produced the same 301
+output quanta through incremental Fuchsia mixing, ending at position 144,480
+and exact checksum 1,584,000,000.

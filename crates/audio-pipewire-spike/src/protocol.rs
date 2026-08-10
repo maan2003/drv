@@ -1,6 +1,7 @@
 //! Minimal server side of the PipeWire native discovery protocol.
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs::File,
     io::IoSlice,
     io::{self, Read, Write},
@@ -22,6 +23,7 @@ use nix::{
         memfd::{MFdFlags, memfd_create},
         socket::{ControlMessage, MsgFlags, sendmsg},
     },
+    time::{ClockId, clock_gettime},
     unistd::ftruncate,
 };
 use pipewire_native_spa::{
@@ -122,34 +124,60 @@ pub struct PlaybackResult {
 }
 
 #[derive(Debug)]
-struct StreamLifecycle {
-    connected_at: Instant,
-    disconnected_at: Instant,
-    pcm: Vec<u8>,
+enum StreamEvent {
+    Started(u64),
+    Chunk(u64, Vec<u8>),
+    Ended(u64),
+}
+
+#[derive(Debug)]
+struct ActiveStream {
+    quantums: VecDeque<Vec<u8>>,
+    ended: bool,
+    solo: bool,
+    started_at: Instant,
+}
+
+impl ActiveStream {
+    fn new() -> Self {
+        Self {
+            quantums: VecDeque::new(),
+            ended: false,
+            solo: false,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 /// Run the single-user compatibility daemon until its listener is closed.
 pub fn serve_daemon(listener: &UnixListener) -> io::Result<()> {
     let registry = DeviceRegistry::register_virtual_playback();
     let device = registry.playback().info().clone();
-    let (completed_tx, completed_rx) = mpsc::channel();
-    thread::spawn(move || run_ring_buffer_worker(registry, completed_rx));
+    let (event_tx, event_rx) = mpsc::channel();
+    thread::spawn(move || run_ring_buffer_worker(registry, event_rx));
+    let mut next_stream_id = 1;
 
     loop {
         let (mut stream, _) = listener.accept()?;
-        let connected_at = Instant::now();
+        let stream_id = next_stream_id;
+        next_stream_id += 1;
         let device = device.clone();
-        let completed_tx = completed_tx.clone();
-        thread::spawn(move || match serve_connection(&mut stream, &device) {
-            Ok(pcm) if !pcm.is_empty() => {
-                let _ = completed_tx.send(StreamLifecycle {
-                    connected_at,
-                    disconnected_at: Instant::now(),
-                    pcm,
-                });
+        let event_tx = event_tx.clone();
+        thread::spawn(move || {
+            let mut started = false;
+            let result = serve_connection_with(&mut stream, &device, &mut |pcm| {
+                if !started {
+                    let _ = event_tx.send(StreamEvent::Started(stream_id));
+                    started = true;
+                }
+                let _ = event_tx.send(StreamEvent::Chunk(stream_id, pcm));
+            });
+            if started {
+                let _ = event_tx.send(StreamEvent::Ended(stream_id));
             }
-            Ok(_) => {}
-            Err(error) => eprintln!("PipeWire client disconnected: {error}"),
+            if let Err(error) = result {
+                eprintln!("PipeWire client disconnected: {error}");
+            }
         });
     }
 }
@@ -174,11 +202,29 @@ pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
 }
 
 fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> io::Result<Vec<u8>> {
+    let mut chunks = Vec::new();
+    serve_connection_with(stream, device, &mut |chunk| chunks.push(chunk))?;
+    // Keep the legacy bounded probe result stable; persistent mode forwards
+    // this stock-client drain quantum to the ring as a real timeline interval.
+    if chunks.len() > 1
+        && chunks
+            .last()
+            .is_some_and(|chunk| chunk.iter().all(|sample| *sample == 0))
+    {
+        chunks.pop();
+    }
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+fn serve_connection_with(
+    stream: &mut UnixStream,
+    device: &RegisteredDeviceInfo,
+    on_pcm: &mut impl FnMut(Vec<u8>),
+) -> io::Result<()> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
     let mut client_nodes: Vec<ClientNodeObject> = Vec::new();
-    let mut pcm = Vec::new();
 
     loop {
         let (header, payload) = match read_message(stream) {
@@ -193,7 +239,7 @@ fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> i
                             | io::ErrorKind::ConnectionReset
                     ) =>
             {
-                return Ok(pcm);
+                return Ok(());
             }
             Err(error) => return Err(error),
         };
@@ -274,11 +320,11 @@ fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> i
                             &mut out_seq,
                         )?;
                         drive_client_node(
-                            &mut pcm,
                             client_nodes[client_node_index].transport.as_ref().unwrap(),
                             client_nodes[client_node_index].buffers.as_ref().unwrap(),
+                            on_pcm,
                         )?;
-                        return Ok(pcm);
+                        return Ok(());
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -410,44 +456,57 @@ fn process_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) -> io::Result<Playback
     })
 }
 
-fn run_ring_buffer_worker(mut registry: DeviceRegistry, completed: Receiver<StreamLifecycle>) {
-    let mut pending = None;
+fn run_ring_buffer_worker(mut registry: DeviceRegistry, events: Receiver<StreamEvent>) {
+    let mut active = BTreeMap::new();
     loop {
-        match completed.recv_timeout(Duration::from_millis(50)) {
-            Ok(next) => {
-                if let Some(first) = pending.take() {
-                    if lifecycles_overlap(&first, &next) && first.pcm.len() == next.pcm.len() {
-                        match mix_pcm(&first.pcm, &next.pcm)
-                            .and_then(|pcm| process_pcm(&mut registry, &pcm))
-                        {
-                            Ok(result) => report_playback(result),
-                            Err(error) => eprintln!("PipeWire playback stopped: {error}"),
-                        }
-                    } else {
-                        commit_stream(&mut registry, first);
-                        pending = Some(next);
-                    }
-                } else {
-                    pending = Some(next);
-                }
-            }
+        match events.recv_timeout(Duration::from_millis(20)) {
+            Ok(event) => handle_stream_event(&mut registry, &mut active, event),
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(stream) = pending.take() {
-                    commit_stream(&mut registry, stream);
+                if active.len() == 1 {
+                    active.values_mut().for_each(|stream| stream.solo = true);
+                    drain_streams(&mut registry, &mut active);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                if let Some(stream) = pending.take() {
-                    commit_stream(&mut registry, stream);
-                }
+                active.values_mut().for_each(|stream| {
+                    stream.ended = true;
+                    stream.solo = true;
+                });
+                drain_streams(&mut registry, &mut active);
                 return;
             }
         }
     }
 }
 
-fn lifecycles_overlap(first: &StreamLifecycle, second: &StreamLifecycle) -> bool {
-    first.connected_at <= second.disconnected_at && second.connected_at <= first.disconnected_at
+fn handle_stream_event(
+    registry: &mut DeviceRegistry,
+    active: &mut BTreeMap<u64, ActiveStream>,
+    event: StreamEvent,
+) {
+    match event {
+        StreamEvent::Started(id) => {
+            active.insert(id, ActiveStream::new());
+            if active.len() > 1 {
+                active.values_mut().for_each(|stream| stream.solo = false);
+            }
+        }
+        StreamEvent::Chunk(id, pcm) => {
+            let only_stream = active.len() == 1;
+            if let Some(stream) = active.get_mut(&id) {
+                stream.quantums.push_back(pcm);
+                if stream.started_at.elapsed() >= Duration::from_millis(20) {
+                    stream.solo = only_stream;
+                }
+            }
+        }
+        StreamEvent::Ended(id) => {
+            if let Some(stream) = active.get_mut(&id) {
+                stream.ended = true;
+            }
+        }
+    }
+    drain_streams(registry, active);
 }
 
 fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
@@ -462,8 +521,83 @@ fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
         .map(|samples| samples.into_iter().flat_map(i16::to_le_bytes).collect())
 }
 
-fn commit_stream(registry: &mut DeviceRegistry, stream: StreamLifecycle) {
-    match process_pcm(registry, &stream.pcm) {
+fn drain_streams(registry: &mut DeviceRegistry, active: &mut BTreeMap<u64, ActiveStream>) {
+    loop {
+        let ids = active.keys().copied().take(2).collect::<Vec<_>>();
+        match ids.as_slice() {
+            [id] => {
+                let stream = active.get_mut(id).unwrap();
+                if !stream.solo && !stream.ended {
+                    return;
+                }
+                let Some(pcm) = stream.quantums.pop_front() else {
+                    if stream.ended {
+                        active.remove(id);
+                    }
+                    return;
+                };
+                commit_pcm(registry, &pcm);
+                if stream.ended && stream.quantums.is_empty() {
+                    active.remove(id);
+                }
+            }
+            [first_id, second_id] => {
+                if active[first_id].quantums.is_empty() || active[second_id].quantums.is_empty() {
+                    let ended_empty = ids.iter().copied().find(|id| {
+                        let stream = &active[id];
+                        stream.ended && stream.quantums.is_empty()
+                    });
+                    if let Some(id) = ended_empty {
+                        active.remove(&id);
+                        if active.len() == 1 {
+                            active.values_mut().for_each(|stream| stream.solo = true);
+                        }
+                        continue;
+                    }
+                    return;
+                }
+                let mut first = active
+                    .get_mut(first_id)
+                    .unwrap()
+                    .quantums
+                    .pop_front()
+                    .unwrap();
+                let mut second = active
+                    .get_mut(second_id)
+                    .unwrap()
+                    .quantums
+                    .pop_front()
+                    .unwrap();
+                let size = first.len().min(second.len()) / 4 * 4;
+                if first.len() > size {
+                    let remainder = first.split_off(size);
+                    active
+                        .get_mut(first_id)
+                        .unwrap()
+                        .quantums
+                        .push_front(remainder);
+                }
+                if second.len() > size {
+                    let remainder = second.split_off(size);
+                    active
+                        .get_mut(second_id)
+                        .unwrap()
+                        .quantums
+                        .push_front(remainder);
+                }
+                match mix_pcm(&first, &second) {
+                    Ok(pcm) => commit_pcm(registry, &pcm),
+                    Err(error) => eprintln!("PipeWire playback stopped: {error}"),
+                }
+            }
+            [] => return,
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn commit_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) {
+    match process_pcm(registry, pcm) {
         Ok(result) => report_playback(result),
         Err(error) => eprintln!("PipeWire playback stopped: {error}"),
     }
@@ -1006,6 +1140,7 @@ fn write_client_transport(
     // `PW_NODE_ACTIVATION_INACTIVE`; the remaining activation page starts zeroed.
     activation.write_all_at(&4_u32.to_ne_bytes(), 0)?;
     activation.write_all_at(&(CLIENT_NODE_GLOBAL_ID as u32).to_ne_bytes(), 564)?;
+    activation.write_all_at(&1_u32.to_ne_bytes(), 560)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 640)?;
     activation.write_all_at(&device.format().rate.to_ne_bytes(), 644)?;
     activation.write_all_at(&480_u64.to_ne_bytes(), 656)?;
@@ -1243,14 +1378,32 @@ fn write_client_node_start(
 }
 
 fn drive_client_node(
-    pcm: &mut Vec<u8>,
     transport: &ClientTransport,
     buffers: &ClientBuffers,
+    on_pcm: &mut impl FnMut(Vec<u8>),
 ) -> io::Result<()> {
     thread::sleep(Duration::from_millis(10));
     let mut recycled = u32::MAX;
+    let mut produced = false;
+    let mut graph_position = 0_u64;
+    let mut cycle = 0_u32;
 
-    for _ in 0..256 {
+    loop {
+        let now = clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(io::Error::from)?;
+        let nsec = u64::try_from(now.tv_sec()).unwrap() * 1_000_000_000
+            + u64::try_from(now.tv_nsec()).unwrap();
+        transport
+            .activation
+            .write_all_at(&nsec.to_ne_bytes(), 632)?;
+        transport
+            .activation
+            .write_all_at(&graph_position.to_ne_bytes(), 648)?;
+        transport
+            .activation
+            .write_all_at(&(nsec + 10_000_000).to_ne_bytes(), 680)?;
+        transport
+            .activation
+            .write_all_at(&cycle.to_ne_bytes(), 708)?;
         buffers.io.write_all_at(&1_i32.to_ne_bytes(), 0)?;
         buffers.io.write_all_at(&recycled.to_ne_bytes(), 4)?;
         transport.activation.write_all_at(&1_u32.to_ne_bytes(), 0)?;
@@ -1281,11 +1434,12 @@ fn drive_client_node(
                 let mut size = [0; 4];
                 buffers.memory.read_exact_at(&mut size, base + 4)?;
                 if u32::from_ne_bytes(size) != 0 {
-                    consume_client_buffer(pcm, buffers, buffer_id)?;
+                    on_pcm(consume_client_buffer(buffers, buffer_id)?);
+                    produced = true;
                     break;
                 }
             }
-            if !pcm.is_empty() {
+            if produced {
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -1298,44 +1452,89 @@ fn drive_client_node(
         buffers.io.read_exact_at(&mut io_state, 0)?;
         let status = i32::from_ne_bytes(io_state[0..4].try_into().unwrap());
         let buffer_id = u32::from_ne_bytes(io_state[4..8].try_into().unwrap());
-        if status & 2 != 0 {
-            if buffer_id >= BUFFER_COUNT as u32 {
+        let mut node_status = [0; 4];
+        transport.activation.read_exact_at(&mut node_status, 8)?;
+        let node_status = i32::from_ne_bytes(node_status);
+        cycle = cycle.wrapping_add(1);
+        if status & 2 != 0 || node_status & 2 != 0 {
+            let mut consumed = false;
+            // The exported node can leave SPA_IO_Buffers pointing at the
+            // just-recycled descriptor while reporting HAVE_DATA through its
+            // activation state, so select whichever descriptor is populated.
+            let buffer_id =
+                if buffer_id < BUFFER_COUNT as u32 && client_buffer_has_data(buffers, buffer_id)? {
+                    Some(buffer_id)
+                } else {
+                    find_produced_buffer(buffers)?
+                };
+            if let Some(buffer_id) = buffer_id {
+                let pcm = consume_client_buffer(buffers, buffer_id)?;
+                buffers.memory.write_all_at(
+                    &0_u32.to_ne_bytes(),
+                    u64::from(buffer_id) * BUFFER_STRIDE as u64 + 4,
+                )?;
+                on_pcm(pcm);
+                produced = true;
+                recycled = buffer_id;
+                graph_position = graph_position.saturating_add(480);
+                consumed = true;
+            } else if status & 2 != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "client produced an invalid buffer id",
+                    "client reported data without a valid buffer",
                 ));
             }
-            consume_client_buffer(pcm, buffers, buffer_id)?;
-            recycled = buffer_id;
+            if !produced {
+                graph_position = graph_position.saturating_add(480);
+            }
+            if consumed || !produced {
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                thread::yield_now();
+            }
         } else if status & 8 != 0 {
             return Ok(());
         } else if status < 0 {
             return Err(io::Error::from_raw_os_error(-status));
         } else {
             recycled = u32::MAX;
-            thread::sleep(Duration::from_millis(10));
+            if !produced {
+                graph_position = graph_position.saturating_add(480);
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                thread::yield_now();
+            }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "client did not drain within the bounded scheduling loop",
-    ))
 }
 
-fn consume_client_buffer(
-    output: &mut Vec<u8>,
-    buffers: &ClientBuffers,
-    buffer_id: u32,
-) -> io::Result<()> {
+fn find_produced_buffer(buffers: &ClientBuffers) -> io::Result<Option<u32>> {
+    for buffer_id in 0..BUFFER_COUNT as u32 {
+        if client_buffer_has_data(buffers, buffer_id)? {
+            return Ok(Some(buffer_id));
+        }
+    }
+    Ok(None)
+}
+
+fn client_buffer_has_data(buffers: &ClientBuffers, buffer_id: u32) -> io::Result<bool> {
+    let mut size = [0; 4];
+    buffers
+        .memory
+        .read_exact_at(&mut size, u64::from(buffer_id) * BUFFER_STRIDE as u64 + 4)?;
+    Ok(u32::from_ne_bytes(size) != 0)
+}
+
+fn consume_client_buffer(buffers: &ClientBuffers, buffer_id: u32) -> io::Result<Vec<u8>> {
     let base = u64::from(buffer_id) * BUFFER_STRIDE as u64;
     let mut chunk = [0; 16];
     buffers.memory.read_exact_at(&mut chunk, base)?;
     let offset = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()) as usize;
     let size = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()) as usize;
-    if size > BUFFER_DATA_SIZE as usize {
+    if size > BUFFER_DATA_SIZE as usize || !size.is_multiple_of(4) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "client produced an oversized PCM chunk",
+            "client produced an invalid PCM chunk size",
         ));
     }
     let offset = offset % BUFFER_DATA_SIZE as usize;
@@ -1350,8 +1549,7 @@ fn consume_client_buffer(
             .memory
             .read_exact_at(&mut pcm[first..], base + BUFFER_DATA_OFFSET as u64)?;
     }
-    output.extend(pcm);
-    Ok(())
+    Ok(pcm)
 }
 
 fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) -> io::Result<()> {
@@ -1938,8 +2136,7 @@ mod tests {
             .memory
             .write_all_at(&[0; 1920], BUFFER_DATA_OFFSET as u64)
             .unwrap();
-        let mut pcm = Vec::new();
-        consume_client_buffer(&mut pcm, &buffers, 0).unwrap();
+        let pcm = consume_client_buffer(&buffers, 0).unwrap();
         let mut registry = DeviceRegistry::register_virtual_playback();
         assert_eq!(
             process_pcm(&mut registry, &pcm).unwrap().frame_position,
@@ -1948,43 +2145,35 @@ mod tests {
     }
 
     #[test]
-    fn persistent_lifecycles_advance_sequentially_and_mix_overlap() {
-        let base = Instant::now();
-        let first = StreamLifecycle {
-            connected_at: base,
-            disconnected_at: base + Duration::from_millis(10),
-            pcm: vec![0; 480 * 4],
-        };
-        let second = StreamLifecycle {
-            connected_at: base + Duration::from_millis(11),
-            disconnected_at: base + Duration::from_millis(20),
-            pcm: vec![0; 480 * 4],
-        };
-        let overlapping = StreamLifecycle {
-            connected_at: base + Duration::from_millis(5),
-            disconnected_at: base + Duration::from_millis(15),
-            pcm: vec![0; 480 * 4],
-        };
-        assert!(!lifecycles_overlap(&first, &second));
-        assert!(lifecycles_overlap(&first, &overlapping));
-
+    fn persistent_worker_commits_quanta_and_mixes_active_streams() {
         let mut registry = DeviceRegistry::register_virtual_playback();
-        assert_eq!(
-            process_pcm(&mut registry, &first.pcm)
-                .unwrap()
-                .frame_position,
-            480
+        let mut active = BTreeMap::new();
+        handle_stream_event(&mut registry, &mut active, StreamEvent::Started(1));
+        active.get_mut(&1).unwrap().solo = true;
+        handle_stream_event(
+            &mut registry,
+            &mut active,
+            StreamEvent::Chunk(1, vec![0; 240 * 4]),
         );
-        assert_eq!(
-            process_pcm(&mut registry, &second.pcm)
-                .unwrap()
-                .frame_position,
-            960
+        assert_eq!(registry.playback().frame_position(), 240);
+        handle_stream_event(
+            &mut registry,
+            &mut active,
+            StreamEvent::Chunk(1, vec![0; 240 * 4]),
         );
-        let mixed = mix_pcm(&first.pcm, &overlapping.pcm).unwrap();
-        assert_eq!(
-            process_pcm(&mut registry, &mixed).unwrap().frame_position,
-            1_440
+        assert_eq!(registry.playback().frame_position(), 480);
+
+        handle_stream_event(&mut registry, &mut active, StreamEvent::Started(2));
+        handle_stream_event(
+            &mut registry,
+            &mut active,
+            StreamEvent::Chunk(1, vec![0; 480 * 4]),
         );
+        handle_stream_event(
+            &mut registry,
+            &mut active,
+            StreamEvent::Chunk(2, vec![0; 480 * 4]),
+        );
+        assert_eq!(registry.playback().frame_position(), 960);
     }
 }
