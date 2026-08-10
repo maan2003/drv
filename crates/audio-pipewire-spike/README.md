@@ -12,6 +12,7 @@ Fuchsia audio `TimelineFunction`/`TimelineRate` implementation packaged in
 ```sh
 cargo run -p drv-audio-pipewire-spike
 cargo test -p drv-audio-pipewire-spike
+PIPEWIRE_RUNTIME_DIR=/tmp/drv-pw cargo run -p drv-audio-pipewire-spike -- daemon
 ```
 
 The pristine Fuchsia ADR/device/ring-buffer sources, hashes, host adaptation,
@@ -92,3 +93,21 @@ Stock `pw-cli ls Node` reports registry-projected `object.serial = "2"`,
 "drv.adr-virtual-sink"`, and the registered S16LE/48000/stereo properties. Two
 stock `pw-cat` clients writing the example streams above advance the same
 registered ring-buffer endpoint to frame 480 and produce checksum 5,280,000.
+
+## Persistent daemon loop
+
+`daemon` keeps the native `pipewire-0` socket and the single registered ADR
+device alive across client disconnects. Each connection has independent native
+protocol, activation and shared-buffer state. Completed playback lifecycles are
+serialized into the one registry-owned ring-buffer worker. Non-overlapping
+streams advance separately; two connection lifecycles whose active intervals
+overlap are accumulated through the pinned Fuchsia mixer into one output frame
+interval. Discovery-only clients never mutate the ring state, and malformed or
+disconnected clients do not stop the listener.
+
+A stock PipeWire 1.6.6 probe ran `pw-cli ls Node` concurrently with playback,
+then two sequential stock `pw-cat` sessions followed by two overlapping stock
+`pw-cat` sessions. The same daemon reported monotonically increasing positions
+480, 960 and 1440, with cumulative post-Fuchsia-processing checksums 2,880,000,
+5,280,000 and 10,560,000. All five clients exited successfully with empty
+stderr; the daemon remained alive until the probe explicitly terminated it.

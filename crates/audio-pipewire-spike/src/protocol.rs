@@ -11,6 +11,7 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
@@ -36,7 +37,7 @@ use pipewire_native_spa::{
 use drv_fuchsia_audio_processing::mix_stereo_s16;
 
 use crate::{
-    device_registry::{DeviceRegistry, RegisteredDevice},
+    device_registry::{DeviceRegistry, RegisteredDeviceInfo},
     enum_format_pod_for,
 };
 
@@ -120,11 +121,44 @@ pub struct PlaybackResult {
     pub processed_sample_checksum: i64,
 }
 
+#[derive(Debug)]
+struct StreamLifecycle {
+    connected_at: Instant,
+    disconnected_at: Instant,
+    pcm: Vec<u8>,
+}
+
+/// Run the single-user compatibility daemon until its listener is closed.
+pub fn serve_daemon(listener: &UnixListener) -> io::Result<()> {
+    let registry = DeviceRegistry::register_virtual_playback();
+    let device = registry.playback().info().clone();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    thread::spawn(move || run_ring_buffer_worker(registry, completed_rx));
+
+    loop {
+        let (mut stream, _) = listener.accept()?;
+        let connected_at = Instant::now();
+        let device = device.clone();
+        let completed_tx = completed_tx.clone();
+        thread::spawn(move || match serve_connection(&mut stream, &device) {
+            Ok(pcm) if !pcm.is_empty() => {
+                let _ = completed_tx.send(StreamLifecycle {
+                    connected_at,
+                    disconnected_at: Instant::now(),
+                    pcm,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("PipeWire client disconnected: {error}"),
+        });
+    }
+}
+
 /// Serve one native client and return its Fuchsia-derived playback frame position.
 pub fn serve_one(listener: &UnixListener) -> io::Result<PlaybackResult> {
     let mut registry = DeviceRegistry::register_virtual_playback();
     let (mut stream, _) = listener.accept()?;
-    let pcm = serve_connection(&mut stream, registry.playback())?;
+    let pcm = serve_connection(&mut stream, registry.playback().info())?;
     process_pcm(&mut registry, &pcm)
 }
 
@@ -132,27 +166,14 @@ pub fn serve_one(listener: &UnixListener) -> io::Result<PlaybackResult> {
 pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
     let mut registry = DeviceRegistry::register_virtual_playback();
     let (mut first_stream, _) = listener.accept()?;
-    let first = serve_connection(&mut first_stream, registry.playback())?;
+    let first = serve_connection(&mut first_stream, registry.playback().info())?;
     let (mut second_stream, _) = listener.accept()?;
-    let second = serve_connection(&mut second_stream, registry.playback())?;
-    if first.len() != second.len() || !first.len().is_multiple_of(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bounded mixer inputs must have equal complete stereo frames",
-        ));
-    }
-    let first = decode_s16(&first);
-    let second = decode_s16(&second);
-    let mixed = mix_stereo_s16(&first, &second)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
-    let mixed = mixed
-        .into_iter()
-        .flat_map(i16::to_le_bytes)
-        .collect::<Vec<_>>();
+    let second = serve_connection(&mut second_stream, registry.playback().info())?;
+    let mixed = mix_pcm(&first, &second)?;
     process_pcm(&mut registry, &mixed)
 }
 
-fn serve_connection(stream: &mut UnixStream, device: &RegisteredDevice) -> io::Result<Vec<u8>> {
+fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> io::Result<Vec<u8>> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
@@ -387,6 +408,72 @@ fn process_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) -> io::Result<Playback
         frame_position: device.frame_position(),
         processed_sample_checksum: device.processed_sample_checksum(),
     })
+}
+
+fn run_ring_buffer_worker(mut registry: DeviceRegistry, completed: Receiver<StreamLifecycle>) {
+    let mut pending = None;
+    loop {
+        match completed.recv_timeout(Duration::from_millis(50)) {
+            Ok(next) => {
+                if let Some(first) = pending.take() {
+                    if lifecycles_overlap(&first, &next) && first.pcm.len() == next.pcm.len() {
+                        match mix_pcm(&first.pcm, &next.pcm)
+                            .and_then(|pcm| process_pcm(&mut registry, &pcm))
+                        {
+                            Ok(result) => report_playback(result),
+                            Err(error) => eprintln!("PipeWire playback stopped: {error}"),
+                        }
+                    } else {
+                        commit_stream(&mut registry, first);
+                        pending = Some(next);
+                    }
+                } else {
+                    pending = Some(next);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(stream) = pending.take() {
+                    commit_stream(&mut registry, stream);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(stream) = pending.take() {
+                    commit_stream(&mut registry, stream);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn lifecycles_overlap(first: &StreamLifecycle, second: &StreamLifecycle) -> bool {
+    first.connected_at <= second.disconnected_at && second.connected_at <= first.disconnected_at
+}
+
+fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
+    if first.len() != second.len() || !first.len().is_multiple_of(4) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "overlapping mixer inputs must have equal complete stereo frames",
+        ));
+    }
+    mix_stereo_s16(&decode_s16(first), &decode_s16(second))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))
+        .map(|samples| samples.into_iter().flat_map(i16::to_le_bytes).collect())
+}
+
+fn commit_stream(registry: &mut DeviceRegistry, stream: StreamLifecycle) {
+    match process_pcm(registry, &stream.pcm) {
+        Ok(result) => report_playback(result),
+        Err(error) => eprintln!("PipeWire playback stopped: {error}"),
+    }
+}
+
+fn report_playback(result: PlaybackResult) {
+    println!(
+        "registered Fuchsia ADR ring-buffer frame position: {}, Fuchsia-processed sample checksum: {}",
+        result.frame_position, result.processed_sample_checksum
+    );
 }
 
 fn decode_s16(pcm: &[u8]) -> Vec<i16> {
@@ -657,7 +744,7 @@ fn decode_get_node(payload: &[u8]) -> io::Result<u32> {
         .map_err(invalid_pod)
 }
 
-fn decode_bind(payload: &[u8], device: &RegisteredDevice) -> io::Result<BoundObject> {
+fn decode_bind(payload: &[u8], device: &RegisteredDeviceInfo) -> io::Result<BoundObject> {
     let mut parser = Parser::new(payload);
     parser
         .pop_struct(|fields| {
@@ -846,7 +933,7 @@ fn write_global(
 
 fn write_object_info(
     stream: &mut UnixStream,
-    device: &RegisteredDevice,
+    device: &RegisteredDeviceInfo,
     object: BoundObject,
     out_seq: &mut u32,
 ) -> io::Result<()> {
@@ -882,7 +969,7 @@ fn write_object_info(
 
 fn write_enum_format(
     stream: &mut UnixStream,
-    device: &RegisteredDevice,
+    device: &RegisteredDeviceInfo,
     proxy_id: u32,
     out_seq: &mut u32,
     request: EnumParamsRequest,
@@ -905,7 +992,7 @@ fn write_enum_format(
 
 fn write_client_transport(
     stream: &mut UnixStream,
-    device: &RegisteredDevice,
+    device: &RegisteredDeviceInfo,
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<ClientTransport> {
@@ -1005,7 +1092,7 @@ fn write_client_node_set_param(
 
 fn write_client_node_port_format(
     stream: &mut UnixStream,
-    device: &RegisteredDevice,
+    device: &RegisteredDeviceInfo,
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<()> {
@@ -1292,7 +1379,7 @@ fn push_properties<'a>(
     })
 }
 
-fn node_properties(device: &RegisteredDevice) -> Vec<(String, String)> {
+fn node_properties(device: &RegisteredDeviceInfo) -> Vec<(String, String)> {
     let format = device.format();
     vec![
         ("object.serial".into(), device.token_id().to_string()),
@@ -1307,7 +1394,7 @@ fn node_properties(device: &RegisteredDevice) -> Vec<(String, String)> {
     ]
 }
 
-fn port_properties(device: &RegisteredDevice) -> Vec<(String, String)> {
+fn port_properties(device: &RegisteredDeviceInfo) -> Vec<(String, String)> {
     vec![
         ("object.serial".into(), device.port_id().to_string()),
         ("node.id".into(), device.node_id().to_string()),
@@ -1542,7 +1629,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
             let registry = DeviceRegistry::register_virtual_playback();
-            serve_connection(&mut server, registry.playback()).unwrap()
+            serve_connection(&mut server, registry.playback().info()).unwrap()
         });
 
         client
@@ -1602,7 +1689,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
             let registry = DeviceRegistry::register_virtual_playback();
-            serve_connection(&mut server, registry.playback()).unwrap()
+            serve_connection(&mut server, registry.playback().info()).unwrap()
         });
 
         client
@@ -1691,8 +1778,10 @@ mod tests {
                 let returned = fields.pop_raw_pod()?;
                 let mut expected_storage = [0; 256];
                 let registry = DeviceRegistry::register_virtual_playback();
-                let expected =
-                    enum_format_pod_for(registry.playback().format(), &mut expected_storage)?;
+                let expected = enum_format_pod_for(
+                    registry.playback().info().format(),
+                    &mut expected_storage,
+                )?;
                 assert_eq!(returned.data(), expected);
                 Ok(())
             })
@@ -1711,7 +1800,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
             let registry = DeviceRegistry::register_virtual_playback();
-            serve_connection(&mut server, registry.playback())
+            serve_connection(&mut server, registry.playback().info())
         });
 
         client
@@ -1782,7 +1871,7 @@ mod tests {
         let mut format_storage = [0; 256];
         let registry = DeviceRegistry::register_virtual_playback();
         let format = RawPod::wrap(
-            enum_format_pod_for(registry.playback().format(), &mut format_storage).unwrap(),
+            enum_format_pod_for(registry.playback().info().format(), &mut format_storage).unwrap(),
         )
         .unwrap();
         let port_update = client_port_update(8, &format, ParamType::EnumFormat);
@@ -1855,6 +1944,47 @@ mod tests {
         assert_eq!(
             process_pcm(&mut registry, &pcm).unwrap().frame_position,
             480
+        );
+    }
+
+    #[test]
+    fn persistent_lifecycles_advance_sequentially_and_mix_overlap() {
+        let base = Instant::now();
+        let first = StreamLifecycle {
+            connected_at: base,
+            disconnected_at: base + Duration::from_millis(10),
+            pcm: vec![0; 480 * 4],
+        };
+        let second = StreamLifecycle {
+            connected_at: base + Duration::from_millis(11),
+            disconnected_at: base + Duration::from_millis(20),
+            pcm: vec![0; 480 * 4],
+        };
+        let overlapping = StreamLifecycle {
+            connected_at: base + Duration::from_millis(5),
+            disconnected_at: base + Duration::from_millis(15),
+            pcm: vec![0; 480 * 4],
+        };
+        assert!(!lifecycles_overlap(&first, &second));
+        assert!(lifecycles_overlap(&first, &overlapping));
+
+        let mut registry = DeviceRegistry::register_virtual_playback();
+        assert_eq!(
+            process_pcm(&mut registry, &first.pcm)
+                .unwrap()
+                .frame_position,
+            480
+        );
+        assert_eq!(
+            process_pcm(&mut registry, &second.pcm)
+                .unwrap()
+                .frame_position,
+            960
+        );
+        let mixed = mix_pcm(&first.pcm, &overlapping.pcm).unwrap();
+        assert_eq!(
+            process_pcm(&mut registry, &mixed).unwrap().frame_position,
+            1_440
         );
     }
 }

@@ -6,7 +6,7 @@ use drv_audio_pipewire_spike::{
 
 fn main() {
     let mode = env::args().nth(1);
-    if matches!(mode.as_deref(), Some("serve" | "serve-two")) {
+    if matches!(mode.as_deref(), Some("serve" | "serve-two" | "daemon")) {
         let runtime_dir = env::var_os("PIPEWIRE_RUNTIME_DIR")
             .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
             .map(PathBuf::from)
@@ -14,6 +14,14 @@ fn main() {
         fs::create_dir_all(&runtime_dir).expect("create runtime directory");
         let socket = runtime_dir.join("pipewire-0");
         let listener = UnixListener::bind(&socket).expect("bind pipewire-0");
+        if mode.as_deref() == Some("daemon") {
+            if let Err(error) = protocol::serve_daemon(&listener) {
+                eprintln!("PipeWire daemon stopped: {error}");
+                let _ = fs::remove_file(&socket);
+                process::exit(2);
+            }
+            return;
+        }
         let result = match if mode.as_deref() == Some("serve-two") {
             protocol::serve_two(&listener)
         } else {

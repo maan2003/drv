@@ -22,12 +22,17 @@ pub(crate) struct DeviceRegistry {
 
 #[derive(Debug)]
 pub(crate) struct RegisteredDevice {
+    info: RegisteredDeviceInfo,
+    ring_buffer: RingBufferEndpoint,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RegisteredDeviceInfo {
     token_id: u64,
     element_id: u64,
     name: String,
     description: String,
     format: PcmFormat,
-    ring_buffer: RingBufferEndpoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,11 +52,13 @@ impl DeviceRegistry {
     pub(crate) fn register_virtual_playback() -> Self {
         Self {
             playback: RegisteredDevice {
-                token_id: PLAYBACK_TOKEN_ID,
-                element_id: PLAYBACK_ELEMENT_ID,
-                name: "drv.adr-virtual-sink".into(),
-                description: "drv Fuchsia ADR Virtual Sink".into(),
-                format: PLAYBACK_FORMAT,
+                info: RegisteredDeviceInfo {
+                    token_id: PLAYBACK_TOKEN_ID,
+                    element_id: PLAYBACK_ELEMENT_ID,
+                    name: "drv.adr-virtual-sink".into(),
+                    description: "drv Fuchsia ADR Virtual Sink".into(),
+                    format: PLAYBACK_FORMAT,
+                },
                 // The virtual device is initialized and its one ring buffer is
                 // created before it becomes visible, matching ADR readiness.
                 ring_buffer: RingBufferEndpoint {
@@ -71,7 +78,7 @@ impl DeviceRegistry {
     }
 }
 
-impl RegisteredDevice {
+impl RegisteredDeviceInfo {
     pub(crate) fn token_id(&self) -> u64 {
         self.token_id
     }
@@ -100,6 +107,12 @@ impl RegisteredDevice {
         match self.format.sample_format {
             SampleFormat::Signed16Le => "S16LE",
         }
+    }
+}
+
+impl RegisteredDevice {
+    pub(crate) fn info(&self) -> &RegisteredDeviceInfo {
+        &self.info
     }
 
     pub(crate) fn write_ring_buffer(&mut self, pcm: &[u8]) -> Result<(), EndpointError> {
@@ -134,10 +147,10 @@ mod tests {
     fn registered_device_owns_format_identity_and_ring_position() {
         let mut registry = DeviceRegistry::register_virtual_playback();
         let device = registry.playback_mut();
-        assert_eq!(device.token_id(), 2);
-        assert_eq!(device.node_id(), 2);
-        assert_eq!(device.port_id(), 3);
-        assert_eq!(device.format().rate, 48_000);
+        assert_eq!(device.info().token_id(), 2);
+        assert_eq!(device.info().node_id(), 2);
+        assert_eq!(device.info().port_id(), 3);
+        assert_eq!(device.info().format().rate, 48_000);
 
         device.write_ring_buffer(&[0; 480 * 4]).unwrap();
         assert_eq!(device.frame_position(), 480);
