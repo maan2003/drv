@@ -896,7 +896,7 @@ fn run() -> Result<(), String> {
         verify_pci_dma_disabled(&bdf)?;
     }
 
-    let base_acquisition = (|| -> Result<RegionInfo, String> {
+    let base_acquisition = (|| -> Result<Option<RegionInfo>, String> {
         capsule.acquisition.record(AcquisitionIntent::BindIommu)?;
         let mut bind = Bind {
             argsz: size::<Bind>(),
@@ -972,6 +972,64 @@ fn run() -> Result<(), String> {
                 format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
             })?;
             record_sae_stage("vfio_attached_d0_preflight_already_ready");
+
+            let mut device_info = DeviceInfo {
+                argsz: size::<DeviceInfo>(),
+                ..Default::default()
+            };
+            record_sae_stage(&format!(
+                "vfio_device_get_info_before argsz={}",
+                device_info.argsz
+            ));
+            if let Err(error) = ioctl_mut(
+                capsule.device.as_raw_fd(),
+                VFIO_DEVICE_GET_INFO,
+                &mut device_info,
+                "query VFIO device info",
+            ) {
+                record_sae_stage(&format!(
+                    "vfio_device_get_info_error argsz={} error={error}",
+                    device_info.argsz
+                ));
+                return Err(error);
+            }
+            record_sae_stage(&format!(
+                "vfio_device_get_info_after argsz={} flags={:#x} num_regions={} num_irqs={}",
+                device_info.argsz,
+                device_info.flags,
+                device_info.num_regions,
+                device_info.num_irqs
+            ));
+
+            for index in 0..device_info.num_regions {
+                let mut region = RegionInfo {
+                    argsz: size::<RegionInfo>(),
+                    index,
+                    ..Default::default()
+                };
+                record_sae_stage(&format!(
+                    "vfio_device_get_region_info_before index={index} argsz={}",
+                    region.argsz
+                ));
+                if let Err(error) = ioctl_mut(
+                    capsule.device.as_raw_fd(),
+                    VFIO_DEVICE_GET_REGION_INFO,
+                    &mut region,
+                    "query VFIO region",
+                ) {
+                    record_sae_stage(&format!(
+                        "vfio_device_get_region_info_error index={index} argsz={} error={error}",
+                        region.argsz
+                    ));
+                    return Err(error);
+                }
+                record_sae_stage(&format!(
+                    "vfio_device_get_region_info_after index={index} argsz={} flags={:#x} cap_offset={} size={} offset={}",
+                    region.argsz, region.flags, region.cap_offset, region.size, region.offset
+                ));
+            }
+            record_sae_stage("vfio_region_discovery_complete");
+            return Ok(None);
         }
 
         let mut info = RegionInfo {
@@ -1013,9 +1071,23 @@ fn run() -> Result<(), String> {
             0xe0000,
             operation.conn_writable(),
         )?);
-        Ok(info)
+        Ok(Some(info))
     })();
     let info = finish_owned_acquisition!(&mut capsule, base_acquisition);
+    if info.is_none() {
+        let release_errors = capsule.release_observable();
+        if !release_errors.is_empty() {
+            record_sae_stage(&format!("vfio_region_discovery_release_error errors={release_errors:?}"));
+            return Err(format!("VFIO discovery release failed: {release_errors:?}"));
+        }
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.phase = RunPhase::Contained;
+        }
+        set_lab_safety("SAFE")?;
+        record_sae_stage("vfio_region_discovery_released_safe");
+        return Ok(());
+    }
+    let info = info.expect("non-discovery operation queried BAR 0");
 
     let device = &capsule.device;
     let iommu = &capsule.iommu;
