@@ -2091,3 +2091,27 @@ reboot after the already-successful native restore; the supervisor deliberately
 kept the watchdog armed because the experiment returned nonzero. Native
 `mt7921e`, iwd, and carrier recovered on the next boot. No further physical
 mutation was attempted pending a canonicalized, nonempty quiesce match.
+
+The canonicalized quiesce wrapper, dynamic native target selection, and exact
+integer-or-`.0` frequency normalization were then deployed for one guarded
+run as `wifi-sae-exchange13`. The run used commit `d73b1f4e462c`, release
+SHA-256
+`fc9d4b96230e24c61ccd27935404fea4da1c15ca19f406b0720190d4387ff5cf`,
+and freshly selected target `f2:a3:18:4f:30:76` on channel 36 at 5180 MHz.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T181358Z-0000_05_00.0.log`
+contains `Cannot find device "wlan0"` before any `QUIESCE` or
+`USERSPACE` record. The interface disappeared between sysfs enumeration and
+`ip link set dev wlan0 down` after iwd stopped. The wrapper failed closed
+before native unbind or VFIO, and restoration completed with
+`RESTORE end failed=0`.
+
+The restored daemon did not reassociate within the bounded recovery window, so
+the safety proof correctly remained incomplete and the watchdog rebooted.
+There was no page-pool warning and no firmware, SAE, association, key, or data
+operation. Native `mt7921e`, iwd, and carrier recovered after reboot. That
+reboot also exposed a deployment regression: the selected persistent system
+no longer exported the patched
+`/sys/module/mt7921e/parameters/keep_d0_on_remove` parameter. Further
+physical work is blocked on both a disappearance-safe netdev quiesce and a
+system closure containing the patched kernel module.
