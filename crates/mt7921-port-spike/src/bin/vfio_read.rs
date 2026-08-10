@@ -720,6 +720,7 @@ fn run_contained_dma_resource_round_trip(
     capsule: &mut ActiveVfioCapsule,
     info: &RegionInfo,
     bdf: &str,
+    operation: Operation,
     wfdma: &ReadPage,
     pcie_mac: &ReadPage,
     selected_irq: PciIrqCapability,
@@ -734,13 +735,18 @@ fn run_contained_dma_resource_round_trip(
             &capsule.iommu,
             capsule.ioas.as_ref().expect("IOAS acquired").id,
             info,
-            Operation::RunOneShotFirmware,
+            operation,
             &mut capsule.acquisition,
             capsule
                 .containment
                 .as_mut()
                 .expect("guarded gate has containment ledger"),
         )?;
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .transition(RunPhase::Contained, RunPhase::MappedDmaDisabled)?;
         record_sae_stage("vfio_dma_resources_mapped core_arenas=10 dma_bytes=126976 bar_pages=4");
         verify_pci_dma_disabled(bdf)?;
         let global = wfdma.read(0xd4208)?;
@@ -902,6 +908,14 @@ fn run_contained_dma_resource_round_trip(
         record_sae_stage(
             "vfio_wfdma_activation_complete engines=true host_irq=wm_wm2 mac_irq=true top_owned=true l0s_disabled=true swdef_normal=true firmware_published=false",
         );
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .transition(
+                RunPhase::MappedDmaDisabled,
+                RunPhase::DmaAndResponseIrqEnabled,
+            )?;
         if let Some((patch_bytes, ram_bytes)) = firmware_images {
             record_sae_stage("vfio_firmware_transport_ready");
             let signal = ActiveSignalGuard::install()?;
@@ -952,10 +966,118 @@ fn run_contained_dma_resource_round_trip(
                 .map_err(|error| format!("parse patch for contained loader: {error:?}"))?;
             let firmware = Firmware::parse(ram_bytes)
                 .map_err(|error| format!("parse RAM for contained loader: {error:?}"))?;
-            let report = load_mt7921_firmware(&mut loader, patch, firmware)
-                .map_err(|error| format!("contained passive firmware initialization: {error:?}"))?;
+            #[cfg(feature = "fuchsia-passive")]
+            let report = if operation == Operation::RunOneShotPassiveChannel1 {
+                load_mt7921_firmware_with_passive_boundary(
+                    &mut loader,
+                    patch,
+                    firmware,
+                    |loader, report| {
+                        capsule
+                            .containment
+                            .as_mut()
+                            .expect("active MCU operation has containment ledger")
+                            .transition(
+                                RunPhase::DmaAndResponseIrqEnabled,
+                                RunPhase::FirmwareReady,
+                            )?;
+                        let mechanics = VfioPassiveMechanics {
+                            loader,
+                            ledger: capsule
+                                .containment
+                                .as_mut()
+                                .expect("active MCU operation has containment ledger"),
+                            data: ActiveMcuRx {
+                                rx_ring: active.data_rx_ring.as_mut().expect("mapped"),
+                                rx_buffers: active.data_rx_buffers.as_ref().expect("mapped"),
+                                rx_tail: 0,
+                                rx_head: 7,
+                                rx_ring_index: 2,
+                                rx_count: 8,
+                                irq_bit: DATA_RX_IRQ_BIT,
+                            },
+                            mac_pages: &active.passive_window_pages,
+                            scan_started: None,
+                            pending_scan_done: None,
+                            advertisements: Vec::new(),
+                            tx_completions: Vec::new(),
+                        };
+                        let transport =
+                            SourceExactPassiveTransport::new(mechanics, report.nic_capability)
+                                .map_err(|error| error.to_string())?;
+                        let channel = ChannelNumber {
+                            band: WlanBand::TwoGhz,
+                            number: 1,
+                        };
+                        let mut adapter = Mt7921SoftmacAdapter::new(
+                            transport,
+                            report.nic_capability,
+                            candidate_channels(report.nic_capability),
+                            vec![channel],
+                        )
+                        .map_err(|error| error.to_string())?;
+                        adapter
+                            .set_channel(WlanSoftmacBaseSetChannelRequest {
+                                primary: Some(channel),
+                                bandwidth: Some(ChannelBandwidth::Cbw20),
+                                vht_secondary_80_channel: None,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        record_sae_stage(
+                            "vfio_passive_receive_setup_ready channel=1 intentional_tx=false",
+                        );
+                        let response = adapter
+                            .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+                                channels: Some(vec![channel]),
+                                min_channel_time: Some(50_000_000),
+                                max_channel_time: Some(120_000_000),
+                                min_home_time: Some(0),
+                            })
+                            .map_err(|error| error.to_string())?;
+                        let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
+                        let mut observations = 0usize;
+                        let success = loop {
+                            match adapter.next_scan_event().map_err(|error| error.to_string())? {
+                                Some(HardwareScanEvent::Observation(observation)) => {
+                                    observations += 1;
+                                    println!(
+                                        r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
+                                    );
+                                }
+                                Some(HardwareScanEvent::Complete {
+                                    scan_id: completed,
+                                    success,
+                                }) if completed == scan_id => break success,
+                                Some(HardwareScanEvent::Complete {
+                                    scan_id: completed,
+                                    ..
+                                }) => {
+                                    return Err(format!(
+                                        "passive completion id {completed} did not match {scan_id}"
+                                    ));
+                                }
+                                None => {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        };
+                        if !success || observations == 0 {
+                            return Err(format!(
+                                "passive channel 1 result success={success} observations={observations}"
+                            ));
+                        }
+                        record_sae_stage(&format!(
+                            "vfio_passive_observation_ready channel=1 scan_id={scan_id} observations={observations}"
+                        ));
+                        Ok(())
+                    },
+                )
+            } else {
+                load_mt7921_firmware(&mut loader, patch, firmware)
+            }
+            .map_err(|error| format!("contained passive firmware initialization: {error:?}"))?;
             record_sae_stage(&format!(
-                "vfio_firmware_passive_init_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom_valid={} clc_rules={} special_unii_mask={:#04x} channel=false scan=false management_tx=false sae=false radio=false",
+                "vfio_firmware_passive_init_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom_valid={} clc_rules={} special_unii_mask={:#04x} passive_rx={} probe_tx=false management_tx=false data_tx=false sae=false",
                 report.patch_sections,
                 report.ram_regions,
                 report.scatter_chunks,
@@ -963,6 +1085,7 @@ fn run_contained_dma_resource_round_trip(
                 report.eeprom_hardware.valid,
                 report.clc_rules_applied,
                 report.special_unii_mask,
+                operation == Operation::RunOneShotPassiveChannel1,
             ));
         }
         Ok(())
@@ -1191,18 +1314,25 @@ fn run() -> Result<(), String> {
     };
     #[cfg(feature = "fuchsia-passive")]
     if operation.uses_contained_transport_gate() {
-        record_sae_stage(if operation == Operation::RunOneShotFirmware {
-            "vfio_firmware_process_started"
-        } else {
-            "process_enter"
+        record_sae_stage(match operation {
+            Operation::RunOneShotFirmware => "vfio_firmware_process_started",
+            Operation::RunOneShotPassiveChannel1 => "vfio_passive_process_started",
+            _ => "process_enter",
         });
     }
-    let contained_firmware_images = if operation == Operation::RunOneShotFirmware {
+    let contained_firmware_images = if matches!(
+        operation,
+        Operation::RunOneShotFirmware | Operation::RunOneShotPassiveChannel1
+    ) {
         let patch = decompress_patch()?;
         let ram = decompress_ram()?;
         Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
         Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
-        record_sae_stage("vfio_firmware_artifacts_ready");
+        record_sae_stage(if operation == Operation::RunOneShotPassiveChannel1 {
+            "vfio_passive_artifacts_ready"
+        } else {
+            "vfio_firmware_artifacts_ready"
+        });
         Some((patch, ram))
     } else {
         None
@@ -1944,6 +2074,7 @@ fn run() -> Result<(), String> {
                                 &mut capsule,
                                 &bar0,
                                 &bdf,
+                                operation,
                                 &wfdma_page,
                                 &pcie_mac_page,
                                 selected_irq,
@@ -8319,7 +8450,10 @@ enum Operation {
 
 impl Operation {
     fn uses_contained_transport_gate(self) -> bool {
-        if self == Self::RunOneShotFirmware {
+        if matches!(
+            self,
+            Self::RunOneShotFirmware | Self::RunOneShotPassiveChannel1
+        ) {
             return true;
         }
         #[cfg(feature = "fuchsia-passive")]
@@ -9435,6 +9569,55 @@ mod tests {
         let artifacts = run.find("vfio_firmware_artifacts_ready").unwrap();
         let attach = run.find("VFIO_DEVICE_BIND_IOMMUFD").unwrap();
         assert!(process < artifacts && artifacts < attach);
+    }
+
+    #[test]
+    fn contained_channel_one_scan_is_receive_only_and_bounded_source_shape() {
+        assert!(Operation::RunOneShotPassiveChannel1.uses_contained_transport_gate());
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let acquisition = boundary
+            .split("acquire_active_vfio_resources(")
+            .nth(1)
+            .unwrap()
+            .split("record_sae_stage")
+            .next()
+            .unwrap();
+        assert!(acquisition.contains("operation,"));
+        assert!(boundary.contains("RunPhase::MappedDmaDisabled"));
+        assert!(boundary.contains("RunPhase::DmaAndResponseIrqEnabled"));
+        let configured = boundary
+            .find("load_mt7921_firmware_with_passive_boundary")
+            .unwrap();
+        let tuned = boundary.find(".set_channel(").unwrap();
+        let rx_ready = boundary.find("vfio_passive_receive_setup_ready").unwrap();
+        let scan = boundary.find(".start_passive_scan(").unwrap();
+        let observed = boundary.find("vfio_passive_observation_ready").unwrap();
+        let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
+        assert!(
+            configured < tuned
+                && tuned < rx_ready
+                && rx_ready < scan
+                && scan < observed
+                && observed < cleanup
+        );
+        assert!(boundary.contains("min_channel_time: Some(50_000_000)"));
+        assert!(boundary.contains("max_channel_time: Some(120_000_000)"));
+        for forbidden in [
+            "transmit_one_sae_auth",
+            "configure_mgmt_tx_ring",
+            "encode_mt7921_5ghz_auth_tx",
+            "send_rate_power_bytes",
+            "start_active_scan",
+        ] {
+            assert!(!boundary.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]
