@@ -714,6 +714,149 @@ fn acquire_active_vfio_resources(
     Ok(())
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn run_contained_dma_resource_round_trip(
+    capsule: &mut ActiveVfioCapsule,
+    info: &RegionInfo,
+    bdf: &str,
+    wfdma: &ReadPage,
+    pcie_mac: &ReadPage,
+) -> Result<(), String> {
+    record_sae_stage("vfio_dma_resource_round_trip_begin");
+    capsule.active = Some(ActiveVfioResources::default());
+    let primary = (|| -> Result<(), String> {
+        acquire_active_vfio_resources(
+            capsule.active.as_mut().expect("active owner installed"),
+            &capsule.device,
+            &capsule.iommu,
+            capsule.ioas.as_ref().expect("IOAS acquired").id,
+            info,
+            Operation::RunOneShotFirmware,
+            &mut capsule.acquisition,
+            capsule
+                .containment
+                .as_mut()
+                .expect("guarded gate has containment ledger"),
+        )?;
+        record_sae_stage("vfio_dma_resources_mapped core_arenas=10 dma_bytes=126976 bar_pages=4");
+        verify_pci_dma_disabled(bdf)?;
+        let global = wfdma.read(0xd4208)?;
+        let host_irq = wfdma.read(0xd4204)?;
+        let mac_irq = pcie_mac.read(0x10188)?;
+        if global & 0xf != 0 || host_irq != 0 || mac_irq != 0 {
+            return Err(format!(
+                "pre-BME state unsafe global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(&format!(
+            "vfio_dma_pre_bme_verified global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x} bme=false"
+        ));
+        let active = capsule.active.as_mut().expect("active owner installed");
+        {
+            let mut transport = VfioGlobalTxRings { page: wfdma };
+            prepare_global_tx_rings(
+                &mut transport,
+                active.tx_guard.as_ref().expect("mapped").iova,
+                active.fwdl_ring.as_ref().expect("mapped").iova,
+                active.mcu_tx_ring.as_ref().expect("mapped").iova,
+                |_| {},
+            )
+            .map_err(|error| format!("prepare contained TX rings: {error:?}"))?;
+        }
+        {
+            let mut transport = VfioGlobalRxRings { page: wfdma };
+            prepare_global_rx_rings(
+                &mut transport,
+                active.rx_guard.as_ref().expect("mapped").iova,
+                active.mcu_rx_ring.as_ref().expect("mapped").iova,
+                |_| {},
+            )
+            .map_err(|error| format!("prepare contained RX rings: {error:?}"))?;
+            wfdma.write_rx_ring_slot(
+                4,
+                active.mcu_wa_rx_ring.as_ref().expect("mapped").iova as u32,
+                8,
+                7,
+                0,
+            )?;
+        }
+        record_sae_stage("vfio_dma_ring_mmio_prepared tx=18 rx=8 wa_rx=1 dma_enabled=false");
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::BusMaster);
+        record_sae_stage("vfio_dma_bme_enable_before");
+        set_pci_bus_master(bdf, true)?;
+        record_sae_stage("vfio_dma_bme_enable_after bme=true wfdma_enabled=false");
+        Ok(())
+    })();
+
+    let mut cleanup = Vec::new();
+    record_sae_stage("vfio_dma_cleanup_begin");
+    if let Err(error) = wfdma.write_active_wfdma(0xd4204, 0) {
+        cleanup.push(format!("mask host IRQ: {error}"));
+    }
+    if let Err(error) = pcie_mac.write_pcie_mac_interrupt_enable_zero() {
+        cleanup.push(format!("mask PCIe MAC IRQ: {error}"));
+    }
+    match wfdma.read(0xd4208) {
+        Ok(global) if global != u32::MAX => {
+            if let Err(error) = wfdma.write_active_wfdma(0xd4208, global & !0xf) {
+                cleanup.push(format!("disable WFDMA: {error}"));
+            }
+        }
+        Ok(_) => cleanup.push("disable WFDMA: all-ones readback".into()),
+        Err(error) => cleanup.push(format!("read WFDMA for disable: {error}")),
+    }
+    if let Err(error) = set_pci_bus_master(bdf, false) {
+        cleanup.push(format!("disable BME: {error}"));
+    }
+    record_sae_stage("vfio_dma_cleanup_masks_and_bme_disabled");
+    let release_errors = capsule.release_observable();
+    if !release_errors.is_empty() {
+        cleanup.push(format!("resource release: {release_errors:?}"));
+    }
+    record_sae_stage("vfio_dma_resources_unmapped_before_reset");
+    if let Err(error) = reset_vfio_device(&capsule.device) {
+        cleanup.push(format!("VFIO containment reset: {error}"));
+    }
+    let safe = verify_active_reset_containment(wfdma, pcie_mac)
+        .and_then(|()| verify_pci_dma_disabled(bdf));
+    match &safe {
+        Ok(()) => record_sae_stage("vfio_dma_safe_state_verified"),
+        Err(error) => {
+            cleanup.push(format!("safe-state verification: {error}"));
+            record_sae_stage("vfio_dma_safe_state_unproven_retaining");
+            park_retention_capsule_ref(capsule);
+        }
+    }
+    if safe.is_ok() {
+        if let Some(ledger) = capsule.containment.as_mut() {
+            for hazard in [
+                Hazard::DmaMapping,
+                Hazard::BusMaster,
+                Hazard::Wfdma,
+                Hazard::DeviceIrq,
+                Hazard::HostControl,
+                Hazard::LabMutated,
+            ] {
+                ledger.confirm_inactive(hazard);
+            }
+            ledger.phase = RunPhase::Contained;
+        }
+    }
+    match (primary, cleanup.is_empty()) {
+        (Ok(()), true) => {
+            record_sae_stage("vfio_dma_resource_round_trip_complete");
+            Ok(())
+        }
+        (Err(primary), true) => Err(primary),
+        (Ok(()), false) => Err(format!("DMA cleanup errors: {cleanup:?}")),
+        (Err(primary), false) => Err(format!("{primary}; DMA cleanup errors: {cleanup:?}")),
+    }
+}
+
 pub fn main() {
     if let Err(message) = run() {
         eprintln!("mt7921-vfio-read: {message}");
@@ -1579,10 +1722,20 @@ fn run() -> Result<(), String> {
                             record_sae_stage("vfio_irq_reset_boundary_unsafe_retaining_resources");
                             park_retention_capsule_ref(&mut capsule);
                         }
+                        let dma_resources = result.as_ref().map_or(Ok(()), |_| {
+                            run_contained_dma_resource_round_trip(
+                                &mut capsule,
+                                &bar0,
+                                &bdf,
+                                &wfdma_page,
+                                &pcie_mac_page,
+                            )
+                        });
                         record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
                         wfdma_page.teardown()?;
                         record_sae_stage("vfio_irq_reset_wfdma_munmap_after page=0xd4000");
                         result.map_err(|error| format!("IRQ/reset boundary: {error:?}"))?;
+                        dma_resources?;
                         record_sae_stage("vfio_irq_reset_boundary_passed_contained");
                         Ok(())
                     })()
@@ -8886,6 +9039,28 @@ mod tests {
         assert!(!route.contains("push(CarriedScanResult"));
         assert!(route.contains("self.fail_close();\n            drop(carried);"));
         assert!(route.contains("self.fail_close();\n                drop(rejected);"));
+    }
+
+    #[test]
+    fn contained_dma_resource_boundary_stops_before_traffic_source_shape() {
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let mapped = boundary.find("acquire_active_vfio_resources(").unwrap();
+        let disabled = boundary.find("vfio_dma_pre_bme_verified").unwrap();
+        let bme = boundary.find("set_pci_bus_master(bdf, true)").unwrap();
+        let unmap = boundary.find("capsule.release_observable()").unwrap();
+        let reset = boundary.find("reset_vfio_device(&capsule.device)").unwrap();
+        assert!(mapped < disabled && disabled < bme && bme < unmap && unmap < reset);
+        assert!(!boundary.contains("load_mt7921_firmware"));
+        assert!(!boundary.contains("publish_mcu_command"));
+        assert!(!boundary.contains("dma_and_response_irq_enabled"));
+        assert!(!boundary.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
