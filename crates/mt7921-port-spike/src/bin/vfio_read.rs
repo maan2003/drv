@@ -722,6 +722,7 @@ fn run_contained_dma_resource_round_trip(
     bdf: &str,
     wfdma: &ReadPage,
     pcie_mac: &ReadPage,
+    selected_irq: PciIrqCapability,
 ) -> Result<(), String> {
     record_sae_stage("vfio_dma_resource_round_trip_begin");
     capsule.active = Some(ActiveVfioResources::default());
@@ -753,6 +754,38 @@ fn run_contained_dma_resource_round_trip(
             "vfio_dma_pre_bme_verified global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x} bme=false"
         ));
         let active = capsule.active.as_mut().expect("active owner installed");
+        record_sae_stage("vfio_wfdma_prep_begin");
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::Wfdma);
+        let disabled =
+            global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+        wfdma.write_active_wfdma(0xd4208, disabled)?;
+        let disable_deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while wfdma.read(0xd4208)? & ((1 << 1) | (1 << 3)) != 0 {
+            if Instant::now() >= disable_deadline {
+                return Err("WFDMA did not quiesce during contained preparation".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let global_ext = wfdma.read(0xd42b0)?;
+        if global_ext == u32::MAX {
+            return Err("WFDMA extended configuration returned all ones".into());
+        }
+        wfdma.write_active_wfdma(0xd42b0, global_ext & !(1 << 6))?;
+        active
+            .dmashdl
+            .as_ref()
+            .expect("mapped")
+            .enable_dmashdl_bypass()?;
+        let reset = wfdma.read(0xd4100)?;
+        if reset == u32::MAX {
+            return Err("WFDMA reset control returned all ones".into());
+        }
+        wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
+        wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
         {
             let mut transport = VfioGlobalTxRings { page: wfdma };
             prepare_global_tx_rings(
@@ -786,10 +819,44 @@ fn run_contained_dma_resource_round_trip(
             .containment
             .as_mut()
             .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::DeviceIrq);
+        active.irq = Some(VfioIrq::install(&capsule.device, selected_irq)?);
+        if active
+            .irq
+            .as_ref()
+            .expect("IRQ installed")
+            .try_read()?
+            .is_some()
+        {
+            return Err("unexpected IRQ before contained source enable".into());
+        }
+        if wfdma.read(0xd4200)? != 0 {
+            return Err("nonzero host interrupt status during contained preparation".into());
+        }
+        wfdma.write_active_wfdma(0xd42f0, 0)?;
+        wfdma.write_active_wfdma(0xd4680, 4)?;
+        wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
+        wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
+        wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
             .mark_possibly_active(Hazard::BusMaster);
         record_sae_stage("vfio_dma_bme_enable_before");
         set_pci_bus_master(bdf, true)?;
         record_sae_stage("vfio_dma_bme_enable_after bme=true wfdma_enabled=false");
+        let prepared_global = wfdma.read(0xd4208)?;
+        let prepared_host_irq = wfdma.read(0xd4204)?;
+        let prepared_mac_irq = pcie_mac.read(0x10188)?;
+        if prepared_global & 0xf != 0 || prepared_host_irq != 0 || prepared_mac_irq != 0 {
+            return Err(format!(
+                "prepared transport escaped disabled state global={prepared_global:#010x} host_irq={prepared_host_irq:#010x} mac_irq={prepared_mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(
+            "vfio_wfdma_prep_complete engines=false host_irq=false mac_irq=false bme=true msi_owned=true",
+        );
         Ok(())
     })();
 
@@ -812,6 +879,14 @@ fn run_contained_dma_resource_round_trip(
     }
     if let Err(error) = set_pci_bus_master(bdf, false) {
         cleanup.push(format!("disable BME: {error}"));
+    }
+    if let Some(irq) = capsule
+        .active
+        .as_mut()
+        .and_then(|active| active.irq.as_mut())
+        && let Err(error) = irq.disable()
+    {
+        cleanup.push(format!("disable MSI: {error}"));
     }
     record_sae_stage("vfio_dma_cleanup_masks_and_bme_disabled");
     let release_errors = capsule.release_observable();
@@ -1730,6 +1805,7 @@ fn run() -> Result<(), String> {
                                 &bdf,
                                 &wfdma_page,
                                 &pcie_mac_page,
+                                selected_irq,
                             )
                         });
                         record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
@@ -9125,14 +9201,23 @@ mod tests {
             .unwrap();
         let mapped = boundary.find("acquire_active_vfio_resources(").unwrap();
         let disabled = boundary.find("vfio_dma_pre_bme_verified").unwrap();
+        let prep = boundary.find("vfio_wfdma_prep_begin").unwrap();
+        let sanitize = boundary
+            .find("write_active_wfdma(0xd4208, disabled)")
+            .unwrap();
+        let irq = boundary.find("VfioIrq::install").unwrap();
         let bme = boundary.find("set_pci_bus_master(bdf, true)").unwrap();
+        let complete = boundary.find("vfio_wfdma_prep_complete").unwrap();
         let unmap = boundary.find("capsule.release_observable()").unwrap();
         let reset = boundary.find("reset_vfio_device(&capsule.device)").unwrap();
-        assert!(mapped < disabled && disabled < bme && bme < unmap && unmap < reset);
+        assert!(mapped < disabled && disabled < prep && prep < sanitize);
+        assert!(sanitize < irq && irq < bme && bme < complete);
+        assert!(complete < unmap && unmap < reset);
         assert!(!boundary.contains("load_mt7921_firmware"));
         assert!(!boundary.contains("publish_mcu_command"));
         assert!(!boundary.contains("dma_and_response_irq_enabled"));
         assert!(!boundary.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
+        assert!(!boundary.contains("| (1 << 0)\n                | (1 << 2)"));
     }
 
     #[test]
