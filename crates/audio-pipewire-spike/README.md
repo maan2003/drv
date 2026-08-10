@@ -141,3 +141,42 @@ stock WirePlumber 0.5.14 `wpctl inspect 2` bound the node and displayed all ADR
 sink properties. Playback again produced 301 quantum writes and ended at exact
 position 144,480 and checksum 864,000,000; client and server stderr were empty
 (apart from wpctl's expected host RTKit warnings).
+
+## Opt-in Nix package and user service
+
+The flake package `audio-pipewire-daemon` installs the release binary, the
+`drv-audio-pipewire-private` lifecycle launcher, and an opt-in systemd user
+unit. It does not enable itself or replace the host `pipewire.service`. The
+launcher exclusively uses `$XDG_RUNTIME_DIR/drv-audio-pipewire`, enforces mode
+0700, removes a stale `pipewire-0` before launch, forwards TERM/INT to the
+daemon, waits for it, and removes the socket on exit. The user unit adds
+`RuntimeDirectory`, restart-on-failure, a bounded graceful-stop timeout, and
+single-user sandboxing.
+
+Exact activation commands:
+
+```sh
+nix build .#audio-pipewire-daemon
+systemctl --user link "$(readlink -f result)/share/systemd/user/drv-audio-pipewire.service"
+systemctl --user enable --now drv-audio-pipewire.service
+
+PIPEWIRE_RUNTIME_DIR="$XDG_RUNTIME_DIR/drv-audio-pipewire" pw-cli ls Metadata
+PIPEWIRE_RUNTIME_DIR="$XDG_RUNTIME_DIR/drv-audio-pipewire" \
+  pw-cat --playback --raw --rate 48000 --channels 2 --format s16 audio.raw
+
+systemctl --user disable --now drv-audio-pipewire.service
+```
+
+For an ephemeral opt-in run without installing the unit:
+
+```sh
+nix run .#audio-pipewire-daemon
+```
+
+The packaged launcher was tested against a pre-existing stale socket, then
+with untargeted stock `pw-cat`, `pw-cli ls Metadata`, and `wpctl inspect 2` on
+the private socket. TERM reaped the daemon and removed the socket; a second
+launch recreated it and passed stock Node discovery. Playback retained exact
+accounting for the 480-frame pattern (checksum 2,880,000) plus the stock silent
+drain quantum (final ring position 960). Package tests, service-unit validation,
+and all client probes succeeded.

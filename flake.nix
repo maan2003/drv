@@ -24,6 +24,11 @@
           ./crates/netstack3-port-spike/kernel-provider/check.nix
           { };
 
+      checks.x86_64-linux.audio-pipewire-daemon =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/audio-pipewire-spike/package.nix
+          { };
+
       checks.x86_64-linux.netstack3-provider-daemon =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
           ./crates/netstack3-port-spike/provider-package.nix
@@ -47,6 +52,9 @@
           physicalWasmSource = builtins.getEnv "SAPPHIRE_PHYSICAL_WASM_SOURCE";
         in
         rec {
+          audio-pipewire-daemon =
+            pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
+
           netstack3-provider-daemon =
             pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix
               { };
