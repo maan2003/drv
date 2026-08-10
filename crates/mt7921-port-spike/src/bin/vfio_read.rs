@@ -1266,17 +1266,29 @@ fn read_sae_credential() -> Result<SaeCredential, String> {
     if raw_fd <= 2 {
         return Err("DRV_SAE_CREDENTIAL_FD is invalid".into());
     }
-    let mut credential = Vec::with_capacity(64);
+    let credential_len = env::var("DRV_SAE_CREDENTIAL_LEN")
+        .map_err(|_| "DRV_SAE_CREDENTIAL_LEN is required")?
+        .parse::<usize>()
+        .map_err(|_| "DRV_SAE_CREDENTIAL_LEN is invalid")?;
+    read_sae_credential_exact(raw_fd, credential_len)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn read_sae_credential_exact(
+    raw_fd: RawFd,
+    credential_len: usize,
+) -> Result<SaeCredential, String> {
+    if !(8..=63).contains(&credential_len) {
+        return Err("SAE credential length is invalid".into());
+    }
+    let mut credential = vec![0; credential_len];
     // SAFETY: the root launcher transfers this inherited descriptor exactly
     // once to this one-shot process; taking ownership also closes it promptly.
     let mut file = unsafe { File::from_raw_fd(raw_fd) };
-    Read::by_ref(&mut file)
-        .take(64)
-        .read_to_end(&mut credential)
-        .map_err(|_| "read SAE credential FD failed".to_string())?;
-    if !(8..=63).contains(&credential.len()) {
+    if file.read_exact(&mut credential).is_err() {
         credential.fill(0);
-        return Err("SAE credential length is invalid".into());
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        return Err("read exact SAE credential bytes failed".into());
     }
     Ok(SaeCredential(credential))
 }
@@ -10258,6 +10270,21 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn sae_credential_declared_length_does_not_wait_for_eof() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"eight-byte-secret").unwrap();
+        let credential = read_sae_credential_exact(reader.into_raw_fd(), 8).unwrap();
+        assert_eq!(credential.0, b"eight-by");
+        // The peer deliberately remains open: returning proves there was no
+        // read-to-EOF dependency. Remaining bytes are discarded on close.
+        drop(writer);
+    }
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
