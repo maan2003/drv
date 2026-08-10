@@ -1569,3 +1569,36 @@ not return an owner, or as a best-effort fallback after owned-disable failure.
 No second physical attempt was made. The completed safe-state verification is
 authoritative for containment; the redundant cleanup error did not leave an
 IRQ or device source active.
+
+### Contained DMA-resource boundary
+
+The next guarded boundary now allocates only the DMA resources needed to
+represent Linux's pre-firmware ring setup. It maps four BAR pages and ten DMA
+arenas: 4 KiB TX and RX guards, 4 KiB FWDL and MCU TX rings, 4 KiB MCU and WA
+RX rings, two 16 KiB RX-buffer arenas, a 64 KiB command-payload arena, and a
+4 KiB FWDL-payload arena (126,976 DMA bytes total). It programs the existing
+18 TX, eight RX, and one WA RX ring slots while BME is clear and the WFDMA
+enable/busy low nibble plus host and MAC interrupt masks are all zero.
+
+Only after those mappings and disabled-state checks does the boundary set PCI
+BME. WFDMA remains disabled throughout; the path has no firmware loader, MCU
+publication, response interrupt, or radio operation. Cleanup masks host and
+MAC sources, clears WFDMA's low nibble, clears BME, releases all DMA and BAR
+mappings and the IOAS, then performs VFIO reset and the established
+post-reset containment checks. If that verification cannot prove the safe
+state, the resources remain parked under the watchdog rather than being
+claimed released.
+
+The single guarded physical attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T131434Z-0000_05_00.0.log` and used
+release binary SHA-256
+`95148a063f6c7e5b53d02df1758828f028587577a5e7b0dfb2892b586ab1e827`.
+It completed the preceding ownership and IRQ/reset boundaries, mapped all ten
+arenas and four BAR pages, verified BME false and WFDMA disabled, prepared all
+27 ring slots, then observed BME true with WFDMA still disabled. Cleanup
+disabled BME, recorded resources unmapped before reset, passed the safe-state
+verification, and ended with userspace `rc=0` and supervisor restore
+`failed=0`. The client heartbeat briefly lost SSH and conservatively returned
+unknown status, but the durable report contains every completion marker.
+Afterward `mt7921e` was rebound, `iwd` was active, and `wlan1` was connected;
+the reboot watchdog was inactive. No second attempt was made.
