@@ -1425,6 +1425,46 @@ fn run() -> Result<(), String> {
                         query_info.flags
                     ));
                 }
+
+                record_sae_stage(&format!(
+                    "vfio_bar0_mmap_before page=0x10000 length={} prot=read flags=shared region_size={} region_offset={}",
+                    PAGE, bar0.size, bar0.offset
+                ));
+                let mut pcie_mac_page = match ReadPage::map(&capsule.device, &bar0, 0x10000, false)
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_bar0_mmap_error page=0x10000 error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage("vfio_bar0_mmap_after page=0x10000 length=4096");
+                let mac_interrupt_enable = (|| -> Result<u32, String> {
+                    record_sae_stage("vfio_pcie_mac_int_enable_read_before offset=0x10188 bytes=4");
+                    let raw = pcie_mac_page.read(0x10188)?;
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_read_after offset=0x10188 bytes=4 value={raw:#010x}"
+                    ));
+                    if raw == u32::MAX {
+                        return Err("MT_PCIE_MAC_INT_ENABLE returned all ones".into());
+                    }
+                    Ok(raw)
+                })();
+                record_sae_stage("vfio_bar0_munmap_before page=0x10000 length=4096");
+                let unmap = pcie_mac_page.teardown();
+                match &unmap {
+                    Ok(()) => record_sae_stage("vfio_bar0_munmap_after page=0x10000 length=4096"),
+                    Err(error) => record_sae_stage(&format!(
+                        "vfio_bar0_munmap_error page=0x10000 error={error}"
+                    )),
+                }
+                unmap?;
+                let mac_interrupt_enable = mac_interrupt_enable?;
+                record_sae_stage(&format!(
+                    "vfio_pcie_mac_int_enable_snapshot_complete value={mac_interrupt_enable:#010x}"
+                ));
                 Ok(())
             })();
 
