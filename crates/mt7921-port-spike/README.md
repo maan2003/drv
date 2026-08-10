@@ -1810,3 +1810,25 @@ RX arenas are retained for the hook. All 73 integrated tests and the release
 build pass after that correction (release SHA-256
 `ae7dda3efc61165aa97ab418b8e1ca2861b824ece8306f3f5dfd452c587724a7`).
 Per the one-run limit, the corrected path has not been rerun physically.
+
+One corrected rerun was subsequently authorized, using unchanged release
+SHA-256
+`ae7dda3efc61165aa97ab418b8e1ca2861b824ece8306f3f5dfd452c587724a7`.
+Its report is
+`/var/lib/wifi-driver-lab/reports/20260810T142520Z-0000_05_00.0.log`.
+All passive preparation steps passed, including data RX ring/IRQ ownership.
+The source-exact MAC enable, RX-path, device/BSS, receive-filter, and channel
+switch commands completed for channel 1 at 2412 MHz, and the durable setup
+marker records `intentional_tx=false`. The passive `START_SCAN` command
+completed with matching scan ID 1 and firmware reported successful scan
+completion, but the bounded dwell produced zero beacon/probe-response
+observations. Therefore there is no RSSI evidence and the receive boundary is
+not physically proved.
+
+The run stopped at that exact bounded failure without retrying or transmitting
+a probe, management frame, data frame, or SAE frame. Transport quiesce and
+outer containment disabled WFDMA/IRQs/BME, released mappings before reset, and
+passed safe-state verification. Userspace ended with `rc=1` and supervisor
+restore with `failed=0`; native `mt7921e` rebound, `iwd` was active,
+`wlan1` was connected, and both watchdog units were inactive. No further run
+was made.
