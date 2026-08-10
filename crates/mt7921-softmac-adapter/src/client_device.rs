@@ -45,6 +45,12 @@ pub struct ClientRxFrame {
 /// Errors are already-mapped Zircon statuses. The adapter forwards them
 /// unchanged and never retries or interprets them.
 pub trait Mt7921ClientEffects {
+    /// Immediately poison scan-derived authority in every shared TX handle.
+    fn revoke_scan(&mut self);
+
+    /// Immediately and durably poison every shared TX handle for lifecycle.
+    fn revoke_lifecycle(&mut self);
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -191,6 +197,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
             Ok(event) => event,
             Err(_) => {
                 backend.revoked = true;
+                backend.effects.revoke_scan();
                 if let Some(scan_id) = backend.active_scan_id.take() {
                     let _ = backend.effects.complete_passive_scan(scan_id, false);
                 }
@@ -200,10 +207,15 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         if let Some(event) = &event {
             match event {
                 HardwareScanEvent::Observation(observation) => {
-                    let scan_id = backend.active_scan_id.ok_or(zx::Status::BAD_STATE)?;
+                    let Some(scan_id) = backend.active_scan_id else {
+                        backend.revoked = true;
+                        backend.effects.revoke_scan();
+                        return Err(zx::Status::BAD_STATE);
+                    };
                     if let Err(status) = backend.effects.observe_passive_scan(scan_id, observation)
                     {
                         backend.revoked = true;
+                        backend.effects.revoke_scan();
                         backend.active_scan_id = None;
                         let _ = backend.effects.complete_passive_scan(scan_id, false);
                         return Err(status);
@@ -212,18 +224,24 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
                 HardwareScanEvent::Complete { scan_id, success } => {
                     if backend.active_scan_id != Some(*scan_id) {
                         backend.revoked = true;
+                        backend.effects.revoke_scan();
                         return Err(zx::Status::BAD_STATE);
                     }
                     if !success {
                         backend.revoked = true;
+                        backend.effects.revoke_scan();
                     }
                     if let Err(status) = backend.effects.complete_passive_scan(*scan_id, *success) {
                         backend.revoked = true;
+                        backend.effects.revoke_scan();
                         backend.active_scan_id = None;
                         return Err(status);
                     }
                     backend.active_scan_id = None;
-                    backend.revoked = !success;
+                    backend.revoked = !success || backend.lifecycle_poisoned;
+                    if backend.revoked {
+                        backend.effects.revoke_scan();
+                    }
                 }
             }
         }
@@ -235,6 +253,8 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     pub fn reset(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         backend.revoked = true;
+        backend.lifecycle_poisoned = true;
+        backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
         backend.effects.reset()
     }
@@ -244,6 +264,8 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     pub fn stop(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         backend.revoked = true;
+        backend.lifecycle_poisoned = true;
+        backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
         backend.effects.stop()
     }
@@ -266,6 +288,7 @@ struct ComposedBackend<E, S> {
     scan: S,
     active_scan_id: Option<u64>,
     revoked: bool,
+    lifecycle_poisoned: bool,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
@@ -295,6 +318,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 scan: NoClientScan,
                 active_scan_id: None,
                 revoked: false,
+                lifecycle_poisoned: false,
             })),
             support,
         )
@@ -307,15 +331,17 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     /// Construct the usable production boundary. TX authorization is checked
     /// by `effects` at every submission; construction grants no authority.
     pub fn new(
-        effects: E,
+        mut effects: E,
         scan: Mt7921SoftmacAdapter<T>,
         support: ClientSupport,
     ) -> (Self, Mt7921ScanRunner<E, T>) {
+        effects.revoke_scan();
         let backend = Arc::new(Mutex::new(ComposedBackend {
             effects,
             scan,
             active_scan_id: None,
             revoked: true,
+            lifecycle_poisoned: false,
         }));
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
@@ -414,6 +440,8 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
+        backend.revoked = true;
+        backend.effects.revoke_scan();
         let response = backend.scan.start_passive_scan(request.clone())?;
         let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
         backend.active_scan_id = Some(scan_id);
@@ -654,6 +682,10 @@ mod tests {
     }
 
     impl Mt7921ClientEffects for FakeEffects {
+        fn revoke_scan(&mut self) {}
+
+        fn revoke_lifecycle(&mut self) {}
+
         fn set_channel(
             &mut self,
             primary: fidl_ieee80211::ChannelNumber,

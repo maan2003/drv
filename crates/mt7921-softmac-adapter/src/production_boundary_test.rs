@@ -230,6 +230,8 @@ enum Reject {
 
 #[derive(Default)]
 struct BackendState {
+    scan_poisoned: bool,
+    lifecycle_poisoned: bool,
     active_scan_id: Option<u64>,
     pending_scan_channel: Option<fidl_ieee80211::ChannelNumber>,
     regulatory_channel: Option<fidl_ieee80211::ChannelNumber>,
@@ -245,10 +247,12 @@ struct BackendState {
     fail_stop: bool,
 }
 
-#[derive(Clone, Default)]
 struct ProductionBackend(Arc<Mutex<BackendState>>);
 
-impl ProductionBackend {
+#[derive(Clone)]
+struct BackendProgrammer(Arc<Mutex<BackendState>>);
+
+impl BackendProgrammer {
     fn set_regulatory_max(&self, power_dbm: i8) {
         let mut state = self.0.lock().unwrap();
         state.regulatory_max_dbm = Some(power_dbm);
@@ -272,6 +276,22 @@ impl ProductionBackend {
 }
 
 impl Mt7921ClientEffects for ProductionBackend {
+    fn revoke_scan(&mut self) {
+        self.0.lock().unwrap().scan_poisoned = true;
+    }
+
+    fn revoke_lifecycle(&mut self) {
+        let mut state = self.0.lock().unwrap();
+        state.lifecycle_poisoned = true;
+        state.scan_poisoned = true;
+        state.regulatory_channel = None;
+        state.current_channel = None;
+        state.regulatory_max_dbm = None;
+        state.sar_cap_dbm = None;
+        state.programmed_power_dbm = None;
+        state.programmed_rate_mbps = None;
+    }
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -294,10 +314,12 @@ impl Mt7921ClientEffects for ProductionBackend {
             state.regulatory_max_dbm.is_some_and(|limit| power <= limit)
                 && state.sar_cap_dbm.is_some_and(|limit| power <= limit)
         });
-        if state.current_channel != Some(channel(6))
+        if state.scan_poisoned
+            || state.lifecycle_poisoned
+            || state.current_channel != Some(channel(6))
             || state.regulatory_channel != state.current_channel
             || !power_authorized
-            || state.programmed_rate_mbps.is_none()
+            || !state.programmed_rate_mbps.is_some_and(|rate| rate > 0)
         {
             state.rejects.push(Reject::Revoked);
             return Err(zx::Status::ACCESS_DENIED);
@@ -354,13 +376,17 @@ impl Mt7921ClientEffects for ProductionBackend {
     }
     fn complete_passive_scan(&mut self, scan_id: u64, success: bool) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
-        state.regulatory_channel = if state.active_scan_id == Some(scan_id) && success {
-            state.pending_scan_channel
-        } else {
-            None
-        };
+        state.regulatory_channel =
+            if state.active_scan_id == Some(scan_id) && success && !state.lifecycle_poisoned {
+                state.pending_scan_channel
+            } else {
+                None
+            };
         state.active_scan_id = None;
         state.pending_scan_channel = None;
+        if success && !state.lifecycle_poisoned {
+            state.scan_poisoned = false;
+        }
         Ok(())
     }
     fn reset(&mut self) -> Result<(), zx::Status> {
@@ -368,11 +394,7 @@ impl Mt7921ClientEffects for ProductionBackend {
         if state.fail_reset {
             return Err(zx::Status::IO);
         }
-        state.regulatory_channel = None;
         state.active_scan_id = None;
-        state.current_channel = None;
-        state.programmed_power_dbm = None;
-        state.programmed_rate_mbps = None;
         Ok(())
     }
     fn stop(&mut self) -> Result<(), zx::Status> {
@@ -447,9 +469,11 @@ fn device_info() -> fidl_mlme::DeviceInfo {
 #[test]
 fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
     futures::executor::block_on(async {
-        let backend = ProductionBackend::default();
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let programmer = BackendProgrammer(state.clone());
+        let backend = ProductionBackend(state.clone());
         let (mut device, runner) =
-            Mt7921ClientDevice::new(backend.clone(), physical_adapter(), client_support());
+            Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
         let mut events = device.take_mlme_event_stream().unwrap();
         let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
         let mut mlme = ClientMlme::new(Default::default(), device, timer)
@@ -542,22 +566,10 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             .await
             .expect("pinned selector must select the physical WPA3 BSS");
 
-        let mut backend_clone = backend.clone();
-        assert_eq!(
-            backend_clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
-            Err(zx::Status::ACCESS_DENIED),
-            "missing regulatory, SAR, and programming inputs must reject"
-        );
-        backend.set_regulatory_max(18);
-        backend.set_sar_cap(16);
-        backend.complete_power_programming(17);
-        backend.complete_rate_programming(6);
-        assert_eq!(
-            backend_clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
-            Err(zx::Status::ACCESS_DENIED),
-            "descriptor power above SAR must reject"
-        );
-        backend.complete_power_programming(16);
+        programmer.set_regulatory_max(18);
+        programmer.set_sar_cap(16);
+        programmer.complete_power_programming(16);
+        programmer.complete_rate_programming(6);
         let _transaction = sme.on_connect_command(fidl_sme::ConnectRequest {
             ssid: SSID.to_vec(),
             bss_description: Sequestered::release(selected.bss.bss_description),
@@ -588,11 +600,8 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             .unwrap();
 
         {
-            let state = backend.0.lock().unwrap();
-            assert_eq!(
-                state.applied,
-                [Applied::Power(17), Applied::Rate(6), Applied::Power(16)]
-            );
+            let state = state.lock().unwrap();
+            assert_eq!(state.applied, [Applied::Power(16), Applied::Rate(6)]);
             assert_eq!(state.frames.len(), 1);
             let frame = &state.frames[0];
             assert_eq!(&frame[0..2], &[0xb0, 0]);
@@ -602,33 +611,162 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             assert_eq!(&frame[24..28], &[3, 0, 1, 0]);
         }
 
-        let mut clone = backend.clone();
+        runner.reset().unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.lifecycle_poisoned);
+        assert!(state.regulatory_max_dbm.is_none());
+        assert!(state.sar_cap_dbm.is_none());
+        assert!(state.programmed_power_dbm.is_none());
+        assert!(state.programmed_rate_mbps.is_none());
+    });
+}
+
+#[test]
+fn production_tx_requires_independent_power_and_rate_authorization() {
+    futures::executor::block_on(async {
+        let state = Arc::new(Mutex::new(BackendState {
+            regulatory_channel: Some(channel(6)),
+            regulatory_max_dbm: Some(18),
+            sar_cap_dbm: Some(16),
+            programmed_power_dbm: Some(16),
+            ..Default::default()
+        }));
+        let programmer = BackendProgrammer(state.clone());
+        let mut device = Mt7921ClientDevice::new_offline_fake(
+            ProductionBackend(state.clone()),
+            client_support(),
+        );
+        device
+            .set_channel(
+                channel(6),
+                fidl_ieee80211::ChannelBandwidth::Cbw20,
+                channel(0),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(
-            clone.send_wlan_frame(&[], fidl_softmac::WlanTxInfoFlags::empty()),
+            device.send_wlan_frame(vec![1].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        programmer.complete_rate_programming(0);
+        assert_eq!(
+            device.send_wlan_frame(vec![2].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        programmer.complete_rate_programming(6);
+        programmer.complete_power_programming(17);
+        assert_eq!(
+            device.send_wlan_frame(vec![3].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        programmer.complete_power_programming(16);
+        device
+            .send_wlan_frame(vec![4].into(), fidl_softmac::WlanTxInfoFlags::empty(), None)
+            .unwrap();
+        assert_eq!(
+            device.send_wlan_frame(vec![5].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
             Err(zx::Status::ALREADY_EXISTS)
         );
-        backend.0.lock().unwrap().fail_reset = true;
-        assert_eq!(runner.reset(), Err(zx::Status::IO));
-        assert!(runner.backend.lock().unwrap().revoked);
 
-        // Re-establish every effect-side prerequisite before independently
-        // proving write-ahead stop revocation on its own failure path.
-        {
-            let mut state = backend.0.lock().unwrap();
-            state.fail_reset = false;
-            state.fail_stop = true;
-            state.regulatory_channel = state.current_channel;
-            state.regulatory_max_dbm = Some(18);
-            state.sar_cap_dbm = Some(16);
-            state.programmed_power_dbm = Some(16);
-            state.programmed_rate_mbps = Some(6);
-        }
-        runner.backend.lock().unwrap().revoked = false;
-        assert_eq!(runner.stop(), Err(zx::Status::IO));
-        assert!(runner.backend.lock().unwrap().revoked);
+        let state = state.lock().unwrap();
+        assert_eq!(state.frames, [vec![4]]);
         assert_eq!(
-            backend.0.lock().unwrap().rejects,
-            [Reject::Revoked, Reject::Revoked, Reject::AlreadyTransmitted]
+            state.rejects,
+            [
+                Reject::Revoked,
+                Reject::Revoked,
+                Reject::Revoked,
+                Reject::AlreadyTransmitted
+            ]
         );
     });
+}
+
+#[test]
+fn reset_failure_revokes_before_first_frame_and_survives_later_scan() {
+    futures::executor::block_on(async {
+        let state = Arc::new(Mutex::new(BackendState {
+            regulatory_channel: Some(channel(6)),
+            current_channel: Some(channel(6)),
+            regulatory_max_dbm: Some(18),
+            sar_cap_dbm: Some(16),
+            programmed_power_dbm: Some(16),
+            programmed_rate_mbps: Some(6),
+            fail_reset: true,
+            ..Default::default()
+        }));
+        let (mut device, runner) = Mt7921ClientDevice::new(
+            ProductionBackend(state.clone()),
+            physical_adapter(),
+            client_support(),
+        );
+
+        assert!(state.lock().unwrap().frames.is_empty());
+        assert_eq!(runner.reset(), Err(zx::Status::IO));
+        let request = fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest {
+            channels: Some(vec![channel(6)]),
+            min_channel_time: Some(10),
+            max_channel_time: Some(20),
+            min_home_time: Some(0),
+        };
+        DeviceOps::start_passive_scan(&mut device, &request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            runner.poll(),
+            Ok(Some(HardwareScanEvent::Observation(_)))
+        ));
+        assert!(matches!(
+            runner.poll(),
+            Ok(Some(HardwareScanEvent::Complete { success: true, .. }))
+        ));
+
+        let backend = runner.backend.lock().unwrap();
+        assert!(backend.revoked);
+        assert!(backend.lifecycle_poisoned);
+        let state = state.lock().unwrap();
+        assert!(state.frames.is_empty());
+        assert!(state.lifecycle_poisoned);
+        assert!(state.regulatory_channel.is_none());
+        assert!(state.current_channel.is_none());
+        assert!(state.regulatory_max_dbm.is_none());
+        assert!(state.sar_cap_dbm.is_none());
+        assert!(state.programmed_power_dbm.is_none());
+        assert!(state.programmed_rate_mbps.is_none());
+    });
+}
+
+#[test]
+fn stop_failure_revokes_and_clears_evidence_before_first_frame() {
+    let state = Arc::new(Mutex::new(BackendState {
+        regulatory_channel: Some(channel(6)),
+        current_channel: Some(channel(6)),
+        regulatory_max_dbm: Some(18),
+        sar_cap_dbm: Some(16),
+        programmed_power_dbm: Some(16),
+        programmed_rate_mbps: Some(6),
+        fail_stop: true,
+        ..Default::default()
+    }));
+    let (_device, runner) = Mt7921ClientDevice::new(
+        ProductionBackend(state.clone()),
+        physical_adapter(),
+        client_support(),
+    );
+
+    assert!(state.lock().unwrap().frames.is_empty());
+    assert_eq!(runner.stop(), Err(zx::Status::IO));
+    let backend = runner.backend.lock().unwrap();
+    assert!(backend.revoked);
+    assert!(backend.lifecycle_poisoned);
+    let state = state.lock().unwrap();
+    assert!(state.frames.is_empty());
+    assert!(state.lifecycle_poisoned);
+    assert!(state.regulatory_channel.is_none());
+    assert!(state.current_channel.is_none());
+    assert!(state.regulatory_max_dbm.is_none());
+    assert!(state.sar_cap_dbm.is_none());
+    assert!(state.programmed_power_dbm.is_none());
+    assert!(state.programmed_rate_mbps.is_none());
 }
