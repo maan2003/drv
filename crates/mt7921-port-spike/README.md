@@ -2015,3 +2015,23 @@ recorded. After reboot, native `mt7921e` rebound, iwd was active, `wlan0` had
 carrier, all recovery and watchdog units were inactive, and
 `/run/wifi-driver-lab` was absent. No further physical mutation was
 attempted.
+
+The per-stage file write and blocking `sync_all` were then removed; stages
+were emitted best-effort to stderr instead. One guarded run of that correction
+was launched as `wifi-sae-exchange10` from commit `23191175e221`; the
+release binary SHA-256 was
+`73ddf24e4866d9cc2e835c3da5baae643621a9a3ddd954a0c22f90881e8a3adc`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T165813Z-0000_05_00.0.log`
+contains only the supervisor's member, start, and userspace-begin records:
+`wifi-driver-lab` did not spool the payload's stderr and the prior-boot
+journal retained no transient-unit output. Consequently this run provides no
+durable evidence for BAR mapping, firmware startup, beacon RX, or SAE TX/RX;
+association, key, and data effects remained disabled.
+
+The kernel recorded two completed `vfio-pci` resets followed by a 60-second
+page-pool shutdown stall for pool 19 with one inflight buffer. The watchdog
+rebooted before userspace end or supervisor restore could be recorded. After
+reboot, native `mt7921e` rebound, iwd was active, `wlan0` had carrier, all
+recovery and watchdog units were inactive, and `/run/wifi-driver-lab` was
+absent. No further physical mutation was attempted.
