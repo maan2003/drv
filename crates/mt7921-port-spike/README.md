@@ -2115,3 +2115,26 @@ no longer exported the patched
 `/sys/module/mt7921e/parameters/keep_d0_on_remove` parameter. Further
 physical work is blocked on both a disappearance-safe netdev quiesce and a
 system closure containing the patched kernel module.
+
+After booting a merged closure with the patched kernel module and a
+disappearance-convergent quiesce loop, one guarded run was launched as
+`wifi-sae-exchange14`. The run used commit `d73b1f4e462c`, release SHA-256
+`fc9d4b96230e24c61ccd27935404fea4da1c15ca19f406b0720190d4387ff5cf`,
+and freshly derived target `f2:a3:18:4f:30:76` on channel 36 at 5180 MHz.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T182726Z-0000_05_00.0.log`
+records the expected race-safe `QUIESCE netdev=wlan0 vanished=true`, VFIO
+userspace entry, immediate userspace return with status 1, and successful
+native restore. It contains no payload stage, firmware, SAE, association, key,
+or data evidence.
+
+The dynamic BSSID and channel were exported by the outer recovery supervisor,
+but the handoff wrapper creates a nested transient service. The protected
+inner launcher therefore received neither value and exited its validation
+before invoking the binary; the earlier hard-coded target had hidden this
+environment-transport boundary. The restored interface did not reassociate
+within the bounded recovery window, so the watchdog rebooted. There was no
+page-pool warning. The patched system closure remained selected after reboot,
+`keep_d0_on_remove` was `Y`, and native `mt7921e`, iwd, and carrier
+recovered. Further physical work is blocked on explicit non-secret target
+transport across the nested service boundary.
