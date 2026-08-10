@@ -1719,3 +1719,30 @@ before reset, and passed `vfio_dma_safe_state_verified`. Userspace ended with
 `rc=0` and supervisor restore with `failed=0`. After the conservative wrapper
 heartbeat loss, native `mt7921e` rebound, `iwd` was active, `wlan1` connected,
 and the watchdog inactive. No firmware attempt followed.
+
+### Contained firmware bootstrap on the proven transport
+
+The firmware bootstrap now enters the same contained coordinator used by the
+passed transport-activation boundary. It verifies and parses both installed
+artifacts before VFIO attachment, retains the coordinator's live MSI, WFDMA,
+WM/WM2, command, and firmware-download resources after activation, and gives
+those resources directly to the existing loader. There is no parallel
+transport setup. Durable coarse markers cover process start, artifact
+readiness, and transport readiness before the existing patch, RAM,
+firmware-start, N9-ready, and NIC-capability phases.
+
+The single guarded attempt used binary SHA-256
+`23581dbfcb72fa50f9a7a09bc8a86b21ca471e3c174390ab45322cc1fd5416f5`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T140636Z-0000_05_00.0.log`.
+It completed one patch section and four downloadable RAM regions in 196
+scatter chunks, observed N9 ready, and received a 23-element
+`GET_NIC_CAPABILITY` response on WM2. The boundary then quiesced the
+transport without issuing EEPROM, CLC/calibration, channel, scan, or radio
+operations. Outer containment masked and disabled the transport, cleared BME,
+released mappings before reset, and passed the safe-state verification.
+Userspace ended with `rc=0` and supervisor restore with `failed=0`. The
+wrapper conservatively returned unknown status after losing SSH, but the
+durable report is complete. After recovery `mt7921e` was rebound, `iwd`
+was active, `wlan1` was connected, and the watchdog was inactive. No second
+attempt was made.
