@@ -1,4 +1,4 @@
-//! Safe host bridge to Fuchsia's pinned audio gain processing.
+//! Safe host bridge to Fuchsia's pinned audio processing primitives.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -13,6 +13,12 @@ pub fn apply_gain_s16(samples: &mut [i16], gain_db: f32) {
 pub enum MixError {
     LengthMismatch,
     PartialStereoFrame,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResampleError {
+    PartialStereoFrame,
+    FrameCountOverflow,
 }
 
 /// Mixes two equal-length stereo streams through Fuchsia's planar channel strip.
@@ -37,6 +43,40 @@ pub fn mix_stereo_s16(first: &[i16], second: &[i16]) -> Result<Vec<i16>, MixErro
     Ok(dest)
 }
 
+/// Point-resamples interleaved stereo S16 from 44.1 kHz onto a 48 kHz timeline.
+///
+/// The call treats `source` as one contiguous stream beginning at frame zero.
+/// Fuchsia's pinned `PositionManager` owns the exact fractional source clock
+/// progression, while the host bridge owns only PCM conversion and allocation.
+pub fn resample_stereo_s16_44100_to_48000(source: &[i16]) -> Result<Vec<i16>, ResampleError> {
+    if !source.len().is_multiple_of(2) {
+        return Err(ResampleError::PartialStereoFrame);
+    }
+    let source_frames = source.len() / 2;
+    let dest_frames = source_frames
+        .checked_mul(48_000)
+        .and_then(|frames| frames.checked_add(44_100 - 1))
+        .map(|frames| frames / 44_100)
+        .ok_or(ResampleError::FrameCountOverflow)?;
+    let dest_samples = dest_frames
+        .checked_mul(2)
+        .ok_or(ResampleError::FrameCountOverflow)?;
+    let mut dest = vec![0; dest_samples];
+    // SAFETY: source and destination cover the declared stereo frame counts,
+    // are separately borrowed, and the bridge retains no pointers.
+    let produced = unsafe {
+        drv_fuchsia_resample_stereo_s16_44100_to_48000(
+            source.as_ptr(),
+            source_frames,
+            dest.as_mut_ptr(),
+            dest_frames,
+        )
+    };
+    debug_assert_eq!(produced, dest_frames);
+    dest.truncate(produced * 2);
+    Ok(dest)
+}
+
 unsafe extern "C" {
     fn drv_fuchsia_apply_gain_s16(samples: *mut i16, sample_count: usize, gain_db: f32);
     fn drv_fuchsia_mix_stereo_s16(
@@ -45,6 +85,12 @@ unsafe extern "C" {
         dest: *mut i16,
         frame_count: usize,
     );
+    fn drv_fuchsia_resample_stereo_s16_44100_to_48000(
+        source: *const i16,
+        source_frame_count: usize,
+        dest: *mut i16,
+        dest_frame_count: usize,
+    ) -> usize;
 }
 
 #[cfg(test)]
@@ -72,6 +118,34 @@ mod tests {
         assert_eq!(
             mix_stereo_s16(&first, &second).unwrap(),
             [15_000, -5_000, i16::MAX, i16::MIN]
+        );
+    }
+
+    #[test]
+    fn pinned_fuchsia_positions_produce_exact_one_second_frame_count() {
+        let source = vec![0; 44_100 * 2];
+        assert_eq!(
+            resample_stereo_s16_44100_to_48000(&source).unwrap().len(),
+            48_000 * 2
+        );
+    }
+
+    #[test]
+    fn pinned_fuchsia_positions_select_deterministic_point_samples() {
+        let source: Vec<_> = (0_i16..441).flat_map(|frame| [frame, -frame]).collect();
+        let dest = resample_stereo_s16_44100_to_48000(&source).unwrap();
+        assert_eq!(dest.len(), 480 * 2);
+        for (dest_frame, samples) in dest.chunks_exact(2).enumerate() {
+            let source_frame = (dest_frame * 44_100 / 48_000) as i16;
+            assert_eq!(samples, [source_frame, -source_frame]);
+        }
+    }
+
+    #[test]
+    fn resampler_rejects_partial_stereo_frames() {
+        assert_eq!(
+            resample_stereo_s16_44100_to_48000(&[1]),
+            Err(ResampleError::PartialStereoFrame)
         );
     }
 }
