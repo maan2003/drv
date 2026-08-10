@@ -130,13 +130,19 @@ struct ClientBuffers {
     io: File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackResult {
+    pub frame_position: u64,
+    pub processed_sample_checksum: i64,
+}
+
 /// Serve one native client and return its Fuchsia-derived playback frame position.
-pub fn serve_one(listener: &UnixListener) -> io::Result<u64> {
+pub fn serve_one(listener: &UnixListener) -> io::Result<PlaybackResult> {
     let (mut stream, _) = listener.accept()?;
     serve_connection(&mut stream)
 }
 
-fn serve_connection(stream: &mut UnixStream) -> io::Result<u64> {
+fn serve_connection(stream: &mut UnixStream) -> io::Result<PlaybackResult> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
@@ -156,7 +162,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<u64> {
                             | io::ErrorKind::ConnectionReset
                     ) =>
             {
-                return Ok(endpoint.frame_position());
+                return Ok(playback_result(&endpoint));
             }
             Err(error) => return Err(error),
         };
@@ -240,7 +246,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<u64> {
                             client_nodes[client_node_index].transport.as_ref().unwrap(),
                             client_nodes[client_node_index].buffers.as_ref().unwrap(),
                         )?;
-                        return Ok(endpoint.frame_position());
+                        return Ok(playback_result(&endpoint));
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -357,6 +363,13 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<u64> {
                 ));
             }
         }
+    }
+}
+
+fn playback_result(endpoint: &VirtualPcmEndpoint) -> PlaybackResult {
+    PlaybackResult {
+        frame_position: endpoint.frame_position(),
+        processed_sample_checksum: endpoint.processed_sample_checksum(),
     }
 }
 
@@ -1703,7 +1716,7 @@ mod tests {
         let (set_format, _) = read_message(&mut client).unwrap();
         assert_eq!((set_format.id, set_format.opcode), (8, 7));
         drop(client);
-        assert_eq!(worker.join().unwrap().unwrap(), 0);
+        assert_eq!(worker.join().unwrap().unwrap().frame_position, 0);
     }
 
     #[test]

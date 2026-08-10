@@ -13,8 +13,8 @@ fn main() {
         fs::create_dir_all(&runtime_dir).expect("create runtime directory");
         let socket = runtime_dir.join("pipewire-0");
         let listener = UnixListener::bind(&socket).expect("bind pipewire-0");
-        let position = match protocol::serve_one(&listener) {
-            Ok(position) => position,
+        let result = match protocol::serve_one(&listener) {
+            Ok(result) => result,
             Err(error) => {
                 eprintln!("PipeWire probe stopped: {error}");
                 let _ = fs::remove_file(&socket);
@@ -22,7 +22,10 @@ fn main() {
             }
         };
         fs::remove_file(socket).expect("remove pipewire-0");
-        println!("consumed frame position: {position}");
+        println!(
+            "consumed frame position: {}, Fuchsia-processed sample checksum: {}",
+            result.frame_position, result.processed_sample_checksum
+        );
         return;
     }
 

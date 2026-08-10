@@ -15,6 +15,13 @@ The SPA POD bytes use PipeWire's native ABI and can be placed directly in a
 future node/port parameter event. The protocol frontend does not leak into the
 playback state. This milestone neither accesses ALSA nor physical hardware.
 
+Every negotiated S16 sample also runs through the unchanged Fuchsia processing
+library's `DbToScale` and `ApplyGain<GainType::kNonUnity>` at a fixed
+-6.0206003 dB, packaged in `../fuchsia-audio-processing`. Only the C ABI and
+S16 representation conversion are host-owned; no pinned processing source is
+patched. A post-gain sample checksum makes the processing observable in
+stock-client probes rather than a decorative dependency.
+
 ## Rust PipeWire libraries
 
 `pipewire` (`pipewire-rs`) is a safe wrapper over the installed C
@@ -60,6 +67,6 @@ then exports two real memfd-backed PCM buffer descriptors with
 `SPA_IO_Buffers`, starts and activates the client node, recycles its buffers,
 and writes each finite PCM chunk into the Fuchsia TimelineFunction-backed
 endpoint. A 1,920-byte stock `pw-cat` playback exits successfully with a
-reported position of 480 frames. Production graph policy, realtime pacing,
-multi-node clock/quantum coordination, and long-running playback remain outside
-this spike.
+reported position of 480 frames and a checksum of the post-gain samples.
+Production graph policy, realtime pacing, multi-node clock/quantum coordination,
+and long-running playback remain outside this spike.

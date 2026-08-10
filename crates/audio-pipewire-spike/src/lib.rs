@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use drv_fuchsia_audio_processing::apply_gain_s16;
 use drv_fuchsia_audio_timeline::TimelineFunction;
 use pipewire_native_spa::{
     param::{
@@ -40,6 +41,9 @@ pub const VIRTUAL_SINK_FORMAT: PcmFormat = PcmFormat {
     channels: 2,
 };
 
+/// Fixed non-unity gain used to prove pinned Fuchsia processing is in-path.
+pub const VIRTUAL_SINK_GAIN_DB: f32 = -6.020_600_3;
+
 /// Minimal backend surface needed after PipeWire has negotiated a playback format.
 pub trait PlaybackEndpoint {
     fn format(&self) -> PcmFormat;
@@ -58,6 +62,7 @@ pub enum EndpointError {
 pub struct VirtualPcmEndpoint {
     bytes_consumed: i64,
     frames_from_bytes: TimelineFunction,
+    processed_sample_checksum: i64,
 }
 
 impl Default for VirtualPcmEndpoint {
@@ -65,6 +70,7 @@ impl Default for VirtualPcmEndpoint {
         Self {
             bytes_consumed: 0,
             frames_from_bytes: TimelineFunction::new(0, 0, 1, 4).unwrap(),
+            processed_sample_checksum: 0,
         }
     }
 }
@@ -79,6 +85,16 @@ impl PlaybackEndpoint for VirtualPcmEndpoint {
         if !pcm.len().is_multiple_of(FRAME_BYTES) {
             return Err(EndpointError::PartialFrame);
         }
+        let mut samples = pcm
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes(sample.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        apply_gain_s16(&mut samples, VIRTUAL_SINK_GAIN_DB);
+        self.processed_sample_checksum = samples
+            .iter()
+            .fold(self.processed_sample_checksum, |sum, sample| {
+                sum.wrapping_add(i64::from(*sample))
+            });
         self.bytes_consumed = self
             .bytes_consumed
             .checked_add(i64::try_from(pcm.len()).map_err(|_| EndpointError::PositionOverflow)?)
@@ -88,6 +104,13 @@ impl PlaybackEndpoint for VirtualPcmEndpoint {
 
     fn frame_position(&self) -> u64 {
         self.frames_from_bytes.apply(self.bytes_consumed) as u64
+    }
+}
+
+impl VirtualPcmEndpoint {
+    /// Deterministic evidence of samples after pinned Fuchsia gain processing.
+    pub fn processed_sample_checksum(&self) -> i64 {
+        self.processed_sample_checksum
     }
 }
 
@@ -200,6 +223,18 @@ mod tests {
         let mut endpoint = VirtualPcmEndpoint::default();
         endpoint.write(&vec![0; 48_000 * 4]).unwrap();
         assert_eq!(endpoint.frame_position(), 48_000);
+    }
+
+    #[test]
+    fn virtual_endpoint_runs_pcm_through_pinned_fuchsia_gain() {
+        let mut endpoint = VirtualPcmEndpoint::default();
+        let mut pcm = Vec::new();
+        pcm.extend(20_000_i16.to_le_bytes());
+        pcm.extend(10_000_i16.to_le_bytes());
+        endpoint.write(&pcm).unwrap();
+
+        assert_eq!(endpoint.frame_position(), 1);
+        assert_eq!(endpoint.processed_sample_checksum(), 15_000);
     }
 
     #[test]
