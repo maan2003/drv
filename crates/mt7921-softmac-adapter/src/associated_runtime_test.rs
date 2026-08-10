@@ -31,6 +31,50 @@ const AP_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const CLIENT_IP: [u8; 4] = [192, 0, 2, 10];
 const SERVER_IP: [u8; 4] = [192, 0, 2, 1];
 
+fn establish_association() -> crate::client_device::Mt7921AssociationState {
+    let mut association = crate::client_device::Mt7921AssociationState::default();
+    association
+        .program(
+            &fidl_fuchsia_wlan_softmac::WlanAssociationConfig {
+                bssid: Some(AP_MAC),
+                aid: Some(1),
+                ..Default::default()
+            },
+            1,
+            false,
+        )
+        .unwrap();
+    let key = |key_type, peer_addr, key_idx| {
+        fidl_fuchsia_wlan_softmac::WlanKeyConfiguration {
+            protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
+            cipher_oui: Some([0, 15, 172]),
+            cipher_type: Some(4),
+            key_type: Some(key_type),
+            peer_addr: Some(peer_addr),
+            key_idx: Some(key_idx),
+            // Public synthetic test pattern, never network key material.
+            key: Some(vec![0xa5; 16]),
+            rsc: Some(0),
+        }
+    };
+    association
+        .key_installed(&key(
+            fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise,
+            AP_MAC,
+            0,
+        ))
+        .unwrap();
+    association
+        .key_installed(&key(
+            fidl_fuchsia_wlan_ieee80211::KeyType::Group,
+            [0xff; 6],
+            1,
+        ))
+        .unwrap();
+    association.set_link_up().unwrap();
+    association
+}
+
 struct AssociatedAp {
     server: Runtime,
     dns: netstack3_port_integration::UdpSocketHandle,
@@ -250,8 +294,9 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
     let mut runner = EthernetRunner::new(service, device);
     let mut ap = AssociatedAp::new();
 
-    // This is the host-visible result of association, key installation, and
-    // opening Fuchsia MLME's controlled port.
+    // This is the host-visible result of WCID programming, required traffic
+    // key installation, and opening Fuchsia MLME's controlled port.
+    let mut association = establish_association();
     sink.set_link(true);
     for second in 0..16 {
         drive(
@@ -339,6 +384,10 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
     let read = ap.server.tcp_read(accepted, &mut request).unwrap();
     assert_eq!(&request[..read], b"GET / HTTP/1.0\r\n\r\n");
 
+    let teardown = association.clear().unwrap();
+    assert!(teardown.close_link);
+    assert!(teardown.remove_pairwise_key);
+    assert!(teardown.remove_group_key);
     sink.set_link(false);
     drive(
         &mut runner,
@@ -361,6 +410,8 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         Err(RemoteSocketError::NetworkUnreachable)
     );
 
+    association = establish_association();
+    assert_eq!(association.wcid(), Some(1));
     sink.set_link(true);
     for second in 97..128 {
         drive(
