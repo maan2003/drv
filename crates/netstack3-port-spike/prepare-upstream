@@ -46,6 +46,7 @@ host_patches=(
   "$patch_dir/wlan-trace-host.patch"
   "$patch_dir/wlan-timer-host.patch"
   "$patch_dir/wlan-mlme-host.patch"
+  "$patch_dir/wlan-mlme-provenance-host.patch"
 )
 patch_set=$(cat "${host_patches[@]}" | sha256sum | cut -d' ' -f1)
 patch_stamp="$refroot/.drv-host-patch-set"

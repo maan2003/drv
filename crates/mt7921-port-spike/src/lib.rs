@@ -3395,17 +3395,21 @@ pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveR
     })
 }
 
-/// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
-/// beacon/probe-response material to pinned Fuchsia. Data/control frames,
-/// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
-pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Connac2RxFrame {
+    pub bytes: Vec<u8>,
+    pub band: PhysicalBand,
+    pub channel: u8,
+    pub rssi_dbm: i8,
+}
+
+/// Strip exactly one Connac2 data/MCU-normal RX envelope into the complete
+/// 802.11 frame plus the receive fields retained by the pinned client seam.
+pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxError> {
     let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
     let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
     let reported_len = (rxd0 & 0xffff) as usize;
     let bytes = bytes.get(..reported_len).ok_or(PassiveRxError::Truncated)?;
-    if reported_len < 24 {
-        return Err(PassiveRxError::Truncated);
-    }
     let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
     let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
     let rxd3 = u32::from_le_bytes(header[12..16].try_into().expect("fixed field"));
@@ -3432,33 +3436,49 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
     };
     let mut offset = 24usize;
     if rxd1 & (1 << 14) != 0 {
-        offset += 16;
+        offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
     }
     if rxd1 & (1 << 11) != 0 {
-        offset += 16;
+        offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
     }
     if rxd1 & (1 << 12) != 0 {
-        offset += 8;
+        offset = offset.checked_add(8).ok_or(PassiveRxError::Truncated)?;
     }
     if rxd1 & (1 << 13) == 0 {
         return Err(PassiveRxError::MissingRxVector);
     }
-    let rxv = bytes
-        .get(offset..offset + 8)
-        .ok_or(PassiveRxError::Truncated)?;
-    let rcpi = u32::from_le_bytes(rxv[4..8].try_into().expect("fixed field"));
-    let strongest = (0..2)
+    let rxv = bytes.get(offset..offset + 8).ok_or(PassiveRxError::Truncated)?;
+    let mut rcpi = u32::from_le_bytes(rxv[4..8].try_into().expect("fixed field"));
+    offset += 8;
+    if rxd1 & (1 << 15) != 0 {
+        let group5 = bytes.get(offset..offset + 72).ok_or(PassiveRxError::Truncated)?;
+        // Pinned Linux skips the first 24 bytes of GROUP_5, takes its
+        // overriding RCPI field, then advances across the remaining 48.
+        rcpi = u32::from_le_bytes(group5[24..28].try_into().expect("fixed field"));
+        offset = offset.checked_add(72).ok_or(PassiveRxError::Truncated)?;
+    }
+    let rssi_dbm = (0..2)
         .map(|chain| ((rcpi >> (chain * 8)) & 0xff) as i16)
         .map(|value| (value - 220) / 2)
         .max()
         .unwrap_or(-128)
         .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
-    offset += 8;
-    if rxd1 & (1 << 15) != 0 {
-        offset += 72;
-    }
-    offset += 2 * ((rxd2 >> 14) & 0x3) as usize;
+    offset = offset
+        .checked_add(2 * ((rxd2 >> 14) & 0x3) as usize)
+        .ok_or(PassiveRxError::Truncated)?;
     let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
+    if frame.len() < 2 {
+        return Err(PassiveRxError::Truncated);
+    }
+    Ok(Connac2RxFrame { bytes: frame.to_vec(), band, channel, rssi_dbm })
+}
+
+/// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
+/// beacon/probe-response material to pinned Fuchsia. Data/control frames,
+/// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
+pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
+    let Connac2RxFrame { bytes: frame, band, channel, rssi_dbm } =
+        parse_connac2_rx_frame(bytes)?;
     let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
     let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
     let probe_response = match frame_control & 0x00fc {
@@ -3474,7 +3494,7 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
         ies: frame[36..].to_vec(),
         band,
         channel,
-        rssi_dbm: strongest,
+        rssi_dbm,
     })
 }
 
@@ -8529,6 +8549,45 @@ mod tests {
             parse_passive_advertisement(&rx),
             Err(PassiveRxError::UnsupportedFrame)
         );
+    }
+
+    #[test]
+    fn passive_advertisement_and_client_frame_share_exact_connac_envelope_parsing() {
+        let mut data = vec![0; 24 + 8 + 36 + 5];
+        data[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        data[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        data[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        let frame = &mut data[32..];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        frame[16..22].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+        frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
+        frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
+
+        for packet in [2u32 << 27, (7u32 << 27) | (1 << 16)] {
+            for with_group_5 in [false, true] {
+                let mut envelope = if with_group_5 {
+                    let mut envelope = data[..32].to_vec();
+                    envelope.resize(32 + 72, 0);
+                    envelope[56..60].copy_from_slice(&0x6464u32.to_le_bytes());
+                    envelope.extend_from_slice(&data[32..]);
+                    envelope[4..8].copy_from_slice(&((1u32 << 13) | (1 << 15)).to_le_bytes());
+                    envelope
+                } else {
+                    data.clone()
+                };
+                let len = envelope.len() as u32;
+                envelope[0..4].copy_from_slice(&(packet | len).to_le_bytes());
+
+                let stripped = parse_connac2_rx_frame(&envelope).unwrap();
+                let advertisement = parse_passive_advertisement(&envelope).unwrap();
+                assert_eq!(advertisement.band, stripped.band);
+                assert_eq!(advertisement.channel, stripped.channel);
+                assert_eq!(advertisement.rssi_dbm, stripped.rssi_dbm);
+                assert_eq!(advertisement.rssi_dbm, if with_group_5 { -60 } else { -50 });
+                assert_eq!(advertisement.ies, stripped.bytes[36..]);
+            }
+        }
     }
 
     #[test]

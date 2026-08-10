@@ -24,6 +24,108 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 
+/// One frame/status/provenance tuple carried only through the in-process
+/// production client receive path. The provenance value is opaque here: this
+/// shape cannot inspect, validate, clone, detach, or serialize it.
+///
+/// ```compile_fail
+/// fn detach<P>(rx: mt7921_softmac_adapter::PinnedClientRx<P>) {
+///     let _ = rx.provenance;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn duplicate<P>(rx: mt7921_softmac_adapter::PinnedClientRx<P>) {
+///     let _ = rx.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn fake_trusted_admission<P>(
+///     rx: mt7921_softmac_adapter::PinnedClientRx<P>,
+/// ) -> fidl_fuchsia_wlan_mlme::ScanResult {
+///     rx.into()
+/// }
+/// ```
+pub struct PinnedClientRx<P> {
+    bytes: Vec<u8>,
+    status: fidl_fuchsia_wlan_softmac::WlanRxInfo,
+    provenance: P,
+}
+
+pub fn pinned_client_rx_from_connac2<P>(
+    envelope: &[u8],
+    provenance: P,
+) -> Result<PinnedClientRx<P>, mt7921_port_spike::PassiveRxError> {
+    let frame = mt7921_port_spike::parse_connac2_rx_frame(envelope)?;
+    let band = match frame.band {
+        PhysicalBand::Ghz2 => fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+        PhysicalBand::Ghz5 => fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz,
+        PhysicalBand::Ghz6 => return Err(mt7921_port_spike::PassiveRxError::InvalidChannel),
+    };
+    let primary = fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+        band,
+        number: frame.channel,
+    };
+    Ok(PinnedClientRx::new(
+        frame.bytes,
+        fidl_fuchsia_wlan_softmac::WlanRxInfo {
+            rx_flags: fidl_fuchsia_wlan_softmac::WlanRxInfoFlags::empty(),
+            // The pinned client scanner consumes primary and RSSI. PHY, rate,
+            // MCS, bandwidth, and SNR are semantic ignores on this path, so
+            // their neutral placeholders are deliberately not marked valid.
+            valid_fields: fidl_fuchsia_wlan_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_fuchsia_wlan_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary,
+            bandwidth: fidl_fuchsia_wlan_ieee80211::ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                band,
+                number: 0,
+            },
+            mcs: 0,
+            rssi_dbm: frame.rssi_dbm,
+            snr_dbh: 0,
+        },
+        provenance,
+    ))
+}
+
+impl<P> PinnedClientRx<P> {
+    fn new(bytes: Vec<u8>, status: fidl_fuchsia_wlan_softmac::WlanRxInfo, provenance: P) -> Self {
+        Self {
+            bytes,
+            status,
+            provenance,
+        }
+    }
+}
+
+/// Apply the purely structural carrier above to the actual pinned
+/// `ClientMlme` receive path. Only the caller's observer can interpret `P`.
+pub async fn handle_pinned_client_rx<D, P, O>(
+    mlme: &mut wlan_mlme::client::ClientMlme<D>,
+    rx: PinnedClientRx<P>,
+    observer: &mut O,
+) where
+    D: wlan_mlme::device::DeviceOps,
+    O: wlan_mlme::ScanResultObserver<P>,
+{
+    let PinnedClientRx {
+        bytes,
+        status,
+        provenance,
+    } = rx;
+    mlme.handle_mac_frame_rx_observed(
+        &bytes,
+        status,
+        fuchsia_trace::Id::new(),
+        provenance,
+        observer,
+    )
+    .await;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassiveScanCommand {
     pub scan_id: u64,
@@ -821,6 +923,56 @@ pub fn query_from_capabilities(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    fn connac2_envelope(mcu_normal: bool, group5: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut frame = vec![0x80, 0, 0, 0];
+        frame.extend(0u8..32);
+        let mut envelope = vec![0; if group5 { 104 } else { 32 }];
+        let len = (envelope.len() + frame.len()) as u32;
+        let kind = if mcu_normal {
+            (7 << 27) | (1 << 16)
+        } else {
+            2 << 27
+        };
+        envelope[0..4].copy_from_slice(&(kind | len).to_le_bytes());
+        envelope[4..8].copy_from_slice(&((1u32 << 13) | (u32::from(group5) << 15)).to_le_bytes());
+        envelope[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        envelope[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        if group5 {
+            envelope[56..60].copy_from_slice(&0x6464u32.to_le_bytes());
+        }
+        envelope.extend_from_slice(&frame);
+        (envelope, frame)
+    }
+
+    #[test]
+    fn connac2_data_and_mcu_normal_map_once_to_exact_frame_and_rx_info() {
+        for (mcu_normal, group5, expected_rssi) in [
+            (false, false, -50),
+            (true, false, -50),
+            (false, true, -60),
+            (true, true, -60),
+        ] {
+            let (envelope, frame) = connac2_envelope(mcu_normal, group5);
+            let rx = pinned_client_rx_from_connac2(&envelope, 9u8).unwrap();
+            assert_eq!(rx.bytes, frame);
+            assert_eq!(rx.provenance, 9);
+            assert_eq!(rx.status.primary.number, 36);
+            assert_eq!(
+                rx.status.primary.band,
+                fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz
+            );
+            assert_eq!(rx.status.rssi_dbm, expected_rssi);
+            assert_eq!(
+                rx.status.bandwidth,
+                fidl_fuchsia_wlan_ieee80211::ChannelBandwidth::Cbw20
+            );
+            assert_eq!(
+                rx.status.valid_fields,
+                fidl_fuchsia_wlan_softmac::WlanRxInfoValid::RSSI
+            );
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ScriptError(&'static str);

@@ -2616,6 +2616,388 @@ struct DescriptorOccurrence {
     lease: Arc<DescriptorOccurrenceLease>,
 }
 
+#[cfg(all(test, feature = "fuchsia-passive"))]
+struct ProvenanceHandle {
+    session: NonZeroU64,
+    generation: u64,
+    index: usize,
+    drop_order_probe: Option<(Arc<DescriptorOccurrenceLease>, Arc<AtomicBool>)>,
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+impl Drop for ProvenanceHandle {
+    fn drop(&mut self) {
+        if let Some((lease, released_after_invalidation)) = &self.drop_order_probe {
+            released_after_invalidation
+                .store(!lease.current.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationDisposition {
+    Pending,
+    Produced,
+    Ignored(wlan_mlme::ScanResultIgnore),
+    ConversionDrop,
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+struct ProvenanceRegistration {
+    generation: u64,
+    occurrence: DescriptorOccurrence,
+    disposition: RegistrationDisposition,
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+struct CarriedScanResult {
+    provenance: ProvenanceHandle,
+    result: fidl_fuchsia_wlan_mlme::ScanResult,
+}
+
+/// Binary-private, compile/test-only B2a arena. It owns the actual B1
+/// occurrences and the only sink allowed to validate and export a scan result.
+#[cfg(all(test, feature = "fuchsia-passive"))]
+struct ProvenanceSession {
+    source: DescriptorProvenance,
+    id: NonZeroU64,
+    generation: u64,
+    ingress: Vec<PrivateRawFrameCarrier>,
+    registrations: Vec<ProvenanceRegistration>,
+    quarantine: Vec<PrivateRawFrameCarrier>,
+    observed_order: Vec<u64>,
+    result_tx: Option<futures::channel::mpsc::UnboundedSender<CarriedScanResult>>,
+    result_rx: futures::channel::mpsc::UnboundedReceiver<CarriedScanResult>,
+    carried_results: Vec<CarriedScanResult>,
+    outstanding_results: usize,
+    next_observe_index: usize,
+    last_admitted_occurrence: Option<u64>,
+    next_handle_drop_order_probe: Option<Arc<AtomicBool>>,
+    closed: bool,
+    invalidated: bool,
+    poisoned: bool,
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+impl ProvenanceSession {
+    const CAPACITY: usize = 4096;
+
+    fn new() -> Self {
+        let source = DescriptorProvenance::new();
+        let id = source.owner;
+        let (result_tx, result_rx) = futures::channel::mpsc::unbounded();
+        Self {
+            source,
+            id,
+            generation: 1,
+            ingress: Vec::new(),
+            registrations: Vec::new(),
+            quarantine: Vec::new(),
+            observed_order: Vec::new(),
+            result_tx: Some(result_tx),
+            result_rx,
+            carried_results: Vec::new(),
+            outstanding_results: 0,
+            next_observe_index: 0,
+            last_admitted_occurrence: None,
+            next_handle_drop_order_probe: None,
+            closed: false,
+            invalidated: false,
+            poisoned: false,
+        }
+    }
+
+    fn enqueue(&mut self, carrier: PrivateRawFrameCarrier) -> Result<(), String> {
+        if self.closed || self.poisoned {
+            return Err("provenance session is closed or poisoned".into());
+        }
+        let Some(owned) = self.registrations.len().checked_add(self.ingress.len()) else {
+            self.quarantine.push(carrier);
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        };
+        if owned >= Self::CAPACITY {
+            self.quarantine.push(carrier);
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        }
+        self.ingress.push(carrier);
+        Ok(())
+    }
+
+    fn flush_ingress(
+        &mut self,
+    ) -> Result<Vec<mt7921_softmac_adapter::PinnedClientRx<ProvenanceHandle>>, String> {
+        self.ingress.sort_by_key(|carrier| {
+            carrier
+                .occurrence
+                .as_ref()
+                .map_or(u64::MAX, |occurrence| occurrence.identity.occurrence)
+        });
+        let ingress = std::mem::take(&mut self.ingress);
+        ingress
+            .into_iter()
+            .map(|carrier| self.admit_carrier(carrier))
+            .collect()
+    }
+
+    fn admit(&mut self, occurrence: DescriptorOccurrence) -> Result<ProvenanceHandle, String> {
+        if self.closed || self.poisoned {
+            return Err("provenance session is closed or poisoned".into());
+        }
+        if !self.ingress.is_empty() {
+            self.quarantine.push(PrivateRawFrameCarrier {
+                bytes: Vec::new(),
+                occurrence: Some(occurrence),
+            });
+            self.fail_close();
+            return Err("direct admission cannot bypass queued ingress".into());
+        }
+        let Some(owned) = self.registrations.len().checked_add(self.ingress.len()) else {
+            self.quarantine.push(PrivateRawFrameCarrier {
+                bytes: Vec::new(),
+                occurrence: Some(occurrence),
+            });
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        };
+        if owned >= Self::CAPACITY {
+            self.quarantine.push(PrivateRawFrameCarrier {
+                bytes: Vec::new(),
+                occurrence: Some(occurrence),
+            });
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        }
+        if self
+            .last_admitted_occurrence
+            .is_some_and(|previous| occurrence.identity.occurrence <= previous)
+        {
+            self.quarantine.push(PrivateRawFrameCarrier {
+                bytes: Vec::new(),
+                occurrence: Some(occurrence),
+            });
+            self.fail_close();
+            return Err("provenance ingress occurrence order regressed".into());
+        }
+        let index = self.registrations.len();
+        self.last_admitted_occurrence = Some(occurrence.identity.occurrence);
+        let drop_order_probe =
+            self.next_handle_drop_order_probe
+                .take()
+                .map(|released_after_invalidation| {
+                    (Arc::clone(&occurrence.lease), released_after_invalidation)
+                });
+        self.registrations.push(ProvenanceRegistration {
+            generation: self.generation,
+            occurrence,
+            disposition: RegistrationDisposition::Pending,
+        });
+        Ok(ProvenanceHandle {
+            session: self.id,
+            generation: self.generation,
+            index,
+            drop_order_probe,
+        })
+    }
+
+    fn admit_carrier(
+        &mut self,
+        carrier: PrivateRawFrameCarrier,
+    ) -> Result<mt7921_softmac_adapter::PinnedClientRx<ProvenanceHandle>, String> {
+        if carrier.occurrence.is_none() {
+            self.quarantine.push(carrier);
+            self.fail_close();
+            return Err("B1 carrier has no occurrence".into());
+        }
+        let Some(owned) = self.registrations.len().checked_add(self.ingress.len()) else {
+            self.quarantine.push(carrier);
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        };
+        if owned >= Self::CAPACITY {
+            self.quarantine.push(carrier);
+            self.fail_close();
+            return Err("provenance session arena exhausted".into());
+        }
+        let PrivateRawFrameCarrier { bytes, occurrence } = carrier;
+        let occurrence = occurrence.expect("checked above");
+        let handle = self.admit(occurrence)?;
+        match mt7921_softmac_adapter::pinned_client_rx_from_connac2(&bytes, handle) {
+            Ok(rx) => Ok(rx),
+            Err(error) => {
+                self.fail_close();
+                Err(format!("reject B1 Connac2 carrier: {error:?}"))
+            }
+        }
+    }
+
+    fn validate_index(&self, handle: &ProvenanceHandle) -> Result<usize, String> {
+        if self.closed
+            || self.poisoned
+            || handle.session != self.id
+            || handle.generation != self.generation
+        {
+            return Err("provenance session handle mismatch".into());
+        }
+        let registration = self
+            .registrations
+            .get(handle.index)
+            .ok_or_else(|| "provenance session index mismatch".to_string())?;
+        if registration.generation != self.generation
+            || registration.disposition != RegistrationDisposition::Pending
+        {
+            return Err("provenance registration is stale".into());
+        }
+        self.source.validate(&registration.occurrence)?;
+        Ok(handle.index)
+    }
+
+    fn inspect_next_result(&mut self, inspect: impl FnOnce(&CarriedScanResult)) -> bool {
+        let Ok(carried) = self.result_rx.try_recv() else {
+            return false;
+        };
+        self.carried_results.push(carried);
+        self.outstanding_results -= 1;
+        inspect(self.carried_results.last().expect("just pushed"));
+        true
+    }
+
+    fn advance_generation(&mut self) {
+        self.generation = self.generation.checked_add(1).unwrap_or_else(|| {
+            self.poisoned = true;
+            u64::MAX
+        });
+    }
+
+    fn fail_close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.poisoned = true;
+        // Invalidate while ingress, canonical registrations, quarantine, and
+        // carried results are all still owned by this session.
+        self.source.invalidate(DescriptorInvalidation::Run).ok();
+        self.invalidated = true;
+        self.result_tx.take();
+        while self.result_rx.try_recv().is_ok() {}
+        self.outstanding_results = 0;
+        self.next_observe_index = 0;
+        self.last_admitted_occurrence = None;
+        self.carried_results.clear();
+        self.ingress.clear();
+        self.registrations.clear();
+        self.quarantine.clear();
+        self.observed_order.clear();
+        self.closed = true;
+        self.advance_generation();
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        if self.closed || self.poisoned {
+            return Err("provenance session cannot finish".into());
+        }
+        if !self.ingress.is_empty()
+            || !self.quarantine.is_empty()
+            || self.outstanding_results != 0
+            || self.next_observe_index != self.registrations.len()
+            || self
+                .registrations
+                .iter()
+                .any(|registration| registration.disposition == RegistrationDisposition::Pending)
+        {
+            self.fail_close();
+            return Err("provenance session has unclassified or undrained state".into());
+        }
+        // Exclusive &mut access proves no observer can race this retirement.
+        // Every never-reused arena index is retired exactly once here.
+        for registration in &self.registrations {
+            self.source.retire(&registration.occurrence);
+        }
+        // Carried results remain session-owned until after their registrations
+        // have been retired under this exclusive access.
+        self.carried_results.clear();
+        self.registrations.clear();
+        self.observed_order.clear();
+        self.last_admitted_occurrence = None;
+        self.result_tx.take();
+        self.closed = true;
+        self.advance_generation();
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+impl wlan_mlme::ScanResultObserver<ProvenanceHandle> for ProvenanceSession {
+    fn observe(
+        &mut self,
+        disposition: &wlan_mlme::ScanResultDisposition<'_>,
+        provenance: ProvenanceHandle,
+    ) -> wlan_mlme::ScanResultObserverControl {
+        let Ok(index) = self.validate_index(&provenance) else {
+            self.fail_close();
+            return wlan_mlme::ScanResultObserverControl::Suppress;
+        };
+        if index != self.next_observe_index {
+            self.fail_close();
+            return wlan_mlme::ScanResultObserverControl::Suppress;
+        }
+        let Some(next_observe_index) = self.next_observe_index.checked_add(1) else {
+            self.fail_close();
+            return wlan_mlme::ScanResultObserverControl::Suppress;
+        };
+        self.next_observe_index = next_observe_index;
+        self.observed_order
+            .push(self.registrations[index].occurrence.identity.occurrence);
+        let classification = match disposition {
+            wlan_mlme::ScanResultDisposition::Produced(result) => {
+                let carried = CarriedScanResult {
+                    provenance,
+                    result: (**result).clone(),
+                };
+                let Some(tx) = self.result_tx.as_ref() else {
+                    self.fail_close();
+                    drop(carried);
+                    return wlan_mlme::ScanResultObserverControl::Suppress;
+                };
+                if let Err(rejected) = tx.unbounded_send(carried) {
+                    // The send error owns the affine handle. Retain it across
+                    // fail-close so source invalidation precedes its release.
+                    self.fail_close();
+                    drop(rejected);
+                    return wlan_mlme::ScanResultObserverControl::Suppress;
+                }
+                self.outstanding_results += 1;
+                RegistrationDisposition::Produced
+            }
+            wlan_mlme::ScanResultDisposition::Ignored(reason) => {
+                RegistrationDisposition::Ignored(*reason)
+            }
+            wlan_mlme::ScanResultDisposition::ConversionDrop => {
+                RegistrationDisposition::ConversionDrop
+            }
+        };
+        self.registrations[index].disposition = classification;
+        wlan_mlme::ScanResultObserverControl::Continue
+    }
+
+    fn observe_transport_failure(&mut self) {
+        self.fail_close();
+    }
+}
+
+#[cfg(all(test, feature = "fuchsia-passive"))]
+impl Drop for ProvenanceSession {
+    fn drop(&mut self) {
+        // Drop bodies run before fields: invalidate every B1 occurrence before
+        // the queue, arena registrations, or source provenance are released.
+        if !self.closed {
+            self.fail_close();
+        }
+    }
+}
+
 impl DescriptorOccurrence {
     fn is_current(&self) -> bool {
         self.lease.owner == self.identity.owner && self.lease.current.load(Ordering::Acquire)
@@ -5998,6 +6380,897 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fuchsia-passive")]
+    struct B2aFakeDevice {
+        events: Arc<std::sync::Mutex<Vec<fidl_fuchsia_wlan_mlme::MlmeEvent>>>,
+        event_tx: futures::channel::mpsc::UnboundedSender<fidl_fuchsia_wlan_mlme::MlmeEvent>,
+        event_rx:
+            Option<futures::channel::mpsc::UnboundedReceiver<fidl_fuchsia_wlan_mlme::MlmeEvent>>,
+        minstrel: Option<wlan_mlme::MinstrelWrapper>,
+        fail_mlme_event: bool,
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    impl B2aFakeDevice {
+        fn new() -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<fidl_fuchsia_wlan_mlme::MlmeEvent>>>,
+        ) {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
+            (
+                Self {
+                    events: Arc::clone(&events),
+                    event_tx,
+                    event_rx: Some(event_rx),
+                    minstrel: None,
+                    fail_mlme_event: false,
+                },
+                events,
+            )
+        }
+
+        fn new_with_failed_mlme_transport() -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<fidl_fuchsia_wlan_mlme::MlmeEvent>>>,
+        ) {
+            let (mut device, events) = Self::new();
+            device.fail_mlme_event = true;
+            (device, events)
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    impl wlan_mlme::device::DeviceOps for B2aFakeDevice {
+        async fn wlan_softmac_query_response(
+            &mut self,
+        ) -> Result<fidl_fuchsia_wlan_softmac::WlanSoftmacQueryResponse, zx::Status> {
+            Ok(fidl_fuchsia_wlan_softmac::WlanSoftmacQueryResponse {
+                sta_addr: Some([7; 6]),
+                ..Default::default()
+            })
+        }
+        async fn discovery_support(
+            &mut self,
+        ) -> Result<fidl_fuchsia_wlan_softmac::DiscoverySupport, zx::Status> {
+            Ok(fidl_fuchsia_wlan_softmac::DiscoverySupport {
+                scan_offload: Some(fidl_fuchsia_wlan_softmac::ScanOffloadExtension {
+                    supported: Some(true),
+                    scan_cancel_supported: Some(true),
+                }),
+                ..Default::default()
+            })
+        }
+        async fn mac_sublayer_support(
+            &mut self,
+        ) -> Result<fidl_fuchsia_wlan_common::MacSublayerSupport, zx::Status> {
+            Ok(Default::default())
+        }
+        async fn security_support(
+            &mut self,
+        ) -> Result<fidl_fuchsia_wlan_common::SecuritySupport, zx::Status> {
+            Ok(Default::default())
+        }
+        async fn spectrum_management_support(
+            &mut self,
+        ) -> Result<fidl_fuchsia_wlan_common::SpectrumManagementSupport, zx::Status> {
+            Ok(Default::default())
+        }
+        fn deliver_eth_frame(&mut self, _packet: &[u8]) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn send_wlan_frame(
+            &mut self,
+            _buffer: fdf::ArenaStaticBox<[u8]>,
+            _tx_flags: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags,
+            _async_id: Option<fuchsia_trace::Id>,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn set_ethernet_status(
+            &mut self,
+            _status: wlan_mlme::device::LinkStatus,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn set_channel(
+            &mut self,
+            _primary: fidl_fuchsia_wlan_ieee80211::ChannelNumber,
+            _bandwidth: fidl_fuchsia_wlan_ieee80211::ChannelBandwidth,
+            _vht_secondary_80_channel: fidl_fuchsia_wlan_ieee80211::ChannelNumber,
+        ) -> Result<(), zx::Status> {
+            Ok(())
+        }
+        async fn set_mac_address(&mut self, _mac_addr: [u8; 6]) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn start_passive_scan(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+        ) -> Result<fidl_fuchsia_wlan_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>
+        {
+            Ok(
+                fidl_fuchsia_wlan_softmac::WlanSoftmacBaseStartPassiveScanResponse {
+                    scan_id: Some(7),
+                },
+            )
+        }
+        async fn start_active_scan(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_softmac::WlanSoftmacStartActiveScanRequest,
+        ) -> Result<fidl_fuchsia_wlan_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>
+        {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn cancel_scan(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_softmac::WlanSoftmacBaseCancelScanRequest,
+        ) -> Result<(), zx::Status> {
+            Ok(())
+        }
+        async fn join_bss(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_driver::JoinBssRequest,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn enable_beaconing(
+            &mut self,
+            _request: fidl_fuchsia_wlan_softmac::WlanSoftmacBaseEnableBeaconingRequest,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn disable_beaconing(&mut self) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn install_key(
+            &mut self,
+            _configuration: &fidl_fuchsia_wlan_softmac::WlanKeyConfiguration,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn notify_association_complete(
+            &mut self,
+            _configuration: fidl_fuchsia_wlan_softmac::WlanAssociationConfig,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn clear_association(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_softmac::WlanSoftmacBaseClearAssociationRequest,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        async fn update_wmm_parameters(
+            &mut self,
+            _request: &fidl_fuchsia_wlan_softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn take_mlme_event_stream(
+            &mut self,
+        ) -> Option<futures::channel::mpsc::UnboundedReceiver<fidl_fuchsia_wlan_mlme::MlmeEvent>>
+        {
+            self.event_rx.take()
+        }
+        fn send_mlme_event(
+            &mut self,
+            event: fidl_fuchsia_wlan_mlme::MlmeEvent,
+        ) -> Result<(), anyhow::Error> {
+            if self.fail_mlme_event {
+                return Err(anyhow::anyhow!("injected MLME event transport failure"));
+            }
+            self.events.lock().unwrap().push(event.clone());
+            self.event_tx.unbounded_send(event).map_err(Into::into)
+        }
+        fn set_minstrel(&mut self, minstrel: wlan_mlme::MinstrelWrapper) {
+            self.minstrel = Some(minstrel);
+        }
+        fn minstrel(&mut self) -> Option<wlan_mlme::MinstrelWrapper> {
+            self.minstrel.clone()
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    async fn compile_actual_private_provenance_route<D: wlan_mlme::device::DeviceOps>(
+        mlme: &mut wlan_mlme::client::ClientMlme<D>,
+        session: &mut ProvenanceSession,
+    ) {
+        let carried = session
+            .source
+            .seal_frame(
+                DescriptorOccurrenceRoute::DataRx,
+                2,
+                0,
+                passive_advertisement_frame(),
+            )
+            .unwrap();
+        let PrivateFrameSeal::Carried(carrier) = carried else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        // P is inferred here as the binary-private ProvenanceHandle. Neither
+        // the adapter nor pinned MLME names the B1 DescriptorOccurrence.
+        let rx = session.admit_carrier(carrier).unwrap();
+        mt7921_softmac_adapter::handle_pinned_client_rx(mlme, rx, session).await;
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn b2a_scan_result(tag: u8) -> fidl_fuchsia_wlan_mlme::ScanResult {
+        let channel = fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+            band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+            number: 1,
+        };
+        fidl_fuchsia_wlan_mlme::ScanResult {
+            txn_id: 17,
+            timestamp_nanos: 23,
+            bss: fidl_fuchsia_wlan_ieee80211::BssDescription {
+                bssid: [1, 2, 3, 4, 5, 6],
+                bss_type: fidl_fuchsia_wlan_ieee80211::BssType::Infrastructure,
+                beacon_period: 100,
+                capability_info: 1,
+                ies: vec![0, 1, tag],
+                primary: channel,
+                bandwidth: fidl_fuchsia_wlan_ieee80211::ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+                rssi_dbm: -40,
+                snr_db: 0,
+            },
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn private_session_owns_actual_b1_registration_and_invalidates_once() {
+        let mut session = ProvenanceSession::new();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![1, 2, 3])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        assert_eq!(session.validate_index(&handle), Ok(0));
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Ignored(
+                wlan_mlme::ScanResultIgnore::NonAdvertisement,
+            ),
+            handle,
+        );
+        session.finish().unwrap();
+        session.finish().unwrap_err();
+        assert!(!session.invalidated);
+        assert!(session.source.sealed.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn private_session_caps_first_4096_without_slot_reuse_and_poison_is_permanent() {
+        let mut session = ProvenanceSession::new();
+        for index in 0..ProvenanceSession::CAPACITY {
+            let carried = session
+                .source
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+                .unwrap();
+            let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+                occurrence: Some(occurrence),
+                ..
+            }) = carried
+            else {
+                panic!("actual B1 occurrence {index} was not minted");
+            };
+            let handle = session.admit(occurrence).unwrap();
+            assert_eq!(handle.index, index);
+            session
+                .source
+                .rearm(DescriptorOccurrenceRoute::DataRx, 2, 0)
+                .unwrap();
+        }
+        let stale_identity = session.registrations[0].occurrence.identity;
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("4097th actual B1 occurrence was not retained");
+        };
+        let overflow_lease = Arc::clone(&occurrence.lease);
+        assert_eq!(
+            session
+                .admit_carrier(PrivateRawFrameCarrier {
+                    bytes: vec![9, 8, 7],
+                    occurrence: Some(occurrence),
+                })
+                .err()
+                .unwrap(),
+            "provenance session arena exhausted"
+        );
+        assert!(!overflow_lease.current.load(Ordering::Acquire));
+        assert!(session.closed);
+        assert!(session.poisoned);
+        assert!(session.invalidated);
+        assert!(session.quarantine.is_empty());
+        assert!(
+            session
+                .admit(DescriptorOccurrence {
+                    identity: stale_identity,
+                    lease: Arc::clone(&session.source.lease),
+                })
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn private_session_rejects_mismatch_cancellation_and_late_handles() {
+        let mut session = ProvenanceSession::new();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual MCU-normal B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let mismatch = ProvenanceHandle {
+            session: NonZeroU64::new(handle.session.get().checked_add(1).unwrap()).unwrap(),
+            generation: handle.generation,
+            index: handle.index,
+            drop_order_probe: None,
+        };
+        assert!(session.validate_index(&mismatch).is_err());
+        session
+            .source
+            .invalidate(DescriptorInvalidation::Cancellation)
+            .unwrap();
+        assert!(session.validate_index(&handle).is_err());
+        session.fail_close();
+        assert!(session.validate_index(&handle).is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn successful_stale_session_handle_rejection_does_not_poison_new_session() {
+        let mut old = ProvenanceSession::new();
+        let carried = old
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let stale = old.admit(occurrence).unwrap();
+        let mut new = ProvenanceSession::new();
+        assert!(new.validate_index(&stale).is_err());
+        assert!(!new.poisoned);
+        assert!(!new.closed);
+        new.finish().unwrap();
+        old.fail_close();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn ingress_batch_preserves_carriers_in_owner_order_through_real_client_mlme() {
+        futures::executor::block_on(async {
+            use wlan_mlme::MlmeImpl;
+
+            let mut session = ProvenanceSession::new();
+            let mut carriers = Vec::new();
+            for (ordinal, route, ring) in [
+                (1u8, DescriptorOccurrenceRoute::McuNormalRx, 4),
+                (2, DescriptorOccurrenceRoute::DataRx, 2),
+                (3, DescriptorOccurrenceRoute::McuNormalRx, 0),
+            ] {
+                let mut bytes = passive_advertisement_frame();
+                *bytes.last_mut().unwrap() = b'0' + ordinal;
+                let rcpi = 120 - 20 * (ordinal - 1);
+                bytes[28..32].copy_from_slice(&(u32::from(rcpi) * 0x0101).to_le_bytes());
+                if route == DescriptorOccurrenceRoute::McuNormalRx {
+                    let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) & 0xffff;
+                    bytes[0..4].copy_from_slice(&((7 << 27) | (1 << 16) | len).to_le_bytes());
+                }
+                let carried = session.source.seal_frame(route, ring, 0, bytes).unwrap();
+                let PrivateFrameSeal::Carried(carrier) = carried else {
+                    panic!("actual B1 occurrence was not minted");
+                };
+                carriers.push(carrier);
+            }
+            let expected = carriers
+                .iter()
+                .map(|carrier| carrier.occurrence.as_ref().unwrap().identity.occurrence)
+                .collect::<Vec<_>>();
+            for carrier in carriers.into_iter().rev() {
+                session.enqueue(carrier).unwrap();
+            }
+            let ordered_rx = session.flush_ingress().unwrap();
+            assert_eq!(
+                session
+                    .registrations
+                    .iter()
+                    .map(|registration| registration.occurrence.identity.occurrence)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+
+            let (device, events) = B2aFakeDevice::new();
+            let (timer, _) = wlan_mlme::common::timer::create_timer();
+            let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                .await
+                .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Scan(
+                fidl_fuchsia_wlan_mlme::ScanRequest {
+                    txn_id: 77,
+                    scan_type: fidl_fuchsia_wlan_mlme::ScanTypes::Passive,
+                    channel_list: vec![fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                        band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                        number: 1,
+                    }],
+                    ssid_list: vec![],
+                    probe_delay: 0,
+                    min_channel_time: 10,
+                    max_channel_time: 20,
+                },
+            ))
+            .await
+            .unwrap();
+            for rx in ordered_rx {
+                mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, rx, &mut session).await;
+            }
+            assert_eq!(session.observed_order, expected);
+            let emitted = events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| match event {
+                    fidl_fuchsia_wlan_mlme::MlmeEvent::OnScanResult { result } => {
+                        (*result.bss.ies.last().unwrap(), result.bss.rssi_dbm)
+                    }
+                    other => panic!("unexpected MLME event: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(emitted, [(b'1', -50), (b'2', -60), (b'3', -70)]);
+            for (expected_tag, expected_rssi) in emitted {
+                assert!(session.inspect_next_result(|carried| {
+                    assert_eq!(*carried.result.bss.ies.last().unwrap(), expected_tag);
+                    assert_eq!(carried.result.bss.rssi_dbm, expected_rssi);
+                }));
+            }
+            session.finish().unwrap();
+        });
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn real_client_mlme_suppresses_results_rejected_as_out_of_order_or_stale() {
+        futures::executor::block_on(async {
+            use wlan_mlme::MlmeImpl;
+
+            let mut session = ProvenanceSession::new();
+            let mut admitted = Vec::new();
+            for (route, ring) in [
+                (DescriptorOccurrenceRoute::DataRx, 2),
+                (DescriptorOccurrenceRoute::McuNormalRx, 0),
+            ] {
+                let carried = session
+                    .source
+                    .seal_frame(route, ring, 0, passive_advertisement_frame())
+                    .unwrap();
+                let PrivateFrameSeal::Carried(carrier) = carried else {
+                    panic!("actual B1 occurrence was not minted");
+                };
+                admitted.push(session.admit_carrier(carrier).unwrap());
+            }
+            let first = admitted.remove(0);
+            let second = admitted.remove(0);
+
+            let (device, events) = B2aFakeDevice::new();
+            let (timer, _) = wlan_mlme::common::timer::create_timer();
+            let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                .await
+                .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Scan(
+                fidl_fuchsia_wlan_mlme::ScanRequest {
+                    txn_id: 78,
+                    scan_type: fidl_fuchsia_wlan_mlme::ScanTypes::Passive,
+                    channel_list: vec![fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                        band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                        number: 1,
+                    }],
+                    ssid_list: vec![],
+                    probe_delay: 0,
+                    min_channel_time: 10,
+                    max_channel_time: 20,
+                },
+            ))
+            .await
+            .unwrap();
+
+            mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, second, &mut session).await;
+            assert!(session.invalidated);
+            assert!(events.lock().unwrap().is_empty());
+
+            // The formerly first handle is stale after fail-close and must
+            // remain unable to escape through the ordinary MLME event path.
+            mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, first, &mut session).await;
+            assert!(events.lock().unwrap().is_empty());
+        });
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn real_client_mlme_suppresses_result_when_private_sidecar_sink_is_closed() {
+        futures::executor::block_on(async {
+            use wlan_mlme::MlmeImpl;
+
+            let mut session = ProvenanceSession::new();
+            let released_after_invalidation = Arc::new(AtomicBool::new(false));
+            session.next_handle_drop_order_probe = Some(Arc::clone(&released_after_invalidation));
+            let carried = session
+                .source
+                .seal_frame(
+                    DescriptorOccurrenceRoute::DataRx,
+                    2,
+                    0,
+                    passive_advertisement_frame(),
+                )
+                .unwrap();
+            let PrivateFrameSeal::Carried(carrier) = carried else {
+                panic!("actual B1 occurrence was not minted");
+            };
+            let admitted = session.admit_carrier(carrier).unwrap();
+            session.result_rx.close();
+
+            let (device, events) = B2aFakeDevice::new();
+            let (timer, _) = wlan_mlme::common::timer::create_timer();
+            let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                .await
+                .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Scan(
+                fidl_fuchsia_wlan_mlme::ScanRequest {
+                    txn_id: 79,
+                    scan_type: fidl_fuchsia_wlan_mlme::ScanTypes::Passive,
+                    channel_list: vec![fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                        band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                        number: 1,
+                    }],
+                    ssid_list: vec![],
+                    probe_delay: 0,
+                    min_channel_time: 10,
+                    max_channel_time: 20,
+                },
+            ))
+            .await
+            .unwrap();
+
+            mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, admitted, &mut session)
+                .await;
+            assert!(session.invalidated);
+            assert!(session.poisoned);
+            assert!(released_after_invalidation.load(Ordering::Acquire));
+            assert!(events.lock().unwrap().is_empty());
+        });
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn real_client_mlme_transport_failure_invalidates_already_carried_handle() {
+        futures::executor::block_on(async {
+            use wlan_mlme::MlmeImpl;
+
+            let mut session = ProvenanceSession::new();
+            let carried = session
+                .source
+                .seal_frame(
+                    DescriptorOccurrenceRoute::DataRx,
+                    2,
+                    0,
+                    passive_advertisement_frame(),
+                )
+                .unwrap();
+            let PrivateFrameSeal::Carried(carrier) = carried else {
+                panic!("actual B1 occurrence was not minted");
+            };
+            let admitted = session.admit_carrier(carrier).unwrap();
+
+            let (device, events) = B2aFakeDevice::new_with_failed_mlme_transport();
+            let (timer, _) = wlan_mlme::common::timer::create_timer();
+            let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                .await
+                .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Scan(
+                fidl_fuchsia_wlan_mlme::ScanRequest {
+                    txn_id: 80,
+                    scan_type: fidl_fuchsia_wlan_mlme::ScanTypes::Passive,
+                    channel_list: vec![fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                        band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                        number: 1,
+                    }],
+                    ssid_list: vec![],
+                    probe_delay: 0,
+                    min_channel_time: 10,
+                    max_channel_time: 20,
+                },
+            ))
+            .await
+            .unwrap();
+
+            mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, admitted, &mut session)
+                .await;
+            assert!(session.invalidated);
+            assert!(session.poisoned);
+            assert_eq!(session.outstanding_results, 0);
+            assert!(session.result_rx.try_recv().is_err());
+            assert!(session.carried_results.is_empty());
+            assert!(events.lock().unwrap().is_empty());
+        });
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn reordered_ingress_handle_fail_closes_before_classification() {
+        let mut session = ProvenanceSession::new();
+        let mut handles = Vec::new();
+        for (route, ring) in [
+            (DescriptorOccurrenceRoute::McuNormalRx, 4),
+            (DescriptorOccurrenceRoute::DataRx, 2),
+        ] {
+            let carried = session.source.seal_frame(route, ring, 0, vec![]).unwrap();
+            let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+                occurrence: Some(occurrence),
+                ..
+            }) = carried
+            else {
+                panic!("actual B1 occurrence was not minted");
+            };
+            handles.push(session.admit(occurrence).unwrap());
+        }
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Ignored(
+                wlan_mlme::ScanResultIgnore::NonAdvertisement,
+            ),
+            handles.remove(1),
+        );
+        assert!(session.invalidated);
+        assert!(session.poisoned);
+        assert!(session.registrations.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn queued_ingress_counts_toward_the_single_4096_cap() {
+        let mut session = ProvenanceSession::new();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        session
+            .enqueue(PrivateRawFrameCarrier {
+                bytes: Vec::new(),
+                occurrence: Some(occurrence),
+            })
+            .unwrap();
+        session
+            .source
+            .rearm(DescriptorOccurrenceRoute::DataRx, 2, 0)
+            .unwrap();
+        for _ in 1..ProvenanceSession::CAPACITY {
+            let carried = session
+                .source
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+                .unwrap();
+            let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+                occurrence: Some(occurrence),
+                ..
+            }) = carried
+            else {
+                panic!("actual B1 occurrence was not minted");
+            };
+            session
+                .enqueue(PrivateRawFrameCarrier {
+                    bytes: Vec::new(),
+                    occurrence: Some(occurrence),
+                })
+                .unwrap();
+            session
+                .source
+                .rearm(DescriptorOccurrenceRoute::DataRx, 2, 0)
+                .unwrap();
+        }
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("4097th actual B1 occurrence was not minted");
+        };
+        assert!(
+            session
+                .enqueue(PrivateRawFrameCarrier {
+                    bytes: Vec::new(),
+                    occurrence: Some(occurrence),
+                })
+                .is_err()
+        );
+        assert!(session.invalidated);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn transport_failure_and_unclassified_finish_invalidate_before_release() {
+        let mut transport_failed = ProvenanceSession::new();
+        let carried = transport_failed
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = transport_failed.admit(occurrence).unwrap();
+        let result = b2a_scan_result(1);
+        wlan_mlme::ScanResultObserver::observe(
+            &mut transport_failed,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        assert_eq!(transport_failed.outstanding_results, 1);
+        wlan_mlme::ScanResultObserver::<ProvenanceHandle>::observe_transport_failure(
+            &mut transport_failed,
+        );
+        assert!(transport_failed.invalidated);
+        assert!(transport_failed.registrations.is_empty());
+        assert_eq!(transport_failed.outstanding_results, 0);
+        assert!(transport_failed.result_rx.try_recv().is_err());
+        assert!(transport_failed.carried_results.is_empty());
+
+        let mut unclassified = ProvenanceSession::new();
+        let carried = unclassified
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        unclassified.admit(occurrence).unwrap();
+        assert!(unclassified.finish().is_err());
+        assert!(unclassified.invalidated);
+        assert!(unclassified.registrations.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn uncovered_carrier_invalidates_and_clears_prior_produced_result_before_release() {
+        let mut session = ProvenanceSession::new();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let result = b2a_scan_result(3);
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        assert_eq!(session.outstanding_results, 1);
+        assert!(
+            session
+                .admit_carrier(PrivateRawFrameCarrier {
+                    bytes: vec![1, 2, 3],
+                    occurrence: None,
+                })
+                .is_err()
+        );
+        assert!(session.invalidated);
+        assert_eq!(session.outstanding_results, 0);
+        assert!(session.result_rx.try_recv().is_err());
+        assert!(session.carried_results.is_empty());
+        assert!(session.registrations.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn private_session_alone_validates_and_exports_exact_result_once_over_mpsc() {
+        let mut session = ProvenanceSession::new();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let generation = handle.generation;
+        let index = handle.index;
+        let result = b2a_scan_result(2);
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        assert!(session.inspect_next_result(|carried| {
+            assert_eq!(carried.provenance.generation, generation);
+            assert_eq!(carried.provenance.index, index);
+            assert_eq!(carried.result, result);
+        }));
+        assert_eq!(session.carried_results.len(), 1);
+        assert_eq!(session.source.sealed.len(), 1);
+        assert_eq!(
+            session.registrations[index].disposition,
+            RegistrationDisposition::Produced
+        );
+        session.finish().unwrap();
+        assert!(session.closed);
+        assert!(!session.poisoned);
+        assert!(!session.invalidated);
+        assert!(session.source.sealed.is_empty());
+        assert!(session.carried_results.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn private_session_drop_invalidates_before_panic_abandonment_releases_fields() {
+        let lease = std::panic::catch_unwind(|| {
+            let session = ProvenanceSession::new();
+            let lease = Arc::clone(&session.source.lease);
+            std::panic::panic_any(lease);
+        })
+        .unwrap_err()
+        .downcast::<Arc<DescriptorOccurrenceLease>>()
+        .unwrap();
+        assert!(!lease.current.load(Ordering::Acquire));
+    }
 
     struct TestMapping {
         ptr: NonNull<u8>,
