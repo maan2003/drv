@@ -1235,3 +1235,30 @@ unknown high bits. Command must likewise restore exactly from `0x0402` to
 `0x0002`. That gate must still stop before `SET_IRQS`, reset, WFDMA/DMA,
 firmware, or radio. Pinned Fuchsia does not own this PCIe interrupt latch; it
 remains Linux-derived transport mechanics below SoftMAC.
+
+The read-only latch snapshot completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T105906Z-0000_05_00.0.log` using
+release binary SHA-256
+`3a65924bf318b01a02cd218a5b7d112b04b4c1082841f4ea4268fc012219b61d`.
+After temporary Command `0x0402` and the query-only capability checks, the gate
+mapped BAR0 page `0x10000` read-only and performed exactly one aligned volatile
+32-bit read at `0x10188`. Native handoff state was
+`MT_PCIE_MAC_INT_ENABLE = 0x000000ff`. The gate explicitly unmapped page
+`0x10000`, then restored and verified exact PCI Command `0x0002`, unmapped the
+two identity pages, and released safely. It performed no register write,
+`SET_IRQS`, reset, DMA mapping, firmware, WFDMA, or radio operation.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T105906Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:29:08.841005 IST`; sample zero saw mt7921e in D0 and iwd active. iwd
+announced usable `wlan8` at `16:29:10.208004`. The first association was
+briefly disassociated with reason 2, then the retry associated at
+`16:29:11.859865` and iwd reached connected state at `16:29:11.990117`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:29:12.937781`, 4.10 seconds after restore; the watchdog
+disarmed at `16:29:13.002728`. Boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with existing
+upstream warnings; the standalone default-feature and rustfmt limitations
+remain unchanged.
