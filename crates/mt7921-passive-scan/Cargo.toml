@@ -23,7 +23,6 @@ fdf = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3
 fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-driver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.driver" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
-fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
 fidl-fuchsia-wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.mlme" }
 fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
 fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
