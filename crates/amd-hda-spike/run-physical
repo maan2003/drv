@@ -62,7 +62,11 @@ printf 'amd-hda: selected analog target %s group=%s codec=%s\n' "$bdf" "${group#
 modprobe iommufd || fail 'cannot load iommufd (kernel CONFIG_IOMMUFD/module unavailable)'
 [[ -c /dev/iommu ]] || fail '/dev/iommu did not appear after modprobe iommufd; check CONFIG_IOMMUFD and device-node policy'
 
-cargo build -p amd-hda-spike --bin amd-hda-enumerate
+binary=${DRV_HDA_BINARY:-target/debug/amd-hda-enumerate}
+if [[ ! -x $binary ]]; then
+  cargo build -p amd-hda-spike --bin amd-hda-enumerate
+  binary=target/debug/amd-hda-enumerate
+fi
 modprobe vfio-pci
 watchdog_pid=
 restore() {
@@ -111,4 +115,4 @@ for _ in {1..50}; do
 done
 [[ -n ${cdev:-} && -c /dev/vfio/devices/$cdev ]] || fail 'VFIO device cdev did not appear'
 
-timeout --signal=TERM "$((watchdog_seconds - 2))" target/debug/amd-hda-enumerate "/dev/vfio/devices/$cdev"
+timeout --signal=TERM "$((watchdog_seconds - 2))" "$binary" "/dev/vfio/devices/$cdev"

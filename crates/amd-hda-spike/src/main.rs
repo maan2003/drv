@@ -127,7 +127,9 @@ unsafe extern "C" {
 }
 fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T) -> io::Result<()> {
     if unsafe { ioctl(fd, request, value) } < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        eprintln!("ioctl {request:#x} failed: {error}");
+        Err(error)
     } else {
         Ok(())
     }
@@ -135,7 +137,13 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T) -> io::Result<()> {
 fn map(len: usize, fd: RawFd, offset: i64, flags: i32) -> io::Result<NonNull<u8>> {
     NonNull::new(unsafe { mmap(std::ptr::null_mut(), len, 3, flags, fd, offset) })
         .filter(|p| p.as_ptr() as isize != -1)
-        .ok_or_else(io::Error::last_os_error)
+        .ok_or_else(|| {
+            let error = io::Error::last_os_error();
+            eprintln!(
+                "mmap len={len:#x} fd={fd} offset={offset:#x} flags={flags:#x} failed: {error}"
+            );
+            error
+        })
 }
 struct Mapping {
     ptr: NonNull<u8>,
@@ -176,16 +184,6 @@ impl VfioHda {
             .read(true)
             .write(true)
             .open("/dev/iommu")?;
-        let mut info = DeviceInfo {
-            argsz: size::<DeviceInfo>(),
-            ..Default::default()
-        };
-        ioctl_mut(device.as_raw_fd(), VFIO_DEVICE_GET_INFO, &mut info)?;
-        if info.num_regions <= VFIO_PCI_CONFIG_REGION_INDEX
-            || info.num_irqs <= VFIO_PCI_MSI_IRQ_INDEX
-        {
-            return Err(io::Error::other("incomplete VFIO PCI regions/IRQs"));
-        }
         let mut bind = Bind {
             argsz: size::<Bind>(),
             iommufd: iommu.as_raw_fd(),
@@ -207,6 +205,18 @@ impl VfioHda {
             VFIO_DEVICE_ATTACH_IOMMUFD_PT,
             &mut attach,
         )?;
+        // A VFIO cdev is not operational until it is bound and attached to an
+        // IOAS; capability queries before attachment fail with EINVAL.
+        let mut info = DeviceInfo {
+            argsz: size::<DeviceInfo>(),
+            ..Default::default()
+        };
+        ioctl_mut(device.as_raw_fd(), VFIO_DEVICE_GET_INFO, &mut info)?;
+        if info.num_regions <= VFIO_PCI_CONFIG_REGION_INDEX
+            || info.num_irqs <= VFIO_PCI_MSI_IRQ_INDEX
+        {
+            return Err(io::Error::other("incomplete VFIO PCI regions/IRQs"));
+        }
 
         let config = Self::region(&device, VFIO_PCI_CONFIG_REGION_INDEX)?;
         let read_cfg16 = |at: u64| -> io::Result<u16> {
