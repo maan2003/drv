@@ -2273,3 +2273,33 @@ renamed `wlan1`; the watchdog was disarmed without a reboot. The patched
 system, profile, kernel, generation-25 default, `keep_d0_on_remove=Y`, and
 empty lab-state invariants remained intact. There was no page-pool warning or
 kernel warning/oops. No rerun was attempted.
+
+After selecting SAE H2E from the peer RSNXE, one guarded run was launched as
+`wifi-sae-exchange20` from integrated commit `a5dbf144e1ca`. The explicitly
+feature-enabled release and staged artifact shared SHA-256
+`1a38e18d8156a4bcde5c77525fbaa936cce04672e0932b72f929c4f15fe500d8`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T195257Z-0000_05_00.0.log`
+records peer and local H2E capability inputs selecting the reviewed Direct
+path, the correctly generated H2E commit publication, and
+`sae_tx_ring0_consumed didx=1 descriptor_done=true`.
+
+The post-publication IRQ was `0x0c400010`. Ring 4 delivered an acknowledged
+TX status for WCID 19 and PID 3, followed by TX-free for WCID 19, token 0,
+with `dropped=false` and one attempt. Their dual correlation produced
+`sae_commit_tx_acked`, proving local transmission of the H2E commit. The AP
+gave no SAE response and there was no later RX IRQ, so the run stopped with
+`bounded SAE peer response timed out`. There is no peer commit RX, confirm
+publication or RX, PMK derivation, or authenticated marker.
+
+Containment and cleanup quiesced the transport, released DMA mappings, reset
+VFIO, verified the post-reset safe state, and restored the native driver with
+`RESTORE end failed=0`. Native `mt7921e`, D0, iwd, WPA3 association, IPv4,
+the default route, and gateway connectivity recovered in 84246 ms on the
+renamed `wlan2`; the watchdog was disarmed without a reboot. The boot ID and
+patched system, profile, kernel, generation-25 default,
+`keep_d0_on_remove=Y`, and empty lab-state invariants remained intact. During
+the slow recovery the kernel reported pool 22 with five inflight buffers at
+60 seconds and three at 120 seconds, while native connectivity was healthy at
+final collection. No rerun was attempted, and the physical deployment remains
+held unchanged pending the H2E cryptographic and frame KAT audit.
