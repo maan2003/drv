@@ -5916,6 +5916,166 @@ fn encode_remove_wcid_command(
     Ok(bytes)
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn encode_legacy_wme_add_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    aid: u16,
+    peer: [u8; 6],
+    rcpi: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) {
+        return Err("WCID add omitted valid sequence".into());
+    }
+    let mut bytes = vec![
+        176, 0, 0, 65, 0, 0, 1, 128, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        144, 0, 3, 0, 0, 160, 0, sequence, 0, 0, 0, 7, 0, 0, 0, 0,
+        bss_index, wcid, 5, 0, 1, 0, 0, 0, 0, 0, 20, 0, 2, 0, 1, 0,
+        2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 21, 0, 12, 0,
+        1, 0, 8, 0, 0, rcpi, 0, 0, 1, 0, 16, 0, 64, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 12, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 13, 0, 60, 0, wcid, 1, 4, 0, 0, 0, 0, 0,
+        0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0,
+        6, 0, 8, 0, 1, 0, 1, 0, 13, 0, 8, 0, 0, 0, 0, 0,
+    ];
+    bytes[66..68].copy_from_slice(&aid.to_le_bytes());
+    bytes[68..74].copy_from_slice(&peer);
+    bytes[132..138].copy_from_slice(&peer);
+    bytes[141] = 1;
+    bytes[144..146].copy_from_slice(&aid.to_le_bytes());
+    Ok(bytes)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct SensitiveUniCommand(Vec<u8>);
+
+#[cfg(feature = "fuchsia-passive")]
+impl SensitiveUniCommand {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for SensitiveUniCommand {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_key_v2_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    muar_index: u8,
+    key_id: u8,
+    key: &[u8],
+    retained_gtk: Option<(u8, &[u8])>,
+) -> Result<SensitiveUniCommand, String> {
+    if !(1..=15).contains(&sequence) || key.len() != 16 {
+        return Err("key-v2 requires a valid sequence and 16-byte key".into());
+    }
+    if let Some((_, gtk)) = retained_gtk
+        && gtk.len() != 16
+    {
+        return Err("IGTK update requires a retained 16-byte GTK".into());
+    }
+    let mut bytes = vec![0; 136];
+    let txd0 = 136u32 | (2 << 23) | (0x20 << 25);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&104u16.to_le_bytes());
+    bytes[34..36].copy_from_slice(&3u16.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 7;
+    bytes[48..56].copy_from_slice(&[bss_index, wcid, 1, 0, 1, muar_index, 0, 0]);
+    bytes[56..58].copy_from_slice(&17u16.to_le_bytes());
+    bytes[60] = 0;
+    if let Some((gtk_id, gtk)) = retained_gtk {
+        bytes[58..60].copy_from_slice(&80u16.to_le_bytes());
+        bytes[61] = 2;
+        bytes[64..68].copy_from_slice(&[5, 36, gtk_id, 16]);
+        bytes[68..84].copy_from_slice(gtk);
+        bytes[100..104].copy_from_slice(&[10, 36, 0, 16]);
+        bytes[104..120].copy_from_slice(key);
+    } else {
+        bytes[58..60].copy_from_slice(&44u16.to_le_bytes());
+        bytes[61] = 1;
+        bytes[64..68].copy_from_slice(&[5, 36, key_id, 16]);
+        bytes[68..84].copy_from_slice(key);
+    }
+    Ok(SensitiveUniCommand(bytes))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_disable_keys_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    muar_index: u8,
+) -> Result<SensitiveUniCommand, String> {
+    let mut command = encode_key_v2_command(sequence, bss_index, wcid, muar_index, 0, &[0; 16], None)?;
+    let bytes = &mut command.0;
+    bytes[58..60].copy_from_slice(&8u16.to_le_bytes());
+    bytes[60] = 1;
+    bytes[61..].fill(0);
+    Ok(command)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_ptk_command(
+    sequence: u8,
+    bss_index: u8,
+    peer_wcid: u8,
+    key: &[u8],
+) -> Result<SensitiveUniCommand, String> {
+    encode_key_v2_command(sequence, bss_index, peer_wcid, 0, 0, key, None)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_gtk_command(
+    sequence: u8,
+    bss_index: u8,
+    key_id: u8,
+    key: &[u8],
+) -> Result<SensitiveUniCommand, String> {
+    if !(1..=3).contains(&key_id) {
+        return Err("GTK key ID escaped group-key slots".into());
+    }
+    encode_key_v2_command(sequence, bss_index, 19, 0x0e, key_id, key, None)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_igtk_command(
+    sequence: u8,
+    bss_index: u8,
+    igtk_id: u8,
+    igtk: &[u8],
+    gtk_id: u8,
+    retained_gtk: &[u8],
+) -> Result<SensitiveUniCommand, String> {
+    if !(4..=5).contains(&igtk_id) || !(1..=3).contains(&gtk_id) {
+        return Err("IGTK/GTK key ID escaped protected-management slots".into());
+    }
+    encode_key_v2_command(
+        sequence,
+        bss_index,
+        19,
+        0x0e,
+        igtk_id,
+        igtk,
+        Some((gtk_id, retained_gtk)),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveArenaKind {
     #[cfg(feature = "fuchsia-passive")]
@@ -9583,6 +9743,53 @@ mod tests {
         assert!(validate_uni_request(3, &wrong_txd).is_err());
         let qos = encode_remove_wcid_command(9, 0, 7, 42, peer, true).unwrap();
         assert_eq!(qos[65], 1);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn add_wcid_matches_pinned_linux_legacy_wme_fixture() {
+        let encoded = encode_legacy_wme_add_wcid_command(
+            9,
+            0,
+            7,
+            42,
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            100,
+        )
+        .unwrap();
+        assert_eq!(encoded.len(), 176);
+        assert_eq!(validate_uni_request(3, &encoded).unwrap(), 9);
+        assert_eq!(&encoded[48..56], &[0, 7, 5, 0, 1, 0, 0, 0]);
+        assert_eq!(&encoded[56..76], &[0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 3, 0]);
+        assert_eq!(&encoded[116..124], &[13, 0, 60, 0, 7, 1, 4, 0]);
+        assert_eq!(&encoded[128..148], &[0, 0, 20, 0, 16, 32, 48, 64, 80, 96, 0, 0, 0, 1, 0, 0, 42, 0, 0, 0]);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn key_v2_commands_keep_linux_physical_allocation_and_targets() {
+        let ptk = encode_ptk_command(1, 0, 7, &[0x11; 16]).unwrap();
+        assert_eq!(ptk.as_bytes().len(), 136);
+        assert_eq!(validate_uni_request(3, ptk.as_bytes()).unwrap(), 1);
+        assert_eq!(&ptk.as_bytes()[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
+        assert_eq!(&ptk.as_bytes()[56..68], &[17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16]);
+
+        let gtk = encode_gtk_command(2, 0, 2, &[0x22; 16]).unwrap();
+        assert_eq!(&gtk.as_bytes()[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
+        assert_eq!(&gtk.as_bytes()[64..68], &[5, 36, 2, 16]);
+
+        let igtk = encode_igtk_command(3, 0, 4, &[0x44; 16], 2, &[0x22; 16]).unwrap();
+        assert_eq!(igtk.as_bytes().len(), 136);
+        assert_eq!(&igtk.as_bytes()[58..62], &[80, 0, 0, 2]);
+        assert_eq!(&igtk.as_bytes()[64..68], &[5, 36, 2, 16]);
+        assert_eq!(&igtk.as_bytes()[68..84], &[0x22; 16]);
+        assert_eq!(&igtk.as_bytes()[100..104], &[10, 36, 0, 16]);
+        assert_eq!(&igtk.as_bytes()[104..120], &[0x44; 16]);
+
+        let disabled = encode_disable_keys_command(4, 0, 19, 0x0e).unwrap();
+        assert_eq!(disabled.as_bytes().len(), 136);
+        assert_eq!(&disabled.as_bytes()[56..64], &[17, 0, 8, 0, 1, 0, 0, 0]);
+        assert!(disabled.as_bytes()[64..].iter().all(|byte| *byte == 0));
     }
 
     #[cfg(feature = "fuchsia-passive")]
