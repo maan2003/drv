@@ -1427,11 +1427,10 @@ fn run() -> Result<(), String> {
                 }
 
                 record_sae_stage(&format!(
-                    "vfio_bar0_mmap_before page=0x10000 length={} prot=read flags=shared region_size={} region_offset={}",
+                    "vfio_bar0_mmap_before page=0x10000 length={} prot=read_write flags=shared region_size={} region_offset={}",
                     PAGE, bar0.size, bar0.offset
                 ));
-                let mut pcie_mac_page = match ReadPage::map(&capsule.device, &bar0, 0x10000, false)
-                {
+                let mut pcie_mac_page = match ReadPage::map(&capsule.device, &bar0, 0x10000, true) {
                     Ok(page) => page,
                     Err(error) => {
                         record_sae_stage(&format!(
@@ -1441,16 +1440,72 @@ fn run() -> Result<(), String> {
                     }
                 };
                 record_sae_stage("vfio_bar0_mmap_after page=0x10000 length=4096");
-                let mac_interrupt_enable = (|| -> Result<u32, String> {
-                    record_sae_stage("vfio_pcie_mac_int_enable_read_before offset=0x10188 bytes=4");
-                    let raw = pcie_mac_page.read(0x10188)?;
-                    record_sae_stage(&format!(
-                        "vfio_pcie_mac_int_enable_read_after offset=0x10188 bytes=4 value={raw:#010x}"
-                    ));
-                    if raw == u32::MAX {
-                        return Err("MT_PCIE_MAC_INT_ENABLE returned all ones".into());
+                record_sae_stage("vfio_pcie_mac_int_enable_read_before offset=0x10188 bytes=4");
+                let saved_mac_interrupt_enable = pcie_mac_page.read(0x10188)?;
+                record_sae_stage(&format!(
+                    "vfio_pcie_mac_int_enable_saved offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                ));
+                if saved_mac_interrupt_enable == u32::MAX {
+                    return Err("MT_PCIE_MAC_INT_ENABLE returned all ones".into());
+                }
+                let disable = (|| -> Result<(), String> {
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_write_before offset=0x10188 bytes=4 value=0x00000000",
+                    );
+                    if let Err(error) = pcie_mac_page.write_pcie_mac_interrupt_enable_zero() {
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_zero_write_error offset=0x10188 bytes=4 error={error}"
+                        ));
+                        return Err(error);
                     }
-                    Ok(raw)
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_write_after offset=0x10188 bytes=4 value=0x00000000",
+                    );
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_verify_before offset=0x10188 bytes=4",
+                    );
+                    let zero_readback = pcie_mac_page.read(0x10188)?;
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_zero_verify_after offset=0x10188 bytes=4 value={zero_readback:#010x} expected=0x00000000 equal={}",
+                        zero_readback == 0
+                    ));
+                    if zero_readback != 0 {
+                        return Err(format!(
+                            "MT_PCIE_MAC_INT_ENABLE zero readback is {zero_readback:#010x}"
+                        ));
+                    }
+                    Ok(())
+                })();
+
+                record_sae_stage(&format!(
+                    "vfio_pcie_mac_int_enable_restore_write_before offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                ));
+                let restore = (|| -> Result<u32, String> {
+                    if let Err(error) =
+                        pcie_mac_page.restore_pcie_mac_interrupt_enable(saved_mac_interrupt_enable)
+                    {
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_restore_write_error offset=0x10188 bytes=4 error={error}"
+                        ));
+                        return Err(error);
+                    }
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_restore_write_after offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                    ));
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_restore_verify_before offset=0x10188 bytes=4",
+                    );
+                    let restored = pcie_mac_page.read(0x10188)?;
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_restore_verify_after offset=0x10188 bytes=4 value={restored:#010x} expected={saved_mac_interrupt_enable:#010x} equal={}",
+                        restored == saved_mac_interrupt_enable
+                    ));
+                    if restored != saved_mac_interrupt_enable {
+                        return Err(format!(
+                            "MT_PCIE_MAC_INT_ENABLE restore mismatch: saved={saved_mac_interrupt_enable:#010x} restored={restored:#010x}"
+                        ));
+                    }
+                    Ok(restored)
                 })();
                 record_sae_stage("vfio_bar0_munmap_before page=0x10000 length=4096");
                 let unmap = pcie_mac_page.teardown();
@@ -1461,9 +1516,10 @@ fn run() -> Result<(), String> {
                     )),
                 }
                 unmap?;
-                let mac_interrupt_enable = mac_interrupt_enable?;
+                let restored_mac_interrupt_enable = restore?;
+                disable?;
                 record_sae_stage(&format!(
-                    "vfio_pcie_mac_int_enable_snapshot_complete value={mac_interrupt_enable:#010x}"
+                    "vfio_pcie_mac_int_enable_round_trip_complete saved={saved_mac_interrupt_enable:#010x} disabled=0x00000000 restored={restored_mac_interrupt_enable:#010x}"
                 ));
                 Ok(())
             })();
@@ -7213,11 +7269,17 @@ impl ReadPage {
         self.write_pcie_mac_interrupt_enable(0)
     }
     fn write_pcie_mac_interrupt_enable(&self, value: u32) -> Result<(), String> {
-        if self.bar_page != 0x10000 {
-            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
-        }
         if value != 0 && value != 0xff {
             return Err("PCIe MAC interrupt value escaped allowlist".into());
+        }
+        self.write_pcie_mac_interrupt_enable_raw(value)
+    }
+    fn restore_pcie_mac_interrupt_enable(&self, saved: u32) -> Result<(), String> {
+        self.write_pcie_mac_interrupt_enable_raw(saved)
+    }
+    fn write_pcie_mac_interrupt_enable_raw(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0x10000 {
+            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
         }
         let within = 0x10188 - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
