@@ -2047,11 +2047,12 @@ Even with the independent durability companion, report
 the harness `USERSPACE begin` record and contains no first payload stage.
 
 The kernel recorded two completed `vfio-pci` resets and then a 60-second
-page-pool shutdown stall for pool 19 with two inflight buffers. The stop is
-therefore before observable payload entry, in the harness/native-driver
-handoff, rather than in credential parsing. There is no evidence for BAR
-mapping, firmware startup, beacon RX, or SAE TX/RX, and association, key, and
-data effects remained disabled. The watchdog rebooted; native `mt7921e`, iwd,
-and `wlan0` carrier recovered on the next boot, with no active recovery or
-report-sync units and no `/run/wifi-driver-lab` state. No further physical
-mutation was attempted.
+page-pool shutdown stall for pool 19 with two inflight buffers. The durable
+evidence localizes the stop only to the native-to-VFIO handoff or the payload's
+pre-marker work; absence of the first marker alone cannot distinguish harness
+handoff from pre-marker ACPI, argument, or credential processing. There is no
+evidence for BAR mapping, firmware startup, beacon RX, or SAE TX/RX, and
+association, key, and data effects remained disabled. The watchdog rebooted;
+native `mt7921e`, iwd, and `wlan0` carrier recovered on the next boot, with no
+active recovery or report-sync units and no `/run/wifi-driver-lab` state. No
+further physical mutation was attempted.
