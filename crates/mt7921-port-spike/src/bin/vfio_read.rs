@@ -857,6 +857,50 @@ fn run_contained_dma_resource_round_trip(
         record_sae_stage(
             "vfio_wfdma_prep_complete engines=false host_irq=false mac_irq=false bme=true msi_owned=true",
         );
+        record_sae_stage("vfio_wfdma_activation_begin");
+        let enabled = prepared_global
+            | (1 << 0)
+            | (1 << 2)
+            | (3 << 4)
+            | (1 << 6)
+            | (1 << 11)
+            | (1 << 12)
+            | (1 << 13)
+            | (1 << 15)
+            | (1 << 21)
+            | (1 << 28)
+            | (1 << 30);
+        pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
+        wfdma.write_active_wfdma(0xd4208, enabled)?;
+        wfdma.write_active_wfdma(0xd4204, firmware_bootstrap_rx_irq_mask())?;
+        let mut top = VfioTopOwnership {
+            selector: active.selector_page.as_ref().expect("mapped"),
+            window: active.dynamic_window.as_ref().expect("mapped"),
+            start: Instant::now(),
+            saved: Cell::new(None),
+        };
+        acquire_top_driver_ownership(&mut top, |_| {})
+            .map_err(|error| format!("contained MT_TOP ownership: {error:?}"))?;
+        pcie_mac.disable_pcie_l0s()?;
+        active
+            .swdef
+            .as_ref()
+            .expect("mapped")
+            .write_swdef_normal()?;
+        let active_global = wfdma.read(0xd4208)?;
+        let active_host_irq = wfdma.read(0xd4204)?;
+        let active_mac_irq = pcie_mac.read(0x10188)?;
+        if active_global & 0x5 != 0x5
+            || active_host_irq != firmware_bootstrap_rx_irq_mask()
+            || active_mac_irq != 0xff
+        {
+            return Err(format!(
+                "transport activation mismatch global={active_global:#010x} host_irq={active_host_irq:#010x} mac_irq={active_mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(
+            "vfio_wfdma_activation_complete engines=true host_irq=wm_wm2 mac_irq=true top_owned=true l0s_disabled=true swdef_normal=true firmware_published=false",
+        );
         Ok(())
     })();
 
@@ -870,12 +914,31 @@ fn run_contained_dma_resource_round_trip(
     }
     match wfdma.read(0xd4208) {
         Ok(global) if global != u32::MAX => {
-            if let Err(error) = wfdma.write_active_wfdma(0xd4208, global & !0xf) {
+            let disabled =
+                global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+            if let Err(error) = wfdma.write_active_wfdma(0xd4208, disabled) {
                 cleanup.push(format!("disable WFDMA: {error}"));
             }
         }
         Ok(_) => cleanup.push("disable WFDMA: all-ones readback".into()),
         Err(error) => cleanup.push(format!("read WFDMA for disable: {error}")),
+    }
+    let idle_deadline = Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        match wfdma.read(0xd4208) {
+            Ok(global) if global & 0xa == 0 => break,
+            Ok(global) if Instant::now() >= idle_deadline => {
+                cleanup.push(format!(
+                    "WFDMA busy during contained cleanup: {global:#010x}"
+                ));
+                break;
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(error) => {
+                cleanup.push(format!("read WFDMA idle state: {error}"));
+                break;
+            }
+        }
     }
     if let Err(error) = set_pci_bus_master(bdf, false) {
         cleanup.push(format!("disable BME: {error}"));
@@ -9190,7 +9253,7 @@ mod tests {
     }
 
     #[test]
-    fn contained_dma_resource_boundary_stops_before_traffic_source_shape() {
+    fn contained_transport_activation_stops_before_firmware_source_shape() {
         let source = include_str!("vfio_read.rs");
         let boundary = source
             .split("fn run_contained_dma_resource_round_trip")
@@ -9208,16 +9271,30 @@ mod tests {
         let irq = boundary.find("VfioIrq::install").unwrap();
         let bme = boundary.find("set_pci_bus_master(bdf, true)").unwrap();
         let complete = boundary.find("vfio_wfdma_prep_complete").unwrap();
+        let activation = boundary.find("vfio_wfdma_activation_begin").unwrap();
+        let engine = boundary
+            .find("write_active_wfdma(0xd4208, enabled)")
+            .unwrap();
+        let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
+        let mask = boundary.find("write_active_wfdma(0xd4204, 0)").unwrap();
+        let idle = boundary
+            .find("WFDMA busy during contained cleanup")
+            .unwrap();
+        let bme_off = boundary.find("set_pci_bus_master(bdf, false)").unwrap();
         let unmap = boundary.find("capsule.release_observable()").unwrap();
         let reset = boundary.find("reset_vfio_device(&capsule.device)").unwrap();
         assert!(mapped < disabled && disabled < prep && prep < sanitize);
         assert!(sanitize < irq && irq < bme && bme < complete);
-        assert!(complete < unmap && unmap < reset);
+        assert!(complete < activation && activation < engine && engine < activated);
+        assert!(activated < mask && mask < idle && idle < bme_off);
+        assert!(bme_off < unmap && unmap < reset);
         assert!(!boundary.contains("load_mt7921_firmware"));
         assert!(!boundary.contains("publish_mcu_command"));
         assert!(!boundary.contains("dma_and_response_irq_enabled"));
         assert!(!boundary.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
-        assert!(!boundary.contains("| (1 << 0)\n                | (1 << 2)"));
+        assert!(!boundary.contains("publish_mcu_bytes"));
+        assert!(!boundary.contains("write_active_wfdma(0xd4408"));
+        assert!(!boundary.contains("write_active_wfdma(0xd4418"));
     }
 
     #[test]
