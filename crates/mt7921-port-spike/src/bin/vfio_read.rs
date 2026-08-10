@@ -843,6 +843,7 @@ fn run_contained_dma_resource_round_trip(
         }
         wfdma.write_active_wfdma(0xd42f0, 0)?;
         wfdma.write_active_wfdma(0xd4680, 4)?;
+        wfdma.write_active_wfdma(0xd4688, 0x0040_0004)?;
         wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
         wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
         wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
@@ -2884,6 +2885,7 @@ fn run() -> Result<(), String> {
                 .mark_possibly_active(Hazard::Wfdma);
             wfdma.write_active_wfdma(0xd42f0, 0)?;
             wfdma.write_active_wfdma(0xd4680, 4)?;
+            wfdma.write_active_wfdma(0xd4688, 0x0040_0004)?;
             wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
             wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
             wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
@@ -5723,6 +5725,7 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
         0xd4208 | 0xd4100 | 0xd42b0 => true,
         0xd42f0 => value == 0 || value == 4,
         0xd4680 => value == 4,
+        0xd4688 => value == 0x0040_0004,
         0xd4690 => value == 0x00c0_0004,
         0xd4640 => value == 0x0340_0004,
         0xd4644 => value == 0x0380_0004,
@@ -9602,6 +9605,44 @@ mod tests {
         assert!(!activation_only.contains("publish_mcu_bytes"));
         assert!(!activation_only.contains("write_active_wfdma(0xd4408"));
         assert!(!activation_only.contains("write_active_wfdma(0xd4418"));
+    }
+
+    #[test]
+    fn contained_rx2_ext_ctrl_is_source_exact_and_precedes_rx_dma() {
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let rx_rings = boundary.find("prepare_global_rx_rings(").unwrap();
+        let rx2_ext = boundary
+            .find("write_active_wfdma(0xd4688, 0x0040_0004)")
+            .unwrap();
+        let rx_dma = boundary
+            .find("write_active_wfdma(0xd4208, enabled)")
+            .unwrap();
+        assert!(rx_rings < rx2_ext && rx2_ext < rx_dma);
+        assert!(active_wfdma_write_allowed(
+            0xd4688,
+            0x0040_0004,
+            firmware_bootstrap_rx_irq_mask()
+        ));
+        assert!(!active_wfdma_write_allowed(
+            0xd4688,
+            0,
+            firmware_bootstrap_rx_irq_mask()
+        ));
+
+        let accepts = |writes: &[(usize, u32)]| writes.contains(&(0xd4688, 0x0040_0004));
+        assert!(accepts(&[
+            (0xd4680, 4),
+            (0xd4688, 0x0040_0004),
+            (0xd4690, 0x00c0_0004),
+        ]));
+        assert!(!accepts(&[(0xd4680, 4), (0xd4690, 0x00c0_0004)]));
     }
 
     #[test]
