@@ -38,10 +38,10 @@ DMA, arm an interrupt, or reset the function.
 With `--acquire-driver-ownership`, the same binary additionally ports
 `__mt792xe_mcu_drv_pmctrl` from pinned Linux `mt792x_core.c`: it writes only
 `PCIE_LPCR_HOST_CLR_OWN` to `MT_CONN_ON_LPCTL`, then polls only that register's
-`PCIE_LPCR_HOST_OWN_SYNC` bit. It preserves Linux's ten 50 ms attempts and 1 ms
-poll tick while adding a 500 ms absolute deadline and rejecting command bits
-on readback. Every write, status sample, retry, terminal success, timeout, or
-unexpected state is emitted as a structured event. No firmware-ownership or
+`PCIE_LPCR_HOST_OWN_SYNC` bit. It preserves Linux's ten independently timed
+50 ms attempts and 1 ms poll tick; like Linux, poll success masks only
+`OWN_SYNC` and ignores echoed command bits. Every write, status sample, retry,
+terminal success, or timeout is emitted as a structured event. No firmware-ownership or
 dynamic L1-remap write is admitted.
 
 The physical MT7961 at `0000:05:00.0` completed this transition on the first
@@ -1462,3 +1462,53 @@ This gate stops before WFSYS reset, WFDMA reads or writes, IRQ installation,
 DMA mapping, firmware loading, or radio work. No hardware run is authorized
 until the ASPM delay and inverse rollback are represented and separately
 reviewed.
+
+Those prerequisites are now represented offline, without making the temporary
+gate reachable. `pcie_link_control` walks the conventional PCI capability list
+only when `PCI_STATUS_CAP_LIST` is asserted, uses the masked pointer at config
+byte `0x34`, finds capability ID `0x10`
+(`PCI_CAP_ID_EXP`), and reads the little-endian Link Control word at capability
+offset `0x10` (`PCI_EXP_LNKCTL`). It rejects short configurations, invalid or
+looping capability pointers, a truncated PCIe capability, and capability
+absence. `mt76_pci_aspm_supported` parses endpoint and optional parent bridge
+independently, masks exactly `PCI_EXP_LNKCTL_ASPMC = 0x3`, and reproduces
+pinned `mt76/pci.c`: the delay predicate is true if either side has L0s or L1
+enabled. Unlike the kernel caller, which operates on known PCIe devices, the
+offline parser retains malformed/absent-capability errors instead of guessing
+false. Focused fixtures cover a chained endpoint capability, endpoint L0s,
+parent-only L1, both sides disabled, absence, a list loop, and truncation.
+
+`round_trip_driver_ownership` is a separate, currently uncalled transaction.
+It emits a before-read durable-stage hook, reads one full low-power-control
+word, rejects all ones and either asserted command bit, and saves only the
+semantic `OWN_SYNC` state. Its CLR state machine preserves Linux's ten attempts,
+50 ms per attempt and 1 ms polling. Each poll window gets its own deadline,
+started after the command, settling delay, and durable callbacks, so MMIO,
+scheduling, and fsync overhead cannot clip a later Linux poll window. The
+zero-overhead worst case is 500 ms without ASPM and 530 ms with ten maximum
+settling delays. When the parsed ASPM predicate is true it
+invokes the transport's exact 2,000--3,000 us range hook
+after every CLR store and before the first poll; the host adapter conservatively
+sleeps the upper 3,000 us bound. Before-store, after-store, delay, before-read,
+status, retry, success, and timeout events are exposed to the
+durable stage adapter.
+
+If the snapshot was driver-owned, CLR is allowed as an idempotent command and
+the transaction never issues SET on success or error. If it was firmware-owned,
+the CLR result is retained but cannot bypass rollback: SET plus the pinned
+ten independently timed 50-ms polls for `OWN_SYNC` set runs after every
+CLR-path result. A SET or rollback-read transport error is retained, but cannot
+short-circuit the remaining bounded best-effort SET/poll sequence; this covers
+an MMIO store that reached hardware despite an adapter error. Successful
+rollback followed by failed acquisition returns the acquisition error;
+successful acquisition followed by failed rollback returns the rollback error;
+dual failure retains both in `AcquireAndRestore`. A rollback timeout emits no
+`Complete` event and therefore cannot claim restored ownership. Injected tests
+cover source delay and successful round trip, initially driver-owned no-SET,
+post-CLR read failure with successful rollback, CLR timeout with successful
+rollback, SET timeout without a completion claim, rollback-read continuation,
+an ambiguous SET error whose status verifies restoration, and simultaneous
+primary and rollback transport errors. The VFIO adapter admits SET only on BAR0 page
+`0xe0000` at exact offset `0xe0010`, and the dormant durable-stage adapter maps
+every transaction event to the fsynced SAE stage channel. No physical path
+calls the transaction yet; the existing early return remains unchanged.

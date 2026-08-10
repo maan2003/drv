@@ -31,11 +31,12 @@ use mt7921_port_spike::{
     GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
     MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus, OwnershipError,
-    OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability,
-    PciIrqKind, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
-    TopOwnershipTransport, TxRingState, WfsysResetEvent, WfsysResetTransport,
-    acquire_driver_ownership, acquire_top_driver_ownership, encode_download_command,
-    encode_mt7921_5ghz_auth_tx, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
+    OwnershipEvent, OwnershipRoundTripEvent, OwnershipRoundTripTransport, OwnershipTransport,
+    PCIE_LPCR_HOST_CLR_OWN, PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind,
+    ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport,
+    TxRingState, WfsysResetEvent, WfsysResetTransport, acquire_driver_ownership,
+    acquire_top_driver_ownership, encode_download_command, encode_mt7921_5ghz_auth_tx,
+    load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
     mask_ack_disabled_fwdl_interrupt, mt7921_packet_type, parse_clc_set_response,
     parse_download_response, parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status,
     parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
@@ -7187,6 +7188,20 @@ impl ReadPage {
         };
         Ok(())
     }
+    fn write_set_own(&self) -> Result<(), String> {
+        let offset = ReadRegister::ConnOnLowPowerControl.bar_offset();
+        let within = offset - self.bar_page;
+        if self.bar_page != 0xe0000 || within + 4 > PAGE {
+            return Err("SET_OWN write escaped immutable allowlist".into());
+        }
+        unsafe {
+            std::ptr::write_volatile(
+                self.ptr.as_ptr().add(within).cast::<u32>(),
+                PCIE_LPCR_HOST_SET_OWN,
+            )
+        };
+        Ok(())
+    }
     fn write_remap_selector(&self, value: u32) -> Result<(), String> {
         let within = MT_HIF_REMAP_L1_BAR_OFFSET - self.bar_page;
         if self.bar_page != 0xfe000 || within + 4 > PAGE {
@@ -7587,12 +7602,34 @@ impl OwnershipTransport for VfioOwnership<'_> {
     fn sleep_ms(&mut self, milliseconds: u64) {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds));
     }
+    fn sleep_us_range(&mut self, _minimum: u64, maximum: u64) {
+        std::thread::sleep(std::time::Duration::from_micros(maximum));
+    }
+}
+impl OwnershipRoundTripTransport for VfioOwnership<'_> {
+    fn write_set_own(&mut self) -> Result<(), Self::Error> {
+        self.page.write_set_own()
+    }
 }
 
 fn log_ownership_event(event: OwnershipEvent) {
     match event {
+        OwnershipEvent::ClearOwnBefore { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"clear_own_before\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
+        ),
         OwnershipEvent::ClearOwnWritten { attempt, at_ms } => println!(
             "{{\"ownership_event\":\"clear_own_written\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"value\":\"{PCIE_LPCR_HOST_CLR_OWN:#010x}\"}}"
+        ),
+        OwnershipEvent::AspmDelay {
+            attempt,
+            at_ms,
+            minimum_us,
+            maximum_us,
+        } => println!(
+            "{{\"ownership_event\":\"aspm_delay\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"minimum_us\":{minimum_us},\"maximum_us\":{maximum_us}}}"
+        ),
+        OwnershipEvent::StatusReadBefore { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"status_read_before\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
         ),
         OwnershipEvent::StatusRead {
             attempt,
@@ -7617,6 +7654,28 @@ fn log_ownership_event(event: OwnershipEvent) {
         OwnershipEvent::TimedOut { at_ms } => {
             println!("{{\"ownership_event\":\"timed_out\",\"at_ms\":{at_ms}}}")
         }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[allow(dead_code)]
+fn record_ownership_round_trip_stage(event: OwnershipRoundTripEvent) {
+    match event {
+        OwnershipRoundTripEvent::SnapshotReadBefore => {
+            record_sae_stage("vfio_ownership_snapshot_read_before offset=0xe0010 bytes=4")
+        }
+        OwnershipRoundTripEvent::Snapshot { raw, state } => record_sae_stage(&format!(
+            "vfio_ownership_snapshot_read_after offset=0xe0010 bytes=4 raw={raw:#010x} state={state:?}"
+        )),
+        OwnershipRoundTripEvent::Driver(event) => {
+            record_sae_stage(&format!("vfio_ownership_driver_transition event={event:?}"))
+        }
+        OwnershipRoundTripEvent::Firmware(event) => record_sae_stage(&format!(
+            "vfio_ownership_rollback_transition event={event:?}"
+        )),
+        OwnershipRoundTripEvent::Complete { restored } => record_sae_stage(&format!(
+            "vfio_ownership_round_trip_complete restored={restored:?}"
+        )),
     }
 }
 
