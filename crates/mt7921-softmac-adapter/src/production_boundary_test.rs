@@ -239,6 +239,7 @@ struct BackendState {
     regulatory_max_dbm: Option<i8>,
     sar_cap_dbm: Option<i8>,
     programmed_power_dbm: Option<i8>,
+    authorized_rate_mbps: Option<u16>,
     programmed_rate_mbps: Option<u16>,
     applied: Vec<Applied>,
     frames: Vec<Vec<u8>>,
@@ -273,6 +274,10 @@ impl BackendProgrammer {
         state.programmed_rate_mbps = Some(rate_mbps);
         state.applied.push(Applied::Rate(rate_mbps));
     }
+
+    fn authorize_rate(&self, rate_mbps: u16) {
+        self.0.lock().unwrap().authorized_rate_mbps = Some(rate_mbps);
+    }
 }
 
 impl Mt7921ClientEffects for ProductionBackend {
@@ -289,6 +294,7 @@ impl Mt7921ClientEffects for ProductionBackend {
         state.regulatory_max_dbm = None;
         state.sar_cap_dbm = None;
         state.programmed_power_dbm = None;
+        state.authorized_rate_mbps = None;
         state.programmed_rate_mbps = None;
     }
 
@@ -319,7 +325,8 @@ impl Mt7921ClientEffects for ProductionBackend {
             || state.current_channel != Some(channel(6))
             || state.regulatory_channel != state.current_channel
             || !power_authorized
-            || !state.programmed_rate_mbps.is_some_and(|rate| rate > 0)
+            || state.programmed_rate_mbps != state.authorized_rate_mbps
+            || !state.authorized_rate_mbps.is_some_and(|rate| rate > 0)
         {
             state.rejects.push(Reject::Revoked);
             return Err(zx::Status::ACCESS_DENIED);
@@ -569,6 +576,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         programmer.set_regulatory_max(18);
         programmer.set_sar_cap(16);
         programmer.complete_power_programming(16);
+        programmer.authorize_rate(6);
         programmer.complete_rate_programming(6);
         let _transaction = sme.on_connect_command(fidl_sme::ConnectRequest {
             ssid: SSID.to_vec(),
@@ -617,6 +625,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         assert!(state.regulatory_max_dbm.is_none());
         assert!(state.sar_cap_dbm.is_none());
         assert!(state.programmed_power_dbm.is_none());
+        assert!(state.authorized_rate_mbps.is_none());
         assert!(state.programmed_rate_mbps.is_none());
     });
 }
@@ -629,6 +638,7 @@ fn production_tx_requires_independent_power_and_rate_authorization() {
             regulatory_max_dbm: Some(18),
             sar_cap_dbm: Some(16),
             programmed_power_dbm: Some(16),
+            authorized_rate_mbps: Some(6),
             ..Default::default()
         }));
         let programmer = BackendProgrammer(state.clone());
@@ -654,26 +664,32 @@ fn production_tx_requires_independent_power_and_rate_authorization() {
             device.send_wlan_frame(vec![2].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
             Err(zx::Status::ACCESS_DENIED)
         );
-        programmer.complete_rate_programming(6);
-        programmer.complete_power_programming(17);
+        programmer.complete_rate_programming(12);
         assert_eq!(
             device.send_wlan_frame(vec![3].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
             Err(zx::Status::ACCESS_DENIED)
         );
+        programmer.complete_rate_programming(6);
+        programmer.complete_power_programming(17);
+        assert_eq!(
+            device.send_wlan_frame(vec![4].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
+            Err(zx::Status::ACCESS_DENIED)
+        );
         programmer.complete_power_programming(16);
         device
-            .send_wlan_frame(vec![4].into(), fidl_softmac::WlanTxInfoFlags::empty(), None)
+            .send_wlan_frame(vec![5].into(), fidl_softmac::WlanTxInfoFlags::empty(), None)
             .unwrap();
         assert_eq!(
-            device.send_wlan_frame(vec![5].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
+            device.send_wlan_frame(vec![6].into(), fidl_softmac::WlanTxInfoFlags::empty(), None),
             Err(zx::Status::ALREADY_EXISTS)
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.frames, [vec![4]]);
+        assert_eq!(state.frames, [vec![5]]);
         assert_eq!(
             state.rejects,
             [
+                Reject::Revoked,
                 Reject::Revoked,
                 Reject::Revoked,
                 Reject::Revoked,
@@ -692,6 +708,7 @@ fn reset_failure_revokes_before_first_frame_and_survives_later_scan() {
             regulatory_max_dbm: Some(18),
             sar_cap_dbm: Some(16),
             programmed_power_dbm: Some(16),
+            authorized_rate_mbps: Some(6),
             programmed_rate_mbps: Some(6),
             fail_reset: true,
             ..Default::default()
@@ -733,6 +750,7 @@ fn reset_failure_revokes_before_first_frame_and_survives_later_scan() {
         assert!(state.regulatory_max_dbm.is_none());
         assert!(state.sar_cap_dbm.is_none());
         assert!(state.programmed_power_dbm.is_none());
+        assert!(state.authorized_rate_mbps.is_none());
         assert!(state.programmed_rate_mbps.is_none());
     });
 }
@@ -745,6 +763,7 @@ fn stop_failure_revokes_and_clears_evidence_before_first_frame() {
         regulatory_max_dbm: Some(18),
         sar_cap_dbm: Some(16),
         programmed_power_dbm: Some(16),
+        authorized_rate_mbps: Some(6),
         programmed_rate_mbps: Some(6),
         fail_stop: true,
         ..Default::default()
@@ -768,5 +787,6 @@ fn stop_failure_revokes_and_clears_evidence_before_first_frame() {
     assert!(state.regulatory_max_dbm.is_none());
     assert!(state.sar_cap_dbm.is_none());
     assert!(state.programmed_power_dbm.is_none());
+    assert!(state.authorized_rate_mbps.is_none());
     assert!(state.programmed_rate_mbps.is_none());
 }
