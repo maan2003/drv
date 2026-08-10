@@ -33,8 +33,20 @@ Supported now: deterministic virtual PCM consumption and the complete fixed
 sample format, rate, channels, and channel positions). Tests parse the object
 and independently check its native object type and parameter ID.
 
-An unmodified client cannot connect yet. The next frontend operation is
-server-side native-protocol handling of `Core.GetRegistry`, followed by
-`Registry.Global` events for a Node and its input Port. After discovery, stream
-use still requires node/port bind and parameter enumeration, link creation,
-shared-buffer negotiation, activation, clock/quantum scheduling, and processing.
+The `serve` mode binds the standard `$PIPEWIRE_RUNTIME_DIR/pipewire-0` Unix
+socket, handles native `Core.GetRegistry`, and advertises the virtual sink Node
+and its input Port with `Registry.Global`. It also handles the mandatory Hello,
+client-property, and Sync/Done bootstrap around discovery, then exits after one
+client. No alternate application protocol is exposed.
+
+For example, start `PIPEWIRE_RUNTIME_DIR=/tmp/drv-pw cargo run -p
+drv-audio-pipewire-spike -- serve`, then use the unmodified `pw-cli ls Node` or
+`pw-cli ls Port` with the same environment. Both globals are listed. Since this
+probe intentionally closes after the post-registry Sync, `pw-cli` can also print
+a remote-disconnect diagnostic on stderr after the successful listing.
+
+An unmodified client can connect and discover both globals, but cannot bind the
+Node or Port yet. The next frontend operation is `Registry.Bind`, followed by
+Node/Port Info and `EnumParams` for the already implemented `EnumFormat` POD.
+Stream use subsequently requires link creation, shared-buffer negotiation,
+activation, clock/quantum scheduling, and processing.

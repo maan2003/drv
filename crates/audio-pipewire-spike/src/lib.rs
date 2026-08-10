@@ -18,6 +18,8 @@ use pipewire_native_spa::{
     },
 };
 
+pub mod protocol;
+
 /// The project-owned PCM contract at the compatibility/backend boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PcmFormat {
