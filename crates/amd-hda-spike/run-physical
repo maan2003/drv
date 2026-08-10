@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bdf=0000:67:00.6
-dev=/sys/bus/pci/devices/$bdf
-group=/sys/kernel/iommu_groups/27
 watchdog_seconds=${DRV_HDA_WATCHDOG_SECONDS:-20}
-
 fail() { printf 'amd-hda physical guard: %s\n' "$*" >&2; exit 2; }
-[[ -d $dev ]] || fail "$bdf is absent on this boot"
-[[ $(cat "$dev/vendor") == 0x1022 && $(cat "$dev/device") == 0x15e3 ]] || fail 'PCI identity mismatch'
-[[ $(cat "$dev/subsystem_vendor") == 0x1043 && $(cat "$dev/subsystem_device") == 0x1513 ]] || fail 'PCI subsystem mismatch'
-[[ $(readlink -f "$dev/iommu_group") == $(readlink -f "$group") ]] || fail 'device is not in IOMMU group 27'
+
+# PCI numbering and IOMMU group numbers are not stable across boots. Select by
+# the complete hardware identity and class on every invocation.
+matches=()
+for candidate in /sys/bus/pci/devices/*; do
+  [[ -r $candidate/class && -r $candidate/vendor && -r $candidate/device ]] || continue
+  class=$(cat "$candidate/class")
+  [[ ${class%??} == 0x0403 ]] || continue
+  [[ $(cat "$candidate/vendor") == 0x1022 && $(cat "$candidate/device") == 0x15e3 ]] || continue
+  [[ $(cat "$candidate/subsystem_vendor") == 0x1043 && $(cat "$candidate/subsystem_device") == 0x1513 ]] || continue
+  matches+=("$candidate")
+done
+[[ ${#matches[@]} == 1 ]] || fail "expected exactly one 0403/1022:15e3/1043:1513 function; found ${#matches[@]}"
+dev=${matches[0]}
+bdf=${dev##*/}
+class=$(cat "$dev/class")
+[[ ${class%??} != 0x0280 ]] || fail "refusing Wi-Fi-class function $bdf"
+
+group=$(readlink -f "$dev/iommu_group")
+[[ -n $group && -d $group/devices ]] || fail "$bdf has no IOMMU group"
 mapfile -t members < <(find "$group/devices" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
-[[ ${#members[@]} == 1 && ${members[0]} == "$bdf" ]] || fail "group 27 is not isolated: ${members[*]}"
+for member in "${members[@]}"; do
+  member_class=$(cat "/sys/bus/pci/devices/$member/class")
+  [[ ${member_class%??} != 0x0280 ]] || fail "IOMMU group ${group##*/} contains Wi-Fi function $member"
+done
+[[ ${#members[@]} == 1 && ${members[0]} == "$bdf" ]] || fail "IOMMU group ${group##*/} is not isolated: ${members[*]}"
 [[ $(basename "$(readlink -f "$dev/driver")") == snd_hda_intel ]] || fail 'snd_hda_intel does not own the function'
-[[ $EUID == 0 ]] || fail 'rerun as root after this preflight succeeds'
-[[ -e /dev/iommu ]] || fail '/dev/iommu is unavailable'
+[[ $EUID == 0 ]] || fail "selected $bdf in isolated group ${group##*/}; rerun as root"
+
+# iommufd can be modular. Only diagnose the device node after trying to load it.
+modprobe iommufd || fail 'cannot load iommufd (kernel CONFIG_IOMMUFD/module unavailable)'
+[[ -c /dev/iommu ]] || fail '/dev/iommu did not appear after modprobe iommufd; check CONFIG_IOMMUFD and device-node policy'
 
 cargo build -p amd-hda-spike --bin amd-hda-enumerate
 modprobe vfio-pci
-modprobe iommufd
-restored=0
 watchdog_pid=
 restore() {
   local status=$?
@@ -35,7 +52,7 @@ restore() {
     printf 'amd-hda: native driver restoration failed; reboot is required\n' >&2
     status=1
   else
-    restored=1
+    printf 'amd-hda: verified native restore of %s to snd_hda_intel\n' "$bdf"
   fi
   exit "$status"
 }
