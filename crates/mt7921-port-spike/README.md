@@ -1950,3 +1950,16 @@ supervisor restore could be recorded. After reboot, native `mt7921e` rebound,
 iwd was active, `wlan0` had carrier, all recovery and watchdog units were
 inactive, and `/run/wifi-driver-lab` was absent. No further physical mutation
 was attempted.
+
+The immediate source-order comparison found one concrete mismatch at that
+boundary. The physically passing bounded channel-36 passive operation
+re-verified PCI MSE=1, BME=0, and D0 immediately after attach, then recorded
+`vfio_attached_d0_preflight_already_ready` before its first device-info query.
+SAE skipped that post-attach revalidation and proceeded directly to an
+unmarked `VFIO_DEVICE_GET_REGION_INFO(BAR0)` ioctl. Its credential, target,
+and optional management-DMA values remain live but are neither borrowed nor
+dropped in this segment, so they cannot explain a stall at this boundary. The
+smallest correction moves the existing post-attach D0 check ahead of the
+contained/passive branch for both stage-recording paths; SAE now refuses the
+BAR query unless the same passing precondition holds and emits the existing
+marker.

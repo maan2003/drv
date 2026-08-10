@@ -1577,14 +1577,13 @@ fn run() -> Result<(), String> {
         capsule.ioas_attached = true;
         if operation.records_active_transport_stages() {
             record_sae_stage("vfio_attach_iommufd_pt_after");
+            verify_pci_dma_disabled(&bdf).map_err(|error| {
+                format!("vfio_attached_d0_preflight_not_ready; refusing BAR query: {error}")
+            })?;
+            record_sae_stage("vfio_attached_d0_preflight_already_ready");
         }
 
         if operation.uses_contained_transport_gate() {
-            verify_pci_dma_disabled(&bdf).map_err(|error| {
-                format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
-            })?;
-            record_sae_stage("vfio_attached_d0_preflight_already_ready");
-
             let mut device_info = DeviceInfo {
                 argsz: size::<DeviceInfo>(),
                 ..Default::default()
@@ -10048,6 +10047,22 @@ mod tests {
         let vfio = startup.find("record_sae_stage(\"vfio_cdev_open_before\")").unwrap();
         assert!(bdf < identity && identity < watchdog && watchdog < marker && marker < vfio);
         assert!(startup.matches("records_active_transport_stages()").count() >= 6);
+
+        let post_attach = source
+            .split("record_sae_stage(\"vfio_attach_iommufd_pt_after\");")
+            .nth(1)
+            .unwrap()
+            .split("let mut info = RegionInfo")
+            .next()
+            .unwrap();
+        let d0 = post_attach.find("verify_pci_dma_disabled(&bdf)").unwrap();
+        let d0_marker = post_attach
+            .find("vfio_attached_d0_preflight_already_ready")
+            .unwrap();
+        let contained = post_attach
+            .find("if operation.uses_contained_transport_gate()")
+            .unwrap();
+        assert!(d0 < d0_marker && d0_marker < contained);
     }
 
     #[test]
