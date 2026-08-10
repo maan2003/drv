@@ -50,6 +50,10 @@ struct RingBufferEndpoint {
 
 impl DeviceRegistry {
     pub(crate) fn register_virtual_playback() -> Self {
+        Self::register_playback_with_format(PLAYBACK_FORMAT)
+    }
+
+    pub(crate) fn register_playback_with_format(format: PcmFormat) -> Self {
         Self {
             playback: RegisteredDevice {
                 info: RegisteredDeviceInfo {
@@ -57,7 +61,7 @@ impl DeviceRegistry {
                     element_id: PLAYBACK_ELEMENT_ID,
                     name: "drv.adr-virtual-sink".into(),
                     description: "drv Fuchsia ADR Virtual Sink".into(),
-                    format: PLAYBACK_FORMAT,
+                    format,
                 },
                 // The virtual device is initialized and its one ring buffer is
                 // created before it becomes visible, matching ADR readiness.

@@ -191,3 +191,20 @@ worker, pinned Fuchsia mixing/gain processing and timeline accounting; the
 private sink then submits each processed quantum as one AMD HDA BDL period.
 No new application protocol or public hardware-selection API is exposed.
 
+
+## Position-managed 44.1 kHz physical input
+
+The private physical-daemon hook can now register a stereo S16 input format of
+44.1 kHz while retaining a 48 kHz `PlaybackEndpoint`. At the registry worker
+boundary, each 441-frame input quantum passes through the pinned Fuchsia
+`PositionManager` point-SRC and becomes exactly 480 hardware frames before the
+existing physical sink. The ordinary virtual daemon and 48 kHz physical path
+remain byte-for-byte paths with their previous fixed format and 480-frame
+quantum.
+
+This hook still accepts one input format for a daemon lifetime. A single daemon
+that alternates 48 kHz and 44.1 kHz clients needs the pending long-lived HDA
+lifecycle owner to expose client begin/end boundaries (or a rate-tagged quantum
+write) without releasing VFIO ownership. Until that interface lands, the audio
+layer does not duplicate controller/codec ownership merely to perform a mixed-
+rate physical test.

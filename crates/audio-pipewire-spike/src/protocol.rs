@@ -36,7 +36,7 @@ use pipewire_native_spa::{
     },
 };
 
-use drv_fuchsia_audio_processing::mix_stereo_s16;
+use drv_fuchsia_audio_processing::{mix_stereo_s16, resample_stereo_s16_44100_to_48000};
 
 use crate::{
     device_registry::{DeviceRegistry, RegisteredDeviceInfo},
@@ -166,14 +166,29 @@ pub fn serve_daemon_with_physical_sink(
     listener: &UnixListener,
     sink: Box<dyn crate::PlaybackEndpoint + Send>,
 ) -> io::Result<()> {
-    serve_daemon_with_sink(listener, Some(sink))
+    serve_daemon_with_input_format(listener, sink, crate::VIRTUAL_SINK_FORMAT)
+}
+
+/// Rate-aware private driver hook. The long-lived HDA owner supplies the
+/// client-side format while retaining its fixed 48 kHz hardware format.
+#[doc(hidden)]
+pub fn serve_daemon_with_input_format(
+    listener: &UnixListener,
+    sink: Box<dyn crate::PlaybackEndpoint + Send>,
+    input_format: crate::PcmFormat,
+) -> io::Result<()> {
+    serve_daemon_with_sink(listener, Some((sink, input_format)))
 }
 
 fn serve_daemon_with_sink(
     listener: &UnixListener,
-    sink: Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    sink: Option<(Box<dyn crate::PlaybackEndpoint + Send>, crate::PcmFormat)>,
 ) -> io::Result<()> {
-    let registry = DeviceRegistry::register_virtual_playback();
+    let registry = sink
+        .as_ref()
+        .map_or_else(DeviceRegistry::register_virtual_playback, |(_, format)| {
+            DeviceRegistry::register_playback_with_format(*format)
+        });
     let device = registry.playback().info().clone();
     let (event_tx, event_rx) = mpsc::channel();
     thread::spawn(move || run_ring_buffer_worker(registry, event_rx, sink));
@@ -516,7 +531,7 @@ fn process_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) -> io::Result<Playback
 fn run_ring_buffer_worker(
     mut registry: DeviceRegistry,
     events: Receiver<StreamEvent>,
-    mut sink: Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    mut sink: Option<(Box<dyn crate::PlaybackEndpoint + Send>, crate::PcmFormat)>,
 ) {
     let mut active = BTreeMap::new();
     loop {
@@ -545,7 +560,7 @@ fn run_ring_buffer_worker(
 fn handle_stream_event_with_sink(
     registry: &mut DeviceRegistry,
     active: &mut BTreeMap<u64, ActiveStream>,
-    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    sink: &mut Option<(Box<dyn crate::PlaybackEndpoint + Send>, crate::PcmFormat)>,
     event: StreamEvent,
 ) {
     match event {
@@ -597,7 +612,7 @@ fn mix_pcm(first: &[u8], second: &[u8]) -> io::Result<Vec<u8>> {
 fn drain_streams(
     registry: &mut DeviceRegistry,
     active: &mut BTreeMap<u64, ActiveStream>,
-    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    sink: &mut Option<(Box<dyn crate::PlaybackEndpoint + Send>, crate::PcmFormat)>,
 ) {
     loop {
         let ids = active.keys().copied().take(2).collect::<Vec<_>>();
@@ -675,15 +690,22 @@ fn drain_streams(
 
 fn commit_pcm(
     registry: &mut DeviceRegistry,
-    sink: &mut Option<Box<dyn crate::PlaybackEndpoint + Send>>,
+    sink: &mut Option<(Box<dyn crate::PlaybackEndpoint + Send>, crate::PcmFormat)>,
     pcm: &[u8],
 ) {
     match process_pcm(registry, pcm) {
         Ok(result) => report_playback(result),
         Err(error) => eprintln!("PipeWire playback stopped: {error}"),
     }
-    if let Some(sink) = sink {
-        if let Err(error) = sink.write(pcm) {
+    if let Some((sink, input_format)) = sink {
+        let physical_pcm = match physical_pcm_at_sink_rate(*input_format, sink.format(), pcm) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                eprintln!("Physical SRC stopped: {error:?}");
+                return;
+            }
+        };
+        if let Err(error) = sink.write(&physical_pcm) {
             eprintln!("Physical playback stopped: {error:?}");
         } else {
             println!(
@@ -692,6 +714,34 @@ fn commit_pcm(
             );
         }
     }
+}
+
+fn physical_pcm_at_sink_rate(
+    input: crate::PcmFormat,
+    output: crate::PcmFormat,
+    pcm: &[u8],
+) -> Result<Vec<u8>, crate::EndpointError> {
+    if input.sample_format != crate::SampleFormat::Signed16Le
+        || output.sample_format != crate::SampleFormat::Signed16Le
+        || input.channels != 2
+        || output.channels != 2
+        || !pcm.len().is_multiple_of(4)
+    {
+        return Err(crate::EndpointError::PartialFrame);
+    }
+    if input.rate == output.rate {
+        return Ok(pcm.to_vec());
+    }
+    if (input.rate, output.rate) != (44_100, 48_000) {
+        return Err(crate::EndpointError::PositionOverflow);
+    }
+    let source = pcm
+        .chunks_exact(2)
+        .map(|sample| i16::from_le_bytes(sample.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    resample_stereo_s16_44100_to_48000(&source)
+        .map_err(|_| crate::EndpointError::PositionOverflow)
+        .map(|samples| samples.into_iter().flat_map(i16::to_le_bytes).collect())
 }
 
 fn report_playback(result: PlaybackResult) {
@@ -1308,6 +1358,7 @@ fn write_client_transport(
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<ClientTransport> {
+    let quantum_frames = u64::from(device.format().rate / 100);
     let activation = memfd_create(
         "drv-client-node-activation",
         MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
@@ -1321,10 +1372,10 @@ fn write_client_transport(
     activation.write_all_at(&1_u32.to_ne_bytes(), 560)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 640)?;
     activation.write_all_at(&device.format().rate.to_ne_bytes(), 644)?;
-    activation.write_all_at(&480_u64.to_ne_bytes(), 656)?;
+    activation.write_all_at(&quantum_frames.to_ne_bytes(), 656)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 688)?;
     activation.write_all_at(&device.format().rate.to_ne_bytes(), 692)?;
-    activation.write_all_at(&480_u64.to_ne_bytes(), 696)?;
+    activation.write_all_at(&quantum_frames.to_ne_bytes(), 696)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 720)?;
     activation.write_all_at(&i64::MIN.to_ne_bytes(), 760)?;
     activation.write_all_at(&2_u32.to_ne_bytes(), 768)?;
@@ -2486,5 +2537,42 @@ mod tests {
             StreamEvent::Chunk(2, vec![0; 480 * 4]),
         );
         assert_eq!(registry.playback().frame_position(), 960);
+    }
+
+    #[test]
+    fn physical_boundary_preserves_48k_and_maps_441_frames_to_480() {
+        let format_48 = crate::VIRTUAL_SINK_FORMAT;
+        let format_441 = crate::PcmFormat {
+            rate: 44_100,
+            ..format_48
+        };
+        let pcm_48 = vec![7; 480 * 4];
+        assert_eq!(
+            physical_pcm_at_sink_rate(format_48, format_48, &pcm_48).unwrap(),
+            pcm_48
+        );
+
+        let source = (0_i16..441)
+            .flat_map(|frame| [frame, -frame])
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let output = physical_pcm_at_sink_rate(format_441, format_48, &source).unwrap();
+        assert_eq!(output.len(), 480 * 4);
+        for (dest_frame, frame) in output.chunks_exact(4).enumerate() {
+            let expected = (dest_frame * 44_100 / 48_000) as i16;
+            assert_eq!(
+                i16::from_le_bytes(frame[0..2].try_into().unwrap()),
+                expected
+            );
+            assert_eq!(
+                i16::from_le_bytes(frame[2..4].try_into().unwrap()),
+                -expected
+            );
+        }
+
+        let mut registry = DeviceRegistry::register_playback_with_format(format_441);
+        registry.playback_mut().write_ring_buffer(&source).unwrap();
+        assert_eq!(registry.playback().frame_position(), 441);
+        assert_eq!(output.len() / 4, 480);
     }
 }
