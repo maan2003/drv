@@ -224,7 +224,7 @@ impl PlaybackEndpoint for PhysicalHdaEndpoint {
             .into_iter()
             .flat_map(i16::to_le_bytes)
             .collect::<Vec<_>>();
-        let report = match self.controller.play_pcm_period(0, &processed) {
+        let report = match self.controller.play_pcm_period(&processed) {
             Ok(report) => report,
             Err(error) => {
                 self.underruns += 1;
@@ -552,14 +552,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let backend = VfioHda::open(&path)?;
     let mut controller = Controller::new(backend);
-    let state = controller.reset().map_err(format_hda)?;
-    if state != 1 {
-        return Err(
-            format!("expected only codec address 0 after reset; STATESTS={state:#x}").into(),
-        );
-    }
-    controller.start_command_rings().map_err(format_hda)?;
-    let codec = controller.enumerate_codec(0).map_err(format_hda)?;
+    let codec = controller.initialize_alc256(0).map_err(format_hda)?;
     println!(
         "codec address={} vendor_device={:08x} revision={:08x}",
         codec.address, codec.vendor_device, codec.revision
@@ -605,7 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .write(&tone)
             .map_err(|error| io::Error::other(format!("ADR PCM period: {error:?}")))?;
         let report = controller
-            .play_pcm_period(0, &period.pcm)
+            .play_pcm_period(&period.pcm)
             .map_err(format_hda)?;
         println!(
             "playback route={:?} stream={} position={}..{} irq_count={} amp_gain_step={}",

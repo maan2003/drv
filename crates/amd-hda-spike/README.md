@@ -78,7 +78,19 @@ proving client stop and restart without rebinding the device.
 
 At the 200-period checkpoint the backend reported 96,000 frames over 2,549 ms,
 LPIB `0..1856`, 200 IOC MSI events, and zero FIFO/descriptor underruns. Every
-period independently required LPIB movement and a post-command-drain IOC before
-clean stream stop/reset. The watchdog finally restored `snd_hda_intel` and the
+period independently required LPIB movement and a post-command-drain IOC. The
+watchdog finally restored `snd_hda_intel` and the
 ALC256 proc node; `wlan0` remained the active route and no IOMMU, FIFO, or
 descriptor fault was logged.
+
+The persistent controller now makes that ownership model explicit in the
+driver library. VFIO, DMA, MSI, CORB/RIRB, codec identity, amplifier
+capabilities, and the selected route are initialized once for the daemon.
+Completed periods enter a muted, stopped idle state without resetting the
+stream, disconnecting the converter, disabling EAPD, or releasing the device.
+Headphone presence is checked before each period; a change mutes and disables
+the old pin before configuring the new one. Gain steps are bounded by the
+ALC256-reported capability. Transport failures mute and reset the stream, while
+service shutdown additionally disconnects the converter, disables the pin and
+EAPD, powers down the codec, and only then lets the development wrapper restore
+`snd_hda_intel`.

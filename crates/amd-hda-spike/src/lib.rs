@@ -10,6 +10,10 @@ const RIRB_OFFSET: usize = 1024;
 const BDL_OFFSET: usize = 4096;
 const PCM_OFFSET: usize = 8192;
 const PCM_BYTES: usize = 7680;
+const ALC256_AFG: u8 = 0x01;
+const ALC256_DAC: u8 = 0x02;
+const ALC256_SPEAKER_PIN: u8 = 0x14;
+const ALC256_HEADPHONE_PIN: u8 = 0x21;
 
 pub trait Transport {
     type Error;
@@ -79,6 +83,17 @@ pub struct Controller<T: Transport> {
     io: T,
     corb_wp: u16,
     rirb_rp: u16,
+    playback: Option<PlaybackState>,
+}
+
+#[derive(Clone, Copy)]
+struct PlaybackState {
+    codec: u8,
+    stream_index: u8,
+    stream: usize,
+    route: Option<OutputRoute>,
+    gain_step: u8,
+    gain_steps: u8,
 }
 
 impl<T: Transport> Controller<T> {
@@ -87,6 +102,7 @@ impl<T: Transport> Controller<T> {
             io,
             corb_wp: 0,
             rirb_rp: 0,
+            playback: None,
         }
     }
     fn poll(
@@ -250,53 +266,202 @@ impl<T: Transport> Controller<T> {
             widgets,
         })
     }
-    pub fn play_pcm_period(
-        &mut self,
-        codec: u8,
-        pcm: &[u8],
-    ) -> Result<PlaybackReport, Error<T::Error>> {
-        if pcm.is_empty() || pcm.len() > PCM_BYTES || !pcm.len().is_multiple_of(4) {
-            return Err(Error::Unsupported(
-                "PCM period must be 1..7680 bytes of stereo S16LE",
-            ));
+    /// Resets and starts the controller, verifies the sole ALC256 codec, and
+    /// establishes persistent playback state. Called once per VFIO ownership
+    /// lifetime, not once per client or PCM period.
+    pub fn initialize_alc256(&mut self, address: u8) -> Result<CodecInventory, Error<T::Error>> {
+        if self.playback.is_some() {
+            return Err(Error::Unsupported("ALC256 is already initialized"));
         }
+        let codec_mask = 1_u16
+            .checked_shl(u32::from(address))
+            .ok_or(Error::Unsupported("invalid codec address"))?;
+        if self.reset()? != codec_mask {
+            return Err(Error::Unsupported("expected exactly one codec address"));
+        }
+        self.start_command_rings()?;
+        let inventory = self.enumerate_codec(address)?;
         let gcap = map_io(self.io.read16(0x00))?;
         let stream_index = ((gcap >> 8) & 0x0f) as u8;
         if (gcap >> 12) & 0x0f == 0 {
             return Err(Error::Unsupported("controller has no output stream"));
         }
-        let stream = 0x80 + stream_index as usize * 0x20;
-        let (route, pin) = if self.command(codec, 0x21, 0x0f09, 0)? & (1 << 31) != 0 {
-            (OutputRoute::Headphone, 0x21)
-        } else {
-            (OutputRoute::Speaker, 0x14)
-        };
-
-        let amp_caps = self.parameter(codec, 0x02, 0x12)?;
+        let amp_caps = self.parameter(address, ALC256_DAC, 0x12)?;
         let offset = (amp_caps & 0x7f) as u8;
-        let quarter_db = (((amp_caps >> 16) & 0x7f) + 1) as u8;
-        let attenuation_steps = 144_u16.div_ceil(u16::from(quarter_db.max(1))) as u8;
-        let gain = offset.saturating_sub(attenuation_steps); // approximately -36 dB
+        let gain_steps = ((amp_caps >> 8) & 0x7f) as u8;
+        if offset > gain_steps {
+            return Err(Error::Unsupported("invalid ALC256 amplifier capabilities"));
+        }
+        let quarter_db = (((amp_caps >> 16) & 0x7f) + 1) as u16;
+        let attenuation_steps = 144_u16.div_ceil(quarter_db.max(1));
+        let gain_step = offset.saturating_sub(attenuation_steps.min(u16::from(u8::MAX)) as u8);
+        self.playback = Some(PlaybackState {
+            codec: address,
+            stream_index,
+            stream: 0x80 + stream_index as usize * 0x20,
+            route: None,
+            gain_step,
+            gain_steps,
+        });
+        Ok(inventory)
+    }
 
-        let ctl = (1 << 20) | (1 << 19);
-        let playback = (|| {
-            for node in [0x01, 0x02, pin] {
-                self.command(codec, node, 0x0705, 0)?;
-            }
-            thread::sleep(Duration::from_millis(2));
-            self.command_long(codec, 0x02, 0x3, 0xb080)?;
-            self.command_long(codec, pin, 0x3, 0xb080)?;
-            self.command(codec, pin, 0x0701, 0)?;
-            self.command_long(codec, 0x02, 0x2, 0x0011)?;
-            self.command(codec, 0x02, 0x0706, 0x10)?;
-            let pin_ctl = if route == OutputRoute::Headphone {
+    /// Selects an ALC256 output-amplifier step. Initialization defaults to
+    /// approximately -36 dB.
+    pub fn set_gain_step(&mut self, gain_step: u8) -> Result<(), Error<T::Error>> {
+        let state = self
+            .playback
+            .as_mut()
+            .ok_or(Error::Unsupported("ALC256 is not initialized"))?;
+        if gain_step > state.gain_steps {
+            return Err(Error::Unsupported("gain step exceeds ALC256 capability"));
+        }
+        state.gain_step = gain_step;
+        Ok(())
+    }
+
+    pub fn output_route(&self) -> Option<OutputRoute> {
+        self.playback.and_then(|state| state.route)
+    }
+
+    fn route_pin(route: OutputRoute) -> u8 {
+        match route {
+            OutputRoute::Headphone => ALC256_HEADPHONE_PIN,
+            OutputRoute::Speaker => ALC256_SPEAKER_PIN,
+        }
+    }
+
+    fn sensed_route(&mut self, codec: u8) -> Result<OutputRoute, Error<T::Error>> {
+        if self.command(codec, ALC256_HEADPHONE_PIN, 0x0f09, 0)? & (1 << 31) != 0 {
+            Ok(OutputRoute::Headphone)
+        } else {
+            Ok(OutputRoute::Speaker)
+        }
+    }
+
+    fn transition_route(&mut self, route: OutputRoute) -> Result<(), Error<T::Error>> {
+        let state = self
+            .playback
+            .ok_or(Error::Unsupported("ALC256 is not initialized"))?;
+        if state.route == Some(route) {
+            return Ok(());
+        }
+        if let Some(old_route) = state.route {
+            let old_pin = Self::route_pin(old_route);
+            self.command_long(state.codec, old_pin, 0x3, 0xb080)?;
+            self.command(state.codec, old_pin, 0x0707, 0)?;
+            self.command(state.codec, old_pin, 0x070c, 0)?;
+        }
+
+        let pin = Self::route_pin(route);
+        // Record the candidate before touching it so a partial setup failure
+        // can still find and mute the pin through idle_playback.
+        self.playback.as_mut().unwrap().route = Some(route);
+        for node in [ALC256_AFG, ALC256_DAC, pin] {
+            self.command(state.codec, node, 0x0705, 0)?;
+        }
+        thread::sleep(Duration::from_millis(2));
+        self.command_long(state.codec, ALC256_DAC, 0x3, 0xb080)?;
+        self.command_long(state.codec, pin, 0x3, 0xb080)?;
+        self.command(state.codec, pin, 0x0701, 0)?;
+        self.command(
+            state.codec,
+            pin,
+            0x0707,
+            if route == OutputRoute::Headphone {
                 0xc0
             } else {
                 0x40
-            };
-            self.command(codec, pin, 0x0707, pin_ctl)?;
-            self.command(codec, pin, 0x070c, 0x02)?;
+            },
+        )?;
+        self.command(state.codec, pin, 0x070c, 0x02)?;
+        Ok(())
+    }
 
+    /// Mutes the persistent codec route and stops the DMA stream without
+    /// tearing down CORB/RIRB, MSI, DMA mappings, or VFIO ownership.
+    pub fn idle_playback(&mut self) -> Result<(), Error<T::Error>> {
+        let state = self
+            .playback
+            .ok_or(Error::Unsupported("ALC256 is not initialized"))?;
+        let mut result = Ok(());
+        if let Some(route) = state.route {
+            let pin = Self::route_pin(route);
+            retain_first_error(
+                &mut result,
+                self.command_long(state.codec, ALC256_DAC, 0x3, 0xb080)
+                    .map(|_| ()),
+            );
+            retain_first_error(
+                &mut result,
+                self.command_long(state.codec, pin, 0x3, 0xb080).map(|_| ()),
+            );
+        }
+        let ctl = (1 << 20) | (1 << 19);
+        match map_io(self.io.write32(state.stream, ctl)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("stop playback stream", |io| {
+                    Ok(io.read32(state.stream)? & 2 == 0)
+                }),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
+        }
+        // Match Fuchsia's stream stop hold before acknowledging status.
+        thread::sleep(Duration::from_micros(100));
+        retain_first_error(
+            &mut result,
+            map_io(self.io.write8(state.stream + 0x03, 0x1c)),
+        );
+        self.io.fence();
+        result
+    }
+
+    fn reset_playback_stream(&mut self) -> Result<(), Error<T::Error>> {
+        let state = self
+            .playback
+            .ok_or(Error::Unsupported("ALC256 is not initialized"))?;
+        let mut result = self.idle_playback();
+        match map_io(self.io.write32(state.stream, 1)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("assert playback stream reset", |io| {
+                    Ok(io.read32(state.stream)? & 1 != 0)
+                }),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
+        }
+        match map_io(self.io.write32(state.stream, 0)) {
+            Ok(()) => retain_first_error(
+                &mut result,
+                self.poll("deassert playback stream reset", |io| {
+                    Ok(io.read32(state.stream)? & 1 == 0)
+                }),
+            ),
+            Err(error) => retain_first_error(&mut result, Err(error)),
+        }
+        result
+    }
+
+    pub fn play_pcm_period(&mut self, pcm: &[u8]) -> Result<PlaybackReport, Error<T::Error>> {
+        if pcm.is_empty() || pcm.len() > PCM_BYTES || !pcm.len().is_multiple_of(4) {
+            return Err(Error::Unsupported(
+                "PCM period must be 1..7680 bytes of stereo S16LE",
+            ));
+        }
+        let state = self
+            .playback
+            .ok_or(Error::Unsupported("ALC256 is not initialized"))?;
+        let route = self.sensed_route(state.codec)?;
+        if let Err(error) = self.transition_route(route) {
+            let _ = self.idle_playback();
+            return Err(error);
+        }
+        let state = self.playback.unwrap();
+        let pin = Self::route_pin(route);
+        let ctl = (1 << 20) | (1 << 19);
+
+        let playback = (|| {
             for (index, word) in pcm.chunks_exact(4).enumerate() {
                 self.io.dma_write32(
                     PCM_OFFSET + index * 4,
@@ -310,22 +475,34 @@ impl<T: Transport> Controller<T> {
             self.io.dma_write32(BDL_OFFSET + 12, 1);
             self.io.fence();
 
-            map_io(self.io.write32(stream, ctl))?;
-            map_io(self.io.write16(stream + 0x12, 0x0011))?;
+            map_io(self.io.write32(state.stream, ctl))?;
+            map_io(self.io.write16(state.stream + 0x12, 0x0011))?;
             let bdl_iova = self.io.dma_iova() + BDL_OFFSET as u64;
-            map_io(self.io.write32(stream + 0x18, bdl_iova as u32))?;
-            map_io(self.io.write32(stream + 0x1c, (bdl_iova >> 32) as u32))?;
-            map_io(self.io.write32(stream + 0x08, pcm.len() as u32))?;
-            map_io(self.io.write16(stream + 0x0c, 0))?;
-            map_io(self.io.write8(stream + 0x03, 0x1c))?;
-            map_io(self.io.write32(0x20, 0xc000_0000 | (1 << stream_index)))?;
-            self.command_long(codec, 0x02, 0x3, 0xb000 | u16::from(gain))?;
-            self.command_long(codec, pin, 0x3, 0xb000)?;
-            // Drain command-response MSI counts before RUN. Any later eventfd
-            // count therefore comes from the stream IOC entry, not a codec verb.
+            map_io(self.io.write32(state.stream + 0x18, bdl_iova as u32))?;
+            map_io(
+                self.io
+                    .write32(state.stream + 0x1c, (bdl_iova >> 32) as u32),
+            )?;
+            map_io(self.io.write32(state.stream + 0x08, pcm.len() as u32))?;
+            map_io(self.io.write16(state.stream + 0x0c, 0))?;
+            map_io(self.io.write8(state.stream + 0x03, 0x1c))?;
+            map_io(
+                self.io
+                    .write32(0x20, 0xc000_0000 | (1 << state.stream_index)),
+            )?;
+            self.command_long(state.codec, ALC256_DAC, 0x2, 0x0011)?;
+            self.command(state.codec, ALC256_DAC, 0x0706, 0x10)?;
+            self.command_long(
+                state.codec,
+                ALC256_DAC,
+                0x3,
+                0xb000 | u16::from(state.gain_step),
+            )?;
+            self.command_long(state.codec, pin, 0x3, 0xb000)?;
+
             while map_io(self.io.take_irq_count())? != 0 {}
-            let start_position = map_io(self.io.read32(stream + 0x04))?;
-            map_io(self.io.write32(stream, ctl | 0x1e))?;
+            let start_position = map_io(self.io.read32(state.stream + 0x04))?;
+            map_io(self.io.write32(state.stream, ctl | 0x1e))?;
             self.io.fence();
 
             let deadline = Instant::now() + Duration::from_millis(250);
@@ -335,12 +512,12 @@ impl<T: Transport> Controller<T> {
             let mut stream_fault = false;
             while Instant::now() < deadline {
                 irq_count += map_io(self.io.take_irq_count())?;
-                let position = map_io(self.io.read32(stream + 0x04))?;
+                let position = map_io(self.io.read32(state.stream + 0x04))?;
                 if position != start_position {
                     end_position = position;
                     position_changed = true;
                 }
-                if map_io(self.io.read8(stream + 0x03))? & 0x18 != 0 {
+                if map_io(self.io.read8(state.stream + 0x03))? & 0x18 != 0 {
                     stream_fault = true;
                     break;
                 }
@@ -357,72 +534,63 @@ impl<T: Transport> Controller<T> {
             }
             Ok(PlaybackReport {
                 route,
-                stream_index,
+                stream_index: state.stream_index,
                 start_position,
                 end_position,
                 irq_count,
-                amp_gain_step: gain,
+                amp_gain_step: state.gain_step,
             })
         })();
 
-        // Once route setup begins, quiesce it on every exit. In particular,
-        // eventfd/MMIO errors after unmute must not leave EAPD or DMA active.
-        let cleanup = self.quiesce_playback(codec, pin, stream, ctl);
+        let idle = self.idle_playback();
         match playback {
-            Err(error) => Err(error),
-            Ok(report) => cleanup.map(|()| report),
+            Err(error) => {
+                let _ = self.reset_playback_stream();
+                Err(error)
+            }
+            Ok(report) => idle.map(|()| report),
         }
     }
-    fn quiesce_playback(
-        &mut self,
-        codec: u8,
-        pin: u8,
-        stream: usize,
-        ctl: u32,
-    ) -> Result<(), Error<T::Error>> {
-        let mut result = Ok(());
-        retain_first_error(
-            &mut result,
-            self.command_long(codec, 0x02, 0x3, 0xb080).map(|_| ()),
-        );
-        retain_first_error(
-            &mut result,
-            self.command_long(codec, pin, 0x3, 0xb080).map(|_| ()),
-        );
-        match map_io(self.io.write32(stream, ctl)) {
-            Ok(()) => retain_first_error(
+
+    /// Fully disconnects and powers down the codec route. VFIO ownership is
+    /// released later by the host backend; normal client idle does not call
+    /// this service-stop path.
+    pub fn shutdown_alc256(&mut self) -> Result<(), Error<T::Error>> {
+        let Some(state) = self.playback else {
+            return Ok(());
+        };
+        let mut result = self.idle_playback();
+        if let Some(route) = state.route {
+            let pin = Self::route_pin(route);
+            retain_first_error(
                 &mut result,
-                self.poll("stop playback stream", |io| Ok(io.read32(stream)? & 2 == 0)),
-            ),
-            Err(error) => retain_first_error(&mut result, Err(error)),
-        }
-        match map_io(self.io.write32(stream, ctl | 1)) {
-            Ok(()) => retain_first_error(
+                self.command(state.codec, ALC256_DAC, 0x0706, 0).map(|_| ()),
+            );
+            retain_first_error(
                 &mut result,
-                self.poll("assert playback stream reset", |io| {
-                    Ok(io.read32(stream)? & 1 != 0)
-                }),
-            ),
-            Err(error) => retain_first_error(&mut result, Err(error)),
-        }
-        match map_io(self.io.write32(stream, 0)) {
-            Ok(()) => retain_first_error(
+                self.command(state.codec, pin, 0x0707, 0).map(|_| ()),
+            );
+            retain_first_error(
                 &mut result,
-                self.poll("deassert playback stream reset", |io| {
-                    Ok(io.read32(stream)? & 1 == 0)
-                }),
-            ),
-            Err(error) => retain_first_error(&mut result, Err(error)),
+                self.command(state.codec, pin, 0x070c, 0).map(|_| ()),
+            );
+            retain_first_error(
+                &mut result,
+                self.command(state.codec, pin, 0x0705, 3).map(|_| ()),
+            );
         }
-        retain_first_error(
-            &mut result,
-            self.command(codec, 0x02, 0x0706, 0).map(|_| ()),
-        );
-        retain_first_error(&mut result, self.command(codec, pin, 0x0707, 0).map(|_| ()));
-        retain_first_error(&mut result, self.command(codec, pin, 0x070c, 0).map(|_| ()));
+        for node in [ALC256_DAC, ALC256_AFG] {
+            retain_first_error(
+                &mut result,
+                self.command(state.codec, node, 0x0705, 3).map(|_| ()),
+            );
+        }
+        self.playback = None;
         result
     }
+
     pub fn shutdown(&mut self) {
+        let _ = self.shutdown_alc256();
         let _ = self.io.write32(0x20, 0);
         let _ = self.io.write8(0x4c, 0);
         let _ = self.io.write8(0x5c, 0);
@@ -439,7 +607,7 @@ impl<T: Transport> Drop for Controller<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     struct Fake {
         regs: RefCell<Vec<u8>>,
@@ -447,6 +615,7 @@ mod tests {
         commands: RefCell<Vec<u32>>,
         irq: u64,
         fail_irq: bool,
+        headphone_plugged: Cell<bool>,
     }
     impl Fake {
         fn new() -> Self {
@@ -464,11 +633,19 @@ mod tests {
                 commands: RefCell::new(Vec::new()),
                 irq: 0,
                 fail_irq: false,
+                headphone_plugged: Cell::new(false),
             }
         }
-        fn response(command: u32) -> u32 {
+        fn response(&self, command: u32) -> u32 {
             let node = ((command >> 20) & 0xff) as u8;
             let parameter = command as u8;
+            if node == ALC256_HEADPHONE_PIN && command & 0x000f_ff00 == 0x000f_0900 {
+                return if self.headphone_plugged.get() {
+                    1 << 31
+                } else {
+                    0
+                };
+            }
             match (node, parameter) {
                 (0, 0x00) => EXPECTED_CODEC_VENDOR,
                 (0, 0x02) => 0x0010_0101,
@@ -505,7 +682,7 @@ mod tests {
             if o == 0x48 {
                 let command = self.dma_read32(v as usize * 4);
                 self.commands.borrow_mut().push(command);
-                let response = Self::response(command);
+                let response = self.response(command);
                 let next = ((self.read16(0x58)? & 0xff) + 1) & 0xff;
                 self.dma.borrow_mut()
                     [RIRB_OFFSET + next as usize * 8..RIRB_OFFSET + next as usize * 8 + 4]
@@ -517,7 +694,8 @@ mod tests {
         fn write32(&mut self, o: usize, v: u32) -> Result<(), ()> {
             self.regs.borrow_mut()[o..o + 4].copy_from_slice(&v.to_le_bytes());
             if o == 0xa0 && v & 2 != 0 {
-                self.regs.borrow_mut()[o + 4..o + 8].copy_from_slice(&128_u32.to_le_bytes());
+                let position = self.read32(o + 4)?.wrapping_add(128);
+                self.regs.borrow_mut()[o + 4..o + 8].copy_from_slice(&position.to_le_bytes());
                 self.regs.borrow_mut()[o + 3] = 4;
                 self.irq += 1;
             }
@@ -544,25 +722,26 @@ mod tests {
     }
 
     #[test]
-    fn reset_rings_and_enumerate_expected_alc256() {
+    fn initializes_controller_rings_and_expected_alc256_once() {
         let mut controller = Controller::new(Fake::new());
-        assert_eq!(controller.reset().unwrap(), 1);
-        controller.start_command_rings().unwrap();
-        let inventory = controller.enumerate_codec(0).unwrap();
+        let inventory = controller.initialize_alc256(0).unwrap();
         assert_eq!(inventory.vendor_device, EXPECTED_CODEC_VENDOR);
         assert_eq!(inventory.function_groups, vec![1]);
         assert_eq!(
             inventory.widgets.iter().map(|w| w.node).collect::<Vec<_>>(),
             vec![2, 3]
         );
+        assert!(matches!(
+            controller.initialize_alc256(0),
+            Err(Error::Unsupported("ALC256 is already initialized"))
+        ));
     }
 
     #[test]
     fn bounded_speaker_playback_observes_position_and_irq_then_stops() {
         let mut controller = Controller::new(Fake::new());
-        controller.reset().unwrap();
-        controller.start_command_rings().unwrap();
-        let report = controller.play_pcm_period(0, &[0; PCM_BYTES]).unwrap();
+        controller.initialize_alc256(0).unwrap();
+        let report = controller.play_pcm_period(&[0; PCM_BYTES]).unwrap();
         assert_eq!(report.route, OutputRoute::Speaker);
         assert_eq!(report.stream_index, 1);
         assert!(report.end_position > report.start_position);
@@ -570,26 +749,87 @@ mod tests {
     }
 
     #[test]
-    fn playback_io_error_still_mutes_disconnects_and_resets_stream() {
+    fn playback_io_error_still_mutes_and_resets_stream() {
         let mut fake = Fake::new();
         fake.fail_irq = true;
         let mut controller = Controller::new(fake);
-        controller.reset().unwrap();
-        controller.start_command_rings().unwrap();
+        controller.initialize_alc256(0).unwrap();
 
         assert!(matches!(
-            controller.play_pcm_period(0, &[0; PCM_BYTES]),
+            controller.play_pcm_period(&[0; PCM_BYTES]),
             Err(Error::Io(()))
         ));
         assert_eq!(controller.io.read32(0xa0).unwrap(), 0);
         let commands = controller.io.commands.borrow();
         assert_eq!(
-            &commands[commands.len() - 3..],
+            &commands[commands.len() - 2..],
             &[
-                (0x02 << 20) | 0x070600, // disconnect converter
-                (0x14 << 20) | 0x070700, // disable speaker pin output
-                (0x14 << 20) | 0x070c00, // disable speaker EAPD
+                (ALC256_DAC as u32) << 20 | 0x03b080,
+                (ALC256_SPEAKER_PIN as u32) << 20 | 0x03b080,
             ]
         );
+    }
+
+    #[test]
+    fn periods_share_initialized_route_and_leave_device_muted_idle() {
+        let mut controller = Controller::new(Fake::new());
+        controller.initialize_alc256(0).unwrap();
+
+        controller.play_pcm_period(&[0; PCM_BYTES]).unwrap();
+        controller.play_pcm_period(&[0; PCM_BYTES]).unwrap();
+
+        assert_eq!(controller.output_route(), Some(OutputRoute::Speaker));
+        assert_eq!(controller.io.read32(0xa0).unwrap() & 2, 0);
+        assert_eq!(controller.io.read8(0x4c).unwrap(), 0x02);
+        assert_eq!(controller.io.read8(0x5c).unwrap(), 0x03);
+        let commands = controller.io.commands.borrow();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|word| { **word == ((ALC256_SPEAKER_PIN as u32) << 20) | 0x070c02 })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn plug_change_mutes_old_route_and_switches_to_headphones() {
+        let mut controller = Controller::new(Fake::new());
+        controller.initialize_alc256(0).unwrap();
+        controller.play_pcm_period(&[0; PCM_BYTES]).unwrap();
+        controller.io.headphone_plugged.set(true);
+
+        let report = controller.play_pcm_period(&[0; PCM_BYTES]).unwrap();
+
+        assert_eq!(report.route, OutputRoute::Headphone);
+        assert_eq!(controller.output_route(), Some(OutputRoute::Headphone));
+        let commands = controller.io.commands.borrow();
+        assert!(commands.contains(&(((ALC256_SPEAKER_PIN as u32) << 20) | 0x070c00)));
+        assert!(commands.contains(&(((ALC256_HEADPHONE_PIN as u32) << 20) | 0x070c02)));
+    }
+
+    #[test]
+    fn gain_is_bounded_and_service_shutdown_disconnects_codec() {
+        let mut controller = Controller::new(Fake::new());
+        controller.initialize_alc256(0).unwrap();
+        assert!(matches!(
+            controller.set_gain_step(128),
+            Err(Error::Unsupported("gain step exceeds ALC256 capability"))
+        ));
+        controller.set_gain_step(10).unwrap();
+        assert_eq!(
+            controller
+                .play_pcm_period(&[0; PCM_BYTES])
+                .unwrap()
+                .amp_gain_step,
+            10
+        );
+
+        controller.shutdown_alc256().unwrap();
+
+        assert_eq!(controller.output_route(), None);
+        let commands = controller.io.commands.borrow();
+        assert!(commands.contains(&(((ALC256_SPEAKER_PIN as u32) << 20) | 0x070c00)));
+        assert!(commands.contains(&(((ALC256_AFG as u32) << 20) | 0x070503)));
     }
 }
