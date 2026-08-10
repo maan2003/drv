@@ -1978,3 +1978,22 @@ end or supervisor restore could be recorded.
 After reboot, native `mt7921e` rebound, iwd was active, `wlan0` had carrier,
 all recovery and watchdog units were inactive, and `/run/wifi-driver-lab` was
 absent. No further physical mutation was attempted.
+
+The existing marked `VFIO_DEVICE_GET_INFO` transaction was then moved into the
+same shared active path, with contained passive reusing its result. One guarded
+run of that correction was launched as `wifi-sae-exchange8` from commit
+`efc2880fe59c`; the release binary SHA-256 was
+`2899307651653dffcfee56b22a339ff2f64421b4e062e5299a35e582be93583e`.
+Report `/var/lib/wifi-driver-lab/reports/20260810T162609Z-0000_05_00.0.log`
+ended at `vfio_device_get_info_after argsz=24 flags=0x3 num_regions=9
+num_irqs=5`. Device-info discovery therefore completed successfully, but
+there is no evidence for the following region/BAR query or mappings, firmware
+startup, beacon RX, SAE TX, or SAE RX. The offline UNI/key transport was not
+exercised.
+
+The kernel later reported a 60-second page-pool shutdown stall for pool 19
+with two inflight buffers, and the watchdog rebooted before userspace end or
+supervisor restore could be recorded. After reboot, native `mt7921e` rebound,
+iwd was active, `wlan0` had carrier, all recovery and watchdog units were
+inactive, and `/run/wifi-driver-lab` was absent. No further physical mutation
+was attempted.
