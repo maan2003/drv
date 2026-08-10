@@ -2035,3 +2035,23 @@ rebooted before userspace end or supervisor restore could be recorded. After
 reboot, native `mt7921e` rebound, iwd was active, `wlan0` had carrier, all
 recovery and watchdog units were inactive, and `/run/wifi-driver-lab` was
 absent. No further physical mutation was attempted.
+
+Credential ingestion was subsequently bounded by an explicit validated byte
+length and `read_exact`, eliminating any dependency on pipe EOF. A separate
+transient companion also synchronized the newest report once per second,
+outside the payload control group. One guarded run was launched as
+`wifi-sae-exchange11` from commit `6d5348ffd6fa`; the release binary SHA-256
+was `9bd501540921cefb4e9e4e7fa124378d7aca8b01dde42e6ac467ac6e12a36833`.
+Even with the independent durability companion, report
+`/var/lib/wifi-driver-lab/reports/20260810T172942Z-0000_05_00.0.log` ends at
+the harness `USERSPACE begin` record and contains no first payload stage.
+
+The kernel recorded two completed `vfio-pci` resets and then a 60-second
+page-pool shutdown stall for pool 19 with two inflight buffers. The stop is
+therefore before observable payload entry, in the harness/native-driver
+handoff, rather than in credential parsing. There is no evidence for BAR
+mapping, firmware startup, beacon RX, or SAE TX/RX, and association, key, and
+data effects remained disabled. The watchdog rebooted; native `mt7921e`, iwd,
+and `wlan0` carrier recovered on the next boot, with no active recovery or
+report-sync units and no `/run/wifi-driver-lab` state. No further physical
+mutation was attempted.
