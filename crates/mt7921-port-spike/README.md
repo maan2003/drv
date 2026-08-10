@@ -1262,3 +1262,29 @@ disarmed at `16:29:13.002728`. Boot ID
 release-workspace tests and the locked release build passed with existing
 upstream warnings; the standalone default-feature and rustfmt limitations
 remain unchanged.
+
+The isolated interrupt-latch mutation completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T110510Z-0000_05_00.0.log` using
+release binary SHA-256
+`d3b3a68fde35f7cdcc1b0bcc5e1c68d38cc255c07f0982b39e16abd660bcf32a`.
+Under temporary Command `0x0402`, the gate mapped only BAR0 page `0x10000`
+read-write, saved the complete runtime latch `0x000000ff`, wrote exactly one
+full-word zero, and obtained the single full-zero readback. It then wrote back
+the exact saved `0x000000ff`, read full equality, durably marked and explicitly
+unmapped the page, restored and verified exact Command `0x0002`, unmapped the
+two identity pages, and released safely. No `SET_IRQS`, reset, DMA mapping,
+firmware, WFDMA, or radio operation occurred.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T110510Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:35:12.646038 IST`; sample zero saw mt7921e in D0 and iwd active. This
+run's network recovery was unusually slow but remained inside the independent
+watchdog: association appeared on `wlan9` at `16:36:53.036274`, and IPv4
+`192.168.235.6/24`, the default route, and gateway connectivity followed at
+`16:36:55.086799`, 102.44 seconds after restore. The watchdog disarmed at
+`16:36:55.148763`; boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained
+unchanged. Final health was mt7921e in D0, iwd active, `wlan9` associated and
+routed, and the gateway reachable. All 69 locked release-workspace tests and
+the locked release build passed with existing upstream warnings; the
+standalone default-feature and rustfmt limitations remain unchanged.
