@@ -1548,5 +1548,24 @@ The primary error and every cleanup error remain separately visible. Durable
 events cover only IRQ installation, the existing reset milestones, host mask,
 MAC enable, setup completion, and each cleanup boundary. Focused fixtures prove
 the successful source-derived order and that all cleanup steps still run after
-an ambiguous install failure. This boundary is not connected to the physical
-early-return path yet.
+an ambiguous install failure. The temporary early-return path now contains
+only the minimal concrete adapter for this boundary.
+
+The one guarded physical attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T130511Z-0000_05_00.0.log`. It
+prevalidated the 32-vector eventfd-capable MSI index, completed WFSYS
+assert/release/readiness in 59 ms, left the host interrupt mask at zero, opened
+the PCIe MAC gate, and installed the VFIO MSI eventfd before any BME, DMA,
+firmware, WFDMA-enable, or radio work. Immediate cleanup masked host and MAC,
+disabled the owned IRQ, completed VFIO reset, and passed the existing
+post-reset host/MAC/DMA-disabled plus PCI BME-disabled verification. Supervisor
+restore ended with `failed=0`.
+
+Userspace returned failure only because the first adapter version redundantly
+sent an explicit index-disable after its successfully owned IRQ had already
+been disabled; VFIO correctly returned `EINVAL`, retained as cleanup entry
+`DisableIrq`. The explicit index path is now used only when installation did
+not return an owner, or as a best-effort fallback after owned-disable failure.
+No second physical attempt was made. The completed safe-state verification is
+authoritative for containment; the redundant cleanup error did not leave an
+IRQ or device source active.

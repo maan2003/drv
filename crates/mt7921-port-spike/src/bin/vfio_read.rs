@@ -8134,23 +8134,29 @@ impl IrqResetTransport for VfioIrqResetBoundary<'_> {
         self.pcie_mac.write_pcie_mac_interrupt_enable_zero()
     }
     fn disable_irq(&mut self) -> Result<(), Self::Error> {
-        let owner = match self.irq.as_mut() {
-            Some(irq) => irq.disable(),
-            None => Ok(()),
+        let Some(irq) = self.irq.as_mut() else {
+            return disable_vfio_irq_index(self.device, self.selected);
         };
-        let explicit = disable_vfio_irq_index(self.device, self.selected);
-        match (owner, explicit) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(owner), Err(explicit)) => Err(format!(
-                "disable IRQ owner: {owner}; explicit index disable: {explicit}"
-            )),
+        match irq.disable() {
+            Ok(()) => Ok(()),
+            Err(owner) => match disable_vfio_irq_index(self.device, self.selected) {
+                Ok(()) => Err(format!("disable IRQ owner: {owner}")),
+                Err(explicit) => Err(format!(
+                    "disable IRQ owner: {owner}; explicit index disable: {explicit}"
+                )),
+            },
         }
     }
     fn containment_reset(&mut self) -> Result<(), Self::Error> {
         reset_vfio_device(self.device)
     }
     fn verify_contained(&mut self) -> Result<(), Self::Error> {
+        let global = self.wfdma.read(0xd4208)?;
+        let host_irq = self.wfdma.read(0xd4204)?;
+        let mac_irq = self.pcie_mac.read(0x10188)?;
+        record_sae_stage(&format!(
+            "vfio_irq_reset_safe_state global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x} bme=false"
+        ));
         verify_active_reset_containment(self.wfdma, self.pcie_mac)?;
         verify_pci_dma_disabled(self.bdf)?;
         for hazard in [
