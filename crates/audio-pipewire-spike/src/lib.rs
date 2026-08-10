@@ -20,6 +20,7 @@ use pipewire_native_spa::{
     },
 };
 
+mod device_registry;
 pub mod protocol;
 
 /// The project-owned PCM contract at the compatibility/backend boundary.
@@ -35,11 +36,7 @@ pub enum SampleFormat {
     Signed16Le,
 }
 
-pub const VIRTUAL_SINK_FORMAT: PcmFormat = PcmFormat {
-    sample_format: SampleFormat::Signed16Le,
-    rate: 48_000,
-    channels: 2,
-};
+pub const VIRTUAL_SINK_FORMAT: PcmFormat = device_registry::PLAYBACK_FORMAT;
 
 /// Fixed non-unity gain used to prove pinned Fuchsia processing is in-path.
 pub const VIRTUAL_SINK_GAIN_DB: f32 = -6.020_600_3;
@@ -169,6 +166,12 @@ impl TryFrom<u32> for SpaAudioChannel {
 /// The returned bytes are directly suitable for a PipeWire native-protocol
 /// node/port parameter event; no project-specific envelope is introduced.
 pub fn enum_format_pod(storage: &mut [u8]) -> Result<&[u8], Error> {
+    enum_format_pod_for(VIRTUAL_SINK_FORMAT, storage)
+}
+
+fn enum_format_pod_for(format: PcmFormat, storage: &mut [u8]) -> Result<&[u8], Error> {
+    debug_assert_eq!(format.sample_format, SampleFormat::Signed16Le);
+    debug_assert_eq!(format.channels, 2);
     Builder::new(storage)
         .push_object(ObjectType::Format, ParamType::EnumFormat, |object| {
             object
@@ -187,8 +190,16 @@ pub fn enum_format_pod(storage: &mut [u8]) -> Result<&[u8], Error> {
                     PropertyFlags::empty(),
                     Id(SpaAudioFormat::S16Le),
                 )
-                .push_property(Format::AudioRate, PropertyFlags::empty(), 48_000_i32)
-                .push_property(Format::AudioChannels, PropertyFlags::empty(), 2_i32)
+                .push_property(
+                    Format::AudioRate,
+                    PropertyFlags::empty(),
+                    format.rate as i32,
+                )
+                .push_property(
+                    Format::AudioChannels,
+                    PropertyFlags::empty(),
+                    format.channels as i32,
+                )
                 .push_property(
                     Format::AudioPosition,
                     PropertyFlags::empty(),

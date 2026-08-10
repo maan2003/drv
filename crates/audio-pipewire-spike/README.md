@@ -1,7 +1,10 @@
 # PipeWire audio spike
 
-This slice supplies a hardware-free, deterministic S16LE/48 kHz/stereo
-playback endpoint and encodes its standard `SPA_PARAM_EnumFormat` object. Its
+This slice registers a hardware-free virtual playback device behind a narrow
+host adaptation of Fuchsia's Audio Device Registry and ring-buffer contracts.
+The registered device owns its identity, S16LE/48 kHz/stereo format and
+ring-buffer endpoint; the PipeWire frontend derives its Node/Port globals,
+properties and `SPA_PARAM_EnumFormat` object from that record. The endpoint's
 consumed-byte to frame-position mapping directly executes the unchanged pinned
 Fuchsia audio `TimelineFunction`/`TimelineRate` implementation packaged in
 `../fuchsia-audio-timeline`; it is not a retyped local equivalent. Run it with:
@@ -11,9 +14,13 @@ cargo run -p drv-audio-pipewire-spike
 cargo test -p drv-audio-pipewire-spike
 ```
 
-The SPA POD bytes use PipeWire's native ABI and can be placed directly in a
-future node/port parameter event. The protocol frontend does not leak into the
-playback state. This milestone neither accesses ALSA nor physical hardware.
+The pristine Fuchsia ADR/device/ring-buffer sources, hashes, host adaptation,
+and exact ownership mapping are recorded in [PROVENANCE.md](PROVENANCE.md) and
+[SOURCE-MAP.md](SOURCE-MAP.md). The Fuchsia implementation cannot be compiled
+on this host without Zircon and generated FIDL bindings, so it is preserved
+unchanged while the private Rust adapter implements only this bounded contract.
+The protocol frontend does not leak into playback state. This milestone neither
+accesses ALSA nor physical hardware.
 
 Every negotiated S16 sample also runs through the unchanged Fuchsia processing
 library's `DbToScale` and `ApplyGain<GainType::kNonUnity>` at a fixed
@@ -29,7 +36,7 @@ planar processing component and sampler `MixSample` accumulation primitive
 before entering the gain and timeline endpoint.
 For two 480-frame streams containing `{10000, 2000}` and `{4000, 6000}`, both
 stock clients and the server exit successfully and the mixed post-gain checksum
-is 5,280,000 at frame position 480.
+is 5,280,000 at the registered ring-buffer frame position 480.
 
 ## Rust PipeWire libraries
 
@@ -79,3 +86,9 @@ endpoint. A 1,920-byte stock `pw-cat` playback exits successfully with a
 reported position of 480 frames and a checksum of the post-gain samples.
 Production graph policy, realtime pacing, multi-node clock/quantum coordination,
 and long-running playback remain outside this spike.
+
+Stock `pw-cli ls Node` reports registry-projected `object.serial = "2"`,
+`device.api = "fuchsia.audio.device"`, `node.name =
+"drv.adr-virtual-sink"`, and the registered S16LE/48000/stereo properties. Two
+stock `pw-cat` clients writing the example streams above advance the same
+registered ring-buffer endpoint to frame 480 and produce checksum 5,280,000.

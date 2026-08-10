@@ -35,7 +35,10 @@ use pipewire_native_spa::{
 
 use drv_fuchsia_audio_processing::mix_stereo_s16;
 
-use crate::{PlaybackEndpoint, VirtualPcmEndpoint, enum_format_pod};
+use crate::{
+    device_registry::{DeviceRegistry, RegisteredDevice},
+    enum_format_pod_for,
+};
 
 const HEADER_LEN: usize = 16;
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -67,28 +70,7 @@ const BUFFER_STRIDE: i32 = 12 * 1024;
 const BUFFER_DATA_OFFSET: i32 = 64;
 const BUFFER_DATA_SIZE: i32 = 8 * 1024;
 
-const VIRTUAL_SINK_NODE_ID: i32 = 2;
-const VIRTUAL_SINK_PORT_ID: i32 = 3;
 const CLIENT_NODE_GLOBAL_ID: i32 = 4;
-
-const NODE_PROPERTIES: &[(&str, &str)] = &[
-    ("object.serial", "2"),
-    ("node.name", "drv.virtual-sink"),
-    ("node.description", "drv Virtual Sink"),
-    ("media.class", "Audio/Sink"),
-    ("audio.format", "S16LE"),
-    ("audio.rate", "48000"),
-    ("audio.channels", "2"),
-];
-
-const PORT_PROPERTIES: &[(&str, &str)] = &[
-    ("object.serial", "3"),
-    ("node.id", "2"),
-    ("port.id", "0"),
-    ("port.name", "playback"),
-    ("port.direction", "in"),
-    ("port.alias", "drv.virtual-sink:playback"),
-];
 
 #[derive(Debug)]
 struct Header {
@@ -140,17 +122,19 @@ pub struct PlaybackResult {
 
 /// Serve one native client and return its Fuchsia-derived playback frame position.
 pub fn serve_one(listener: &UnixListener) -> io::Result<PlaybackResult> {
+    let mut registry = DeviceRegistry::register_virtual_playback();
     let (mut stream, _) = listener.accept()?;
-    let pcm = serve_connection(&mut stream)?;
-    process_pcm(&pcm)
+    let pcm = serve_connection(&mut stream, registry.playback())?;
+    process_pcm(&mut registry, &pcm)
 }
 
 /// Serve two bounded stock streams and mix them into one endpoint result.
 pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
+    let mut registry = DeviceRegistry::register_virtual_playback();
     let (mut first_stream, _) = listener.accept()?;
-    let first = serve_connection(&mut first_stream)?;
+    let first = serve_connection(&mut first_stream, registry.playback())?;
     let (mut second_stream, _) = listener.accept()?;
-    let second = serve_connection(&mut second_stream)?;
+    let second = serve_connection(&mut second_stream, registry.playback())?;
     if first.len() != second.len() || !first.len().is_multiple_of(4) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -165,10 +149,10 @@ pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
         .into_iter()
         .flat_map(i16::to_le_bytes)
         .collect::<Vec<_>>();
-    process_pcm(&mixed)
+    process_pcm(&mut registry, &mixed)
 }
 
-fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+fn serve_connection(stream: &mut UnixStream, device: &RegisteredDevice) -> io::Result<Vec<u8>> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
@@ -194,14 +178,14 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
         };
 
         if Some(header.id) == registry_id && header.opcode == REGISTRY_BIND {
-            let object = decode_bind(&payload)?;
+            let object = decode_bind(&payload, device)?;
             if proxy_id_in_use(object.proxy_id, registry_id, &bound_objects, &client_nodes) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "duplicate PipeWire proxy id",
                 ));
             }
-            write_object_info(stream, object, &mut out_seq)?;
+            write_object_info(stream, device, object, &mut out_seq)?;
             bound_objects.push(object);
             continue;
         }
@@ -251,6 +235,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
                     if client_nodes[client_node_index].port_updates == 0 {
                         write_client_node_port_format(
                             stream,
+                            device,
                             client_nodes[client_node_index].proxy_id,
                             &mut out_seq,
                         )?;
@@ -306,7 +291,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
             match header.opcode {
                 OBJECT_ENUM_PARAMS => {
                     let request = decode_enum_params(&payload)?;
-                    write_enum_format(stream, object.proxy_id, &mut out_seq, request)?;
+                    write_enum_format(stream, device, object.proxy_id, &mut out_seq, request)?;
                 }
                 // Clients may subscribe immediately after binding. The fixed
                 // format has already been described in Info and never changes.
@@ -328,17 +313,17 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
                     stream,
                     new_registry_id,
                     &mut out_seq,
-                    VIRTUAL_SINK_NODE_ID,
+                    device.node_id(),
                     "PipeWire:Interface:Node",
-                    NODE_PROPERTIES,
+                    &node_properties(device),
                 )?;
                 write_global(
                     stream,
                     new_registry_id,
                     &mut out_seq,
-                    VIRTUAL_SINK_PORT_ID,
+                    device.port_id(),
                     "PipeWire:Interface:Port",
-                    PORT_PROPERTIES,
+                    &port_properties(device),
                 )?;
                 registry_id = Some(new_registry_id);
             }
@@ -358,6 +343,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
                 write_bound_props(stream, client_node.proxy_id, &mut out_seq)?;
                 client_node.transport = Some(write_client_transport(
                     stream,
+                    device,
                     client_node.proxy_id,
                     &mut out_seq,
                 )?);
@@ -392,14 +378,14 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     }
 }
 
-fn process_pcm(pcm: &[u8]) -> io::Result<PlaybackResult> {
-    let mut endpoint = VirtualPcmEndpoint::default();
-    endpoint
-        .write(pcm)
+fn process_pcm(registry: &mut DeviceRegistry, pcm: &[u8]) -> io::Result<PlaybackResult> {
+    let device = registry.playback_mut();
+    device
+        .write_ring_buffer(pcm)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
     Ok(PlaybackResult {
-        frame_position: endpoint.frame_position(),
-        processed_sample_checksum: endpoint.processed_sample_checksum(),
+        frame_position: device.frame_position(),
+        processed_sample_checksum: device.processed_sample_checksum(),
     })
 }
 
@@ -671,7 +657,7 @@ fn decode_get_node(payload: &[u8]) -> io::Result<u32> {
         .map_err(invalid_pod)
 }
 
-fn decode_bind(payload: &[u8]) -> io::Result<BoundObject> {
+fn decode_bind(payload: &[u8], device: &RegisteredDevice) -> io::Result<BoundObject> {
     let mut parser = Parser::new(payload);
     parser
         .pop_struct(|fields| {
@@ -680,8 +666,8 @@ fn decode_bind(payload: &[u8]) -> io::Result<BoundObject> {
             let version = fields.pop_int()?;
             let proxy_id = fields.pop_int()?;
             let kind = match (global_id, interface.as_str()) {
-                (VIRTUAL_SINK_NODE_ID, "PipeWire:Interface:Node") => BoundKind::Node,
-                (VIRTUAL_SINK_PORT_ID, "PipeWire:Interface:Port") => BoundKind::Port,
+                (id, "PipeWire:Interface:Node") if id == device.node_id() => BoundKind::Node,
+                (id, "PipeWire:Interface:Port") if id == device.port_id() => BoundKind::Port,
                 _ => {
                     return Err(pipewire_native_spa::pod::Error::Invalid(
                         "bind does not match an advertised global".into(),
@@ -837,7 +823,7 @@ fn write_global(
     out_seq: &mut u32,
     global_id: i32,
     interface: &str,
-    properties: &[(&str, &str)],
+    properties: &[(String, String)],
 ) -> io::Result<()> {
     let body = encode_struct(|builder| {
         builder
@@ -860,6 +846,7 @@ fn write_global(
 
 fn write_object_info(
     stream: &mut UnixStream,
+    device: &RegisteredDevice,
     object: BoundObject,
     out_seq: &mut u32,
 ) -> io::Result<()> {
@@ -867,7 +854,7 @@ fn write_object_info(
         BoundKind::Node => encode_struct(|builder| {
             push_param_info(push_properties(
                 builder
-                    .push_int(VIRTUAL_SINK_NODE_ID)
+                    .push_int(device.node_id())
                     .push_int(1)
                     .push_int(0)
                     .push_long(0x1d)
@@ -875,16 +862,16 @@ fn write_object_info(
                     .push_int(0)
                     .push_id(Id(2_u32))
                     .push_none(),
-                NODE_PROPERTIES,
+                &node_properties(device),
             ))
         })?,
         BoundKind::Port => encode_struct(|builder| {
             push_param_info(push_properties(
                 builder
-                    .push_int(VIRTUAL_SINK_PORT_ID)
+                    .push_int(device.port_id())
                     .push_int(0)
                     .push_long(0x3),
-                PORT_PROPERTIES,
+                &port_properties(device),
             ))
         })?,
     };
@@ -895,12 +882,13 @@ fn write_object_info(
 
 fn write_enum_format(
     stream: &mut UnixStream,
+    device: &RegisteredDevice,
     proxy_id: u32,
     out_seq: &mut u32,
     request: EnumParamsRequest,
 ) -> io::Result<()> {
     let mut storage = [0; 256];
-    let format = enum_format_pod(&mut storage).map_err(invalid_pod)?;
+    let format = enum_format_pod_for(device.format(), &mut storage).map_err(invalid_pod)?;
     let format = RawPod::wrap(format).map_err(invalid_pod)?;
     let body = encode_struct(|builder| {
         builder
@@ -917,6 +905,7 @@ fn write_enum_format(
 
 fn write_client_transport(
     stream: &mut UnixStream,
+    device: &RegisteredDevice,
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<ClientTransport> {
@@ -931,10 +920,10 @@ fn write_client_transport(
     activation.write_all_at(&4_u32.to_ne_bytes(), 0)?;
     activation.write_all_at(&(CLIENT_NODE_GLOBAL_ID as u32).to_ne_bytes(), 564)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 640)?;
-    activation.write_all_at(&48_000_u32.to_ne_bytes(), 644)?;
+    activation.write_all_at(&device.format().rate.to_ne_bytes(), 644)?;
     activation.write_all_at(&480_u64.to_ne_bytes(), 656)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 688)?;
-    activation.write_all_at(&48_000_u32.to_ne_bytes(), 692)?;
+    activation.write_all_at(&device.format().rate.to_ne_bytes(), 692)?;
     activation.write_all_at(&480_u64.to_ne_bytes(), 696)?;
     activation.write_all_at(&1_u32.to_ne_bytes(), 720)?;
     activation.write_all_at(&i64::MIN.to_ne_bytes(), 760)?;
@@ -1016,11 +1005,14 @@ fn write_client_node_set_param(
 
 fn write_client_node_port_format(
     stream: &mut UnixStream,
+    device: &RegisteredDevice,
     client_node_id: u32,
     out_seq: &mut u32,
 ) -> io::Result<()> {
     let mut storage = [0; 256];
-    let mut format = enum_format_pod(&mut storage).map_err(invalid_pod)?.to_vec();
+    let mut format = enum_format_pod_for(device.format(), &mut storage)
+        .map_err(invalid_pod)?
+        .to_vec();
     format[12..16].copy_from_slice(&(ParamType::Format as u32).to_ne_bytes());
     let format = RawPod::wrap(&format).map_err(invalid_pod)?;
     let body = encode_struct(|builder| {
@@ -1289,7 +1281,7 @@ fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) 
 
 fn push_properties<'a>(
     builder: StructBuilder<'a>,
-    properties: &[(&str, &str)],
+    properties: &[(String, String)],
 ) -> StructBuilder<'a> {
     builder.push_struct(|mut pair_list| {
         pair_list = pair_list.push_int(properties.len() as i32);
@@ -1298,6 +1290,32 @@ fn push_properties<'a>(
         }
         pair_list
     })
+}
+
+fn node_properties(device: &RegisteredDevice) -> Vec<(String, String)> {
+    let format = device.format();
+    vec![
+        ("object.serial".into(), device.token_id().to_string()),
+        ("device.id".into(), device.token_id().to_string()),
+        ("device.api".into(), "fuchsia.audio.device".into()),
+        ("node.name".into(), device.name().into()),
+        ("node.description".into(), device.description().into()),
+        ("media.class".into(), "Audio/Sink".into()),
+        ("audio.format".into(), device.sample_format_name().into()),
+        ("audio.rate".into(), format.rate.to_string()),
+        ("audio.channels".into(), format.channels.to_string()),
+    ]
+}
+
+fn port_properties(device: &RegisteredDevice) -> Vec<(String, String)> {
+    vec![
+        ("object.serial".into(), device.port_id().to_string()),
+        ("node.id".into(), device.node_id().to_string()),
+        ("port.id".into(), "0".into()),
+        ("port.name".into(), "playback".into()),
+        ("port.direction".into(), "in".into()),
+        ("port.alias".into(), format!("{}:playback", device.name())),
+    ]
 }
 
 fn push_param_info(builder: StructBuilder<'_>) -> StructBuilder<'_> {
@@ -1522,7 +1540,10 @@ mod tests {
     #[test]
     fn get_registry_advertises_virtual_sink_node_and_input_port() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || serve_connection(&mut server).unwrap());
+        let worker = thread::spawn(move || {
+            let registry = DeviceRegistry::register_virtual_playback();
+            serve_connection(&mut server, registry.playback()).unwrap()
+        });
 
         client
             .write_all(&request(CORE_ID, 1, |b| b.push_int(3)))
@@ -1544,15 +1565,24 @@ mod tests {
         assert_eq!((port_header.id, port_header.opcode), (7, REGISTRY_GLOBAL));
 
         let node = decode_global(&node_payload);
-        assert_eq!(node.0, VIRTUAL_SINK_NODE_ID);
+        assert_eq!(node.0, 2);
         assert_eq!(node.1, "PipeWire:Interface:Node");
         assert!(
             node.2
                 .contains(&("media.class".into(), "Audio/Sink".into()))
         );
+        assert!(
+            node.2
+                .contains(&("device.api".into(), "fuchsia.audio.device".into()))
+        );
+        assert!(
+            node.2
+                .contains(&("node.name".into(), "drv.adr-virtual-sink".into()))
+        );
+        assert!(node.2.contains(&("audio.rate".into(), "48000".into())));
 
         let port = decode_global(&port_payload);
-        assert_eq!(port.0, VIRTUAL_SINK_PORT_ID);
+        assert_eq!(port.0, 3);
         assert_eq!(port.1, "PipeWire:Interface:Port");
         assert!(port.2.contains(&("port.direction".into(), "in".into())));
         assert!(port.2.contains(&("node.id".into(), "2".into())));
@@ -1570,7 +1600,10 @@ mod tests {
     #[test]
     fn bind_emits_info_and_enum_format_for_node_and_port() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || serve_connection(&mut server).unwrap());
+        let worker = thread::spawn(move || {
+            let registry = DeviceRegistry::register_virtual_playback();
+            serve_connection(&mut server, registry.playback()).unwrap()
+        });
 
         client
             .write_all(&request(CORE_ID, 1, |b| b.push_int(3)))
@@ -1594,7 +1627,7 @@ mod tests {
 
         client
             .write_all(&request(7, REGISTRY_BIND, |b| {
-                b.push_int(VIRTUAL_SINK_NODE_ID)
+                b.push_int(2)
                     .push_string("PipeWire:Interface:Node")
                     .push_int(3)
                     .push_int(8)
@@ -1605,16 +1638,13 @@ mod tests {
         let mut node_parser = Parser::new(&node_info);
         node_parser
             .pop_struct(|fields| {
-                assert_eq!(fields.pop_int()?, VIRTUAL_SINK_NODE_ID);
+                assert_eq!(fields.pop_int()?, 2);
                 assert_eq!((fields.pop_int()?, fields.pop_int()?), (1, 0));
                 assert_eq!(fields.pop_long()?, 0x1d);
                 assert_eq!((fields.pop_int()?, fields.pop_int()?), (1, 0));
                 assert_eq!(fields.pop_id::<u32>()?.0, 2);
                 fields.pop_none()?;
-                assert_eq!(
-                    fields.pop_struct(|p| p.pop_int())?.0,
-                    NODE_PROPERTIES.len() as i32
-                );
+                assert_eq!(fields.pop_struct(|p| p.pop_int())?.0, 9);
                 let (param_count, _) = fields.pop_struct(|p| p.pop_int())?;
                 assert_eq!(param_count, 1);
                 Ok(())
@@ -1623,7 +1653,7 @@ mod tests {
 
         client
             .write_all(&request(7, REGISTRY_BIND, |b| {
-                b.push_int(VIRTUAL_SINK_PORT_ID)
+                b.push_int(3)
                     .push_string("PipeWire:Interface:Port")
                     .push_int(3)
                     .push_int(9)
@@ -1634,7 +1664,7 @@ mod tests {
         let mut port_parser = Parser::new(&port_info);
         port_parser
             .pop_struct(|fields| {
-                assert_eq!(fields.pop_int()?, VIRTUAL_SINK_PORT_ID);
+                assert_eq!(fields.pop_int()?, 3);
                 assert_eq!(fields.pop_int()?, 0);
                 assert_eq!(fields.pop_long()?, 0x3);
                 Ok(())
@@ -1660,7 +1690,9 @@ mod tests {
                 assert_eq!((fields.pop_int()?, fields.pop_int()?), (0, 1));
                 let returned = fields.pop_raw_pod()?;
                 let mut expected_storage = [0; 256];
-                let expected = enum_format_pod(&mut expected_storage)?;
+                let registry = DeviceRegistry::register_virtual_playback();
+                let expected =
+                    enum_format_pod_for(registry.playback().format(), &mut expected_storage)?;
                 assert_eq!(returned.data(), expected);
                 Ok(())
             })
@@ -1677,7 +1709,10 @@ mod tests {
     #[test]
     fn emits_client_transport_and_accepts_client_node_updates() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || serve_connection(&mut server));
+        let worker = thread::spawn(move || {
+            let registry = DeviceRegistry::register_virtual_playback();
+            serve_connection(&mut server, registry.playback())
+        });
 
         client
             .write_all(&request(CORE_ID, 1, |b| b.push_int(3)))
@@ -1745,7 +1780,11 @@ mod tests {
             .unwrap();
 
         let mut format_storage = [0; 256];
-        let format = RawPod::wrap(enum_format_pod(&mut format_storage).unwrap()).unwrap();
+        let registry = DeviceRegistry::register_virtual_playback();
+        let format = RawPod::wrap(
+            enum_format_pod_for(registry.playback().format(), &mut format_storage).unwrap(),
+        )
+        .unwrap();
         let port_update = client_port_update(8, &format, ParamType::EnumFormat);
         client.write_all(&port_update).unwrap();
         let (set_format, _) = read_message(&mut client).unwrap();
@@ -1812,6 +1851,10 @@ mod tests {
             .unwrap();
         let mut pcm = Vec::new();
         consume_client_buffer(&mut pcm, &buffers, 0).unwrap();
-        assert_eq!(process_pcm(&pcm).unwrap().frame_position, 480);
+        let mut registry = DeviceRegistry::register_virtual_playback();
+        assert_eq!(
+            process_pcm(&mut registry, &pcm).unwrap().frame_position,
+            480
+        );
     }
 }

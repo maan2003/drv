@@ -28,7 +28,7 @@ fn main() {
         };
         fs::remove_file(socket).expect("remove pipewire-0");
         println!(
-            "consumed frame position: {}, Fuchsia-processed sample checksum: {}",
+            "registered Fuchsia ADR ring-buffer frame position: {}, Fuchsia-processed sample checksum: {}",
             result.frame_position, result.processed_sample_checksum
         );
         return;
