@@ -122,3 +122,22 @@ ring writes and final position 144,480 with exact patterned checksum
 stderr was empty. Two concurrent three-second streams produced the same 301
 output quanta through incremental Fuchsia mixing, ending at position 144,480
 and exact checksum 1,584,000,000.
+
+## Standard default sink
+
+The persistent daemon advertises a standard version-3 Metadata global named
+`default`. Binding it emits `default.audio.sink` with the SPA JSON value
+`{"name":"drv.adr-virtual-sink"}`. It also advertises and implements the
+version-3 `client-node` Factory Info corresponding to the existing standard
+`Core.CreateObject("client-node")` path. Registry binds receive standard
+`Core.BoundId`, and the initial Hello receives Core Info with the fixed clock
+rate and quantum. These additions keep longer-lived WirePlumber-style object
+managers bound instead of relying on the old discovery timeout.
+
+With no `--target`, an unmodified PipeWire 1.6.6 `pw-cat` played the full
+three-second pattern through the same multi-buffer ADR path. Concurrent
+`pw-cli ls Metadata` reported object 4 as `metadata.name = "default"`, while
+stock WirePlumber 0.5.14 `wpctl inspect 2` bound the node and displayed all ADR
+sink properties. Playback again produced 301 quantum writes and ended at exact
+position 144,480 and checksum 864,000,000; client and server stderr were empty
+(apart from wpctl's expected host RTKit warnings).

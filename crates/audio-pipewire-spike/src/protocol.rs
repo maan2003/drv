@@ -73,7 +73,9 @@ const BUFFER_STRIDE: i32 = 12 * 1024;
 const BUFFER_DATA_OFFSET: i32 = 64;
 const BUFFER_DATA_SIZE: i32 = 8 * 1024;
 
-const CLIENT_NODE_GLOBAL_ID: i32 = 4;
+const DEFAULT_METADATA_ID: i32 = 4;
+const CLIENT_NODE_FACTORY_ID: i32 = 5;
+const CLIENT_NODE_GLOBAL_ID: i32 = 6;
 
 #[derive(Debug)]
 struct Header {
@@ -86,11 +88,14 @@ struct Header {
 enum BoundKind {
     Node,
     Port,
+    Metadata,
+    Factory,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct BoundObject {
     proxy_id: u32,
+    global_id: i32,
     kind: BoundKind,
 }
 
@@ -165,7 +170,7 @@ pub fn serve_daemon(listener: &UnixListener) -> io::Result<()> {
         let event_tx = event_tx.clone();
         thread::spawn(move || {
             let mut started = false;
-            let result = serve_connection_with(&mut stream, &device, &mut |pcm| {
+            let result = serve_connection_with(&mut stream, &device, true, &mut |pcm| {
                 if !started {
                     let _ = event_tx.send(StreamEvent::Started(stream_id));
                     started = true;
@@ -203,7 +208,7 @@ pub fn serve_two(listener: &UnixListener) -> io::Result<PlaybackResult> {
 
 fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> io::Result<Vec<u8>> {
     let mut chunks = Vec::new();
-    serve_connection_with(stream, device, &mut |chunk| chunks.push(chunk))?;
+    serve_connection_with(stream, device, false, &mut |chunk| chunks.push(chunk))?;
     // Keep the legacy bounded probe result stable; persistent mode forwards
     // this stock-client drain quantum to the ring as a real timeline interval.
     if chunks.len() > 1
@@ -219,6 +224,7 @@ fn serve_connection(stream: &mut UnixStream, device: &RegisteredDeviceInfo) -> i
 fn serve_connection_with(
     stream: &mut UnixStream,
     device: &RegisteredDeviceInfo,
+    persistent: bool,
     on_pcm: &mut impl FnMut(Vec<u8>),
 ) -> io::Result<()> {
     let mut out_seq = 0;
@@ -252,6 +258,7 @@ fn serve_connection_with(
                     "duplicate PipeWire proxy id",
                 ));
             }
+            write_bound_id(stream, object.proxy_id, object.global_id, &mut out_seq)?;
             write_object_info(stream, device, object, &mut out_seq)?;
             bound_objects.push(object);
             continue;
@@ -355,14 +362,28 @@ fn serve_connection_with(
             .find(|object| object.proxy_id == header.id)
             .copied()
         {
-            match header.opcode {
-                OBJECT_ENUM_PARAMS => {
+            match (object.kind, header.opcode) {
+                (BoundKind::Node | BoundKind::Port, OBJECT_ENUM_PARAMS) => {
                     let request = decode_enum_params(&payload)?;
                     write_enum_format(stream, device, object.proxy_id, &mut out_seq, request)?;
                 }
                 // Clients may subscribe immediately after binding. The fixed
                 // format has already been described in Info and never changes.
-                OBJECT_SUBSCRIBE_PARAMS => decode_subscribe_params(&payload)?,
+                (BoundKind::Node | BoundKind::Port, OBJECT_SUBSCRIBE_PARAMS) => {
+                    decode_subscribe_params(&payload)?
+                }
+                (BoundKind::Metadata, 1) => {
+                    let property = decode_metadata_set_property(&payload)?;
+                    write_metadata_property(
+                        stream,
+                        object.proxy_id,
+                        &mut out_seq,
+                        property.0,
+                        &property.1,
+                        &property.2,
+                        &property.3,
+                    )?;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -391,6 +412,22 @@ fn serve_connection_with(
                     device.port_id(),
                     "PipeWire:Interface:Port",
                     &port_properties(device),
+                )?;
+                write_global(
+                    stream,
+                    new_registry_id,
+                    &mut out_seq,
+                    DEFAULT_METADATA_ID,
+                    "PipeWire:Interface:Metadata",
+                    &metadata_properties(),
+                )?;
+                write_global(
+                    stream,
+                    new_registry_id,
+                    &mut out_seq,
+                    CLIENT_NODE_FACTORY_ID,
+                    "PipeWire:Interface:Factory",
+                    &factory_properties(),
                 )?;
                 registry_id = Some(new_registry_id);
             }
@@ -422,7 +459,7 @@ fn serve_connection_with(
                 let body = encode_struct(|builder| builder.push_int(id).push_int(seq))?;
                 write_message(stream, CORE_ID, CORE_DONE, out_seq, &body)?;
                 out_seq += 1;
-                if registry_id.is_some() {
+                if registry_id.is_some() && !persistent {
                     // The stock CLI sends Bind only after processing this Done.
                     // Keep the one-shot probe alive briefly for that request.
                     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -430,7 +467,10 @@ fn serve_connection_with(
             }
             // Hello and Client.UpdateProperties are required connection bootstrap
             // messages but have no response in this discovery-only milestone.
-            (CORE_ID, 1) => decode_hello(&payload)?,
+            (CORE_ID, 1) => {
+                decode_hello(&payload)?;
+                write_core_info(stream, &mut out_seq)?;
+            }
             (CLIENT_ID, CLIENT_UPDATE_PROPERTIES) => decode_properties(&payload)?,
             _ => {
                 return Err(io::Error::new(
@@ -889,6 +929,8 @@ fn decode_bind(payload: &[u8], device: &RegisteredDeviceInfo) -> io::Result<Boun
             let kind = match (global_id, interface.as_str()) {
                 (id, "PipeWire:Interface:Node") if id == device.node_id() => BoundKind::Node,
                 (id, "PipeWire:Interface:Port") if id == device.port_id() => BoundKind::Port,
+                (DEFAULT_METADATA_ID, "PipeWire:Interface:Metadata") => BoundKind::Metadata,
+                (CLIENT_NODE_FACTORY_ID, "PipeWire:Interface:Factory") => BoundKind::Factory,
                 _ => {
                     return Err(pipewire_native_spa::pod::Error::Invalid(
                         "bind does not match an advertised global".into(),
@@ -902,6 +944,7 @@ fn decode_bind(payload: &[u8], device: &RegisteredDeviceInfo) -> io::Result<Boun
             }
             Ok(BoundObject {
                 proxy_id: proxy_id as u32,
+                global_id,
                 kind,
             })
         })
@@ -952,6 +995,23 @@ fn decode_subscribe_params(payload: &[u8]) -> io::Result<()> {
             Ok(())
         })
         .map(|_| ())
+        .map_err(invalid_pod)
+}
+
+fn decode_metadata_set_property(payload: &[u8]) -> io::Result<(i32, String, String, String)> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            let property = (
+                fields.pop_int()?,
+                fields.pop_string()?,
+                fields.pop_string()?,
+                fields.pop_string()?,
+            );
+            require_empty(fields, "Metadata.SetProperty")?;
+            Ok(property)
+        })
+        .map(|(property, _)| property)
         .map_err(invalid_pod)
 }
 
@@ -1065,6 +1125,30 @@ fn write_global(
     Ok(())
 }
 
+fn write_core_info(stream: &mut UnixStream, out_seq: &mut u32) -> io::Result<()> {
+    let properties = vec![
+        ("core.name".into(), "drv-audio-daemon".into()),
+        ("default.clock.rate".into(), "48000".into()),
+        ("default.clock.quantum".into(), "480".into()),
+    ];
+    let body = encode_struct(|builder| {
+        push_properties(
+            builder
+                .push_int(CORE_ID as i32)
+                .push_int(1)
+                .push_string("drv")
+                .push_string("localhost")
+                .push_string("1.6.6")
+                .push_string("drv-audio-daemon")
+                .push_long(1),
+            &properties,
+        )
+    })?;
+    write_message(stream, CORE_ID, 0, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
 fn write_object_info(
     stream: &mut UnixStream,
     device: &RegisteredDeviceInfo,
@@ -1095,8 +1179,51 @@ fn write_object_info(
                 &port_properties(device),
             ))
         })?,
+        BoundKind::Metadata => {
+            return write_metadata_property(
+                stream,
+                object.proxy_id,
+                out_seq,
+                0,
+                "default.audio.sink",
+                "Spa:String:JSON",
+                &format!(r#"{{"name":"{}"}}"#, device.name()),
+            );
+        }
+        BoundKind::Factory => encode_struct(|builder| {
+            push_properties(
+                builder
+                    .push_int(CLIENT_NODE_FACTORY_ID)
+                    .push_string("client-node")
+                    .push_string("PipeWire:Interface:ClientNode")
+                    .push_int(6)
+                    .push_long(1),
+                &factory_properties(),
+            )
+        })?,
     };
     write_message(stream, object.proxy_id, OBJECT_INFO, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
+fn write_metadata_property(
+    stream: &mut UnixStream,
+    proxy_id: u32,
+    out_seq: &mut u32,
+    subject: i32,
+    key: &str,
+    type_name: &str,
+    value: &str,
+) -> io::Result<()> {
+    let body = encode_struct(|builder| {
+        builder
+            .push_int(subject)
+            .push_string(key)
+            .push_string(type_name)
+            .push_string(value)
+    })?;
+    write_message(stream, proxy_id, 0, *out_seq, &body)?;
     *out_seq += 1;
     Ok(())
 }
@@ -1564,6 +1691,18 @@ fn write_bound_props(stream: &mut UnixStream, proxy_id: u32, out_seq: &mut u32) 
     Ok(())
 }
 
+fn write_bound_id(
+    stream: &mut UnixStream,
+    proxy_id: u32,
+    global_id: i32,
+    out_seq: &mut u32,
+) -> io::Result<()> {
+    let body = encode_struct(|builder| builder.push_int(proxy_id as i32).push_int(global_id))?;
+    write_message(stream, CORE_ID, 5, *out_seq, &body)?;
+    *out_seq += 1;
+    Ok(())
+}
+
 fn push_properties<'a>(
     builder: StructBuilder<'a>,
     properties: &[(String, String)],
@@ -1600,6 +1739,25 @@ fn port_properties(device: &RegisteredDeviceInfo) -> Vec<(String, String)> {
         ("port.name".into(), "playback".into()),
         ("port.direction".into(), "in".into()),
         ("port.alias".into(), format!("{}:playback", device.name())),
+    ]
+}
+
+fn metadata_properties() -> Vec<(String, String)> {
+    vec![
+        ("object.serial".into(), DEFAULT_METADATA_ID.to_string()),
+        ("metadata.name".into(), "default".into()),
+    ]
+}
+
+fn factory_properties() -> Vec<(String, String)> {
+    vec![
+        ("object.serial".into(), CLIENT_NODE_FACTORY_ID.to_string()),
+        ("factory.name".into(), "client-node".into()),
+        (
+            "factory.type.name".into(),
+            "PipeWire:Interface:ClientNode".into(),
+        ),
+        ("factory.type.version".into(), "6".into()),
     ]
 }
 
@@ -1822,6 +1980,19 @@ mod tests {
             .0
     }
 
+    fn assert_bound_id(stream: &mut UnixStream, proxy_id: i32, global_id: i32) {
+        let (header, payload) = read_message(stream).unwrap();
+        assert_eq!((header.id, header.opcode), (CORE_ID, 5));
+        let mut parser = Parser::new(&payload);
+        parser
+            .pop_struct(|fields| {
+                assert_eq!(fields.pop_int()?, proxy_id);
+                assert_eq!(fields.pop_int()?, global_id);
+                require_empty(fields, "test Core.BoundId")
+            })
+            .unwrap();
+    }
+
     #[test]
     fn get_registry_advertises_virtual_sink_node_and_input_port() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
@@ -1844,10 +2015,22 @@ mod tests {
             }))
             .unwrap();
 
+        let (core_header, _) = read_message(&mut client).unwrap();
+        assert_eq!((core_header.id, core_header.opcode), (CORE_ID, 0));
         let (node_header, node_payload) = read_message(&mut client).unwrap();
         let (port_header, port_payload) = read_message(&mut client).unwrap();
+        let (metadata_header, metadata_payload) = read_message(&mut client).unwrap();
+        let (factory_header, factory_payload) = read_message(&mut client).unwrap();
         assert_eq!((node_header.id, node_header.opcode), (7, REGISTRY_GLOBAL));
         assert_eq!((port_header.id, port_header.opcode), (7, REGISTRY_GLOBAL));
+        assert_eq!(
+            (metadata_header.id, metadata_header.opcode),
+            (7, REGISTRY_GLOBAL)
+        );
+        assert_eq!(
+            (factory_header.id, factory_header.opcode),
+            (7, REGISTRY_GLOBAL)
+        );
 
         let node = decode_global(&node_payload);
         assert_eq!(node.0, 2);
@@ -1871,6 +2054,27 @@ mod tests {
         assert_eq!(port.1, "PipeWire:Interface:Port");
         assert!(port.2.contains(&("port.direction".into(), "in".into())));
         assert!(port.2.contains(&("node.id".into(), "2".into())));
+
+        let metadata = decode_global(&metadata_payload);
+        assert_eq!(
+            (metadata.0, metadata.1.as_str()),
+            (4, "PipeWire:Interface:Metadata")
+        );
+        assert!(
+            metadata
+                .2
+                .contains(&("metadata.name".into(), "default".into()))
+        );
+        let factory = decode_global(&factory_payload);
+        assert_eq!(
+            (factory.0, factory.1.as_str()),
+            (5, "PipeWire:Interface:Factory")
+        );
+        assert!(
+            factory
+                .2
+                .contains(&("factory.name".into(), "client-node".into()))
+        );
 
         client
             .write_all(&request(CORE_ID, CORE_SYNC, |b| b.push_int(0).push_int(99)))
@@ -1903,6 +2107,10 @@ mod tests {
                 b.push_int(3).push_int(7)
             }))
             .unwrap();
+        let (core_header, _) = read_message(&mut client).unwrap();
+        assert_eq!((core_header.id, core_header.opcode), (CORE_ID, 0));
+        read_message(&mut client).unwrap();
+        read_message(&mut client).unwrap();
         read_message(&mut client).unwrap();
         read_message(&mut client).unwrap();
         client
@@ -1918,6 +2126,7 @@ mod tests {
                     .push_int(8)
             }))
             .unwrap();
+        assert_bound_id(&mut client, 8, 2);
         let (node_header, node_info) = read_message(&mut client).unwrap();
         assert_eq!((node_header.id, node_header.opcode), (8, OBJECT_INFO));
         let mut node_parser = Parser::new(&node_info);
@@ -1944,6 +2153,7 @@ mod tests {
                     .push_int(9)
             }))
             .unwrap();
+        assert_bound_id(&mut client, 9, 3);
         let (port_header, port_info) = read_message(&mut client).unwrap();
         assert_eq!((port_header.id, port_header.opcode), (9, OBJECT_INFO));
         let mut port_parser = Parser::new(&port_info);
@@ -1952,6 +2162,52 @@ mod tests {
                 assert_eq!(fields.pop_int()?, 3);
                 assert_eq!(fields.pop_int()?, 0);
                 assert_eq!(fields.pop_long()?, 0x3);
+                Ok(())
+            })
+            .unwrap();
+
+        client
+            .write_all(&request(7, REGISTRY_BIND, |b| {
+                b.push_int(DEFAULT_METADATA_ID)
+                    .push_string("PipeWire:Interface:Metadata")
+                    .push_int(3)
+                    .push_int(10)
+            }))
+            .unwrap();
+        assert_bound_id(&mut client, 10, DEFAULT_METADATA_ID);
+        let (metadata_header, metadata_property) = read_message(&mut client).unwrap();
+        assert_eq!((metadata_header.id, metadata_header.opcode), (10, 0));
+        let mut metadata_parser = Parser::new(&metadata_property);
+        metadata_parser
+            .pop_struct(|fields| {
+                assert_eq!(fields.pop_int()?, 0);
+                assert_eq!(fields.pop_string()?, "default.audio.sink");
+                assert_eq!(fields.pop_string()?, "Spa:String:JSON");
+                assert_eq!(fields.pop_string()?, r#"{"name":"drv.adr-virtual-sink"}"#);
+                require_empty(fields, "test Metadata.Property")
+            })
+            .unwrap();
+
+        client
+            .write_all(&request(7, REGISTRY_BIND, |b| {
+                b.push_int(CLIENT_NODE_FACTORY_ID)
+                    .push_string("PipeWire:Interface:Factory")
+                    .push_int(3)
+                    .push_int(11)
+            }))
+            .unwrap();
+        assert_bound_id(&mut client, 11, CLIENT_NODE_FACTORY_ID);
+        let (factory_header, factory_info) = read_message(&mut client).unwrap();
+        assert_eq!((factory_header.id, factory_header.opcode), (11, 0));
+        let mut factory_parser = Parser::new(&factory_info);
+        factory_parser
+            .pop_struct(|fields| {
+                assert_eq!(fields.pop_int()?, CLIENT_NODE_FACTORY_ID);
+                assert_eq!(fields.pop_string()?, "client-node");
+                assert_eq!(fields.pop_string()?, "PipeWire:Interface:ClientNode");
+                assert_eq!(fields.pop_int()?, 6);
+                assert_eq!(fields.pop_long()?, 1);
+                assert_eq!(fields.pop_struct(|props| props.pop_int())?.0, 4);
                 Ok(())
             })
             .unwrap();
@@ -2014,6 +2270,10 @@ mod tests {
                 b.push_int(3).push_int(7)
             }))
             .unwrap();
+        let (core_header, _) = read_message(&mut client).unwrap();
+        assert_eq!((core_header.id, core_header.opcode), (CORE_ID, 0));
+        read_message(&mut client).unwrap();
+        read_message(&mut client).unwrap();
         read_message(&mut client).unwrap();
         read_message(&mut client).unwrap();
         client
