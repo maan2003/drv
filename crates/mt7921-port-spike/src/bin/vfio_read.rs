@@ -3,11 +3,20 @@
 #![allow(unexpected_cfgs)]
 
 #[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_common as fidl_common;
+#[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_driver as fidl_driver;
+#[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
+#[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_softmac as fidl_softmac;
+#[cfg(feature = "fuchsia-passive")]
 use fuchsia_softmac_port::{
     BeaconHintAuthorizer, ChannelBandwidth, ChannelNumber, ConservativeRegulatoryPolicy,
-    HardwareScanEvent, MlmeScanEvent, PassiveScanner, ScanRequest, ScanResultCode, ScanTypes,
-    SoftmacHardware, WlanBand, WlanSoftmacBaseSetChannelRequest,
-    WlanSoftmacBaseStartPassiveScanRequest, allowed_passive_channels,
+    HardwareScanEvent, MlmeScanEvent, PassiveScanner, SaeHandshake, SaeHandshakeUpdate,
+    ScanRequest, ScanResultCode, ScanTypes, SoftmacHardware, WlanBand,
+    WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
+    allowed_passive_channels, build_sae_auth_frame,
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
@@ -21,15 +30,17 @@ use mt7921_port_spike::{
     FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
     GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
     MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
-    MT7921_FWDL_RING_BYTES, McuRxRegisters, OwnershipError, OwnershipEvent, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
-    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
-    WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    encode_download_command, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
-    mask_ack_disabled_fwdl_interrupt, parse_clc_set_response, parse_download_response,
-    parse_eeprom_block, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
-    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
-    select_vfio_irq, stage_disabled_firmware_chunk,
+    MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus, OwnershipError,
+    OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability,
+    PciIrqKind, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
+    TopOwnershipTransport, TxRingState, WfsysResetEvent, WfsysResetTransport,
+    acquire_driver_ownership, acquire_top_driver_ownership, encode_download_command,
+    encode_mt7921_5ghz_auth_tx, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
+    mask_ack_disabled_fwdl_interrupt, mt7921_packet_type, parse_clc_set_response,
+    parse_download_response, parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status,
+    parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
+    stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
@@ -38,6 +49,10 @@ use mt7921_port_spike::{
     load_mt7921_firmware_with_passive_boundary, parse_passive_advertisement,
     parse_passive_scan_done, parse_pse_reg_read_response, passive_mac_bar_offset,
     passive_mac_mmio_plan, passive_mac_source_rmw_value, validate_passive_mac_bar_read,
+};
+#[cfg(feature = "fuchsia-passive")]
+use mt7921_softmac_adapter::client_device::{
+    ClientRxFrame, ClientSupport, Mt7921ClientDevice, Mt7921ClientEffects,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
@@ -54,11 +69,13 @@ use std::{
     process::{Command, Stdio},
     ptr::NonNull,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
+#[cfg(feature = "fuchsia-passive")]
+use wlan_mlme::device::DeviceOps;
 
 const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
@@ -319,6 +336,12 @@ struct ActiveVfioResources {
     data_rx_ring: Option<DmaArena>,
     #[cfg(feature = "fuchsia-passive")]
     data_rx_buffers: Option<DmaArena>,
+    #[cfg(feature = "fuchsia-passive")]
+    mgmt_txwi: Option<DmaArena>,
+    #[cfg(feature = "fuchsia-passive")]
+    mgmt_frame: Option<DmaArena>,
+    #[cfg(feature = "fuchsia-passive")]
+    mgmt_tx_ring: Option<DmaArena>,
     irq: Option<VfioIrq>,
 }
 
@@ -394,6 +417,12 @@ impl ActiveVfioCapsule {
             release_dma(&mut active.data_rx_buffers, &mut failures);
             #[cfg(feature = "fuchsia-passive")]
             release_dma(&mut active.data_rx_ring, &mut failures);
+            #[cfg(feature = "fuchsia-passive")]
+            release_dma(&mut active.mgmt_frame, &mut failures);
+            #[cfg(feature = "fuchsia-passive")]
+            release_dma(&mut active.mgmt_txwi, &mut failures);
+            #[cfg(feature = "fuchsia-passive")]
+            release_dma(&mut active.mgmt_tx_ring, &mut failures);
             for slot in [
                 &mut active.mcu_wa_rx_buffers,
                 &mut active.mcu_wa_rx_ring,
@@ -565,6 +594,11 @@ fn acquire_active_vfio_resources(
     {
         map_dma!(data_rx_ring, 0x0101_0000, PAGE);
         map_dma!(data_rx_buffers, 0x0101_1000, 4 * PAGE);
+        if operation == Operation::RunOneShotSaeAuth {
+            map_dma!(mgmt_txwi, 0x0103_0000, PAGE);
+            map_dma!(mgmt_frame, 0x0103_1000, PAGE);
+            map_dma!(mgmt_tx_ring, 0x0103_2000, PAGE);
+        }
     }
 
     let tx_guard = resources.tx_guard.as_mut().expect("mapped");
@@ -599,6 +633,15 @@ fn acquire_active_vfio_resources(
             .as_mut()
             .expect("mapped")
             .zero_bytes(4 * PAGE)?;
+        if let Some(arena) = resources.mgmt_txwi.as_mut() {
+            arena.zero_bytes(PAGE)?;
+        }
+        if let Some(arena) = resources.mgmt_frame.as_mut() {
+            arena.zero_bytes(PAGE)?;
+        }
+        if let Some(arena) = resources.mgmt_tx_ring.as_mut() {
+            arena.initialize_descriptor_page()?;
+        }
     }
     let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
         .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
@@ -628,6 +671,89 @@ pub fn main() {
     if let Err(message) = run() {
         eprintln!("mt7921-vfio-read: {message}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct SaeCredential(Vec<u8>);
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for SaeCredential {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn read_sae_credential() -> Result<SaeCredential, String> {
+    let raw_fd = env::var("DRV_SAE_CREDENTIAL_FD")
+        .map_err(|_| "DRV_SAE_CREDENTIAL_FD is required")?
+        .parse::<RawFd>()
+        .map_err(|_| "DRV_SAE_CREDENTIAL_FD is invalid")?;
+    if raw_fd <= 2 {
+        return Err("DRV_SAE_CREDENTIAL_FD is invalid".into());
+    }
+    let mut credential = Vec::with_capacity(64);
+    // SAFETY: the root launcher transfers this inherited descriptor exactly
+    // once to this one-shot process; taking ownership also closes it promptly.
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    Read::by_ref(&mut file)
+        .take(64)
+        .read_to_end(&mut credential)
+        .map_err(|_| "read SAE credential FD failed".to_string())?;
+    if !(8..=63).contains(&credential.len()) {
+        credential.fill(0);
+        return Err("SAE credential length is invalid".into());
+    }
+    Ok(SaeCredential(credential))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn find_ie(ies: &[u8], wanted: u8) -> Option<&[u8]> {
+    let mut offset = 0;
+    while offset + 2 <= ies.len() {
+        let length = usize::from(ies[offset + 1]);
+        let end = offset.checked_add(length + 2)?;
+        let ie = ies.get(offset..end)?;
+        if ie[0] == wanted {
+            return Some(ie);
+        }
+        offset = end;
+    }
+    None
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn live_client_support(query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientSupport {
+    ClientSupport {
+        query,
+        discovery: fidl_softmac::DiscoverySupport {
+            scan_offload: Some(fidl_softmac::ScanOffloadExtension {
+                supported: Some(true),
+                scan_cancel_supported: Some(true),
+            }),
+            ..Default::default()
+        },
+        mac_sublayer: fidl_common::MacSublayerSupport {
+            device: Some(fidl_common::DeviceExtension {
+                mac_implementation_type: Some(fidl_common::MacImplementationType::Softmac),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        security: fidl_common::SecuritySupport {
+            mfp: Some(fidl_common::MfpFeature {
+                supported: Some(true),
+            }),
+            sae: Some(fidl_common::SaeFeature {
+                driver_handler_supported: Some(false),
+                sme_handler_supported: Some(true),
+                hash_to_element_supported: Some(false),
+            }),
+            ..Default::default()
+        },
+        spectrum_management: Default::default(),
     }
 }
 
@@ -665,13 +791,16 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-power-setup") => Operation::RunOneShotPowerSetup,
         #[cfg(feature = "fuchsia-passive")]
-        Some("--run-one-shot-sae-auth") => {
-            return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into());
-        }
+        Some("--run-one-shot-sae-auth") => Operation::RunOneShotSaeAuth,
+        #[cfg(not(feature = "fuchsia-passive"))]
+        Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     #[cfg(feature = "fuchsia-passive")]
-    let power_target = if operation == Operation::RunOneShotPowerSetup {
+    let power_target = if matches!(
+        operation,
+        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+    ) {
         let bssid = parse_mac(
             &env::var("DRV_SAE_BSSID").map_err(|_| "DRV_SAE_BSSID is required for power setup")?,
         )?;
@@ -686,6 +815,10 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    #[cfg(feature = "fuchsia-passive")]
+    let mut sae_credential = (operation == Operation::RunOneShotSaeAuth)
+        .then(read_sae_credential)
+        .transpose()?;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -1216,6 +1349,12 @@ fn run() -> Result<(), String> {
             data_rx_ring,
             #[cfg(feature = "fuchsia-passive")]
             data_rx_buffers,
+            #[cfg(feature = "fuchsia-passive")]
+            mgmt_txwi,
+            #[cfg(feature = "fuchsia-passive")]
+            mgmt_frame,
+            #[cfg(feature = "fuchsia-passive")]
+            mgmt_tx_ring,
             irq,
         } = resources;
         let selector_page = selector_page.as_ref().expect("acquired");
@@ -1238,6 +1377,12 @@ fn run() -> Result<(), String> {
         let data_rx_ring = data_rx_ring.as_mut().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
         let data_rx_buffers = data_rx_buffers.as_mut().expect("acquired");
+        #[cfg(feature = "fuchsia-passive")]
+        let mut mgmt_txwi = mgmt_txwi.as_mut();
+        #[cfg(feature = "fuchsia-passive")]
+        let mut mgmt_frame = mgmt_frame.as_mut();
+        #[cfg(feature = "fuchsia-passive")]
+        let mut mgmt_tx_ring = mgmt_tx_ring.as_mut();
         let ledger = capsule
             .containment
             .as_mut()
@@ -1495,6 +1640,7 @@ fn run() -> Result<(), String> {
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
+                                tx_completions: Vec::new(),
                             };
                             let mut transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
@@ -1527,6 +1673,7 @@ fn run() -> Result<(), String> {
                         | Operation::RunOneShotPassive5GhzDfsHigh
                         | Operation::RunOneShotPassiveSmeFull
                         | Operation::RunOneShotPowerSetup
+                        | Operation::RunOneShotSaeAuth
                 ) {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -1560,6 +1707,7 @@ fn run() -> Result<(), String> {
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
+                                tx_completions: Vec::new(),
                             };
                             let transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
@@ -1608,12 +1756,15 @@ fn run() -> Result<(), String> {
                                 Operation::RunOneShotPowerSetup => {
                                     channels_for(WlanBand::FiveGhz, &[36])
                                 }
+                                Operation::RunOneShotSaeAuth => {
+                                    channels_for(WlanBand::FiveGhz, &[36])
+                                }
                                 _ => unreachable!("passive scan operation matched above"),
                             };
                             let mut adapter = Mt7921SoftmacAdapter::new(
                                 transport,
                                 report.nic_capability,
-                                candidates,
+                                candidates.clone(),
                                 channels.clone(),
                             )
                             .map_err(|error| error.to_string())?;
@@ -1671,6 +1822,7 @@ fn run() -> Result<(), String> {
                                     BeaconHintAuthorizer::new(*bssid, ssid.clone())
                                 });
                             let mut beacon_authorization = None;
+                            let mut target_bss = None;
                             let mut total_observations = 0usize;
                             for channel in &channels {
                                 adapter
@@ -1709,6 +1861,7 @@ fn run() -> Result<(), String> {
                                                         authorizer.observe(scan_id, &observation)
                                                 {
                                                     beacon_authorization = Some(authorization);
+                                                    target_bss = Some(observation.bss.clone());
                                                 }
                                                 println!(
                                                     r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
@@ -1761,7 +1914,10 @@ fn run() -> Result<(), String> {
                                     channels.len()
                                 ));
                             }
-                            if operation == Operation::RunOneShotPowerSetup {
+                            if matches!(
+                                operation,
+                                Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+                            ) {
                                 let beacon_authorization = beacon_authorization
                                     .as_ref()
                                     .ok_or("target beacon did not authorize channel 36")?;
@@ -1773,6 +1929,171 @@ fn run() -> Result<(), String> {
                                         "target beacon authorization is no longer live".into()
                                     );
                                 }
+                                if operation == Operation::RunOneShotSaeAuth {
+                                    let shared = Arc::new(Mutex::new(LiveClientState::default()));
+                                    let effects = LiveClientEffects {
+                                        state: shared.clone(),
+                                        target: power_target.as_ref().expect("SAE target").0,
+                                    };
+                                    let support = live_client_support(query_from_capabilities(
+                                        report.nic_capability,
+                                        &candidates,
+                                    ));
+                                    let (mut device, runner) =
+                                        Mt7921ClientDevice::new(effects, adapter, support);
+                                    futures::executor::block_on(DeviceOps::set_channel(
+                                        &mut device,
+                                        channels[0],
+                                        fidl_ieee80211::ChannelBandwidth::Cbw20,
+                                        ChannelNumber {
+                                            band: WlanBand::TwoGhz,
+                                            number: 0,
+                                        },
+                                    ))
+                                    .map_err(|status| {
+                                        format!("DeviceOps set channel failed: {status}")
+                                    })?;
+                                    let response = futures::executor::block_on(
+                                        DeviceOps::start_passive_scan(
+                                            &mut device,
+                                            &WlanSoftmacBaseStartPassiveScanRequest {
+                                                channels: Some(vec![channels[0]]),
+                                                min_channel_time: Some(50_000_000),
+                                                max_channel_time: Some(120_000_000),
+                                                min_home_time: Some(0),
+                                            },
+                                        ),
+                                    )
+                                    .map_err(|status| {
+                                        format!("DeviceOps passive scan failed: {status}")
+                                    })?;
+                                    let scan_id = response
+                                        .scan_id
+                                        .ok_or("DeviceOps passive scan omitted id")?;
+                                    loop {
+                                        match runner.poll().map_err(|status| {
+                                            format!("DeviceOps runner failed: {status}")
+                                        })? {
+                                            Some(HardwareScanEvent::Complete {
+                                                scan_id: completed,
+                                                success,
+                                            }) if completed == scan_id && success => break,
+                                            Some(HardwareScanEvent::Complete { .. }) => {
+                                                return Err(
+                                                    "DeviceOps scan completion failed".into()
+                                                );
+                                            }
+                                            _ => std::thread::sleep(
+                                                std::time::Duration::from_millis(1),
+                                            ),
+                                        }
+                                    }
+                                    runner.with_physical(|adapter| {
+                                        adapter.with_transport_mut(|transport| {
+                                            let mechanics = transport.mechanics_mut();
+                                            mechanics.ledger.transition(
+                                                RunPhase::PassiveReady,
+                                                RunPhase::BeaconAuthorized,
+                                            )?;
+                                            program_live_rate_power(
+                                                mechanics,
+                                                report.nic_capability,
+                                            )
+                                        })
+                                    })?;
+                                    shared.lock().unwrap().power_rate_authorized = true;
+                                    let bss =
+                                        target_bss.as_ref().ok_or("target BSS was not retained")?;
+                                    let rsne =
+                                        find_ie(&bss.ies, 48).ok_or("target BSS omitted RSNE")?;
+                                    let client = report
+                                        .nic_capability
+                                        .mac_address
+                                        .ok_or("NIC omitted MAC address")?;
+                                    let credential = sae_credential
+                                        .as_mut()
+                                        .ok_or("SAE credential unavailable")?;
+                                    let mut handshake = SaeHandshake::new(
+                                        power_target.as_ref().unwrap().1.clone(),
+                                        credential.0.clone(),
+                                        client.into(),
+                                        power_target.as_ref().unwrap().0.into(),
+                                        rsne,
+                                        false,
+                                    )
+                                    .map_err(|_| {
+                                        "initialize pinned SAE supplicant failed".to_string()
+                                    })?;
+                                    credential.0.fill(0);
+                                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                                    let frames = handshake
+                                        .start()
+                                        .map_err(|_| {
+                                            "start pinned SAE supplicant failed".to_string()
+                                        })?
+                                        .into_iter()
+                                        .filter_map(|u| match u {
+                                            SaeHandshakeUpdate::TxFrame(f) => Some(f),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if frames.len() != 1 {
+                                        return Err(
+                                            "pinned SAE startup did not produce exactly one frame"
+                                                .into(),
+                                        );
+                                    }
+                                    let frame = build_sae_auth_frame(
+                                        client.into(),
+                                        power_target.as_ref().unwrap().0.into(),
+                                        0,
+                                        &frames[0],
+                                    )
+                                    .map_err(|_| {
+                                        "build pinned SAE authentication frame failed".to_string()
+                                    })?;
+                                    DeviceOps::send_wlan_frame(
+                                        &mut device,
+                                        frame.into(),
+                                        fidl_softmac::WlanTxInfoFlags::empty(),
+                                        None,
+                                    )
+                                    .map_err(|status| {
+                                        format!("DeviceOps SAE TX rejected: {status}")
+                                    })?;
+                                    let frame = shared
+                                        .lock()
+                                        .unwrap()
+                                        .frame
+                                        .take()
+                                        .ok_or("DeviceOps did not retain SAE frame")?;
+                                    runner.with_physical(|adapter| {
+                                        adapter.with_transport_mut(|transport| {
+                                            let mechanics = transport.mechanics_mut();
+                                            let ring = mgmt_tx_ring
+                                                .as_deref_mut()
+                                                .ok_or("SAE TX ring arena missing")?;
+                                            mechanics.loader.mcu.wfdma.write_tx_ring_slot(
+                                                0,
+                                                ring.iova as u32,
+                                                128,
+                                                0,
+                                            )?;
+                                            mechanics.transmit_one_sae_auth(
+                                                ring,
+                                                mgmt_txwi
+                                                    .as_deref_mut()
+                                                    .ok_or("SAE TXWI arena missing")?,
+                                                mgmt_frame
+                                                    .as_deref_mut()
+                                                    .ok_or("SAE frame arena missing")?,
+                                                &frame,
+                                            )
+                                        })
+                                    })?;
+                                    println!(r#"{{"sae_auth_event":"one_management_mpdu_acked"}}"#);
+                                    return Ok(());
+                                }
                                 let transport = adapter.into_transport();
                                 let mut mechanics = transport.into_mechanics();
                                 mechanics.ledger.transition(
@@ -1783,6 +2104,7 @@ fn run() -> Result<(), String> {
                                     mechanics.loader.mcu.wfdma,
                                     &mut mechanics.data,
                                     &mut mechanics.loader.mcu.descriptor_provenance,
+                                    &mut mechanics.tx_completions,
                                 )?;
                                 mechanics.loader.mcu.extra_irq_mask = 0;
                                 mechanics.loader.mcu.wfdma.write_active_wfdma(
@@ -3970,7 +4292,7 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
         0xd4690 => value == 0x00c0_0004,
         0xd4640 => value == 0x0340_0004,
         0xd4644 => value == 0x0380_0004,
-        0xd4408 => value < 128,
+        0xd4308 | 0xd4408 => value < 128,
         0xd4418 => value < 256,
         _ => false,
     }
@@ -4614,6 +4936,34 @@ impl RateTxPowerTransport for VfioRateTxPower<'_, '_> {
     }
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn program_live_rate_power(
+    mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
+    capability: mt7921_port_spike::NicCapability,
+) -> Result<(), String> {
+    let mut transport = VfioRateTxPower {
+        loader: &mut *mechanics.loader,
+    };
+    let mut authorizer = RateTxPowerAuthorizer::new();
+    let authorization = authorizer
+        .submit(
+            &mut transport,
+            capability,
+            ConservativePowerLimits {
+                alpha2: *b"00",
+                max_reg_power_dbm: 20,
+                sar_limit_half_dbm: Some(40),
+                external_safety_cap_half_dbm: Some(0),
+            },
+            1,
+        )
+        .map_err(|error| format!("submit rate-power setup: {error:?}"))?;
+    authorizer
+        .permits(&authorization)
+        .then_some(())
+        .ok_or_else(|| "rate-power authorization is not live".into())
+}
+
 impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
     type Error = String;
 
@@ -5066,6 +5416,7 @@ fn drain_data_rx_queue(
     wfdma: &ReadPage,
     queue: &mut ActiveMcuRx<'_>,
     provenance: &mut DescriptorProvenance,
+    completions: &mut Vec<MgmtTxCompletion>,
 ) -> Result<Vec<PrivateRawAdvertisementCarrier>, String> {
     let mut advertisements = Vec::new();
     let result = (|| -> Result<(), String> {
@@ -5095,37 +5446,58 @@ fn drain_data_rx_queue(
                 let bytes = queue
                     .rx_buffers
                     .read_bytes(completed_index * 2048, length)?;
-                match parse_passive_advertisement(&bytes) {
-                    Ok(advertisement) => Ok(
-                        match provenance.seal_frame(
-                            DescriptorOccurrenceRoute::DataRx,
-                            queue.rx_ring_index,
-                            completed_index,
-                            bytes,
-                        )? {
-                            PrivateFrameSeal::Carried(frame) => PrivateRawAdvertisementCarrier {
-                                advertisement,
-                                frame_bytes: frame.bytes,
-                                occurrence: frame.occurrence,
-                            },
-                            PrivateFrameSeal::Uncovered(frame_bytes) => {
-                                PrivateRawAdvertisementCarrier {
-                                    advertisement,
-                                    frame_bytes,
-                                    occurrence: None,
+                let completion = match mt7921_packet_type(&bytes) {
+                    Some(6) => parse_mt7921_tx_free(&bytes)
+                        .ok()
+                        .map(MgmtTxCompletion::Free),
+                    Some(0) if bytes.len() == 40 => parse_mt7921_tx_status(&bytes)
+                        .ok()
+                        .map(MgmtTxCompletion::Status),
+                    _ => None,
+                };
+                if let Some(completion) = completion {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::DataRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    completions.push(completion);
+                    Ok(None)
+                } else {
+                    match parse_passive_advertisement(&bytes) {
+                        Ok(advertisement) => Ok(Some(
+                            match provenance.seal_frame(
+                                DescriptorOccurrenceRoute::DataRx,
+                                queue.rx_ring_index,
+                                completed_index,
+                                bytes,
+                            )? {
+                                PrivateFrameSeal::Carried(frame) => {
+                                    PrivateRawAdvertisementCarrier {
+                                        advertisement,
+                                        frame_bytes: frame.bytes,
+                                        occurrence: frame.occurrence,
+                                    }
                                 }
-                            }
-                        },
-                    ),
-                    Err(error) => {
-                        provenance.consume_without_mint(
-                            DescriptorOccurrenceRoute::DataRx,
-                            queue.rx_ring_index,
-                            completed_index,
-                        );
-                        Err(format!(
-                            "reject passive RX descriptor {completed_index}: {error:?}"
-                        ))
+                                PrivateFrameSeal::Uncovered(frame_bytes) => {
+                                    PrivateRawAdvertisementCarrier {
+                                        advertisement,
+                                        frame_bytes,
+                                        occurrence: None,
+                                    }
+                                }
+                            },
+                        )),
+                        Err(error) => {
+                            provenance.consume_without_mint(
+                                DescriptorOccurrenceRoute::DataRx,
+                                queue.rx_ring_index,
+                                completed_index,
+                            );
+                            Err(format!(
+                                "reject passive RX descriptor {completed_index}: {error:?}"
+                            ))
+                        }
                     }
                 }
             };
@@ -5151,7 +5523,9 @@ fn drain_data_rx_queue(
                 },
             )?;
             queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
-            advertisements.push(parsed?);
+            if let Some(advertisement) = parsed? {
+                advertisements.push(advertisement);
+            }
         }
         Ok(())
     })();
@@ -5163,6 +5537,150 @@ fn drain_data_rx_queue(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MgmtTxCompletion {
+    Free(Mt7921TxFree),
+    Status(Mt7921TxStatus),
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct MgmtTxCompletionState {
+    free: Option<Mt7921TxFree>,
+    status: Option<Mt7921TxStatus>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl MgmtTxCompletionState {
+    fn observe(&mut self, completion: MgmtTxCompletion) -> Result<(), String> {
+        match completion {
+            MgmtTxCompletion::Free(value) if value.token == 0 && self.free.is_none() => {
+                self.free = Some(value)
+            }
+            MgmtTxCompletion::Status(value)
+                if value.pid == 3 && value.wcid == 19 && self.status.is_none() =>
+            {
+                self.status = Some(value)
+            }
+            _ => return Err("uncorrelated or duplicate management TX completion".into()),
+        }
+        Ok(())
+    }
+
+    fn finished(&self) -> Option<Result<(), String>> {
+        let (free, status) = (self.free?, self.status?);
+        Some(if !free.dropped && status.acked {
+            Ok(())
+        } else {
+            Err("SAE authentication MPDU was not acknowledged".into())
+        })
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct LiveClientState {
+    scan_seen: bool,
+    scan_authorized: bool,
+    power_rate_authorized: bool,
+    frame: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct LiveClientEffects {
+    state: Arc<Mutex<LiveClientState>>,
+    target: [u8; 6],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Mt7921ClientEffects for LiveClientEffects {
+    fn revoke_scan(&mut self) {
+        self.state.lock().unwrap().scan_authorized = false;
+    }
+    fn revoke_lifecycle(&mut self) {
+        *self.state.lock().unwrap() = LiveClientState::default();
+    }
+    fn set_channel(
+        &mut self,
+        _: fidl_ieee80211::ChannelNumber,
+        _: fidl_ieee80211::ChannelBandwidth,
+        _: fidl_ieee80211::ChannelNumber,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn join_bss(&mut self, _: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn send_wlan_frame(
+        &mut self,
+        bytes: &[u8],
+        _: fidl_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        let mut state = self.state.lock().unwrap();
+        if !state.scan_authorized
+            || !state.power_rate_authorized
+            || state.frame.is_some()
+            || bytes.get(..2) != Some(&[0xb0, 0])
+            || bytes.get(4..10) != Some(&self.target)
+        {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        state.frame = Some(bytes.to_vec());
+        Ok(())
+    }
+    fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn notify_association_complete(
+        &mut self,
+        _: &fidl_softmac::WlanAssociationConfig,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn clear_association(
+        &mut self,
+        _: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        Ok(None)
+    }
+    fn begin_passive_scan(
+        &mut self,
+        _: u64,
+        _: &[fidl_ieee80211::ChannelNumber],
+    ) -> Result<(), zx::Status> {
+        self.state.lock().unwrap().scan_seen = false;
+        Ok(())
+    }
+    fn observe_passive_scan(
+        &mut self,
+        _: u64,
+        observation: &fuchsia_softmac_port::ScanObservation,
+    ) -> Result<(), zx::Status> {
+        if observation.bss.bssid == self.target {
+            self.state.lock().unwrap().scan_seen = true;
+        }
+        Ok(())
+    }
+    fn complete_passive_scan(&mut self, _: u64, success: bool) -> Result<(), zx::Status> {
+        let mut state = self.state.lock().unwrap();
+        state.scan_authorized = success && state.scan_seen;
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), zx::Status> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct VfioPassiveMechanics<'a, 'b, 'c> {
     loader: &'a mut VfioFirmwareLoader<'b>,
     ledger: &'c mut ContainmentLedger,
@@ -5171,6 +5689,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
+    tx_completions: Vec<MgmtTxCompletion>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -5183,6 +5702,60 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
             .mcu
             .descriptor_provenance
             .invalidate(DescriptorInvalidation::Run);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl VfioPassiveMechanics<'_, '_, '_> {
+    fn transmit_one_sae_auth(
+        &mut self,
+        ring: &mut DmaArena,
+        txwi: &mut DmaArena,
+        frame_arena: &mut DmaArena,
+        frame: &[u8],
+    ) -> Result<(), String> {
+        if !self.tx_completions.is_empty() {
+            return Err("management TX began with stale completion state".into());
+        }
+        frame_arena.write_bytes(frame)?;
+        let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
+            .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
+        txwi.write_bytes(&encoded.txwi)?;
+        ring.write_descriptor_at(0, encoded.descriptor);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        let mut completion_state = MgmtTxCompletionState::default();
+        let result = (|| -> Result<(), String> {
+            loop {
+                self.loader.mcu.cancelled()?;
+                self.loader.mcu.handle_irq(None)?;
+                let _ = drain_data_rx_queue(
+                    self.loader.mcu.wfdma,
+                    &mut self.data,
+                    &mut self.loader.mcu.descriptor_provenance,
+                    &mut self.tx_completions,
+                )?;
+                for completion in self.tx_completions.drain(..) {
+                    completion_state.observe(completion)?;
+                }
+                if let Some(result) = completion_state.finished() {
+                    break result;
+                }
+                if Instant::now() >= deadline {
+                    break Err(
+                        "SAE management TX completion timed out; frame may have transmitted".into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })();
+        ring.write_descriptor_at(0, DmaDescriptor::reset());
+        let txwi_reset = txwi.zero_bytes(PAGE);
+        let frame_reset = frame_arena.zero_bytes(PAGE);
+        result?;
+        txwi_reset?;
+        frame_reset
     }
 }
 
@@ -5304,6 +5877,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 self.loader.mcu.wfdma,
                 &mut self.data,
                 &mut self.loader.mcu.descriptor_provenance,
+                &mut self.tx_completions,
             )
             .map_err(PhysicalPassiveError)?,
         );
@@ -6311,12 +6885,14 @@ enum Operation {
     RunOneShotPassiveSmeFull,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPowerSetup,
+    #[cfg(feature = "fuchsia-passive")]
+    RunOneShotSaeAuth,
 }
 
 impl Operation {
     #[cfg(feature = "fuchsia-passive")]
     fn passive_scan_attempt_limit(self) -> usize {
-        if self == Self::RunOneShotPowerSetup {
+        if matches!(self, Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth) {
             5
         } else {
             1
@@ -6342,6 +6918,7 @@ impl Operation {
                     | Self::RunOneShotPassive5GhzDfsHigh
                     | Self::RunOneShotPassiveSmeFull
                     | Self::RunOneShotPowerSetup
+                    | Self::RunOneShotSaeAuth
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -8421,7 +8998,7 @@ mod tests {
         };
         let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
-        let error = match drain_data_rx_queue(&page, &mut queue, &mut provenance) {
+        let error = match drain_data_rx_queue(&page, &mut queue, &mut provenance, &mut Vec::new()) {
             Ok(_) => panic!("later invalid descriptor unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -9545,5 +10122,82 @@ mod tests {
             capsule.containment.as_ref().unwrap().phase,
             RunPhase::SafeReleaseError
         );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn one_management_tx_requires_correlated_free_and_status_in_either_order() {
+        for completions in [
+            [
+                MgmtTxCompletion::Free(Mt7921TxFree {
+                    token: 0,
+                    dropped: false,
+                    attempts: 1,
+                }),
+                MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid: 3,
+                    acked: true,
+                }),
+            ],
+            [
+                MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid: 3,
+                    acked: true,
+                }),
+                MgmtTxCompletion::Free(Mt7921TxFree {
+                    token: 0,
+                    dropped: false,
+                    attempts: 1,
+                }),
+            ],
+        ] {
+            let mut state = MgmtTxCompletionState::default();
+            assert!(state.finished().is_none());
+            state.observe(completions[0]).unwrap();
+            assert!(state.finished().is_none());
+            state.observe(completions[1]).unwrap();
+            assert_eq!(state.finished().unwrap(), Ok(()));
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn one_management_tx_rejects_wrong_identity_duplicate_and_failed_ack() {
+        let mut state = MgmtTxCompletionState::default();
+        assert!(
+            state
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    token: 1,
+                    dropped: false,
+                    attempts: 1
+                }))
+                .is_err()
+        );
+        state
+            .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                token: 0,
+                dropped: true,
+                attempts: 1,
+            }))
+            .unwrap();
+        assert!(
+            state
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    token: 0,
+                    dropped: false,
+                    attempts: 1
+                }))
+                .is_err()
+        );
+        state
+            .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                wcid: 19,
+                pid: 3,
+                acked: true,
+            }))
+            .unwrap();
+        assert!(state.finished().unwrap().is_err());
     }
 }

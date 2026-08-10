@@ -191,6 +191,11 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 }
 
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
+    /// Run one short-lived physical operation without transferring the
+    /// DeviceOps-owned backend or its revocation state.
+    pub fn with_physical<R>(&self, operation: impl FnOnce(&mut Mt7921SoftmacAdapter<T>) -> R) -> R {
+        operation(&mut self.backend.lock().unwrap().scan)
+    }
     pub fn poll(&self) -> Result<Option<HardwareScanEvent>, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         let event = match backend.scan.next_scan_event() {

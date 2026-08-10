@@ -278,6 +278,10 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         self.mechanics
     }
 
+    pub fn mechanics_mut(&mut self) -> &mut M {
+        &mut self.mechanics
+    }
+
     /// Execute the source-ordered EEPROM-buffer command and mandatory receive
     /// preparation without enabling MAC/channel/scan operation.
     pub fn prepare_receive_only(
@@ -609,6 +613,12 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+
+    /// Borrow the physical edge for one contained operation while retaining
+    /// the adapter's scan/lifecycle ownership.
+    pub fn with_transport_mut<R>(&mut self, operation: impl FnOnce(&mut T) -> R) -> R {
+        operation(&mut self.transport)
     }
 
     /// Explicit rejection surface for callers that otherwise have active scan
