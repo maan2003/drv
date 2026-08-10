@@ -1344,6 +1344,87 @@ fn run() -> Result<(), String> {
                         "PCI INTx disable mismatch: expected {selected_command:#06x}, read {readback:#06x}"
                     ));
                 }
+
+                let mut capabilities = Vec::new();
+                for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut irq = IrqInfo {
+                        argsz: size::<IrqInfo>(),
+                        index: index as u32,
+                        ..Default::default()
+                    };
+                    record_sae_stage(&format!(
+                        "vfio_pci_irq_info_query_before index={index} kind={kind:?} argsz={}",
+                        irq.argsz
+                    ));
+                    if let Err(error) = ioctl_mut(
+                        capsule.device.as_raw_fd(),
+                        VFIO_DEVICE_GET_IRQ_INFO,
+                        &mut irq,
+                        "query post-identity VFIO IRQ",
+                    ) {
+                        record_sae_stage(&format!(
+                            "vfio_pci_irq_info_query_error index={index} kind={kind:?} argsz={} error={error}",
+                            irq.argsz
+                        ));
+                        return Err(error);
+                    }
+                    record_sae_stage(&format!(
+                        "vfio_pci_irq_info_query_after index={index} kind={kind:?} argsz={} flags={:#010x} count={}",
+                        irq.argsz, irq.flags, irq.count
+                    ));
+                    capabilities.push(PciIrqCapability {
+                        kind,
+                        count: irq.count,
+                        eventfd: irq.flags & 1 != 0,
+                    });
+                }
+                let selected_irq = select_vfio_irq(&capabilities)
+                    .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+                if selected_irq.kind == PciIrqKind::Intx {
+                    return Err("active MCU preflight selected only level INTx".into());
+                }
+                record_sae_stage(&format!(
+                    "vfio_pci_irq_selection_complete kind={:?} count={} eventfd={}",
+                    selected_irq.kind, selected_irq.count, selected_irq.eventfd
+                ));
+
+                let mut query_info = DeviceInfo {
+                    argsz: size::<DeviceInfo>(),
+                    ..Default::default()
+                };
+                record_sae_stage(&format!(
+                    "vfio_reset_capability_query_before argsz={}",
+                    query_info.argsz
+                ));
+                if let Err(error) = ioctl_mut(
+                    capsule.device.as_raw_fd(),
+                    VFIO_DEVICE_GET_INFO,
+                    &mut query_info,
+                    "query post-identity VFIO device info",
+                ) {
+                    record_sae_stage(&format!(
+                        "vfio_reset_capability_query_error argsz={} error={error}",
+                        query_info.argsz
+                    ));
+                    return Err(error);
+                }
+                record_sae_stage(&format!(
+                    "vfio_reset_capability_query_after argsz={} flags={:#010x} num_regions={} num_irqs={} cap_offset={}",
+                    query_info.argsz,
+                    query_info.flags,
+                    query_info.num_regions,
+                    query_info.num_irqs,
+                    query_info.cap_offset
+                ));
+                if query_info.flags & 0x3 != 0x3 {
+                    return Err(format!(
+                        "VFIO device requires RESET|PCI flags, read {:#010x}",
+                        query_info.flags
+                    ));
+                }
                 Ok(())
             })();
 
