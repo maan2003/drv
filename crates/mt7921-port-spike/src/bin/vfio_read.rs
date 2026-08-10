@@ -27,20 +27,23 @@ use mt7921_port_spike::{
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
     DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
     DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
-    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, GlobalTxRingError,
-    GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT_HIF_REMAP_WINDOW_BAR_OFFSET, MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES,
-    MT7921_FWDL_RING_BYTES, McuRxRegisters, Mt7921TxFree, Mt7921TxStatus, OwnershipError,
-    OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, Patch, PciIrqCapability,
-    PciIrqKind, ReadOnlyStatus, ReadRegister, TopOwnershipError, TopOwnershipEvent,
-    TopOwnershipTransport, TxRingState, WfsysResetEvent, WfsysResetTransport,
-    acquire_driver_ownership, acquire_top_driver_ownership, encode_download_command,
-    encode_mt7921_5ghz_auth_tx, load_mt7921_firmware, load_mt7921_firmware_through_channel_domain,
-    mask_ack_disabled_fwdl_interrupt, mt7921_packet_type, parse_clc_set_response,
-    parse_download_response, parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status,
-    parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, FirmwareOwnershipEvent,
+    GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, IrqResetCleanupStep,
+    IrqResetEvent, IrqResetTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxRegisters,
+    Mt7921TxFree, Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
+    OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
+    PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
+    TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
+    WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
+    load_mt7921_firmware, load_mt7921_firmware_bootstrap,
+    load_mt7921_firmware_through_channel_domain, mask_ack_disabled_fwdl_interrupt,
+    mt76_pci_aspm_supported, mt7921_packet_type, parse_clc_set_response, parse_download_response,
+    parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability,
+    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
+    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
@@ -86,6 +89,7 @@ const VFIO_DEVICE_SET_IRQS: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 10);
 const VFIO_DEVICE_RESET: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 11);
 const VFIO_DEVICE_BIND_IOMMUFD: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 18);
 const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 19);
+const VFIO_DEVICE_DETACH_IOMMUFD_PT: u64 = (VFIO_TYPE << 8) | (VFIO_BASE + 20);
 const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
 const IOMMU_IOAS_ALLOC: u64 = (VFIO_TYPE << 8) | 0x81;
 const IOMMU_IOAS_MAP: u64 = (VFIO_TYPE << 8) | 0x85;
@@ -125,6 +129,21 @@ const RAM_SHA256: &str = "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc
 const PATCH_IMAGE_BYTES: usize = 92_192;
 const RAM_IMAGE_BYTES: usize = 792_036;
 const WATCHDOG_STATUS_PATH: &str = "/run/current-system/sw/bin/wifi-lab-watchdog";
+const SAE_STAGE_PATH: &str = "/var/lib/wifi-driver-lab/sae-stage";
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_sae_stage(event: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(SAE_STAGE_PATH)
+    {
+        let _ = writeln!(file, "{event}");
+        let _ = file.sync_all();
+    }
+    eprintln!(r#"{{"sae_auth_event":"{event}"}}"#);
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -143,6 +162,13 @@ struct Attach {
 }
 #[repr(C)]
 #[derive(Default)]
+struct Detach {
+    argsz: u32,
+    flags: u32,
+    pasid: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct RegionInfo {
     argsz: u32,
     flags: u32,
@@ -349,6 +375,7 @@ struct ActiveVfioCapsule {
     device: Arc<File>,
     iommu: Arc<File>,
     ioas: Option<Ioas>,
+    ioas_attached: bool,
     wfdma: Option<ReadPage>,
     pcie_mac: Option<ReadPage>,
     conn: Option<ReadPage>,
@@ -375,6 +402,7 @@ impl ActiveVfioCapsule {
             device,
             iommu,
             ioas: None,
+            ioas_attached: false,
             wfdma: None,
             pcie_mac: None,
             conn: None,
@@ -458,7 +486,27 @@ impl ActiveVfioCapsule {
         for slot in [&mut self.conn, &mut self.pcie_mac, &mut self.wfdma] {
             release_bar(slot, &mut failures);
         }
-        if let Some(ioas) = self.ioas.as_mut()
+        if self.ioas_attached {
+            let mut detach = Detach {
+                argsz: size::<Detach>(),
+                ..Default::default()
+            };
+            if let Err(error) = ioctl_mut(
+                self.device.as_raw_fd(),
+                VFIO_DEVICE_DETACH_IOMMUFD_PT,
+                &mut detach,
+                "detach VFIO device from IOAS",
+            ) {
+                failures.push(ReleaseFailure {
+                    action: ObservableRelease::IoasDetach,
+                    error,
+                });
+            } else {
+                self.ioas_attached = false;
+            }
+        }
+        if !self.ioas_attached
+            && let Some(ioas) = self.ioas.as_mut()
             && let Err(error) = ioas.teardown()
         {
             failures.push(ReleaseFailure {
@@ -667,6 +715,488 @@ fn acquire_active_vfio_resources(
     Ok(())
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn run_contained_dma_resource_round_trip(
+    capsule: &mut ActiveVfioCapsule,
+    info: &RegionInfo,
+    bdf: &str,
+    operation: Operation,
+    wfdma: &ReadPage,
+    pcie_mac: &ReadPage,
+    selected_irq: PciIrqCapability,
+    firmware_images: Option<(&[u8], &[u8])>,
+    passive_channel: Option<ChannelNumber>,
+) -> Result<(), String> {
+    record_sae_stage("vfio_dma_resource_round_trip_begin");
+    capsule.active = Some(ActiveVfioResources::default());
+    let primary = (|| -> Result<(), String> {
+        acquire_active_vfio_resources(
+            capsule.active.as_mut().expect("active owner installed"),
+            &capsule.device,
+            &capsule.iommu,
+            capsule.ioas.as_ref().expect("IOAS acquired").id,
+            info,
+            operation,
+            &mut capsule.acquisition,
+            capsule
+                .containment
+                .as_mut()
+                .expect("guarded gate has containment ledger"),
+        )?;
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .transition(RunPhase::Contained, RunPhase::MappedDmaDisabled)?;
+        record_sae_stage("vfio_dma_resources_mapped core_arenas=10 dma_bytes=126976 bar_pages=4");
+        verify_pci_dma_disabled(bdf)?;
+        let global = wfdma.read(0xd4208)?;
+        let host_irq = wfdma.read(0xd4204)?;
+        let mac_irq = pcie_mac.read(0x10188)?;
+        if global & 0xf != 0 || host_irq != 0 || mac_irq != 0 {
+            return Err(format!(
+                "pre-BME state unsafe global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(&format!(
+            "vfio_dma_pre_bme_verified global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x} bme=false"
+        ));
+        let active = capsule.active.as_mut().expect("active owner installed");
+        record_sae_stage("vfio_wfdma_prep_begin");
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::Wfdma);
+        let disabled =
+            global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+        wfdma.write_active_wfdma(0xd4208, disabled)?;
+        let disable_deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while wfdma.read(0xd4208)? & ((1 << 1) | (1 << 3)) != 0 {
+            if Instant::now() >= disable_deadline {
+                return Err("WFDMA did not quiesce during contained preparation".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let global_ext = wfdma.read(0xd42b0)?;
+        if global_ext == u32::MAX {
+            return Err("WFDMA extended configuration returned all ones".into());
+        }
+        wfdma.write_active_wfdma(0xd42b0, global_ext & !(1 << 6))?;
+        active
+            .dmashdl
+            .as_ref()
+            .expect("mapped")
+            .enable_dmashdl_bypass()?;
+        let reset = wfdma.read(0xd4100)?;
+        if reset == u32::MAX {
+            return Err("WFDMA reset control returned all ones".into());
+        }
+        wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
+        wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
+        {
+            let mut transport = VfioGlobalTxRings { page: wfdma };
+            prepare_global_tx_rings(
+                &mut transport,
+                active.tx_guard.as_ref().expect("mapped").iova,
+                active.fwdl_ring.as_ref().expect("mapped").iova,
+                active.mcu_tx_ring.as_ref().expect("mapped").iova,
+                |_| {},
+            )
+            .map_err(|error| format!("prepare contained TX rings: {error:?}"))?;
+        }
+        {
+            let mut transport = VfioGlobalRxRings { page: wfdma };
+            prepare_global_rx_rings(
+                &mut transport,
+                active.rx_guard.as_ref().expect("mapped").iova,
+                active.mcu_rx_ring.as_ref().expect("mapped").iova,
+                |_| {},
+            )
+            .map_err(|error| format!("prepare contained RX rings: {error:?}"))?;
+            wfdma.write_rx_ring_slot(
+                4,
+                active.mcu_wa_rx_ring.as_ref().expect("mapped").iova as u32,
+                8,
+                7,
+                0,
+            )?;
+        }
+        record_sae_stage("vfio_dma_ring_mmio_prepared tx=18 rx=8 wa_rx=1 dma_enabled=false");
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::DeviceIrq);
+        active.irq = Some(VfioIrq::install(&capsule.device, selected_irq)?);
+        if active
+            .irq
+            .as_ref()
+            .expect("IRQ installed")
+            .try_read()?
+            .is_some()
+        {
+            return Err("unexpected IRQ before contained source enable".into());
+        }
+        if wfdma.read(0xd4200)? != 0 {
+            return Err("nonzero host interrupt status during contained preparation".into());
+        }
+        wfdma.write_active_wfdma(0xd42f0, 0)?;
+        wfdma.write_active_wfdma(0xd4680, 4)?;
+        wfdma.write_active_wfdma(0xd4688, 0x0040_0004)?;
+        wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
+        wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
+        wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .mark_possibly_active(Hazard::BusMaster);
+        record_sae_stage("vfio_dma_bme_enable_before");
+        set_pci_bus_master(bdf, true)?;
+        record_sae_stage("vfio_dma_bme_enable_after bme=true wfdma_enabled=false");
+        let prepared_global = wfdma.read(0xd4208)?;
+        let prepared_host_irq = wfdma.read(0xd4204)?;
+        let prepared_mac_irq = pcie_mac.read(0x10188)?;
+        if prepared_global & 0xf != 0 || prepared_host_irq != 0 || prepared_mac_irq != 0 {
+            return Err(format!(
+                "prepared transport escaped disabled state global={prepared_global:#010x} host_irq={prepared_host_irq:#010x} mac_irq={prepared_mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(
+            "vfio_wfdma_prep_complete engines=false host_irq=false mac_irq=false bme=true msi_owned=true",
+        );
+        record_sae_stage("vfio_wfdma_activation_begin");
+        let enabled = prepared_global
+            | (1 << 0)
+            | (1 << 2)
+            | (3 << 4)
+            | (1 << 6)
+            | (1 << 11)
+            | (1 << 12)
+            | (1 << 13)
+            | (1 << 15)
+            | (1 << 21)
+            | (1 << 28)
+            | (1 << 30);
+        pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
+        wfdma.write_active_wfdma(0xd4208, enabled)?;
+        wfdma.write_active_wfdma(0xd4204, firmware_bootstrap_rx_irq_mask())?;
+        let mut top = VfioTopOwnership {
+            selector: active.selector_page.as_ref().expect("mapped"),
+            window: active.dynamic_window.as_ref().expect("mapped"),
+            start: Instant::now(),
+            saved: Cell::new(None),
+        };
+        acquire_top_driver_ownership(&mut top, |_| {})
+            .map_err(|error| format!("contained MT_TOP ownership: {error:?}"))?;
+        pcie_mac.disable_pcie_l0s()?;
+        active
+            .swdef
+            .as_ref()
+            .expect("mapped")
+            .write_swdef_normal()?;
+        let active_global = wfdma.read(0xd4208)?;
+        let active_host_irq = wfdma.read(0xd4204)?;
+        let active_mac_irq = pcie_mac.read(0x10188)?;
+        if active_global & 0x5 != 0x5
+            || active_host_irq != firmware_bootstrap_rx_irq_mask()
+            || active_mac_irq != 0xff
+        {
+            return Err(format!(
+                "transport activation mismatch global={active_global:#010x} host_irq={active_host_irq:#010x} mac_irq={active_mac_irq:#010x}"
+            ));
+        }
+        record_sae_stage(
+            "vfio_wfdma_activation_complete engines=true host_irq=wm_wm2 mac_irq=true top_owned=true l0s_disabled=true swdef_normal=true firmware_published=false",
+        );
+        capsule
+            .containment
+            .as_mut()
+            .expect("guarded gate has containment ledger")
+            .transition(
+                RunPhase::MappedDmaDisabled,
+                RunPhase::DmaAndResponseIrqEnabled,
+            )?;
+        if let Some((patch_bytes, ram_bytes)) = firmware_images {
+            record_sae_stage("vfio_firmware_transport_ready");
+            let signal = ActiveSignalGuard::install()?;
+            let conn = ReadPage::map(&capsule.device, info, 0xe0000, true)?;
+            let mcu = ActiveMcuIo {
+                wfdma,
+                irq: active.irq.as_mut().expect("IRQ installed"),
+                signal: &signal,
+                tx_ring: active.mcu_tx_ring.as_mut().expect("mapped"),
+                payload: active.command_payload.as_mut().expect("mapped"),
+                wm: ActiveMcuRx {
+                    rx_ring: active.mcu_rx_ring.as_mut().expect("mapped"),
+                    rx_buffers: active.mcu_rx_buffers.as_ref().expect("mapped"),
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 0,
+                    rx_count: 8,
+                    irq_bit: WM_RX_IRQ_BIT,
+                },
+                wm2: Some(ActiveMcuRx {
+                    rx_ring: active.mcu_wa_rx_ring.as_mut().expect("mapped"),
+                    rx_buffers: active.mcu_wa_rx_buffers.as_ref().expect("mapped"),
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 4,
+                    rx_count: 8,
+                    irq_bit: WM2_RX_IRQ_BIT,
+                }),
+                extra_irq_mask: 0,
+                unsolicited: Vec::new(),
+                normal_rx_frames: Vec::new(),
+                descriptor_provenance: DescriptorProvenance::new(),
+            };
+            let mut loader = VfioFirmwareLoader {
+                mcu,
+                conn: &conn,
+                pcie_mac,
+                bdf,
+                fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
+                fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
+                sequence: 0,
+                command_index: 0,
+                fwdl_index: 0,
+                pending_scatter: None,
+                start: Instant::now(),
+            };
+            let patch = Patch::parse(patch_bytes)
+                .map_err(|error| format!("parse patch for contained loader: {error:?}"))?;
+            let firmware = Firmware::parse(ram_bytes)
+                .map_err(|error| format!("parse RAM for contained loader: {error:?}"))?;
+            #[cfg(feature = "fuchsia-passive")]
+            let report = if operation == Operation::RunOneShotPassiveChannel1 {
+                load_mt7921_firmware_with_passive_boundary(
+                    &mut loader,
+                    patch,
+                    firmware,
+                    |loader, report| {
+                        capsule
+                            .containment
+                            .as_mut()
+                            .expect("active MCU operation has containment ledger")
+                            .transition(
+                                RunPhase::DmaAndResponseIrqEnabled,
+                                RunPhase::FirmwareReady,
+                            )?;
+                        let mechanics = VfioPassiveMechanics {
+                            loader,
+                            ledger: capsule
+                                .containment
+                                .as_mut()
+                                .expect("active MCU operation has containment ledger"),
+                            data: ActiveMcuRx {
+                                rx_ring: active.data_rx_ring.as_mut().expect("mapped"),
+                                rx_buffers: active.data_rx_buffers.as_ref().expect("mapped"),
+                                rx_tail: 0,
+                                rx_head: 7,
+                                rx_ring_index: 2,
+                                rx_count: 8,
+                                irq_bit: DATA_RX_IRQ_BIT,
+                            },
+                            mac_pages: &active.passive_window_pages,
+                            scan_started: None,
+                            pending_scan_done: None,
+                            advertisements: Vec::new(),
+                            tx_completions: Vec::new(),
+                        };
+                        let transport =
+                            SourceExactPassiveTransport::new(mechanics, report.nic_capability)
+                                .map_err(|error| error.to_string())?;
+                        let channel = passive_channel
+                            .ok_or("contained passive scan omitted its selected channel")?;
+                        let mut adapter = Mt7921SoftmacAdapter::new(
+                            transport,
+                            report.nic_capability,
+                            candidate_channels(report.nic_capability),
+                            vec![channel],
+                        )
+                        .map_err(|error| error.to_string())?;
+                        adapter
+                            .set_channel(WlanSoftmacBaseSetChannelRequest {
+                                primary: Some(channel),
+                                bandwidth: Some(ChannelBandwidth::Cbw20),
+                                vht_secondary_80_channel: None,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        record_sae_stage(
+                            &format!(
+                                "vfio_passive_receive_setup_ready channel={} frequency_mhz={} dwell_min_ms=150 dwell_max_ms=250 intentional_tx=false",
+                                channel.number,
+                                if channel.band == WlanBand::TwoGhz {
+                                    if channel.number == 14 {
+                                        2484
+                                    } else {
+                                        2407 + u16::from(channel.number) * 5
+                                    }
+                                } else {
+                                    5000 + u16::from(channel.number) * 5
+                                },
+                            ),
+                        );
+                        let response = adapter
+                            .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+                                channels: Some(vec![channel]),
+                                min_channel_time: Some(150_000_000),
+                                max_channel_time: Some(250_000_000),
+                                min_home_time: Some(0),
+                            })
+                            .map_err(|error| error.to_string())?;
+                        let scan_id = response.scan_id.ok_or("passive scan omitted id")?;
+                        let mut observations = 0usize;
+                        let success = loop {
+                            match adapter.next_scan_event().map_err(|error| error.to_string())? {
+                                Some(HardwareScanEvent::Observation(observation)) => {
+                                    observations += 1;
+                                    println!(
+                                        r#"{{"passive_scan_observation":{{"scan_id":{scan_id},"value":"{observation:?}"}}}}"#
+                                    );
+                                }
+                                Some(HardwareScanEvent::Complete {
+                                    scan_id: completed,
+                                    success,
+                                }) if completed == scan_id => break success,
+                                Some(HardwareScanEvent::Complete {
+                                    scan_id: completed,
+                                    ..
+                                }) => {
+                                    return Err(format!(
+                                        "passive completion id {completed} did not match {scan_id}"
+                                    ));
+                                }
+                                None => {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        };
+                        if !success || observations == 0 {
+                            return Err(format!(
+                                "passive channel {} result success={success} observations={observations}",
+                                channel.number,
+                            ));
+                        }
+                        record_sae_stage(&format!(
+                            "vfio_passive_observation_ready channel={} scan_id={scan_id} observations={observations}",
+                            channel.number,
+                        ));
+                        Ok(())
+                    },
+                )
+            } else {
+                load_mt7921_firmware(&mut loader, patch, firmware)
+            }
+            .map_err(|error| format!("contained passive firmware initialization: {error:?}"))?;
+            record_sae_stage(&format!(
+                "vfio_firmware_passive_init_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom_valid={} clc_rules={} special_unii_mask={:#04x} passive_rx={} probe_tx=false management_tx=false data_tx=false sae=false",
+                report.patch_sections,
+                report.ram_regions,
+                report.scatter_chunks,
+                report.nic_capability.element_count,
+                report.eeprom_hardware.valid,
+                report.clc_rules_applied,
+                report.special_unii_mask,
+                operation == Operation::RunOneShotPassiveChannel1,
+            ));
+        }
+        Ok(())
+    })();
+
+    let mut cleanup = Vec::new();
+    record_sae_stage("vfio_dma_cleanup_begin");
+    if let Err(error) = wfdma.write_active_wfdma(0xd4204, 0) {
+        cleanup.push(format!("mask host IRQ: {error}"));
+    }
+    if let Err(error) = pcie_mac.write_pcie_mac_interrupt_enable_zero() {
+        cleanup.push(format!("mask PCIe MAC IRQ: {error}"));
+    }
+    match wfdma.read(0xd4208) {
+        Ok(global) if global != u32::MAX => {
+            let disabled =
+                global & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+            if let Err(error) = wfdma.write_active_wfdma(0xd4208, disabled) {
+                cleanup.push(format!("disable WFDMA: {error}"));
+            }
+        }
+        Ok(_) => cleanup.push("disable WFDMA: all-ones readback".into()),
+        Err(error) => cleanup.push(format!("read WFDMA for disable: {error}")),
+    }
+    let idle_deadline = Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        match wfdma.read(0xd4208) {
+            Ok(global) if global & 0xa == 0 => break,
+            Ok(global) if Instant::now() >= idle_deadline => {
+                cleanup.push(format!(
+                    "WFDMA busy during contained cleanup: {global:#010x}"
+                ));
+                break;
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(error) => {
+                cleanup.push(format!("read WFDMA idle state: {error}"));
+                break;
+            }
+        }
+    }
+    if let Err(error) = set_pci_bus_master(bdf, false) {
+        cleanup.push(format!("disable BME: {error}"));
+    }
+    if let Some(irq) = capsule
+        .active
+        .as_mut()
+        .and_then(|active| active.irq.as_mut())
+        && let Err(error) = irq.disable()
+    {
+        cleanup.push(format!("disable MSI: {error}"));
+    }
+    record_sae_stage("vfio_dma_cleanup_masks_and_bme_disabled");
+    let release_errors = capsule.release_observable();
+    if !release_errors.is_empty() {
+        cleanup.push(format!("resource release: {release_errors:?}"));
+    }
+    record_sae_stage("vfio_dma_resources_unmapped_before_reset");
+    if let Err(error) = reset_vfio_device(&capsule.device) {
+        cleanup.push(format!("VFIO containment reset: {error}"));
+    }
+    let safe = verify_active_reset_containment(wfdma, pcie_mac)
+        .and_then(|()| verify_pci_dma_disabled(bdf));
+    match &safe {
+        Ok(()) => record_sae_stage("vfio_dma_safe_state_verified"),
+        Err(error) => {
+            cleanup.push(format!("safe-state verification: {error}"));
+            record_sae_stage("vfio_dma_safe_state_unproven_retaining");
+            park_retention_capsule_ref(capsule);
+        }
+    }
+    if safe.is_ok() {
+        if let Some(ledger) = capsule.containment.as_mut() {
+            for hazard in [
+                Hazard::DmaMapping,
+                Hazard::BusMaster,
+                Hazard::Wfdma,
+                Hazard::DeviceIrq,
+                Hazard::HostControl,
+                Hazard::LabMutated,
+            ] {
+                ledger.confirm_inactive(hazard);
+            }
+            ledger.phase = RunPhase::Contained;
+        }
+    }
+    match (primary, cleanup.is_empty()) {
+        (Ok(()), true) => {
+            record_sae_stage("vfio_dma_resource_round_trip_complete");
+            Ok(())
+        }
+        (Err(primary), true) => Err(primary),
+        (Ok(()), false) => Err(format!("DMA cleanup errors: {cleanup:?}")),
+        (Err(primary), false) => Err(format!("{primary}; DMA cleanup errors: {cleanup:?}")),
+    }
+}
+
 pub fn main() {
     if let Err(message) = run() {
         eprintln!("mt7921-vfio-read: {message}");
@@ -758,7 +1288,8 @@ fn live_client_support(query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientS
 }
 
 fn run() -> Result<(), String> {
-    let operation = match env::args().nth(1).as_deref() {
+    let operation_argument = env::args().nth(1);
+    let operation = match operation_argument.as_deref() {
         None => Operation::ReadFixed,
         Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
         Some("--read-dynamic-identity") => Operation::ReadDynamicIdentity,
@@ -776,6 +1307,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channel-1") => Operation::RunOneShotPassiveChannel1,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-one-shot-passive-channel") => Operation::RunOneShotPassiveChannel1,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-channels-1-6") => Operation::RunOneShotPassiveChannels1And6,
         #[cfg(feature = "fuchsia-passive")]
@@ -795,6 +1328,79 @@ fn run() -> Result<(), String> {
         #[cfg(not(feature = "fuchsia-passive"))]
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
+    };
+    #[cfg(feature = "fuchsia-passive")]
+    let contained_passive_channel = if operation == Operation::RunOneShotPassiveChannel1 {
+        let number = if operation_argument.as_deref() == Some("--run-one-shot-passive-channel") {
+            env::args()
+                .nth(2)
+                .ok_or("--run-one-shot-passive-channel requires a channel")?
+                .parse::<u8>()
+                .map_err(|_| "invalid passive channel")?
+        } else {
+            1
+        };
+        let band = if (1..=14).contains(&number) {
+            WlanBand::TwoGhz
+        } else if matches!(
+            number,
+            36 | 40
+                | 44
+                | 48
+                | 52
+                | 56
+                | 60
+                | 64
+                | 100
+                | 104
+                | 108
+                | 112
+                | 116
+                | 120
+                | 124
+                | 128
+                | 132
+                | 136
+                | 140
+                | 144
+                | 149
+                | 153
+                | 157
+                | 161
+                | 165
+        ) {
+            WlanBand::FiveGhz
+        } else {
+            return Err(format!("unsupported bounded passive channel {number}"));
+        };
+        Some(ChannelNumber { band, number })
+    } else {
+        None
+    };
+    #[cfg(feature = "fuchsia-passive")]
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage(match operation {
+            Operation::RunOneShotFirmware => "vfio_firmware_process_started",
+            Operation::RunOneShotPassiveChannel1 => "vfio_passive_process_started",
+            _ => "process_enter",
+        });
+    }
+    let contained_firmware_images = if matches!(
+        operation,
+        Operation::RunOneShotFirmware | Operation::RunOneShotPassiveChannel1
+    ) {
+        let patch = decompress_patch()?;
+        let ram = decompress_ram()?;
+        Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+        Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+        record_sae_stage(if operation == Operation::RunOneShotPassiveChannel1 {
+            "vfio_passive_artifacts_ready"
+        } else {
+            "vfio_firmware_artifacts_ready"
+        });
+        Some((patch, ram))
+    } else {
+        None
     };
     #[cfg(feature = "fuchsia-passive")]
     let power_target = if matches!(
@@ -819,6 +1425,10 @@ fn run() -> Result<(), String> {
     let mut sae_credential = (operation == Operation::RunOneShotSaeAuth)
         .then(read_sae_credential)
         .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    if operation == Operation::RunOneShotSaeAuth {
+        record_sae_stage("credential_read");
+    }
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -826,11 +1436,18 @@ fn run() -> Result<(), String> {
         .is_active_mcu()
         .then(verify_external_watchdog_armed)
         .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("watchdog_verified");
+    }
     let containment = operation
         .is_active_mcu()
         .then(|| ContainmentLedger::acquire(watchdog))
         .transpose()?;
 
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("vfio_cdev_open_before");
+    }
     let device = Arc::new(
         OpenOptions::new()
             .read(true)
@@ -838,6 +1455,10 @@ fn run() -> Result<(), String> {
             .open(&vfio)
             .map_err(|error| format!("open {vfio}: {error}"))?,
     );
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("vfio_cdev_open_after");
+        record_sae_stage("iommufd_open_before");
+    }
     let iommu = Arc::new(
         OpenOptions::new()
             .read(true)
@@ -845,13 +1466,24 @@ fn run() -> Result<(), String> {
             .open("/dev/iommu")
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("iommufd_open_after");
+    }
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("second_pci_identity_before");
+    }
     verify_pci_identity(&bdf)?;
-    verify_pci_dma_disabled(&bdf)?;
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage("second_pci_identity_after");
+    }
+    if !operation.uses_contained_transport_gate() {
+        verify_pci_dma_disabled(&bdf)?;
+    }
 
-    let base_acquisition = (|| -> Result<RegionInfo, String> {
+    let base_acquisition = (|| -> Result<Option<RegionInfo>, String> {
         capsule.acquisition.record(AcquisitionIntent::BindIommu)?;
         let mut bind = Bind {
             argsz: size::<Bind>(),
@@ -861,12 +1493,18 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::VfioBound);
         }
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("vfio_bind_iommufd_before");
+        }
         ioctl_mut(
             capsule.device.as_raw_fd(),
             VFIO_DEVICE_BIND_IOMMUFD,
             &mut bind,
             "bind iommufd",
         )?;
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("vfio_bind_iommufd_after");
+        }
         capsule
             .acquisition
             .record(AcquisitionIntent::AllocateIoas)?;
@@ -877,12 +1515,18 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAllocated);
         }
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("ioas_allocate_before");
+        }
         ioctl_mut(
             capsule.iommu.as_raw_fd(),
             IOMMU_IOAS_ALLOC,
             &mut alloc,
             "allocate IOAS",
         )?;
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("ioas_allocate_after");
+        }
         capsule.ioas = Some(Ioas {
             fd: Arc::clone(&capsule.iommu),
             id: alloc.out_ioas_id,
@@ -897,12 +1541,735 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAttached);
         }
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("vfio_attach_iommufd_pt_before");
+        }
         ioctl_mut(
             capsule.device.as_raw_fd(),
             VFIO_DEVICE_ATTACH_IOMMUFD_PT,
             &mut attach,
             "attach IOAS",
         )?;
+        capsule.ioas_attached = true;
+        if operation.uses_contained_transport_gate() {
+            record_sae_stage("vfio_attach_iommufd_pt_after");
+        }
+
+        if operation.uses_contained_transport_gate() {
+            verify_pci_dma_disabled(&bdf).map_err(|error| {
+                format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
+            })?;
+            record_sae_stage("vfio_attached_d0_preflight_already_ready");
+
+            let mut device_info = DeviceInfo {
+                argsz: size::<DeviceInfo>(),
+                ..Default::default()
+            };
+            record_sae_stage(&format!(
+                "vfio_device_get_info_before argsz={}",
+                device_info.argsz
+            ));
+            if let Err(error) = ioctl_mut(
+                capsule.device.as_raw_fd(),
+                VFIO_DEVICE_GET_INFO,
+                &mut device_info,
+                "query VFIO device info",
+            ) {
+                record_sae_stage(&format!(
+                    "vfio_device_get_info_error argsz={} error={error}",
+                    device_info.argsz
+                ));
+                return Err(error);
+            }
+            record_sae_stage(&format!(
+                "vfio_device_get_info_after argsz={} flags={:#x} num_regions={} num_irqs={}",
+                device_info.argsz,
+                device_info.flags,
+                device_info.num_regions,
+                device_info.num_irqs
+            ));
+
+            let mut bar0 = None;
+            for index in 0..device_info.num_regions {
+                let mut region = RegionInfo {
+                    argsz: size::<RegionInfo>(),
+                    index,
+                    ..Default::default()
+                };
+                record_sae_stage(&format!(
+                    "vfio_device_get_region_info_before index={index} argsz={}",
+                    region.argsz
+                ));
+                if unsafe {
+                    ioctl(
+                        capsule.device.as_raw_fd(),
+                        VFIO_DEVICE_GET_REGION_INFO,
+                        &mut region,
+                    )
+                } < 0
+                {
+                    let io_error = std::io::Error::last_os_error();
+                    if io_error.raw_os_error() == Some(22) && index != 0 && index != 7 {
+                        record_sae_stage(&format!(
+                            "vfio_device_get_region_info_absent index={index} argsz={} errno=22",
+                            region.argsz
+                        ));
+                        continue;
+                    }
+                    let error = format!("query VFIO region: {io_error}");
+                    record_sae_stage(&format!(
+                        "vfio_device_get_region_info_error index={index} argsz={} error={error}",
+                        region.argsz
+                    ));
+                    return Err(error);
+                }
+                record_sae_stage(&format!(
+                    "vfio_device_get_region_info_after index={index} argsz={} flags={:#x} cap_offset={} size={} offset={}",
+                    region.argsz, region.flags, region.cap_offset, region.size, region.offset
+                ));
+                if index == BAR0_REGION {
+                    bar0 = Some(region);
+                }
+            }
+            record_sae_stage("vfio_region_discovery_complete");
+            let bar0 = bar0.ok_or("required BAR0 region was not discovered")?;
+            let selector_page = MT_HIF_REMAP_L1_BAR_OFFSET & !(PAGE - 1);
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_before page={selector_page:#x} length={} prot=read_write flags=shared region_size={} region_offset={}",
+                PAGE, bar0.size, bar0.offset
+            ));
+            let mut page = match ReadPage::map(&capsule.device, &bar0, selector_page, true) {
+                Ok(page) => page,
+                Err(error) => {
+                    record_sae_stage(&format!(
+                        "vfio_bar0_mmap_error page={selector_page:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+            };
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_after page={selector_page:#x} length=4096"
+            ));
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length={} prot=read_write flags=shared region_size={} region_offset={}",
+                PAGE, bar0.size, bar0.offset
+            ));
+            let mut window = match ReadPage::map(
+                &capsule.device,
+                &bar0,
+                MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+                true,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    record_sae_stage(&format!(
+                        "vfio_bar0_mmap_error page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+            };
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_after page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
+            record_sae_stage(&format!(
+                "vfio_remap_selector_read_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+            ));
+            let saved_selector = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
+                Ok(value) => value,
+                Err(error) => {
+                    record_sae_stage(&format!(
+                        "vfio_remap_selector_read_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+            };
+            record_sae_stage(&format!(
+                "vfio_remap_selector_saved offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+            ));
+            let selected = (saved_selector & !0xffff) | 0x7001;
+            let identity = (|| -> Result<(u32, u32, u32, u32, u32), String> {
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} saved={saved_selector:#010x} value={selected:#010x} base=0x7001"
+                ));
+                if let Err(error) = page.write_remap_selector(selected) {
+                    record_sae_stage(&format!(
+                        "vfio_remap_selector_select_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={selected:#010x}"
+                ));
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_verify_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+                ));
+                let verified = page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_verify_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={verified:#010x} base={:#06x}",
+                    verified & 0xffff
+                ));
+                if verified & 0xffff != 0x7001 {
+                    return Err(format!(
+                        "L1 selector did not retain 0x7001: {verified:#010x}"
+                    ));
+                }
+
+                let chip_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0200;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=chip_id physical=0x70010200 bar_offset={chip_offset:#x}"
+                ));
+                let chip_id = match window.read(chip_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=chip_id physical=0x70010200 bar_offset={chip_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=chip_id physical=0x70010200 bar_offset={chip_offset:#x} value={chip_id:#010x}"
+                ));
+                if chip_id == u32::MAX {
+                    return Err("MT_HW_CHIPID returned all ones".into());
+                }
+                if chip_id != 0x7961 {
+                    return Err(format!(
+                        "MT_HW_CHIPID is {chip_id:#010x}, expected 0x00007961"
+                    ));
+                }
+
+                let bound_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0020;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x}"
+                ));
+                let hardware_bound = match window.read(bound_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=hardware_bound physical=0x70010020 bar_offset={bound_offset:#x} value={hardware_bound:#010x}"
+                ));
+                if hardware_bound == u32::MAX {
+                    return Err("MT_HW_BOUND returned all ones".into());
+                }
+
+                let revision_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0204;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=revision physical=0x70010204 bar_offset={revision_offset:#x}"
+                ));
+                let revision = match window.read(revision_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=revision physical=0x70010204 bar_offset={revision_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=revision physical=0x70010204 bar_offset={revision_offset:#x} value={revision:#010x}"
+                ));
+                if revision == u32::MAX {
+                    return Err("MT_HW_REV returned all ones".into());
+                }
+                let effective_chip_id = if hardware_bound & (1 << 7) != 0 {
+                    0x7920
+                } else {
+                    chip_id
+                };
+                let composite_revision = (effective_chip_id << 16) | (revision & 0xff);
+                Ok((
+                    chip_id,
+                    hardware_bound,
+                    revision,
+                    effective_chip_id,
+                    composite_revision,
+                ))
+            })();
+
+            record_sae_stage(&format!(
+                "vfio_remap_selector_restore_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+            ));
+            let restore_write = page.write_remap_selector(saved_selector);
+            match &restore_write {
+                Ok(()) => record_sae_stage(&format!(
+                    "vfio_remap_selector_restore_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+                )),
+                Err(error) => record_sae_stage(&format!(
+                    "vfio_remap_selector_restore_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                )),
+            }
+            restore_write?;
+            record_sae_stage(&format!(
+                "vfio_remap_selector_restore_verify_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+            ));
+            let restored = page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+            record_sae_stage(&format!(
+                "vfio_remap_selector_restore_verify_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={restored:#010x} expected={saved_selector:#010x} equal={}",
+                restored == saved_selector
+            ));
+            if restored != saved_selector {
+                return Err(format!(
+                    "L1 selector restore mismatch: saved={saved_selector:#010x} restored={restored:#010x}"
+                ));
+            }
+            let (chip_id, hardware_bound, revision, effective_chip_id, composite_revision) =
+                identity?;
+            record_sae_stage(&format!(
+                "vfio_dynamic_identity_complete chip_id={chip_id:#010x} hardware_bound={hardware_bound:#010x} revision={revision:#010x} effective_chip_id={effective_chip_id:#010x} composite_revision={composite_revision:#010x}"
+            ));
+
+            record_sae_stage("vfio_post_identity_pci_preflight_before config_bytes=256");
+            let config_path = format!("/sys/bus/pci/devices/{bdf}/config");
+            let mut config_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config_path)
+                .map_err(|error| format!("open post-identity PCI config: {error}"))?;
+            let mut config = [0u8; 256];
+            config_file
+                .read_exact(&mut config)
+                .map_err(|error| format!("read post-identity PCI config: {error}"))?;
+            let command = u16::from_le_bytes(config[4..6].try_into().expect("fixed field"));
+            let mut capability = usize::from(config[0x34] & !3);
+            let mut power = None;
+            for _ in 0..48 {
+                if capability < 0x40 || capability + 6 > config.len() {
+                    break;
+                }
+                if config[capability] == 1 {
+                    let pmcsr = u16::from_le_bytes(
+                        config[capability + 4..capability + 6]
+                            .try_into()
+                            .expect("fixed field"),
+                    );
+                    power = Some((capability, pmcsr));
+                    break;
+                }
+                capability = usize::from(config[capability + 1] & !3);
+            }
+            let (pm_capability_offset, pmcsr) =
+                power.ok_or("post-identity PCI PM capability is absent")?;
+            let mse = command & (1 << 1) != 0;
+            let bme = command & (1 << 2) != 0;
+            let power_state = pmcsr & 3;
+            record_sae_stage(&format!(
+                "vfio_post_identity_pci_preflight_after command={command:#06x} pm_capability_offset={pm_capability_offset:#04x} pmcsr={pmcsr:#06x} mse={mse} bme={bme} power_state={power_state}"
+            ));
+            if !mse || bme {
+                return Err(format!(
+                    "post-identity PCI command requires MSE=1 BME=0, read {command:#06x}"
+                ));
+            }
+            if power_state != 0 {
+                return Err(format!(
+                    "post-identity PCI device is not in D0: PMCSR {pmcsr:#06x}"
+                ));
+            }
+            let device_path = std::fs::canonicalize(format!("/sys/bus/pci/devices/{bdf}"))
+                .map_err(|error| format!("resolve PCI device path: {error}"))?;
+            let parent_path = device_path
+                .parent()
+                .ok_or("PCI endpoint has no parent bridge")?;
+            let parent_bdf = parent_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("PCI parent bridge path is invalid")?;
+            let mut parent_config = [0u8; 256];
+            File::open(parent_path.join("config"))
+                .and_then(|mut file| file.read_exact(&mut parent_config))
+                .map_err(|error| format!("read parent PCI config {parent_bdf}: {error}"))?;
+            let aspm_supported = mt76_pci_aspm_supported(&config, Some(&parent_config))
+                .map_err(|error| format!("parse PCIe Link Control: {error:?}"))?;
+            record_sae_stage(&format!(
+                "vfio_ownership_aspm_predicate endpoint={bdf} parent={parent_bdf} supported={aspm_supported}"
+            ));
+
+            let selected_command = command | 0x0400;
+            let intx_disable = (|| -> Result<(), String> {
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_write_before offset=0x04 bytes=2 saved={command:#06x} value={selected_command:#06x}"
+                ));
+                config_file
+                    .seek(SeekFrom::Start(4))
+                    .and_then(|_| config_file.write_all(&selected_command.to_le_bytes()))
+                    .map_err(|error| format!("write PCI INTx disable: {error}"))?;
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_write_after offset=0x04 bytes=2 value={selected_command:#06x}"
+                ));
+                record_sae_stage("vfio_pci_intx_disable_verify_before offset=0x04 bytes=2");
+                let mut raw = [0u8; 2];
+                config_file
+                    .seek(SeekFrom::Start(4))
+                    .and_then(|_| config_file.read_exact(&mut raw))
+                    .map_err(|error| format!("read PCI INTx disable: {error}"))?;
+                let readback = u16::from_le_bytes(raw);
+                record_sae_stage(&format!(
+                    "vfio_pci_intx_disable_verify_after offset=0x04 bytes=2 value={readback:#06x} expected={selected_command:#06x} equal={}",
+                    readback == selected_command
+                ));
+                if readback != selected_command {
+                    return Err(format!(
+                        "PCI INTx disable mismatch: expected {selected_command:#06x}, read {readback:#06x}"
+                    ));
+                }
+
+                let mut capabilities = Vec::new();
+                for (index, kind) in [PciIrqKind::Intx, PciIrqKind::Msi, PciIrqKind::Msix]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut irq = IrqInfo {
+                        argsz: size::<IrqInfo>(),
+                        index: index as u32,
+                        ..Default::default()
+                    };
+                    record_sae_stage(&format!(
+                        "vfio_pci_irq_info_query_before index={index} kind={kind:?} argsz={}",
+                        irq.argsz
+                    ));
+                    if let Err(error) = ioctl_mut(
+                        capsule.device.as_raw_fd(),
+                        VFIO_DEVICE_GET_IRQ_INFO,
+                        &mut irq,
+                        "query post-identity VFIO IRQ",
+                    ) {
+                        record_sae_stage(&format!(
+                            "vfio_pci_irq_info_query_error index={index} kind={kind:?} argsz={} error={error}",
+                            irq.argsz
+                        ));
+                        return Err(error);
+                    }
+                    record_sae_stage(&format!(
+                        "vfio_pci_irq_info_query_after index={index} kind={kind:?} argsz={} flags={:#010x} count={}",
+                        irq.argsz, irq.flags, irq.count
+                    ));
+                    capabilities.push(PciIrqCapability {
+                        kind,
+                        count: irq.count,
+                        eventfd: irq.flags & 1 != 0,
+                    });
+                }
+                let selected_irq = select_vfio_irq(&capabilities)
+                    .ok_or("VFIO exposes no eventfd-capable PCI interrupt")?;
+                if selected_irq.kind == PciIrqKind::Intx {
+                    return Err("active MCU preflight selected only level INTx".into());
+                }
+                record_sae_stage(&format!(
+                    "vfio_pci_irq_selection_complete kind={:?} count={} eventfd={}",
+                    selected_irq.kind, selected_irq.count, selected_irq.eventfd
+                ));
+
+                let mut query_info = DeviceInfo {
+                    argsz: size::<DeviceInfo>(),
+                    ..Default::default()
+                };
+                record_sae_stage(&format!(
+                    "vfio_reset_capability_query_before argsz={}",
+                    query_info.argsz
+                ));
+                if let Err(error) = ioctl_mut(
+                    capsule.device.as_raw_fd(),
+                    VFIO_DEVICE_GET_INFO,
+                    &mut query_info,
+                    "query post-identity VFIO device info",
+                ) {
+                    record_sae_stage(&format!(
+                        "vfio_reset_capability_query_error argsz={} error={error}",
+                        query_info.argsz
+                    ));
+                    return Err(error);
+                }
+                record_sae_stage(&format!(
+                    "vfio_reset_capability_query_after argsz={} flags={:#010x} num_regions={} num_irqs={} cap_offset={}",
+                    query_info.argsz,
+                    query_info.flags,
+                    query_info.num_regions,
+                    query_info.num_irqs,
+                    query_info.cap_offset
+                ));
+                if query_info.flags & 0x3 != 0x3 {
+                    return Err(format!(
+                        "VFIO device requires RESET|PCI flags, read {:#010x}",
+                        query_info.flags
+                    ));
+                }
+
+                record_sae_stage(&format!(
+                    "vfio_bar0_mmap_before page=0x10000 length={} prot=read_write flags=shared region_size={} region_offset={}",
+                    PAGE, bar0.size, bar0.offset
+                ));
+                let mut pcie_mac_page = match ReadPage::map(&capsule.device, &bar0, 0x10000, true) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_bar0_mmap_error page=0x10000 error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage("vfio_bar0_mmap_after page=0x10000 length=4096");
+                record_sae_stage("vfio_pcie_mac_int_enable_read_before offset=0x10188 bytes=4");
+                let saved_mac_interrupt_enable = pcie_mac_page.read(0x10188)?;
+                record_sae_stage(&format!(
+                    "vfio_pcie_mac_int_enable_saved offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                ));
+                if saved_mac_interrupt_enable == u32::MAX {
+                    return Err("MT_PCIE_MAC_INT_ENABLE returned all ones".into());
+                }
+                let disable = (|| -> Result<(), String> {
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_write_before offset=0x10188 bytes=4 value=0x00000000",
+                    );
+                    if let Err(error) = pcie_mac_page.write_pcie_mac_interrupt_enable_zero() {
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_zero_write_error offset=0x10188 bytes=4 error={error}"
+                        ));
+                        return Err(error);
+                    }
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_write_after offset=0x10188 bytes=4 value=0x00000000",
+                    );
+                    record_sae_stage(
+                        "vfio_pcie_mac_int_enable_zero_verify_before offset=0x10188 bytes=4",
+                    );
+                    let zero_readback = pcie_mac_page.read(0x10188)?;
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_zero_verify_after offset=0x10188 bytes=4 value={zero_readback:#010x} expected=0x00000000 equal={}",
+                        zero_readback == 0
+                    ));
+                    if zero_readback != 0 {
+                        return Err(format!(
+                            "MT_PCIE_MAC_INT_ENABLE zero readback is {zero_readback:#010x}"
+                        ));
+                    }
+                    Ok(())
+                })();
+
+                let ownership = disable.as_ref().map_or(Ok(()), |_| {
+                    (|| -> Result<(), String> {
+                        record_sae_stage(
+                            "vfio_ownership_round_trip_begin page=0xe0000 offset=0xe0010",
+                        );
+                        let mut conn_page = ReadPage::map(&capsule.device, &bar0, 0xe0000, true)?;
+                        let result = {
+                            let mut transport = VfioOwnership {
+                                page: &conn_page,
+                                start: Instant::now(),
+                            };
+                            round_trip_driver_ownership(
+                                &mut transport,
+                                aspm_supported,
+                                record_ownership_round_trip_stage,
+                            )
+                            .map_err(|error| format!("ownership round trip: {error:?}"))
+                        };
+                        record_sae_stage("vfio_ownership_bar0_munmap_before page=0xe0000");
+                        let unmap = conn_page.teardown();
+                        match &unmap {
+                            Ok(()) => {
+                                record_sae_stage("vfio_ownership_bar0_munmap_after page=0xe0000")
+                            }
+                            Err(error) => record_sae_stage(&format!(
+                                "vfio_ownership_bar0_munmap_error page=0xe0000 error={error}"
+                            )),
+                        }
+                        unmap?;
+                        result?;
+                        record_sae_stage("vfio_ownership_round_trip_passed");
+                        Ok(())
+                    })()
+                });
+
+                let irq_reset = ownership.as_ref().map_or(Ok(()), |_| {
+                    (|| -> Result<(), String> {
+                        record_sae_stage("vfio_irq_reset_boundary_begin");
+                        let mut wfdma_page = ReadPage::map(&capsule.device, &bar0, 0xd4000, true)?;
+                        let result = {
+                            let ledger = capsule
+                                .containment
+                                .as_mut()
+                                .expect("guarded gate has containment ledger");
+                            for hazard in [
+                                Hazard::HostControl,
+                                Hazard::DeviceIrq,
+                                Hazard::Wfdma,
+                                Hazard::LabMutated,
+                            ] {
+                                ledger.mark_possibly_active(hazard);
+                            }
+                            let mut transport = VfioIrqResetBoundary {
+                                wfsys: VfioWfsysReset {
+                                    selector: &page,
+                                    window: &window,
+                                    start: Instant::now(),
+                                    saved: saved_selector,
+                                },
+                                device: &capsule.device,
+                                wfdma: &wfdma_page,
+                                pcie_mac: &pcie_mac_page,
+                                irq: None,
+                                selected: selected_irq,
+                                bdf: &bdf,
+                                ledger,
+                            };
+                            exercise_irq_reset_boundary(
+                                &mut transport,
+                                selected_irq,
+                                record_irq_reset_stage,
+                            )
+                        };
+                        if result.as_ref().is_err_and(|error| {
+                            error
+                                .cleanup
+                                .iter()
+                                .any(|(step, _)| *step == IrqResetCleanupStep::VerifyContained)
+                        }) {
+                            record_sae_stage("vfio_irq_reset_boundary_unsafe_retaining_resources");
+                            park_retention_capsule_ref(&mut capsule);
+                        }
+                        let dma_resources = result.as_ref().map_or(Ok(()), |_| {
+                            run_contained_dma_resource_round_trip(
+                                &mut capsule,
+                                &bar0,
+                                &bdf,
+                                operation,
+                                &wfdma_page,
+                                &pcie_mac_page,
+                                selected_irq,
+                                contained_firmware_images
+                                    .as_ref()
+                                    .map(|(patch, ram)| (patch.as_slice(), ram.as_slice())),
+                                contained_passive_channel,
+                            )
+                        });
+                        record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
+                        wfdma_page.teardown()?;
+                        record_sae_stage("vfio_irq_reset_wfdma_munmap_after page=0xd4000");
+                        result.map_err(|error| format!("IRQ/reset boundary: {error:?}"))?;
+                        dma_resources?;
+                        record_sae_stage("vfio_irq_reset_boundary_passed_contained");
+                        Ok(())
+                    })()
+                });
+
+                let restore = if ownership.is_err() {
+                    record_sae_stage(&format!(
+                        "vfio_pcie_mac_int_enable_restore_write_before offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                    ));
+                    (|| -> Result<Option<u32>, String> {
+                        if let Err(error) = pcie_mac_page
+                            .restore_pcie_mac_interrupt_enable(saved_mac_interrupt_enable)
+                        {
+                            record_sae_stage(&format!(
+                                "vfio_pcie_mac_int_enable_restore_write_error offset=0x10188 bytes=4 error={error}"
+                            ));
+                            return Err(error);
+                        }
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_restore_write_after offset=0x10188 bytes=4 value={saved_mac_interrupt_enable:#010x}"
+                        ));
+                        record_sae_stage(
+                            "vfio_pcie_mac_int_enable_restore_verify_before offset=0x10188 bytes=4",
+                        );
+                        let restored = pcie_mac_page.read(0x10188)?;
+                        record_sae_stage(&format!(
+                            "vfio_pcie_mac_int_enable_restore_verify_after offset=0x10188 bytes=4 value={restored:#010x} expected={saved_mac_interrupt_enable:#010x} equal={}",
+                            restored == saved_mac_interrupt_enable
+                        ));
+                        if restored != saved_mac_interrupt_enable {
+                            return Err(format!(
+                                "MT_PCIE_MAC_INT_ENABLE restore mismatch: saved={saved_mac_interrupt_enable:#010x} restored={restored:#010x}"
+                            ));
+                        }
+                        Ok(Some(restored))
+                    })()
+                } else {
+                    Ok(None)
+                };
+                record_sae_stage("vfio_bar0_munmap_before page=0x10000 length=4096");
+                let unmap = pcie_mac_page.teardown();
+                match &unmap {
+                    Ok(()) => record_sae_stage("vfio_bar0_munmap_after page=0x10000 length=4096"),
+                    Err(error) => record_sae_stage(&format!(
+                        "vfio_bar0_munmap_error page=0x10000 error={error}"
+                    )),
+                }
+                unmap?;
+                let restored_mac_interrupt_enable = restore?;
+                disable?;
+                ownership?;
+                irq_reset?;
+                record_sae_stage(&format!(
+                    "vfio_irq_reset_cleanup_complete saved_mac={saved_mac_interrupt_enable:#010x} restored_on_pre_reset_error={restored_mac_interrupt_enable:?} safe_mac=0x00000000"
+                ));
+                Ok(())
+            })();
+
+            record_sae_stage(&format!(
+                "vfio_pci_command_restore_write_before offset=0x04 bytes=2 value={command:#06x}"
+            ));
+            let restore_write = config_file
+                .seek(SeekFrom::Start(4))
+                .and_then(|_| config_file.write_all(&command.to_le_bytes()))
+                .map_err(|error| format!("restore PCI Command: {error}"));
+            match &restore_write {
+                Ok(()) => record_sae_stage(&format!(
+                    "vfio_pci_command_restore_write_after offset=0x04 bytes=2 value={command:#06x}"
+                )),
+                Err(error) => record_sae_stage(&format!(
+                    "vfio_pci_command_restore_write_error offset=0x04 bytes=2 error={error}"
+                )),
+            }
+            restore_write?;
+            record_sae_stage("vfio_pci_command_restore_verify_before offset=0x04 bytes=2");
+            let mut restored_raw = [0u8; 2];
+            config_file
+                .seek(SeekFrom::Start(4))
+                .and_then(|_| config_file.read_exact(&mut restored_raw))
+                .map_err(|error| format!("verify restored PCI Command: {error}"))?;
+            let restored_command = u16::from_le_bytes(restored_raw);
+            record_sae_stage(&format!(
+                "vfio_pci_command_restore_verify_after offset=0x04 bytes=2 value={restored_command:#06x} expected={command:#06x} equal={}",
+                restored_command == command
+            ));
+            if restored_command != command {
+                return Err(format!(
+                    "PCI Command restore mismatch: saved={command:#06x} restored={restored_command:#06x}"
+                ));
+            }
+            intx_disable?;
+            record_sae_stage(&format!(
+                "vfio_pci_intx_disable_complete selected={selected_command:#06x} restored={restored_command:#06x}"
+            ));
+
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
+            window.teardown()?;
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_after page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_before page={selector_page:#x} length=4096"
+            ));
+            if let Err(error) = page.teardown() {
+                record_sae_stage(&format!(
+                    "vfio_bar0_munmap_error page={selector_page:#x} error={error}"
+                ));
+                return Err(error);
+            }
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_after page={selector_page:#x} length=4096"
+            ));
+            return Ok(None);
+        }
 
         let mut info = RegionInfo {
             argsz: size::<RegionInfo>(),
@@ -943,9 +2310,22 @@ fn run() -> Result<(), String> {
             0xe0000,
             operation.conn_writable(),
         )?);
-        Ok(info)
+        Ok(Some(info))
     })();
     let info = finish_owned_acquisition!(&mut capsule, base_acquisition);
+    if info.is_none() {
+        let release_errors = capsule.release_observable();
+        if !release_errors.is_empty() {
+            record_sae_stage(&format!("vfio_region_discovery_release_error errors={release_errors:?}"));
+            return Err(format!("VFIO discovery release failed: {release_errors:?}"));
+        }
+        if let Some(ledger) = capsule.containment.as_mut() {
+            ledger.phase = RunPhase::Contained;
+        }
+        record_sae_stage("vfio_region_discovery_released_safe");
+        return Ok(());
+    }
+    let info = info.expect("non-discovery operation queried BAR 0");
 
     let device = &capsule.device;
     let iommu = &capsule.iommu;
@@ -1505,6 +2885,7 @@ fn run() -> Result<(), String> {
                 .mark_possibly_active(Hazard::Wfdma);
             wfdma.write_active_wfdma(0xd42f0, 0)?;
             wfdma.write_active_wfdma(0xd4680, 4)?;
+            wfdma.write_active_wfdma(0xd4688, 0x0040_0004)?;
             wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
             wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
             wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
@@ -1555,6 +2936,14 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
             pcie_mac.disable_pcie_l0s()?;
             swdef.write_swdef_normal()?;
+            if operation == Operation::RunOneShotFirmware {
+                println!(
+                    "{{\"firmware_bootstrap_event\":\"transport_ready\",\"bme\":true,\"wfdma_global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\",\"rings\":[\"fwdl_tx\",\"mcu_tx\",\"wm_rx\",\"wm2_rx\"]}}"
+                );
+                std::io::stdout().flush().map_err(|error| {
+                    format!("flush firmware transport-ready milestone: {error}")
+                })?;
+            }
             if operation.loads_firmware() {
                 let (patch_bytes, ram_bytes) = firmware_images
                     .as_ref()
@@ -1592,7 +2981,6 @@ fn run() -> Result<(), String> {
                     mcu,
                     conn: &conn,
                     pcie_mac,
-                    device: &device,
                     bdf: &bdf,
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
@@ -1606,8 +2994,27 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("parse patch for loader: {error:?}"))?;
                 let firmware = Firmware::parse(ram_bytes)
                     .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
+                if operation == Operation::RunOneShotFirmware {
+                    println!(
+                        r#"{{"firmware_bootstrap_event":"begin","patch_version":"{:#010x}","patch_build":"{}","ram_version":"{}","ram_build":"{}","downloadable_regions":{}}}"#,
+                        patch.header.patch_version,
+                        String::from_utf8_lossy(patch.header.build_date).trim_end_matches('\0'),
+                        String::from_utf8_lossy(firmware.trailer.firmware_version)
+                            .trim_end_matches('\0'),
+                        String::from_utf8_lossy(firmware.trailer.build_date).trim_end_matches('\0'),
+                        firmware
+                            .regions()
+                            .filter(|region| region.is_downloadable())
+                            .count(),
+                    );
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|error| format!("flush firmware bootstrap begin: {error}"))?;
+                }
                 #[cfg(feature = "fuchsia-passive")]
-                let result = if operation == Operation::RunOneShotPassivePrepare {
+                let result = if operation == Operation::RunOneShotFirmware {
+                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotPassivePrepare {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
                         patch,
@@ -2073,12 +3480,7 @@ fn run() -> Result<(), String> {
                                             let ring = mgmt_tx_ring
                                                 .as_deref_mut()
                                                 .ok_or("SAE TX ring arena missing")?;
-                                            mechanics.loader.mcu.wfdma.write_tx_ring_slot(
-                                                0,
-                                                ring.iova as u32,
-                                                128,
-                                                0,
-                                            )?;
+                                            println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
                                             mechanics.transmit_one_sae_auth(
                                                 ring,
                                                 mgmt_txwi
@@ -2161,13 +3563,30 @@ fn run() -> Result<(), String> {
                     load_mt7921_firmware(&mut loader, patch, firmware)
                 };
                 #[cfg(not(feature = "fuchsia-passive"))]
-                let result = if operation == Operation::RunOneShotChannelDomain {
+                let result = if operation == Operation::RunOneShotFirmware {
+                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotChannelDomain {
                     load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
                 } else {
                     load_mt7921_firmware(&mut loader, patch, firmware)
                 };
                 let report =
                     result.map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
+                if operation == Operation::RunOneShotFirmware {
+                    println!(
+                        r#"{{"firmware_bootstrap_event":"n9_ready_and_capability_response","download_ready":{},"patch":"{:?}","patch_sections":{},"ram_regions":{},"scatter_chunks":{},"scatter_bytes":{},"capability_elements":{},"eeprom_read":false,"calibration":false,"radio":false}}"#,
+                        report.download_ready_observed,
+                        report.patch,
+                        report.patch_sections,
+                        report.ram_regions,
+                        report.scatter_chunks,
+                        report.scatter_bytes,
+                        report.nic_capability.element_count,
+                    );
+                    std::io::stdout().flush().map_err(|error| {
+                        format!("flush firmware bootstrap ready milestone: {error}")
+                    })?;
+                }
                 println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
                 return Ok(());
             }
@@ -2292,27 +3711,6 @@ fn run() -> Result<(), String> {
         {
             cleanup_errors.push(error);
         }
-        let reset = reset_vfio_device(&device);
-        if reset.is_err() {
-            retain_mappings_for_watchdog("reset while pinned failed");
-        }
-        println!("{{\"active_mcu_event\":\"vfio_device_reset_while_pinned\"}}");
-        if verify_pci_dma_disabled(&bdf)
-            .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
-            .and_then(|()| set_lab_safety("SAFE"))
-            .is_err()
-        {
-            retain_mappings_for_watchdog("post-reset containment verification failed");
-        }
-        for hazard in [
-            Hazard::HostControl,
-            Hazard::DeviceIrq,
-            Hazard::Wfdma,
-            Hazard::BusMaster,
-            Hazard::LabMutated,
-        ] {
-            ledger.confirm_inactive(hazard);
-        }
         let release_errors = attempt_all_cleanup(
             [
                 #[cfg(feature = "fuchsia-passive")]
@@ -2336,8 +3734,46 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("teardown {kind:?}: {error}"))
             },
         );
-        ledger.confirm_inactive(Hazard::DmaMapping);
-        println!("{{\"active_mcu_event\":\"all_dma_mappings_released_after_reset\"}}");
+        if release_errors.is_empty() {
+            ledger.confirm_inactive(Hazard::DmaMapping);
+            println!("{{\"active_mcu_event\":\"dma_mappings_released_before_reset\"}}");
+        } else {
+            println!(
+                "{{\"active_mcu_event\":\"dma_mapping_release_errors_before_reset\",\"count\":{}}}",
+                release_errors.len()
+            );
+        }
+        match reset_vfio_device(&device) {
+            Ok(()) => println!("{{\"active_mcu_event\":\"vfio_device_reset_after_unmap\"}}"),
+            Err(error) => {
+                cleanup_errors.push(format!("VFIO reset after DMA unmap: {error}"));
+                retain_mappings_for_watchdog("reset after DMA unmap failed");
+            }
+        }
+        match verify_pci_dma_disabled(&bdf)
+            .and_then(|()| verify_active_reset_containment(wfdma, pcie_mac))
+            .and_then(|()| set_lab_safety("SAFE"))
+        {
+            Ok(()) => {
+                println!("{{\"active_mcu_event\":\"post_reset_safe_state_verified\"}}");
+                for hazard in [
+                    Hazard::HostControl,
+                    Hazard::DeviceIrq,
+                    Hazard::Wfdma,
+                    Hazard::BusMaster,
+                    Hazard::LabMutated,
+                ] {
+                    ledger.confirm_inactive(hazard);
+                }
+            }
+            Err(error) => {
+                cleanup_errors.push(format!("post-reset safe-state verification: {error}"));
+                retain_mappings_for_watchdog("post-reset containment verification failed");
+            }
+        }
+        if let Err(error) = std::io::stdout().flush() {
+            cleanup_errors.push(format!("flush containment milestones: {error}"));
+        }
         if !release_errors.is_empty() {
             ledger.phase = RunPhase::SafeReleaseError;
             active_terminal_error = Some(match active {
@@ -2688,6 +4124,7 @@ impl ContainmentLedger {
 enum ObservableRelease {
     DmaUnmap,
     BarMunmap,
+    IoasDetach,
     IoasDestroy,
 }
 
@@ -4186,7 +5623,6 @@ struct VfioFirmwareLoader<'a> {
     mcu: ActiveMcuIo<'a>,
     conn: &'a ReadPage,
     pcie_mac: &'a ReadPage,
-    device: &'a File,
     bdf: &'a str,
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
@@ -4289,9 +5725,11 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
         0xd4208 | 0xd4100 | 0xd42b0 => true,
         0xd42f0 => value == 0 || value == 4,
         0xd4680 => value == 4,
+        0xd4688 => value == 0x0040_0004,
         0xd4690 => value == 0x00c0_0004,
         0xd4640 => value == 0x0340_0004,
         0xd4644 => value == 0x0380_0004,
+        0xd4600 => value == 0x0140_0004,
         0xd4308 | 0xd4408 => value < 128,
         0xd4418 => value < 256,
         _ => false,
@@ -5037,6 +6475,19 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        let milestone = match command {
+            DownloadCommand::PatchFinish => Some("patch_published_and_finished"),
+            DownloadCommand::FirmwareStart { .. } => Some("ram_published_firmware_start_acked"),
+            DownloadCommand::GetNicCapability => Some("nic_capability_response"),
+            DownloadCommand::ReadEepromBlock { .. } => Some("eeprom_efuse_acquired"),
+            _ => None,
+        };
+        if let Some(event) = milestone {
+            println!("{{\"firmware_bootstrap_event\":\"{event}\",\"sequence\":{sequence}}}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush firmware command milestone: {error}"))?;
+        }
         Ok(completion)
     }
 
@@ -5092,6 +6543,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        println!(
+            "{{\"firmware_bootstrap_event\":\"clc_calibration_configured\",\"sequence\":{sequence},\"rule_index\":{},\"response\":{}}}",
+            command.index,
+            response.is_some(),
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush CLC/calibration milestone: {error}"))?;
         Ok(response)
     }
 
@@ -5229,7 +6688,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
 
     fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
         self.mcu.cancelled()?;
-        Ok(self.conn.read(0xe00f0)? & 3 == 3)
+        let ready = self.conn.read(0xe00f0)? & 3 == 3;
+        if ready {
+            println!("{{\"firmware_bootstrap_event\":\"n9_ready\"}}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush N9-ready milestone: {error}"))?;
+        }
+        Ok(ready)
     }
 
     fn now_ms(&self) -> u64 {
@@ -5282,17 +6748,10 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             errors.push(error);
         }
         if errors.is_empty() {
-            if reset_vfio_device(self.device).is_err() {
-                retain_mappings_for_watchdog("loader reset while pinned failed");
-            }
-            if verify_pci_dma_disabled(self.bdf)
-                .and_then(|()| verify_active_reset_containment(self.mcu.wfdma, self.pcie_mac))
-                .and_then(|()| set_lab_safety("SAFE"))
-                .is_err()
-            {
-                retain_mappings_for_watchdog("loader post-reset containment verification failed");
-            }
-            println!(r#"{{"active_fwdl_event":"reset_while_pinned"}}"#);
+            println!(r#"{{"active_fwdl_event":"transport_quiesced"}}"#);
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush firmware transport cleanup milestone: {error}"))?;
             Ok(())
         } else {
             Err(format!("loader cleanup failed before reset: {errors:?}"))
@@ -5707,6 +7166,65 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn stop_tx_dma_and_reset_ring0(&mut self) -> Result<(), String> {
+        let global = self.loader.mcu.wfdma.read(0xd4208)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4208, global & !1)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while self.loader.mcu.wfdma.read(0xd4208)? & 2 != 0 {
+            if Instant::now() >= deadline {
+                return Err("REBOOT REQUIRED: TX DMA did not quiesce".into());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+        }
+        let reset = self.loader.mcu.wfdma.read(0xd4100)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4100, reset & !(1 << 4))?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4100, reset | (1 << 4))?;
+        if self.loader.mcu.wfdma.read(0xd430c)? != 0 {
+            return Err("REBOOT REQUIRED: ring-0 DIDX remained nonzero after reset".into());
+        }
+        Ok(())
+    }
+
+    fn configure_mgmt_tx_ring(&mut self, ring: &DmaArena) -> Result<(), String> {
+        self.stop_tx_dma_and_reset_ring0()?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_tx_ring_slot(0, ring.iova as u32, 128, 0)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4600, 0x0140_0004)?;
+        for (offset, expected) in [
+            (0xd4300, ring.iova as u32),
+            (0xd4304, 128),
+            (0xd4308, 0),
+            (0xd430c, 0),
+            (0xd4600, 0x0140_0004),
+        ] {
+            let actual = self.loader.mcu.wfdma.read(offset)?;
+            if actual != expected {
+                return Err(format!(
+                    "REBOOT REQUIRED: ring-0 readback {offset:#x}={actual:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+        let global = self.loader.mcu.wfdma.read(0xd4208)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4208, global | 1)
+    }
+
     fn transmit_one_sae_auth(
         &mut self,
         ring: &mut DmaArena,
@@ -5717,16 +7235,17 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if !self.tx_completions.is_empty() {
             return Err("management TX began with stale completion state".into());
         }
-        frame_arena.write_bytes(frame)?;
-        let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
-            .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
-        txwi.write_bytes(&encoded.txwi)?;
-        ring.write_descriptor_at(0, encoded.descriptor);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
+        self.configure_mgmt_tx_ring(ring)?;
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut completion_state = MgmtTxCompletionState::default();
         let result = (|| -> Result<(), String> {
+            frame_arena.write_bytes(frame)?;
+            let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
+                .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
+            txwi.write_bytes(&encoded.txwi)?;
+            ring.write_descriptor_at(0, encoded.descriptor);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
                 self.loader.mcu.cancelled()?;
                 self.loader.mcu.handle_irq(None)?;
@@ -5750,12 +7269,25 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         })();
+        let contained = self.stop_tx_dma_and_reset_ring0();
+        if let Err(error) = contained {
+            return Err(format!(
+                "REBOOT REQUIRED: management TX outcome={result:?}; containment failed: {error}"
+            ));
+        }
         ring.write_descriptor_at(0, DmaDescriptor::reset());
         let txwi_reset = txwi.zero_bytes(PAGE);
         let frame_reset = frame_arena.zero_bytes(PAGE);
-        result?;
-        txwi_reset?;
-        frame_reset
+        if let Err(error) = result {
+            txwi_reset
+                .map_err(|wipe| format!("REBOOT REQUIRED: {error}; TXWI reclaim failed: {wipe}"))?;
+            frame_reset.map_err(|wipe| {
+                format!("REBOOT REQUIRED: {error}; frame reclaim failed: {wipe}")
+            })?;
+            return Err(format!("REBOOT REQUIRED: SAE spike failed: {error}"));
+        }
+        txwi_reset.map_err(|error| format!("REBOOT REQUIRED: TXWI reclaim failed: {error}"))?;
+        frame_reset.map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))
     }
 }
 
@@ -6361,6 +7893,27 @@ impl Drop for VfioIrq {
     }
 }
 
+fn disable_vfio_irq_index(device: &File, capability: PciIrqCapability) -> Result<(), String> {
+    let index = match capability.kind {
+        PciIrqKind::Intx => 0,
+        PciIrqKind::Msi => 1,
+        PciIrqKind::Msix => 2,
+    };
+    let mut set = IrqSetHeader {
+        argsz: size::<IrqSetHeader>(),
+        flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+        index,
+        start: 0,
+        count: 0,
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_SET_IRQS,
+        &mut set,
+        "explicitly disable VFIO IRQ index",
+    )
+}
+
 struct ReadPage {
     ptr: NonNull<u8>,
     bar_page: usize,
@@ -6421,6 +7974,20 @@ impl ReadPage {
             std::ptr::write_volatile(
                 self.ptr.as_ptr().add(within).cast::<u32>(),
                 PCIE_LPCR_HOST_CLR_OWN,
+            )
+        };
+        Ok(())
+    }
+    fn write_set_own(&self) -> Result<(), String> {
+        let offset = ReadRegister::ConnOnLowPowerControl.bar_offset();
+        let within = offset - self.bar_page;
+        if self.bar_page != 0xe0000 || within + 4 > PAGE {
+            return Err("SET_OWN write escaped immutable allowlist".into());
+        }
+        unsafe {
+            std::ptr::write_volatile(
+                self.ptr.as_ptr().add(within).cast::<u32>(),
+                PCIE_LPCR_HOST_SET_OWN,
             )
         };
         Ok(())
@@ -6507,11 +8074,17 @@ impl ReadPage {
         self.write_pcie_mac_interrupt_enable(0)
     }
     fn write_pcie_mac_interrupt_enable(&self, value: u32) -> Result<(), String> {
-        if self.bar_page != 0x10000 {
-            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
-        }
         if value != 0 && value != 0xff {
             return Err("PCIe MAC interrupt value escaped allowlist".into());
+        }
+        self.write_pcie_mac_interrupt_enable_raw(value)
+    }
+    fn restore_pcie_mac_interrupt_enable(&self, saved: u32) -> Result<(), String> {
+        self.write_pcie_mac_interrupt_enable_raw(saved)
+    }
+    fn write_pcie_mac_interrupt_enable_raw(&self, value: u32) -> Result<(), String> {
+        if self.bar_page != 0x10000 {
+            return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
         }
         let within = 0x10188 - self.bar_page;
         unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
@@ -6819,12 +8392,34 @@ impl OwnershipTransport for VfioOwnership<'_> {
     fn sleep_ms(&mut self, milliseconds: u64) {
         std::thread::sleep(std::time::Duration::from_millis(milliseconds));
     }
+    fn sleep_us_range(&mut self, _minimum: u64, maximum: u64) {
+        std::thread::sleep(std::time::Duration::from_micros(maximum));
+    }
+}
+impl OwnershipRoundTripTransport for VfioOwnership<'_> {
+    fn write_set_own(&mut self) -> Result<(), Self::Error> {
+        self.page.write_set_own()
+    }
 }
 
 fn log_ownership_event(event: OwnershipEvent) {
     match event {
+        OwnershipEvent::ClearOwnBefore { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"clear_own_before\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
+        ),
         OwnershipEvent::ClearOwnWritten { attempt, at_ms } => println!(
             "{{\"ownership_event\":\"clear_own_written\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"value\":\"{PCIE_LPCR_HOST_CLR_OWN:#010x}\"}}"
+        ),
+        OwnershipEvent::AspmDelay {
+            attempt,
+            at_ms,
+            minimum_us,
+            maximum_us,
+        } => println!(
+            "{{\"ownership_event\":\"aspm_delay\",\"attempt\":{attempt},\"at_ms\":{at_ms},\"minimum_us\":{minimum_us},\"maximum_us\":{maximum_us}}}"
+        ),
+        OwnershipEvent::StatusReadBefore { attempt, at_ms } => println!(
+            "{{\"ownership_event\":\"status_read_before\",\"attempt\":{attempt},\"at_ms\":{at_ms}}}"
         ),
         OwnershipEvent::StatusRead {
             attempt,
@@ -6849,6 +8444,38 @@ fn log_ownership_event(event: OwnershipEvent) {
         OwnershipEvent::TimedOut { at_ms } => {
             println!("{{\"ownership_event\":\"timed_out\",\"at_ms\":{at_ms}}}")
         }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[allow(dead_code)]
+fn record_ownership_round_trip_stage(event: OwnershipRoundTripEvent) {
+    match event {
+        OwnershipRoundTripEvent::SnapshotReadBefore => {
+            record_sae_stage("vfio_ownership_snapshot_read_before offset=0xe0010 bytes=4")
+        }
+        OwnershipRoundTripEvent::Snapshot { raw, state } => record_sae_stage(&format!(
+            "vfio_ownership_snapshot_read_after offset=0xe0010 bytes=4 raw={raw:#010x} state={state:?}"
+        )),
+        OwnershipRoundTripEvent::Driver(
+            event @ (OwnershipEvent::ClearOwnBefore { .. }
+            | OwnershipEvent::AspmDelay { .. }
+            | OwnershipEvent::AttemptExpired { .. }
+            | OwnershipEvent::Acquired { .. }
+            | OwnershipEvent::TimedOut { .. }),
+        ) => record_sae_stage(&format!("vfio_ownership_driver_transition event={event:?}")),
+        OwnershipRoundTripEvent::Firmware(
+            event @ (FirmwareOwnershipEvent::SetOwnBefore { .. }
+            | FirmwareOwnershipEvent::AttemptExpired { .. }
+            | FirmwareOwnershipEvent::Restored { .. }
+            | FirmwareOwnershipEvent::TimedOut { .. }),
+        ) => record_sae_stage(&format!(
+            "vfio_ownership_rollback_transition event={event:?}"
+        )),
+        OwnershipRoundTripEvent::Driver(_) | OwnershipRoundTripEvent::Firmware(_) => {}
+        OwnershipRoundTripEvent::Complete { restored } => record_sae_stage(&format!(
+            "vfio_ownership_round_trip_complete restored={restored:?}"
+        )),
     }
 }
 
@@ -6890,6 +8517,23 @@ enum Operation {
 }
 
 impl Operation {
+    fn uses_contained_transport_gate(self) -> bool {
+        if matches!(
+            self,
+            Self::RunOneShotFirmware | Self::RunOneShotPassiveChannel1
+        ) {
+            return true;
+        }
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            self == Self::RunOneShotSaeAuth
+        }
+        #[cfg(not(feature = "fuchsia-passive"))]
+        {
+            false
+        }
+    }
+
     #[cfg(feature = "fuchsia-passive")]
     fn passive_scan_attempt_limit(self) -> usize {
         if matches!(self, Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth) {
@@ -7112,6 +8756,102 @@ impl WfsysResetTransport for VfioWfsysReset<'_> {
 
 fn log_wfsys_reset_event(event: WfsysResetEvent) {
     println!("{{\"wfsys_reset_event\":\"{event:?}\"}}")
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct VfioIrqResetBoundary<'a> {
+    wfsys: VfioWfsysReset<'a>,
+    device: &'a Arc<File>,
+    wfdma: &'a ReadPage,
+    pcie_mac: &'a ReadPage,
+    irq: Option<VfioIrq>,
+    selected: PciIrqCapability,
+    bdf: &'a str,
+    ledger: &'a mut ContainmentLedger,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl WfsysResetTransport for VfioIrqResetBoundary<'_> {
+    type Error = String;
+    fn now_ms(&self) -> u64 {
+        self.wfsys.now_ms()
+    }
+    fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+        self.wfsys.read_reset_control()
+    }
+    fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+        self.wfsys.write_reset_control(value)
+    }
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        self.wfsys.sleep_ms(milliseconds)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl IrqResetTransport for VfioIrqResetBoundary<'_> {
+    fn install_irq(&mut self, capability: PciIrqCapability) -> Result<(), Self::Error> {
+        self.ledger.mark_possibly_active(Hazard::DeviceIrq);
+        self.irq = Some(VfioIrq::install(self.device, capability)?);
+        Ok(())
+    }
+    fn mask_host_irq(&mut self) -> Result<(), Self::Error> {
+        self.wfdma.write_active_wfdma(0xd4204, 0)
+    }
+    fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+        self.pcie_mac.write_pcie_mac_interrupt_enable(0xff)
+    }
+    fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+        self.pcie_mac.write_pcie_mac_interrupt_enable_zero()
+    }
+    fn disable_irq(&mut self) -> Result<(), Self::Error> {
+        let Some(irq) = self.irq.as_mut() else {
+            return disable_vfio_irq_index(self.device, self.selected);
+        };
+        match irq.disable() {
+            Ok(()) => Ok(()),
+            Err(owner) => match disable_vfio_irq_index(self.device, self.selected) {
+                Ok(()) => Err(format!("disable IRQ owner: {owner}")),
+                Err(explicit) => Err(format!(
+                    "disable IRQ owner: {owner}; explicit index disable: {explicit}"
+                )),
+            },
+        }
+    }
+    fn containment_reset(&mut self) -> Result<(), Self::Error> {
+        reset_vfio_device(self.device)
+    }
+    fn verify_contained(&mut self) -> Result<(), Self::Error> {
+        let global = self.wfdma.read(0xd4208)?;
+        let host_irq = self.wfdma.read(0xd4204)?;
+        let mac_irq = self.pcie_mac.read(0x10188)?;
+        record_sae_stage(&format!(
+            "vfio_irq_reset_safe_state global={global:#010x} host_irq={host_irq:#010x} mac_irq={mac_irq:#010x} bme=false"
+        ));
+        verify_active_reset_containment(self.wfdma, self.pcie_mac)?;
+        verify_pci_dma_disabled(self.bdf)?;
+        for hazard in [
+            Hazard::HostControl,
+            Hazard::DeviceIrq,
+            Hazard::Wfdma,
+            Hazard::BusMaster,
+            Hazard::LabMutated,
+        ] {
+            self.ledger.confirm_inactive(hazard);
+        }
+        self.ledger.phase = RunPhase::Contained;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_irq_reset_stage(event: IrqResetEvent) {
+    if matches!(
+        event,
+        IrqResetEvent::Wfsys(WfsysResetEvent::StatusRead { .. })
+    ) {
+        return;
+    }
+    record_sae_stage(&format!("vfio_irq_reset_boundary event={event:?}"));
 }
 
 fn log_top_ownership_event(event: TopOwnershipEvent) {
@@ -7816,6 +9556,207 @@ mod tests {
         assert!(!route.contains("push(CarriedScanResult"));
         assert!(route.contains("self.fail_close();\n            drop(carried);"));
         assert!(route.contains("self.fail_close();\n                drop(rejected);"));
+    }
+
+    #[test]
+    fn contained_transport_activation_stops_before_firmware_source_shape() {
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let activation_only = boundary
+            .split("if let Some((patch_bytes, ram_bytes)) = firmware_images")
+            .next()
+            .unwrap();
+        let mapped = boundary.find("acquire_active_vfio_resources(").unwrap();
+        let disabled = boundary.find("vfio_dma_pre_bme_verified").unwrap();
+        let prep = boundary.find("vfio_wfdma_prep_begin").unwrap();
+        let sanitize = boundary
+            .find("write_active_wfdma(0xd4208, disabled)")
+            .unwrap();
+        let irq = boundary.find("VfioIrq::install").unwrap();
+        let bme = boundary.find("set_pci_bus_master(bdf, true)").unwrap();
+        let complete = boundary.find("vfio_wfdma_prep_complete").unwrap();
+        let activation = boundary.find("vfio_wfdma_activation_begin").unwrap();
+        let engine = boundary
+            .find("write_active_wfdma(0xd4208, enabled)")
+            .unwrap();
+        let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
+        let mask = boundary.find("write_active_wfdma(0xd4204, 0)").unwrap();
+        let idle = boundary
+            .find("WFDMA busy during contained cleanup")
+            .unwrap();
+        let bme_off = boundary.find("set_pci_bus_master(bdf, false)").unwrap();
+        let unmap = boundary.find("capsule.release_observable()").unwrap();
+        let reset = boundary.find("reset_vfio_device(&capsule.device)").unwrap();
+        assert!(mapped < disabled && disabled < prep && prep < sanitize);
+        assert!(sanitize < irq && irq < bme && bme < complete);
+        assert!(complete < activation && activation < engine && engine < activated);
+        assert!(activated < mask && mask < idle && idle < bme_off);
+        assert!(bme_off < unmap && unmap < reset);
+        assert!(!activation_only.contains("load_mt7921_firmware"));
+        assert!(!activation_only.contains("publish_mcu_command"));
+        assert!(!activation_only.contains("dma_and_response_irq_enabled"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
+        assert!(!activation_only.contains("publish_mcu_bytes"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4408"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4418"));
+    }
+
+    #[test]
+    fn contained_rx2_ext_ctrl_is_source_exact_and_precedes_rx_dma() {
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let rx_rings = boundary.find("prepare_global_rx_rings(").unwrap();
+        let rx2_ext = boundary
+            .find("write_active_wfdma(0xd4688, 0x0040_0004)")
+            .unwrap();
+        let rx_dma = boundary
+            .find("write_active_wfdma(0xd4208, enabled)")
+            .unwrap();
+        assert!(rx_rings < rx2_ext && rx2_ext < rx_dma);
+        assert!(active_wfdma_write_allowed(
+            0xd4688,
+            0x0040_0004,
+            firmware_bootstrap_rx_irq_mask()
+        ));
+        assert!(!active_wfdma_write_allowed(
+            0xd4688,
+            0,
+            firmware_bootstrap_rx_irq_mask()
+        ));
+
+        let accepts = |writes: &[(usize, u32)]| writes.contains(&(0xd4688, 0x0040_0004));
+        assert!(accepts(&[
+            (0xd4680, 4),
+            (0xd4688, 0x0040_0004),
+            (0xd4690, 0x00c0_0004),
+        ]));
+        assert!(!accepts(&[(0xd4680, 4), (0xd4690, 0x00c0_0004)]));
+    }
+
+    #[test]
+    fn passive_firmware_init_reuses_contained_transport_source_shape() {
+        assert!(Operation::RunOneShotFirmware.uses_contained_transport_gate());
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
+        let ready = boundary.find("vfio_firmware_transport_ready").unwrap();
+        let loader = boundary.find("load_mt7921_firmware(&mut loader").unwrap();
+        let eeprom = source.find("eeprom_efuse_acquired").unwrap();
+        let clc = source.find("clc_calibration_configured").unwrap();
+        let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
+        assert!(activated < ready && ready < loader && loader < cleanup);
+        assert!(eeprom < clc);
+        assert!(!boundary.contains("load_mt7921_firmware_through_channel_domain(&mut loader"));
+        assert!(!boundary.contains("load_mt7921_firmware_with_passive_boundary(&mut loader"));
+
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let process = run.find("vfio_firmware_process_started").unwrap();
+        let artifacts = run.find("vfio_firmware_artifacts_ready").unwrap();
+        let attach = run.find("VFIO_DEVICE_BIND_IOMMUFD").unwrap();
+        assert!(process < artifacts && artifacts < attach);
+    }
+
+    #[test]
+    fn contained_channel_one_scan_is_receive_only_and_bounded_source_shape() {
+        assert!(Operation::RunOneShotPassiveChannel1.uses_contained_transport_gate());
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let acquisition = boundary
+            .split("acquire_active_vfio_resources(")
+            .nth(1)
+            .unwrap()
+            .split("record_sae_stage")
+            .next()
+            .unwrap();
+        assert!(acquisition.contains("operation,"));
+        assert!(boundary.contains("RunPhase::MappedDmaDisabled"));
+        assert!(boundary.contains("RunPhase::DmaAndResponseIrqEnabled"));
+        let configured = boundary
+            .find("load_mt7921_firmware_with_passive_boundary")
+            .unwrap();
+        let tuned = boundary.find(".set_channel(").unwrap();
+        let rx_ready = boundary.find("vfio_passive_receive_setup_ready").unwrap();
+        let scan = boundary.find(".start_passive_scan(").unwrap();
+        let observed = boundary.find("vfio_passive_observation_ready").unwrap();
+        let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
+        assert!(
+            configured < tuned
+                && tuned < rx_ready
+                && rx_ready < scan
+                && scan < observed
+                && observed < cleanup
+        );
+        assert!(boundary.contains("min_channel_time: Some(150_000_000)"));
+        assert!(boundary.contains("max_channel_time: Some(250_000_000)"));
+        assert!(boundary.contains("passive_channel"));
+        for forbidden in [
+            "transmit_one_sae_auth",
+            "configure_mgmt_tx_ring",
+            "encode_mt7921_5ghz_auth_tx",
+            "send_rate_power_bytes",
+            "start_active_scan",
+        ] {
+            assert!(!boundary.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn firmware_bootstrap_boundary_and_cleanup_source_shape() {
+        let source = include_str!("vfio_read.rs");
+        let dispatch = source
+            .split("let result = if operation == Operation::RunOneShotFirmware")
+            .nth(1)
+            .unwrap()
+            .split("let report =")
+            .next()
+            .unwrap();
+        assert!(dispatch.starts_with(" {\n                    load_mt7921_firmware_bootstrap"));
+
+        let cleanup = source
+            .split("ledger.phase = RunPhase::Containing;")
+            .nth(1)
+            .unwrap()
+            .split("if !release_errors.is_empty()")
+            .next()
+            .unwrap();
+        let mask = cleanup.find("write_active_wfdma(0xd4204, 0)").unwrap();
+        let disable_dma = cleanup
+            .find("write_active_wfdma(0xd4208, disabled)")
+            .unwrap();
+        let bme = cleanup.find("set_pci_bus_master(&bdf, false)").unwrap();
+        let irq = cleanup.find("installed.disable()").unwrap();
+        let unmap = cleanup.find("attempt_all_cleanup(").unwrap();
+        let reset = cleanup.find("reset_vfio_device(&device)").unwrap();
+        let verify = cleanup.find("verify_active_reset_containment").unwrap();
+        assert!(mask < disable_dma && disable_dma < bme && bme < irq);
+        assert!(irq < unmap && unmap < reset && reset < verify);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -9599,6 +11540,8 @@ mod tests {
             passive
         ));
         assert!(active_wfdma_write_allowed(0xd4204, passive, passive));
+        assert!(active_wfdma_write_allowed(0xd4600, 0x0140_0004, passive));
+        assert!(!active_wfdma_write_allowed(0xd4600, 0, passive));
         assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
         assert!(Operation::RunOneShotPassiveChannel1.conn_writable());
         assert!(Operation::RunOneShotPassiveChannel1.loads_firmware());
@@ -10062,9 +12005,10 @@ mod tests {
         let observable_actions = [
             ObservableRelease::DmaUnmap,
             ObservableRelease::BarMunmap,
+            ObservableRelease::IoasDetach,
             ObservableRelease::IoasDestroy,
         ];
-        assert_eq!(observable_actions.len(), 3);
+        assert_eq!(observable_actions.len(), 4);
     }
 
     #[test]
@@ -10130,6 +12074,7 @@ mod tests {
         for completions in [
             [
                 MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1,
@@ -10147,6 +12092,7 @@ mod tests {
                     acked: true,
                 }),
                 MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1,
@@ -10169,6 +12115,7 @@ mod tests {
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 1,
                     dropped: false,
                     attempts: 1
@@ -10177,6 +12124,7 @@ mod tests {
         );
         state
             .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: None,
                 token: 0,
                 dropped: true,
                 attempts: 1,
@@ -10185,6 +12133,7 @@ mod tests {
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1

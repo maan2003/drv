@@ -1,0 +1,20 @@
+--- a/src/connectivity/wlan/lib/fcg-crypto/src/sae/state.rs
++++ b/src/connectivity/wlan/lib/fcg-crypto/src/sae/state.rs
+@@ -28,6 +28,17 @@ struct SaeConfiguration<E> {
+     pwe: Vec<u8>,
+ }
+ 
++impl<E> Drop for SaeConfiguration<E> {
++    fn drop(&mut self) {
++        self.params.password.fill(0);
++        if let Some(password_id) = self.params.password_id.as_mut() {
++            password_id.fill(0);
++        }
++        self.pwe.fill(0);
++        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
++    }
++}
++
+ struct Commit<E> {
+     scalar: Bignum,
+     element: E,

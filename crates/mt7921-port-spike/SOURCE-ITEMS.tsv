@@ -5356,9 +5356,9 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	393	macro	MT_CBTOP_RGU_WF_SUBSY
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	395	macro	MT7925_CBTOP_RGU_WF_SUBSYS_RST	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	396	macro	MT7925_WFSYS_INIT_DONE_ADDR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	397	macro	MT7925_WFSYS_INIT_DONE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	399	macro	MT_HW_BOUND	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	400	macro	MT_HW_CHIPID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	401	macro	MT_HW_REV	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	399	macro	MT_HW_BOUND	read_dynamic_identity_status	adapted	source-order fixture; physical read
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	400	macro	MT_HW_CHIPID	read_dynamic_identity_status	adapted	source-order fixture; physical read
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	401	macro	MT_HW_REV	read_dynamic_identity_status	adapted	source-order fixture; physical read
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	403	macro	MT_HW_EMI_CTL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	404	macro	MT_HW_EMI_CTL_SLPPROT_EN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	406	macro	MT_PCIE_MAC_BASE	-	unmapped	-

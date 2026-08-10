@@ -38,10 +38,10 @@ DMA, arm an interrupt, or reset the function.
 With `--acquire-driver-ownership`, the same binary additionally ports
 `__mt792xe_mcu_drv_pmctrl` from pinned Linux `mt792x_core.c`: it writes only
 `PCIE_LPCR_HOST_CLR_OWN` to `MT_CONN_ON_LPCTL`, then polls only that register's
-`PCIE_LPCR_HOST_OWN_SYNC` bit. It preserves Linux's ten 50 ms attempts and 1 ms
-poll tick while adding a 500 ms absolute deadline and rejecting command bits
-on readback. Every write, status sample, retry, terminal success, timeout, or
-unexpected state is emitted as a structured event. No firmware-ownership or
+`PCIE_LPCR_HOST_OWN_SYNC` bit. It preserves Linux's ten independently timed
+50 ms attempts and 1 ms poll tick; like Linux, poll success masks only
+`OWN_SYNC` and ignores echoed command bits. Every write, status sample, retry,
+terminal success, or timeout is emitted as a structured event. No firmware-ownership or
 dynamic L1-remap write is admitted.
 
 The physical MT7961 at `0000:05:00.0` completed this transition on the first
@@ -747,3 +747,1112 @@ advances from `wlan0` to `wlanN` after reprobe.
 
 RF-kill/wakeup wiring, ASPM quirks, and reset behavior beyond the repeatedly
 successful VFIO-reset-and-native-rebind boundary remain unverified.
+
+### Spike-only D0 handoff result
+
+The Linux 6.18.40 lab kernel patch keeps one runtime-PM reference after the
+native driver's DMA/IRQ teardown for exactly `14c3:7961` subsystem
+`1a3b:4680`. With `mt7921e.keep_d0_on_remove=1`, watchdog-guarded report
+`/var/lib/wifi-driver-lab/reports/20260810T094728Z-0000_05_00.0.log` reached
+the durable stage `vfio_attached_d0_preflight_already_ready`: the VFIO cdev
+opened, iommufd opened, the device bound to iommufd, an IOAS was allocated and
+attached, and the function still reported D0 with memory decoding enabled and
+bus mastering disabled. The host then wedged before a later durable stage,
+with `VFIO_DEVICE_GET_REGION_INFO` next in the acquisition sequence. No BAR
+mapping, firmware load, DMA publication, radio operation, or SAE MPDU is proven
+by this run.
+
+The reboot watchdog recovered into the same patched closure with `mt7921e`
+bound in D0, iwd active, `wlan0` up, and the default route restored. The
+on-disk stage file and forced syncs are deliberately spike-only crash-tracing
+instrumentation, not a production logging contract.
+
+A discovery-only follow-up from commit `2f0df96d` reached device info
+`argsz=24 flags=0x3 num_regions=9 num_irqs=5` and completed region-info
+queries for indices 0 through 7 without mapping any region. Index 0 reported
+the 1 MiB read/write/mmap BAR, indices 2 and 4 reported 16 KiB and 4 KiB
+read/write/mmap regions, and index 7 reported a 4 KiB read/write region.
+Indices 1, 3, 5, and 6 reported zero-size/zero-flag regions. The exact last
+durable marker was
+`vfio_device_get_region_info_error index=8 argsz=32 error=query VFIO region:
+Invalid argument (os error 22)`. IOAS destruction while the device remained
+attached returned `EBUSY`; process close and the supervisor nevertheless
+restored `mt7921e` with `RESTORE end failed=0`. Report
+`/var/lib/wifi-driver-lab/reports/20260810T095455Z-0000_05_00.0.log` contains
+the complete per-ioctl trace. Watchdog recovery again returned to the patched
+kernel with the native adapter in D0, iwd active, and the default route healthy.
+Index 8 is the fixed VFIO PCI VGA-region ABI slot, so `EINVAL` is the expected
+absence result for this non-VGA function; useful discovery completed through
+the PCI configuration region at index 7. The `EBUSY` result separately shows
+that discovery cleanup must close or detach the VFIO device before destroying
+its attached IOAS.
+
+The corrected discovery-only run uses `VFIO_DEVICE_DETACH_IOMMUFD_PT` before
+IOAS destruction and treats `EINVAL` only on non-required region slots as an
+absent region. Report
+`/var/lib/wifi-driver-lab/reports/20260810T100543Z-0000_05_00.0.log` records
+index 8 as absent, then reaches both `vfio_region_discovery_complete` and
+`vfio_region_discovery_released_safe`. Userspace exited zero and supervisor
+restoration ended with `failed=0`; there was no BAR mapping and no watchdog
+reboot. The boot ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`, and the
+native driver returned in D0 with iwd and the default route active.
+
+The next guarded boundary mapped only BAR0 page zero for read access and
+immediately unmapped it without dereferencing the mapping. Report
+`/var/lib/wifi-driver-lab/reports/20260810T100928Z-0000_05_00.0.log` durably
+records `vfio_bar0_mmap_before`, `vfio_bar0_mmap_after`,
+`vfio_bar0_munmap_before`, and `vfio_bar0_munmap_after`, followed by
+`vfio_region_discovery_released_safe`. No MMIO read or write, firmware action,
+or DMA mapping occurred. Userspace returned zero, restoration ended with
+`failed=0`, and the watchdog disarmed automatically after its absolute-path
+health checks observed the native driver, iwd, and the default route. The boot
+ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`.
+
+Pinned Linux `mt792x_regs.h` defines `MT_INFRA_CFG_BASE` as direct BAR offset
+`0xfe000` and `MT_HIF_REMAP_L1` as `MT_INFRA(0x24c)`, yielding direct BAR0
+offset `0xfe24c`. Pinned `mt7921_reg_map_l1` passes that register to
+`mt76_rmw_field` and then reads it with `mt76_rr` to push the selector write;
+the existing `VfioDynamicL1::read_selector` likewise reads exactly
+`MT_HIF_REMAP_L1_BAR_OFFSET` before any selector update. This establishes the
+selector itself as a directly addressed readable register, unlike the
+identity targets behind its indirect window.
+
+The guarded read-only follow-up mapped only BAR0 page `0xfe000`, executed one
+volatile 32-bit read at `0xfe24c`, and observed `0x18451800`. Report
+`/var/lib/wifi-driver-lab/reports/20260810T101318Z-0000_05_00.0.log` contains
+the durable before/after read markers and the subsequent munmap and safe
+release markers. It performed no selector write, indirect-window read, other
+MMIO access, firmware action, DMA, or radio operation. Userspace and restore
+both returned success, the watchdog disarmed automatically, and the unchanged
+boot returned the native driver in D0 with iwd and the default route healthy.
+
+The minimal write boundary did not hardcode that observation: it mapped only
+BAR0 page `0xfe000` read/write, read and retained the selector, wrote that exact
+runtime value back once, and read it once more. Report
+`/var/lib/wifi-driver-lab/reports/20260810T101540Z-0000_05_00.0.log` records
+saved value `0x18451800`, the single identity write of `0x18451800`, and equal
+readback `0x18451800`, followed by munmap and safe release. No selector bits
+changed and there was no indirect-window access, other MMIO, firmware, DMA, or
+radio operation. Userspace returned zero and supervisor restoration reported
+`failed=0`, but the native network did not become remotely reachable before
+the watchdog deadline. Recovery therefore rebooted to
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8`, where the patched kernel, native driver
+in D0, iwd, and the default route were healthy. Thus the identical-value write
+is mechanically verified but, unlike the read-only boundary, does not yet
+prove reboot-free native-network recovery.
+
+Postmortem evidence from that boot is limited because the effective journald
+configuration ends with `Storage=volatile` and `RuntimeMaxUse=16M`; boot ID
+`87e137b8-3d23-493d-af4c-4c1ff447876a` has no entries after reboot, including
+no retained kernel, iwd, or watchdog messages. NetworkManager, networkd, and
+dhcpcd are not installed; iwd owns association and network configuration. The
+durable report was created at `2026-08-10 15:45:40 IST` and last written at
+`15:45:42.025815 IST` after `RESTORE end failed=0`. That restore result proves
+the PCI device reprobed as `mt7921e`, its override cleared, udev settled, iwd
+started active, and the state file was removed. The local health supervisor
+then checked those same facts plus a default route every two seconds for 60
+seconds; because it did not disarm, the missing fact was the route, not a
+reported reprobe or iwd service-start failure. The recovery kernel began at
+`15:47:50.972681 IST`, about 129 seconds after restore completed, consistent
+with expiry of the 120-second watchdog lease and reboot startup. Whether a new
+`wlanN` appeared but association/DHCP lagged or association failed cannot be
+recovered from the volatile journal.
+
+Before repeating the identical-value write, the supervisor should fsync a
+two-second post-restore timeline to `/var/lib/wifi-driver-lab`: driver link and
+PCI power state, every `wlan*` name/operstate/address, iwd state, default route,
+and kernel/iwd journal excerpts. That is the smallest rerun able to distinguish
+interface rename, firmware/reprobe failure, association failure, and route
+latency without changing the selector value.
+
+That instrumented identical-value rerun completed without a failed recovery
+transition. Report
+`/var/lib/wifi-driver-lab/reports/20260810T102304Z-0000_05_00.0.log` again
+records saved selector `0x18451800`, one write of the same runtime value, equal
+readback, and safe release. The fsynced timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T102304Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`.
+
+Restore returned zero at `15:53:05.966697 IST`. By then mt7921e had logged
+ASIC revision `79610010` at `15:53:05.856833`, firmware versions by
+`15:53:05.941854`, and iwd started at `15:53:05.957059`; there was no reprobe
+or firmware-init error. iwd first announced `wlan0` at `15:53:06.798926`, then
+the usable interface `wlan1` at `15:53:07.352426`. The timeline therefore saw
+no WLAN at sample 0, disconnected/scanning `wlan1` at `15:53:08.010741`, and
+connecting `wlan1` without an address at `15:53:10.059721`. The AP rejected
+the first authentication attempt with status 77 at `15:53:10.062851`, but the
+immediate retry authenticated and associated by `15:53:10.147843`. iwd entered
+netconfig at `15:53:11.217967` and connected at `15:53:11.284564`.
+
+At `15:53:12.117522`, 6.15 seconds after restore returned, the timeline
+separately recorded association, IPv4 `192.168.235.6/24`, the default route on
+`wlan1`, and successful gateway reachability. The all-interface check was not
+fooled by the rename. The watchdog disarmed at `15:53:12.180541`, and boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. Thus no required
+transition failed in this rerun; the only error was the recovered initial
+status-77 authentication response. The earlier watchdog recovery remains an
+unreproduced association/netconfig failure rather than evidence of failed
+mt7921e reprobe or a deterministic selector identity-write side effect.
+
+The first changed-selector boundary then used only the pinned
+`mt7921_reg_map_l1` sequence needed for the two identity words. Report
+`/var/lib/wifi-driver-lab/reports/20260810T103027Z-0000_05_00.0.log` records
+the runtime selector `0x18451800`, one selection write to `0x18457001` for L1
+base `0x7001`, and posted-write verification before any indirect read. The
+read-only window returned `MT_HW_CHIPID = 0x00007961` from physical
+`0x70010200` and `MT_HW_REV = 0x00008a10` from `0x70010204`. The run then
+wrote back the exact saved selector, verified full equality with
+`0x18451800`, unmapped both pages, and reached safe VFIO release. It performed
+no other window read, firmware action, DMA mapping, or radio operation.
+
+Userspace and restoration both returned zero without changing boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8`. The fsynced recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T103027Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:00:29.159243 IST`; native mt7921e had logged ASIC revision `79610010`
+at `16:00:29.043032`, firmware identity by `16:00:29.129854`, and iwd started
+at `16:00:29.149974`. iwd announced the usable `wlan3` at
+`16:00:30.522528` and reached connected state at `16:00:34.825973`. At
+`16:00:35.296528`, 6.14 seconds after restore returned, the supervisor
+observed association, IPv4 `192.168.235.6/24`, the default route, and a
+successful gateway ping together; it disarmed the watchdog at
+`16:00:35.356926`. The native driver remained bound in D0 and iwd remained
+active.
+
+### Next boundary after dynamic identity
+
+The temporary `--run-one-shot-sae-auth` preflight currently stops and releases
+VFIO immediately after the proven `MT_HW_CHIPID` and `MT_HW_REV` reads. It must
+not be advanced by merely deleting that return: the continuation acquires the
+full active-MCU resource set and eventually reaches interrupt, reset, WFDMA,
+firmware, and radio operations.
+
+At pinned Linux commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`mt7921/pci.c:mt7921_pci_probe` reads `MT_HW_CHIPID`, conditionally reads
+`MT_HW_BOUND`, then reads `MT_HW_REV`. `mt792x_regs.h` defines
+`MT_HW_BOUND = 0x70010020`; under the already proven L1 base `0x7001` this is
+one aligned volatile 32-bit read at BAR0 offset `0x40020`. Linux tests only bit
+7 when the chip ID is `0x7961`: set changes the effective chip ID to `0x7920`,
+clear retains `0x7961`. It does not write this register and does not interpret
+the other bits. The low eight bits of the subsequent revision word form the
+low byte of Linux's composite ASIC revision.
+
+Pinned Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3` has no PCI,
+L1-remap, or MT7921 identity operation at this point. Its client MLME begins at
+the `DeviceOps`/SoftMAC contract after hardware initialization, so this read is
+Linux-derived transport mechanics rather than Fuchsia policy.
+
+The smallest independently reversible next boundary is therefore to extend
+the existing narrow preflight with exactly the `MT_HW_BOUND` read, not to enter
+the full continuation. It must retain the read-only `0x40000` window mapping,
+derive selector `0x7001` from the complete saved selector, verify the posted
+selector write, reject a chip ID other than `0x7961`, perform no window access
+other than the three closed identity offsets, restore and verify the exact
+saved selector on every exit, then unmap and release. An all-ones read must
+fail closed as invalid MMIO evidence. No PCI command, interrupt gate, WFSYS,
+WFDMA, firmware, DMA, or radio operation belongs in this boundary.
+
+That boundary completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104105Z-0000_05_00.0.log` using
+release binary SHA-256
+`56481a2b11a98be13535db50e27027eeaec113b884350172dce28c3eb928386a`.
+Under one saved selector `0x18451800`, the run selected and verified
+`0x18457001`, then read in pinned Linux order: `MT_HW_CHIPID = 0x00007961`,
+`MT_HW_BOUND = 0x00000018`, and `MT_HW_REV = 0x00008a10`. Bound bit 7 is clear,
+so Linux retains effective chip ID `0x7961`; combining it with revision low
+byte `0x10` yields composite revision `0x79610010`, matching the native
+driver's ASIC log. The run restored and verified exact selector equality with
+`0x18451800`, unmapped both pages, reached safe VFIO release, and returned zero.
+The temporary early return remained in place, so no PCI command, interrupt,
+reset/WFSYS/WFDMA, firmware, DMA, or radio operation followed.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104105Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:11:07.612080 IST`; mt7921e was already bound in D0 and iwd active. Native
+firmware identity completed by `16:11:07.578832`, iwd announced usable `wlan4`
+at `16:11:08.984206`, and reached connected state at `16:11:12.918349`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:11:13.750197`, 6.14 seconds after restore. The watchdog
+disarmed at `16:11:13.812929`; boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged.
+
+Verification remains deliberately scoped. The release workspace passed all 69
+`mt7921-passive-scan` tests and a locked release build, with existing upstream
+unused-code/import warnings. The root/default-feature `mt7921-port-spike` test
+command remains blocked by pre-existing unrelated errors: firmware-inspect
+calls `world_clc_commands` without its fourth argument, and non-
+`fuchsia-passive` compilation references the cfg-gated SAE operation/stage
+logger. A rustfmt check of `vfio_read.rs` likewise still reports pre-existing
+formatting drift around the device-info marker and discovery-release marker;
+those unrelated lines were not changed.
+
+### Next active-acquisition boundary after identity
+
+The exact continuation behind the temporary early return first re-queries BAR0
+region metadata and maps BAR pages `0xd4000`, `0x10000`, and `0xe0000`; mapping
+alone does not dereference a register or change device state. The first
+device-visible operation in `active_preflight` is then
+`verify_pci_dma_disabled`: a read-only 256-byte PCI configuration snapshot. It
+reads the 16-bit Command register at configuration offset `0x04`, requires
+Memory Space Enable (bit 1) set and Bus Master Enable (bit 2) clear, walks the
+standard capability list from offset `0x34`, and requires the Power Management
+Control/Status Register power-state field to report D0 (`00b`). IRQ-capability
+and VFIO reset-capability queries follow, but are not part of this boundary.
+DMA mappings occur only after those preconditions.
+
+The first later state mutation is `disable_pci_intx`, which reads the same
+Command word and sets Interrupt Disable bit 10 (`0x0400`). This is an adapted
+userspace form of pinned Linux
+`drivers/pci/pci.c:pci_intx(pdev, 0)` at commit
+`e8efe09d4f378992c890d181d65e2ed8d8cb1194`; pinned
+`include/uapi/linux/pci_regs.h` defines Command offset `0x04`, Memory Space
+Enable `0x0002`, Bus Master Enable `0x0004`, and INTx Disable `0x0400`.
+Requiring BME clear during handoff is stricter lab containment: normal pinned
+`mt7921_pci_probe` enables memory decoding and bus mastering during native
+probe. Pinned Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3`
+does not own PCI Command or PMCSR; its SoftMAC `DeviceOps` boundary begins
+after transport initialization.
+
+The smallest next physical boundary is therefore read-only: while retaining
+the temporary early return, take and durably record the complete post-identity
+PCI Command word plus the located PM capability offset and raw PMCSR, verify
+MSE=1, BME=0, and D0, then release exactly as the identity boundary does. It
+needs no restoration because it performs no write, and it must stop before
+`VFIO_DEVICE_GET_IRQ_INFO`, active-resource allocation, DMA mapping, interrupt
+installation, reset, or any BAR dereference. This also proves that the selector
+transaction did not perturb PCI command/power state.
+
+If the subsequent INTx-disable write is later admitted, it must be a separate
+boundary: save the entire 16-bit Command word; compute only
+`selected = saved | 0x0400`; write exactly those two bytes at offset `0x04`;
+read back and require full equality with `selected`; restore the exact saved
+word on every exit; and read back full equality before release. If bit 10 was
+already set, that boundary is an identical-value write and still requires the
+same durable write/readback/restore evidence. It must not touch the PCIe MAC
+interrupt gate at BAR0 `0x10188` in the same run.
+
+The existing verification failures do not change these hardware semantics.
+The locked `mt7921-passive-scan` build used for physical gates enables
+`fuchsia-passive` by default and compiles this path. The standalone
+`mt7921-port-spike` default-feature failure is configuration-specific: the same
+source file references cfg-gated SAE names without that feature; the separate
+firmware-inspect missing argument is unrelated. Rustfmt drift is also
+non-semantic, although one reported hunk is nearby in the device-info marker
+and the other is in the unreachable discovery-release continuation. A future
+implementation should format only its changed lines or separately fix that
+pre-existing drift; neither issue authorizes weakening the boundary.
+
+The read-only post-identity PCI gate completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104636Z-0000_05_00.0.log` using
+release binary SHA-256
+`fb1c1c19ed3de71e8b15fe91246437172865695256d4c9098f259e8355427325`.
+After the unchanged identity sequence restored and verified selector
+`0x18451800`, one 256-byte configuration read returned full PCI Command
+`0x0002`, PM capability offset `0xf8`, and raw PMCSR `0x0008`. Thus MSE was set,
+BME was clear, and PMCSR power-state bits were zero (D0). INTx Disable bit 10
+was also clear; a future disable boundary would change Command from `0x0002`
+to `0x0402`, not perform an identical-value write. The gate then unmapped only
+the two existing identity pages and reached safe release. It did not map the
+full continuation's WFDMA, PCIe-MAC, or CONN pages and performed no PCI write,
+BAR dereference beyond the proven identity closure, IRQ/reset query, DMA
+mapping, firmware, WFDMA, or radio operation.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104636Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:16:38.365253 IST`; sample zero already observed native mt7921e in D0 and
+iwd active. iwd announced usable `wlan5` at `16:16:39.743045` and reached
+connected state at `16:16:43.992928`. The AP briefly disassociated the first
+association with reason 2, then the retry succeeded. Association, IPv4
+`192.168.235.6/24`, default route, and gateway ping were all observed at
+`16:16:44.509745`, 6.14 seconds after restore, and the watchdog disarmed at
+`16:16:44.570324`. Boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained
+unchanged. The same verification limits apply: all 69 locked release-workspace
+tests and the locked release build passed with existing upstream warnings;
+the unrelated standalone default-feature and rustfmt failures remain as
+recorded above.
+
+The isolated INTx-disable round trip completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104952Z-0000_05_00.0.log` using
+release binary SHA-256
+`342f4692a9681349ea3485e2cbd998b6d616cb03e5c97322776f0c36b90b8bb5`.
+After the unchanged identity and PCI-preflight gates, the transaction saved
+full Command `0x0002`, wrote exactly two bytes at configuration offset `0x04`
+for selected value `0x0402`, and verified full readback equality. It then wrote
+the exact saved two bytes on the unconditional restore path and verified full
+equality with `0x0002` before publishing completion. The existing identity
+pages were then unmapped and VFIO released safely. No other PCI field, BAR
+mapping or dereference, VFIO IRQ/reset query, DMA mapping, firmware, WFDMA, or
+radio operation was admitted.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104952Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:19:53.966904 IST`; sample zero already saw mt7921e in D0 and iwd active.
+iwd announced usable `wlan6` at `16:19:55.332584`, authenticated and associated
+by `16:19:58.129848`, and reached connected state at `16:19:59.279892`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:20:00.108705`, 6.14 seconds after restore, and the watchdog
+disarmed at `16:20:00.171036`. Boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with the existing
+upstream warnings; the previously recorded standalone default-feature and
+rustfmt limitations remain unchanged.
+
+### VFIO query boundary under temporary INTx disable
+
+The real active path has an important ordering distinction. Its
+`active_preflight` queries IRQ and reset capabilities before allocating active
+resources and before persistently disabling INTx. After later
+`disable_pci_intx`, the literal next device operation is not a query: it is a
+volatile zero write to `MT_PCIE_MAC_INT_ENABLE` at BAR0 `0x10188`. That write
+currently has no local saved-state rollback and must remain outside the next
+gate. Repeating the already-required query preflight while Command is
+temporarily `0x0402` is the smallest way to advance evidence without reaching
+that BAR write.
+
+At pinned Linux UAPI commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`VFIO_DEVICE_GET_IRQ_INFO` is ioctl number `VFIO_BASE + 9`. The caller supplies
+the 16-byte `vfio_irq_info` with `argsz` and `index`; the kernel returns
+`flags` and `count`. PCI indices 0, 1, and 2 are respectively INTx, MSI, and
+MSI-X. A zero count denotes an unimplemented type. Flag bit 0
+`VFIO_IRQ_INFO_EVENTFD` says that index supports eventfd signaling; bits 1, 2,
+and 3 report maskable, automasked, and no-resize behavior. This query does not
+install an eventfd, select an IRQ mode, mask/unmask a source, or alter device
+interrupt state. Those effects require the distinct `VFIO_DEVICE_SET_IRQS`
+ioctl, which is excluded.
+
+`VFIO_DEVICE_GET_INFO` is ioctl number `VFIO_BASE + 7`. The caller supplies
+`vfio_device_info.argsz`; the kernel returns `flags`, `num_regions`,
+`num_irqs`, and `cap_offset`. Flag bit 0 `VFIO_DEVICE_FLAGS_RESET` only
+advertises that the device supports reset; the query does not reset it. Reset
+requires the distinct `VFIO_DEVICE_RESET` ioctl (`VFIO_BASE + 11`), which is
+excluded. Both GET ioctls are therefore read-only capability queries against
+the already-open VFIO device fd. The current cdev path has already bound the
+device to iommufd and attached its empty IOAS before identity; no IRQ install,
+BAR mapping, or DMA mapping is an ioctl prerequisite. Existing code maps BAR
+pages before active preflight only because the broader resource owner batches
+later operations, not because either query uses them.
+
+The smallest next boundary retains the early return and the two identity pages
+only. After preflight saves Command `0x0002`, it writes and fully verifies
+temporary `0x0402`; while that value is selected, it queries IRQ indices 0, 1,
+and 2 in order and durably records each complete `argsz`, `flags`, and `count`.
+It then selects MSI-X over MSI over INTx only when count is nonzero and EVENTFD
+is set, fails closed if no such source exists or if only INTx wins, queries
+complete device info, and requires RESET plus PCI flags without invoking reset.
+The existing unconditional Command restore must run after query success or
+failure and fully verify exact `0x0002` before unmapping and release. The gate
+must stop before `VFIO_DEVICE_SET_IRQS`, `VFIO_DEVICE_RESET`, DMA mapping, BAR
+`0x10188`, firmware, WFDMA, or radio. Pinned Fuchsia owns none of these VFIO or
+PCI mechanics; its SoftMAC boundary remains downstream of transport setup.
+
+That query-only gate completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T105414Z-0000_05_00.0.log` using
+release binary SHA-256
+`db0aa62d3fc70658a55cebf73b82fd2ea989e229e1b94f136988619168e0fe3a`.
+While Command `0x0402` was fully verified, `VFIO_DEVICE_GET_IRQ_INFO` returned:
+INTx index 0, `argsz=16`, flags `0x00000007`, count 1; MSI index 1,
+`argsz=16`, flags `0x00000009`, count 32; and MSI-X index 2, `argsz=16`,
+flags `0x00000009`, count 0. Thus INTx reports EVENTFD, MASKABLE, and
+AUTOMASKED; MSI reports EVENTFD and NORESIZE; MSI-X reports the same flags but
+is unimplemented because its count is zero. The pure preference selected MSI
+with 32 vectors and did not install it.
+
+The subsequent read-only `VFIO_DEVICE_GET_INFO` returned `argsz=24`, flags
+`0x00000003`, nine regions, five IRQ indices, and capability offset zero.
+RESET and PCI flags were therefore both present; no reset ioctl followed. The
+unconditional rollback then wrote exact saved Command `0x0002` and verified
+full equality before safe unmap/release. Only the two identity pages were
+mapped. No `SET_IRQS`, `DEVICE_RESET`, BAR `0x10188`, DMA mapping, firmware,
+WFDMA, or radio operation occurred.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T105413Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:24:15.766081 IST`; sample zero saw mt7921e in D0 and iwd active. iwd
+announced usable `wlan7` at `16:24:17.135169`, associated by
+`16:24:17.428829`, and reached connected state at `16:24:18.559458`.
+Association was visible at `16:24:17.809902`; IPv4 `192.168.235.6/24`, default
+route, and gateway ping followed at `16:24:19.857688`, 4.09 seconds after
+restore. The watchdog disarmed at `16:24:19.917976`, and boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with existing
+upstream warnings; previously recorded standalone default-feature and rustfmt
+limitations remain unchanged.
+
+### PCIe MAC interrupt-gate boundary
+
+After persistent PCI INTx disable, the literal next active-path device access
+is `write_pcie_mac_interrupt_enable_zero`, a volatile 32-bit zero write at BAR0
+`0x10188`. Pinned Linux commit
+`e8efe09d4f378992c890d181d65e2ed8d8cb1194` defines
+`MT_PCIE_MAC_BASE = 0x10000` and
+`MT_PCIE_MAC_INT_ENABLE = MT_PCIE_MAC(0x188)` in `mt792x_regs.h`, producing
+`0x10188`. `mt7921/pci.c:__mt7921_reg_addr` returns every address below
+`0x100000` unchanged, so this is a direct BAR0 offset, not an L1-remapped
+register. The same function's fixed map also translates silicon address
+`0x74030188` through PCIE_MAC_IREG base `0x74030000` to BAR0 `0x10188`; that
+alternate expression still requires no selector transaction.
+
+Linux accesses the register through `mt76_wr`, hence one aligned volatile
+32-bit little-endian MMIO store. Probe/resume and WPDMA reinitialization write
+`0x000000ff`; suspend, MAC reset, and WPDMA reinitialization write
+`0x00000000`. These paired enable/disable values establish interrupt-enable
+latch semantics rather than status acknowledgement or W1C command semantics.
+Pinned source defines no individual bit names and never reads the register, so
+it does not establish that immediate readback is architecturally required for
+success or that bits outside the low byte are reserved. Existing lab code has
+successfully used ordinary volatile reads for precondition and containment
+checks, but the native value at the new D0 handoff boundary has not been
+durably recorded.
+
+Native teardown does not justify hard-coding zero or `0xff`.
+`mt7921e_unregister_device` unregisters mt76, disables NAPI, takes driver
+ownership, cleans DMA, and resets WFSYS, but has no local
+`MT_PCIE_MAC_INT_ENABLE` write. Deeper generic teardown or hardware reset may
+affect the latch, so its exact post-remove value is an observation, not an
+invariant. The only safe initial checks are that the read succeeds and is not
+all ones; interpretation should preserve the complete raw word.
+
+The smallest next boundary is therefore read-only. Retain the current identity,
+PCI, INTx, and VFIO-query sequence with temporary Command `0x0402`; map only
+one additional BAR0 page, page `0x10000`, with read permission; perform exactly
+one volatile 32-bit read at `0x10188`; durably record the raw value; reject
+`0xffffffff`; unmap that page; then run the already-unconditional exact Command
+restore/readback and early release. No other active-path BAR pages (`0xd4000`,
+`0xe0000`, `0x9f000`, or `0xd6000`) are needed. The page is required only
+because VFIO BAR MMIO is exposed by `mmap`; it is not required by the preceding
+capability ioctls.
+
+A later mutation must remain a separate gate. Save the exact 32-bit snapshot,
+write only `0x00000000`, and use one ordinary volatile read to verify full zero
+while treating that read as lab rollback evidence rather than a pinned-Linux
+success condition. On every exit, write back the complete saved word and read
+back full equality before unmapping; do not synthesize `0xff` or discard
+unknown high bits. Command must likewise restore exactly from `0x0402` to
+`0x0002`. That gate must still stop before `SET_IRQS`, reset, WFDMA/DMA,
+firmware, or radio. Pinned Fuchsia does not own this PCIe interrupt latch; it
+remains Linux-derived transport mechanics below SoftMAC.
+
+The read-only latch snapshot completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T105906Z-0000_05_00.0.log` using
+release binary SHA-256
+`3a65924bf318b01a02cd218a5b7d112b04b4c1082841f4ea4268fc012219b61d`.
+After temporary Command `0x0402` and the query-only capability checks, the gate
+mapped BAR0 page `0x10000` read-only and performed exactly one aligned volatile
+32-bit read at `0x10188`. Native handoff state was
+`MT_PCIE_MAC_INT_ENABLE = 0x000000ff`. The gate explicitly unmapped page
+`0x10000`, then restored and verified exact PCI Command `0x0002`, unmapped the
+two identity pages, and released safely. It performed no register write,
+`SET_IRQS`, reset, DMA mapping, firmware, WFDMA, or radio operation.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T105906Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:29:08.841005 IST`; sample zero saw mt7921e in D0 and iwd active. iwd
+announced usable `wlan8` at `16:29:10.208004`. The first association was
+briefly disassociated with reason 2, then the retry associated at
+`16:29:11.859865` and iwd reached connected state at `16:29:11.990117`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:29:12.937781`, 4.10 seconds after restore; the watchdog
+disarmed at `16:29:13.002728`. Boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with existing
+upstream warnings; the standalone default-feature and rustfmt limitations
+remain unchanged.
+
+The isolated interrupt-latch mutation completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T110510Z-0000_05_00.0.log` using
+release binary SHA-256
+`d3b3a68fde35f7cdcc1b0bcc5e1c68d38cc255c07f0982b39e16abd660bcf32a`.
+Under temporary Command `0x0402`, the gate mapped only BAR0 page `0x10000`
+read-write, saved the complete runtime latch `0x000000ff`, wrote exactly one
+full-word zero, and obtained the single full-zero readback. It then wrote back
+the exact saved `0x000000ff`, read full equality, durably marked and explicitly
+unmapped the page, restored and verified exact Command `0x0002`, unmapped the
+two identity pages, and released safely. No `SET_IRQS`, reset, DMA mapping,
+firmware, WFDMA, or radio operation occurred.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T110510Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:35:12.646038 IST`; sample zero saw mt7921e in D0 and iwd active. This
+run's network recovery was unusually slow but remained inside the independent
+watchdog: association appeared on `wlan9` at `16:36:53.036274`, and IPv4
+`192.168.235.6/24`, the default route, and gateway connectivity followed at
+`16:36:55.086799`, 102.44 seconds after restore. The watchdog disarmed at
+`16:36:55.148763`; boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained
+unchanged. Final health was mt7921e in D0, iwd active, `wlan9` associated and
+routed, and the gateway reachable. All 69 locked release-workspace tests and
+the locked release build passed with existing upstream warnings; the
+standalone default-feature and rustfmt limitations remain unchanged.
+
+#### Slow-recovery postmortem
+
+Read-only correlation of the durable timeline, its kernel/iwd message capture,
+and the current boot journal shows that the 102.44-second recovery was not a
+100-second PCI reprobe or firmware-load stall. VFIO reset ran from
+`16:35:12.175833` to `16:35:12.279883`; mt7921e logged the ASIC at
+`16:35:12.530882`, HW/SW firmware at `16:35:12.604854`, and WM firmware at
+`16:35:12.615831`. iwd restarted at `16:35:12.636789`, discovered `phy9` at
+`16:35:13.437626`, observed an initial `wlan0` with ifindex 22 at
+`16:35:13.465911`, and observed the final `wlan9` station with ifindex 23 at
+`16:35:14.016900`. The timeline's sample 1 saw `wlan9` scanning and
+disconnected at `16:35:14.689386`. Thus an enumerated station interface existed
+about 1.37 seconds after restore; enumeration/recreation and the final name did
+not account for the long outage.
+
+iwd selected `ph1` at `16:35:31.145126`. The AP first returned authentication
+status 77, after which authentication succeeded at `16:35:31.235827`; all
+eight earlier captured recoveries also contain the same status-77 exchange and
+then recovered quickly, so that exchange is not unique to this incident. The
+kernel sent three association requests but received no association response,
+timed out at `16:35:31.551933`, and iwd recorded `association-timeout`,
+`CMD_ASSOCIATE (-2)`, and `connect-failed` before returning to
+`autoconnect_full`. iwd did not select the AP again until
+`16:36:52.017412`, an 80.44-second retry interval. That second attempt received
+a successful association response at `16:36:52.079221`, associated at
+`16:36:52.089881`, and reached iwd `connected` at `16:36:53.209008`. The
+proximate cause of the long recovery was therefore one missing association
+response followed by iwd's retry/backoff interval. The logs cannot determine
+whether that missing response was an AP, RF, driver receive, or protocol
+transient, and do not justify attributing it to the restored interrupt latch.
+
+There was no rfkill event; the radio is currently neither soft nor hard
+blocked. Every sampler iteration reported mt7921e attached, PCI D0, and runtime
+active, with no PCI/AER or firmware error. The `page_pool_release_retry`
+warning at `16:36:12.488911` concerns a retiring pool from the removed
+interface, not delayed reprobe: similar warnings occurred after earlier fast
+recoveries, and this run's new interface was already scanning before the
+warning and later associated without another reprobe. It remains a teardown
+diagnostic worth retaining, but is not evidence for the 80-second wait.
+
+Sample 0 at `16:35:12.656384` was diagnostically premature: its fields only
+proved the driver symlink, D0/runtime-active PCI state, and an active iwd
+process. It printed no WLAN interface, and iwd did not discover the wiphy for
+another 0.78 seconds. This does not weaken the watchdog completion guard,
+which also required carrier, IPv4, default route, and gateway connectivity,
+but sample 0 must be described only as lower-layer/service presence rather
+than usable Wi-Fi health.
+
+No further mutation gate should use this recovery as a routine baseline. The
+smallest next diagnostic is one supervised recovery-only control using the
+same detach/VFIO/restore path with a payload that performs no device access,
+while retaining the current journal capture. Before that control, the
+procedural progression guard should classify any association timeout,
+`connect-failed`, or restore-to-connectivity interval over 60 seconds as an
+anomalous recovery that blocks the next gate even if the 120-second watchdog
+eventually disarms. The sampler should also record explicit wiphy/interface
+readiness separately from its PCI/iwd-process fields. Do not extend the
+watchdog merely to make this run appear routine; first determine whether the
+failure repeats in the zero-access control.
+
+The recovery-only control completed under the unchanged 120-second watchdog
+in report
+`/var/lib/wifi-driver-lab/reports/20260810T111422Z-0000_05_00.0.log` and
+timeline
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T111422Z.log`.
+Supervisor SHA-256 was
+`7149772f9be7d708150581f759babdfb176486d97202c368a95439d376d49030`.
+The native lab wrapper performed the same detach, VFIO acquisition and
+release, and native restore, but its sole userspace payload was
+`/run/current-system/sw/bin/true`; the report contains only payload begin/end
+with return code zero. The payload opened no VFIO device and performed no PCI
+configuration access, BAR mapping or MMIO, IRQ or reset query/action, DMA,
+firmware, WFDMA, or radio operation.
+
+Restore returned at `16:44:24.348499 IST`. The kernel had logged the ASIC at
+`16:44:24.227849`, HW/SW firmware at `16:44:24.302869`, and WM firmware at
+`16:44:24.313828`. iwd observed `phy10` at `16:44:25.136466` and final
+`wlan10` at `16:44:25.720022`. With the supervisor's two-second sampling
+resolution, the new durable BDF-owned `wiphy_ready` and BDF-owned,
+iwd-queryable `usable_interface_ready` transitions were both recorded at
+`16:44:26.391315`, 2.04 seconds after restore. Association, IPv4, default
+route, and gateway connectivity were all sampled at `16:44:30.498662`;
+measured restore-to-connectivity time was 6,197 ms. The watchdog disarmed with
+`outcome=passed reason=none` at `16:44:30.564992`.
+
+iwd's first attempt selected `ph1` at `16:44:28.378855`, completed the usual
+status-77 retry, authenticated, and associated at `16:44:29.548866`; the AP
+then immediately disassociated it with reason 2 (`PREV_AUTH_NOT_VALID`). iwd
+returned to `autoconnect_full` without logging `association-timeout` or
+`connect-failed`, selected the AP again after only 8 ms, and the second attempt
+associated at `16:44:29.818879` and reached `connected` at
+`16:44:29.959353`. Therefore neither strict failure condition fired: there was
+no association timeout/connect-failed event and recovery was well below 60
+seconds. Boot ID `cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged;
+final state was mt7921e in D0/runtime-active, iwd active, rfkill unblocked,
+`wlan10` associated with IPv4/default route, gateway ping successful, and the
+watchdog inactive. This control clears the anomalous-backoff question only; it
+does not add evidence for any further hardware mutation.
+
+### Next active-path boundary: conn-on ownership
+
+The temporary physical early return remains before the general active-resource
+path. A source trace of that path shows that after its persistent PCI INTx
+disable and `MT_PCIE_MAC_INT_ENABLE = 0` store, constructing `VfioOwnership`
+has no device effect. The first device operation in
+`acquire_driver_ownership` is `write_clear_own`: one aligned volatile 32-bit
+store of `0x00000002` (`PCIE_LPCR_HOST_CLR_OWN`) to direct BAR0 offset
+`0xe0010`. The next operation is a volatile 32-bit read of the same offset,
+polling `PCIE_LPCR_HOST_OWN_SYNC` clear. No IRQ installation, reset, DMA
+mapping, firmware operation, WFDMA access, or radio operation is between the
+interrupt-latch store and this ownership-command store. The general path has
+already allocated unrelated DMA arenas before entering the mutation closure,
+but an isolated boundary does not need them; it needs only BAR0 page
+`0xe0000` read-write in addition to the already-proven preflight pages.
+
+At pinned Linux commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`mt792x_regs.h` defines physical `MT_CONN_ON_LPCTL = 0x7c060010`,
+`PCIE_LPCR_HOST_SET_OWN = BIT(0)`, `CLR_OWN = BIT(1)`, and `OWN_SYNC = BIT(2)`.
+The fixed map in `mt7921/pci.c::__mt7921_reg_addr` maps physical base
+`0x7c060000` to BAR0 `0xe0000`, producing direct offset `0xe0010` without an
+L1 selector transaction. `mt792x_core.c::__mt792xe_mcu_drv_pmctrl` writes
+`CLR_OWN`, optionally waits 2--3 ms when PCIe ASPM is supported, and polls
+`OWN_SYNC == 0` for 50 ms at 1 ms ticks, repeating for at most ten attempts.
+This is Linux PCI transport ownership below Fuchsia SoftMAC, not a Fuchsia
+firmware or radio contract.
+
+The register is a command/status handshake, not an ordinary saved-value
+latch. `CLR_OWN` requests host ownership; its command bit is not expected to
+remain set. A read with either `SET_OWN` or `CLR_OWN` asserted is outside the
+state Linux relies on. `OWN_SYNC == 0` is driver-owned and `OWN_SYNC == BIT(2)`
+is firmware-owned. Unknown non-command bits are status, so rollback cannot be
+specified as writing a saved full word. The pinned inverse operation is
+`mt792xe_mcu_fw_pmctrl`: write only `PCIE_LPCR_HOST_SET_OWN`, then poll
+`OWN_SYNC == BIT(2)` with the same ten 50 ms attempts. State restoration is
+therefore equality of the initial ownership state, with command bits clear,
+not raw full-word equality.
+
+Required state is the already-established VFIO/iommufd attachment, D0,
+Memory-Space Enable set, Bus Master Enable clear, persistent PCI INTx disable,
+the PCIe MAC interrupt latch at zero, and a writable mapping of only conn-on
+page `0xe0000`. Firmware/conn-infra must be powered enough to acknowledge the
+handshake; the earlier isolated physical ownership run observed
+`MT_CONN_ON_MISC = 1` (firmware power set), N9 readiness clear, DMA disabled,
+and acquired driver ownership on the first write with status zero. That report,
+`/var/lib/wifi-driver-lab/reports/20260802T170812Z-0000_05_00.0.log`, proves
+the command alone on this adapter, but it restored only by VFIO function reset
+and did not prove the inverse `SET_OWN` handshake or this exact composite
+state.
+
+The current helper is not ready for another physical claim. The target module
+has `disable_aspm=N`, while `acquire_driver_ownership` currently polls
+immediately and has no representation of Linux's conditional 2--3 ms ASPM
+settling delay. Actual ASPM support is derived by Linux from both endpoint and
+parent Link Control state, so it must not be guessed from that module parameter.
+Also, current active containment and the earlier standalone run use VFIO reset,
+not the pinned inverse ownership handshake, as rollback.
+
+The smallest independently reversible next gate is consequently an isolated
+ownership round trip, not the full active helper: read `MT_CONN_ON_LPCTL` once,
+reject all ones or asserted command bits, and save only the semantic initial
+`OWN_SYNC` state; if firmware-owned, issue only `CLR_OWN`, honor the pinned ASPM
+delay conservatively, and poll only `OWN_SYNC` clear within the pinned bound;
+then issue only `SET_OWN` and poll the original firmware-owned state before
+unmapping. If initially driver-owned, the CLR command is idempotent and no SET
+command may be issued because that would change the initial state. On every
+exit after issuing CLR from an initially firmware-owned state, attempt SET and
+the semantic-state poll before unmap even if the CLR poll failed, then restore
+the exact saved interrupt latch and PCI Command.
+Durable markers must precede every command, poll phase, inverse, and unmap.
+This gate stops before WFSYS reset, WFDMA reads or writes, IRQ installation,
+DMA mapping, firmware loading, or radio work. No hardware run is authorized
+until the ASPM delay and inverse rollback are represented and separately
+reviewed.
+
+Those prerequisites are now represented offline, without making the temporary
+gate reachable. `pcie_link_control` walks the conventional PCI capability list
+only when `PCI_STATUS_CAP_LIST` is asserted, uses the masked pointer at config
+byte `0x34`, finds capability ID `0x10`
+(`PCI_CAP_ID_EXP`), and reads the little-endian Link Control word at capability
+offset `0x10` (`PCI_EXP_LNKCTL`). It rejects short configurations, invalid or
+looping capability pointers, a truncated PCIe capability, and capability
+absence. `mt76_pci_aspm_supported` parses endpoint and optional parent bridge
+independently, masks exactly `PCI_EXP_LNKCTL_ASPMC = 0x3`, and reproduces
+pinned `mt76/pci.c`: the delay predicate is true if either side has L0s or L1
+enabled. Unlike the kernel caller, which operates on known PCIe devices, the
+offline parser retains malformed/absent-capability errors instead of guessing
+false. Focused fixtures cover a chained endpoint capability, endpoint L0s,
+parent-only L1, both sides disabled, absence, a list loop, and truncation.
+
+`round_trip_driver_ownership` is a separate, currently uncalled transaction.
+It emits a before-read durable-stage hook, reads one full low-power-control
+word, rejects all ones and either asserted command bit, and saves only the
+semantic `OWN_SYNC` state. Its CLR state machine preserves Linux's ten attempts,
+50 ms per attempt and 1 ms polling. Each poll window gets its own deadline,
+started after the command, settling delay, and durable callbacks, so MMIO,
+scheduling, and fsync overhead cannot clip a later Linux poll window. The
+zero-overhead worst case is 500 ms without ASPM and 530 ms with ten maximum
+settling delays. When the parsed ASPM predicate is true it
+invokes the transport's exact 2,000--3,000 us range hook
+after every CLR store and before the first poll; the host adapter conservatively
+sleeps the upper 3,000 us bound. Before-store, after-store, delay, before-read,
+status, retry, success, and timeout events are exposed to the
+durable stage adapter.
+
+If the snapshot was driver-owned, CLR is allowed as an idempotent command and
+the transaction never issues SET on success or error. If it was firmware-owned,
+the CLR result is retained but cannot bypass rollback: SET plus the pinned
+ten independently timed 50-ms polls for `OWN_SYNC` set runs after every
+CLR-path result. A SET or rollback-read transport error is retained, but cannot
+short-circuit the remaining bounded best-effort SET/poll sequence; this covers
+an MMIO store that reached hardware despite an adapter error. Successful
+rollback followed by failed acquisition returns the acquisition error;
+successful acquisition followed by failed rollback returns the rollback error;
+dual failure retains both in `AcquireAndRestore`. A rollback timeout emits no
+`Complete` event and therefore cannot claim restored ownership. Injected tests
+cover source delay and successful round trip, initially driver-owned no-SET,
+post-CLR read failure with successful rollback, CLR timeout with successful
+rollback, SET timeout without a completion claim, rollback-read continuation,
+an ambiguous SET error whose status verifies restoration, and simultaneous
+primary and rollback transport errors. The VFIO adapter admits SET only on BAR0 page
+`0xe0000` at exact offset `0xe0010`. The guarded SAE preflight now invokes the
+transaction immediately before its unchanged early return, while PCI INTx and
+the PCIe MAC interrupt latch are disabled. Its fsynced stage adapter retains
+only snapshot, command, delay, retry, terminal, and unmap milestones rather
+than logging every poll read.
+
+The single watchdog-contained run in
+`/var/lib/wifi-driver-lab/reports/20260810T124821Z-0000_05_00.0.log` completed
+with userspace `rc=0` and supervisor restore `failed=0`. Endpoint
+`0000:05:00.0` plus parent `0000:00:02.2` selected the ASPM delay. The snapshot
+was already driver-owned (`0x00000000`), so the source-correct transaction
+issued one CLR, settled for the maximum 3 ms, verified driver ownership at
+5 ms, and intentionally issued no SET. The PCIe MAC latch restored
+`0x000000ff`, PCI Command restored `0x0002`, and all BAR mappings were removed.
+The client lost SSH after launch, left the watchdog armed, and the watchdog
+rebooted the host; the durable report survived and proves the successful gate
+and native supervisor restoration. It does not physically prove SET because
+the saved initial state did not authorize that inverse command.
+
+### Next coherent boundary: reset plus IRQ ownership
+
+The pinned `mt7921_pci_probe` continuation is one responsibility rather than a
+sequence of more register gates: after identity it calls
+`mt792x_wfsys_reset`, writes the WFDMA host interrupt enable to zero, writes
+`MT_PCIE_MAC_INT_ENABLE = 0xff`, requests the PCI IRQ, and only then enters
+`mt7921_dma_init`. `exercise_irq_reset_boundary` now represents that complete
+pre-DMA boundary offline: it prevalidates the eventfd-capable vector, preserves
+Linux's reset, host-mask, MAC-gate, then IRQ-install order, and stops with the
+host interrupt mask still zero. It deliberately has no
+DMA mapping, ring setup, firmware loading, or MCU command surface.
+
+Containment is part of the same state machine: whether setup succeeds or an
+IRQ installation error is ambiguous, it attempts host IRQ mask, MAC-source
+disable, explicit VFIO IRQ disable, containment reset, and post-reset safe-state
+verification in that order.
+The primary error and every cleanup error remain separately visible. Durable
+events cover only IRQ installation, the existing reset milestones, host mask,
+MAC enable, setup completion, and each cleanup boundary. Focused fixtures prove
+the successful source-derived order and that all cleanup steps still run after
+an ambiguous install failure. The temporary early-return path now contains
+only the minimal concrete adapter for this boundary.
+
+The one guarded physical attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T130511Z-0000_05_00.0.log`. It
+prevalidated the 32-vector eventfd-capable MSI index, completed WFSYS
+assert/release/readiness in 59 ms, left the host interrupt mask at zero, opened
+the PCIe MAC gate, and installed the VFIO MSI eventfd before any BME, DMA,
+firmware, WFDMA-enable, or radio work. Immediate cleanup masked host and MAC,
+disabled the owned IRQ, completed VFIO reset, and passed the existing
+post-reset host/MAC/DMA-disabled plus PCI BME-disabled verification. Supervisor
+restore ended with `failed=0`.
+
+Userspace returned failure only because the first adapter version redundantly
+sent an explicit index-disable after its successfully owned IRQ had already
+been disabled; VFIO correctly returned `EINVAL`, retained as cleanup entry
+`DisableIrq`. The explicit index path is now used only when installation did
+not return an owner, or as a best-effort fallback after owned-disable failure.
+No second physical attempt was made. The completed safe-state verification is
+authoritative for containment; the redundant cleanup error did not leave an
+IRQ or device source active.
+
+### Contained DMA-resource boundary
+
+The next guarded boundary now allocates only the DMA resources needed to
+represent Linux's pre-firmware ring setup. It maps four BAR pages and ten DMA
+arenas: 4 KiB TX and RX guards, 4 KiB FWDL and MCU TX rings, 4 KiB MCU and WA
+RX rings, two 16 KiB RX-buffer arenas, a 64 KiB command-payload arena, and a
+4 KiB FWDL-payload arena (126,976 DMA bytes total). It programs the existing
+18 TX, eight RX, and one WA RX ring slots while BME is clear and the WFDMA
+enable/busy low nibble plus host and MAC interrupt masks are all zero.
+
+Only after those mappings and disabled-state checks does the boundary set PCI
+BME. WFDMA remains disabled throughout; the path has no firmware loader, MCU
+publication, response interrupt, or radio operation. Cleanup masks host and
+MAC sources, clears WFDMA's low nibble, clears BME, releases all DMA and BAR
+mappings and the IOAS, then performs VFIO reset and the established
+post-reset containment checks. If that verification cannot prove the safe
+state, the resources remain parked under the watchdog rather than being
+claimed released.
+
+The single guarded physical attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T131434Z-0000_05_00.0.log` and used
+release binary SHA-256
+`95148a063f6c7e5b53d02df1758828f028587577a5e7b0dfb2892b586ab1e827`.
+It completed the preceding ownership and IRQ/reset boundaries, mapped all ten
+arenas and four BAR pages, verified BME false and WFDMA disabled, prepared all
+27 ring slots, then observed BME true with WFDMA still disabled. Cleanup
+disabled BME, recorded resources unmapped before reset, passed the safe-state
+verification, and ended with userspace `rc=0` and supervisor restore
+`failed=0`. The client heartbeat briefly lost SSH and conservatively returned
+unknown status, but the durable report contains every completion marker.
+Afterward `mt7921e` was rebound, `iwd` was active, and `wlan1` was connected;
+the reboot watchdog was inactive. No second attempt was made.
+
+### Firmware-bootstrap boundary
+
+The Linux-derived loader is separable immediately after N9 readiness and the
+bounded `GET_NIC_CAPABILITY` response. `load_mt7921_firmware_bootstrap` follows
+the existing NIC-power, download-ready, patch semaphore, patch scatter, RAM
+scatter, firmware-start, and N9-ready sequence, then accepts exactly that one
+post-N9 capability response and returns. The next command in the full path is
+the EEPROM hardware-block read, so the bootstrap boundary issues no EEPROM,
+CLC/calibration, channel-domain, scan, management-frame, or radio command.
+
+The `--run-one-shot-fwdl` transport uses the established ownership, WFSYS
+reset, global-ring, MSI eventfd, BME, WFDMA TX/RX, and dual MCU-response-ring
+path. Its cleanup masks PCIe MAC and WFDMA interrupts, disables WFDMA, waits
+for DMA idle, clears BME, disables the IRQ, unmaps every DMA arena, resets the
+VFIO device, and verifies the established BME/WFDMA/host/MAC safe state before
+releasing the remaining BAR and IOAS resources. Bootstrap dispatch and this
+cleanup order have focused source-shape coverage; the loader fixture proves
+that `GET_NIC_CAPABILITY` is followed by cleanup rather than EEPROM or CLC.
+
+The pinned artifacts are patch SHA-256
+`a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6`
+(build `20260224110909a`, platform `ALPS`, patch version `0xffffffff`) and RAM
+SHA-256
+`b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9`
+(firmware `____010000`, build `20260224110949`, chip `0x0d`, five regions).
+
+The single guarded attempt used release binary SHA-256
+`281077fd9d258bd6c392d1a30b2e2dcd341f55365a63fb4eaa57c58d9f1ae797`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T132637Z-0000_05_00.0.log`.
+The host stopped responding and the reboot watchdog recovered it, but the
+report ends after `USERSPACE begin`: the existing general-path JSON output was
+still buffered, so no firmware, DMA/IRQ, ready, or cleanup milestone became
+durable. This attempt is therefore inconclusive and does not physically prove
+firmware publication, an MCU response, or userspace cleanup. No second attempt
+was initially made. After watchdog recovery `mt7921e` rebound, `iwd` was
+active, `wlan0` was connected, and the watchdog was inactive. The native
+driver independently reported the same patch build and WM firmware version
+during recovery, but that is recovery evidence, not proof of the userspace
+bootstrap. The coherent
+bootstrap and cleanup markers now explicitly flush stdout for any future
+authorized run.
+
+One rerun was subsequently authorized after adding flushed phase markers for
+transport readiness, patch completion, RAM completion plus firmware-start
+acknowledgement, N9 readiness, NIC capability, and containment. It used binary
+SHA-256
+`2ae603a90af3123c8353327c5b7319b8e4557eafe16f7898c4027ebd186b193d`;
+the report is
+`/var/lib/wifi-driver-lab/reports/20260810T133639Z-0000_05_00.0.log`.
+The host again stopped responding and watchdog-rebooted, and the exact last
+durable milestone remained supervisor `USERSPACE begin`: none of the flushed
+transport-ready or later markers was reached. Consequently the boundary is
+blocked before proven transport readiness; there is no durable evidence that
+BME, WFDMA, the MSI eventfd/source, firmware DMA, or MCU publication was
+enabled during this run, and no userspace cleanup can be claimed. The
+watchdog recovery again rebound `mt7921e`; `iwd` was active, `wlan0` connected,
+and the watchdog inactive. This was the only authorized rerun.
+
+### Contained pre-engine WFDMA preparation
+
+The passed DMA-resource coordinator now also represents Linux's coherent
+pre-engine transport preparation. With BME and WFDMA engines initially off it
+sanitizes the global configuration, waits for idle, configures the extended
+and DMASHDL bypass state, toggles the WFDMA index reset, programs the existing
+global rings, installs the selected MSI eventfd, requires empty interrupt
+status, and writes the source-derived queue configuration. It then enables
+BME while leaving TX/RX engine bits clear and both host and PCIe MAC source
+masks zero. No MCU/FWDL CPU index or firmware descriptor is published.
+
+Cleanup retains the passed containment order: host and MAC masks zero, WFDMA
+disabled and idle, BME clear, MSI disabled, all active DMA/BAR/IOAS resources
+released, VFIO reset, and the established safe-state verification. Focused
+source-shape coverage proves the preparation precedes BME, no engine-enable
+construction or response-source mask is present, and unmap precedes reset.
+
+The single guarded attempt used binary SHA-256
+`5c1e64e3375095f44bcfef7938407f093c5fb6650ed789fe539a59c88b986b32`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T134859Z-0000_05_00.0.log`.
+It durably reached both `vfio_wfdma_prep_begin` and
+`vfio_wfdma_prep_complete` with engines, host IRQ, and MAC IRQ disabled, BME
+enabled, and MSI owned. Immediate cleanup disabled BME and MSI, released the
+resources before reset, and passed `vfio_dma_safe_state_verified`. Userspace
+ended with `rc=0` and supervisor restore with `failed=0`. The wrapper lost its
+SSH heartbeat and conservatively left watchdog recovery armed, but the durable
+report is complete. After recovery `mt7921e` was rebound, `iwd` active,
+`wlan0` connected, and the watchdog inactive. No follow-on attempt was made.
+
+### Contained transport activation without firmware
+
+The same contained coordinator now continues from passed pre-engine state
+through the remaining Linux pre-firmware transport activation as one boundary:
+it enables WFDMA TX/RX with the source-derived global configuration, opens the
+PCIe MAC and WM/WM2 host response sources, acquires top-driver ownership,
+disables PCIe L0s, and selects normal SWDEF mode. It does not publish an MCU,
+FWDL, or firmware-ring CPU index, construct a loader, or issue an MCU command.
+
+Containment immediately masks the host and MAC sources, clears the WFDMA
+engine and related configuration bits, waits for DMA idle, clears BME,
+disables MSI, releases resources, resets VFIO, and verifies the established
+safe state. Focused source-shape coverage proves activation precedes masking
+and containment, and rejects every firmware publication primitive.
+
+The single guarded attempt used binary SHA-256
+`c3a5038a902e356fcf18dfd9d1f050453882d78d308b73d30474251832763d62`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T135553Z-0000_05_00.0.log`.
+It durably completed `vfio_wfdma_activation_begin` and
+`vfio_wfdma_activation_complete` with engines enabled, WM/WM2 and MAC sources
+enabled, top ownership acquired, L0s disabled, SWDEF normal, and firmware
+publication false. Immediate containment disabled BME, released mappings
+before reset, and passed `vfio_dma_safe_state_verified`. Userspace ended with
+`rc=0` and supervisor restore with `failed=0`. After the conservative wrapper
+heartbeat loss, native `mt7921e` rebound, `iwd` was active, `wlan1` connected,
+and the watchdog inactive. No firmware attempt followed.
+
+### Contained firmware bootstrap on the proven transport
+
+The firmware bootstrap now enters the same contained coordinator used by the
+passed transport-activation boundary. It verifies and parses both installed
+artifacts before VFIO attachment, retains the coordinator's live MSI, WFDMA,
+WM/WM2, command, and firmware-download resources after activation, and gives
+those resources directly to the existing loader. There is no parallel
+transport setup. Durable coarse markers cover process start, artifact
+readiness, and transport readiness before the existing patch, RAM,
+firmware-start, N9-ready, and NIC-capability phases.
+
+The single guarded attempt used binary SHA-256
+`23581dbfcb72fa50f9a7a09bc8a86b21ca471e3c174390ab45322cc1fd5416f5`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T140636Z-0000_05_00.0.log`.
+It completed one patch section and four downloadable RAM regions in 196
+scatter chunks, observed N9 ready, and received a 23-element
+`GET_NIC_CAPABILITY` response on WM2. The boundary then quiesced the
+transport without issuing EEPROM, CLC/calibration, channel, scan, or radio
+operations. Outer containment masked and disabled the transport, cleared BME,
+released mappings before reset, and passed the safe-state verification.
+Userspace ended with `rc=0` and supervisor restore with `failed=0`. The
+wrapper conservatively returned unknown status after losing SSH, but the
+durable report is complete. After recovery `mt7921e` was rebound, `iwd`
+was active, `wlan1` was connected, and the watchdog was inactive. No second
+attempt was made.
+
+### Contained passive EEPROM and CLC initialization
+
+The same consolidated transport now continues from NIC capability discovery
+through the next Linux-derived passive responsibility. It reads the fixed
+`0x550` eFuse/EEPROM hardware block, selects the installed CLC calibration
+record using that result and the discovered chip capability, and applies the
+single world/indoor rule. `SET_CLC` only supplies regulatory/calibration data;
+the separately gated channel-domain call remains unreachable, as do channel
+tuning, MAC/RF enable, scan, management TX, and SAE. Phase markers for eFuse
+acquisition and CLC configuration are flushed before the existing mandatory
+transport quiesce and outer containment.
+
+The single guarded attempt used binary SHA-256
+`4da54784290d782f05ed54e2c23c92e782fc258a844031dd8adab7a0a1866a47`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T141101Z-0000_05_00.0.log`.
+After the previously proved 23-element NIC capability response, eFuse event
+`0xed` returned on WM2 with `valid=0`. One response-bearing world/indoor
+CLC rule then completed as event `0x80`, with special-UNII mask zero. The
+summary records one patch section, four downloadable RAM regions, 196 scatter
+chunks, one applied CLC rule, and explicitly records channel, scan, management
+TX, SAE, and radio as false. Transport quiesce and outer containment cleared
+BME, released mappings before reset, and passed safe-state verification.
+Userspace ended with `rc=0` and supervisor restore with `failed=0`. The
+wrapper conservatively returned unknown after losing SSH, but the durable
+report is complete. Native `mt7921e` rebound, `iwd` was active, `wlan1`
+was connected, both watchdog units were inactive, and no lab state directory
+remained. No second attempt was made.
+
+### Consolidated receive-only channel-1 boundary
+
+The channel-1 passive operation now enters the same contained transport and
+configuration path. After world/indoor CLC it sends the separately gated
+39-channel `NO_IR` domain, owns data RX ring 2 and its interrupt, applies the
+source-exact passive MAC plan, tunes channel 1, and requests one passive dwell
+with zero SSIDs and zero probes. The existing pinned Fuchsia processing path
+must parse at least one real beacon or probe response and observe matching scan
+completion within the bounded dwell/deadline. The contained source has no
+active-scan, probe-frame, management/data-frame, rate-power, or SAE publication
+call and does not allocate the SAE TX arenas.
+
+The one guarded attempt used binary SHA-256
+`fad60861c85997913a8e5eede2f41d08f9d6ec177edd3641be1a11999541cf3a`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T141847Z-0000_05_00.0.log`.
+Firmware, NIC capability, eFuse, CLC, and the channel-domain TX completion all
+passed. The passive hook then stopped before MAC setup, channel tune, or scan
+because the newly consolidated coordinator had not advanced its containment
+phase from `Contained` to `DmaAndResponseIrqEnabled`. Thus this run proves
+no receive observation and performed no intentional RF transmission.
+Transport quiesce and outer containment still disabled BME, released mappings
+before reset, and passed safe-state verification; userspace ended with
+`rc=1` and supervisor restore with `failed=0`. Native `mt7921e` rebound,
+`iwd` was active, `wlan0` was connected, both watchdogs were inactive, and
+no lab state remained.
+
+The coordinator now records the contained DMA-disabled and
+DMA/response-enabled phases explicitly and passes the actual passive operation
+into shared resource acquisition, so the existing passive BAR pages and data
+RX arenas are retained for the hook. All 73 integrated tests and the release
+build pass after that correction (release SHA-256
+`ae7dda3efc61165aa97ab418b8e1ca2861b824ece8306f3f5dfd452c587724a7`).
+Per the one-run limit, the corrected path has not been rerun physically.
+
+One corrected rerun was subsequently authorized, using unchanged release
+SHA-256
+`ae7dda3efc61165aa97ab418b8e1ca2861b824ece8306f3f5dfd452c587724a7`.
+Its report is
+`/var/lib/wifi-driver-lab/reports/20260810T142520Z-0000_05_00.0.log`.
+All passive preparation steps passed, including data RX ring/IRQ ownership.
+The source-exact MAC enable, RX-path, device/BSS, receive-filter, and channel
+switch commands completed for channel 1 at 2412 MHz, and the durable setup
+marker records `intentional_tx=false`. The passive `START_SCAN` command
+completed with matching scan ID 1 and firmware reported successful scan
+completion, but the bounded dwell produced zero beacon/probe-response
+observations. Therefore there is no RSSI evidence and the receive boundary is
+not physically proved.
+
+The run stopped at that exact bounded failure without retrying or transmitting
+a probe, management frame, data frame, or SAE frame. Transport quiesce and
+outer containment disabled WFDMA/IRQs/BME, released mappings before reset, and
+passed safe-state verification. Userspace ended with `rc=1` and supervisor
+restore with `failed=0`; native `mt7921e` rebound, `iwd` was active,
+`wlan1` was connected, and both watchdog units were inactive. No further run
+was made.
+
+A later read-only native check, without VFIO detach, established that the
+currently connected AP was not on channel 1: iwd reported interface `wlan0`,
+BSSID `42:50:fd:67:3a:88`, 5180 MHz/channel 36, and RSSI -57 dBm. The same
+zero-TX contained operation was therefore minimally parameterized with a
+bounded channel argument and a 150--250 ms passive dwell. All 73 integrated
+tests and the release build passed; the unchanged-semantics binary SHA-256 was
+`9f5f96922b57d2c0941d27e5658bf956f886205cf61cfdf685cb423a564ae8f1`.
+
+The single environment-informed attempt is report
+`/var/lib/wifi-driver-lab/reports/20260810T143132Z-0000_05_00.0.log`.
+Every passive preparation and configuration command completed for channel 36
+at 5180 MHz, and the durable marker records the 150--250 ms dwell plus
+`intentional_tx=false`. Scan ID 1 again completed successfully but produced
+zero parsed beacon/probe-response observations, so the Fuchsia adapter has no
+physical RSSI evidence and the receive boundary remains unproved. No probe,
+management, data, or SAE frame was transmitted.
+
+The run stopped without retry. Transport quiesce and outer containment
+disabled WFDMA/IRQs/BME, released mappings before reset, and passed safe-state
+verification; userspace ended with `rc=1` and supervisor restore with
+`failed=0`. Native networking recovered on `wlan1` to the same BSSID,
+5180 MHz/channel 36, with RSSI -60 dBm (average -58 dBm); both watchdogs were
+inactive and the lab state directory was empty. No further attempt was made.

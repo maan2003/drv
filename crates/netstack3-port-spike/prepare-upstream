@@ -49,6 +49,7 @@ host_patches=(
   "$patch_dir/trust-dns-workspace.patch"
   "$patch_dir/wlan-common-host.patch"
   "$patch_dir/wlan-frame-writer-host.patch"
+  "$patch_dir/wlan-fcg-crypto-host.patch"
   "$patch_dir/wlan-fidl-ext-host.patch"
   "$patch_dir/wlan-rsn-host.patch"
   "$patch_dir/wlan-sme-host.patch"

@@ -33,3 +33,32 @@
      fn supplicant_handle_public_key_wrong_key_size(public_key: Vec<u8>) {
          let mut supplicant = test_util::get_owe_supplicant();
          let mut update_sink = vec![];
+--- a/src/connectivity/wlan/lib/rsn/src/lib.rs
++++ b/src/connectivity/wlan/lib/rsn/src/lib.rs
+@@ -46,6 +46,17 @@
+     pub auth_cfg: auth::Config,
+ }
+ 
++impl Drop for Supplicant {
++    fn drop(&mut self) {
++        match &mut self.auth_cfg {
++            auth::Config::Sae { password, .. }
++            | auth::Config::DriverSae { password } => password.fill(0),
++            _ => {}
++        }
++        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
++    }
++}
++
+ /// Any information (i.e. info elements) used to negotiate protection on an RSN.
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum ProtectionInfo {
+@@ -79,7 +90,7 @@
+         }));
+ 
+         let auth_method = auth::Method::from_config(auth_cfg.clone())?;
+-        let pmk = match auth_cfg.clone() {
++        let pmk = match &auth_cfg {
+             auth::Config::ComputedPsk(psk) => Some(psk.to_vec()),
+             _ => None,
+         };

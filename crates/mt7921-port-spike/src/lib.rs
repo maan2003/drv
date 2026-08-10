@@ -1060,6 +1060,87 @@ pub const DRIVER_OWN_ATTEMPTS: u8 = 10;
 pub const DRIVER_OWN_ATTEMPT_MS: u64 = 50;
 pub const DRIVER_OWN_POLL_MS: u64 = 1;
 pub const DRIVER_OWN_HARD_DEADLINE_MS: u64 = DRIVER_OWN_ATTEMPTS as u64 * DRIVER_OWN_ATTEMPT_MS;
+pub const DRIVER_OWN_ASPM_DELAY_MIN_US: u64 = 2_000;
+pub const DRIVER_OWN_ASPM_DELAY_MAX_US: u64 = 3_000;
+pub const DRIVER_OWN_ASPM_HARD_DEADLINE_MS: u64 = DRIVER_OWN_HARD_DEADLINE_MS
+    + DRIVER_OWN_ATTEMPTS as u64 * DRIVER_OWN_ASPM_DELAY_MAX_US.div_ceil(1_000);
+
+const PCI_CAPABILITY_LIST: usize = 0x34;
+const PCI_STATUS: usize = 0x06;
+const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
+const PCI_CAP_ID_EXP: u8 = 0x10;
+const PCI_EXP_LNKCTL: usize = 0x10;
+const PCI_EXP_LNKCTL_ASPMC: u16 = 0x3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcieLinkControlError {
+    ConfigTooShort,
+    InvalidCapabilityOffset(u8),
+    CapabilityLoop(u8),
+    TruncatedPcieCapability(u8),
+    PcieCapabilityAbsent,
+}
+
+/// Parse the standard PCIe capability's Link Control word.
+///
+/// Pinned Linux `pcie_capability_read_word(..., PCI_EXP_LNKCTL, ...)` first
+/// locates conventional capability ID `PCI_CAP_ID_EXP`, then reads the
+/// little-endian word at capability offset `PCI_EXP_LNKCTL`.
+pub fn pcie_link_control(config: &[u8]) -> Result<u16, PcieLinkControlError> {
+    if config.len() <= PCI_CAPABILITY_LIST {
+        return Err(PcieLinkControlError::ConfigTooShort);
+    }
+    let status = u16::from_le_bytes([config[PCI_STATUS], config[PCI_STATUS + 1]]);
+    if status & PCI_STATUS_CAP_LIST == 0 {
+        return Err(PcieLinkControlError::PcieCapabilityAbsent);
+    }
+    let mut offset = config[PCI_CAPABILITY_LIST] & !3;
+    if offset == 0 {
+        return Err(PcieLinkControlError::PcieCapabilityAbsent);
+    }
+    let mut visited = [false; 64];
+    for _ in 0..48 {
+        let index = usize::from(offset);
+        if index < 0x40 || index + 2 > config.len() {
+            return Err(PcieLinkControlError::InvalidCapabilityOffset(offset));
+        }
+        let slot = index / 4;
+        if visited[slot] {
+            return Err(PcieLinkControlError::CapabilityLoop(offset));
+        }
+        visited[slot] = true;
+        if config[index] == PCI_CAP_ID_EXP {
+            let link_control = index + PCI_EXP_LNKCTL;
+            if link_control + 2 > config.len() {
+                return Err(PcieLinkControlError::TruncatedPcieCapability(offset));
+            }
+            return Ok(u16::from_le_bytes([
+                config[link_control],
+                config[link_control + 1],
+            ]));
+        }
+        offset = config[index + 1] & !3;
+        if offset == 0 {
+            return Err(PcieLinkControlError::PcieCapabilityAbsent);
+        }
+    }
+    Err(PcieLinkControlError::CapabilityLoop(offset))
+}
+
+/// Reproduce pinned Linux `mt76_pci_aspm_supported`: ASPM is supported when
+/// either the endpoint or its optional parent bridge has L0s/L1 enabled in
+/// Link Control. Parsing errors are retained rather than guessed as false.
+pub fn mt76_pci_aspm_supported(
+    endpoint_config: &[u8],
+    parent_config: Option<&[u8]>,
+) -> Result<bool, PcieLinkControlError> {
+    let endpoint = pcie_link_control(endpoint_config)? & PCI_EXP_LNKCTL_ASPMC;
+    let parent = match parent_config {
+        Some(config) => pcie_link_control(config)? & PCI_EXP_LNKCTL_ASPMC,
+        None => 0,
+    };
+    Ok(endpoint != 0 || parent != 0)
+}
 
 pub trait OwnershipTransport {
     type Error;
@@ -1068,16 +1149,52 @@ pub trait OwnershipTransport {
     fn write_clear_own(&mut self) -> Result<(), Self::Error>;
     fn read_low_power_control(&mut self) -> Result<u32, Self::Error>;
     fn sleep_ms(&mut self, milliseconds: u64);
+    fn sleep_us_range(&mut self, _minimum: u64, maximum: u64) {
+        self.sleep_ms(maximum.div_ceil(1_000));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnershipEvent {
-    ClearOwnWritten { attempt: u8, at_ms: u64 },
-    StatusRead { attempt: u8, at_ms: u64, raw: u32 },
-    AttemptExpired { attempt: u8, at_ms: u64 },
-    Acquired { attempt: u8, at_ms: u64 },
-    UnexpectedState { attempt: u8, at_ms: u64, raw: u32 },
-    TimedOut { at_ms: u64 },
+    ClearOwnBefore {
+        attempt: u8,
+        at_ms: u64,
+    },
+    ClearOwnWritten {
+        attempt: u8,
+        at_ms: u64,
+    },
+    AspmDelay {
+        attempt: u8,
+        at_ms: u64,
+        minimum_us: u64,
+        maximum_us: u64,
+    },
+    StatusRead {
+        attempt: u8,
+        at_ms: u64,
+        raw: u32,
+    },
+    StatusReadBefore {
+        attempt: u8,
+        at_ms: u64,
+    },
+    AttemptExpired {
+        attempt: u8,
+        at_ms: u64,
+    },
+    Acquired {
+        attempt: u8,
+        at_ms: u64,
+    },
+    UnexpectedState {
+        attempt: u8,
+        at_ms: u64,
+        raw: u32,
+    },
+    TimedOut {
+        at_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1096,6 +1213,18 @@ pub enum OwnershipError<E> {
 /// a logger or component runtime.
 pub fn acquire_driver_ownership<T, F>(
     transport: &mut T,
+    event: F,
+) -> Result<(), OwnershipError<T::Error>>
+where
+    T: OwnershipTransport,
+    F: FnMut(OwnershipEvent),
+{
+    acquire_driver_ownership_with_aspm(transport, false, event)
+}
+
+pub fn acquire_driver_ownership_with_aspm<T, F>(
+    transport: &mut T,
+    aspm_supported: bool,
     mut event: F,
 ) -> Result<(), OwnershipError<T::Error>>
 where
@@ -1103,28 +1232,35 @@ where
     F: FnMut(OwnershipEvent),
 {
     let start = transport.now_ms();
-    let hard_deadline = start
-        .checked_add(DRIVER_OWN_HARD_DEADLINE_MS)
-        .ok_or(OwnershipError::ClockOverflow)?;
     for attempt in 1..=DRIVER_OWN_ATTEMPTS {
         let now = transport.now_ms();
-        if now >= hard_deadline {
-            event(OwnershipEvent::TimedOut { at_ms: now - start });
-            return Err(OwnershipError::Timeout);
-        }
-        transport
-            .write_clear_own()
-            .map_err(OwnershipError::Transport)?;
-        event(OwnershipEvent::ClearOwnWritten {
+        event(OwnershipEvent::ClearOwnBefore {
             attempt,
-            at_ms: transport.now_ms().saturating_sub(start),
+            at_ms: now.saturating_sub(start),
         });
-        let attempt_deadline = transport
-            .now_ms()
-            .checked_add(DRIVER_OWN_ATTEMPT_MS)
-            .ok_or(OwnershipError::ClockOverflow)?
-            .min(hard_deadline);
+        let clear_result = transport.write_clear_own();
+        if clear_result.is_ok() {
+            event(OwnershipEvent::ClearOwnWritten {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+            });
+        }
+        if aspm_supported {
+            transport.sleep_us_range(DRIVER_OWN_ASPM_DELAY_MIN_US, DRIVER_OWN_ASPM_DELAY_MAX_US);
+            event(OwnershipEvent::AspmDelay {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+                minimum_us: DRIVER_OWN_ASPM_DELAY_MIN_US,
+                maximum_us: DRIVER_OWN_ASPM_DELAY_MAX_US,
+            });
+        }
+        clear_result.map_err(OwnershipError::Transport)?;
+        let attempt_deadline = transport.now_ms().saturating_add(DRIVER_OWN_ATTEMPT_MS);
         loop {
+            event(OwnershipEvent::StatusReadBefore {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+            });
             let raw = transport
                 .read_low_power_control()
                 .map_err(OwnershipError::Transport)?;
@@ -1134,16 +1270,6 @@ where
                 at_ms: now.saturating_sub(start),
                 raw,
             });
-            // SET_OWN and CLR_OWN are write commands. Seeing either asserted
-            // on readback is not a state Linux relies on and is rejected.
-            if raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
-                event(OwnershipEvent::UnexpectedState {
-                    attempt,
-                    at_ms: now.saturating_sub(start),
-                    raw,
-                });
-                return Err(OwnershipError::UnexpectedState(raw));
-            }
             if raw & PCIE_LPCR_HOST_OWN_SYNC == 0 {
                 event(OwnershipEvent::Acquired {
                     attempt,
@@ -1164,6 +1290,199 @@ where
     let at_ms = transport.now_ms().saturating_sub(start);
     event(OwnershipEvent::TimedOut { at_ms });
     Err(OwnershipError::Timeout)
+}
+
+pub trait OwnershipRoundTripTransport: OwnershipTransport {
+    fn write_set_own(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipState {
+    DriverOwned,
+    FirmwareOwned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareOwnershipEvent {
+    SetOwnBefore { attempt: u8, at_ms: u64 },
+    SetOwnWritten { attempt: u8, at_ms: u64 },
+    StatusReadBefore { attempt: u8, at_ms: u64 },
+    StatusRead { attempt: u8, at_ms: u64, raw: u32 },
+    AttemptExpired { attempt: u8, at_ms: u64 },
+    Restored { attempt: u8, at_ms: u64 },
+    UnexpectedState { attempt: u8, at_ms: u64, raw: u32 },
+    TimedOut { at_ms: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FirmwareOwnershipError<E> {
+    Transport(E),
+    TransportAndTimeout(E),
+    ClockOverflow,
+    UnexpectedState(u32),
+    Timeout,
+}
+
+fn restore_firmware_ownership<T, F>(
+    transport: &mut T,
+    mut event: F,
+) -> Result<(), FirmwareOwnershipError<T::Error>>
+where
+    T: OwnershipRoundTripTransport,
+    F: FnMut(FirmwareOwnershipEvent),
+{
+    let start = transport.now_ms();
+    let mut first_transport_error = None;
+    for attempt in 1..=DRIVER_OWN_ATTEMPTS {
+        let now = transport.now_ms();
+        event(FirmwareOwnershipEvent::SetOwnBefore {
+            attempt,
+            at_ms: now.saturating_sub(start),
+        });
+        match transport.write_set_own() {
+            Ok(()) => event(FirmwareOwnershipEvent::SetOwnWritten {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+            }),
+            Err(error) => {
+                if first_transport_error.is_none() {
+                    first_transport_error = Some(error);
+                }
+            }
+        }
+        let attempt_deadline = transport.now_ms().saturating_add(DRIVER_OWN_ATTEMPT_MS);
+        loop {
+            event(FirmwareOwnershipEvent::StatusReadBefore {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+            });
+            let raw = match transport.read_low_power_control() {
+                Ok(raw) => raw,
+                Err(error) => {
+                    if first_transport_error.is_none() {
+                        first_transport_error = Some(error);
+                    }
+                    let now = transport.now_ms();
+                    if now >= attempt_deadline {
+                        event(FirmwareOwnershipEvent::AttemptExpired {
+                            attempt,
+                            at_ms: now.saturating_sub(start),
+                        });
+                        break;
+                    }
+                    transport.sleep_ms(DRIVER_OWN_POLL_MS.min(attempt_deadline - now));
+                    continue;
+                }
+            };
+            let now = transport.now_ms();
+            event(FirmwareOwnershipEvent::StatusRead {
+                attempt,
+                at_ms: now.saturating_sub(start),
+                raw,
+            });
+            if raw & PCIE_LPCR_HOST_OWN_SYNC != 0 {
+                event(FirmwareOwnershipEvent::Restored {
+                    attempt,
+                    at_ms: now.saturating_sub(start),
+                });
+                return match first_transport_error {
+                    Some(error) => Err(FirmwareOwnershipError::Transport(error)),
+                    None => Ok(()),
+                };
+            }
+            if now >= attempt_deadline {
+                event(FirmwareOwnershipEvent::AttemptExpired {
+                    attempt,
+                    at_ms: now.saturating_sub(start),
+                });
+                break;
+            }
+            transport.sleep_ms(DRIVER_OWN_POLL_MS.min(attempt_deadline - now));
+        }
+    }
+    let at_ms = transport.now_ms().saturating_sub(start);
+    event(FirmwareOwnershipEvent::TimedOut { at_ms });
+    match first_transport_error {
+        Some(error) => Err(FirmwareOwnershipError::TransportAndTimeout(error)),
+        None => Err(FirmwareOwnershipError::Timeout),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipRoundTripEvent {
+    SnapshotReadBefore,
+    Snapshot { raw: u32, state: OwnershipState },
+    Driver(OwnershipEvent),
+    Firmware(FirmwareOwnershipEvent),
+    Complete { restored: OwnershipState },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipRoundTripError<E> {
+    SnapshotTransport(E),
+    SnapshotAllOnes,
+    SnapshotCommandBits(u32),
+    Acquire(OwnershipError<E>),
+    Restore(FirmwareOwnershipError<E>),
+    AcquireAndRestore {
+        acquire: OwnershipError<E>,
+        restore: FirmwareOwnershipError<E>,
+    },
+}
+
+/// Round-trip the conn-on ownership command while restoring the semantic
+/// initial state. Once CLR is issued from firmware-owned state, SET rollback
+/// is attempted regardless of the acquisition result.
+pub fn round_trip_driver_ownership<T, F>(
+    transport: &mut T,
+    aspm_supported: bool,
+    mut event: F,
+) -> Result<OwnershipState, OwnershipRoundTripError<T::Error>>
+where
+    T: OwnershipRoundTripTransport,
+    F: FnMut(OwnershipRoundTripEvent),
+{
+    event(OwnershipRoundTripEvent::SnapshotReadBefore);
+    let raw = transport
+        .read_low_power_control()
+        .map_err(OwnershipRoundTripError::SnapshotTransport)?;
+    if raw == u32::MAX {
+        return Err(OwnershipRoundTripError::SnapshotAllOnes);
+    }
+    if raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
+        return Err(OwnershipRoundTripError::SnapshotCommandBits(raw));
+    }
+    let initial = if raw & PCIE_LPCR_HOST_OWN_SYNC == 0 {
+        OwnershipState::DriverOwned
+    } else {
+        OwnershipState::FirmwareOwned
+    };
+    event(OwnershipRoundTripEvent::Snapshot {
+        raw,
+        state: initial,
+    });
+    let acquire = acquire_driver_ownership_with_aspm(transport, aspm_supported, |item| {
+        event(OwnershipRoundTripEvent::Driver(item))
+    });
+    if initial == OwnershipState::DriverOwned {
+        acquire.map_err(OwnershipRoundTripError::Acquire)?;
+        event(OwnershipRoundTripEvent::Complete { restored: initial });
+        return Ok(initial);
+    }
+    let restore = restore_firmware_ownership(transport, |item| {
+        event(OwnershipRoundTripEvent::Firmware(item))
+    });
+    match (acquire, restore) {
+        (Ok(()), Ok(())) => {
+            event(OwnershipRoundTripEvent::Complete { restored: initial });
+            Ok(initial)
+        }
+        (Err(acquire), Ok(())) => Err(OwnershipRoundTripError::Acquire(acquire)),
+        (Ok(()), Err(restore)) => Err(OwnershipRoundTripError::Restore(restore)),
+        (Err(acquire), Err(restore)) => {
+            Err(OwnershipRoundTripError::AcquireAndRestore { acquire, restore })
+        }
+    }
 }
 
 pub const MT_HIF_REMAP_L1_BAR_OFFSET: usize = 0xfe24c;
@@ -1234,8 +1553,8 @@ where
     let operation = (|| {
         select_l1(transport, saved, 0x7001, &mut event)?;
         let chip_id = read_l1(transport, "chip_id", 0x7001_0200, &mut event)?;
-        let revision = read_l1(transport, "revision", 0x7001_0204, &mut event)?;
         let hardware_bound = read_l1(transport, "hardware_bound", 0x7001_0020, &mut event)?;
+        let revision = read_l1(transport, "revision", 0x7001_0204, &mut event)?;
         select_l1(transport, saved, 0x1806, &mut event)?;
         let top_low_power_control =
             read_l1(transport, "top_low_power_control", 0x1806_0010, &mut event)?;
@@ -3474,15 +3793,24 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if frame.len() < 2 {
         return Err(PassiveRxError::Truncated);
     }
-    Ok(Connac2RxFrame { bytes: frame.to_vec(), band, channel, rssi_dbm })
+    Ok(Connac2RxFrame {
+        bytes: frame.to_vec(),
+        band,
+        channel,
+        rssi_dbm
+    })
 }
 
 /// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
 /// beacon/probe-response material to pinned Fuchsia. Data/control frames,
 /// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
 pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
-    let Connac2RxFrame { bytes: frame, band, channel, rssi_dbm } =
-        parse_connac2_rx_frame(bytes)?;
+    let Connac2RxFrame {
+        bytes: frame,
+        band,
+        channel,
+        rssi_dbm
+    } = parse_connac2_rx_frame(bytes)?;
     let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
     let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
     let probe_response = match frame_control & 0x00fc {
@@ -3788,6 +4116,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
     state: &mut FirmwareLoaderState,
     configure_channel_domain: bool,
+    stop_after_capability: bool,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
     let mut report = FirmwareLoaderReport {
         download_ready_observed: false,
@@ -3982,6 +4311,10 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             });
         }
     }
+    if stop_after_capability {
+        *state = FirmwareLoaderState::Ready;
+        return Ok(report);
+    }
     let eeprom_command = DownloadCommand::ReadEepromBlock {
         address: MT7921_EEPROM_HW_TYPE_BLOCK,
     };
@@ -4046,7 +4379,7 @@ pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, false);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -4058,7 +4391,7 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, true);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -4076,14 +4409,29 @@ where
     F: FnOnce(&mut T, &FirmwareLoaderReport) -> Result<(), T::Error>,
 {
     let mut state = FirmwareLoaderState::Powering;
-    let result =
-        run_firmware_loader(transport, patch, firmware, &mut state, true).and_then(|report| {
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false).and_then(
+        |report| {
             passive(transport, &report).map_err(|source| FirmwareLoaderFailure::Transport {
                 operation: FirmwareLoaderOperation::PassiveBoundary,
                 source,
             })?;
             Ok(report)
-        });
+        },
+    );
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Load and start the pinned patch and RAM firmware, prove N9 readiness, and
+/// complete one bounded GET_NIC_CAPABILITY response. This deliberately stops
+/// before the first EEPROM read, CLC/calibration, channel-domain, or radio
+/// command and then runs the same mandatory fail-closed cleanup transaction.
+pub fn load_mt7921_firmware_bootstrap<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, true);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -4296,7 +4644,9 @@ pub trait WfsysResetTransport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WfsysResetEvent {
     Snapshot { raw: u32 },
+    AssertBefore { raw: u32 },
     Asserted { raw: u32, at_ms: u64 },
+    ReleaseBefore { raw: u32 },
     Released { raw: u32, at_ms: u64 },
     StatusRead { raw: u32, at_ms: u64 },
     Ready { raw: u32, at_ms: u64 },
@@ -4327,6 +4677,7 @@ where
         .map_err(WfsysResetError::Transport)?;
     event(WfsysResetEvent::Snapshot { raw: initial });
     let asserted = initial & !WFSYS_SW_RST_B;
+    event(WfsysResetEvent::AssertBefore { raw: asserted });
     transport
         .write_reset_control(asserted)
         .map_err(WfsysResetError::Transport)?;
@@ -4336,6 +4687,7 @@ where
     });
     transport.sleep_ms(WFSYS_ASSERT_MS);
     let released = asserted | WFSYS_SW_RST_B;
+    event(WfsysResetEvent::ReleaseBefore { raw: released });
     transport
         .write_reset_control(released)
         .map_err(WfsysResetError::Transport)?;
@@ -4371,6 +4723,134 @@ where
             return Err(WfsysResetError::Timeout);
         }
         transport.sleep_ms(DRIVER_OWN_POLL_MS.min(deadline - now));
+    }
+}
+
+pub trait IrqResetTransport: WfsysResetTransport {
+    fn install_irq(&mut self, capability: PciIrqCapability) -> Result<(), Self::Error>;
+    fn mask_host_irq(&mut self) -> Result<(), Self::Error>;
+    fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error>;
+    fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error>;
+    fn disable_irq(&mut self) -> Result<(), Self::Error>;
+    fn containment_reset(&mut self) -> Result<(), Self::Error>;
+    fn verify_contained(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrqResetPrimaryError<E> {
+    InvalidCapability,
+    Install(E),
+    Wfsys(WfsysResetError<E>),
+    MaskHost(E),
+    EnablePcieMac(E),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqResetCleanupStep {
+    DisablePcieMac,
+    MaskHost,
+    DisableIrq,
+    ContainmentReset,
+    VerifyContained,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrqResetError<E> {
+    pub primary: Option<IrqResetPrimaryError<E>>,
+    pub cleanup: Vec<(IrqResetCleanupStep, E)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrqResetEvent {
+    IrqInstallBefore { capability: PciIrqCapability },
+    IrqInstalled { capability: PciIrqCapability },
+    Wfsys(WfsysResetEvent),
+    HostIrqMaskBefore,
+    HostIrqMasked,
+    PcieMacIrqEnableBefore,
+    PcieMacIrqEnabled,
+    SetupComplete,
+    CleanupBefore { step: IrqResetCleanupStep },
+    CleanupComplete { step: IrqResetCleanupStep },
+}
+
+/// Prepare the Linux-derived reset/IRQ boundary, then contain it before any
+/// DMA mapping or firmware work. It preserves pinned Linux's reset, host-mask,
+/// MAC-gate, then IRQ-install order; all cleanup steps are attempted even after
+/// an ambiguous install error.
+pub fn exercise_irq_reset_boundary<T, F>(
+    transport: &mut T,
+    capability: PciIrqCapability,
+    mut event: F,
+) -> Result<(), IrqResetError<T::Error>>
+where
+    T: IrqResetTransport,
+    F: FnMut(IrqResetEvent),
+{
+    if capability.count == 0 || !capability.eventfd {
+        return Err(IrqResetError {
+            primary: Some(IrqResetPrimaryError::InvalidCapability),
+            cleanup: Vec::new(),
+        });
+    }
+    let primary = match reset_wfsys(transport, |item| event(IrqResetEvent::Wfsys(item))) {
+        Err(error) => Some(IrqResetPrimaryError::Wfsys(error)),
+        Ok(()) => {
+            event(IrqResetEvent::HostIrqMaskBefore);
+            match transport.mask_host_irq() {
+                Err(error) => Some(IrqResetPrimaryError::MaskHost(error)),
+                Ok(()) => {
+                    event(IrqResetEvent::HostIrqMasked);
+                    event(IrqResetEvent::PcieMacIrqEnableBefore);
+                    match transport.enable_pcie_mac_irq() {
+                        Err(error) => Some(IrqResetPrimaryError::EnablePcieMac(error)),
+                        Ok(()) => {
+                            event(IrqResetEvent::PcieMacIrqEnabled);
+                            event(IrqResetEvent::IrqInstallBefore { capability });
+                            match transport.install_irq(capability) {
+                                Err(error) => Some(IrqResetPrimaryError::Install(error)),
+                                Ok(()) => {
+                                    event(IrqResetEvent::IrqInstalled { capability });
+                                    event(IrqResetEvent::SetupComplete);
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let mut cleanup = Vec::new();
+    macro_rules! cleanup_step {
+        ($step:expr, $operation:expr) => {{
+            let step = $step;
+            event(IrqResetEvent::CleanupBefore { step });
+            match $operation {
+                Ok(()) => event(IrqResetEvent::CleanupComplete { step }),
+                Err(error) => cleanup.push((step, error)),
+            }
+        }};
+    }
+    cleanup_step!(IrqResetCleanupStep::MaskHost, transport.mask_host_irq());
+    cleanup_step!(
+        IrqResetCleanupStep::DisablePcieMac,
+        transport.disable_pcie_mac_irq()
+    );
+    cleanup_step!(IrqResetCleanupStep::DisableIrq, transport.disable_irq());
+    cleanup_step!(
+        IrqResetCleanupStep::ContainmentReset,
+        transport.containment_reset()
+    );
+    cleanup_step!(
+        IrqResetCleanupStep::VerifyContained,
+        transport.verify_contained()
+    );
+    if primary.is_none() && cleanup.is_empty() {
+        Ok(())
+    } else {
+        Err(IrqResetError { primary, cleanup })
     }
 }
 
@@ -4781,6 +5261,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mt7921TxFree {
+    pub wcid: Option<u16>,
     pub token: u16,
     pub dropped: bool,
     pub attempts: u16,
@@ -4818,7 +5299,7 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
         return Err(Mt7921TxCompletionError::WrongPacketType);
     }
     let reported_len = (header & 0xffff) as usize;
-    if reported_len != 12 {
+    if reported_len != 12 && reported_len != 16 {
         return Err(Mt7921TxCompletionError::InvalidFormat);
     }
     let bytes = bytes
@@ -4827,17 +5308,30 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
     if header >> 16 & 0x03ff != 1 {
         return Err(Mt7921TxCompletionError::MultipleOrPaired);
     }
-    let info = u32::from_le_bytes(
+    let first = u32::from_le_bytes(
         bytes
             .get(8..12)
             .ok_or(Mt7921TxCompletionError::Truncated)?
             .try_into()
             .expect("fixed field"),
     );
-    if info & (1 << 31) != 0 {
-        return Err(Mt7921TxCompletionError::MultipleOrPaired);
-    }
+    let (wcid, info) = if first & (1 << 31) != 0 {
+        if reported_len != 16 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        let info = u32::from_le_bytes(bytes[12..16].try_into().expect("fixed field"));
+        if info & (1 << 31) != 0 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        (Some(((first >> 14) & 0x03ff) as u16), info)
+    } else {
+        if reported_len != 12 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        (None, first)
+    };
     Ok(Mt7921TxFree {
+        wcid,
         token: ((info >> 16) & 0x7fff) as u16,
         dropped: (info >> 13) & 0x3 != 0,
         attempts: (info & 0x1fff) as u16,
@@ -6448,6 +6942,7 @@ mod tests {
         assert_eq!(
             parse_mt7921_tx_free(&free),
             Ok(Mt7921TxFree {
+                wcid: None,
                 token: 7,
                 dropped: false,
                 attempts: 1
@@ -6483,9 +6978,16 @@ mod tests {
         );
         let mut stale_free_tail = [0u8; 16];
         stale_free_tail[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        stale_free_tail[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+        stale_free_tail[12..16].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
         assert_eq!(
             parse_mt7921_tx_free(&stale_free_tail),
-            Err(Mt7921TxCompletionError::InvalidFormat)
+            Ok(Mt7921TxFree {
+                wcid: Some(19),
+                token: 7,
+                dropped: false,
+                attempts: 1
+            })
         );
     }
 
@@ -6632,7 +7134,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_ownership_rejects_command_bits_on_readback() {
+    fn driver_ownership_poll_masks_only_own_sync_like_linux() {
         let mut transport = FakeOwnership {
             now: 0,
             status: PCIE_LPCR_HOST_CLR_OWN,
@@ -6642,17 +7144,328 @@ mod tests {
         let mut events = Vec::new();
         assert_eq!(
             acquire_driver_ownership(&mut transport, |event| events.push(event)),
-            Err(OwnershipError::UnexpectedState(PCIE_LPCR_HOST_CLR_OWN))
+            Ok(())
         );
         assert_eq!(transport.writes, 1);
         assert_eq!(
             events.last(),
-            Some(&OwnershipEvent::UnexpectedState {
+            Some(&OwnershipEvent::Acquired {
                 attempt: 1,
                 at_ms: 0,
-                raw: PCIE_LPCR_HOST_CLR_OWN
             })
         );
+    }
+
+    fn pcie_config(link_control: u16) -> [u8; 256] {
+        let mut config = [0u8; 256];
+        config[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&PCI_STATUS_CAP_LIST.to_le_bytes());
+        config[PCI_CAPABILITY_LIST] = 0x40;
+        config[0x40] = 0x05;
+        config[0x41] = 0x60;
+        config[0x60] = PCI_CAP_ID_EXP;
+        config[0x61] = 0;
+        config[0x60 + PCI_EXP_LNKCTL..0x60 + PCI_EXP_LNKCTL + 2]
+            .copy_from_slice(&link_control.to_le_bytes());
+        config
+    }
+
+    #[test]
+    fn parses_endpoint_and_parent_aspm_like_pinned_mt76() {
+        let disabled = pcie_config(0x0040);
+        let endpoint_l0s = pcie_config(0x0041);
+        let parent_l1 = pcie_config(0x0002);
+        assert_eq!(pcie_link_control(&endpoint_l0s), Ok(0x0041));
+        assert_eq!(mt76_pci_aspm_supported(&disabled, None), Ok(false));
+        assert_eq!(mt76_pci_aspm_supported(&endpoint_l0s, None), Ok(true));
+        assert_eq!(
+            mt76_pci_aspm_supported(&disabled, Some(&parent_l1)),
+            Ok(true)
+        );
+        assert_eq!(
+            mt76_pci_aspm_supported(&disabled, Some(&disabled)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn pcie_capability_parser_rejects_absence_loops_and_truncation() {
+        let absent = [0u8; 256];
+        assert_eq!(
+            pcie_link_control(&absent),
+            Err(PcieLinkControlError::PcieCapabilityAbsent)
+        );
+        let mut looped = [0u8; 256];
+        looped[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&PCI_STATUS_CAP_LIST.to_le_bytes());
+        looped[PCI_CAPABILITY_LIST] = 0x40;
+        looped[0x40] = 0x05;
+        looped[0x41] = 0x40;
+        assert_eq!(
+            pcie_link_control(&looped),
+            Err(PcieLinkControlError::CapabilityLoop(0x40))
+        );
+        let mut truncated = [0u8; 72];
+        truncated[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&PCI_STATUS_CAP_LIST.to_le_bytes());
+        truncated[PCI_CAPABILITY_LIST] = 0x40;
+        truncated[0x40] = PCI_CAP_ID_EXP;
+        assert_eq!(
+            pcie_link_control(&truncated),
+            Err(PcieLinkControlError::TruncatedPcieCapability(0x40))
+        );
+    }
+
+    struct FakeOwnershipRoundTrip {
+        now: u64,
+        status: u32,
+        clear_after_writes: Option<u8>,
+        set_after_writes: Option<u8>,
+        clear_writes: u8,
+        set_writes: u8,
+        reads: u8,
+        fail_read: Option<u8>,
+        fail_clear_after_write: bool,
+        fail_set: bool,
+        fail_set_after_write: bool,
+        aspm_delays: Vec<(u64, u64)>,
+    }
+
+    impl OwnershipTransport for FakeOwnershipRoundTrip {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn write_clear_own(&mut self) -> Result<(), Self::Error> {
+            self.clear_writes += 1;
+            if self.clear_after_writes == Some(self.clear_writes) {
+                self.status &= !PCIE_LPCR_HOST_OWN_SYNC;
+            }
+            if self.fail_clear_after_write {
+                return Err("clear");
+            }
+            Ok(())
+        }
+        fn read_low_power_control(&mut self) -> Result<u32, Self::Error> {
+            self.reads += 1;
+            if self.fail_read == Some(self.reads) {
+                return Err("read");
+            }
+            Ok(self.status)
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+        fn sleep_us_range(&mut self, minimum: u64, maximum: u64) {
+            self.aspm_delays.push((minimum, maximum));
+            self.now += maximum.div_ceil(1_000);
+        }
+    }
+
+    impl OwnershipRoundTripTransport for FakeOwnershipRoundTrip {
+        fn write_set_own(&mut self) -> Result<(), Self::Error> {
+            self.set_writes += 1;
+            if self.fail_set {
+                return Err("set");
+            }
+            if self.set_after_writes == Some(self.set_writes) {
+                self.status |= PCIE_LPCR_HOST_OWN_SYNC;
+            }
+            if self.fail_set_after_write {
+                return Err("set");
+            }
+            Ok(())
+        }
+    }
+
+    fn round_trip_fake(initial: OwnershipState) -> FakeOwnershipRoundTrip {
+        FakeOwnershipRoundTrip {
+            now: 0,
+            status: match initial {
+                OwnershipState::DriverOwned => 0,
+                OwnershipState::FirmwareOwned => PCIE_LPCR_HOST_OWN_SYNC,
+            },
+            clear_after_writes: Some(1),
+            set_after_writes: Some(1),
+            clear_writes: 0,
+            set_writes: 0,
+            reads: 0,
+            fail_read: None,
+            fail_clear_after_write: false,
+            fail_set: false,
+            fail_set_after_write: false,
+            aspm_delays: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn firmware_owned_round_trip_delays_acquires_and_restores() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        let mut events = Vec::new();
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, true, |event| events.push(event)),
+            Ok(OwnershipState::FirmwareOwned)
+        );
+        assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+        assert_eq!(
+            transport.aspm_delays,
+            vec![(DRIVER_OWN_ASPM_DELAY_MIN_US, DRIVER_OWN_ASPM_DELAY_MAX_US)]
+        );
+        assert_eq!(events[0], OwnershipRoundTripEvent::SnapshotReadBefore);
+        assert!(events.contains(&OwnershipRoundTripEvent::Driver(
+            OwnershipEvent::AspmDelay {
+                attempt: 1,
+                at_ms: 3,
+                minimum_us: DRIVER_OWN_ASPM_DELAY_MIN_US,
+                maximum_us: DRIVER_OWN_ASPM_DELAY_MAX_US,
+            }
+        )));
+        assert_eq!(
+            events.last(),
+            Some(&OwnershipRoundTripEvent::Complete {
+                restored: OwnershipState::FirmwareOwned
+            })
+        );
+    }
+
+    #[test]
+    fn initially_driver_owned_never_issues_set_own() {
+        let mut transport = round_trip_fake(OwnershipState::DriverOwned);
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Ok(OwnershipState::DriverOwned)
+        );
+        assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, 0);
+        assert_eq!(transport.status, 0);
+    }
+
+    #[test]
+    fn post_clear_failure_still_restores_firmware_ownership() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_read = Some(2);
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Err(OwnershipRoundTripError::Acquire(OwnershipError::Transport(
+                "read"
+            )))
+        );
+        assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn ambiguous_clear_error_settles_for_aspm_before_rollback() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_clear_after_write = true;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, true, |_| {}),
+            Err(OwnershipRoundTripError::Acquire(OwnershipError::Transport(
+                "clear"
+            )))
+        );
+        assert_eq!(
+            transport.aspm_delays,
+            vec![(DRIVER_OWN_ASPM_DELAY_MIN_US, DRIVER_OWN_ASPM_DELAY_MAX_US)]
+        );
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn acquisition_timeout_still_runs_firmware_rollback() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.clear_after_writes = None;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Err(OwnershipRoundTripError::Acquire(OwnershipError::Timeout))
+        );
+        assert_eq!(transport.clear_writes, DRIVER_OWN_ATTEMPTS);
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn aspm_timeout_preserves_all_ten_full_poll_windows() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.clear_after_writes = None;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, true, |_| {}),
+            Err(OwnershipRoundTripError::Acquire(OwnershipError::Timeout))
+        );
+        assert_eq!(transport.clear_writes, DRIVER_OWN_ATTEMPTS);
+        assert_eq!(
+            transport.aspm_delays.len(),
+            usize::from(DRIVER_OWN_ATTEMPTS)
+        );
+        assert_eq!(transport.now, DRIVER_OWN_ASPM_HARD_DEADLINE_MS);
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn rollback_timeout_is_terminal_and_never_claims_restoration() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.set_after_writes = None;
+        let mut events = Vec::new();
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |event| events.push(event)),
+            Err(OwnershipRoundTripError::Restore(
+                FirmwareOwnershipError::Timeout
+            ))
+        );
+        assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, DRIVER_OWN_ATTEMPTS);
+        assert_eq!(transport.status, 0);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, OwnershipRoundTripEvent::Complete { .. }))
+        );
+    }
+
+    #[test]
+    fn rollback_read_error_is_retained_but_polling_continues_to_restoration() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_read = Some(3);
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Err(OwnershipRoundTripError::Restore(
+                FirmwareOwnershipError::Transport("read")
+            ))
+        );
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn ambiguous_set_error_is_polled_and_restoration_is_verified() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_set_after_write = true;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Err(OwnershipRoundTripError::Restore(
+                FirmwareOwnershipError::Transport("set")
+            ))
+        );
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn primary_and_rollback_errors_are_both_retained() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_read = Some(2);
+        transport.fail_set = true;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, false, |_| {}),
+            Err(OwnershipRoundTripError::AcquireAndRestore {
+                acquire: OwnershipError::Transport("read"),
+                restore: FirmwareOwnershipError::TransportAndTimeout("set"),
+            })
+        );
+        assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, DRIVER_OWN_ATTEMPTS);
     }
 
     #[derive(Default)]
@@ -6823,6 +7636,14 @@ mod tests {
         assert_eq!(status.revision, 0x7001_0204);
         assert_eq!(status.hardware_bound, 0x7001_0020);
         assert_eq!(status.top_low_power_control, 0x1806_0010);
+        let reads = events
+            .iter()
+            .filter_map(|event| match event {
+                DynamicL1Event::RegisterRead { physical, .. } => Some(*physical),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads, [0x7001_0200, 0x7001_0020, 0x7001_0204, 0x1806_0010]);
         assert_eq!(transport.selector, 0xabcd_1234);
         assert_eq!(transport.writes, [0xabcd_7001, 0xabcd_1806, 0xabcd_1234]);
         assert_eq!(
@@ -7103,6 +7924,212 @@ mod tests {
                 at_ms: WFSYS_ASSERT_MS + WFSYS_READY_DEADLINE_MS
             })
         );
+    }
+
+    struct FakeIrqReset {
+        now: u64,
+        raw: u32,
+        fail_setup: Option<&'static str>,
+        fail_cleanup: Vec<&'static str>,
+        operations: Vec<&'static str>,
+    }
+    impl WfsysResetTransport for FakeIrqReset {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn read_reset_control(&mut self) -> Result<u32, Self::Error> {
+            self.raw |= WFSYS_SW_INIT_DONE;
+            Ok(self.raw)
+        }
+        fn write_reset_control(&mut self, value: u32) -> Result<(), Self::Error> {
+            self.operations.push("wfsys_write");
+            if self.fail_setup == Some("wfsys_write") {
+                return Err("wfsys_write");
+            }
+            self.raw = value;
+            Ok(())
+        }
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.now += milliseconds;
+        }
+    }
+    impl IrqResetTransport for FakeIrqReset {
+        fn install_irq(&mut self, _: PciIrqCapability) -> Result<(), Self::Error> {
+            self.operations.push("install_irq");
+            if self.fail_setup == Some("install_irq") {
+                Err("install")
+            } else {
+                Ok(())
+            }
+        }
+        fn mask_host_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("mask_host");
+            if self.fail_setup == Some("mask_host") {
+                Err("mask_host")
+            } else {
+                Ok(())
+            }
+        }
+        fn enable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("enable_mac");
+            if self.fail_setup == Some("enable_mac") {
+                Err("enable_mac")
+            } else {
+                Ok(())
+            }
+        }
+        fn disable_pcie_mac_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("disable_mac");
+            if self.fail_cleanup.contains(&"disable_mac") {
+                Err("disable_mac")
+            } else {
+                Ok(())
+            }
+        }
+        fn disable_irq(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("disable_irq");
+            if self.fail_cleanup.contains(&"disable_irq") {
+                Err("disable_irq")
+            } else {
+                Ok(())
+            }
+        }
+        fn containment_reset(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("containment_reset");
+            if self.fail_cleanup.contains(&"containment_reset") {
+                Err("containment_reset")
+            } else {
+                Ok(())
+            }
+        }
+        fn verify_contained(&mut self) -> Result<(), Self::Error> {
+            self.operations.push("verify_contained");
+            if self.fail_cleanup.contains(&"verify_contained") {
+                Err("verify_contained")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn irq_capability() -> PciIrqCapability {
+        PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 32,
+            eventfd: true,
+        }
+    }
+
+    #[test]
+    fn irq_reset_boundary_orders_setup_before_dma_and_contains_it() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: None,
+            fail_cleanup: Vec::new(),
+            operations: Vec::new(),
+        };
+        exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}).unwrap();
+        assert_eq!(
+            transport.operations,
+            [
+                "wfsys_write",
+                "wfsys_write",
+                "mask_host",
+                "enable_mac",
+                "install_irq",
+                "mask_host",
+                "disable_mac",
+                "disable_irq",
+                "containment_reset",
+                "verify_contained"
+            ]
+        );
+    }
+
+    #[test]
+    fn irq_reset_boundary_attempts_all_cleanup_after_ambiguous_install_error() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: Some("install_irq"),
+            fail_cleanup: vec!["disable_mac", "disable_irq"],
+            operations: Vec::new(),
+        };
+        assert_eq!(
+            exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}),
+            Err(IrqResetError {
+                primary: Some(IrqResetPrimaryError::Install("install")),
+                cleanup: vec![
+                    (IrqResetCleanupStep::DisablePcieMac, "disable_mac"),
+                    (IrqResetCleanupStep::DisableIrq, "disable_irq"),
+                ],
+            })
+        );
+        assert_eq!(
+            transport.operations,
+            [
+                "wfsys_write",
+                "wfsys_write",
+                "mask_host",
+                "enable_mac",
+                "install_irq",
+                "mask_host",
+                "disable_mac",
+                "disable_irq",
+                "containment_reset",
+                "verify_contained"
+            ]
+        );
+    }
+
+    #[test]
+    fn irq_reset_boundary_stops_setup_at_each_failure_and_still_contains() {
+        for failed in ["wfsys_write", "mask_host", "enable_mac", "install_irq"] {
+            let mut transport = FakeIrqReset {
+                now: 0,
+                raw: WFSYS_SW_RST_B,
+                fail_setup: Some(failed),
+                fail_cleanup: Vec::new(),
+                operations: Vec::new(),
+            };
+            assert!(exercise_irq_reset_boundary(&mut transport, irq_capability(), |_| {}).is_err());
+            assert_eq!(
+                &transport.operations[transport.operations.len() - 5..],
+                [
+                    "mask_host",
+                    "disable_mac",
+                    "disable_irq",
+                    "containment_reset",
+                    "verify_contained"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn irq_reset_boundary_rejects_invalid_vector_before_mmio() {
+        let mut transport = FakeIrqReset {
+            now: 0,
+            raw: WFSYS_SW_RST_B,
+            fail_setup: None,
+            fail_cleanup: Vec::new(),
+            operations: Vec::new(),
+        };
+        let invalid = PciIrqCapability {
+            kind: PciIrqKind::Msi,
+            count: 0,
+            eventfd: true,
+        };
+        assert_eq!(
+            exercise_irq_reset_boundary(&mut transport, invalid, |_| {}),
+            Err(IrqResetError {
+                primary: Some(IrqResetPrimaryError::InvalidCapability),
+                cleanup: Vec::new(),
+            })
+        );
+        assert!(transport.operations.is_empty());
     }
 
     struct FakeInterrupt {
@@ -9115,6 +10142,36 @@ mod tests {
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
+    }
+
+    #[test]
+    fn firmware_bootstrap_stops_after_n9_capability_before_eeprom_or_clc() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader::default();
+        let report = load_mt7921_firmware_bootstrap(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+
+        assert!(report.download_ready_observed);
+        assert_eq!(report.nic_capability, nic_capability_fixture().1);
+        assert_eq!(report.eeprom_hardware.valid, 0);
+        assert!(transport.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::GetNicCapability, _)
+        )));
+        assert!(!transport.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::ReadEepromBlock { .. }, _)
+                | LoaderTrace::SetClc(..)
+                | LoaderTrace::SetChannelDomain(..)
+        )));
+        assert!(matches!(
+            transport.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        ));
     }
 
     #[test]
