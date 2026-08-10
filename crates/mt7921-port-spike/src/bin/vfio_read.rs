@@ -1094,6 +1094,27 @@ fn run() -> Result<(), String> {
                 "vfio_bar0_mmap_after page={selector_page:#x} length=4096"
             ));
             record_sae_stage(&format!(
+                "vfio_bar0_mmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length={} prot=read flags=shared region_size={} region_offset={}",
+                PAGE, bar0.size, bar0.offset
+            ));
+            let mut window = match ReadPage::map(
+                &capsule.device,
+                &bar0,
+                MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+                false,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    record_sae_stage(&format!(
+                        "vfio_bar0_mmap_error page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} error={error}"
+                    ));
+                    return Err(error);
+                }
+            };
+            record_sae_stage(&format!(
+                "vfio_bar0_mmap_after page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
+            record_sae_stage(&format!(
                 "vfio_remap_selector_read_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
             ));
             let saved_selector = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
@@ -1108,39 +1129,108 @@ fn run() -> Result<(), String> {
             record_sae_stage(&format!(
                 "vfio_remap_selector_saved offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
             ));
-            record_sae_stage(&format!(
-                "vfio_remap_selector_identity_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
-            ));
-            if let Err(error) = page.write_remap_selector(saved_selector) {
+            let selected = (saved_selector & !0xffff) | 0x7001;
+            let identity = (|| -> Result<(u32, u32), String> {
                 record_sae_stage(&format!(
-                    "vfio_remap_selector_identity_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                    "vfio_remap_selector_select_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} saved={saved_selector:#010x} value={selected:#010x} base=0x7001"
                 ));
-                return Err(error);
-            }
-            record_sae_stage(&format!(
-                "vfio_remap_selector_identity_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
-            ));
-            record_sae_stage(&format!(
-                "vfio_remap_selector_readback_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
-            ));
-            let readback = match page.read(MT_HIF_REMAP_L1_BAR_OFFSET) {
-                Ok(value) => value,
-                Err(error) => {
+                if let Err(error) = page.write_remap_selector(selected) {
                     record_sae_stage(&format!(
-                        "vfio_remap_selector_readback_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                        "vfio_remap_selector_select_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
                     ));
                     return Err(error);
                 }
-            };
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={selected:#010x}"
+                ));
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_verify_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+                ));
+                let verified = page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+                record_sae_stage(&format!(
+                    "vfio_remap_selector_select_verify_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={verified:#010x} base={:#06x}",
+                    verified & 0xffff
+                ));
+                if verified & 0xffff != 0x7001 {
+                    return Err(format!(
+                        "L1 selector did not retain 0x7001: {verified:#010x}"
+                    ));
+                }
+
+                let chip_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0200;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=chip_id physical=0x70010200 bar_offset={chip_offset:#x}"
+                ));
+                let chip_id = match window.read(chip_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=chip_id physical=0x70010200 bar_offset={chip_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=chip_id physical=0x70010200 bar_offset={chip_offset:#x} value={chip_id:#010x}"
+                ));
+
+                let revision_offset = MT_HIF_REMAP_WINDOW_BAR_OFFSET + 0x0204;
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_before name=revision physical=0x70010204 bar_offset={revision_offset:#x}"
+                ));
+                let revision = match window.read(revision_offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record_sae_stage(&format!(
+                            "vfio_dynamic_identity_read_error name=revision physical=0x70010204 bar_offset={revision_offset:#x} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                };
+                record_sae_stage(&format!(
+                    "vfio_dynamic_identity_read_after name=revision physical=0x70010204 bar_offset={revision_offset:#x} value={revision:#010x}"
+                ));
+                Ok((chip_id, revision))
+            })();
+
             record_sae_stage(&format!(
-                "vfio_remap_selector_readback_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={readback:#010x} equal={}",
-                readback == saved_selector
+                "vfio_remap_selector_restore_write_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
             ));
-            if readback != saved_selector {
+            let restore_write = page.write_remap_selector(saved_selector);
+            match &restore_write {
+                Ok(()) => record_sae_stage(&format!(
+                    "vfio_remap_selector_restore_write_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={saved_selector:#010x}"
+                )),
+                Err(error) => record_sae_stage(&format!(
+                    "vfio_remap_selector_restore_write_error offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} error={error}"
+                )),
+            }
+            restore_write?;
+            record_sae_stage(&format!(
+                "vfio_remap_selector_restore_verify_before offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x}"
+            ));
+            let restored = page.read(MT_HIF_REMAP_L1_BAR_OFFSET)?;
+            record_sae_stage(&format!(
+                "vfio_remap_selector_restore_verify_after offset={MT_HIF_REMAP_L1_BAR_OFFSET:#x} value={restored:#010x} expected={saved_selector:#010x} equal={}",
+                restored == saved_selector
+            ));
+            if restored != saved_selector {
                 return Err(format!(
-                    "L1 selector identity-write mismatch: saved={saved_selector:#010x} readback={readback:#010x}"
+                    "L1 selector restore mismatch: saved={saved_selector:#010x} restored={restored:#010x}"
                 ));
             }
+            let (chip_id, revision) = identity?;
+            record_sae_stage(&format!(
+                "vfio_dynamic_identity_complete chip_id={chip_id:#010x} revision={revision:#010x}"
+            ));
+
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
+            window.teardown()?;
+            record_sae_stage(&format!(
+                "vfio_bar0_munmap_after page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
+            ));
             record_sae_stage(&format!(
                 "vfio_bar0_munmap_before page={selector_page:#x} length=4096"
             ));
