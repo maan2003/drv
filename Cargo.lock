@@ -306,7 +306,15 @@ dependencies = [
 name = "drv-audio-pipewire-spike"
 version = "0.1.0"
 dependencies = [
+ "drv-fuchsia-audio-timeline",
  "pipewire-native-spa",
+]
+
+[[package]]
+name = "drv-fuchsia-audio-timeline"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

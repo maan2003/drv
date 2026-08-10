@@ -1,8 +1,10 @@
 # PipeWire audio spike
 
-This first slice supplies a hardware-free, deterministic S16LE/48 kHz/stereo
-playback endpoint and encodes its standard `SPA_PARAM_EnumFormat` object. Run it
-with:
+This slice supplies a hardware-free, deterministic S16LE/48 kHz/stereo
+playback endpoint and encodes its standard `SPA_PARAM_EnumFormat` object. Its
+consumed-byte to frame-position mapping directly executes the unchanged pinned
+Fuchsia audio `TimelineFunction`/`TimelineRate` implementation packaged in
+`../fuchsia-audio-timeline`; it is not a retyped local equivalent. Run it with:
 
 ```sh
 cargo run -p drv-audio-pipewire-spike
@@ -10,10 +12,8 @@ cargo test -p drv-audio-pipewire-spike
 ```
 
 The SPA POD bytes use PipeWire's native ABI and can be placed directly in a
-future node/port parameter event. The endpoint boundary contains project-owned
-PCM types only, so the protocol frontend does not leak into the eventual
-Fuchsia Audio Device Registry, mixer, timeline, processing, and ring-buffer
-implementation. This milestone neither accesses ALSA nor physical hardware.
+future node/port parameter event. The protocol frontend does not leak into the
+playback state. This milestone neither accesses ALSA nor physical hardware.
 
 ## Rust PipeWire libraries
 

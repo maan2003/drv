@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use drv_fuchsia_audio_timeline::TimelineFunction;
 use pipewire_native_spa::{
     param::{
         ParamType,
@@ -49,12 +50,23 @@ pub trait PlaybackEndpoint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointError {
     PartialFrame,
+    PositionOverflow,
 }
 
 /// A hardware-free endpoint that deterministically consumes complete PCM frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VirtualPcmEndpoint {
-    frames: u64,
+    bytes_consumed: i64,
+    frames_from_bytes: TimelineFunction,
+}
+
+impl Default for VirtualPcmEndpoint {
+    fn default() -> Self {
+        Self {
+            bytes_consumed: 0,
+            frames_from_bytes: TimelineFunction::new(0, 0, 1, 4).unwrap(),
+        }
+    }
 }
 
 impl PlaybackEndpoint for VirtualPcmEndpoint {
@@ -67,12 +79,15 @@ impl PlaybackEndpoint for VirtualPcmEndpoint {
         if !pcm.len().is_multiple_of(FRAME_BYTES) {
             return Err(EndpointError::PartialFrame);
         }
-        self.frames += (pcm.len() / FRAME_BYTES) as u64;
+        self.bytes_consumed = self
+            .bytes_consumed
+            .checked_add(i64::try_from(pcm.len()).map_err(|_| EndpointError::PositionOverflow)?)
+            .ok_or(EndpointError::PositionOverflow)?;
         Ok(())
     }
 
     fn frame_position(&self) -> u64 {
-        self.frames
+        self.frames_from_bytes.apply(self.bytes_consumed) as u64
     }
 }
 
@@ -175,6 +190,16 @@ mod tests {
         assert_eq!(endpoint.frame_position(), 4);
         assert_eq!(endpoint.write(&[0; 3]), Err(EndpointError::PartialFrame));
         assert_eq!(endpoint.frame_position(), 4);
+    }
+
+    #[test]
+    fn pipewire_virtual_sink_position_runs_through_fuchsia_timeline() {
+        let mut storage = [0; 256];
+        assert!(enum_format_pod(&mut storage).is_ok());
+
+        let mut endpoint = VirtualPcmEndpoint::default();
+        endpoint.write(&vec![0; 48_000 * 4]).unwrap();
+        assert_eq!(endpoint.frame_position(), 48_000);
     }
 
     #[test]

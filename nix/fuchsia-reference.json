@@ -1,6 +1,6 @@
 {
   "commit": "1e1219e3fac944c9a906aea9646939746b6062b3",
-  "closure": "netstack3-port-v2-wlan-mlme-1",
+  "closure": "netstack3-port-v2-wlan-mlme-audio-timeline-1",
   "paths": [
     "src/connectivity/bluetooth",
     "src/connectivity/network/netstack3",
@@ -63,6 +63,10 @@
     "sdk/fidl/fuchsia.wlan.stats"
   ],
   "providerArchives": [
+    {
+      "path": "src/media/audio/lib/timeline",
+      "hash": "sha256-RMk5GJbuLmbDvbLB5bBVJTxnBOe5JSPEK2RjdPYm9sg="
+    },
     {
       "path": "src/connectivity/network/netstack3",
       "hash": "sha256-htzxY54MBdauPS5fDPthvUb2gH2vBMRzGJNM5tUqc6U="

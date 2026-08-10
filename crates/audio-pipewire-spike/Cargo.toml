@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drv-fuchsia-audio-timeline = { path = "../fuchsia-audio-timeline" }
 pipewire-native-spa = "=0.1.4"
