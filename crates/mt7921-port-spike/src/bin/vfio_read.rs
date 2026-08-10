@@ -863,12 +863,18 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::VfioBound);
         }
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"vfio_bind_iommufd_before"}}"#);
+        }
         ioctl_mut(
             capsule.device.as_raw_fd(),
             VFIO_DEVICE_BIND_IOMMUFD,
             &mut bind,
             "bind iommufd",
         )?;
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"vfio_bind_iommufd_after"}}"#);
+        }
         capsule
             .acquisition
             .record(AcquisitionIntent::AllocateIoas)?;
@@ -879,12 +885,18 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAllocated);
         }
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"ioas_allocate_before"}}"#);
+        }
         ioctl_mut(
             capsule.iommu.as_raw_fd(),
             IOMMU_IOAS_ALLOC,
             &mut alloc,
             "allocate IOAS",
         )?;
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"ioas_allocate_after"}}"#);
+        }
         capsule.ioas = Some(Ioas {
             fd: Arc::clone(&capsule.iommu),
             id: alloc.out_ioas_id,
@@ -899,12 +911,18 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAttached);
         }
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"vfio_attach_iommufd_pt_before"}}"#);
+        }
         ioctl_mut(
             capsule.device.as_raw_fd(),
             VFIO_DEVICE_ATTACH_IOMMUFD_PT,
             &mut attach,
             "attach IOAS",
         )?;
+        if operation == Operation::RunOneShotSaeAuth {
+            println!(r#"{{"sae_auth_event":"vfio_attach_iommufd_pt_after"}}"#);
+        }
 
         if operation == Operation::RunOneShotSaeAuth {
             verify_pci_dma_disabled(&bdf).map_err(|error| {
