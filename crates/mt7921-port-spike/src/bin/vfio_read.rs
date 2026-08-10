@@ -907,12 +907,11 @@ fn run() -> Result<(), String> {
         )?;
 
         if operation == Operation::RunOneShotSaeAuth {
-            println!(r#"{{"sae_auth_event":"vfio_attached_reset_d0_preflight_started"}}"#);
-            reset_vfio_device(&capsule.device)?;
-            set_pci_bus_master(&bdf, false)?;
-            verify_pci_dma_disabled(&bdf)?;
+            verify_pci_dma_disabled(&bdf).map_err(|error| {
+                format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
+            })?;
             println!(
-                r#"{{"sae_auth_event":"vfio_attached_reset_d0_preflight_completed","pci_command":"mse_on_bme_off","power_state":"d0"}}"#
+                r#"{{"sae_auth_event":"vfio_attached_d0_preflight_already_ready","pci_command":"mse_on_bme_off","power_state":"d0","reset":"skipped"}}"#
             );
         }
 
