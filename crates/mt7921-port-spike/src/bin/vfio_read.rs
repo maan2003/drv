@@ -1181,6 +1181,9 @@ fn run_contained_dma_resource_round_trip(
     {
         cleanup.push(format!("disable MSI: {error}"));
     }
+    if !bme_disabled {
+        park_retention_capsule_ref(capsule);
+    }
     // A verified BME clear is the terminal ownership boundary even when an
     // internally busy WFDMA engine failed to report idle.
     if bme_disabled
@@ -3843,6 +3846,9 @@ fn run() -> Result<(), String> {
         {
             cleanup_errors.push(error);
         }
+        if !bme_disabled {
+            retain_mappings_for_watchdog("BME clear failed; DMA mappings remain device-owned");
+        }
         // BME readback makes the command arena host-owned even if WFDMA's
         // internal busy indication did not clear before the deadline.
         if bme_disabled {
@@ -6467,14 +6473,20 @@ impl ActiveMcuIo<'_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioFirmwareLoader<'_> {
+    fn ensure_mcu_tx_allowed(&self) -> Result<(), String> {
+        if self.uni_terminal_poisoned {
+            Err("MCU TX transport is terminally poisoned; containment required".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn send_acknowledged_uni_command(
         &mut self,
         expected_cid: u8,
         encoded: &[u8],
     ) -> Result<(), String> {
-        if self.uni_terminal_poisoned {
-            return Err("unified MCU transport is terminally poisoned; containment required".into());
-        }
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         let sequence = validate_uni_request(expected_cid, encoded)?;
         if encoded.len() > MCU_COMMAND_SLOT_BYTES {
@@ -6546,6 +6558,7 @@ impl VfioFirmwareLoader<'_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), String> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         let sequence = *encoded
             .get(39)
@@ -6613,6 +6626,7 @@ impl VfioFirmwareLoader<'_> {
     }
 
     fn send_rate_power_bytes(&mut self, encoded: &[u8]) -> Result<(), String> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         let _template_sequence = *encoded
             .get(39)
@@ -6658,6 +6672,7 @@ impl VfioFirmwareLoader<'_> {
     }
 
     fn query_pse_base(&mut self) -> Result<u32, String> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         self.mcu
             .wfdma
@@ -6764,6 +6779,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         sequence: u8,
         encoded: &[u8],
     ) -> Result<FirmwareCommandCompletion, Self::Error> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         if command == DownloadCommand::GetNicCapability {
             self.mcu.verify_post_n9_dual_rx()?;
@@ -6837,6 +6853,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         sequence: u8,
         encoded: &[u8],
     ) -> Result<Option<ClcSetResponse>, Self::Error> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         if command.alpha2 != *b"00" || command.environment != 1 || command.index > 1 {
             return Err("SET_CLC escaped the world/indoor allowlist".into());
@@ -6900,6 +6917,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         sequence: u8,
         encoded: &[u8],
     ) -> Result<(), Self::Error> {
+        self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         if command.alpha2 != *b"00"
             || !command.indoor
@@ -9652,6 +9670,38 @@ mod tests {
             .unwrap();
         assert!(submit.contains("self.uni_terminal_poisoned = true"));
         assert!(submit.contains("containment required"));
+        let loader = source
+            .split("impl VfioFirmwareLoader<'_> {")
+            .nth(1)
+            .unwrap()
+            .split("struct VfioRateTxPower")
+            .next()
+            .unwrap();
+        for method in [
+            "fn send_acknowledged_uni_command(",
+            "fn send_passive_command(",
+            "fn send_rate_power_bytes(",
+            "fn query_pse_base(",
+        ] {
+            let body = loader.split(method).nth(1).unwrap();
+            let guard = body.find("ensure_mcu_tx_allowed()?").unwrap();
+            let publish = body.find("publish_mcu_bytes(").unwrap();
+            assert!(guard < publish, "{method}");
+        }
+
+        let active_cleanup = source
+            .split("let ledger = capsule")
+            .find(|segment| segment.contains("DMA busy during teardown"))
+            .unwrap()
+            .split("if !release_errors.is_empty()")
+            .next()
+            .unwrap();
+        assert!(
+            active_cleanup
+                .find("if !bme_disabled")
+                .unwrap()
+                < active_cleanup.find("attempt_all_cleanup").unwrap()
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
