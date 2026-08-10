@@ -8,7 +8,9 @@
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
+use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
@@ -459,6 +461,265 @@ impl FirmwareRegion<'_> {
     pub const fn is_clc(&self) -> bool {
         self.feature_set & FW_FEATURE_NON_DL != 0 && self.region_type == FW_TYPE_CLC
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClcDiscovery {
+    pub segment_count: u16,
+    pub selected_power_segments: u16,
+    pub selected_power_rules: u16,
+    pub channel_segments: u16,
+    pub channel_rules: u16,
+    pub unique_country_codes: u16,
+    pub world_domain_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClcDiscoveryError {
+    TruncatedSegmentHeader,
+    InvalidSegmentLength(u32),
+    UnsupportedSegmentIndex(u8),
+    TruncatedRule { segment: u16 },
+    CountOverflow,
+    MissingWorldRule,
+    RuleTooLarge,
+}
+
+/// Inventory the local CLC region exactly up to (but not including) Linux's
+/// mutating `SET_CLC` call. Power segment selection uses the EEPROM hardware
+/// encapsulation bit; channel rules remain opaque firmware input.
+pub fn discover_clc(
+    firmware: Firmware<'_>,
+    hardware: EepromHardwareInfo,
+) -> Result<ClcDiscovery, ClcDiscoveryError> {
+    let Some(region) = firmware.regions().find(FirmwareRegion::is_clc) else {
+        return Ok(ClcDiscovery::default());
+    };
+    let mut discovery = ClcDiscovery::default();
+    let mut countries = Vec::<[u8; 2]>::new();
+    let mut accepted = [false; 2];
+    let mut offset = 0usize;
+    while offset < region.payload.len() {
+        let header = region
+            .payload
+            .get(offset..offset + 16)
+            .ok_or(ClcDiscoveryError::TruncatedSegmentHeader)?;
+        let length = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+        let length_usize = length as usize;
+        if length_usize < 16
+            || offset
+                .checked_add(length_usize)
+                .is_none_or(|end| end > region.payload.len())
+        {
+            return Err(ClcDiscoveryError::InvalidSegmentLength(length));
+        }
+        let index = header[4];
+        if index > 1 {
+            return Err(ClcDiscoveryError::UnsupportedSegmentIndex(index));
+        }
+        discovery.segment_count = discovery
+            .segment_count
+            .checked_add(1)
+            .ok_or(ClcDiscoveryError::CountOverflow)?;
+        let selected = !accepted[index as usize]
+            && (index == 1 || ((header[7] & 1 != 0) == hardware.encapsulated_calibration));
+        if selected {
+            accepted[index as usize] = true;
+        }
+        if index == 0 && selected {
+            discovery.selected_power_segments = discovery
+                .selected_power_segments
+                .checked_add(1)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+        } else if index == 1 {
+            discovery.channel_segments = discovery
+                .channel_segments
+                .checked_add(1)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+        }
+        let end = offset + length_usize;
+        let mut rule_offset = offset + 16;
+        // Pinned Linux stops when no more than 16 bytes remain in a segment.
+        while end - rule_offset > 16 {
+            let rule = region.payload.get(rule_offset..rule_offset + 6).ok_or(
+                ClcDiscoveryError::TruncatedRule {
+                    segment: discovery.segment_count - 1,
+                },
+            )?;
+            let data_length = u16::from_le_bytes([rule[4], rule[5]]) as usize;
+            let rule_length = 6usize
+                .checked_add(data_length)
+                .ok_or(ClcDiscoveryError::CountOverflow)?;
+            if rule_offset
+                .checked_add(rule_length)
+                .is_none_or(|rule_end| rule_end > end)
+            {
+                return Err(ClcDiscoveryError::TruncatedRule {
+                    segment: discovery.segment_count - 1,
+                });
+            }
+            if selected {
+                if index == 0 {
+                    discovery.selected_power_rules = discovery
+                        .selected_power_rules
+                        .checked_add(1)
+                        .ok_or(ClcDiscoveryError::CountOverflow)?;
+                } else {
+                    discovery.channel_rules = discovery
+                        .channel_rules
+                        .checked_add(1)
+                        .ok_or(ClcDiscoveryError::CountOverflow)?;
+                }
+                let alpha2 = [rule[0], rule[1]];
+                if alpha2 == *b"00" {
+                    discovery.world_domain_available = true;
+                }
+                if !countries.contains(&alpha2) {
+                    countries.push(alpha2);
+                }
+            }
+            rule_offset += rule_length;
+        }
+        offset = end;
+    }
+    discovery.unique_country_codes =
+        u16::try_from(countries.len()).map_err(|_| ClcDiscoveryError::CountOverflow)?;
+    Ok(discovery)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClcSetCommand {
+    pub index: u8,
+    pub environment: u8,
+    pub acpi_configuration: u8,
+    pub capability: u8,
+    pub alpha2: [u8; 2],
+    pub rule_type: [u8; 2],
+    pub environment_6ghz: u8,
+    pub mtcl_configuration: u8,
+    pub data: Vec<u8>,
+}
+
+impl ClcSetCommand {
+    /// Linux passes this exact predicate as `wait_resp` to
+    /// `mt76_mcu_skb_send_and_get_msg` for every selected rule.
+    pub const fn expects_response(&self) -> bool {
+        self.capability & 1 != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClcSetResponse {
+    pub tag: u16,
+    pub length: u16,
+    pub special_unii_mask: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClcSetResponseError {
+    Truncated,
+    InvalidLength(u16),
+    InvalidMask(u8),
+}
+
+/// Select every opaque `"00"` rule from Linux's accepted CLC records. This
+/// intentionally supplies no ACPI/MTCL overrides and never interprets data.
+pub fn world_clc_commands(
+    firmware: Firmware<'_>,
+    hardware: EepromHardwareInfo,
+    chip_capability: u64,
+    acpi_configuration: u8,
+) -> Result<Vec<ClcSetCommand>, ClcDiscoveryError> {
+    if acpi_configuration > 1 {
+        return Err(ClcDiscoveryError::RuleTooLarge);
+    }
+    let Some(region) = firmware.regions().find(FirmwareRegion::is_clc) else {
+        return Err(ClcDiscoveryError::MissingWorldRule);
+    };
+    let mut commands = Vec::new();
+    let mut accepted = [false; 2];
+    let mut offset = 0usize;
+    while offset < region.payload.len() {
+        let header = region
+            .payload
+            .get(offset..offset + 16)
+            .ok_or(ClcDiscoveryError::TruncatedSegmentHeader)?;
+        let length = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+        let length_usize = length as usize;
+        if length_usize < 16
+            || offset
+                .checked_add(length_usize)
+                .is_none_or(|end| end > region.payload.len())
+        {
+            return Err(ClcDiscoveryError::InvalidSegmentLength(length));
+        }
+        let index = header[4];
+        if index > 1 {
+            return Err(ClcDiscoveryError::UnsupportedSegmentIndex(index));
+        }
+        let selected = !accepted[index as usize]
+            && (index == 1 || ((header[7] & 1 != 0) == hardware.encapsulated_calibration));
+        if selected {
+            accepted[index as usize] = true;
+        }
+        let end = offset + length_usize;
+        let mut rule_offset = offset + 16;
+        while end - rule_offset > 16 {
+            let rule = region.payload.get(rule_offset..rule_offset + 6).ok_or(
+                ClcDiscoveryError::TruncatedRule {
+                    segment: index as u16,
+                },
+            )?;
+            let data_length = u16::from_le_bytes([rule[4], rule[5]]) as usize;
+            let rule_end = rule_offset
+                .checked_add(6)
+                .and_then(|start| start.checked_add(data_length))
+                .filter(|rule_end| *rule_end <= end)
+                .ok_or(ClcDiscoveryError::TruncatedRule {
+                    segment: index as u16,
+                })?;
+            if selected && &rule[..2] == b"00" {
+                commands.push(ClcSetCommand {
+                    index,
+                    environment: 1,
+                    acpi_configuration,
+                    capability: u8::from(chip_capability & 1 != 0),
+                    alpha2: *b"00",
+                    rule_type: [rule[2], rule[3]],
+                    environment_6ghz: 0,
+                    // mt792x_acpi_get_mtcl_conf returns u32::MAX when no
+                    // ACPI SAR country table exists; assignment to the
+                    // packed u8 request field retains 0xff.
+                    mtcl_configuration: 0xff,
+                    data: region.payload[rule_offset + 6..rule_end].to_vec(),
+                });
+            }
+            rule_offset = rule_end;
+        }
+        offset = end;
+    }
+    if commands.is_empty() {
+        Err(ClcDiscoveryError::MissingWorldRule)
+    } else {
+        Ok(commands)
+    }
+}
+
+pub fn parse_clc_set_response(bytes: &[u8]) -> Result<ClcSetResponse, ClcSetResponseError> {
+    let response = bytes.get(4..72).ok_or(ClcSetResponseError::Truncated)?;
+    let length = u16::from_le_bytes([response[2], response[3]]);
+    if length != 68 {
+        return Err(ClcSetResponseError::InvalidLength(length));
+    }
+    let special_unii_mask = response[4];
+    if special_unii_mask & !0x1f != 0 {
+        return Err(ClcSetResponseError::InvalidMask(special_unii_mask));
+    }
+    Ok(ClcSetResponse {
+        tag: u16::from_le_bytes([response[0], response[1]]),
+        length,
+        special_unii_mask,
+    })
 }
 
 /// A bounds-checked view of the Connac2 RAM firmware layout consumed by
@@ -2069,12 +2330,77 @@ where
 pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
 pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
 pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+pub const PATCH_FINISH_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
+pub const FIRMWARE_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 8;
+pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
+pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
+pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
+pub const DL_MODE_WORKING_PDA_CR4: u32 = 1 << 4;
+pub const DL_MODE_ENCRYPTION_MODE_SELECT: u32 = 1 << 6;
+pub const DL_MODE_NEED_RESPONSE: u32 = 1 << 31;
+
+/// Translate a Connac2 RAM region feature byte into Linux's download mode.
+/// Address override and non-download are caller-side region controls and do
+/// not contribute mode bits.
+pub const fn firmware_download_mode(feature_set: u8, working_pda_cr4: bool) -> u32 {
+    let mut mode = DL_MODE_NEED_RESPONSE | ((feature_set as u32) & DL_MODE_KEY_INDEX);
+    if feature_set & (1 << 0) != 0 {
+        mode |= DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV;
+    }
+    if feature_set & (1 << 4) != 0 {
+        mode |= DL_MODE_ENCRYPTION_MODE_SELECT;
+    }
+    if working_pda_cr4 {
+        mode |= DL_MODE_WORKING_PDA_CR4;
+    }
+    mode
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchSecurityError {
+    UnsupportedEncryptionType(u8),
+}
+
+/// Translate a Connac2 patch section's security word into Linux's download
+/// mode. Unknown encryption types fail closed instead of merely being logged.
+pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError> {
+    let mut mode = DL_MODE_NEED_RESPONSE;
+    if security_info == u32::MAX {
+        return Ok(mode);
+    }
+    match (security_info >> 24) as u8 {
+        0 => {}
+        1 => {
+            mode |= DL_MODE_ENCRYPT
+                | ((security_info << 1) & DL_MODE_KEY_INDEX)
+                | DL_MODE_RESET_SECURITY_IV;
+        }
+        2 => {
+            mode |= DL_MODE_ENCRYPT | DL_MODE_ENCRYPTION_MODE_SELECT | DL_MODE_RESET_SECURITY_IV;
+        }
+        encryption_type => {
+            return Err(PatchSecurityError::UnsupportedEncryptionType(
+                encryption_type,
+            ));
+        }
+    }
+    Ok(mode)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
     NicPowerControl,
+    GetNicCapability,
+    ReadEepromBlock {
+        address: u32,
+    },
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
+    PatchFinish,
+    FirmwareStart {
+        address: u32,
+        option: u32,
+    },
     PatchStart {
         address: u32,
         length: u32,
@@ -2091,6 +2417,8 @@ pub enum DownloadCommand {
 pub enum DownloadCommandError {
     InvalidSequence,
     InvalidLength,
+    InvalidFirmwareStart,
+    InvalidEepromAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2108,6 +2436,301 @@ pub enum DownloadResponseError {
     Truncated,
     InvalidLength,
     SequenceMismatch { expected: u8, actual: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NicPhyCapability {
+    pub ht: bool,
+    pub vht: bool,
+    pub has_5ghz: bool,
+    pub max_bandwidth: u8,
+    pub spatial_streams: u8,
+    pub hardware_path: u8,
+    pub he: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NicCapability {
+    pub element_count: u16,
+    pub mac_address: Option<[u8; 6]>,
+    pub phy: Option<NicPhyCapability>,
+    pub has_6ghz: Option<bool>,
+    pub chip_capability: Option<u64>,
+    pub unknown_elements: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalBand {
+    Ghz2,
+    Ghz5,
+    Ghz6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateChannel {
+    pub band: PhysicalBand,
+    pub number: u16,
+    pub frequency_mhz: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateChannelSummary {
+    pub ghz2: u16,
+    pub ghz5: u16,
+    pub ghz6: u16,
+}
+
+const FUCHSIA_PASSIVE_5GHZ: [u16; 25] = [
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165,
+];
+
+/// One enabled channel in pinned Linux `mt76_connac_mcu_channel_domain`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelDomainChannel {
+    pub band: PhysicalBand,
+    pub number: u16,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelDomainCommand {
+    pub alpha2: [u8; 2],
+    pub indoor: bool,
+    pub special_unii_mask: u8,
+    pub channels: Vec<ChannelDomainChannel>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelDomainError {
+    NonWorldDomain,
+    OutdoorEnvironment,
+    NonzeroSpecialUniiMask,
+    MissingBandCapabilities,
+    InvalidSequence,
+    InvalidChannelSet,
+}
+
+/// Generate only the pinned Fuchsia world/indoor passive channel intersection.
+/// Every entry carries Linux `IEEE80211_CHAN_NO_IR`; SET_CHAN_DOMAIN therefore
+/// cannot authorize transmission before the later passive-scan boundary.
+pub fn conservative_channel_domain(
+    capability: NicCapability,
+    alpha2: [u8; 2],
+    indoor: bool,
+    special_unii_mask: u8,
+) -> Result<ChannelDomainCommand, ChannelDomainError> {
+    if alpha2 != *b"00" {
+        return Err(ChannelDomainError::NonWorldDomain);
+    }
+    if !indoor {
+        return Err(ChannelDomainError::OutdoorEnvironment);
+    }
+    if special_unii_mask != 0 {
+        return Err(ChannelDomainError::NonzeroSpecialUniiMask);
+    }
+    if capability.phy.is_none() {
+        return Err(ChannelDomainError::MissingBandCapabilities);
+    }
+    let channels: Vec<ChannelDomainChannel> = candidate_channels(capability)
+        .into_iter()
+        .filter(|channel| {
+            matches!(channel.band, PhysicalBand::Ghz2) && channel.number <= 14
+                || matches!(channel.band, PhysicalBand::Ghz5)
+                    && FUCHSIA_PASSIVE_5GHZ.contains(&channel.number)
+        })
+        .map(|channel| ChannelDomainChannel {
+            band: channel.band,
+            number: channel.number,
+            flags: 1 << 1,
+        })
+        .collect();
+    if channels.is_empty() {
+        return Err(ChannelDomainError::MissingBandCapabilities);
+    }
+    Ok(ChannelDomainCommand {
+        alpha2,
+        indoor,
+        special_unii_mask,
+        channels,
+    })
+}
+
+/// Build the physical candidate universe installed by pinned mt76. These are
+/// not regulatory-valid channels until regdb, platform limits and CLC output
+/// have been applied.
+pub fn candidate_channels(capability: NicCapability) -> Vec<CandidateChannel> {
+    const CHANNELS_5GHZ: [u16; 28] = [
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165, 169, 173, 177,
+    ];
+    let mut channels = Vec::new();
+    let Some(phy) = capability.phy else {
+        return channels;
+    };
+    if phy.hardware_path & 1 != 0 {
+        for number in 1..=14 {
+            channels.push(CandidateChannel {
+                band: PhysicalBand::Ghz2,
+                number,
+                frequency_mhz: if number == 14 {
+                    2484
+                } else {
+                    2407 + 5 * number
+                },
+            });
+        }
+    }
+    if phy.hardware_path & 2 != 0 {
+        channels.extend(CHANNELS_5GHZ.into_iter().map(|number| CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number,
+            frequency_mhz: 5000 + 5 * number,
+        }));
+    }
+    if capability.has_6ghz == Some(true) {
+        channels.extend((1..=233).step_by(4).map(|number| CandidateChannel {
+            band: PhysicalBand::Ghz6,
+            number,
+            frequency_mhz: 5950 + 5 * number,
+        }));
+    }
+    channels
+}
+
+pub fn candidate_channel_summary(capability: NicCapability) -> CandidateChannelSummary {
+    let mut summary = CandidateChannelSummary::default();
+    for channel in candidate_channels(capability) {
+        match channel.band {
+            PhysicalBand::Ghz2 => summary.ghz2 += 1,
+            PhysicalBand::Ghz5 => summary.ghz5 += 1,
+            PhysicalBand::Ghz6 => summary.ghz6 += 1,
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NicCapabilityError {
+    TruncatedHeader,
+    TruncatedElementHeader { index: u16 },
+    TruncatedElement { index: u16, length: u32 },
+    InvalidKnownElement { index: u16, kind: u32 },
+}
+
+pub const MT7921_EEPROM_BLOCK_SIZE: usize = 16;
+pub const MT7921_EEPROM_HW_TYPE: u32 = 0x55b;
+pub const MT7921_EEPROM_HW_TYPE_BLOCK: u32 = 0x550;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EepromBlock {
+    pub address: u32,
+    pub valid: u32,
+    pub data: [u8; MT7921_EEPROM_BLOCK_SIZE],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EepromBlockError {
+    Truncated,
+    AddressMismatch { expected: u32, actual: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EepromHardwareInfo {
+    pub raw_type: u8,
+    pub encapsulated_calibration: bool,
+}
+
+impl EepromBlock {
+    pub fn hardware_info(&self) -> Result<EepromHardwareInfo, EepromBlockError> {
+        if self.address != MT7921_EEPROM_HW_TYPE_BLOCK {
+            return Err(EepromBlockError::AddressMismatch {
+                expected: MT7921_EEPROM_HW_TYPE_BLOCK,
+                actual: self.address,
+            });
+        }
+        let raw_type = self.data[(MT7921_EEPROM_HW_TYPE - MT7921_EEPROM_HW_TYPE_BLOCK) as usize];
+        Ok(EepromHardwareInfo {
+            raw_type,
+            encapsulated_calibration: raw_type & 1 != 0,
+        })
+    }
+}
+
+/// Parse pinned Linux `struct mt7921_mcu_eeprom_info` after the MCU RXD.
+pub fn parse_eeprom_block(
+    bytes: &[u8],
+    expected_address: u32,
+) -> Result<EepromBlock, EepromBlockError> {
+    let response = bytes.get(..24).ok_or(EepromBlockError::Truncated)?;
+    let address = u32::from_le_bytes(response[0..4].try_into().expect("fixed field"));
+    if address != expected_address {
+        return Err(EepromBlockError::AddressMismatch {
+            expected: expected_address,
+            actual: address,
+        });
+    }
+    Ok(EepromBlock {
+        address,
+        valid: u32::from_le_bytes(response[4..8].try_into().expect("fixed field")),
+        data: response[8..24].try_into().expect("fixed EEPROM block"),
+    })
+}
+
+/// Parse the TLV body returned by pinned Linux GET_NIC_CAPAB.
+pub fn parse_nic_capability(bytes: &[u8]) -> Result<NicCapability, NicCapabilityError> {
+    let header = bytes.get(..4).ok_or(NicCapabilityError::TruncatedHeader)?;
+    let element_count = u16::from_le_bytes([header[0], header[1]]);
+    let mut offset = 4usize;
+    let mut capability = NicCapability {
+        element_count,
+        mac_address: None,
+        phy: None,
+        has_6ghz: None,
+        chip_capability: None,
+        unknown_elements: 0,
+    };
+    for index in 0..element_count {
+        let tlv = bytes
+            .get(offset..offset + 8)
+            .ok_or(NicCapabilityError::TruncatedElementHeader { index })?;
+        let kind = u32::from_le_bytes(tlv[0..4].try_into().expect("fixed field"));
+        let length = u32::from_le_bytes(tlv[4..8].try_into().expect("fixed field"));
+        offset += 8;
+        let end = offset
+            .checked_add(length as usize)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(NicCapabilityError::TruncatedElement { index, length })?;
+        let value = &bytes[offset..end];
+        offset = end;
+        match kind {
+            7 if value.len() >= 6 => {
+                capability.mac_address = Some(value[..6].try_into().expect("checked MAC length"));
+            }
+            8 if value.len() >= 12 => {
+                capability.phy = Some(NicPhyCapability {
+                    ht: value[0] != 0,
+                    vht: value[1] != 0,
+                    has_5ghz: value[2] != 0,
+                    max_bandwidth: value[3],
+                    spatial_streams: value[4],
+                    hardware_path: value[10],
+                    he: value[11] != 0,
+                });
+            }
+            0x18 if !value.is_empty() => capability.has_6ghz = Some(value[0] != 0),
+            0x20 if value.len() >= 8 => {
+                capability.chip_capability = Some(u64::from_le_bytes(
+                    value[..8].try_into().expect("checked u64"),
+                ));
+            }
+            7 | 8 | 0x18 | 0x20 => {
+                return Err(NicCapabilityError::InvalidKnownElement { index, kind });
+            }
+            _ => capability.unknown_elements += 1,
+        }
+    }
+    Ok(capability)
 }
 
 /// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
@@ -2153,10 +2776,29 @@ pub fn encode_download_command(
     if sequence == 0 || sequence > 15 {
         return Err(DownloadCommandError::InvalidSequence);
     }
-    let (cid, payload): (u8, Vec<u8>) = match command {
-        DownloadCommand::NicPowerControl => (0x04, vec![1, 0, 0, 0]),
-        DownloadCommand::PatchSemaphoreGet => (0x10, 1u32.to_le_bytes().to_vec()),
-        DownloadCommand::PatchSemaphoreRelease => (0x10, 0u32.to_le_bytes().to_vec()),
+    let (cid, set_query, ext_cid, ext_cid_ack, payload): (u8, u8, u8, u8, Vec<u8>) = match command {
+        DownloadCommand::NicPowerControl => (0x04, 3, 0, 0, vec![1, 0, 0, 0]),
+        DownloadCommand::GetNicCapability => (0x8a, 1, 0, 0, vec![]),
+        DownloadCommand::ReadEepromBlock { address } => {
+            if address & 0xf != 0 || address > 0x9f0 {
+                return Err(DownloadCommandError::InvalidEepromAddress);
+            }
+            let mut payload = vec![0; 24];
+            payload[..4].copy_from_slice(&address.to_le_bytes());
+            (0xed, 0, 0x01, 1, payload)
+        }
+        DownloadCommand::PatchSemaphoreGet => (0x10, 3, 0, 0, 1u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0, 0, 0u32.to_le_bytes().to_vec()),
+        DownloadCommand::PatchFinish => (0x07, 3, 0, 0, vec![0; 4]),
+        DownloadCommand::FirmwareStart { address, option } => {
+            if address != 0x0091_5000 || option != 1 {
+                return Err(DownloadCommandError::InvalidFirmwareStart);
+            }
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&option.to_le_bytes());
+            payload.extend_from_slice(&address.to_le_bytes());
+            (0x02, 3, 0, 0, payload)
+        }
         DownloadCommand::PatchStart {
             address,
             length,
@@ -2169,7 +2811,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x05, payload)
+            (0x05, 3, 0, 0, payload)
         }
         DownloadCommand::TargetAddressLength {
             address,
@@ -2183,7 +2825,7 @@ pub fn encode_download_command(
             payload.extend_from_slice(&address.to_le_bytes());
             payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(&mode.to_le_bytes());
-            (0x01, payload)
+            (0x01, 3, 0, 0, payload)
         }
     };
     let total = CONNAC2_MCU_TXD_BYTES + payload.len();
@@ -2193,12 +2835,1271 @@ pub fn encode_download_command(
     bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
     bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
     bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
     bytes[36] = cid;
     bytes[37] = 0xa0;
-    bytes[38] = 3;
+    bytes[38] = set_query;
     bytes[39] = sequence;
+    bytes[41] = ext_cid;
+    bytes[43] = ext_cid_ack;
     bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(&payload);
     Ok(bytes)
+}
+
+/// Encode pinned Linux `MCU_CE_CMD(SET_CLC)` for one opaque CLC rule.
+pub fn encode_clc_set_command(
+    command: &ClcSetCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, DownloadCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(DownloadCommandError::InvalidSequence);
+    }
+    if command.index > 1
+        || command.environment != 1
+        || command.acpi_configuration > 1
+        || command.capability & !1 != 0
+        || command.alpha2 != *b"00"
+        || command.environment_6ghz != 0
+        || command.mtcl_configuration != 0xff
+        || command.data.is_empty()
+    {
+        return Err(DownloadCommandError::InvalidLength);
+    }
+    let request_length = 76usize
+        .checked_add(command.data.len())
+        .filter(|length| *length <= u16::MAX as usize)
+        .ok_or(DownloadCommandError::InvalidLength)?;
+    let total = CONNAC2_MCU_TXD_BYTES + request_length;
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0x5c, 0xa0, 1, sequence]);
+    let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+    request[0] = 1;
+    request[2..4].copy_from_slice(&(request_length as u16).to_le_bytes());
+    request[4] = command.index;
+    request[5] = command.environment;
+    request[6] = command.acpi_configuration;
+    request[7] = command.capability;
+    request[8..10].copy_from_slice(&command.alpha2);
+    request[10..12].copy_from_slice(&command.rule_type);
+    request[12] = command.environment_6ghz;
+    request[13] = command.mtcl_configuration;
+    request[76..].copy_from_slice(&command.data);
+    Ok(bytes)
+}
+
+/// Encode pinned Linux `MCU_CE_CMD(SET_CHAN_DOMAIN)` with its packed header
+/// and channel records. This command intentionally requests no MCU response.
+pub fn encode_channel_domain_command(
+    command: &ChannelDomainCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, ChannelDomainError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(ChannelDomainError::InvalidSequence);
+    }
+    if command.alpha2 != *b"00" {
+        return Err(ChannelDomainError::NonWorldDomain);
+    }
+    if !command.indoor {
+        return Err(ChannelDomainError::OutdoorEnvironment);
+    }
+    if command.special_unii_mask != 0 {
+        return Err(ChannelDomainError::NonzeroSpecialUniiMask);
+    }
+    let mut n_2ch = 0u8;
+    let mut n_5ch = 0u8;
+    let mut previous = None;
+    for channel in &command.channels {
+        let valid = match channel.band {
+            PhysicalBand::Ghz2 => channel.number >= 1 && channel.number <= 14,
+            PhysicalBand::Ghz5 => FUCHSIA_PASSIVE_5GHZ.contains(&channel.number),
+            PhysicalBand::Ghz6 => false,
+        };
+        let order = match channel.band {
+            PhysicalBand::Ghz2 => channel.number,
+            PhysicalBand::Ghz5 => 256 + channel.number,
+            PhysicalBand::Ghz6 => u16::MAX,
+        };
+        if !valid || channel.flags != 1 << 1 || previous.is_some_and(|value| value >= order) {
+            return Err(ChannelDomainError::InvalidChannelSet);
+        }
+        previous = Some(order);
+        match channel.band {
+            PhysicalBand::Ghz2 => n_2ch = n_2ch.saturating_add(1),
+            PhysicalBand::Ghz5 => n_5ch = n_5ch.saturating_add(1),
+            PhysicalBand::Ghz6 => unreachable!("6 GHz was rejected"),
+        }
+    }
+    if command.channels.is_empty() {
+        return Err(ChannelDomainError::InvalidChannelSet);
+    }
+    let request_length = 12 + command.channels.len() * 8;
+    let total = CONNAC2_MCU_TXD_BYTES + request_length;
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0x0f, 0xa0, 1, sequence]);
+    let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+    request[..2].copy_from_slice(&command.alpha2);
+    request[4..8].copy_from_slice(&[0, 3, 3, 0]);
+    request[8..12].copy_from_slice(&[n_2ch, n_5ch, 0, 0]);
+    for (index, channel) in command.channels.iter().enumerate() {
+        let offset = 12 + index * 8;
+        request[offset..offset + 2].copy_from_slice(&channel.number.to_le_bytes());
+        request[offset + 4..offset + 8].copy_from_slice(&channel.flags.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PassiveMcuCommand {
+    EepromBufferMode,
+    MacEnable,
+    SetRxPath {
+        channel: CandidateChannel,
+        antenna_mask: u8,
+    },
+    ChannelSwitch {
+        channel: CandidateChannel,
+        antenna_mask: u8,
+    },
+    AddDevice {
+        mac: [u8; 6],
+    },
+    AddBss,
+    SetPassiveRxFilter,
+    StartScan {
+        scan_sequence: u8,
+        channel: CandidateChannel,
+    },
+    CancelScan {
+        scan_sequence: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMcuCommandError {
+    InvalidSequence,
+    UnsupportedChannel,
+    InvalidAntennaMask,
+    InvalidScanSequence,
+    ActiveScanMaterial,
+}
+
+impl PassiveMcuCommand {
+    pub fn expects_response(&self) -> bool {
+        matches!(
+            self,
+            Self::EepromBufferMode
+                | Self::MacEnable
+                | Self::SetRxPath { .. }
+                | Self::ChannelSwitch { .. }
+                | Self::AddDevice { .. }
+                | Self::AddBss
+        )
+    }
+}
+
+fn encode_legacy_mcu(cid: u8, ext_cid: u8, payload: &[u8], sequence: u8) -> Vec<u8> {
+    let total = CONNAC2_MCU_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..44].copy_from_slice(&[
+        cid,
+        0xa0,
+        1,
+        sequence,
+        0,
+        ext_cid,
+        0,
+        u8::from(ext_cid != 0),
+    ]);
+    bytes[CONNAC2_MCU_TXD_BYTES..].copy_from_slice(payload);
+    bytes
+}
+
+fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
+    const UNI_TXD_BYTES: usize = 48;
+    let total = UNI_TXD_BYTES + payload.len();
+    let mut bytes = vec![0; total];
+    let txd0 = (total as u32) | (2 << 23) | (0x20 << 25);
+    let txd1 = (1u32 << 31) | (1 << 16);
+    bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
+    bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&cid.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 0x07;
+    bytes[UNI_TXD_BYTES..].copy_from_slice(payload);
+    bytes
+}
+
+/// Encode only the pinned Linux commands required by the conservative passive
+/// one-channel milestone. START_HW_SCAN has no SSID, probe, IE, random-MAC, or
+/// transmit material and uses Connac2's firmware-selected dwell fields (zero).
+pub fn encode_passive_mcu_command(
+    command: &PassiveMcuCommand,
+    sequence: u8,
+) -> Result<Vec<u8>, PassiveMcuCommandError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(PassiveMcuCommandError::InvalidSequence);
+    }
+    let channel_payload = |channel: CandidateChannel,
+                           antenna_mask: u8,
+                           switch_reason: u8,
+                           channel_switch: bool|
+     -> Result<Vec<u8>, PassiveMcuCommandError> {
+        let channel_band = match channel.band {
+            PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 0,
+            PhysicalBand::Ghz5 if FUCHSIA_PASSIVE_5GHZ.contains(&channel.number) => 1,
+            _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
+        };
+        if channel.frequency_mhz
+            != match channel.band {
+                PhysicalBand::Ghz2 if channel.number == 14 => 2484,
+                PhysicalBand::Ghz2 => 2407 + 5 * channel.number,
+                PhysicalBand::Ghz5 => 5000 + 5 * channel.number,
+                PhysicalBand::Ghz6 => unreachable!("6 GHz rejected above"),
+            }
+        {
+            return Err(PassiveMcuCommandError::UnsupportedChannel);
+        }
+        if antenna_mask != 3 {
+            return Err(PassiveMcuCommandError::InvalidAntennaMask);
+        }
+        let mut payload = vec![0; 76];
+        payload[0] = channel.number as u8;
+        payload[1] = channel.number as u8;
+        payload[2] = 0;
+        payload[3] = 2;
+        payload[4] = if channel_switch { 2 } else { antenna_mask };
+        payload[5] = switch_reason;
+        payload[10] = channel_band;
+        Ok(payload)
+    };
+    Ok(match command {
+        PassiveMcuCommand::EepromBufferMode => {
+            encode_legacy_mcu(0xed, 0x21, &[1, 0, 0, 0], sequence)
+        }
+        PassiveMcuCommand::MacEnable => encode_legacy_mcu(0xed, 0x46, &[1, 0, 0, 0], sequence),
+        PassiveMcuCommand::SetRxPath {
+            channel,
+            antenna_mask,
+        } => encode_legacy_mcu(
+            0xed,
+            0x4e,
+            &channel_payload(*channel, *antenna_mask, 0, false)?,
+            sequence,
+        ),
+        PassiveMcuCommand::ChannelSwitch {
+            channel,
+            antenna_mask,
+        } => encode_legacy_mcu(
+            0xed,
+            0x08,
+            &channel_payload(*channel, *antenna_mask, 9, true)?,
+            sequence,
+        ),
+        PassiveMcuCommand::AddDevice { mac } => {
+            let mut payload = vec![0; 16];
+            payload[4..8].copy_from_slice(&[0, 0, 12, 0]);
+            payload[8] = 1;
+            payload[10..16].copy_from_slice(mac);
+            encode_uni_mcu(1, &payload, sequence)
+        }
+        PassiveMcuCommand::AddBss => {
+            let mut payload = vec![0; 36];
+            payload[4..8].copy_from_slice(&[0, 0, 32, 0]);
+            payload[8] = 1;
+            payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+            payload[16] = 1;
+            payload[24..26].copy_from_slice(&19u16.to_le_bytes());
+            payload[30..32].copy_from_slice(&19u16.to_le_bytes());
+            encode_uni_mcu(2, &payload, sequence)
+        }
+        PassiveMcuCommand::SetPassiveRxFilter => {
+            let mut payload = vec![0; 68];
+            payload[4] = 1;
+            payload[8..12].copy_from_slice(&0x8000_0040u32.to_le_bytes());
+            encode_legacy_mcu(0x0a, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::StartScan {
+            scan_sequence,
+            channel,
+        } => {
+            if *scan_sequence > 0x7f {
+                return Err(PassiveMcuCommandError::InvalidScanSequence);
+            }
+            let scan_band = match channel.band {
+                PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 1,
+                PhysicalBand::Ghz5 if FUCHSIA_PASSIVE_5GHZ.contains(&channel.number) => 2,
+                _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
+            };
+            let mut payload = vec![0; 1186];
+            payload[0] = *scan_sequence;
+            payload[3] = 1;
+            payload[7] = 1;
+            payload[158] = 4;
+            payload[159] = 1;
+            payload[160] = scan_band;
+            payload[161] = channel.number as u8;
+            payload[6] = 1 << 5;
+            encode_legacy_mcu(0x03, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::CancelScan { scan_sequence } => {
+            if *scan_sequence > 0x7f {
+                return Err(PassiveMcuCommandError::InvalidScanSequence);
+            }
+            encode_legacy_mcu(0x1b, 0, &[*scan_sequence, 0, 0, 0], sequence)
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassiveScanDone {
+    pub scan_sequence: u8,
+    pub completed_channels: u8,
+    pub beacon_scan_count: u32,
+    pub alpha2: [u8; 2],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassiveAdvertisement {
+    pub probe_response: bool,
+    pub bssid: [u8; 6],
+    pub beacon_interval_tu: u16,
+    pub capability_info: u16,
+    pub ies: Vec<u8>,
+    pub band: PhysicalBand,
+    pub channel: u8,
+    pub rssi_dbm: i8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveRxError {
+    Truncated,
+    WrongEvent,
+    WrongPacketType,
+    RxError,
+    HeaderTranslated,
+    MissingRxVector,
+    UnsupportedFrame,
+    InvalidChannel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMacMmioOperation {
+    Rmw {
+        address: u32,
+        mask: u32,
+        value: u32,
+    },
+    WtblClear {
+        index: u8,
+        address: u32,
+        value: u32,
+        busy_mask: u32,
+        timeout_us: u32,
+    },
+}
+
+/// Exact ordered MMIO closure from pinned `mt7921_mac_init` and
+/// `mt792x_mac_init_band`. Physical code must execute every entry with the
+/// source primitive's verification semantics; partial support is not
+/// sufficient to attest `mac_mmio_initialized`.
+pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
+    let mut plan = vec![
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d004,
+            mask: 0x0000_fff8,
+            value: 1536 << 3,
+        },
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d000,
+            mask: 1 << 15,
+            value: 1 << 15,
+        },
+        PassiveMacMmioOperation::Rmw {
+            address: 0x820c_d000,
+            mask: 1 << 19,
+            value: 1 << 19,
+        },
+    ];
+    plan.extend((0..20).map(|index| PassiveMacMmioOperation::WtblClear {
+        index,
+        address: 0x820d_4230,
+        value: u32::from(index) | (1 << 12),
+        busy_mask: 1 << 31,
+        timeout_us: 5000,
+    }));
+    for band in 0..2 {
+        let (tmac, dma, rmac, mib, wtbloff) = if band == 0 {
+            (
+                0x820e_4000,
+                0x820e_7000,
+                0x820e_5000,
+                0x820e_d000,
+                0x820e_9000,
+            )
+        } else {
+            (
+                0x820f_4000,
+                0x820f_7000,
+                0x820f_5000,
+                0x820f_d000,
+                0x820f_9000,
+            )
+        };
+        plan.extend([
+            PassiveMacMmioOperation::Rmw {
+                address: tmac + 0x0f4,
+                mask: 0x3f,
+                value: 0x3f,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: tmac + 0x0f4,
+                mask: (1 << 17) | (1 << 18),
+                value: (1 << 17) | (1 << 18),
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: rmac + 0x03c4,
+                mask: 1 << 30,
+                value: 1 << 30,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: rmac + 0x0380,
+                mask: 1 << 30,
+                value: 1 << 30,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: mib + 0x004,
+                mask: 1 << 8,
+                value: 1 << 8,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: mib + 0x004,
+                mask: 1 << 9,
+                value: 1 << 9,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: dma,
+                mask: 0x0000_fff8,
+                value: 1536 << 3,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: dma,
+                mask: 1 << 23,
+                value: 0,
+            },
+            PassiveMacMmioOperation::Rmw {
+                address: wtbloff + 0x008,
+                mask: (3 << 30) | (3 << 24),
+                value: 3 << 24,
+            },
+        ]);
+    }
+    plan
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveMacBarError {
+    UnsupportedAddress(u32),
+    AllOnes { address: u32 },
+}
+
+/// Translate only the fixed-map regions touched by the mandatory passive MAC
+/// plan. Pinned `__mt7921_reg_addr` resolves these before its L1-remap fallback;
+/// callers must not mutate `MT_HIF_REMAP_L1` for any address accepted here.
+pub fn passive_mac_bar_offset(address: u32) -> Result<usize, PassiveMacBarError> {
+    const FIXED: [(u32, u32, u32); 12] = [
+        (0x820d_0000, 0x0003_0000, 0x0001_0000),
+        (0x820e_d000, 0x0002_4800, 0x0000_0800),
+        (0x820e_4000, 0x0002_1000, 0x0000_0400),
+        (0x820e_7000, 0x0002_1e00, 0x0000_0200),
+        (0x820e_5000, 0x0002_1400, 0x0000_0800),
+        (0x820c_d000, 0x0000_f000, 0x0000_1000),
+        (0x820e_9000, 0x0002_3400, 0x0000_0200),
+        (0x820f_4000, 0x000a_1000, 0x0000_0400),
+        (0x820f_5000, 0x000a_1400, 0x0000_0800),
+        (0x820f_7000, 0x000a_1e00, 0x0000_0200),
+        (0x820f_9000, 0x000a_3400, 0x0000_0200),
+        (0x820f_d000, 0x000a_4800, 0x0000_0800),
+    ];
+    if !passive_mac_mmio_plan()
+        .iter()
+        .any(|operation| match operation {
+            PassiveMacMmioOperation::Rmw {
+                address: expected, ..
+            }
+            | PassiveMacMmioOperation::WtblClear {
+                address: expected, ..
+            } => *expected == address,
+        })
+    {
+        return Err(PassiveMacBarError::UnsupportedAddress(address));
+    }
+    for (physical, mapped, size) in FIXED {
+        if let Some(offset) = address.checked_sub(physical)
+            && offset <= size
+        {
+            return Ok((mapped + offset) as usize);
+        }
+    }
+    Err(PassiveMacBarError::UnsupportedAddress(address))
+}
+
+pub fn validate_passive_mac_bar_read(
+    address: u32,
+    value: u32,
+) -> Result<(usize, u32), PassiveMacBarError> {
+    let offset = passive_mac_bar_offset(address)?;
+    if value == u32::MAX {
+        return Err(PassiveMacBarError::AllOnes { address });
+    }
+    Ok((offset, value))
+}
+
+/// Value produced by pinned `mt76_mmio_rmw`: one MMIO read, this calculation,
+/// then one `writel`. Linux returns the calculated value and does not require
+/// an immediate hardware readback to match it.
+pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
+    value | (initial & !mask)
+}
+
+pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
+    let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
+    if response.event_id != 0x0d || response.sequence != 0 {
+        return Err(PassiveRxError::WrongEvent);
+    }
+    let body = bytes.get(36..56).ok_or(PassiveRxError::Truncated)?;
+    Ok(PassiveScanDone {
+        scan_sequence: body[0] & 0x7f,
+        completed_channels: body[4],
+        beacon_scan_count: u32::from_le_bytes(body[8..12].try_into().expect("fixed field")),
+        alpha2: [body[17], body[18]],
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Connac2RxFrame {
+    pub bytes: Vec<u8>,
+    pub band: PhysicalBand,
+    pub channel: u8,
+    pub rssi_dbm: i8,
+}
+
+/// Strip exactly one Connac2 data/MCU-normal RX envelope into the complete
+/// 802.11 frame plus the receive fields retained by the pinned client seam.
+pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxError> {
+    let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
+    let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let reported_len = (rxd0 & 0xffff) as usize;
+    let bytes = bytes.get(..reported_len).ok_or(PassiveRxError::Truncated)?;
+    let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
+    let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
+    let rxd3 = u32::from_le_bytes(header[12..16].try_into().expect("fixed field"));
+    let packet_type = rxd0 >> 27 & 0x1f;
+    let packet_flag = rxd0 >> 16 & 0x0f;
+    if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
+        return Err(PassiveRxError::WrongPacketType);
+    }
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
+    {
+        return Err(PassiveRxError::RxError);
+    }
+    if rxd2 & (1 << 13) != 0 {
+        return Err(PassiveRxError::HeaderTranslated);
+    }
+    let channel = ((rxd3 >> 8) & 0xff) as u8;
+    let band = if (1..=14).contains(&channel) {
+        PhysicalBand::Ghz2
+    } else if FUCHSIA_PASSIVE_5GHZ.contains(&u16::from(channel)) {
+        PhysicalBand::Ghz5
+    } else {
+        return Err(PassiveRxError::InvalidChannel);
+    };
+    let mut offset = 24usize;
+    if rxd1 & (1 << 14) != 0 {
+        offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
+    }
+    if rxd1 & (1 << 11) != 0 {
+        offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
+    }
+    if rxd1 & (1 << 12) != 0 {
+        offset = offset.checked_add(8).ok_or(PassiveRxError::Truncated)?;
+    }
+    if rxd1 & (1 << 13) == 0 {
+        return Err(PassiveRxError::MissingRxVector);
+    }
+    let rxv = bytes.get(offset..offset + 8).ok_or(PassiveRxError::Truncated)?;
+    let mut rcpi = u32::from_le_bytes(rxv[4..8].try_into().expect("fixed field"));
+    offset += 8;
+    if rxd1 & (1 << 15) != 0 {
+        let group5 = bytes.get(offset..offset + 72).ok_or(PassiveRxError::Truncated)?;
+        // Pinned Linux skips the first 24 bytes of GROUP_5, takes its
+        // overriding RCPI field, then advances across the remaining 48.
+        rcpi = u32::from_le_bytes(group5[24..28].try_into().expect("fixed field"));
+        offset = offset.checked_add(72).ok_or(PassiveRxError::Truncated)?;
+    }
+    let rssi_dbm = (0..2)
+        .map(|chain| ((rcpi >> (chain * 8)) & 0xff) as i16)
+        .map(|value| (value - 220) / 2)
+        .max()
+        .unwrap_or(-128)
+        .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+    offset = offset
+        .checked_add(2 * ((rxd2 >> 14) & 0x3) as usize)
+        .ok_or(PassiveRxError::Truncated)?;
+    let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
+    if frame.len() < 2 {
+        return Err(PassiveRxError::Truncated);
+    }
+    Ok(Connac2RxFrame { bytes: frame.to_vec(), band, channel, rssi_dbm })
+}
+
+/// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
+/// beacon/probe-response material to pinned Fuchsia. Data/control frames,
+/// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
+pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
+    let Connac2RxFrame { bytes: frame, band, channel, rssi_dbm } =
+        parse_connac2_rx_frame(bytes)?;
+    let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
+    let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
+    let probe_response = match frame_control & 0x00fc {
+        0x0080 => false,
+        0x0050 => true,
+        _ => return Err(PassiveRxError::UnsupportedFrame),
+    };
+    Ok(PassiveAdvertisement {
+        probe_response,
+        bssid: fixed[16..22].try_into().expect("fixed field"),
+        beacon_interval_tu: u16::from_le_bytes([fixed[32], fixed[33]]),
+        capability_info: u16::from_le_bytes([fixed[34], fixed[35]]),
+        ies: frame[36..].to_vec(),
+        band,
+        channel,
+        rssi_dbm,
+    })
+}
+
+pub const FIRMWARE_POLL_INTERVAL_MS: u64 = 10;
+pub const DOWNLOAD_READY_TIMEOUT_MS: u64 = 1000;
+pub const N9_READY_TIMEOUT_MS: u64 = 1500;
+/// A fail-closed per-chunk safety deadline. Pinned PCI Linux uses a 3-second
+/// MCU timeout and requests no FW_SCATTER response; this offline model is
+/// deliberately stricter by requiring synchronous TX completion per chunk.
+pub const SCATTER_COMPLETION_TIMEOUT_MS: u64 = 3000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderState {
+    Powering,
+    DownloadReady,
+    PatchSemaphoreHeld,
+    PatchSemaphoreReleased,
+    PatchComplete,
+    RamDownloading,
+    FirmwareStarted,
+    N9Ready,
+    CapabilityDiscovered,
+    EepromDiscovered,
+    ClcConfigured,
+    ChannelDomainConfigured,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareImagePart {
+    Patch,
+    Ram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderOperation {
+    Command(DownloadCommand),
+    PublishScatter(FirmwareImagePart),
+    WaitScatterCompletion(FirmwareImagePart),
+    PollDownloadReady,
+    PollN9Ready,
+    SetClc,
+    SetChannelDomain,
+    PassiveBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareCommandCompletion {
+    NoResponse,
+    Ack,
+    PatchSemaphore(PatchSemaphoreStatus),
+    PatchFinish(u8),
+    NicCapability(NicCapability),
+    EepromBlock(EepromBlock),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchSemaphoreStatus {
+    NotDownloadedFailed,
+    AlreadyDownloaded,
+    Acquired,
+    Released,
+    Other(u8),
+}
+
+impl From<u8> for PatchSemaphoreStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::NotDownloadedFailed,
+            1 => Self::AlreadyDownloaded,
+            2 => Self::Acquired,
+            3 => Self::Released,
+            value => Self::Other(value),
+        }
+    }
+}
+
+/// Transport boundary for the complete loader transaction. Implementations
+/// own command/RX matching and one completion for every scatter chunk.
+pub trait FirmwareLoaderTransport {
+    type Error;
+
+    /// Allocate the next persistent nonzero four-bit MCU sequence. Linux keeps
+    /// this counter on the device and consumes a value for scatter messages.
+    fn next_sequence(&mut self) -> u8;
+    fn acpi_configuration(&self) -> u8;
+    fn command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<FirmwareCommandCompletion, Self::Error>;
+    fn set_clc(
+        &mut self,
+        command: &ClcSetCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<Option<ClcSetResponse>, Self::Error>;
+    fn set_channel_domain(
+        &mut self,
+        command: &ChannelDomainCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<(), Self::Error>;
+    fn publish_scatter(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        chunk: &[u8],
+    ) -> Result<(), Self::Error>;
+    fn wait_scatter_completion(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        deadline_ms: u64,
+    ) -> Result<(), Self::Error>;
+    fn firmware_download_state(&mut self) -> Result<u8, Self::Error>;
+    fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error>;
+    fn now_ms(&self) -> u64;
+    fn sleep_ms(&mut self, duration_ms: u64);
+    /// Quiesce DMA/IRQ activity and revoke all loader resources. `state` is
+    /// the last successfully entered protocol state, not cleanup permission.
+    fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderFailure<E> {
+    Command(DownloadCommandError),
+    PatchSecurity(PatchSecurityError),
+    Transport {
+        operation: FirmwareLoaderOperation,
+        source: E,
+    },
+    UnexpectedCommandCompletion {
+        command: DownloadCommand,
+        completion: FirmwareCommandCompletion,
+    },
+    UnexpectedPatchSemaphore(PatchSemaphoreStatus),
+    UnexpectedPatchRelease(PatchSemaphoreStatus),
+    UnexpectedPatchFinish(u8),
+    PatchRelease {
+        primary: Option<Box<FirmwareLoaderFailure<E>>>,
+        release: Box<FirmwareLoaderFailure<E>>,
+    },
+    MissingFirmwareOverride,
+    N9ReadyTimeout,
+    Clc(ClcDiscoveryError),
+    ChannelDomain(ChannelDomainError),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum FirmwareLoaderError<E> {
+    Failed(FirmwareLoaderFailure<E>),
+    Cleanup {
+        failure: Option<FirmwareLoaderFailure<E>>,
+        source: E,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchDisposition {
+    AlreadyDownloaded,
+    Downloaded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareLoaderReport {
+    pub download_ready_observed: bool,
+    pub patch: PatchDisposition,
+    pub patch_sections: usize,
+    pub ram_regions: usize,
+    pub scatter_chunks: usize,
+    pub scatter_bytes: usize,
+    pub nic_capability: NicCapability,
+    pub candidate_channels: CandidateChannelSummary,
+    pub eeprom_hardware: EepromBlock,
+    pub clc: ClcDiscovery,
+    pub clc_rules_applied: u16,
+    pub special_unii_mask: u8,
+}
+
+fn loader_command<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: DownloadCommand,
+) -> Result<FirmwareCommandCompletion, FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded =
+        encode_download_command(command, sequence).map_err(FirmwareLoaderFailure::Command)?;
+    transport
+        .command(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::Command(command),
+            source,
+        })
+}
+
+fn next_loader_sequence<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+) -> Result<u8, FirmwareLoaderFailure<T::Error>> {
+    let sequence = transport.next_sequence();
+    if sequence == 0 || sequence > 15 {
+        Err(FirmwareLoaderFailure::Command(
+            DownloadCommandError::InvalidSequence,
+        ))
+    } else {
+        Ok(sequence)
+    }
+}
+
+fn loader_set_clc<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: &ClcSetCommand,
+) -> Result<Option<ClcSetResponse>, FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded =
+        encode_clc_set_command(command, sequence).map_err(FirmwareLoaderFailure::Command)?;
+    transport
+        .set_clc(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::SetClc,
+            source,
+        })
+}
+
+fn loader_set_channel_domain<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    command: &ChannelDomainCommand,
+) -> Result<(), FirmwareLoaderFailure<T::Error>> {
+    let sequence = next_loader_sequence(transport)?;
+    let encoded = encode_channel_domain_command(command, sequence)
+        .map_err(FirmwareLoaderFailure::ChannelDomain)?;
+    transport
+        .set_channel_domain(command, sequence, &encoded)
+        .map_err(|source| FirmwareLoaderFailure::Transport {
+            operation: FirmwareLoaderOperation::SetChannelDomain,
+            source,
+        })
+}
+
+fn loader_scatter<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    part: FirmwareImagePart,
+    payload: &[u8],
+    report: &mut FirmwareLoaderReport,
+) -> Result<(), FirmwareLoaderFailure<T::Error>> {
+    for chunk in payload.chunks(MT7921_FWDL_CHUNK_BYTES) {
+        let sequence = next_loader_sequence(transport)?;
+        transport
+            .publish_scatter(part, sequence, chunk)
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PublishScatter(part),
+                source,
+            })?;
+        let deadline_ms = transport
+            .now_ms()
+            .saturating_add(SCATTER_COMPLETION_TIMEOUT_MS);
+        transport
+            .wait_scatter_completion(part, sequence, deadline_ms)
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::WaitScatterCompletion(part),
+                source,
+            })?;
+        report.scatter_chunks += 1;
+        report.scatter_bytes += chunk.len();
+    }
+    Ok(())
+}
+
+fn expect_loader_completion<E>(
+    command: DownloadCommand,
+    completion: FirmwareCommandCompletion,
+    expected: FirmwareCommandCompletion,
+) -> Result<(), FirmwareLoaderFailure<E>> {
+    if completion == expected {
+        Ok(())
+    } else {
+        Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+            command,
+            completion,
+        })
+    }
+}
+
+fn run_firmware_loader<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+    state: &mut FirmwareLoaderState,
+    configure_channel_domain: bool,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
+    let mut report = FirmwareLoaderReport {
+        download_ready_observed: false,
+        patch: PatchDisposition::Downloaded,
+        patch_sections: 0,
+        ram_regions: 0,
+        scatter_chunks: 0,
+        scatter_bytes: 0,
+        nic_capability: NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: None,
+            has_6ghz: None,
+            chip_capability: None,
+            unknown_elements: 0,
+        },
+        candidate_channels: CandidateChannelSummary::default(),
+        eeprom_hardware: EepromBlock {
+            address: MT7921_EEPROM_HW_TYPE_BLOCK,
+            valid: 0,
+            data: [0; MT7921_EEPROM_BLOCK_SIZE],
+        },
+        clc: ClcDiscovery::default(),
+        clc_rules_applied: 0,
+        special_unii_mask: 0,
+    };
+
+    let power = DownloadCommand::NicPowerControl;
+    let completion = loader_command(transport, power)?;
+    expect_loader_completion(power, completion, FirmwareCommandCompletion::NoResponse)?;
+    let download_deadline = transport.now_ms().saturating_add(DOWNLOAD_READY_TIMEOUT_MS);
+    loop {
+        let firmware_state = transport.firmware_download_state().map_err(|source| {
+            FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PollDownloadReady,
+                source,
+            }
+        })?;
+        if firmware_state == 1 {
+            *state = FirmwareLoaderState::DownloadReady;
+            report.download_ready_observed = true;
+            break;
+        }
+        if transport.now_ms() >= download_deadline {
+            // Pinned Linux warns and continues into patch semaphore handling.
+            break;
+        }
+        transport.sleep_ms(FIRMWARE_POLL_INTERVAL_MS);
+    }
+
+    let get = DownloadCommand::PatchSemaphoreGet;
+    match loader_command(transport, get)? {
+        FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::AlreadyDownloaded) => {
+            report.patch = PatchDisposition::AlreadyDownloaded
+        }
+        FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Acquired) => {
+            *state = FirmwareLoaderState::PatchSemaphoreHeld;
+            let patch_result = (|| {
+                for section in patch.sections() {
+                    let mode = patch_download_mode(section.security_info)
+                        .map_err(FirmwareLoaderFailure::PatchSecurity)?;
+                    let command = DownloadCommand::PatchStart {
+                        address: section.address,
+                        length: section.payload.len() as u32,
+                        mode,
+                    };
+                    let completion = loader_command(transport, command)?;
+                    expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+                    loader_scatter(
+                        transport,
+                        FirmwareImagePart::Patch,
+                        section.payload,
+                        &mut report,
+                    )?;
+                    report.patch_sections += 1;
+                }
+                let finish = DownloadCommand::PatchFinish;
+                match loader_command(transport, finish)? {
+                    FirmwareCommandCompletion::PatchFinish(0) => {}
+                    FirmwareCommandCompletion::PatchFinish(status) => {
+                        return Err(FirmwareLoaderFailure::UnexpectedPatchFinish(status));
+                    }
+                    completion => {
+                        return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                            command: finish,
+                            completion,
+                        });
+                    }
+                }
+                Ok(())
+            })();
+            let primary = patch_result.err();
+            let release = loader_command(transport, DownloadCommand::PatchSemaphoreRelease);
+            let release_failure = match release {
+                Ok(FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Released)) => {
+                    None
+                }
+                Ok(FirmwareCommandCompletion::PatchSemaphore(result)) => {
+                    Some(FirmwareLoaderFailure::UnexpectedPatchRelease(result))
+                }
+                Ok(completion) => Some(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                    command: DownloadCommand::PatchSemaphoreRelease,
+                    completion,
+                }),
+                Err(error) => Some(error),
+            };
+            if let Some(release) = release_failure {
+                return Err(FirmwareLoaderFailure::PatchRelease {
+                    primary: primary.map(Box::new),
+                    release: Box::new(release),
+                });
+            }
+            *state = FirmwareLoaderState::PatchSemaphoreReleased;
+            if let Some(primary) = primary {
+                return Err(primary);
+            }
+        }
+        FirmwareCommandCompletion::PatchSemaphore(result) => {
+            return Err(FirmwareLoaderFailure::UnexpectedPatchSemaphore(result));
+        }
+        completion => {
+            return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                command: get,
+                completion,
+            });
+        }
+    }
+    *state = FirmwareLoaderState::PatchComplete;
+
+    let mut override_address = 0;
+    *state = FirmwareLoaderState::RamDownloading;
+    for region in firmware.regions() {
+        if !region.is_downloadable() {
+            continue;
+        }
+        if region.feature_set & (1 << 5) != 0 {
+            override_address = region.address;
+        }
+        let command = DownloadCommand::TargetAddressLength {
+            address: region.address,
+            length: region.payload.len() as u32,
+            mode: firmware_download_mode(region.feature_set, false),
+        };
+        let completion = loader_command(transport, command)?;
+        expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+        loader_scatter(
+            transport,
+            FirmwareImagePart::Ram,
+            region.payload,
+            &mut report,
+        )?;
+        report.ram_regions += 1;
+    }
+    if override_address == 0 {
+        return Err(FirmwareLoaderFailure::MissingFirmwareOverride);
+    }
+    let start = DownloadCommand::FirmwareStart {
+        address: override_address,
+        option: 1,
+    };
+    let completion = loader_command(transport, start)?;
+    expect_loader_completion(start, completion, FirmwareCommandCompletion::Ack)?;
+    *state = FirmwareLoaderState::FirmwareStarted;
+    let n9_deadline = transport.now_ms().saturating_add(N9_READY_TIMEOUT_MS);
+    loop {
+        if transport
+            .firmware_n9_ready()
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PollN9Ready,
+                source,
+            })?
+        {
+            *state = FirmwareLoaderState::N9Ready;
+            break;
+        }
+        if transport.now_ms() >= n9_deadline {
+            return Err(FirmwareLoaderFailure::N9ReadyTimeout);
+        }
+        transport.sleep_ms(FIRMWARE_POLL_INTERVAL_MS);
+    }
+    let capability_command = DownloadCommand::GetNicCapability;
+    match loader_command(transport, capability_command)? {
+        FirmwareCommandCompletion::NicCapability(capability) => {
+            report.nic_capability = capability;
+            report.candidate_channels = candidate_channel_summary(capability);
+            *state = FirmwareLoaderState::CapabilityDiscovered;
+        }
+        completion => {
+            return Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                command: capability_command,
+                completion,
+            });
+        }
+    }
+    let eeprom_command = DownloadCommand::ReadEepromBlock {
+        address: MT7921_EEPROM_HW_TYPE_BLOCK,
+    };
+    match loader_command(transport, eeprom_command)? {
+        FirmwareCommandCompletion::EepromBlock(block) => {
+            report.eeprom_hardware = block;
+            *state = FirmwareLoaderState::EepromDiscovered;
+            report.clc = discover_clc(
+                firmware,
+                block
+                    .hardware_info()
+                    .expect("the fixed EEPROM hardware block was validated"),
+            )
+            .map_err(FirmwareLoaderFailure::Clc)?;
+            let chip_capability = report.nic_capability.chip_capability.unwrap_or(0);
+            let commands = world_clc_commands(
+                firmware,
+                block
+                    .hardware_info()
+                    .expect("the fixed EEPROM hardware block was validated"),
+                chip_capability,
+                transport.acpi_configuration(),
+            )
+            .map_err(FirmwareLoaderFailure::Clc)?;
+            *state = FirmwareLoaderState::ClcConfigured;
+            for command in &commands {
+                if let Some(response) = loader_set_clc(transport, command)? {
+                    report.special_unii_mask = response.special_unii_mask;
+                }
+                report.clc_rules_applied = report
+                    .clc_rules_applied
+                    .checked_add(1)
+                    .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
+            }
+            if configure_channel_domain {
+                let command = conservative_channel_domain(
+                    report.nic_capability,
+                    *b"00",
+                    true,
+                    report.special_unii_mask,
+                )
+                .map_err(FirmwareLoaderFailure::ChannelDomain)?;
+                loader_set_channel_domain(transport, &command)?;
+                *state = FirmwareLoaderState::ChannelDomainConfigured;
+            }
+            *state = FirmwareLoaderState::Ready;
+            Ok(report)
+        }
+        completion => Err(FirmwareLoaderFailure::UnexpectedCommandCompletion {
+            command: eeprom_command,
+            completion,
+        }),
+    }
+}
+
+/// Execute the bounded Linux MT7921 patch + RAM loading sequence. Cleanup is
+/// mandatory after both success and failure; release of an acquired patch
+/// semaphore is always attempted before fail-closed cleanup.
+pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false);
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Execute through the separately gated source-exact SET_CHAN_DOMAIN boundary.
+/// No channel tuning, radio enable, or scan command is issued.
+pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true);
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Execute channel-domain setup, then one caller-owned bounded passive hook
+/// before the same mandatory cleanup transaction. The hook cannot bypass or
+/// replace cleanup and its failure is preserved as a typed transport error.
+pub fn load_mt7921_firmware_with_passive_boundary<T, F>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+    passive: F,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>>
+where
+    T: FirmwareLoaderTransport,
+    F: FnOnce(&mut T, &FirmwareLoaderReport) -> Result<(), T::Error>,
+{
+    let mut state = FirmwareLoaderState::Powering;
+    let result =
+        run_firmware_loader(transport, patch, firmware, &mut state, true).and_then(|report| {
+            passive(transport, &report).map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PassiveBoundary,
+                source,
+            })?;
+            Ok(report)
+        });
+    finish_firmware_loader(transport, state, result)
+}
+
+fn finish_firmware_loader<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    state: FirmwareLoaderState,
+    result: Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    match (result, transport.fail_closed_cleanup(state)) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(failure), Ok(())) => Err(FirmwareLoaderError::Failed(failure)),
+        (Ok(_), Err(source)) => Err(FirmwareLoaderError::Cleanup {
+            failure: None,
+            source,
+        }),
+        (Err(failure), Err(source)) => Err(FirmwareLoaderError::Cleanup {
+            failure: Some(failure),
+            source,
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2483,6 +4384,1799 @@ impl ReadOnlyStatus {
     }
 }
 
+pub const MT7921_MGMT_TXWI_BYTES: usize = 64;
+
+pub const MT7921_SKU_RATE_COUNT: usize = 161;
+pub const MT7921_PSE_BASE: u32 = 0x820c_8000;
+
+pub fn encode_pse_reg_read_command(sequence: u8) -> Result<Vec<u8>, RateTxPowerError> {
+    if sequence == 0 || sequence > 15 {
+        return Err(RateTxPowerError::InvalidSequence);
+    }
+    let total = CONNAC2_MCU_TXD_BYTES + 8;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(&[0xc0, 0xa0, 0, sequence]);
+    bytes[CONNAC2_MCU_TXD_BYTES..CONNAC2_MCU_TXD_BYTES + 4]
+        .copy_from_slice(&MT7921_PSE_BASE.to_le_bytes());
+    Ok(bytes)
+}
+
+pub fn parse_pse_reg_read_response(
+    event_id: u8,
+    option: u8,
+    bytes: &[u8],
+) -> Result<u32, RateTxPowerError> {
+    // Pinned mt76 names the legacy CE REG_READ response
+    // MCU_EVENT_REG_ACCESS (0x05); MCU_EVENT_ACCESS_REG (0x02) is distinct.
+    if event_id != 0x05 || option & (1 << 2) != 0 {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
+    let length = u16::from_le_bytes(
+        bytes
+            .get(24..26)
+            .ok_or(RateTxPowerError::InvalidPseResponse)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if length != 20 || bytes.len() < 24 + usize::from(length) {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
+    let event = bytes
+        .get(36..44)
+        .ok_or(RateTxPowerError::InvalidPseResponse)?;
+    if u32::from_le_bytes(event[..4].try_into().expect("fixed field")) != MT7921_PSE_BASE {
+        return Err(RateTxPowerError::InvalidPseResponse);
+    }
+    Ok(u32::from_le_bytes(
+        event[4..8].try_into().expect("fixed field"),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConservativePowerLimits {
+    pub alpha2: [u8; 2],
+    pub max_reg_power_dbm: u8,
+    /// Minimum applicable SAR bound across every emitted static channel/rate.
+    pub sar_limit_half_dbm: Option<i8>,
+    /// Project-owned cap applied in addition to opaque, separately installed CLC policy.
+    pub external_safety_cap_half_dbm: Option<i8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateTxPowerError {
+    NonWorldDomain,
+    MissingBandCapabilities,
+    MissingLimit,
+    InvalidRegulatoryLimit,
+    InvalidSequence,
+    Unsupported6Ghz,
+    InvalidPseResponse,
+}
+
+pub trait RateTxPowerTransport {
+    type Error;
+    /// Return after DMA consumption. This CE command has no response payload.
+    fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error>;
+    /// Mandatory pinned CE REG_READ query after every batch to prevent PSE underflow.
+    fn query_pse_base(&mut self) -> Result<u32, Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RateTxPowerSubmission {
+    target_half_dbm: i8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RateTxPowerAuthorization {
+    owner_id: NonZeroU64,
+    generation: u64,
+    alpha2: [u8; 2],
+    target_half_dbm: i8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RateTxPowerAuthorizer {
+    owner_id: Option<NonZeroU64>,
+    generation: u64,
+    alpha2: [u8; 2],
+    authorization: Option<RateTxPowerAuthorization>,
+}
+
+impl RateTxPowerAuthorizer {
+    pub const fn new() -> Self {
+        Self {
+            owner_id: None,
+            generation: 0,
+            alpha2: *b"00",
+            authorization: None,
+        }
+    }
+
+    pub fn submit<T: RateTxPowerTransport>(
+        &mut self,
+        transport: &mut T,
+        capability: NicCapability,
+        limits: ConservativePowerLimits,
+        first_sequence: u8,
+    ) -> Result<RateTxPowerAuthorization, RateTxPowerInstallError<T::Error>> {
+        if limits.alpha2 != self.alpha2 || self.alpha2 != *b"00" {
+            return Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::NonWorldDomain,
+            ));
+        }
+        let submission =
+            submit_conservative_rate_tx_power(transport, capability, limits, first_sequence)?;
+        let owner_id = *self
+            .owner_id
+            .get_or_insert_with(next_rate_power_authorizer_id);
+        let authorization = RateTxPowerAuthorization {
+            owner_id,
+            generation: self.generation,
+            alpha2: self.alpha2,
+            target_half_dbm: submission.target_half_dbm,
+        };
+        self.authorization = Some(RateTxPowerAuthorization {
+            owner_id: authorization.owner_id,
+            generation: authorization.generation,
+            alpha2: authorization.alpha2,
+            target_half_dbm: authorization.target_half_dbm,
+        });
+        Ok(authorization)
+    }
+
+    pub fn set_regulatory_domain(&mut self, alpha2: [u8; 2]) {
+        self.generation = self.generation.wrapping_add(1);
+        self.alpha2 = alpha2;
+        self.authorization = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.authorization = None;
+    }
+
+    pub fn permits(&self, authorization: &RateTxPowerAuthorization) -> bool {
+        self.authorization.as_ref() == Some(authorization)
+            && self.owner_id == Some(authorization.owner_id)
+            && authorization.generation == self.generation
+            && authorization.alpha2 == self.alpha2
+    }
+}
+
+fn next_rate_power_authorizer_id() -> NonZeroU64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("rate-power authorizer identity space exhausted");
+    NonZeroU64::new(id).expect("rate-power authorizer identities start at one")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RateTxPowerInstallError<E> {
+    Encode(RateTxPowerError),
+    Transport { command: u8, error: E },
+}
+
+fn submit_conservative_rate_tx_power<T: RateTxPowerTransport>(
+    transport: &mut T,
+    capability: NicCapability,
+    limits: ConservativePowerLimits,
+    first_sequence: u8,
+) -> Result<RateTxPowerSubmission, RateTxPowerInstallError<T::Error>> {
+    let commands = encode_conservative_rate_tx_power_commands(capability, limits, first_sequence)
+        .map_err(RateTxPowerInstallError::Encode)?;
+    for (index, command) in commands.iter().enumerate() {
+        transport.send_and_wait_consumed(command).map_err(|error| {
+            RateTxPowerInstallError::Transport {
+                command: index as u8,
+                error,
+            }
+        })?;
+        transport
+            .query_pse_base()
+            .map_err(|error| RateTxPowerInstallError::Transport {
+                command: index as u8,
+                error,
+            })?;
+    }
+    Ok(RateTxPowerSubmission {
+        target_half_dbm: (limits.max_reg_power_dbm as i8 * 2)
+            .min(limits.sar_limit_half_dbm.expect("encoder required SAR"))
+            .min(
+                limits
+                    .external_safety_cap_half_dbm
+                    .expect("encoder required safety cap"),
+            ),
+    })
+}
+
+/// Encode pinned Connac2 `MCU_CE_CMD(SET_RATE_TX_POWER)` batches. This narrow
+/// world-domain subset uses one most-restrictive limit for every rate, matching
+/// Linux when no platform per-rate DT table expands the initialized target.
+/// Both a platform/SAR bound and an explicit project safety cap are mandatory.
+pub fn encode_conservative_rate_tx_power_commands(
+    capability: NicCapability,
+    limits: ConservativePowerLimits,
+    first_sequence: u8,
+) -> Result<Vec<Vec<u8>>, RateTxPowerError> {
+    const CHANNELS_2GHZ: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    const CHANNELS_5GHZ: &[u8] = &[
+        36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110,
+        112, 114, 116, 118, 120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
+        153, 155, 157, 159, 161, 165, 169, 173, 177,
+    ];
+    if limits.alpha2 != *b"00" {
+        return Err(RateTxPowerError::NonWorldDomain);
+    }
+    if limits.max_reg_power_dbm > 20 {
+        return Err(RateTxPowerError::InvalidRegulatoryLimit);
+    }
+    let sar = limits
+        .sar_limit_half_dbm
+        .ok_or(RateTxPowerError::MissingLimit)?;
+    let safety_cap = limits
+        .external_safety_cap_half_dbm
+        .ok_or(RateTxPowerError::MissingLimit)?;
+    let target = (limits.max_reg_power_dbm as i8 * 2)
+        .min(sar)
+        .min(safety_cap);
+    let phy = capability
+        .phy
+        .ok_or(RateTxPowerError::MissingBandCapabilities)?;
+    if capability.has_6ghz != Some(false) {
+        return Err(RateTxPowerError::Unsupported6Ghz);
+    }
+    let mut bands = Vec::new();
+    // The pinned capability has no explicit has_2ghz bit; a present PHY always
+    // contributes the baseline 2-GHz table, while has_5ghz gates that table.
+    bands.push((1u8, CHANNELS_2GHZ));
+    if phy.has_5ghz {
+        bands.push((2u8, CHANNELS_5GHZ));
+    }
+    let command_count: usize = bands
+        .iter()
+        .map(|(_, channels)| channels.len().div_ceil(8))
+        .sum();
+    if first_sequence == 0 || usize::from(first_sequence) + command_count - 1 > 15 {
+        return Err(RateTxPowerError::InvalidSequence);
+    }
+    let final_channel = bands
+        .last()
+        .and_then(|(_, channels)| channels.last())
+        .copied();
+    let final_band = bands.last().map(|(band, _)| *band);
+    let mut commands = Vec::with_capacity(command_count);
+    for (band, channels) in bands {
+        for batch in channels.chunks(8) {
+            let request_length = 44 + batch.len() * (1 + MT7921_SKU_RATE_COUNT);
+            let total = CONNAC2_MCU_TXD_BYTES + request_length;
+            let mut bytes = vec![0u8; total];
+            bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+            bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+            bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+            bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+            bytes[36..40].copy_from_slice(&[0x5d, 0xa0, 1, first_sequence + commands.len() as u8]);
+            let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+            request[4] = batch.len() as u8;
+            request[5] = band;
+            request[6] =
+                u8::from(Some(band) == final_band && batch.last().copied() == final_channel);
+            request[8..10].copy_from_slice(&limits.alpha2);
+            for (index, channel) in batch.iter().copied().enumerate() {
+                let offset = 44 + index * (1 + MT7921_SKU_RATE_COUNT);
+                request[offset] = channel;
+                request[offset + 1..offset + 1 + MT7921_SKU_RATE_COUNT].fill(target as u8);
+                if band == 2 {
+                    request[offset + 1..offset + 5].fill(127);
+                }
+            }
+            commands.push(bytes);
+        }
+    }
+    Ok(commands)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921MgmtTx {
+    pub txwi: [u8; MT7921_MGMT_TXWI_BYTES],
+    pub descriptor: DmaDescriptor,
+    pub token: u16,
+    pub pid: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921MgmtTxError {
+    InvalidFrame,
+    InvalidIova,
+    InvalidToken,
+    InvalidPid,
+    InvalidWcid,
+    Descriptor(DescriptorError),
+}
+
+/// Encode the pinned Connac2 PCI TXWI + hardware TXP used by
+/// `mt7921e_tx_prepare_skb` for one 5-GHz authentication frame. The raw frame
+/// remains in a separate DMA mapping referenced by TXP; the WFDMA descriptor
+/// publishes only the 64-byte TXWI/TXP buffer on band-0 ring 0.
+pub fn encode_mt7921_5ghz_auth_tx(
+    frame: &[u8],
+    txwi_iova: u64,
+    frame_iova: u64,
+    token: u16,
+    pid: u8,
+    wcid: u16,
+) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
+    if frame.len() < 30 || frame.len() > 0x7fff {
+        return Err(Mt7921MgmtTxError::InvalidFrame);
+    }
+    let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
+    if frame_control != 0x00b0 {
+        return Err(Mt7921MgmtTxError::InvalidFrame);
+    }
+    let fits_low32 = |iova: u64, len: usize| {
+        len != 0
+            && iova
+                .checked_add(len as u64 - 1)
+                .is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    if !fits_low32(txwi_iova, MT7921_MGMT_TXWI_BYTES) || !fits_low32(frame_iova, frame.len()) {
+        return Err(Mt7921MgmtTxError::InvalidIova);
+    }
+    if token >= 8192 {
+        return Err(Mt7921MgmtTxError::InvalidToken);
+    }
+    if !(3..127).contains(&pid) {
+        return Err(Mt7921MgmtTxError::InvalidPid);
+    }
+    if wcid >= 20 {
+        return Err(Mt7921MgmtTxError::InvalidWcid);
+    }
+
+    let mut txwi = [0u8; MT7921_MGMT_TXWI_BYTES];
+    let mut word = |index: usize, value: u32| {
+        txwi[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes())
+    };
+    // mt76_connac2_mac_write_txwi: CT packet, alternate TX queue, caller WCID / OMAC 0.
+    word(0, (0x10 << 25) | ((frame.len() as u32 + 32) & 0xffff));
+    // Long format, 802.11 header, 24-byte management header / 2.
+    word(1, (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid));
+    // Authentication subtype, fixed legacy rate, and HTC-valid as in Linux.
+    word(2, (1 << 31) | (1 << 13) | 0x0b);
+    // 15 remaining attempts and BA disabled for fixed-rate management TX.
+    word(3, (1 << 28) | (15 << 11));
+    word(4, 0);
+    word(5, (1 << 10) | u32::from(pid));
+    // 5-GHz lowest basic rate: OFDM 6 Mbps (mode 1, hardware index 11).
+    word(6, ((0x40u32 | 11) << 16) | (1 << 2));
+    word(7, 0x0b << 16);
+    drop(word);
+
+    txwi[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
+    txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    let descriptor = DmaDescriptor::tx(
+        DmaSegment {
+            iova: txwi_iova,
+            len: MT7921_MGMT_TXWI_BYTES as u16,
+        },
+        None,
+        0,
+    )
+    .map_err(Mt7921MgmtTxError::Descriptor)?;
+    Ok(Mt7921MgmtTx {
+        txwi,
+        descriptor,
+        token,
+        pid,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mt7921TxFree {
+    pub token: u16,
+    pub dropped: bool,
+    pub attempts: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mt7921TxStatus {
+    pub wcid: u16,
+    pub pid: u8,
+    pub acked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921TxCompletionError {
+    Truncated,
+    WrongPacketType,
+    MultipleOrPaired,
+    InvalidFormat,
+}
+
+pub fn mt7921_packet_type(bytes: &[u8]) -> Option<u8> {
+    let header = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    Some(((header >> 27) & 0x1f) as u8)
+}
+
+pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxCompletionError> {
+    let header = u32::from_le_bytes(
+        bytes
+            .get(0..4)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if mt7921_packet_type(bytes) != Some(6) {
+        return Err(Mt7921TxCompletionError::WrongPacketType);
+    }
+    let reported_len = (header & 0xffff) as usize;
+    if reported_len != 12 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let bytes = bytes
+        .get(..reported_len)
+        .ok_or(Mt7921TxCompletionError::Truncated)?;
+    if header >> 16 & 0x03ff != 1 {
+        return Err(Mt7921TxCompletionError::MultipleOrPaired);
+    }
+    let info = u32::from_le_bytes(
+        bytes
+            .get(8..12)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if info & (1 << 31) != 0 {
+        return Err(Mt7921TxCompletionError::MultipleOrPaired);
+    }
+    Ok(Mt7921TxFree {
+        token: ((info >> 16) & 0x7fff) as u16,
+        dropped: (info >> 13) & 0x3 != 0,
+        attempts: (info & 0x1fff) as u16,
+    })
+}
+
+pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCompletionError> {
+    let header = u32::from_le_bytes(
+        bytes
+            .get(0..4)
+            .ok_or(Mt7921TxCompletionError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
+    if mt7921_packet_type(bytes) != Some(0) {
+        return Err(Mt7921TxCompletionError::WrongPacketType);
+    }
+    let reported_len = (header & 0xffff) as usize;
+    if reported_len != 40 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let bytes = bytes
+        .get(..reported_len)
+        .ok_or(Mt7921TxCompletionError::Truncated)?;
+    let txs = bytes.get(8..40).ok_or(Mt7921TxCompletionError::Truncated)?;
+    let dword = |index: usize| {
+        u32::from_le_bytes(
+            txs[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("fixed field"),
+        )
+    };
+    if dword(0) >> 23 & 0x3 > 1 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let wcid = ((dword(2) >> 16) & 0x03ff) as u16;
+    if wcid >= 20 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    Ok(Mt7921TxStatus {
+        wcid,
+        pid: (dword(3) >> 24) as u8,
+        acked: dword(0) & (0x7 << 16) == 0,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921AuthRx {
+    pub receiver: [u8; 6],
+    pub transmitter: [u8; 6],
+    pub bssid: [u8; 6],
+    pub algorithm: u16,
+    pub sequence: u16,
+    pub status: u16,
+    pub fields: Vec<u8>,
+}
+
+/// Strip the pinned Connac2 normal-RX metadata and parse one raw 802.11
+/// authentication frame. Crypto and SAE interpretation remain Fuchsia-owned.
+pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError> {
+    let header = bytes.get(..24).ok_or(PassiveRxError::Truncated)?;
+    let rxd0 = u32::from_le_bytes(header[0..4].try_into().expect("fixed field"));
+    let reported_len = (rxd0 & 0xffff) as usize;
+    let bytes = bytes.get(..reported_len).ok_or(PassiveRxError::Truncated)?;
+    if reported_len < 24 {
+        return Err(PassiveRxError::Truncated);
+    }
+    let rxd1 = u32::from_le_bytes(header[4..8].try_into().expect("fixed field"));
+    let rxd2 = u32::from_le_bytes(header[8..12].try_into().expect("fixed field"));
+    let packet_type = rxd0 >> 27 & 0x1f;
+    let packet_flag = rxd0 >> 16 & 0x0f;
+    if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
+        return Err(PassiveRxError::WrongPacketType);
+    }
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
+    {
+        return Err(PassiveRxError::RxError);
+    }
+    if rxd2 & (1 << 13) != 0 {
+        return Err(PassiveRxError::HeaderTranslated);
+    }
+    let mut offset = 24usize;
+    if rxd1 & (1 << 14) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 11) != 0 {
+        offset += 16;
+    }
+    if rxd1 & (1 << 12) != 0 {
+        offset += 8;
+    }
+    if rxd1 & (1 << 13) == 0 {
+        return Err(PassiveRxError::MissingRxVector);
+    }
+    offset += 8;
+    if rxd1 & (1 << 15) != 0 {
+        offset += 72;
+    }
+    offset += 2 * ((rxd2 >> 14) & 0x3) as usize;
+    let frame = bytes.get(offset..).ok_or(PassiveRxError::Truncated)?;
+    if frame.len() < 30 || u16::from_le_bytes([frame[0], frame[1]]) != 0x00b0 {
+        return Err(PassiveRxError::UnsupportedFrame);
+    }
+    Ok(Mt7921AuthRx {
+        receiver: frame[4..10].try_into().expect("fixed field"),
+        transmitter: frame[10..16].try_into().expect("fixed field"),
+        bssid: frame[16..22].try_into().expect("fixed field"),
+        algorithm: u16::from_le_bytes([frame[24], frame[25]]),
+        sequence: u16::from_le_bytes([frame[26], frame[27]]),
+        status: u16::from_le_bytes([frame[28], frame[29]]),
+        fields: frame[30..].to_vec(),
+    })
+}
+
+#[allow(dead_code)]
+mod active_authority {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GenerationAxis {
+        Device,
+        Reset,
+        Firmware,
+        Ownership,
+        Domain,
+        Channel,
+        Power,
+        Scan,
+        Target,
+        Attempt,
+    }
+
+    impl GenerationAxis {
+        const COUNT: usize = 10;
+
+        const fn index(self) -> usize {
+            self as usize
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AxisState {
+        Current,
+        Pending,
+        Unknown,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AuthorityError {
+        GenerationExhausted(GenerationAxis),
+        InvalidTransition,
+        StaleObservation,
+        TerminalAlreadySelected,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Invalidation {
+        Device,
+        Reset,
+        Firmware,
+        Ownership,
+        Domain,
+        Channel,
+        Power,
+        Scan,
+        Target,
+    }
+
+    #[derive(Clone, Copy)]
+    struct InvalidationRule {
+        cause: Invalidation,
+        axes: &'static [GenerationAxis],
+        clears: EvidenceMask,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EvidenceMask(u8);
+
+    impl EvidenceMask {
+        const DISCOVERY: Self = Self(1 << 0);
+        const FINAL_OBSERVATION: Self = Self(1 << 1);
+        const BEACON: Self = Self(1 << 2);
+        const POWER: Self = Self(1 << 3);
+        const LEASE: Self = Self(1 << 4);
+        const ATTEMPT: Self = Self(1 << 5);
+        const ALL: Self = Self(u8::MAX);
+
+        const fn union(self, other: Self) -> Self {
+            Self(self.0 | other.0)
+        }
+
+        const fn contains(self, other: Self) -> bool {
+            self.0 & other.0 != 0
+        }
+    }
+
+    const INVALIDATION_RULES: &[InvalidationRule] = &[
+        InvalidationRule {
+            cause: Invalidation::Device,
+            axes: &[
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Reset,
+            axes: &[
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Firmware,
+            axes: &[GenerationAxis::Firmware],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Ownership,
+            axes: &[GenerationAxis::Ownership],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Domain,
+            axes: &[
+                GenerationAxis::Domain,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+            ],
+            clears: EvidenceMask::ALL,
+        },
+        InvalidationRule {
+            cause: Invalidation::Channel,
+            axes: &[
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+            ],
+            // TargetPending deliberately survives the retune that starts its
+            // final verification lineage; observations do not.
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::POWER)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Power,
+            axes: &[GenerationAxis::Power],
+            clears: EvidenceMask::POWER
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Scan,
+            axes: &[GenerationAxis::Scan],
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+        InvalidationRule {
+            cause: Invalidation::Target,
+            axes: &[GenerationAxis::Target],
+            clears: EvidenceMask::FINAL_OBSERVATION
+                .union(EvidenceMask::BEACON)
+                .union(EvidenceMask::POWER)
+                .union(EvidenceMask::LEASE)
+                .union(EvidenceMask::ATTEMPT),
+        },
+    ];
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ObservationId(u64);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TargetFingerprint(u64);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Observation {
+        id: ObservationId,
+        fingerprint: TargetFingerprint,
+        device: u64,
+        reset: u64,
+        firmware: u64,
+        ownership: u64,
+        domain: u64,
+        channel: u64,
+        scan: u64,
+        target: Option<u64>,
+        slot_epoch: u64,
+        sealed: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TargetState {
+        None,
+        Pending {
+            generation: u64,
+            discovery: ObservationId,
+            fingerprint: TargetFingerprint,
+        },
+        Current {
+            generation: u64,
+            discovery: ObservationId,
+            final_observation: ObservationId,
+        },
+        Unknown {
+            generation: u64,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AttemptState {
+        None,
+        Live {
+            generation: u64,
+        },
+        Staged {
+            generation: u64,
+        },
+        Committing {
+            generation: u64,
+            abort_requested: bool,
+        },
+        InFlight {
+            generation: u64,
+            abort_requested: bool,
+        },
+        Spent {
+            generation: u64,
+        },
+        Revoked {
+            generation: u64,
+            may_have_transmitted: bool,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TerminalResult {
+        CancelledBeforePublish,
+        Completed,
+        MayHaveTransmitted,
+        Contained,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CancellationDisposition {
+        NoAttempt,
+        CancelledBeforePublish,
+        AbortInFlight,
+        AlreadyTerminal,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReleaseClassification {
+        Released,
+        HardwareSafeReleaseError,
+        ParkUnsafe,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum InvalidationStep {
+        Revoked,
+        Advanced(GenerationAxis),
+        Pending(GenerationAxis),
+        Faulted,
+    }
+
+    #[derive(Debug)]
+    struct AuthorityModel {
+        generations: [u64; GenerationAxis::COUNT],
+        axis_states: [AxisState; GenerationAxis::COUNT],
+        discovery: Option<Observation>,
+        final_observation: Option<Observation>,
+        beacon_evidence: bool,
+        power_evidence: bool,
+        lease: bool,
+        target: TargetState,
+        attempt: AttemptState,
+        terminal: Option<TerminalResult>,
+        next_observation: u64,
+        faulted: bool,
+        attempt_authorized: bool,
+        invalidation_trace: [Option<InvalidationStep>; 24],
+        invalidation_trace_len: usize,
+    }
+
+    impl AuthorityModel {
+        #[cfg(test)]
+        fn new_for_test() -> Self {
+            Self {
+                generations: [0; GenerationAxis::COUNT],
+                axis_states: [AxisState::Current; GenerationAxis::COUNT],
+                discovery: None,
+                final_observation: None,
+                beacon_evidence: false,
+                power_evidence: false,
+                lease: false,
+                target: TargetState::None,
+                attempt: AttemptState::None,
+                terminal: None,
+                next_observation: 1,
+                faulted: false,
+                attempt_authorized: false,
+                invalidation_trace: [None; 24],
+                invalidation_trace_len: 0,
+            }
+        }
+
+        fn generation(&self, axis: GenerationAxis) -> u64 {
+            self.generations[axis.index()]
+        }
+
+        fn advance(&mut self, axis: GenerationAxis) -> Result<u64, AuthorityError> {
+            let Some(generation) = self.generations[axis.index()].checked_add(1) else {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(axis));
+            };
+            self.generations[axis.index()] = generation;
+            Ok(generation)
+        }
+
+        fn fault(&mut self) {
+            self.clear(EvidenceMask::ALL);
+            self.axis_states.fill(AxisState::Unknown);
+            self.faulted = true;
+            self.trace(InvalidationStep::Faulted);
+        }
+
+        fn trace(&mut self, step: InvalidationStep) {
+            self.invalidation_trace[self.invalidation_trace_len] = Some(step);
+            self.invalidation_trace_len += 1;
+        }
+
+        fn rule(cause: Invalidation) -> &'static InvalidationRule {
+            INVALIDATION_RULES
+                .iter()
+                .find(|rule| rule.cause == cause)
+                .expect("every invalidation has an explicit rule")
+        }
+
+        fn begin_invalidation(&mut self, cause: Invalidation) -> Result<(), AuthorityError> {
+            if self.faulted {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let rule = *Self::rule(cause);
+            self.invalidation_trace.fill(None);
+            self.invalidation_trace_len = 0;
+            if let Some(axis) = rule
+                .axes
+                .iter()
+                .copied()
+                .find(|axis| self.generation(*axis) == u64::MAX)
+            {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(axis));
+            }
+            // Revocation is deliberately encoded before generation/state
+            // mutation. Preflight above makes the remaining updates infallible.
+            self.clear(rule.clears);
+            self.trace(InvalidationStep::Revoked);
+            for axis in rule.axes {
+                self.advance(*axis)?;
+                self.trace(InvalidationStep::Advanced(*axis));
+                self.axis_states[axis.index()] = AxisState::Pending;
+                self.trace(InvalidationStep::Pending(*axis));
+            }
+            Ok(())
+        }
+
+        fn confirm(&mut self, axis: GenerationAxis) -> Result<(), AuthorityError> {
+            if self.faulted
+                || axis == GenerationAxis::Target
+                || self.axis_states[axis.index()] != AxisState::Pending
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.axis_states[axis.index()] = AxisState::Current;
+            Ok(())
+        }
+
+        fn fail(&mut self, axis: GenerationAxis) -> Result<(), AuthorityError> {
+            if self.faulted || self.axis_states[axis.index()] != AxisState::Pending {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.fault();
+            Ok(())
+        }
+
+        fn clear(&mut self, mask: EvidenceMask) {
+            if mask.contains(EvidenceMask::DISCOVERY) {
+                self.discovery = None;
+            }
+            if mask.contains(EvidenceMask::FINAL_OBSERVATION) {
+                self.final_observation = None;
+            }
+            if mask.contains(EvidenceMask::BEACON) {
+                self.beacon_evidence = false;
+            }
+            if mask.contains(EvidenceMask::POWER) {
+                self.power_evidence = false;
+            }
+            if mask.contains(EvidenceMask::LEASE) {
+                self.lease = false;
+                self.attempt_authorized = false;
+            }
+            if mask.contains(EvidenceMask::ATTEMPT) {
+                self.revoke_attempt();
+            }
+            if mask.0 == EvidenceMask::ALL.0 {
+                self.target = TargetState::None;
+            }
+        }
+
+        fn current_for_observation(&self) -> bool {
+            [
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Scan,
+            ]
+            .into_iter()
+            .all(|axis| self.axis_states[axis.index()] == AxisState::Current)
+        }
+
+        fn observation_is_current(&self, observation: Observation) -> bool {
+            observation.device == self.generation(GenerationAxis::Device)
+                && observation.reset == self.generation(GenerationAxis::Reset)
+                && observation.firmware == self.generation(GenerationAxis::Firmware)
+                && observation.ownership == self.generation(GenerationAxis::Ownership)
+                && observation.domain == self.generation(GenerationAxis::Domain)
+                && observation.channel == self.generation(GenerationAxis::Channel)
+                && observation.scan == self.generation(GenerationAxis::Scan)
+                && observation.slot_epoch == observation.scan
+                && self.current_for_observation()
+        }
+
+        fn make_observation(
+            &mut self,
+            fingerprint: TargetFingerprint,
+            target: Option<u64>,
+            slot_epoch: u64,
+        ) -> Result<Observation, AuthorityError> {
+            if !self.current_for_observation()
+                || slot_epoch != self.generation(GenerationAxis::Scan)
+            {
+                return Err(AuthorityError::StaleObservation);
+            }
+            let id = ObservationId(self.next_observation);
+            let Some(next_observation) = self.next_observation.checked_add(1) else {
+                self.fault();
+                return Err(AuthorityError::GenerationExhausted(GenerationAxis::Scan));
+            };
+            self.next_observation = next_observation;
+            Ok(Observation {
+                id,
+                fingerprint,
+                device: self.generation(GenerationAxis::Device),
+                reset: self.generation(GenerationAxis::Reset),
+                firmware: self.generation(GenerationAxis::Firmware),
+                ownership: self.generation(GenerationAxis::Ownership),
+                domain: self.generation(GenerationAxis::Domain),
+                channel: self.generation(GenerationAxis::Channel),
+                scan: self.generation(GenerationAxis::Scan),
+                target,
+                slot_epoch,
+                sealed: false,
+            })
+        }
+
+        fn record_discovery(
+            &mut self,
+            fingerprint: TargetFingerprint,
+        ) -> Result<ObservationId, AuthorityError> {
+            let observation =
+                self.make_observation(fingerprint, None, self.generation(GenerationAxis::Scan))?;
+            self.discovery = Some(observation);
+            Ok(observation.id)
+        }
+
+        fn begin_final_target(&mut self, discovery: ObservationId) -> Result<u64, AuthorityError> {
+            let observation = self
+                .discovery
+                .filter(|observation| observation.id == discovery)
+                .ok_or(AuthorityError::StaleObservation)?;
+            self.begin_invalidation(Invalidation::Target)?;
+            let generation = self.generation(GenerationAxis::Target);
+            self.target = TargetState::Pending {
+                generation,
+                discovery,
+                fingerprint: observation.fingerprint,
+            };
+            Ok(generation)
+        }
+
+        fn record_final_observation(
+            &mut self,
+            fingerprint: TargetFingerprint,
+            slot_epoch: u64,
+        ) -> Result<ObservationId, AuthorityError> {
+            let (generation, discovery) = match self.target {
+                TargetState::Pending {
+                    generation,
+                    discovery,
+                    ..
+                } => (generation, discovery),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let discovery_scan = self
+                .discovery
+                .filter(|observation| observation.id == discovery)
+                .map(|observation| observation.scan)
+                .ok_or(AuthorityError::StaleObservation)?;
+            if !self.power_evidence || self.generation(GenerationAxis::Scan) <= discovery_scan {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let observation = self.make_observation(fingerprint, Some(generation), slot_epoch)?;
+            self.final_observation = Some(observation);
+            Ok(observation.id)
+        }
+
+        fn seal_final_observation(
+            &mut self,
+            observation: ObservationId,
+            matching_terminal: bool,
+            ring_drained: bool,
+            irq_drained: bool,
+        ) -> Result<(), AuthorityError> {
+            let current_scan = self.generation(GenerationAxis::Scan);
+            let current_target = self.generation(GenerationAxis::Target);
+            let candidate = self
+                .final_observation
+                .filter(|candidate| candidate.id == observation)
+                .ok_or(AuthorityError::StaleObservation)?;
+            if !matching_terminal
+                || !ring_drained
+                || !irq_drained
+                || candidate.scan != current_scan
+                || candidate.slot_epoch != current_scan
+                || candidate.target != Some(current_target)
+                || !self.observation_is_current(candidate)
+            {
+                return Err(AuthorityError::StaleObservation);
+            }
+            self.final_observation
+                .as_mut()
+                .filter(|candidate| candidate.id == observation)
+                .expect("candidate was checked above")
+                .sealed = true;
+            Ok(())
+        }
+
+        fn matching_join(
+            &mut self,
+            final_observation: ObservationId,
+        ) -> Result<(), AuthorityError> {
+            let (generation, discovery, fingerprint) = match self.target {
+                TargetState::Pending {
+                    generation,
+                    discovery,
+                    fingerprint,
+                } => (generation, discovery, fingerprint),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let observation = self.final_observation.filter(|observation| {
+                observation.id == final_observation
+                    && observation.sealed
+                    && observation.fingerprint == fingerprint
+                    && observation.target == Some(generation)
+                    && self.observation_is_current(*observation)
+            });
+            let Some(observation) = observation else {
+                self.reject_join()?;
+                return Err(AuthorityError::StaleObservation);
+            };
+            self.beacon_evidence = true;
+            self.target = TargetState::Current {
+                generation,
+                discovery,
+                final_observation: observation.id,
+            };
+            self.axis_states[GenerationAxis::Target.index()] = AxisState::Current;
+            Ok(())
+        }
+
+        fn reject_join(&mut self) -> Result<(), AuthorityError> {
+            self.begin_invalidation(Invalidation::Target)?;
+            let generation = self.generation(GenerationAxis::Target);
+            self.target = TargetState::Unknown { generation };
+            self.axis_states[GenerationAxis::Target.index()] = AxisState::Unknown;
+            Ok(())
+        }
+
+        fn install_power_evidence(&mut self) -> Result<(), AuthorityError> {
+            if self.axis_states[GenerationAxis::Power.index()] != AxisState::Current
+                || !matches!(
+                    self.target,
+                    TargetState::Pending { .. } | TargetState::Current { .. }
+                )
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.power_evidence = true;
+            Ok(())
+        }
+
+        fn reserve_attempt(&mut self) -> Result<u64, AuthorityError> {
+            if self.faulted
+                || !self.attempt_authorized
+                || !self.beacon_evidence
+                || !self.power_evidence
+                || !matches!(self.target, TargetState::Current { .. })
+                || !matches!(
+                    self.attempt,
+                    AttemptState::None | AttemptState::Spent { .. } | AttemptState::Revoked { .. }
+                )
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            let generation = self.advance(GenerationAxis::Attempt)?;
+            self.axis_states[GenerationAxis::Attempt.index()] = AxisState::Current;
+            self.attempt_authorized = false;
+            self.lease = true;
+            self.terminal = None;
+            self.attempt = AttemptState::Live { generation };
+            Ok(generation)
+        }
+
+        fn authorize_attempt(&mut self) -> Result<(), AuthorityError> {
+            let lineage_closed = matches!(
+                self.attempt,
+                AttemptState::None | AttemptState::Spent { .. }
+            ) || matches!(self.attempt, AttemptState::Revoked { .. })
+                && self.terminal.is_some();
+            if self.faulted
+                || self.attempt_authorized
+                || !lineage_closed
+                || !self.beacon_evidence
+                || !self.power_evidence
+                || !matches!(self.target, TargetState::Current { .. })
+            {
+                return Err(AuthorityError::InvalidTransition);
+            }
+            self.attempt_authorized = true;
+            Ok(())
+        }
+
+        fn stage(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Live { generation } => AttemptState::Staged { generation },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            Ok(())
+        }
+
+        fn commit(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Staged { generation } => AttemptState::Committing {
+                    generation,
+                    abort_requested: false,
+                },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn submitted(&mut self) -> Result<(), AuthorityError> {
+            self.attempt = match self.attempt {
+                AttemptState::Committing {
+                    generation,
+                    abort_requested,
+                } => AttemptState::InFlight {
+                    generation,
+                    abort_requested,
+                },
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<CancellationDisposition, AuthorityError> {
+            match self.attempt {
+                AttemptState::None => Ok(CancellationDisposition::NoAttempt),
+                AttemptState::Live { generation } | AttemptState::Staged { generation } => {
+                    self.attempt = AttemptState::Revoked {
+                        generation,
+                        may_have_transmitted: false,
+                    };
+                    self.lease = false;
+                    self.select_terminal(TerminalResult::CancelledBeforePublish)?;
+                    Ok(CancellationDisposition::CancelledBeforePublish)
+                }
+                AttemptState::Committing { generation, .. } => {
+                    // The publication linearization decision won. The caller
+                    // cannot be told that no effect occurred.
+                    self.attempt = AttemptState::Committing {
+                        generation,
+                        abort_requested: true,
+                    };
+                    Ok(CancellationDisposition::AbortInFlight)
+                }
+                AttemptState::InFlight { generation, .. } => {
+                    self.attempt = AttemptState::InFlight {
+                        generation,
+                        abort_requested: true,
+                    };
+                    Ok(CancellationDisposition::AbortInFlight)
+                }
+                AttemptState::Spent { .. } | AttemptState::Revoked { .. } => {
+                    Ok(CancellationDisposition::AlreadyTerminal)
+                }
+            }
+        }
+
+        fn finish_attempt(&mut self, result: TerminalResult) -> Result<(), AuthorityError> {
+            let generation = match (self.attempt, result) {
+                (
+                    AttemptState::Committing { generation, .. },
+                    TerminalResult::MayHaveTransmitted | TerminalResult::Contained,
+                )
+                | (AttemptState::InFlight { generation, .. }, TerminalResult::Completed)
+                | (
+                    AttemptState::InFlight { generation, .. },
+                    TerminalResult::MayHaveTransmitted | TerminalResult::Contained,
+                ) => generation,
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            self.select_terminal(result)?;
+            self.attempt = AttemptState::Spent { generation };
+            self.lease = false;
+            Ok(())
+        }
+
+        fn finish_revoked_attempt(&mut self) -> Result<TerminalResult, AuthorityError> {
+            let (generation, may_have_transmitted) = match self.attempt {
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted,
+                } => (generation, may_have_transmitted),
+                _ => return Err(AuthorityError::InvalidTransition),
+            };
+            let result = if may_have_transmitted {
+                TerminalResult::MayHaveTransmitted
+            } else {
+                TerminalResult::Contained
+            };
+            self.select_terminal(result)?;
+            self.attempt = AttemptState::Spent { generation };
+            Ok(result)
+        }
+
+        fn select_terminal(&mut self, result: TerminalResult) -> Result<(), AuthorityError> {
+            if self.terminal.is_some() {
+                return Err(AuthorityError::TerminalAlreadySelected);
+            }
+            self.terminal = Some(result);
+            Ok(())
+        }
+
+        fn revoke_attempt(&mut self) {
+            let revoked = match self.attempt {
+                AttemptState::Live { generation } | AttemptState::Staged { generation } => {
+                    Some((generation, false))
+                }
+                AttemptState::Committing { generation, .. }
+                | AttemptState::InFlight { generation, .. } => Some((generation, true)),
+                AttemptState::None | AttemptState::Spent { .. } | AttemptState::Revoked { .. } => {
+                    None
+                }
+            };
+            if let Some((generation, may_have_transmitted)) = revoked {
+                self.attempt = AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted,
+                };
+            }
+            self.lease = false;
+        }
+
+        const fn classify_release(
+            hardware_safe: bool,
+            observable_release_failed: bool,
+        ) -> ReleaseClassification {
+            if !hardware_safe {
+                ReleaseClassification::ParkUnsafe
+            } else if observable_release_failed {
+                ReleaseClassification::HardwareSafeReleaseError
+            } else {
+                ReleaseClassification::Released
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn seed_ready_model() -> AuthorityModel {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(7)).unwrap();
+            let target = model.begin_final_target(discovery).unwrap();
+            assert_eq!(target, 1);
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let final_observation = model
+                .record_final_observation(TargetFingerprint(7), 1)
+                .unwrap();
+            model
+                .seal_final_observation(final_observation, true, true, true)
+                .unwrap();
+            model.matching_join(final_observation).unwrap();
+            model
+        }
+
+        fn reserve_authorized_attempt(model: &mut AuthorityModel) -> u64 {
+            model.authorize_attempt().unwrap();
+            model.reserve_attempt().unwrap()
+        }
+
+        #[test]
+        fn invalidation_table_is_complete_and_revoke_first() {
+            let all_causes = [
+                Invalidation::Device,
+                Invalidation::Reset,
+                Invalidation::Firmware,
+                Invalidation::Ownership,
+                Invalidation::Domain,
+                Invalidation::Channel,
+                Invalidation::Power,
+                Invalidation::Scan,
+                Invalidation::Target,
+            ];
+            assert_eq!(INVALIDATION_RULES.len(), all_causes.len());
+            for cause in all_causes {
+                let mut model = seed_ready_model();
+                let _ = reserve_authorized_attempt(&mut model);
+                let before = model.generations;
+                let rule = *AuthorityModel::rule(cause);
+                model.begin_invalidation(cause).unwrap();
+                for axis in rule.axes {
+                    assert_eq!(model.generation(*axis), before[axis.index()] + 1);
+                    assert_eq!(model.axis_states[axis.index()], AxisState::Pending);
+                }
+                if rule.clears.contains(EvidenceMask::LEASE) {
+                    assert!(!model.lease);
+                }
+                if rule.clears.contains(EvidenceMask::ATTEMPT) {
+                    assert!(matches!(model.attempt, AttemptState::Revoked { .. }));
+                }
+                assert_eq!(model.invalidation_trace[0], Some(InvalidationStep::Revoked));
+                for (index, axis) in rule.axes.iter().copied().enumerate() {
+                    assert_eq!(
+                        model.invalidation_trace[1 + index * 2],
+                        Some(InvalidationStep::Advanced(axis))
+                    );
+                    assert_eq!(
+                        model.invalidation_trace[2 + index * 2],
+                        Some(InvalidationStep::Pending(axis))
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn failed_transition_never_restores_authority() {
+            let mut model = seed_ready_model();
+            model.begin_invalidation(Invalidation::Firmware).unwrap();
+            model.fail(GenerationAxis::Firmware).unwrap();
+            assert_eq!(
+                model.axis_states[GenerationAxis::Firmware.index()],
+                AxisState::Unknown
+            );
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(!model.lease);
+            assert!(model.faulted);
+            assert_eq!(
+                model.confirm(GenerationAxis::Firmware),
+                Err(AuthorityError::InvalidTransition)
+            );
+            assert_eq!(
+                model.begin_invalidation(Invalidation::Firmware),
+                Err(AuthorityError::InvalidTransition)
+            );
+        }
+
+        #[test]
+        fn generation_exhaustion_fails_before_wrap() {
+            for axis in [
+                GenerationAxis::Device,
+                GenerationAxis::Reset,
+                GenerationAxis::Firmware,
+                GenerationAxis::Ownership,
+                GenerationAxis::Domain,
+                GenerationAxis::Channel,
+                GenerationAxis::Power,
+                GenerationAxis::Scan,
+                GenerationAxis::Target,
+                GenerationAxis::Attempt,
+            ] {
+                let mut model = AuthorityModel::new_for_test();
+                model.generations[axis.index()] = u64::MAX;
+                assert_eq!(
+                    model.advance(axis),
+                    Err(AuthorityError::GenerationExhausted(axis))
+                );
+                assert_eq!(model.generation(axis), u64::MAX);
+                assert!(model.faulted);
+                assert!(
+                    model
+                        .axis_states
+                        .iter()
+                        .all(|state| *state == AxisState::Unknown)
+                );
+            }
+        }
+
+        #[test]
+        fn multi_axis_invalidation_is_atomic_at_generation_exhaustion() {
+            let mut model = seed_ready_model();
+            model.generations[GenerationAxis::Ownership.index()] = u64::MAX;
+            let generations = model.generations;
+            assert_eq!(
+                model.begin_invalidation(Invalidation::Reset),
+                Err(AuthorityError::GenerationExhausted(
+                    GenerationAxis::Ownership
+                ))
+            );
+            assert_eq!(model.generations, generations);
+            assert!(model.faulted);
+            assert!(
+                model
+                    .axis_states
+                    .iter()
+                    .all(|state| *state == AxisState::Unknown)
+            );
+            assert_eq!(model.target, TargetState::None);
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(!model.lease);
+        }
+
+        #[test]
+        fn observation_and_attempt_exhaustion_poison_authority() {
+            let mut observation = seed_ready_model();
+            observation.next_observation = u64::MAX;
+            assert_eq!(
+                observation.record_discovery(TargetFingerprint(17)),
+                Err(AuthorityError::GenerationExhausted(GenerationAxis::Scan))
+            );
+            assert!(observation.faulted);
+            assert!(!observation.beacon_evidence);
+
+            let mut attempt = seed_ready_model();
+            attempt.generations[GenerationAxis::Attempt.index()] = u64::MAX;
+            attempt.authorize_attempt().unwrap();
+            assert_eq!(
+                attempt.reserve_attempt(),
+                Err(AuthorityError::GenerationExhausted(GenerationAxis::Attempt))
+            );
+            assert!(attempt.faulted);
+            assert!(!attempt.beacon_evidence);
+            assert!(!attempt.power_evidence);
+        }
+
+        #[test]
+        fn invalidation_revokes_without_replacing_attempt_generation() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.begin_invalidation(Invalidation::Channel).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(
+                model.attempt,
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted: false,
+                }
+            );
+        }
+
+        #[test]
+        fn post_commit_invalidation_remains_may_have_transmitted() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            model.begin_invalidation(Invalidation::Reset).unwrap();
+            assert_eq!(
+                model.attempt,
+                AttemptState::Revoked {
+                    generation,
+                    may_have_transmitted: true,
+                }
+            );
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(model.terminal, None);
+            assert_eq!(
+                model.finish_revoked_attempt().unwrap(),
+                TerminalResult::MayHaveTransmitted
+            );
+            assert_eq!(model.terminal, Some(TerminalResult::MayHaveTransmitted));
+            assert_eq!(
+                model.finish_revoked_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+        }
+
+        #[test]
+        fn final_observation_requires_current_slot_and_terminal_proof() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(9)).unwrap();
+            model.begin_final_target(discovery).unwrap();
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            assert_eq!(
+                model.record_final_observation(TargetFingerprint(9), 0),
+                Err(AuthorityError::StaleObservation)
+            );
+            let observation = model
+                .record_final_observation(TargetFingerprint(9), 1)
+                .unwrap();
+            assert_eq!(
+                model.seal_final_observation(observation, true, false, true),
+                Err(AuthorityError::StaleObservation)
+            );
+            assert!(!model.final_observation.unwrap().sealed);
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+        }
+
+        #[test]
+        fn target_generation_spans_final_scan_and_matching_join() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(11)).unwrap();
+            let generation = model.begin_final_target(discovery).unwrap();
+            assert_eq!(
+                model.axis_states[GenerationAxis::Target.index()],
+                AxisState::Pending
+            );
+            assert_eq!(
+                model.confirm(GenerationAxis::Target),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let observation = model
+                .record_final_observation(TargetFingerprint(11), 1)
+                .unwrap();
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+            model.matching_join(observation).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Target), generation);
+            assert_eq!(
+                model.axis_states[GenerationAxis::Target.index()],
+                AxisState::Current
+            );
+            assert!(matches!(
+                model.target,
+                TargetState::Current { generation: current, .. } if current == generation
+            ));
+        }
+
+        #[test]
+        fn conflicting_final_observation_cannot_promote() {
+            let mut model = AuthorityModel::new_for_test();
+            let discovery = model.record_discovery(TargetFingerprint(13)).unwrap();
+            model.begin_final_target(discovery).unwrap();
+            model.install_power_evidence().unwrap();
+            model.begin_invalidation(Invalidation::Scan).unwrap();
+            model.confirm(GenerationAxis::Scan).unwrap();
+            let observation = model
+                .record_final_observation(TargetFingerprint(14), 1)
+                .unwrap();
+            model
+                .seal_final_observation(observation, true, true, true)
+                .unwrap();
+            assert_eq!(
+                model.matching_join(observation),
+                Err(AuthorityError::StaleObservation)
+            );
+            assert!(matches!(
+                model.target,
+                TargetState::Unknown { generation: 2 }
+            ));
+            assert!(!model.beacon_evidence);
+            assert!(!model.power_evidence);
+            assert!(model.final_observation.is_none());
+        }
+
+        #[test]
+        fn attempt_generation_is_reserved_once_and_consumed_unchanged() {
+            let mut model = seed_ready_model();
+            let generation = reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            assert!(matches!(
+                model.attempt,
+                AttemptState::InFlight { generation: current, .. } if current == generation
+            ));
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            assert_eq!(model.generation(GenerationAxis::Attempt), generation);
+            assert_eq!(
+                model.reserve_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.authorize_attempt().unwrap();
+            let replacement = model.reserve_attempt().unwrap();
+            assert_eq!(replacement, generation + 1);
+        }
+
+        #[test]
+        fn replacement_cannot_be_preauthorized_before_terminal_close() {
+            let mut model = seed_ready_model();
+            model.authorize_attempt().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.reserve_attempt().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            assert_eq!(
+                model.authorize_attempt(),
+                Err(AuthorityError::InvalidTransition)
+            );
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            model.authorize_attempt().unwrap();
+        }
+
+        #[test]
+        fn cancellation_and_publish_have_unambiguous_ordering() {
+            let mut before = seed_ready_model();
+            reserve_authorized_attempt(&mut before);
+            before.stage().unwrap();
+            assert_eq!(
+                before.cancel().unwrap(),
+                CancellationDisposition::CancelledBeforePublish
+            );
+            assert_eq!(
+                before.terminal,
+                Some(TerminalResult::CancelledBeforePublish)
+            );
+            assert_eq!(before.commit(), Err(AuthorityError::InvalidTransition));
+
+            let mut after = seed_ready_model();
+            reserve_authorized_attempt(&mut after);
+            after.stage().unwrap();
+            after.commit().unwrap();
+            assert!(!after.lease);
+            assert_eq!(
+                after.cancel().unwrap(),
+                CancellationDisposition::AbortInFlight
+            );
+            assert!(matches!(
+                after.attempt,
+                AttemptState::Committing {
+                    abort_requested: true,
+                    ..
+                }
+            ));
+            after.submitted().unwrap();
+            assert!(matches!(
+                after.attempt,
+                AttemptState::InFlight {
+                    abort_requested: true,
+                    ..
+                }
+            ));
+            assert_eq!(after.terminal, None);
+            after
+                .finish_attempt(TerminalResult::MayHaveTransmitted)
+                .unwrap();
+            assert_eq!(after.terminal, Some(TerminalResult::MayHaveTransmitted));
+        }
+
+        #[test]
+        fn terminal_result_is_selected_exactly_once() {
+            let mut model = seed_ready_model();
+            reserve_authorized_attempt(&mut model);
+            model.stage().unwrap();
+            model.commit().unwrap();
+            model.submitted().unwrap();
+            model.finish_attempt(TerminalResult::Completed).unwrap();
+            assert_eq!(
+                model.select_terminal(TerminalResult::Contained),
+                Err(AuthorityError::TerminalAlreadySelected)
+            );
+            assert_eq!(model.terminal, Some(TerminalResult::Completed));
+        }
+
+        #[test]
+        fn release_classification_parks_only_when_hardware_is_unproven() {
+            assert_eq!(
+                AuthorityModel::classify_release(false, false),
+                ReleaseClassification::ParkUnsafe
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(false, true),
+                ReleaseClassification::ParkUnsafe
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(true, true),
+                ReleaseClassification::HardwareSafeReleaseError
+            );
+            assert_eq!(
+                AuthorityModel::classify_release(true, false),
+                ReleaseClassification::Released
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -2490,6 +6184,306 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn source_exact_conservative_rate_power_batches_fail_closed() {
+        let reg_read = encode_pse_reg_read_command(9).unwrap();
+        assert_eq!(&reg_read[36..40], &[0xc0, 0xa0, 0, 9]);
+        assert_eq!(
+            &reg_read[CONNAC2_MCU_TXD_BYTES..CONNAC2_MCU_TXD_BYTES + 8],
+            &[0x00, 0x80, 0x0c, 0x82, 0, 0, 0, 0]
+        );
+        let mut response = [0u8; 44];
+        response[24..26].copy_from_slice(&20u16.to_le_bytes());
+        response[36..40].copy_from_slice(&MT7921_PSE_BASE.to_le_bytes());
+        response[40..44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        assert_eq!(
+            parse_pse_reg_read_response(0x05, 0, &response),
+            Ok(0x1234_5678)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0x02, 0, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0xed, 0, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
+        assert_eq!(
+            parse_pse_reg_read_response(0x05, 1 << 2, &response),
+            Err(RateTxPowerError::InvalidPseResponse)
+        );
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 15,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let limits = ConservativePowerLimits {
+            alpha2: *b"00",
+            max_reg_power_dbm: 20,
+            sar_limit_half_dbm: Some(12),
+            external_safety_cap_half_dbm: Some(8),
+        };
+        let commands = encode_conservative_rate_tx_power_commands(capability, limits, 1).unwrap();
+        assert_eq!(commands.len(), 8);
+        for (index, command) in commands.iter().enumerate() {
+            assert_eq!(&command[36..40], &[0x5d, 0xa0, 1, index as u8 + 1]);
+            let request = &command[CONNAC2_MCU_TXD_BYTES..];
+            assert!(request[4] >= 1 && request[4] <= 8);
+            assert!(request[5] == 1 || request[5] == 2);
+            for entry in request[44..].chunks_exact(1 + MT7921_SKU_RATE_COUNT) {
+                if request[5] == 2 {
+                    assert_eq!(&entry[1..5], &[127; 4]);
+                    assert!(entry[5..].iter().all(|power| *power == 8));
+                } else {
+                    assert!(entry[1..].iter().all(|power| *power == 8));
+                }
+            }
+        }
+        assert_eq!(commands.last().unwrap()[CONNAC2_MCU_TXD_BYTES + 6], 1);
+        assert!(
+            commands[..7]
+                .iter()
+                .all(|command| command[CONNAC2_MCU_TXD_BYTES + 6] == 0)
+        );
+
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(
+                capability,
+                ConservativePowerLimits {
+                    sar_limit_half_dbm: None,
+                    ..limits
+                },
+                1,
+            ),
+            Err(RateTxPowerError::MissingLimit)
+        );
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(capability, limits, 9),
+            Err(RateTxPowerError::InvalidSequence)
+        );
+        let mut six_ghz = capability;
+        six_ghz.has_6ghz = Some(true);
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(six_ghz, limits, 1),
+            Err(RateTxPowerError::Unsupported6Ghz)
+        );
+        six_ghz.has_6ghz = None;
+        assert_eq!(
+            encode_conservative_rate_tx_power_commands(six_ghz, limits, 1),
+            Err(RateTxPowerError::Unsupported6Ghz)
+        );
+
+        struct PowerTransport {
+            completed: usize,
+            pse_reads: usize,
+            fail_at: Option<usize>,
+        }
+        impl RateTxPowerTransport for PowerTransport {
+            type Error = ();
+            fn send_and_wait_consumed(&mut self, _encoded: &[u8]) -> Result<(), Self::Error> {
+                if self.fail_at == Some(self.completed) {
+                    return Err(());
+                }
+                self.completed += 1;
+                Ok(())
+            }
+            fn query_pse_base(&mut self) -> Result<u32, Self::Error> {
+                self.pse_reads += 1;
+                Ok(0)
+            }
+        }
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        let mut authorizer = RateTxPowerAuthorizer::new();
+        let authorization = authorizer
+            .submit(&mut transport, capability, limits, 1)
+            .unwrap();
+        assert!(authorizer.permits(&authorization));
+        assert_eq!(transport.completed, 8);
+        assert_eq!(transport.pse_reads, 8);
+
+        let mut other_transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        let mut other_authorizer = RateTxPowerAuthorizer::new();
+        let other_authorization = other_authorizer
+            .submit(&mut other_transport, capability, limits, 1)
+            .unwrap();
+        assert!(other_authorizer.permits(&other_authorization));
+        assert!(!authorizer.permits(&other_authorization));
+        assert!(!other_authorizer.permits(&authorization));
+
+        authorizer.reset();
+        assert!(!authorizer.permits(&authorization));
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: Some(3),
+        };
+        assert_eq!(
+            RateTxPowerAuthorizer::new().submit(&mut transport, capability, limits, 1),
+            Err(RateTxPowerInstallError::Transport {
+                command: 3,
+                error: (),
+            })
+        );
+        let mut authorizer = RateTxPowerAuthorizer::new();
+        authorizer.set_regulatory_domain(*b"IN");
+        let mut transport = PowerTransport {
+            completed: 0,
+            pse_reads: 0,
+            fail_at: None,
+        };
+        assert_eq!(
+            authorizer.submit(&mut transport, capability, limits, 1),
+            Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::NonWorldDomain
+            ))
+        );
+        assert_eq!(transport.completed, 0);
+    }
+
+    #[test]
+    fn source_exact_connac2_sae_auth_txwi_and_txp() {
+        let mut frame = vec![0u8; 30];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        frame[0..2].copy_from_slice(&0x80b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        let tx = encode_mt7921_5ghz_auth_tx(&frame, 0x0102_0000, 0x0102_1000, 7, 3, 19).unwrap();
+        let word = |index: usize| {
+            u32::from_le_bytes(tx.txwi[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!(word(0), (0x10 << 25) | 62);
+        assert_eq!(word(1), (1 << 31) | (2 << 16) | (12 << 11) | 19);
+        assert_eq!(word(2), (1 << 31) | (1 << 13) | 0x0b);
+        assert_eq!(word(3), (1 << 28) | (15 << 11));
+        assert_eq!(word(5), (1 << 10) | 3);
+        assert_eq!(word(6), (75 << 16) | 4);
+        assert_eq!(word(7), 0x0b << 16);
+        assert_eq!(&tx.txwi[32..34], &(0x8007u16).to_le_bytes());
+        assert_eq!(&tx.txwi[40..44], &0x0102_1000u32.to_le_bytes());
+        assert_eq!(&tx.txwi[44..46], &0x801eu16.to_le_bytes());
+        assert_eq!(
+            tx.descriptor,
+            DmaDescriptor {
+                buf0: 0x0102_0000,
+                ctrl: (64 << 16) | (1 << 30),
+                buf1: 0,
+                info: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn management_tx_encoder_rejects_non_auth_and_unrepresentable_identity() {
+        let mut frame = vec![0u8; 30];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 8192, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidToken)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 2, 19),
+            Err(Mt7921MgmtTxError::InvalidPid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 127, 19),
+            Err(Mt7921MgmtTxError::InvalidPid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, 0x2000, 0, 3, 20),
+            Err(Mt7921MgmtTxError::InvalidWcid)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, u32::MAX as u64 - 62, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidIova)
+        );
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&frame, 0x1000, u32::MAX as u64 - 28, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidIova)
+        );
+        let mut oversized = vec![0u8; 0x8000];
+        oversized[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&oversized, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn parses_correlated_tx_free_and_txs_completion() {
+        let mut free = [0u8; 12];
+        free[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 12).to_le_bytes());
+        free[8..12].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_free(&free),
+            Ok(Mt7921TxFree {
+                token: 7,
+                dropped: false,
+                attempts: 1
+            })
+        );
+
+        let mut txs = [0u8; 40];
+        txs[0..4].copy_from_slice(&40u32.to_le_bytes());
+        txs[16..20].copy_from_slice(&0u32.to_le_bytes());
+        txs[20..24].copy_from_slice(&(3u32 << 24).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&txs),
+            Ok(Mt7921TxStatus {
+                wcid: 0,
+                pid: 3,
+                acked: true
+            })
+        );
+        txs[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        assert_eq!(parse_mt7921_tx_status(&txs).unwrap().acked, false);
+
+        let mut batched = [0u8; 72];
+        batched[0..4].copy_from_slice(&72u32.to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&batched),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
+        let mut invalid_wcid = txs;
+        invalid_wcid[16..20].copy_from_slice(&(20u32 << 16).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_status(&invalid_wcid),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
+        let mut stale_free_tail = [0u8; 16];
+        stale_free_tail[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_tx_free(&stale_free_tail),
+            Err(Mt7921TxCompletionError::InvalidFormat)
+        );
+    }
 
     #[test]
     fn ports_fuchsia_beacon_conversion_fixture() {
@@ -3679,6 +7673,7 @@ mod tests {
             0x8001_0000
         );
         assert_eq!(&semaphore[32..34], &36u16.to_le_bytes());
+        assert_eq!(&semaphore[34..36], &0x8000u16.to_le_bytes());
         assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
         assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
         let release = encode_download_command(DownloadCommand::PatchSemaphoreRelease, 2).unwrap();
@@ -3687,6 +7682,25 @@ mod tests {
         let power = encode_download_command(DownloadCommand::NicPowerControl, 3).unwrap();
         assert_eq!(&power[36..40], &[0x04, 0xa0, 3, 3]);
         assert_eq!(&power[64..68], &[1, 0, 0, 0]);
+        let capability = encode_download_command(DownloadCommand::GetNicCapability, 4).unwrap();
+        assert_eq!(capability.len(), CONNAC2_MCU_TXD_BYTES);
+        assert_eq!(&capability[34..36], &0x8000u16.to_le_bytes());
+        assert_eq!(&capability[36..40], &[0x8a, 0xa0, 1, 4]);
+        let eeprom = encode_download_command(
+            DownloadCommand::ReadEepromBlock {
+                address: MT7921_EEPROM_HW_TYPE_BLOCK,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(eeprom.len(), CONNAC2_MCU_TXD_BYTES + 24);
+        assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 0, 5, 0, 1, 0, 1]);
+        assert_eq!(&eeprom[64..68], &MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
+        assert_eq!(&eeprom[68..], &[0; 20]);
+        assert_eq!(
+            encode_download_command(DownloadCommand::ReadEepromBlock { address: 0x551 }, 5),
+            Err(DownloadCommandError::InvalidEepromAddress)
+        );
 
         let patch = encode_download_command(
             DownloadCommand::PatchStart {
@@ -3706,9 +7720,79 @@ mod tests {
         assert_eq!(&patch[64..68], &0x0090_0000u32.to_le_bytes());
         assert_eq!(&patch[68..72], &0x0001_6780u32.to_le_bytes());
         assert_eq!(&patch[72..76], &(1u32 << 31).to_le_bytes());
+        let finish = encode_download_command(DownloadCommand::PatchFinish, 3).unwrap();
+        assert_eq!(finish.len(), PATCH_FINISH_REQUEST_BYTES);
+        assert_eq!(&finish[36..40], &[0x07, 0xa0, 3, 3]);
+        assert_eq!(&finish[64..68], &[0; 4]);
+        let start = encode_download_command(
+            DownloadCommand::FirmwareStart {
+                address: 0x0091_5000,
+                option: 1,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(start.len(), FIRMWARE_START_REQUEST_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(start[0..4].try_into().unwrap()),
+            0x4100_0048
+        );
+        assert_eq!(&start[34..36], &0x8000u16.to_le_bytes());
+        assert_eq!(&start[36..40], &[0x02, 0xa0, 3, 4]);
+        assert_eq!(&start[64..68], &1u32.to_le_bytes());
+        assert_eq!(&start[68..72], &0x0091_5000u32.to_le_bytes());
+        assert_eq!(
+            encode_download_command(
+                DownloadCommand::FirmwareStart {
+                    address: 0,
+                    option: 0,
+                },
+                4,
+            ),
+            Err(DownloadCommandError::InvalidFirmwareStart)
+        );
         assert_eq!(
             encode_download_command(DownloadCommand::PatchSemaphoreGet, 0),
             Err(DownloadCommandError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn derives_connac2_patch_download_security_mode_fail_closed() {
+        assert_eq!(patch_download_mode(u32::MAX), Ok(DL_MODE_NEED_RESPONSE));
+        assert_eq!(patch_download_mode(0), Ok(DL_MODE_NEED_RESPONSE));
+        assert_eq!(
+            patch_download_mode(0x0100_0002),
+            Ok(DL_MODE_NEED_RESPONSE | DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV | (2 << 1))
+        );
+        assert_eq!(
+            patch_download_mode(0x0200_0000),
+            Ok(DL_MODE_NEED_RESPONSE
+                | DL_MODE_ENCRYPT
+                | DL_MODE_RESET_SECURITY_IV
+                | DL_MODE_ENCRYPTION_MODE_SELECT)
+        );
+        assert_eq!(
+            patch_download_mode(0x0300_0000),
+            Err(PatchSecurityError::UnsupportedEncryptionType(3))
+        );
+    }
+
+    #[test]
+    fn derives_connac2_ram_region_download_mode() {
+        assert_eq!(firmware_download_mode(0, false), DL_MODE_NEED_RESPONSE);
+        assert_eq!(
+            firmware_download_mode(0b0001_0111, false),
+            DL_MODE_NEED_RESPONSE
+                | DL_MODE_ENCRYPT
+                | DL_MODE_KEY_INDEX
+                | DL_MODE_RESET_SECURITY_IV
+                | DL_MODE_ENCRYPTION_MODE_SELECT
+        );
+        assert_eq!(firmware_download_mode(1 << 5, false), DL_MODE_NEED_RESPONSE);
+        assert_eq!(
+            firmware_download_mode(0, true),
+            DL_MODE_NEED_RESPONSE | DL_MODE_WORKING_PDA_CR4
         );
     }
 
@@ -4001,6 +8085,1428 @@ mod tests {
         trailer[32..36].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         image.extend_from_slice(&trailer);
         image
+    }
+
+    fn nic_capability_fixture() -> (Vec<u8>, NicCapability) {
+        let mut bytes = vec![0; 4];
+        bytes[0..2].copy_from_slice(&4u16.to_le_bytes());
+        for (kind, value) in [
+            (7u32, vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            (8, vec![1, 1, 1, 2, 2, 0, 1, 1, 1, 1, 3, 1]),
+            (0x18, vec![1]),
+            (0x20, 0x1122_3344_5566_7789u64.to_le_bytes().to_vec()),
+        ] {
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&value);
+        }
+        (
+            bytes,
+            NicCapability {
+                element_count: 4,
+                mac_address: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                phy: Some(NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz: true,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 3,
+                    he: true,
+                }),
+                has_6ghz: Some(true),
+                chip_capability: Some(0x1122_3344_5566_7789),
+                unknown_elements: 0,
+            },
+        )
+    }
+
+    fn eeprom_hardware_fixture() -> (Vec<u8>, EepromBlock) {
+        let mut bytes = vec![0; 24];
+        bytes[0..4].copy_from_slice(&MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        bytes[8 + 11] = 1;
+        (
+            bytes,
+            EepromBlock {
+                address: MT7921_EEPROM_HW_TYPE_BLOCK,
+                valid: 1,
+                data: {
+                    let mut data = [0; MT7921_EEPROM_BLOCK_SIZE];
+                    data[11] = 1;
+                    data
+                },
+            },
+        )
+    }
+
+    fn clc_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 16];
+        bytes[0..4].copy_from_slice(&33u32.to_le_bytes());
+        bytes[4] = 0;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[7] = 1;
+        bytes.extend_from_slice(b"00");
+        bytes.extend_from_slice(b"-0");
+        bytes.extend_from_slice(&11u16.to_le_bytes());
+        bytes.extend_from_slice(&[0x5a; 11]);
+        bytes
+    }
+
+    #[test]
+    fn parses_bounded_nic_capability_tlvs() {
+        let (bytes, expected) = nic_capability_fixture();
+        assert_eq!(parse_nic_capability(&bytes), Ok(expected));
+        let channels = candidate_channels(expected);
+        assert_eq!(
+            candidate_channel_summary(expected),
+            CandidateChannelSummary {
+                ghz2: 14,
+                ghz5: 28,
+                ghz6: 59,
+            }
+        );
+        assert_eq!(channels.first().unwrap().frequency_mhz, 2412);
+        assert_eq!(channels[13].frequency_mhz, 2484);
+        assert_eq!(channels[14].number, 36);
+        assert_eq!(channels.last().unwrap().number, 233);
+        assert_eq!(
+            parse_nic_capability(&bytes[..bytes.len() - 1]),
+            Err(NicCapabilityError::TruncatedElement {
+                index: 3,
+                length: 8,
+            })
+        );
+        assert_eq!(
+            parse_nic_capability(&[1, 0, 0, 0]),
+            Err(NicCapabilityError::TruncatedElementHeader { index: 0 })
+        );
+    }
+
+    #[test]
+    fn parses_bounded_eeprom_block_and_hardware_type() {
+        let (bytes, expected) = eeprom_hardware_fixture();
+        assert_eq!(
+            parse_eeprom_block(&bytes, MT7921_EEPROM_HW_TYPE_BLOCK),
+            Ok(expected)
+        );
+        assert_eq!(
+            expected.hardware_info(),
+            Ok(EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            })
+        );
+        assert_eq!(
+            parse_eeprom_block(&bytes[..23], MT7921_EEPROM_HW_TYPE_BLOCK),
+            Err(EepromBlockError::Truncated)
+        );
+        assert_eq!(
+            parse_eeprom_block(&bytes, 0),
+            Err(EepromBlockError::AddressMismatch {
+                expected: 0,
+                actual: MT7921_EEPROM_HW_TYPE_BLOCK,
+            })
+        );
+    }
+
+    #[test]
+    fn discovers_selected_clc_rules_without_sending_configuration() {
+        let clc = clc_fixture();
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc)]);
+        assert_eq!(
+            discover_clc(
+                Firmware::parse(&image).unwrap(),
+                EepromHardwareInfo {
+                    raw_type: 1,
+                    encapsulated_calibration: true,
+                }
+            ),
+            Ok(ClcDiscovery {
+                segment_count: 1,
+                selected_power_segments: 1,
+                selected_power_rules: 1,
+                channel_segments: 0,
+                channel_rules: 0,
+                unique_country_codes: 1,
+                world_domain_available: true,
+            })
+        );
+        let mut malformed = clc;
+        malformed[0..4].copy_from_slice(&34u32.to_le_bytes());
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &malformed)]);
+        assert_eq!(
+            discover_clc(
+                Firmware::parse(&image).unwrap(),
+                EepromHardwareInfo {
+                    raw_type: 1,
+                    encapsulated_calibration: true,
+                }
+            ),
+            Err(ClcDiscoveryError::InvalidSegmentLength(34))
+        );
+
+        let clc = clc_fixture();
+        let image = firmware_image(&[(0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc)]);
+        let commands = world_clc_commands(
+            Firmware::parse(&image).unwrap(),
+            EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            },
+            19,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            [ClcSetCommand {
+                index: 0,
+                environment: 1,
+                acpi_configuration: 0,
+                capability: 1,
+                alpha2: *b"00",
+                rule_type: *b"-0",
+                environment_6ghz: 0,
+                mtcl_configuration: 0xff,
+                data: vec![0x5a; 11],
+            }]
+        );
+        let encoded = encode_clc_set_command(&commands[0], 6).unwrap();
+        assert_eq!(encoded.len(), 64 + 76 + 11);
+        assert_eq!(&encoded[36..44], &[0x5c, 0xa0, 1, 6, 0, 0, 0, 0]);
+        assert_eq!(&encoded[64..68], &[1, 0, 87, 0]);
+        assert_eq!(&encoded[68..76], &[0, 1, 0, 1, b'0', b'0', b'-', b'0']);
+        assert_eq!(&encoded[76..78], &[0, 0xff]);
+        assert_eq!(&encoded[140..], &[0x5a; 11]);
+        assert!(commands[0].expects_response());
+        let acpi_commands = world_clc_commands(
+            Firmware::parse(&image).unwrap(),
+            EepromHardwareInfo {
+                raw_type: 1,
+                encapsulated_calibration: true,
+            },
+            19,
+            1,
+        )
+        .unwrap();
+        assert_eq!(acpi_commands[0].acpi_configuration, 1);
+        assert_eq!(encode_clc_set_command(&acpi_commands[0], 6).unwrap()[70], 1);
+
+        let mut no_event_capability = commands[0].clone();
+        no_event_capability.capability = 0;
+        assert!(!no_event_capability.expects_response());
+        assert!(encode_clc_set_command(&no_event_capability, 6).is_ok());
+
+        let mut zero_mtcl = commands[0].clone();
+        zero_mtcl.mtcl_configuration = 0;
+        assert_eq!(
+            encode_clc_set_command(&zero_mtcl, 6),
+            Err(DownloadCommandError::InvalidLength)
+        );
+
+        let mut response = vec![0; 72];
+        response[4..6].copy_from_slice(&0x1234u16.to_le_bytes());
+        response[6..8].copy_from_slice(&68u16.to_le_bytes());
+        response[8] = 0x1f;
+        assert_eq!(
+            parse_clc_set_response(&response),
+            Ok(ClcSetResponse {
+                tag: 0x1234,
+                length: 68,
+                special_unii_mask: 0x1f,
+            })
+        );
+        response[8] = 0x20;
+        assert_eq!(
+            parse_clc_set_response(&response),
+            Err(ClcSetResponseError::InvalidMask(0x20))
+        );
+        assert_eq!(
+            parse_clc_set_response(&response[..71]),
+            Err(ClcSetResponseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn channel_domain_is_exact_fuchsia_world_indoor_passive_intersection() {
+        let capability = nic_capability_fixture().1;
+        let command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        assert_eq!(command.channels.len(), 39);
+        assert_eq!(command.channels[0].number, 1);
+        assert_eq!(command.channels[13].number, 14);
+        assert_eq!(command.channels[14].number, 36);
+        assert_eq!(command.channels.last().unwrap().number, 165);
+        assert!(
+            command
+                .channels
+                .iter()
+                .all(|channel| channel.flags == 1 << 1)
+        );
+        assert!(
+            !command
+                .channels
+                .iter()
+                .any(|channel| channel.band == PhysicalBand::Ghz6 || channel.number >= 169)
+        );
+
+        let encoded = encode_channel_domain_command(&command, 2).unwrap();
+        assert_eq!(encoded.len(), CONNAC2_MCU_TXD_BYTES + 12 + 39 * 8);
+        assert_eq!(&encoded[36..44], &[0x0f, 0xa0, 1, 2, 0, 0, 0, 0]);
+        assert_eq!(
+            &encoded[64..76],
+            &[b'0', b'0', 0, 0, 0, 3, 3, 0, 14, 25, 0, 0]
+        );
+        assert_eq!(&encoded[76..84], &[1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(&encoded[188..196], &[36, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            encode_channel_domain_command(&command, 0),
+            Err(ChannelDomainError::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn channel_domain_policy_and_encoder_fail_closed() {
+        let capability = nic_capability_fixture().1;
+        assert_eq!(
+            conservative_channel_domain(capability, *b"US", true, 0),
+            Err(ChannelDomainError::NonWorldDomain)
+        );
+        assert_eq!(
+            conservative_channel_domain(capability, *b"00", false, 0),
+            Err(ChannelDomainError::OutdoorEnvironment)
+        );
+        assert_eq!(
+            conservative_channel_domain(capability, *b"00", true, 1),
+            Err(ChannelDomainError::NonzeroSpecialUniiMask)
+        );
+        let mut command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        command.channels[14].number = 169;
+        assert_eq!(
+            encode_channel_domain_command(&command, 1),
+            Err(ChannelDomainError::InvalidChannelSet)
+        );
+        let mut command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        command.channels[0].flags = 0;
+        assert_eq!(
+            encode_channel_domain_command(&command, 1),
+            Err(ChannelDomainError::InvalidChannelSet)
+        );
+    }
+
+    #[test]
+    fn passive_command_closure_is_source_exact_and_has_no_tx_material() {
+        let channel = CandidateChannel {
+            band: PhysicalBand::Ghz2,
+            number: 1,
+            frequency_mhz: 2412,
+        };
+        let eeprom = encode_passive_mcu_command(&PassiveMcuCommand::EepromBufferMode, 1).unwrap();
+        assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 1, 1, 0, 0x21, 0, 1]);
+        assert_eq!(&eeprom[64..], &[1, 0, 0, 0]);
+        let switch = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel,
+                antenna_mask: 3,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 2, 0, 8, 0, 1]);
+        assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
+
+        let scan = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channel,
+            },
+            3,
+        )
+        .unwrap();
+        let request = &scan[64..];
+        assert_eq!(request.len(), 1186);
+        assert_eq!(&request[..8], &[1, 0, 0, 1, 0, 0, 1 << 5, 1]);
+        assert_eq!(&request[152..160], &[0, 0, 0, 0, 0, 0, 4, 1]);
+        assert_eq!(&request[160..162], &[1, 1]);
+        assert_eq!(request[224..826].iter().copied().sum::<u8>(), 0);
+        assert_eq!(request[826], 0);
+        assert_eq!(request[1185], 0);
+        assert!(
+            !PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channel
+            }
+            .expects_response()
+        );
+
+        let channel_5ghz = CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number: 36,
+            frequency_mhz: 5180,
+        };
+        let switch_5ghz = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel: channel_5ghz,
+                antenna_mask: 3,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(&switch_5ghz[64..75], &[36, 36, 0, 2, 2, 9, 0, 0, 0, 0, 1]);
+        let scan_5ghz = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 2,
+                channel: channel_5ghz,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(&scan_5ghz[64 + 158..64 + 162], &[4, 1, 2, 36]);
+
+        let forbidden = CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number: 169,
+            frequency_mhz: 5845,
+        };
+        assert_eq!(
+            encode_passive_mcu_command(
+                &PassiveMcuCommand::StartScan {
+                    scan_sequence: 1,
+                    channel: forbidden,
+                },
+                1,
+            ),
+            Err(PassiveMcuCommandError::UnsupportedChannel)
+        );
+    }
+
+    #[test]
+    fn parses_only_passive_scan_done_and_beacon_advertisements() {
+        let mut done = vec![0; 56];
+        done[24..26].copy_from_slice(&32u16.to_le_bytes());
+        done[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        done[28] = 0x0d;
+        done[36] = 1;
+        done[40] = 1;
+        done[44..48].copy_from_slice(&3u32.to_le_bytes());
+        done[53..55].copy_from_slice(b"00");
+        assert_eq!(
+            parse_passive_scan_done(&done),
+            Ok(PassiveScanDone {
+                scan_sequence: 1,
+                completed_channels: 1,
+                beacon_scan_count: 3,
+                alpha2: *b"00",
+            })
+        );
+
+        let mut rx = vec![0; 24 + 8 + 36 + 5];
+        let rxd0 = (2u32 << 27) | rx.len() as u32;
+        rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        let frame = &mut rx[32..];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        frame[16..22].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+        frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
+        frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
+        assert_eq!(
+            parse_passive_advertisement(&rx),
+            Ok(PassiveAdvertisement {
+                probe_response: false,
+                bssid: [1, 2, 3, 4, 5, 6],
+                beacon_interval_tu: 100,
+                capability_info: 0x0431,
+                ies: vec![0, 3, b'a', b'p', b'1'],
+                band: PhysicalBand::Ghz2,
+                channel: 1,
+                rssi_dbm: -50,
+            })
+        );
+        let mut normal_mcu = rx.clone();
+        let rxd0 = (7u32 << 27) | (1 << 16) | normal_mcu.len() as u32;
+        normal_mcu[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&normal_mcu),
+            parse_passive_advertisement(&rx)
+        );
+        let mut rx_5ghz = rx.clone();
+        rx_5ghz[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        let mut expected_5ghz = parse_passive_advertisement(&rx).unwrap();
+        expected_5ghz.band = PhysicalBand::Ghz5;
+        expected_5ghz.channel = 36;
+        assert_eq!(parse_passive_advertisement(&rx_5ghz), Ok(expected_5ghz));
+        let mut stale_tail = rx.clone();
+        stale_tail[0..4].copy_from_slice(&((2u32 << 27) | 68).to_le_bytes());
+        let mut without_tail = parse_passive_advertisement(&rx).unwrap();
+        without_tail.ies.clear();
+        assert_eq!(parse_passive_advertisement(&stale_tail), Ok(without_tail));
+        rx[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&rx),
+            Err(PassiveRxError::UnsupportedFrame)
+        );
+    }
+
+    #[test]
+    fn passive_advertisement_and_client_frame_share_exact_connac_envelope_parsing() {
+        let mut data = vec![0; 24 + 8 + 36 + 5];
+        data[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        data[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        data[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        let frame = &mut data[32..];
+        frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        frame[16..22].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+        frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
+        frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
+
+        for packet in [2u32 << 27, (7u32 << 27) | (1 << 16)] {
+            for with_group_5 in [false, true] {
+                let mut envelope = if with_group_5 {
+                    let mut envelope = data[..32].to_vec();
+                    envelope.resize(32 + 72, 0);
+                    envelope[56..60].copy_from_slice(&0x6464u32.to_le_bytes());
+                    envelope.extend_from_slice(&data[32..]);
+                    envelope[4..8].copy_from_slice(&((1u32 << 13) | (1 << 15)).to_le_bytes());
+                    envelope
+                } else {
+                    data.clone()
+                };
+                let len = envelope.len() as u32;
+                envelope[0..4].copy_from_slice(&(packet | len).to_le_bytes());
+
+                let stripped = parse_connac2_rx_frame(&envelope).unwrap();
+                let advertisement = parse_passive_advertisement(&envelope).unwrap();
+                assert_eq!(advertisement.band, stripped.band);
+                assert_eq!(advertisement.channel, stripped.channel);
+                assert_eq!(advertisement.rssi_dbm, stripped.rssi_dbm);
+                assert_eq!(advertisement.rssi_dbm, if with_group_5 { -60 } else { -50 });
+                assert_eq!(advertisement.ies, stripped.bytes[36..]);
+            }
+        }
+    }
+
+    #[test]
+    fn strips_connac2_rx_metadata_without_interpreting_sae_fields() {
+        let mut rx = vec![0; 24 + 8 + 30 + 4];
+        let rxd0 = (2u32 << 27) | rx.len() as u32;
+        rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        let frame = &mut rx[32..];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        frame[4..10].copy_from_slice(&[2; 6]);
+        frame[10..16].copy_from_slice(&[6; 6]);
+        frame[16..22].copy_from_slice(&[6; 6]);
+        frame[24..26].copy_from_slice(&3u16.to_le_bytes());
+        frame[26..28].copy_from_slice(&1u16.to_le_bytes());
+        frame[28..30].copy_from_slice(&0u16.to_le_bytes());
+        frame[30..34].copy_from_slice(&[9, 8, 7, 6]);
+        assert_eq!(
+            parse_mt7921_auth_rx(&rx),
+            Ok(Mt7921AuthRx {
+                receiver: [2; 6],
+                transmitter: [6; 6],
+                bssid: [6; 6],
+                algorithm: 3,
+                sequence: 1,
+                status: 0,
+                fields: vec![9, 8, 7, 6],
+            })
+        );
+        let mut stale_tail = rx.clone();
+        stale_tail[0..4].copy_from_slice(&((2u32 << 27) | 62).to_le_bytes());
+        assert_eq!(
+            parse_mt7921_auth_rx(&stale_tail),
+            Ok(Mt7921AuthRx {
+                receiver: [2; 6],
+                transmitter: [6; 6],
+                bssid: [6; 6],
+                algorithm: 3,
+                sequence: 1,
+                status: 0,
+                fields: Vec::new(),
+            })
+        );
+        let mut ordered = rx.clone();
+        ordered[32..34].copy_from_slice(&0x80b0u16.to_le_bytes());
+        assert_eq!(
+            parse_mt7921_auth_rx(&ordered),
+            Err(PassiveRxError::UnsupportedFrame)
+        );
+    }
+
+    #[test]
+    fn passive_mac_mmio_plan_covers_every_mandatory_source_write() {
+        let plan = passive_mac_mmio_plan();
+        assert_eq!(plan.len(), 41);
+        assert_eq!(
+            &plan[..3],
+            &[
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d004,
+                    mask: 0xfff8,
+                    value: 1536 << 3,
+                },
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d000,
+                    mask: 1 << 15,
+                    value: 1 << 15,
+                },
+                PassiveMacMmioOperation::Rmw {
+                    address: 0x820c_d000,
+                    mask: 1 << 19,
+                    value: 1 << 19,
+                },
+            ]
+        );
+        for (index, operation) in plan[3..23].iter().enumerate() {
+            assert_eq!(
+                *operation,
+                PassiveMacMmioOperation::WtblClear {
+                    index: index as u8,
+                    address: 0x820d_4230,
+                    value: index as u32 | (1 << 12),
+                    busy_mask: 1 << 31,
+                    timeout_us: 5000,
+                }
+            );
+        }
+        assert_eq!(
+            plan.last(),
+            Some(&PassiveMacMmioOperation::Rmw {
+                address: 0x820f_9008,
+                mask: (3 << 30) | (3 << 24),
+                value: 3 << 24,
+            })
+        );
+    }
+
+    #[test]
+    fn passive_mac_addresses_use_exact_fixed_bar_map_and_fail_closed() {
+        assert_eq!(
+            passive_mac_source_rmw_value(0x1234_5678, 0x00ff_0000, 0x005a_0000),
+            0x125a_5678
+        );
+        let fixtures = [
+            (0x820c_d000, 0x0f000),
+            (0x820c_d004, 0x0f004),
+            (0x820d_4230, 0x34230),
+            (0x820e_40f4, 0x210f4),
+            (0x820e_5380, 0x21780),
+            (0x820e_53c4, 0x217c4),
+            (0x820e_7000, 0x21e00),
+            (0x820e_9008, 0x23408),
+            (0x820e_d004, 0x24804),
+            (0x820f_40f4, 0xa10f4),
+            (0x820f_5380, 0xa1780),
+            (0x820f_53c4, 0xa17c4),
+            (0x820f_7000, 0xa1e00),
+            (0x820f_9008, 0xa3408),
+            (0x820f_d004, 0xa4804),
+        ];
+        for &(physical, bar) in &fixtures {
+            assert_eq!(passive_mac_bar_offset(physical), Ok(bar));
+            assert_eq!(
+                validate_passive_mac_bar_read(physical, 0x1234_5678),
+                Ok((bar, 0x1234_5678))
+            );
+            assert_eq!(
+                validate_passive_mac_bar_read(physical, u32::MAX),
+                Err(PassiveMacBarError::AllOnes { address: physical })
+            );
+        }
+        for operation in passive_mac_mmio_plan() {
+            let address = match operation {
+                PassiveMacMmioOperation::Rmw { address, .. }
+                | PassiveMacMmioOperation::WtblClear { address, .. } => address,
+            };
+            assert!(fixtures.iter().any(|fixture| fixture.0 == address));
+        }
+        assert_eq!(
+            passive_mac_bar_offset(0x820e_40f8),
+            Err(PassiveMacBarError::UnsupportedAddress(0x820e_40f8))
+        );
+        assert_eq!(
+            passive_mac_bar_offset(0x1800_0000),
+            Err(PassiveMacBarError::UnsupportedAddress(0x1800_0000))
+        );
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum LoaderTrace {
+        Command(DownloadCommand, u8),
+        PublishScatter(FirmwareImagePart, u8, usize),
+        ScatterCompletion(FirmwareImagePart, u8, u64),
+        DownloadState,
+        N9Ready,
+        Sleep(u64),
+        Cleanup(FirmwareLoaderState),
+        SetClc(u8, u8),
+        SetChannelDomain(usize, u8),
+        PassiveHook,
+    }
+
+    struct FakeFirmwareLoader {
+        trace: Vec<LoaderTrace>,
+        calls: usize,
+        sequence: u8,
+        now_ms: u64,
+        fail_at: Option<usize>,
+        download_states: Vec<u8>,
+        download_poll: usize,
+        n9_states: Vec<bool>,
+        n9_poll: usize,
+        semaphore_result: u8,
+        completion_override: Option<(DownloadCommand, FirmwareCommandCompletion)>,
+        fail_release: bool,
+        fail_patch_publish: bool,
+        fail_patch_completion: bool,
+        clc_mask: u8,
+    }
+
+    impl Default for FakeFirmwareLoader {
+        fn default() -> Self {
+            Self {
+                trace: vec![],
+                calls: 0,
+                sequence: 0,
+                now_ms: 0,
+                fail_at: None,
+                download_states: vec![0, 1],
+                download_poll: 0,
+                n9_states: vec![false, true],
+                n9_poll: 0,
+                semaphore_result: 2,
+                completion_override: None,
+                fail_release: false,
+                fail_patch_publish: false,
+                fail_patch_completion: false,
+                clc_mask: 0x1f,
+            }
+        }
+    }
+
+    impl FakeFirmwareLoader {
+        fn step(&mut self) -> Result<(), &'static str> {
+            self.calls += 1;
+            if self.fail_at == Some(self.calls) {
+                Err("injected transport failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn next_download_state(&mut self) -> u8 {
+            let state = self
+                .download_states
+                .get(self.download_poll)
+                .copied()
+                .unwrap_or_else(|| *self.download_states.last().unwrap_or(&0));
+            self.download_poll += 1;
+            state
+        }
+
+        fn next_n9_state(&mut self) -> bool {
+            let ready = self
+                .n9_states
+                .get(self.n9_poll)
+                .copied()
+                .unwrap_or_else(|| *self.n9_states.last().unwrap_or(&false));
+            self.n9_poll += 1;
+            ready
+        }
+    }
+
+    impl FirmwareLoaderTransport for FakeFirmwareLoader {
+        type Error = &'static str;
+
+        fn next_sequence(&mut self) -> u8 {
+            self.sequence = (self.sequence + 1) & 0x0f;
+            if self.sequence == 0 {
+                self.sequence = 1;
+            }
+            self.sequence
+        }
+
+        fn acpi_configuration(&self) -> u8 {
+            0
+        }
+
+        fn command(
+            &mut self,
+            command: DownloadCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<FirmwareCommandCompletion, Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[34..36], &0x8000u16.to_le_bytes());
+            self.trace.push(LoaderTrace::Command(command, sequence));
+            self.step()?;
+            if self.fail_release && command == DownloadCommand::PatchSemaphoreRelease {
+                return Err("injected release failure");
+            }
+            if let Some((overridden, completion)) = self.completion_override
+                && overridden == command
+            {
+                return Ok(completion);
+            }
+            Ok(match command {
+                DownloadCommand::NicPowerControl => FirmwareCommandCompletion::NoResponse,
+                DownloadCommand::GetNicCapability => {
+                    FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
+                }
+                DownloadCommand::ReadEepromBlock { .. } => {
+                    FirmwareCommandCompletion::EepromBlock(eeprom_hardware_fixture().1)
+                }
+                DownloadCommand::PatchSemaphoreGet => {
+                    FirmwareCommandCompletion::PatchSemaphore(self.semaphore_result.into())
+                }
+                DownloadCommand::PatchSemaphoreRelease => {
+                    FirmwareCommandCompletion::PatchSemaphore(PatchSemaphoreStatus::Released)
+                }
+                DownloadCommand::PatchFinish => FirmwareCommandCompletion::PatchFinish(0),
+                DownloadCommand::PatchStart { .. }
+                | DownloadCommand::TargetAddressLength { .. }
+                | DownloadCommand::FirmwareStart { .. } => FirmwareCommandCompletion::Ack,
+            })
+        }
+
+        fn set_clc(
+            &mut self,
+            command: &ClcSetCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<Option<ClcSetResponse>, Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[36..39], &[0x5c, 0xa0, 1]);
+            self.trace
+                .push(LoaderTrace::SetClc(command.index, sequence));
+            self.step()?;
+            Ok(command.expects_response().then_some(ClcSetResponse {
+                tag: 0,
+                length: 68,
+                special_unii_mask: self.clc_mask,
+            }))
+        }
+
+        fn set_channel_domain(
+            &mut self,
+            command: &ChannelDomainCommand,
+            sequence: u8,
+            encoded: &[u8],
+        ) -> Result<(), Self::Error> {
+            assert_eq!(encoded[39], sequence);
+            assert_eq!(&encoded[36..39], &[0x0f, 0xa0, 1]);
+            self.trace.push(LoaderTrace::SetChannelDomain(
+                command.channels.len(),
+                sequence,
+            ));
+            self.step()
+        }
+
+        fn publish_scatter(
+            &mut self,
+            part: FirmwareImagePart,
+            sequence: u8,
+            chunk: &[u8],
+        ) -> Result<(), Self::Error> {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= MT7921_FWDL_CHUNK_BYTES);
+            self.trace
+                .push(LoaderTrace::PublishScatter(part, sequence, chunk.len()));
+            self.step()?;
+            if self.fail_patch_publish && part == FirmwareImagePart::Patch {
+                Err("injected patch publish failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_scatter_completion(
+            &mut self,
+            part: FirmwareImagePart,
+            sequence: u8,
+            deadline_ms: u64,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(
+                deadline_ms,
+                self.now_ms.saturating_add(SCATTER_COMPLETION_TIMEOUT_MS)
+            );
+            self.trace
+                .push(LoaderTrace::ScatterCompletion(part, sequence, deadline_ms));
+            self.step()?;
+            if self.fail_patch_completion && part == FirmwareImagePart::Patch {
+                Err("injected patch completion timeout")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn firmware_download_state(&mut self) -> Result<u8, Self::Error> {
+            self.trace.push(LoaderTrace::DownloadState);
+            self.step()?;
+            Ok(self.next_download_state())
+        }
+
+        fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
+            self.trace.push(LoaderTrace::N9Ready);
+            self.step()?;
+            Ok(self.next_n9_state())
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.now_ms
+        }
+
+        fn sleep_ms(&mut self, duration_ms: u64) {
+            self.trace.push(LoaderTrace::Sleep(duration_ms));
+            self.now_ms = self.now_ms.saturating_add(duration_ms);
+        }
+
+        fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
+            self.trace.push(LoaderTrace::Cleanup(state));
+            self.step()
+        }
+    }
+
+    fn loader_images() -> (Vec<u8>, Vec<u8>) {
+        let patch = patch_image(0x0004_0002, 160, 4097);
+        let ram_large = vec![0x5a; 4097];
+        let clc = clc_fixture();
+        let ram = firmware_image(&[
+            (0x0091_5000, 1 << 5, 0, &ram_large),
+            (0x0201_5c00, 0, 0, b"ram"),
+            (0, FW_FEATURE_NON_DL, FW_TYPE_CLC, &clc),
+        ]);
+        (patch, ram)
+    }
+
+    #[test]
+    fn clc_without_event_capability_advances_without_response() {
+        let mut transport = FakeFirmwareLoader::default();
+        let command = ClcSetCommand {
+            index: 0,
+            environment: 1,
+            acpi_configuration: 0,
+            capability: 0,
+            alpha2: *b"00",
+            rule_type: *b"-0",
+            environment_6ghz: 0,
+            mtcl_configuration: 0xff,
+            data: vec![0x5a; 11],
+        };
+        assert_eq!(loader_set_clc(&mut transport, &command), Ok(None));
+        assert!(matches!(
+            transport.trace.as_slice(),
+            [LoaderTrace::SetClc(0, 1)]
+        ));
+    }
+
+    #[test]
+    fn firmware_loader_matches_linux_transaction_golden_trace() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader::default();
+        let report = load_mt7921_firmware(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report,
+            FirmwareLoaderReport {
+                download_ready_observed: true,
+                patch: PatchDisposition::Downloaded,
+                patch_sections: 1,
+                ram_regions: 2,
+                scatter_chunks: 5,
+                scatter_bytes: 8197,
+                nic_capability: nic_capability_fixture().1,
+                candidate_channels: CandidateChannelSummary {
+                    ghz2: 14,
+                    ghz5: 28,
+                    ghz6: 59,
+                },
+                eeprom_hardware: eeprom_hardware_fixture().1,
+                clc: ClcDiscovery {
+                    segment_count: 1,
+                    selected_power_segments: 1,
+                    selected_power_rules: 1,
+                    channel_segments: 0,
+                    channel_rules: 0,
+                    unique_country_codes: 1,
+                    world_domain_available: true,
+                },
+                clc_rules_applied: 1,
+                special_unii_mask: 0x1f,
+            }
+        );
+        assert_eq!(
+            transport.trace,
+            [
+                LoaderTrace::Command(DownloadCommand::NicPowerControl, 1),
+                LoaderTrace::DownloadState,
+                LoaderTrace::Sleep(10),
+                LoaderTrace::DownloadState,
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 2),
+                LoaderTrace::Command(
+                    DownloadCommand::PatchStart {
+                        address: 0x0090_0000,
+                        length: 4097,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    3,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 4, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 4, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 5, 1),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 5, 3010),
+                LoaderTrace::Command(DownloadCommand::PatchFinish, 6),
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, 7),
+                LoaderTrace::Command(
+                    DownloadCommand::TargetAddressLength {
+                        address: 0x0091_5000,
+                        length: 4097,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    8,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 9, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 9, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 10, 1),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 10, 3010),
+                LoaderTrace::Command(
+                    DownloadCommand::TargetAddressLength {
+                        address: 0x0201_5c00,
+                        length: 3,
+                        mode: DL_MODE_NEED_RESPONSE,
+                    },
+                    11,
+                ),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 12, 3),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 12, 3010),
+                LoaderTrace::Command(
+                    DownloadCommand::FirmwareStart {
+                        address: 0x0091_5000,
+                        option: 1,
+                    },
+                    13,
+                ),
+                LoaderTrace::N9Ready,
+                LoaderTrace::Sleep(10),
+                LoaderTrace::N9Ready,
+                LoaderTrace::Command(DownloadCommand::GetNicCapability, 14),
+                LoaderTrace::Command(
+                    DownloadCommand::ReadEepromBlock {
+                        address: MT7921_EEPROM_HW_TYPE_BLOCK,
+                    },
+                    15,
+                ),
+                LoaderTrace::SetClc(0, 1),
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
+            ]
+        );
+    }
+
+    #[test]
+    fn channel_domain_loader_boundary_is_separate_and_cleans_up() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware_through_channel_domain(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.special_unii_mask, 0);
+        assert!(matches!(
+            &transport.trace[transport.trace.len() - 2..],
+            [
+                LoaderTrace::SetChannelDomain(39, 2),
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
+            ]
+        ));
+
+        let mut rejected = FakeFirmwareLoader::default();
+        assert!(matches!(
+            load_mt7921_firmware_through_channel_domain(
+                &mut rejected,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::ChannelDomain(ChannelDomainError::NonzeroSpecialUniiMask)
+            ))
+        ));
+        assert!(
+            !rejected
+                .trace
+                .iter()
+                .any(|event| matches!(event, LoaderTrace::SetChannelDomain(_, _)))
+        );
+        assert!(matches!(
+            rejected.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::ClcConfigured))
+        ));
+
+        let mut failed = FakeFirmwareLoader {
+            clc_mask: 0,
+            fail_at: Some(transport.calls - 1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware_through_channel_domain(
+                &mut failed,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::SetChannelDomain,
+                    source: "injected transport failure",
+                }
+            ))
+        ));
+        assert!(matches!(
+            failed.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::ClcConfigured))
+        ));
+    }
+
+    #[test]
+    fn passive_hook_is_inside_mandatory_loader_cleanup() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware_with_passive_boundary(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+            |transport, report| {
+                assert_eq!(report.special_unii_mask, 0);
+                transport.trace.push(LoaderTrace::PassiveHook);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(report.special_unii_mask, 0);
+        assert!(matches!(
+            &transport.trace[transport.trace.len() - 3..],
+            [
+                LoaderTrace::SetChannelDomain(39, _),
+                LoaderTrace::PassiveHook,
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
+            ]
+        ));
+
+        let mut failed = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware_with_passive_boundary(
+                &mut failed,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+                |transport, _| {
+                    transport.trace.push(LoaderTrace::PassiveHook);
+                    Err("passive failure")
+                },
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::PassiveBoundary,
+                    source: "passive failure",
+                }
+            ))
+        ));
+        assert!(matches!(
+            failed.trace.last(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        ));
+    }
+
+    #[test]
+    fn firmware_loader_injected_transport_failures_always_cleanup_and_release() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut baseline = FakeFirmwareLoader::default();
+        load_mt7921_firmware(
+            &mut baseline,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        for fail_at in 1..=baseline.calls {
+            let mut transport = FakeFirmwareLoader {
+                fail_at: Some(fail_at),
+                ..Default::default()
+            };
+            assert!(
+                load_mt7921_firmware(
+                    &mut transport,
+                    Patch::parse(&patch_bytes).unwrap(),
+                    Firmware::parse(&ram_bytes).unwrap(),
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                transport.trace.last(),
+                Some(LoaderTrace::Cleanup(_))
+            ));
+            let acquired = transport.trace.iter().any(|event| {
+                matches!(
+                    event,
+                    LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, _)
+                )
+            }) && fail_at > 4;
+            if acquired {
+                assert!(transport.trace.iter().any(|event| {
+                    matches!(
+                        event,
+                        LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+                    )
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn firmware_loader_preserves_patch_release_and_completion_failures() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut combined = FakeFirmwareLoader {
+            fail_patch_publish: true,
+            fail_release: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut combined,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::PatchRelease {
+                    primary: Some(_),
+                    release: _,
+                }
+            ))
+        ));
+        assert_eq!(
+            combined.trace.last(),
+            Some(&LoaderTrace::Cleanup(
+                FirmwareLoaderState::PatchSemaphoreHeld
+            ))
+        );
+
+        let mut completion_timeout = FakeFirmwareLoader {
+            fail_patch_completion: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut completion_timeout,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::Transport {
+                    operation: FirmwareLoaderOperation::WaitScatterCompletion(
+                        FirmwareImagePart::Patch
+                    ),
+                    ..
+                }
+            ))
+        ));
+        assert!(completion_timeout.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+        )));
+    }
+
+    #[test]
+    fn firmware_loader_rejects_wrong_completions_and_wraps_sequence() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut wrong = FakeFirmwareLoader {
+            completion_override: Some((
+                DownloadCommand::NicPowerControl,
+                FirmwareCommandCompletion::Ack,
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut wrong,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::UnexpectedCommandCompletion {
+                    command: DownloadCommand::NicPowerControl,
+                    completion: FirmwareCommandCompletion::Ack,
+                }
+            ))
+        ));
+
+        let mut wrong_and_cleanup = FakeFirmwareLoader {
+            fail_at: Some(2),
+            completion_override: Some((
+                DownloadCommand::NicPowerControl,
+                FirmwareCommandCompletion::Ack,
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut wrong_and_cleanup,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Cleanup {
+                failure: Some(FirmwareLoaderFailure::UnexpectedCommandCompletion { .. }),
+                source: "injected transport failure",
+            })
+        ));
+
+        let mut finish_status = FakeFirmwareLoader {
+            completion_override: Some((
+                DownloadCommand::PatchFinish,
+                FirmwareCommandCompletion::PatchFinish(9),
+            )),
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut finish_status,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::UnexpectedPatchFinish(9)
+            ))
+        ));
+
+        let mut wrapped = FakeFirmwareLoader {
+            sequence: 14,
+            ..Default::default()
+        };
+        load_mt7921_firmware(
+            &mut wrapped,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped.trace[0],
+            LoaderTrace::Command(DownloadCommand::NicPowerControl, 15)
+        );
+        assert!(wrapped.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 1)
+        )));
+        assert!(!wrapped.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(_, 0)
+                | LoaderTrace::PublishScatter(_, 0, _)
+                | LoaderTrace::ScatterCompletion(_, 0, _)
+        )));
+    }
+
+    #[test]
+    fn firmware_loader_bounds_readiness_warning_and_skips_an_existing_patch() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut timeout = FakeFirmwareLoader {
+            download_states: vec![0],
+            ..Default::default()
+        };
+        let timed_out_report = load_mt7921_firmware(
+            &mut timeout,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(!timed_out_report.download_ready_observed);
+        assert_eq!(timeout.now_ms, DOWNLOAD_READY_TIMEOUT_MS + 10);
+        assert_eq!(
+            timeout
+                .trace
+                .iter()
+                .filter(|event| matches!(event, LoaderTrace::DownloadState))
+                .count(),
+            101
+        );
+        assert_eq!(
+            timeout.trace.last(),
+            Some(&LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        );
+
+        let mut existing = FakeFirmwareLoader {
+            semaphore_result: 1,
+            ..Default::default()
+        };
+        let report = load_mt7921_firmware(
+            &mut existing,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.patch, PatchDisposition::AlreadyDownloaded);
+        assert_eq!(report.patch_sections, 0);
+        assert!(!existing.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::PublishScatter(FirmwareImagePart::Patch, ..)
+        )));
+        assert_eq!(
+            existing
+                .trace
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    LoaderTrace::Command(DownloadCommand::TargetAddressLength { .. }, _)
+                ))
+                .count(),
+            2
+        );
+        assert!(!existing.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+        )));
+
+        let mut n9_timeout = FakeFirmwareLoader {
+            n9_states: vec![false],
+            ..Default::default()
+        };
+        assert!(matches!(
+            load_mt7921_firmware(
+                &mut n9_timeout,
+                Patch::parse(&patch_bytes).unwrap(),
+                Firmware::parse(&ram_bytes).unwrap(),
+            ),
+            Err(FirmwareLoaderError::Failed(
+                FirmwareLoaderFailure::N9ReadyTimeout
+            ))
+        ));
+        assert_eq!(
+            n9_timeout.trace.last(),
+            Some(&LoaderTrace::Cleanup(FirmwareLoaderState::FirmwareStarted))
+        );
+        assert_eq!(
+            n9_timeout
+                .trace
+                .iter()
+                .filter(|event| matches!(event, LoaderTrace::N9Ready))
+                .count(),
+            151
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 //! Host value-type boundary for the Zircon API.
 
-use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 use std::sync::OnceLock;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -26,6 +26,10 @@ impl MonotonicInstant {
         static EPOCH: OnceLock<StdInstant> = OnceLock::new();
         let elapsed = EPOCH.get_or_init(StdInstant::now).elapsed().as_nanos();
         Self(i64::try_from(elapsed).unwrap_or(i64::MAX))
+    }
+
+    pub fn now() -> Self {
+        Self::get()
     }
 
     pub fn after(duration: MonotonicDuration) -> Self {
@@ -164,6 +168,12 @@ impl Add for MonotonicDuration {
     }
 }
 
+impl AddAssign for MonotonicDuration {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 = self.0.saturating_add(rhs.0);
+    }
+}
+
 impl Sub for MonotonicDuration {
     type Output = Self;
 
@@ -179,6 +189,20 @@ impl Neg for MonotonicDuration {
         Self(self.0.saturating_neg())
     }
 }
+
+macro_rules! duration_mul {
+    ($($ty:ty),* $(,)?) => {$ (
+        impl Mul<$ty> for MonotonicDuration {
+            type Output = Self;
+
+            fn mul(self, rhs: $ty) -> Self::Output {
+                Self(self.0.saturating_mul(i64::from(rhs)))
+            }
+        }
+    )* };
+}
+
+duration_mul!(u8, u16, u32, i64);
 
 #[cfg(test)]
 mod tests {

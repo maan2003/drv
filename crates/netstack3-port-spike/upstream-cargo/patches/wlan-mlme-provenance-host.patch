@@ -1,0 +1,510 @@
+diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
+--- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-10 00:12:45.124556969 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-10 01:13:27.884594201 +0000
+@@ -132,6 +132,21 @@
+     bytes
+ }
+
++fn peer_beacon() -> Vec<u8> {
++    let bss = wpa3_bss();
++    let mut bytes = vec![0x80, 0, 0, 0];
++    bytes.extend_from_slice(&[0xff; 6]);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&[0, 0]);
++    bytes.extend_from_slice(&[0; 8]);
++    bytes.extend_from_slice(&bss.beacon_period.to_le_bytes());
++    bytes.extend_from_slice(&bss.capability_info.to_le_bytes());
++    bytes.extend_from_slice(&bss.ies);
++    bytes
++}
++
++
+ fn peer_assoc_success() -> Vec<u8> {
+     let mut bytes = vec![0x10, 0, 0, 0];
+     bytes.extend_from_slice(&CLIENT);
+@@ -208,7 +223,13 @@
+     async fn discovery_support(
+         &mut self,
+     ) -> Result<fidl_softmac::DiscoverySupport, zx::Status> {
+-        Ok(Default::default())
++        Ok(fidl_softmac::DiscoverySupport {
++            scan_offload: Some(fidl_softmac::ScanOffloadExtension {
++                supported: Some(true),
++                scan_cancel_supported: Some(true),
++            }),
++            ..Default::default()
++        })
+     }
+
+     async fn mac_sublayer_support(
+@@ -271,7 +292,7 @@
+         &mut self,
+         _request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
+     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
+-        Err(zx::Status::NOT_SUPPORTED)
++        Ok(fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse { scan_id: Some(7) })
+     }
+
+     async fn start_active_scan(
+@@ -367,6 +388,160 @@
+ }
+
+ #[test]
++fn observed_receive_uses_exact_constructed_scan_result_and_ordinary_sink_is_unchanged() {
++    futures::executor::block_on(async {
++        fn scan_request() -> fidl_mlme::ScanRequest {
++            fidl_mlme::ScanRequest {
++                txn_id: 91,
++                scan_type: fidl_mlme::ScanTypes::Passive,
++                channel_list: vec![channel(6)],
++                ssid_list: vec![],
++                probe_delay: 0,
++                min_channel_time: 10,
++                max_channel_time: 20,
++            }
++        }
++
++        #[derive(Debug, PartialEq)]
++        enum Captured {
++            Produced(fidl_mlme::ScanResult),
++            Ignored(wlan_mlme::ScanResultIgnore),
++            ConversionDrop,
++        }
++        struct Capture(Option<(Captured, u64)>, usize);
++        impl wlan_mlme::ScanResultObserver<u64> for Capture {
++            fn observe(
++                &mut self,
++                disposition: &wlan_mlme::ScanResultDisposition<'_>,
++                provenance: u64,
++            ) -> wlan_mlme::ScanResultObserverControl {
++                self.1 += 1;
++                let captured = match disposition {
++                    wlan_mlme::ScanResultDisposition::Produced(result) => {
++                        Captured::Produced((*result).clone())
++                    }
++                    wlan_mlme::ScanResultDisposition::Ignored(reason) => {
++                        Captured::Ignored(*reason)
++                    }
++                    wlan_mlme::ScanResultDisposition::ConversionDrop => Captured::ConversionDrop,
++                };
++                self.0 = Some((captured, provenance));
++                wlan_mlme::ScanResultObserverControl::Continue
++            }
++        }
++
++        let (device, effects) = FakeDeviceOps::new();
++        let (timer, _) = wlan_mlme::common::timer::create_timer();
++        let mut observed = ClientMlme::new(Default::default(), device, timer)
++            .await
++            .unwrap();
++        observed
++            .handle_mlme_request(MlmeRequest::Scan(scan_request()))
++            .await
++            .unwrap();
++        let mut capture = Capture(None, 0);
++        observed
++            .handle_mac_frame_rx_observed(&peer_beacon(), rx_info(), 1.into(), 44, &mut capture)
++            .await;
++        assert_eq!(capture.1, 1);
++        assert_eq!(effects.lock().unwrap().events.len(), 1);
++        let emitted = effects.lock().unwrap().events.remove(0);
++        let fidl_mlme::MlmeEvent::OnScanResult { result: emitted } = emitted else {
++            panic!("expected scan result");
++        };
++        let (Captured::Produced(captured), provenance) = capture.0.take().unwrap()
++        else {
++            panic!("expected produced disposition");
++        };
++        assert_eq!(provenance, 44);
++        assert_eq!(captured, emitted);
++        let mut malformed_advertisement = peer_beacon();
++        malformed_advertisement.truncate(36);
++        malformed_advertisement.extend_from_slice(&[3, 0]);
++        observed
++            .handle_mac_frame_rx_observed(
++                &malformed_advertisement,
++                rx_info(),
++                6.into(),
++                48,
++                &mut capture,
++            )
++            .await;
++        assert_eq!(
++            capture.0,
++            Some((Captured::ConversionDrop, 48))
++        );
++        assert_eq!(capture.1, 2);
++
++        let (device, _) = FakeDeviceOps::new();
++        let (timer, _) = wlan_mlme::common::timer::create_timer();
++        let mut ignored = ClientMlme::new(Default::default(), device, timer).await.unwrap();
++        ignored
++            .handle_mac_frame_rx_observed(&peer_beacon(), rx_info(), 3.into(), 45, &mut capture)
++            .await;
++        assert_eq!(
++            capture.0,
++            Some((
++                Captured::Ignored(wlan_mlme::ScanResultIgnore::NoOngoingScan),
++                45,
++            ))
++        );
++        assert_eq!(capture.1, 3);
++        ignored
++            .handle_mac_frame_rx_observed(&[1], rx_info(), 4.into(), 46, &mut capture)
++            .await;
++        assert_eq!(
++            capture.0,
++            Some((
++                Captured::Ignored(wlan_mlme::ScanResultIgnore::MalformedFrame),
++                46,
++            ))
++        );
++        assert_eq!(capture.1, 4);
++        ignored
++            .handle_mac_frame_rx_observed(
++                &peer_assoc_success(),
++                rx_info(),
++                5.into(),
++                47,
++                &mut capture,
++            )
++            .await;
++        assert_eq!(
++            capture.0,
++            Some((
++                Captured::Ignored(wlan_mlme::ScanResultIgnore::NonAdvertisement),
++                47,
++            ))
++        );
++        assert_eq!(capture.1, 5);
++
++        let (device, effects) = FakeDeviceOps::new();
++        let (timer, _) = wlan_mlme::common::timer::create_timer();
++        let mut ordinary = ClientMlme::new(Default::default(), device, timer)
++            .await
++            .unwrap();
++        ordinary
++            .handle_mlme_request(MlmeRequest::Scan(scan_request()))
++            .await
++            .unwrap();
++        ordinary
++            .handle_mac_frame_rx(&peer_beacon(), rx_info(), 2.into())
++            .await;
++        assert_eq!(effects.lock().unwrap().events.len(), 1);
++        let ordinary = effects.lock().unwrap().events.remove(0);
++        let fidl_mlme::MlmeEvent::OnScanResult { result: ordinary } = ordinary else {
++            panic!("expected ordinary scan result");
++        };
++        assert_eq!(ordinary.txn_id, emitted.txn_id);
++        assert_eq!(ordinary.bss, emitted.bss);
++        // The host monotonic clock is not injected/frozen here, so the two
++        // separate executions intentionally do not assert timestamp equality.
++    });
++}
++
++
++#[test]
+ fn sme_connect_drives_production_sae_tx_and_both_timer_seams() {
+     tokio::runtime::Builder::new_current_thread()
+         .enable_time()
+diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-10 00:00:55.185000000 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-10 01:09:15.084077465 +0000
+@@ -202,6 +202,49 @@
+         rx_info: fidl_softmac::WlanRxInfo,
+         async_id: trace::Id,
+     ) {
++        self.handle_mac_frame_rx_observed(bytes, rx_info, async_id, (), &mut ()).await;
++    }
++    fn handle_eth_frame_tx(
++        &mut self,
++        bytes: &[u8],
++        async_id: trace::Id,
++    ) -> Result<(), anyhow::Error> {
++        wtrace::duration!("ClientMlme::handle_eth_frame_tx");
++        match self.sta.as_mut() {
++            None => Err(Error::Status(
++                "Ethernet frame dropped (Client does not exist).".to_string(),
++                zx::Status::BAD_STATE,
++            )
++            .into()),
++            Some(sta) => sta
++                .bind(&mut self.ctx, &mut self.scanner, &mut self.channel_state)
++                .handle_eth_frame_tx(bytes, async_id)
++                .map_err(From::from),
++        }
++    }
++    async fn handle_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
++        self.scanner.bind(&mut self.ctx).handle_scan_complete(status, scan_id).await;
++    }
++    async fn handle_timeout(&mut self, event: TimedEvent) {
++        if let Some(sta) = self.sta.as_mut() {
++            let mut bound = sta.bind(&mut self.ctx, &mut self.scanner, &mut self.channel_state);
++            bound.sta.state =
++                Some(bound.sta.state.take().unwrap().on_timed_event(&mut bound, event).await);
++        }
++    }
++}
++
++impl<D: DeviceOps> ClientMlme<D> {
++    /// Run the production receive path while structurally carrying one
++    /// caller-owned value to the scanner's exact result-construction point.
++    pub async fn handle_mac_frame_rx_observed<P, O: crate::ScanResultObserver<P>>(
++        &mut self,
++        bytes: &[u8],
++        rx_info: fidl_softmac::WlanRxInfo,
++        async_id: trace::Id,
++        provenance: P,
++        observer: &mut O,
++    ) {
+         wtrace::duration!("ClientMlme::handle_mac_frame_rx");
+         // TODO(https://fxbug.dev/42120906): Send the entire frame to scanner.
+         if let Some(mgmt_frame) = mac::MgmtFrame::parse(bytes, false) {
+@@ -209,26 +252,42 @@
+             match mgmt_frame.try_into_mgmt_body().1 {
+                 Some(mac::MgmtBody::Beacon { bcn_hdr, elements }) => {
+                     wtrace::duration!("MgmtBody::Beacon");
+-                    self.scanner.bind(&mut self.ctx).handle_ap_advertisement(
++                    self.scanner.bind(&mut self.ctx).handle_ap_advertisement_observed(
+                         bssid,
+                         bcn_hdr.beacon_interval,
+                         bcn_hdr.capabilities,
+                         elements,
+                         rx_info.clone(),
++                        provenance,
++                        observer,
+                     );
+                 }
+                 Some(mac::MgmtBody::ProbeResp { probe_resp_hdr, elements }) => {
+                     wtrace::duration!("MgmtBody::ProbeResp");
+-                    self.scanner.bind(&mut self.ctx).handle_ap_advertisement(
++                    self.scanner.bind(&mut self.ctx).handle_ap_advertisement_observed(
+                         bssid,
+                         probe_resp_hdr.beacon_interval,
+                         probe_resp_hdr.capabilities,
+                         elements,
+                         rx_info.clone(),
++                        provenance,
++                        observer,
+                     )
+                 }
+-                _ => (),
++                _ => {
++                    observer.observe(
++                        &crate::ScanResultDisposition::Ignored(
++                            crate::ScanResultIgnore::NonAdvertisement,
++                        ),
++                        provenance,
++                    );
++                }
+             }
++        } else {
++            observer.observe(
++                &crate::ScanResultDisposition::Ignored(crate::ScanResultIgnore::MalformedFrame),
++                provenance,
++            );
+         }
+
+         if let Some(sta) = self.sta.as_mut() {
+@@ -258,34 +317,6 @@
+             wtrace::async_end_wlansoftmac_rx(async_id, "no bound client");
+         }
+     }
+-    fn handle_eth_frame_tx(
+-        &mut self,
+-        bytes: &[u8],
+-        async_id: trace::Id,
+-    ) -> Result<(), anyhow::Error> {
+-        wtrace::duration!("ClientMlme::handle_eth_frame_tx");
+-        match self.sta.as_mut() {
+-            None => Err(Error::Status(
+-                "Ethernet frame dropped (Client does not exist).".to_string(),
+-                zx::Status::BAD_STATE,
+-            )
+-            .into()),
+-            Some(sta) => sta
+-                .bind(&mut self.ctx, &mut self.scanner, &mut self.channel_state)
+-                .handle_eth_frame_tx(bytes, async_id)
+-                .map_err(From::from),
+-        }
+-    }
+-    async fn handle_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
+-        self.scanner.bind(&mut self.ctx).handle_scan_complete(status, scan_id).await;
+-    }
+-    async fn handle_timeout(&mut self, event: TimedEvent) {
+-        if let Some(sta) = self.sta.as_mut() {
+-            let mut bound = sta.bind(&mut self.ctx, &mut self.scanner, &mut self.channel_state);
+-            bound.sta.state =
+-                Some(bound.sta.state.take().unwrap().on_timed_event(&mut bound, event).await);
+-        }
+-    }
+ }
+
+ impl<D> ClientMlme<D> {
+diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs	2026-08-10 00:00:55.187000000 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs	2026-08-10 01:13:36.686647057 +0000
+@@ -308,12 +308,41 @@
+         ies: &[u8],
+         rx_info: fidl_softmac::WlanRxInfo,
+     ) {
++        self.handle_ap_advertisement_observed(
++            bssid,
++            beacon_interval,
++            capability_info,
++            ies,
++            rx_info,
++            (),
++            &mut (),
++        );
++    }
++
++    pub(super) fn handle_ap_advertisement_observed<P, O: crate::ScanResultObserver<P>>(
++        &mut self,
++        bssid: Bssid,
++        beacon_interval: TimeUnit,
++        capability_info: CapabilityInfo,
++        ies: &[u8],
++        rx_info: fidl_softmac::WlanRxInfo,
++        provenance: P,
++        observer: &mut O,
++    ) {
+         wtrace::duration!("BoundScanner::handle_ap_advertisement");
+
+         let mlme_txn_id = match self.scanner.ongoing_scan {
+             Some(OngoingScan::PassiveOffloadScan { mlme_txn_id, .. }) => mlme_txn_id,
+             Some(OngoingScan::ActiveOffloadScan { mlme_txn_id, .. }) => mlme_txn_id,
+-            None => return,
++            None => {
++                observer.observe(
++                    &crate::ScanResultDisposition::Ignored(
++                        crate::ScanResultIgnore::NoOngoingScan,
++                    ),
++                    provenance,
++                );
++                return;
++            }
+         };
+         let bss_description =
+             construct_bss_description(bssid, beacon_interval, capability_info, ies, rx_info);
+@@ -321,10 +350,17 @@
+             Ok(bss) => bss,
+             Err(e) => {
+                 warn!("Failed to process beacon or probe response: {}", e);
++                observer.observe(&crate::ScanResultDisposition::ConversionDrop, provenance);
+                 return;
+             }
+         };
+-        send_scan_result(mlme_txn_id, bss_description, &mut self.ctx.device);
++        send_scan_result_observed(
++            mlme_txn_id,
++            bss_description,
++            &mut self.ctx.device,
++            provenance,
++            observer,
++        );
+     }
+
+     pub async fn handle_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
+@@ -515,21 +551,36 @@
+     bss: fidl_ieee80211::BssDescription,
+     device: &mut D,
+ ) {
++    send_scan_result_observed(txn_id, bss, device, (), &mut ());
++}
++
++fn send_scan_result_observed<D: DeviceOps, P, O: crate::ScanResultObserver<P>>(
++    txn_id: u64,
++    bss: fidl_ieee80211::BssDescription,
++    device: &mut D,
++    provenance: P,
++    observer: &mut O,
++) {
+     if trace::is_enabled() {
+         let trace_bss = wlan_common::bss::BssDescription::try_from(bss.clone())
+             .map(|bss| format!("{}", bss))
+             .unwrap_or_else(|e| format!("{}", e));
+         wtrace::duration!("send_scan_result", "bss" => &*trace_bss);
+     }
+-    device
+-        .send_mlme_event(fidl_mlme::MlmeEvent::OnScanResult {
+-            result: fidl_mlme::ScanResult {
+-                txn_id,
+-                timestamp_nanos: zx::MonotonicInstant::get().into_nanos(),
+-                bss,
+-            },
+-        })
+-        .unwrap_or_else(|e| error!("error sending MLME ScanResult: {}", e));
++    let result = fidl_mlme::ScanResult {
++        txn_id,
++        timestamp_nanos: zx::MonotonicInstant::get().into_nanos(),
++        bss,
++    };
++    if observer.observe(&crate::ScanResultDisposition::Produced(&result), provenance)
++        == crate::ScanResultObserverControl::Suppress
++    {
++        return;
++    }
++    if let Err(e) = device.send_mlme_event(fidl_mlme::MlmeEvent::OnScanResult { result }) {
++        observer.observe_transport_failure();
++        error!("error sending MLME ScanResult: {}", e);
++    }
+ }
+
+ #[cfg(test)]
+diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wlan/lib/mlme/rust/src/lib.rs
+--- a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs	2026-08-10 00:12:45.128652013 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/lib.rs	2026-08-10 01:13:36.685647051 +0000
+@@ -106,6 +106,51 @@
+     fn handle_timeout(&mut self, event: Self::TimerEvent) -> impl Future<Output = ()>;
+ }
+
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ScanResultIgnore {
++    MalformedFrame,
++    NonAdvertisement,
++    NoOngoingScan,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ScanResultDisposition<'a> {
++    Produced(&'a fidl_fuchsia_wlan_mlme::ScanResult),
++    Ignored(ScanResultIgnore),
++    ConversionDrop,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ScanResultObserverControl {
++    Continue,
++    Suppress,
++}
++
++/// In-process observation seam for the immutable terminal disposition produced
++/// by the client scanner. `P` is consumed structurally exactly once;
++/// implementing this trait does not confer any provenance or trust. A rejected
++/// produced result suppresses the ordinary MLME event. Transport failure is a
++/// later notification because the accepted observer already owns `P`.
++pub trait ScanResultObserver<P> {
++    fn observe(
++        &mut self,
++        disposition: &ScanResultDisposition<'_>,
++        provenance: P,
++    ) -> ScanResultObserverControl;
++
++    fn observe_transport_failure(&mut self) {}
++}
++
++impl<P> ScanResultObserver<P> for () {
++    fn observe(
++        &mut self,
++        _disposition: &ScanResultDisposition<'_>,
++        _provenance: P,
++    ) -> ScanResultObserverControl {
++        ScanResultObserverControl::Continue
++    }
++}
++
+ pub struct MinstrelTimer {
+     timer: wlan_common::timer::Timer<()>,
+     current_timer: Option<common::timer::EventHandle>,

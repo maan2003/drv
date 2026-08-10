@@ -53,12 +53,25 @@ explicitly marked; the initial majority is `unmapped`.
 | `mt792x_dma_enable` ring/IRQ ordering subset | `mt792x_dma.c` | `prepare_global_{tx,rx}_rings`, active boot-ROM adapter | adapted | 44 unit tests; physical RX0 MSI/three-response trace |
 | `mt76_queue` TX descriptor fields | `mt76.h`, `dma.c` | `TxRingState`, `DmaDescriptor` | adapted, tested | unit fixtures/readback traces |
 | `mt76_connac2_mcu_fill_message` download subset | `mt76_connac_mcu.c` | `encode_download_command` | adapted, tested | pinned-format fixtures |
+| `mt76_connac2_get_data_mode` | `mt76_connac_mcu.c` | `patch_download_mode` | adapted, tested | plain/AES/scramble/unsupported fixtures; unsupported encryption fails closed |
+| `mt76_connac_mcu_gen_dl_mode` | `mt76_connac_mcu.h` | `firmware_download_mode` | adapted, tested | RAM feature-bit fixtures; not wired to active DMA |
+| `mt76_connac_mcu_start_patch` request | `mt76_connac_mcu.c` | `DownloadCommand::PatchFinish` | adapted, tested | pinned-format fixture; not wired to active DMA |
+| `mt76_connac_mcu_start_firmware` request | `mt76_connac_mcu.c` | `DownloadCommand::FirmwareStart` | adapted, tested | pinned-format fixture; not wired to active DMA |
+| `mt792x_load_firmware`, connac2 patch/RAM loaders | `mt792x_core.c`, `mt76_connac_mcu.c` | `load_mt7921_firmware`, `FirmwareLoaderTransport`, `VfioFirmwareLoader` | MT7961 installed-artifact subset, tested | golden transaction trace, bounded polls/completions, per-operation failure injection, reset-while-pinned VFIO adapter |
+| `mt7921_mcu_get_nic_capability` | `mt7921/mcu.c`, `mt76_connac_mcu.h` | `DownloadCommand::GetNicCapability`, `parse_nic_capability` | adapted, tested | source-exact command fixture; bounded known/unknown TLV fixtures; no radio mutation |
+| `mt7921_mcu_read_eeprom`, pre-`SET_CLC` `mt7921_load_clc` | `mt7921/mcu.c`, `mcu.h`, `mt7921.h` | `DownloadCommand::ReadEepromBlock`, `parse_eeprom_block`, `discover_clc` | adapted, tested | exact EFUSE query fixture; bounded response/CLC fixtures; mutating CLC application excluded |
+| `__mt7921_mcu_set_clc` request/response format | `mt7921/mcu.c`, `pci_mcu.c`, `pci.c`, `mt792x_acpi_sar.c`, `mt792x_acpi_sar.h`, `mcu.h`, `mt76_connac_mcu.h` | `world_clc_commands`, `ClcSetCommand::expects_response`, `encode_clc_set_command`, `parse_clc_set_response`, dual-ring loader transport | adapted, tested | installed-artifact rule fixture; `wait_resp` follows cap bit 0 and no-response success advances; TX ring 17/Q0 plus simultaneous WM ring 0/bit 0 and WM2 ring 4/bit 22 ownership, ack, drain, wrap, correlation, timeout and failure cleanup fixtures; physical pending |
+| `mt76_channels_{2,5,6}ghz`, band gates | `mac80211.c`, `mt7921/mcu.c` | `candidate_channels`, `CandidateChannelSummary` | adapted, tested | exact physical channel universe fixture; explicitly not regulatory-valid |
 | connac2 patch header/sections | `mt76_connac_mcu.h` | `Patch` parser | adapted, tested | malformed/bounded fixtures |
 | `mt792x_wfsys_reset` | `mt7921/pci.c` | `reset_wfsys`, dynamic-L1 adapter | adapted, tested | ordering/timeout tests; physical ready at 57 ms |
 | driver ownership transitions | `mt7921/pci_mac.c`, connac registers | ownership state machines | adapted, tested | transition/error tests; physical first-attempt CLR_OWN response |
 | PCI interrupt disable (`pci_intx(pdev, 0)`) | Linux PCI core call site | `disable_pci_intx` | adapted, tested | command-bit readback; physical run |
 | kernel DMA allocation/mapping | mt76 DMA/core | `DmaArena` | adapted | iommufd pin/unmap tests; incomplete call graph |
 | IRQ lifecycle/eventfd | mt76 PCI/IRQ paths | `IrqLifecycle`, `VfioIrq` | adapted, tested | state/UAPI tests; physical source-masked MSI RX0 trace |
+| Connac2 PCI management TXWI/TXP and DMA publish shape | `mt7921/pci_mac.c::mt7921e_tx_prepare_skb`, `mt792x_core.c::mt792x_tx`, `mt7921/main.c`, `mt76_connac_mac.c::{mt76_connac2_mac_write_txwi,mt76_connac_write_hw_txp}`, `dma.c` | `encode_mt7921_5ghz_auth_tx` | exact format subset, tested; physical blocked by `NO_IR` | Golden word-level SAE-auth fixture; pre-association first-vif WCID 19; frame/IOVA/token/PID/20-entry-WTBL bounds |
+| Management TX completion | `mt7921/mac.c::{mt7921_mac_tx_free,mt7921_mac_add_txs}`, `mt76_connac2_mac.h` | `parse_mt7921_{tx_free,tx_status}` | exact one-MSDU subset, tested; physical blocked by `NO_IR` | TXRX_NOTIFY packet type 6, RXD byte-count bounds, token/PID/WCID/ACK fixtures; paired/batched/out-of-WTBL completions fail closed |
+| Connac2 rate/SAR power initialization | `mt7921/main.c::mt7921_set_tx_sar_pwr`, `mt76_connac_mcu.c::{mt76_connac_mcu_set_rate_txpower,mt76_connac_mcu_rate_txpower_band,mt76_connac_mcu_build_sku,mt76_connac_mcu_reg_rr}`, `mt7921/mcu.c::mt7921_mcu_parse_response`, `mt76_connac_mcu.h` | `encode_conservative_rate_tx_power_commands`, `encode_pse_reg_read_command`, `RateTxPowerAuthorizer` | adapted conservative uniform-rate subset, tested; temporary VFIO setup pending | Source channel lists/eight-channel batches/161-entry SKU and globally sequenced CE commands; each SET DMA consumption is followed by CE_QUERY(REG_READ) of `MT_PSE_BASE`, whose legacy response is `MCU_EVENT_REG_ACCESS` (`0x05`, distinct from `MCU_EVENT_ACCESS_REG`); world regulatory and SAR bounds plus a project-owned cap are mandatory, while CLC remains separate opaque firmware policy |
+| Connac2 authentication RX metadata strip | `mt7921/mac.c::mt7921_mac_fill_rx`, `mt76_connac2_mac.h` | `parse_mt7921_auth_rx` | adapted, tested; SAE interpretation excluded | Raw SAE fields delivered unchanged after RX error/header-format validation |
 
 This table is not yet exhaustive. The next inventory pass must list every
 function, struct/union/enum, macro/constant, and global in every scoped file,
@@ -84,5 +97,6 @@ gate is **closed**.
    patch-semaphore commands, conditionally releases the semaphore, and disables
    both DMA directions before reset-while-pinned. The physical trace drained
    NIC-power event 3, received patch GET result 2, and received release result
-   3 before a healthy kernel/iwd/network restore. NIC capability remains
-   blocked on full firmware/N9 startup.
+   3 before a healthy kernel/iwd/network restore. Full firmware loading now
+   reaches N9, switches normal responses to WM2 ring 4, and parses the read-only
+   NIC capability response before reset-while-pinned and healthy restoration.

@@ -1,4 +1,6 @@
-use mt7921_port_spike::{Firmware, Patch};
+use mt7921_port_spike::{
+    EepromHardwareInfo, Firmware, Patch, encode_clc_set_command, world_clc_commands,
+};
 use std::process::Command;
 
 const PATCH_PATH: &str =
@@ -66,6 +68,32 @@ fn run() -> Result<(), String> {
         clc,
         ram.trailer.crc,
     );
+    let rules = world_clc_commands(
+        ram,
+        EepromHardwareInfo {
+            // Exact no-plastic EFUSE response: valid=0 and zero data.
+            raw_type: 0,
+            encapsulated_calibration: false,
+        },
+        19,
+    )
+    .map_err(|error| format!("CLC rule fixture: {error:?}"))?;
+    for (rule, command) in rules.iter().enumerate() {
+        let encoded = encode_clc_set_command(command, 1)
+            .map_err(|error| format!("CLC command fixture: {error:?}"))?;
+        println!(
+            "{{\"clc_rule\":{},\"segment_index\":{},\"alpha2\":\"{}\",\"type_hex\":\"{:02x}{:02x}\",\"rule_data_bytes\":{},\"request_bytes\":{},\"cap\":{},\"wait_resp\":{},\"tx_queue\":\"MT_MCUQ_WM/ring17\",\"txd_q_idx\":\"MT_TX_MCU_PORT_RX_Q0/0x20\",\"rx_queues\":[\"WM/ring0\",\"WM2/ring4\"],\"rx_irq_bits\":[0,22]}}",
+            rule,
+            command.index,
+            text(&command.alpha2),
+            command.rule_type[0],
+            command.rule_type[1],
+            command.data.len(),
+            encoded.len(),
+            command.capability,
+            command.expects_response(),
+        );
+    }
     Ok(())
 }
 

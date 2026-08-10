@@ -1,0 +1,20 @@
+[package]
+name = "fuchsia-softmac-port"
+workspace = "../../../network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-common = { path = "../../../../../sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-mlme = { path = "../../../../../sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-softmac = { path = "../../../../../sdk/fidl/fuchsia.wlan.softmac" }
+ieee80211.workspace = true
+wlan-common = { path = "../common/rust" }
+wlan_frame_writer.workspace = true
+wlan_rsn.workspace = true
+
+[dev-dependencies]
+assert_matches.workspace = true

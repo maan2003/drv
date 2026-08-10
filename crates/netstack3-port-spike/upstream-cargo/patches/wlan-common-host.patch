@@ -1,13 +1,27 @@
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/error.rs b/src/connectivity/wlan/lib/common/rust/src/error.rs
 --- a/src/connectivity/wlan/lib/common/rust/src/error.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/error.rs
 @@ -22,6 +22,7 @@
      }
  }
- 
+
 +#[cfg(target_os = "fuchsia")]
  impl From<zx::Status> for FrameWriteError {
      fn from(status: zx::Status) -> Self {
          FrameWriteError::BadWrite(status.to_string())
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/lib.rs b/src/connectivity/wlan/lib/common/rust/src/lib.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/lib.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/lib.rs
+@@ -25,7 +25,7 @@
+ pub mod sequestered;
+ pub mod sink;
+ pub mod stats;
+-#[cfg(target_os = "fuchsia")]
++#[cfg(any(target_os = "fuchsia", feature = "host_test_utils"))]
+ pub mod test_utils;
+ pub mod tim;
+ pub mod time;
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/scan.rs b/src/connectivity/wlan/lib/common/rust/src/scan.rs
 --- a/src/connectivity/wlan/lib/common/rust/src/scan.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/scan.rs
 @@ -322,7 +322,6 @@
@@ -45,8 +59,7 @@
          })
      }
  }
--
-+
+
 +/// VMO persistence is a Fuchsia transport operation and is unavailable on the host.
 +#[cfg(not(target_os = "fuchsia"))]
 +pub fn write_vmo(_results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
@@ -56,41 +69,19 @@
  /// Creates a VMO containing FIDL-encoded scan results.
  #[cfg(target_os = "fuchsia")]
  pub fn write_vmo(results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
---- a/src/connectivity/wlan/lib/common/rust/src/lib.rs
-+++ b/src/connectivity/wlan/lib/common/rust/src/lib.rs
-@@ -25,7 +25,7 @@
- pub mod sequestered;
- pub mod sink;
- pub mod stats;
--#[cfg(target_os = "fuchsia")]
-+#[cfg(any(target_os = "fuchsia", feature = "host_test_utils"))]
- pub mod test_utils;
- pub mod tim;
- pub mod time;
---- a/src/connectivity/wlan/lib/common/rust/src/time.rs
-+++ b/src/connectivity/wlan/lib/common/rust/src/time.rs
-@@ -26,9 +26,7 @@
-     Hash,
- )]
- pub struct TimeUnit(pub u16);
- 
--#[cfg(target_os = "fuchsia")]
--#[cfg(target_os = "fuchsia")]
- impl From<TimeUnit> for zx::MonotonicDuration {
-     fn from(tu: TimeUnit) -> zx::MonotonicDuration {
-         zx::MonotonicDuration::from_micros(tu.into_micros())
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs b/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
 --- a/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
 +++ b/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
 @@ -3,16 +3,23 @@
  // found in the LICENSE file.
- 
+
  use crate::append::{Append, BufferTooSmall, TrackedAppend, VecCursor};
 +#[cfg(target_os = "fuchsia")]
  use fuchsia_async::{DurationExt, OnTimeout, TimeoutExt};
- 
+
 +#[cfg(target_os = "fuchsia")]
  use futures::Future;
- 
+
 +#[cfg(target_os = "fuchsia")]
  pub mod fake_capabilities;
 +#[cfg(target_os = "fuchsia")]
@@ -99,7 +90,7 @@
  pub mod fake_frames;
 +#[cfg(target_os = "fuchsia")]
  pub mod fake_stas;
- 
+
  /// A trait which allows to expect a future to terminate within a given time or panic otherwise.
 +#[cfg(target_os = "fuchsia")]
  pub trait ExpectWithin: Future + Sized {
@@ -108,8 +99,20 @@
 @@ -24,6 +31,7 @@
      }
  }
- 
+
 +#[cfg(target_os = "fuchsia")]
  impl<F: Future + Sized> ExpectWithin for F {}
- 
+
  pub struct FixedSizedTestBuffer(VecCursor);
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/time.rs b/src/connectivity/wlan/lib/common/rust/src/time.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/time.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/time.rs
+@@ -27,8 +27,6 @@
+ )]
+ pub struct TimeUnit(pub u16);
+
+-#[cfg(target_os = "fuchsia")]
+-#[cfg(target_os = "fuchsia")]
+ impl From<TimeUnit> for zx::MonotonicDuration {
+     fn from(tu: TimeUnit) -> zx::MonotonicDuration {
+         zx::MonotonicDuration::from_micros(tu.into_micros())

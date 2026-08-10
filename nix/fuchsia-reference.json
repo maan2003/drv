@@ -1,6 +1,6 @@
 {
   "commit": "1e1219e3fac944c9a906aea9646939746b6062b3",
-  "closure": "netstack3-port-v2-wlan-fidl-ext-1",
+  "closure": "netstack3-port-v2-wlan-mlme-1",
   "paths": [
     "src/connectivity/bluetooth",
     "src/connectivity/network/netstack3",
@@ -11,11 +11,13 @@
     "src/connectivity/wlan",
     "src/lib/mundane",
     "src/lib/fuchsia-sync",
+    "src/lib/fuchsia-async",
     "src/lib/trace/rust",
     "src/lib/fidl/rust/fidl",
     "sdk/rust/zx-types",
     "sdk/rust/zx-status",
     "sdk/rust/zx",
+    "sdk/lib/driver/runtime/rust",
     "src/connectivity/lib/net-types",
     "src/connectivity/lib/net-declare",
     "src/connectivity/lib/internet-checksum",
