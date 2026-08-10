@@ -1288,3 +1288,63 @@ unchanged. Final health was mt7921e in D0, iwd active, `wlan9` associated and
 routed, and the gateway reachable. All 69 locked release-workspace tests and
 the locked release build passed with existing upstream warnings; the
 standalone default-feature and rustfmt limitations remain unchanged.
+
+#### Slow-recovery postmortem
+
+Read-only correlation of the durable timeline, its kernel/iwd message capture,
+and the current boot journal shows that the 102.44-second recovery was not a
+100-second PCI reprobe or firmware-load stall. VFIO reset ran from
+`16:35:12.175833` to `16:35:12.279883`; mt7921e logged the ASIC at
+`16:35:12.530882`, HW/SW firmware at `16:35:12.604854`, and WM firmware at
+`16:35:12.615831`. iwd restarted at `16:35:12.636789`, discovered `phy9` at
+`16:35:13.437626`, observed an initial `wlan0` with ifindex 22 at
+`16:35:13.465911`, and observed the final `wlan9` station with ifindex 23 at
+`16:35:14.016900`. The timeline's sample 1 saw `wlan9` scanning and
+disconnected at `16:35:14.689386`. Thus an enumerated station interface existed
+about 1.37 seconds after restore; enumeration/recreation and the final name did
+not account for the long outage.
+
+iwd selected `ph1` at `16:35:31.145126`. The AP first returned authentication
+status 77, after which authentication succeeded at `16:35:31.235827`; all
+eight earlier captured recoveries also contain the same status-77 exchange and
+then recovered quickly, so that exchange is not unique to this incident. The
+kernel sent three association requests but received no association response,
+timed out at `16:35:31.551933`, and iwd recorded `association-timeout`,
+`CMD_ASSOCIATE (-2)`, and `connect-failed` before returning to
+`autoconnect_full`. iwd did not select the AP again until
+`16:36:52.017412`, an 80.44-second retry interval. That second attempt received
+a successful association response at `16:36:52.079221`, associated at
+`16:36:52.089881`, and reached iwd `connected` at `16:36:53.209008`. The
+proximate cause of the long recovery was therefore one missing association
+response followed by iwd's retry/backoff interval. The logs cannot determine
+whether that missing response was an AP, RF, driver receive, or protocol
+transient, and do not justify attributing it to the restored interrupt latch.
+
+There was no rfkill event; the radio is currently neither soft nor hard
+blocked. Every sampler iteration reported mt7921e attached, PCI D0, and runtime
+active, with no PCI/AER or firmware error. The `page_pool_release_retry`
+warning at `16:36:12.488911` concerns a retiring pool from the removed
+interface, not delayed reprobe: similar warnings occurred after earlier fast
+recoveries, and this run's new interface was already scanning before the
+warning and later associated without another reprobe. It remains a teardown
+diagnostic worth retaining, but is not evidence for the 80-second wait.
+
+Sample 0 at `16:35:12.656384` was diagnostically premature: its fields only
+proved the driver symlink, D0/runtime-active PCI state, and an active iwd
+process. It printed no WLAN interface, and iwd did not discover the wiphy for
+another 0.78 seconds. This does not weaken the watchdog completion guard,
+which also required carrier, IPv4, default route, and gateway connectivity,
+but sample 0 must be described only as lower-layer/service presence rather
+than usable Wi-Fi health.
+
+No further mutation gate should use this recovery as a routine baseline. The
+smallest next diagnostic is one supervised recovery-only control using the
+same detach/VFIO/restore path with a payload that performs no device access,
+while retaining the current journal capture. Before that control, the
+procedural progression guard should classify any association timeout,
+`connect-failed`, or restore-to-connectivity interval over 60 seconds as an
+anomalous recovery that blocks the next gate even if the 120-second watchdog
+eventually disarms. The sampler should also record explicit wiphy/interface
+readiness separately from its PCI/iwd-process fields. Do not extend the
+watchdog merely to make this run appear routine; first determine whether the
+failure repeats in the zero-access control.
