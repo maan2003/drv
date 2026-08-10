@@ -1,0 +1,8 @@
+[package]
+name = "drv-audio-pipewire-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pipewire-native-spa = "=0.1.4"
