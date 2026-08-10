@@ -47,11 +47,12 @@ use mt7921_port_spike::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
-    ConservativePowerLimits, PassiveMacMmioOperation, PassiveMcuCommand, RateTxPowerAuthorizer,
-    RateTxPowerTransport, candidate_channels, encode_pse_reg_read_command,
-    load_mt7921_firmware_with_passive_boundary, parse_passive_advertisement,
-    parse_passive_scan_done, parse_pse_reg_read_response, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, validate_passive_mac_bar_read,
+    ConservativePowerLimits, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
+    RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels, encode_pse_reg_read_command,
+    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
+    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
+    validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -3441,68 +3442,127 @@ fn run() -> Result<(), String> {
                                     })?;
                                     credential.0.fill(0);
                                     std::sync::atomic::compiler_fence(Ordering::SeqCst);
-                                    let frames = handshake
-                                        .start()
+                                    let mut updates = handshake.start().map_err(|_| {
+                                        "start pinned SAE supplicant failed".to_string()
+                                    })?;
+                                    let peer = power_target.as_ref().unwrap().0;
+                                    let auth_deadline =
+                                        Instant::now() + std::time::Duration::from_secs(5);
+                                    let mut sequence_control = 0u16;
+                                    loop {
+                                        if updates.iter().any(|update| {
+                                            matches!(update, SaeHandshakeUpdate::Rejected)
+                                        }) {
+                                            return Err(
+                                                "pinned SAE supplicant rejected peer exchange"
+                                                    .into(),
+                                            );
+                                        }
+                                        if updates.iter().any(|update| {
+                                            matches!(update, SaeHandshakeUpdate::Authenticated)
+                                        }) {
+                                            record_sae_stage(
+                                                "sae_authenticated pmk_derived=true pmkid_state=not_exported association=false key_install=false data=false",
+                                            );
+                                            return Ok(());
+                                        }
+                                        let frames = updates
+                                            .into_iter()
+                                            .filter_map(|update| match update {
+                                                SaeHandshakeUpdate::TxFrame(frame) => Some(frame),
+                                                _ => None,
+                                            })
+                                            .collect::<Vec<_>>();
+                                        if frames.len() != 1 {
+                                            return Err(
+                                                "pinned SAE step did not produce exactly one frame"
+                                                    .into(),
+                                            );
+                                        }
+                                        let sae_sequence = frames[0].seq_num;
+                                        let frame = build_sae_auth_frame(
+                                            client.into(),
+                                            peer.into(),
+                                            sequence_control,
+                                            &frames[0],
+                                        )
                                         .map_err(|_| {
-                                            "start pinned SAE supplicant failed".to_string()
-                                        })?
-                                        .into_iter()
-                                        .filter_map(|u| match u {
-                                            SaeHandshakeUpdate::TxFrame(f) => Some(f),
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if frames.len() != 1 {
-                                        return Err(
-                                            "pinned SAE startup did not produce exactly one frame"
-                                                .into(),
-                                        );
-                                    }
-                                    let frame = build_sae_auth_frame(
-                                        client.into(),
-                                        power_target.as_ref().unwrap().0.into(),
-                                        0,
-                                        &frames[0],
-                                    )
-                                    .map_err(|_| {
-                                        "build pinned SAE authentication frame failed".to_string()
-                                    })?;
-                                    DeviceOps::send_wlan_frame(
-                                        &mut device,
-                                        frame.into(),
-                                        fidl_softmac::WlanTxInfoFlags::empty(),
-                                        None,
-                                    )
-                                    .map_err(|status| {
-                                        format!("DeviceOps SAE TX rejected: {status}")
-                                    })?;
-                                    let frame = shared
-                                        .lock()
-                                        .unwrap()
-                                        .frame
-                                        .take()
-                                        .ok_or("DeviceOps did not retain SAE frame")?;
-                                    runner.with_physical(|adapter| {
-                                        adapter.with_transport_mut(|transport| {
-                                            let mechanics = transport.mechanics_mut();
-                                            let ring = mgmt_tx_ring
-                                                .as_deref_mut()
-                                                .ok_or("SAE TX ring arena missing")?;
-                                            println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
-                                            mechanics.transmit_one_sae_auth(
-                                                ring,
-                                                mgmt_txwi
-                                                    .as_deref_mut()
-                                                    .ok_or("SAE TXWI arena missing")?,
-                                                mgmt_frame
-                                                    .as_deref_mut()
-                                                    .ok_or("SAE frame arena missing")?,
-                                                &frame,
+                                            "build pinned SAE authentication frame failed"
+                                                .to_string()
+                                        })?;
+                                        sequence_control = sequence_control.wrapping_add(0x10);
+                                        DeviceOps::send_wlan_frame(
+                                            &mut device,
+                                            frame.into(),
+                                            fidl_softmac::WlanTxInfoFlags::empty(),
+                                            None,
+                                        )
+                                        .map_err(
+                                            |status| format!("DeviceOps SAE TX rejected: {status}"),
+                                        )?;
+                                        let frame = shared
+                                            .lock()
+                                            .unwrap()
+                                            .frame
+                                            .take()
+                                            .ok_or("DeviceOps did not retain SAE frame")?;
+                                        runner.with_physical(|adapter| {
+                                            adapter.with_transport_mut(|transport| {
+                                                let mechanics = transport.mechanics_mut();
+                                                println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
+                                                mechanics.transmit_one_sae_auth(
+                                                    mgmt_tx_ring
+                                                        .as_deref_mut()
+                                                        .ok_or("SAE TX ring arena missing")?,
+                                                    mgmt_txwi
+                                                        .as_deref_mut()
+                                                        .ok_or("SAE TXWI arena missing")?,
+                                                    mgmt_frame
+                                                        .as_deref_mut()
+                                                        .ok_or("SAE frame arena missing")?,
+                                                    &frame,
+                                                )
+                                            })
+                                        })?;
+                                        record_sae_stage(match sae_sequence {
+                                            1 => "sae_commit_tx_acked",
+                                            2 => "sae_confirm_tx_acked",
+                                            _ => "sae_protocol_tx_acked",
+                                        });
+                                        let received = runner.with_physical(|adapter| {
+                                            adapter.with_transport_mut(|transport| {
+                                                transport.mechanics_mut().receive_one_sae_auth(
+                                                    client,
+                                                    peer,
+                                                    auth_deadline,
+                                                )
+                                            })
+                                        })?;
+                                        record_sae_stage(match received.sequence {
+                                            1 => "sae_peer_commit_rx",
+                                            2 => "sae_peer_confirm_rx",
+                                            _ => "sae_peer_protocol_rx",
+                                        });
+                                        updates = handshake
+                                            .on_frame_rx(
+                                                received.receiver.into(),
+                                                received.transmitter.into(),
+                                                received.bssid.into(),
+                                                received.algorithm,
+                                                received.sequence,
+                                                received.status,
+                                                received.fields,
                                             )
-                                        })
-                                    })?;
-                                    println!(r#"{{"sae_auth_event":"one_management_mpdu_acked"}}"#);
-                                    return Ok(());
+                                            .map_err(|_| {
+                                                "pinned SAE supplicant rejected received frame"
+                                                    .to_string()
+                                            })?;
+                                        if Instant::now() >= auth_deadline {
+                                            return Err(
+                                                "bounded SAE authentication timed out".into()
+                                            );
+                                        }
+                                    }
                                 }
                                 let transport = adapter.into_transport();
                                 let mut mechanics = transport.into_mechanics();
@@ -3515,6 +3575,7 @@ fn run() -> Result<(), String> {
                                     &mut mechanics.data,
                                     &mut mechanics.loader.mcu.descriptor_provenance,
                                     &mut mechanics.tx_completions,
+                                    None,
                                 )?;
                                 mechanics.loader.mcu.extra_irq_mask = 0;
                                 mechanics.loader.mcu.wfdma.write_active_wfdma(
@@ -6882,6 +6943,7 @@ fn drain_data_rx_queue(
     queue: &mut ActiveMcuRx<'_>,
     provenance: &mut DescriptorProvenance,
     completions: &mut Vec<MgmtTxCompletion>,
+    mut normal_rx_frames: Option<&mut Vec<PrivateRawFrameCarrier>>,
 ) -> Result<Vec<PrivateRawAdvertisementCarrier>, String> {
     let mut advertisements = Vec::new();
     let result = (|| -> Result<(), String> {
@@ -6953,6 +7015,22 @@ fn drain_data_rx_queue(
                                 }
                             },
                         )),
+                        Err(PassiveRxError::UnsupportedFrame) if normal_rx_frames.is_some() => {
+                            let frame = match provenance.seal_frame(
+                                DescriptorOccurrenceRoute::DataRx,
+                                queue.rx_ring_index,
+                                completed_index,
+                                bytes,
+                            )? {
+                                PrivateFrameSeal::Carried(frame) => frame,
+                                PrivateFrameSeal::Uncovered(bytes) => PrivateRawFrameCarrier {
+                                    bytes,
+                                    occurrence: None,
+                                },
+                            };
+                            normal_rx_frames.as_deref_mut().unwrap().push(frame);
+                            Ok(None)
+                        }
                         Err(error) => {
                             provenance.consume_without_mint(
                                 DescriptorOccurrenceRoute::DataRx,
@@ -7040,6 +7118,17 @@ impl MgmtTxCompletionState {
             Err("SAE authentication MPDU was not acknowledged".into())
         })
     }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct ReceivedSaeAuth {
+    receiver: [u8; 6],
+    transmitter: [u8; 6],
+    bssid: [u8; 6],
+    algorithm: u16,
+    sequence: u16,
+    status: fidl_ieee80211::StatusCode,
+    fields: Vec<u8>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -7260,6 +7349,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     &mut self.data,
                     &mut self.loader.mcu.descriptor_provenance,
                     &mut self.tx_completions,
+                    Some(&mut self.loader.mcu.normal_rx_frames),
                 )?;
                 for completion in self.tx_completions.drain(..) {
                     completion_state.observe(completion)?;
@@ -7294,6 +7384,69 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         }
         txwi_reset.map_err(|error| format!("REBOOT REQUIRED: TXWI reclaim failed: {error}"))?;
         frame_reset.map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))
+    }
+
+    fn receive_one_sae_auth(
+        &mut self,
+        client: [u8; 6],
+        peer: [u8; 6],
+        deadline: Instant,
+    ) -> Result<ReceivedSaeAuth, String> {
+        loop {
+            self.loader.mcu.cancelled()?;
+            self.loader.mcu.handle_irq(None)?;
+            let _ = drain_data_rx_queue(
+                self.loader.mcu.wfdma,
+                &mut self.data,
+                &mut self.loader.mcu.descriptor_provenance,
+                &mut self.tx_completions,
+                Some(&mut self.loader.mcu.normal_rx_frames),
+            )?;
+            let frames = std::mem::take(&mut self.loader.mcu.normal_rx_frames);
+            for frame in &frames {
+                if let Some(occurrence) = frame.occurrence.as_ref() {
+                    self.loader.mcu.descriptor_provenance.retire(occurrence);
+                }
+            }
+            for frame in frames {
+                let parsed = parse_connac2_rx_frame(&frame.bytes)
+                    .map_err(|error| format!("parse SAE Connac2 RX envelope: {error:?}"))?;
+                let bytes = parsed.bytes;
+                let Some(auth) = bytes.get(..30) else {
+                    return Err("truncated SAE authentication frame".into());
+                };
+                let frame_control = u16::from_le_bytes([auth[0], auth[1]]);
+                let receiver: [u8; 6] = auth[4..10].try_into().expect("fixed field");
+                let transmitter: [u8; 6] = auth[10..16].try_into().expect("fixed field");
+                let bssid: [u8; 6] = auth[16..22].try_into().expect("fixed field");
+                if frame_control & 0x00fc != 0x00b0
+                    || receiver != client
+                    || transmitter != peer
+                    || bssid != peer
+                {
+                    continue;
+                }
+                let algorithm = u16::from_le_bytes([auth[24], auth[25]]);
+                let sequence = u16::from_le_bytes([auth[26], auth[27]]);
+                let status_raw = u16::from_le_bytes([auth[28], auth[29]]);
+                let fields = bytes[30..].to_vec();
+                let status = fidl_ieee80211::StatusCode::from_primitive(status_raw)
+                    .ok_or_else(|| format!("unknown SAE status code {status_raw}"))?;
+                return Ok(ReceivedSaeAuth {
+                    receiver,
+                    transmitter,
+                    bssid,
+                    algorithm,
+                    sequence,
+                    status,
+                    fields,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err("bounded SAE peer response timed out".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -7408,6 +7561,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 &mut self.data,
                 &mut self.loader.mcu.descriptor_provenance,
                 &mut self.tx_completions,
+                None,
             )
             .map_err(PhysicalPassiveError)?,
         );
@@ -9760,6 +9914,40 @@ mod tests {
     }
 
     #[test]
+    fn bounded_sae_exchange_reuses_pinned_state_and_stops_before_association() {
+        let source = include_str!("vfio_read.rs");
+        let exchange = source
+            .split("if operation == Operation::RunOneShotSaeAuth {")
+            .find(|segment| segment.contains("SaeHandshake::new"))
+            .unwrap()
+            .split("let transport = adapter.into_transport();")
+            .next()
+            .unwrap();
+        for required in [
+            "SaeHandshake::new",
+            "credential.0.fill(0)",
+            ".start()",
+            "transmit_one_sae_auth",
+            "receive_one_sae_auth",
+            ".on_frame_rx",
+            "sae_commit_tx_acked",
+            "sae_peer_commit_rx",
+            "sae_confirm_tx_acked",
+            "sae_peer_confirm_rx",
+            "pmk_derived=true",
+            "association=false",
+            "key_install=false",
+            "data=false",
+        ] {
+            assert!(exchange.contains(required), "{required}");
+        }
+        assert!(exchange.contains("Duration::from_secs(5)"));
+        assert!(!exchange.contains("install_key("));
+        assert!(!exchange.contains("notify_association_complete("));
+        assert!(!exchange.contains("set_link_up("));
+    }
+
+    #[test]
     fn firmware_bootstrap_boundary_and_cleanup_source_shape() {
         let source = include_str!("vfio_read.rs");
         let dispatch = source
@@ -10971,10 +11159,11 @@ mod tests {
         };
         let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
-        let error = match drain_data_rx_queue(&page, &mut queue, &mut provenance, &mut Vec::new()) {
-            Ok(_) => panic!("later invalid descriptor unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        let error =
+            match drain_data_rx_queue(&page, &mut queue, &mut provenance, &mut Vec::new(), None) {
+                Ok(_) => panic!("later invalid descriptor unexpectedly succeeded"),
+                Err(error) => error,
+            };
         assert!(error.contains("invalid data RX descriptor length"));
         assert!(!lease.current.load(Ordering::Acquire));
         assert!(provenance.sealed.is_empty());
