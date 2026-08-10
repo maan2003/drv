@@ -3453,6 +3453,10 @@ fn run() -> Result<(), String> {
                                     let effects = LiveClientEffects {
                                         state: shared.clone(),
                                         target: power_target.as_ref().expect("SAE target").0,
+                                        client: report
+                                            .nic_capability
+                                            .mac_address
+                                            .ok_or("NIC omitted MAC address")?,
                                         rcpi: target_rcpi,
                                         firmware: ClientFirmwareEffectsState::default(),
                                         // Deliberately no physical key/WCID enable: mechanics is
@@ -3538,7 +3542,11 @@ fn run() -> Result<(), String> {
                                     record_sae_stage(
                                         "sae_tx_resources_acquired after_beacon=true after_rate_power=true",
                                     );
-                                    shared.lock().unwrap().power_rate_authorized = true;
+                                    {
+                                        let mut state = shared.lock().unwrap();
+                                        state.power_rate_authorized = true;
+                                        state.authorize_sae(channels[0])?;
+                                    }
                                     let bss =
                                         target_bss.as_ref().ok_or("target BSS was not retained")?;
                                     let rsne =
@@ -3621,12 +3629,8 @@ fn run() -> Result<(), String> {
                                         .map_err(
                                             |status| format!("DeviceOps SAE TX rejected: {status}"),
                                         )?;
-                                        let frame = shared
-                                            .lock()
-                                            .unwrap()
-                                            .frame
-                                            .take()
-                                            .ok_or("DeviceOps did not retain SAE frame")?;
+                                        let frame =
+                                            shared.lock().unwrap().take_sae_for_publish()?;
                                         runner.with_physical(|adapter| {
                                             adapter.with_transport_mut(|transport| {
                                                 let mechanics = transport.mechanics_mut();
@@ -8068,18 +8072,56 @@ struct ReceivedSaeAuth {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+struct PendingSaeTx {
+    generation: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct LiveClientState {
     scan_seen: bool,
     scan_authorized: bool,
     power_rate_authorized: bool,
-    frame: Option<Vec<u8>>,
+    tuned_channel: Option<ChannelNumber>,
+    authorized_channel: Option<ChannelNumber>,
+    next_sae_generation: u64,
+    sae_generation: Option<u64>,
+    frame: Option<PendingSaeTx>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl LiveClientState {
+    fn authorize_sae(&mut self, channel: ChannelNumber) -> Result<u64, String> {
+        if !self.power_rate_authorized || self.tuned_channel != Some(channel) {
+            return Err("SAE authorization requires tuned rate-power readiness".into());
+        }
+        self.next_sae_generation = self.next_sae_generation.wrapping_add(1).max(1);
+        self.scan_authorized = true;
+        self.authorized_channel = Some(channel);
+        self.sae_generation = Some(self.next_sae_generation);
+        Ok(self.next_sae_generation)
+    }
+
+    fn take_sae_for_publish(&mut self) -> Result<Vec<u8>, String> {
+        let pending = self
+            .frame
+            .take()
+            .ok_or("SAE publisher had no pending frame")?;
+        if self.sae_generation != Some(pending.generation)
+            || self.authorized_channel != self.tuned_channel
+        {
+            return Err("SAE authorization generation was revoked before publication".into());
+        }
+        Ok(pending.bytes)
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
 struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
+    client: [u8; 6],
     rcpi: u8,
     firmware: ClientFirmwareEffectsState,
     /// Injectable only: the physical SAE path deliberately leaves this
@@ -8092,7 +8134,11 @@ struct LiveClientEffects {
 #[cfg(feature = "fuchsia-passive")]
 impl Mt7921ClientEffects for LiveClientEffects {
     fn revoke_scan(&mut self) {
-        self.state.lock().unwrap().scan_authorized = false;
+        let mut state = self.state.lock().unwrap();
+        state.scan_authorized = false;
+        state.authorized_channel = None;
+        state.sae_generation = None;
+        state.frame = None;
     }
     fn revoke_lifecycle(&mut self) {
         *self.state.lock().unwrap() = LiveClientState::default();
@@ -8104,10 +8150,17 @@ impl Mt7921ClientEffects for LiveClientEffects {
     }
     fn set_channel(
         &mut self,
-        _: fidl_ieee80211::ChannelNumber,
+        primary: fidl_ieee80211::ChannelNumber,
         _: fidl_ieee80211::ChannelBandwidth,
         _: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
+        let mut state = self.state.lock().unwrap();
+        if state.tuned_channel != Some(primary) {
+            state.authorized_channel = None;
+            state.sae_generation = None;
+            state.frame = None;
+        }
+        state.tuned_channel = Some(primary);
         Ok(())
     }
     fn join_bss(&mut self, _: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
@@ -8116,18 +8169,27 @@ impl Mt7921ClientEffects for LiveClientEffects {
     fn send_wlan_frame(
         &mut self,
         bytes: &[u8],
-        _: fidl_softmac::WlanTxInfoFlags,
+        flags: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
         let mut state = self.state.lock().unwrap();
         if !state.scan_authorized
             || !state.power_rate_authorized
+            || state.sae_generation.is_none()
+            || state.authorized_channel != state.tuned_channel
             || state.frame.is_some()
             || bytes.get(..2) != Some(&[0xb0, 0])
             || bytes.get(4..10) != Some(&self.target)
+            || bytes.get(10..16) != Some(&self.client)
+            || bytes.get(16..22) != Some(&self.target)
+            || bytes.get(24..26) != Some(&[3, 0])
+            || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
         {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        state.frame = Some(bytes.to_vec());
+        state.frame = Some(PendingSaeTx {
+            generation: state.sae_generation.expect("checked generation"),
+            bytes: bytes.to_vec(),
+        });
         Ok(())
     }
     fn install_key(
@@ -10637,6 +10699,7 @@ mod tests {
         let mut effects = LiveClientEffects {
             state: Arc::new(Mutex::new(LiveClientState::default())),
             target: peer,
+            client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             uni_submit: Some(Box::new(move |command| {
@@ -10686,6 +10749,7 @@ mod tests {
         let mut physically_unbound = LiveClientEffects {
             state: Arc::new(Mutex::new(LiveClientState::default())),
             target: peer,
+            client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             uni_submit: None,
@@ -10695,6 +10759,93 @@ mod tests {
             Err(zx::Status::NOT_SUPPORTED)
         );
         assert!(physically_unbound.firmware.association.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn live_client_pre_port_sae_generation_reaches_management_publisher_only_when_current() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let client = [6, 5, 4, 3, 2, 1];
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let shared = Arc::new(Mutex::new(LiveClientState::default()));
+        let mut effects = LiveClientEffects {
+            state: shared.clone(),
+            target: peer,
+            client,
+            rcpi: 100,
+            firmware: ClientFirmwareEffectsState::default(),
+            uni_submit: None,
+        };
+        effects
+            .set_channel(
+                channel,
+                ChannelBandwidth::Cbw20,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+        {
+            let mut state = shared.lock().unwrap();
+            state.power_rate_authorized = true;
+            state.authorize_sae(channel).unwrap();
+        }
+        let frame = |sequence: u16| {
+            let mut bytes = vec![0; 30];
+            bytes[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            bytes[4..10].copy_from_slice(&peer);
+            bytes[10..16].copy_from_slice(&client);
+            bytes[16..22].copy_from_slice(&peer);
+            bytes[24..26].copy_from_slice(&3u16.to_le_bytes());
+            bytes[26..28].copy_from_slice(&sequence.to_le_bytes());
+            bytes
+        };
+
+        let mut foreign = frame(1);
+        foreign[4] ^= 1;
+        assert_eq!(
+            effects.send_wlan_frame(&foreign, fidl_softmac::WlanTxInfoFlags::empty()),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        assert_eq!(
+            effects.send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::PROTECTED,),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        let mut open_system = frame(1);
+        open_system[24..26].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            effects.send_wlan_frame(&open_system, fidl_softmac::WlanTxInfoFlags::empty()),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+
+        effects
+            .send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::empty())
+            .unwrap();
+        effects.revoke_scan();
+        assert!(shared.lock().unwrap().take_sae_for_publish().is_err());
+
+        shared.lock().unwrap().authorize_sae(channel).unwrap();
+        effects
+            .send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty())
+            .unwrap();
+        let publish = |bytes: &[u8]| {
+            encode_mt7921_5ghz_auth_tx(bytes, 0x1000, 0x2000, 0, 3, 19)
+                .map_err(|error| format!("management publisher rejected frame: {error:?}"))
+        };
+        let bytes = shared.lock().unwrap().take_sae_for_publish().unwrap();
+        let descriptor = publish(&bytes).unwrap();
+        assert_eq!(descriptor.pid, 3);
+        assert_eq!(descriptor.token, 0);
+        assert_eq!(
+            u32::from_le_bytes(descriptor.txwi[0..4].try_into().unwrap()) & 0xffff,
+            62
+        );
+        assert!(!effects.firmware.controlled_port_open);
+        assert!(effects.firmware.association.is_none());
     }
 
     #[cfg(feature = "fuchsia-passive")]
