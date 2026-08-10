@@ -1147,3 +1147,37 @@ failure and fully verify exact `0x0002` before unmapping and release. The gate
 must stop before `VFIO_DEVICE_SET_IRQS`, `VFIO_DEVICE_RESET`, DMA mapping, BAR
 `0x10188`, firmware, WFDMA, or radio. Pinned Fuchsia owns none of these VFIO or
 PCI mechanics; its SoftMAC boundary remains downstream of transport setup.
+
+That query-only gate completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T105414Z-0000_05_00.0.log` using
+release binary SHA-256
+`db0aa62d3fc70658a55cebf73b82fd2ea989e229e1b94f136988619168e0fe3a`.
+While Command `0x0402` was fully verified, `VFIO_DEVICE_GET_IRQ_INFO` returned:
+INTx index 0, `argsz=16`, flags `0x00000007`, count 1; MSI index 1,
+`argsz=16`, flags `0x00000009`, count 32; and MSI-X index 2, `argsz=16`,
+flags `0x00000009`, count 0. Thus INTx reports EVENTFD, MASKABLE, and
+AUTOMASKED; MSI reports EVENTFD and NORESIZE; MSI-X reports the same flags but
+is unimplemented because its count is zero. The pure preference selected MSI
+with 32 vectors and did not install it.
+
+The subsequent read-only `VFIO_DEVICE_GET_INFO` returned `argsz=24`, flags
+`0x00000003`, nine regions, five IRQ indices, and capability offset zero.
+RESET and PCI flags were therefore both present; no reset ioctl followed. The
+unconditional rollback then wrote exact saved Command `0x0002` and verified
+full equality before safe unmap/release. Only the two identity pages were
+mapped. No `SET_IRQS`, `DEVICE_RESET`, BAR `0x10188`, DMA mapping, firmware,
+WFDMA, or radio operation occurred.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T105413Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:24:15.766081 IST`; sample zero saw mt7921e in D0 and iwd active. iwd
+announced usable `wlan7` at `16:24:17.135169`, associated by
+`16:24:17.428829`, and reached connected state at `16:24:18.559458`.
+Association was visible at `16:24:17.809902`; IPv4 `192.168.235.6/24`, default
+route, and gateway ping followed at `16:24:19.857688`, 4.09 seconds after
+restore. The watchdog disarmed at `16:24:19.917976`, and boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged. All 69 locked
+release-workspace tests and the locked release build passed with existing
+upstream warnings; previously recorded standalone default-feature and rustfmt
+limitations remain unchanged.
