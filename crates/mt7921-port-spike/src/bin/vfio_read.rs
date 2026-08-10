@@ -590,7 +590,6 @@ fn acquire_active_vfio_resources(
     ledger: &mut AcquisitionLedger,
     containment: &mut ContainmentLedger,
 ) -> Result<(), String> {
-    #[cfg(not(feature = "fuchsia-passive"))]
     let _ = operation;
     macro_rules! map_bar {
         ($field:ident, $offset:expr) => {{
@@ -643,11 +642,6 @@ fn acquire_active_vfio_resources(
     {
         map_dma!(data_rx_ring, 0x0101_0000, PAGE);
         map_dma!(data_rx_buffers, 0x0101_1000, 4 * PAGE);
-        if operation == Operation::RunOneShotSaeAuth {
-            map_dma!(mgmt_txwi, 0x0103_0000, PAGE);
-            map_dma!(mgmt_frame, 0x0103_1000, PAGE);
-            map_dma!(mgmt_tx_ring, 0x0103_2000, PAGE);
-        }
     }
 
     let tx_guard = resources.tx_guard.as_mut().expect("mapped");
@@ -682,15 +676,6 @@ fn acquire_active_vfio_resources(
             .as_mut()
             .expect("mapped")
             .zero_bytes(4 * PAGE)?;
-        if let Some(arena) = resources.mgmt_txwi.as_mut() {
-            arena.zero_bytes(PAGE)?;
-        }
-        if let Some(arena) = resources.mgmt_frame.as_mut() {
-            arena.zero_bytes(PAGE)?;
-        }
-        if let Some(arena) = resources.mgmt_tx_ring.as_mut() {
-            arena.initialize_descriptor_page()?;
-        }
     }
     let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
         .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
@@ -713,6 +698,37 @@ fn acquire_active_vfio_resources(
         }
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn acquire_sae_tx_resources(
+    iommu: &Arc<File>,
+    ioas: u32,
+    txwi: &mut Option<DmaArena>,
+    frame: &mut Option<DmaArena>,
+    ring: &mut Option<DmaArena>,
+    acquisition: &mut AcquisitionLedger,
+    containment: &mut ContainmentLedger,
+) -> Result<(), String> {
+    if txwi.is_some() || frame.is_some() || ring.is_some() {
+        return Err("SAE TX resources were already acquired".into());
+    }
+    let mut map = |slot: &mut Option<DmaArena>, iova| -> Result<(), String> {
+        containment.mark_possibly_active(Hazard::DmaMapping);
+        acquisition.record(AcquisitionIntent::MapDma { iova, len: PAGE })?;
+        *slot = Some(DmaArena::map_len(iommu, ioas, iova, PAGE)?);
+        Ok(())
+    };
+    map(txwi, 0x0103_0000)?;
+    map(frame, 0x0103_1000)?;
+    map(ring, 0x0103_2000)?;
+    txwi.as_mut().expect("mapped").zero_bytes(PAGE)?;
+    frame.as_mut().expect("mapped").zero_bytes(PAGE)?;
+    ring.as_mut()
+        .expect("mapped")
+        .initialize_descriptor_page()?;
+    std::sync::atomic::fence(Ordering::Release);
     Ok(())
 }
 
@@ -2766,11 +2782,11 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "fuchsia-passive")]
         let data_rx_buffers = data_rx_buffers.as_mut().expect("acquired");
         #[cfg(feature = "fuchsia-passive")]
-        let mut mgmt_txwi = mgmt_txwi.as_mut();
+        let mgmt_txwi = mgmt_txwi;
         #[cfg(feature = "fuchsia-passive")]
-        let mut mgmt_frame = mgmt_frame.as_mut();
+        let mgmt_frame = mgmt_frame;
         #[cfg(feature = "fuchsia-passive")]
-        let mut mgmt_tx_ring = mgmt_tx_ring.as_mut();
+        let mgmt_tx_ring = mgmt_tx_ring;
         let ledger = capsule
             .containment
             .as_mut()
@@ -3414,9 +3430,21 @@ fn run() -> Result<(), String> {
                                             program_live_rate_power(
                                                 mechanics,
                                                 report.nic_capability,
+                                            )?;
+                                            acquire_sae_tx_resources(
+                                                iommu,
+                                                ioas.id,
+                                                mgmt_txwi,
+                                                mgmt_frame,
+                                                mgmt_tx_ring,
+                                                acquisition_ledger,
+                                                mechanics.ledger,
                                             )
                                         })
                                     })?;
+                                    record_sae_stage(
+                                        "sae_tx_resources_acquired after_beacon=true after_rate_power=true",
+                                    );
                                     shared.lock().unwrap().power_rate_authorized = true;
                                     let bss =
                                         target_bss.as_ref().ok_or("target BSS was not retained")?;
@@ -3512,13 +3540,13 @@ fn run() -> Result<(), String> {
                                                 println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
                                                 mechanics.transmit_one_sae_auth(
                                                     mgmt_tx_ring
-                                                        .as_deref_mut()
+                                                        .as_mut()
                                                         .ok_or("SAE TX ring arena missing")?,
                                                     mgmt_txwi
-                                                        .as_deref_mut()
+                                                        .as_mut()
                                                         .ok_or("SAE TXWI arena missing")?,
                                                     mgmt_frame
-                                                        .as_deref_mut()
+                                                        .as_mut()
                                                         .ok_or("SAE frame arena missing")?,
                                                     &frame,
                                                 )
@@ -3780,7 +3808,24 @@ fn run() -> Result<(), String> {
         {
             cleanup_errors.push(error);
         }
-        let release_errors = attempt_all_cleanup(
+        #[cfg(feature = "fuchsia-passive")]
+        let mut release_errors = attempt_all_cleanup(
+            [
+                (ActiveArenaKind::MgmtRing, mgmt_tx_ring),
+                (ActiveArenaKind::MgmtFrame, mgmt_frame),
+                (ActiveArenaKind::MgmtTxwi, mgmt_txwi),
+            ],
+            |(kind, slot)| {
+                slot.as_mut().map_or(Ok(()), |arena| {
+                    arena
+                        .teardown()
+                        .map_err(|error| format!("teardown {kind:?}: {error}"))
+                })
+            },
+        );
+        #[cfg(not(feature = "fuchsia-passive"))]
+        let mut release_errors = Vec::new();
+        release_errors.extend(attempt_all_cleanup(
             [
                 #[cfg(feature = "fuchsia-passive")]
                 (ActiveArenaKind::DataBuffers, data_rx_buffers),
@@ -3802,7 +3847,7 @@ fn run() -> Result<(), String> {
                     .teardown()
                     .map_err(|error| format!("teardown {kind:?}: {error}"))
             },
-        );
+        ));
         if release_errors.is_empty() {
             ledger.confirm_inactive(Hazard::DmaMapping);
             println!("{{\"active_mcu_event\":\"dma_mappings_released_before_reset\"}}");
@@ -5710,6 +5755,12 @@ struct ReceivedMcuResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveArenaKind {
+    #[cfg(feature = "fuchsia-passive")]
+    MgmtRing,
+    #[cfg(feature = "fuchsia-passive")]
+    MgmtFrame,
+    #[cfg(feature = "fuchsia-passive")]
+    MgmtTxwi,
     #[cfg(feature = "fuchsia-passive")]
     DataBuffers,
     #[cfg(feature = "fuchsia-passive")]
@@ -8670,20 +8721,10 @@ enum Operation {
 
 impl Operation {
     fn uses_contained_transport_gate(self) -> bool {
-        if matches!(
+        matches!(
             self,
             Self::RunOneShotFirmware | Self::RunOneShotPassiveChannel1
-        ) {
-            return true;
-        }
-        #[cfg(feature = "fuchsia-passive")]
-        {
-            self == Self::RunOneShotSaeAuth
-        }
-        #[cfg(not(feature = "fuchsia-passive"))]
-        {
-            false
-        }
+        )
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -9945,6 +9986,71 @@ mod tests {
         assert!(!exchange.contains("install_key("));
         assert!(!exchange.contains("notify_association_complete("));
         assert!(!exchange.contains("set_link_up("));
+    }
+
+    #[test]
+    fn sae_routes_to_consolidated_firmware_transport_not_early_dma_gate() {
+        assert!(!Operation::RunOneShotSaeAuth.uses_contained_transport_gate());
+        assert!(Operation::RunOneShotSaeAuth.loads_firmware());
+        assert!(Operation::RunOneShotSaeAuth.is_active_mcu());
+
+        let source = include_str!("vfio_read.rs");
+        let early_gate = source
+            .split("if operation.uses_contained_transport_gate() {")
+            .find(|segment| segment.contains("return Ok(None);"))
+            .unwrap();
+        assert!(early_gate.contains("run_contained_dma_resource_round_trip"));
+
+        let consolidated = source
+            .split("if operation.is_active_mcu() {")
+            .find(|segment| segment.contains("let firmware_images = if operation.loads_firmware()"))
+            .unwrap();
+        for required in [
+            "decompress_patch()",
+            "decompress_ram()",
+            "load_mt7921_firmware_with_passive_boundary",
+            "Operation::RunOneShotSaeAuth",
+            "SaeHandshake::new",
+        ] {
+            assert!(consolidated.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn sae_tx_dma_authority_is_lazy_and_revoked_before_reset() {
+        let source = include_str!("vfio_read.rs");
+        let generic_acquisition = source
+            .split("fn acquire_active_vfio_resources(")
+            .nth(1)
+            .unwrap()
+            .split("fn acquire_sae_tx_resources(")
+            .next()
+            .unwrap();
+        assert!(!generic_acquisition.contains("map_dma!(mgmt_"));
+
+        let sae = source
+            .split("if operation == Operation::RunOneShotSaeAuth {")
+            .find(|segment| segment.contains("SaeHandshake::new"))
+            .unwrap()
+            .split("let transport = adapter.into_transport();")
+            .next()
+            .unwrap();
+        let power = sae.find("program_live_rate_power").unwrap();
+        let acquire = sae.find("acquire_sae_tx_resources").unwrap();
+        let handshake = sae.find("SaeHandshake::new").unwrap();
+        let transmit = sae.find("transmit_one_sae_auth").unwrap();
+        assert!(power < acquire && acquire < handshake && handshake < transmit);
+
+        let cleanup = source
+            .split("ledger.phase = RunPhase::Containing;")
+            .nth(1)
+            .unwrap()
+            .split("post-reset safe-state verification")
+            .next()
+            .unwrap();
+        let mgmt = cleanup.find("ActiveArenaKind::MgmtRing").unwrap();
+        let reset = cleanup.find("reset_vfio_device(&device)").unwrap();
+        assert!(mgmt < reset);
     }
 
     #[test]

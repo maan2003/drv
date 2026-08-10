@@ -1873,3 +1873,24 @@ Transport cleanup quiesced DMA and IRQs, disabled BME, reset VFIO into the
 verified safe state, and returned `rc=0`; supervisor restore reported
 `failed=0`, with native `mt7921e` and iwd healthy on the same boot. No
 further physical run was made.
+
+### Consolidated SAE routing correction and guarded result
+
+`RunOneShotSaeAuth` no longer selects the earlier contained-DMA milestone,
+which accepted only the firmware and single-channel passive operations and
+returned before the consolidated loader. A regression test now requires SAE
+to bypass that early gate while remaining a firmware-loading active-MCU
+operation. All 76 integrated tests and the release build passed; the binary
+SHA-256 was
+`6d3ed422c3e817d71ad4f800710f29ecf291cd31624b2371085bf628a4fae560`.
+
+Exactly one corrected protected-FD attempt was launched under the transient
+`wifi-sae-exchange3` supervisor. Its report is
+`/var/lib/wifi-driver-lab/reports/20260810T152400Z-0000_05_00.0.log`.
+The durable report reached userspace after VFIO handoff, but the last SAE stage
+was only `credential_read`: there is no firmware, passive RX, SAE commit, or RF
+TX evidence. The process did not return before recovery; the kernel recorded a
+60-second page-pool shutdown stall with six inflight buffers and the external
+watchdog rebooted the host. After reboot, native `mt7921e` was rebound, `iwd`
+was active, both watchdog units were inactive, and no lab state remained. This
+is not an SAE pass and no second attempt was made.
