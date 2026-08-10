@@ -6657,6 +6657,7 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
                 || (rx_irq_mask & DATA_RX_IRQ_BIT != 0 && value == rx_irq_mask)
         }
         0xd4208 | 0xd4100 | 0xd42b0 => true,
+        0xd420c => value == 1,
         0xd42f0 => value == 0 || value == 4,
         0xd4680 => value == 4,
         0xd4688 => value == 0x0040_0004,
@@ -8372,15 +8373,8 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
-        let reset = self.loader.mcu.wfdma.read(0xd4100)?;
-        self.loader
-            .mcu
-            .wfdma
-            .write_active_wfdma(0xd4100, reset & !(1 << 4))?;
-        self.loader
-            .mcu
-            .wfdma
-            .write_active_wfdma(0xd4100, reset | (1 << 4))?;
+        // MT_WFDMA0_RST_DTX_PTR bit 0 resets ring 0 without resetting the RX paths.
+        self.loader.mcu.wfdma.write_active_wfdma(0xd420c, 1)?;
         if self.loader.mcu.wfdma.read(0xd430c)? != 0 {
             return Err("REBOOT REQUIRED: ring-0 DIDX remained nonzero after reset".into());
         }
@@ -13735,6 +13729,9 @@ mod tests {
             passive
         ));
         assert!(active_wfdma_write_allowed(0xd4204, passive, passive));
+        assert!(active_wfdma_write_allowed(0xd420c, 1, passive));
+        assert!(!active_wfdma_write_allowed(0xd420c, 0, passive));
+        assert!(!active_wfdma_write_allowed(0xd420c, u32::MAX, passive));
         assert!(active_wfdma_write_allowed(0xd4600, 0x0140_0004, passive));
         assert!(!active_wfdma_write_allowed(0xd4600, 0, passive));
         assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
@@ -14260,6 +14257,21 @@ mod tests {
             capsule.containment.as_ref().unwrap().phase,
             RunPhase::SafeReleaseError
         );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn management_tx_resets_only_ring0_descriptor_pointer() {
+        let source = include_str!("vfio_read.rs");
+        let reset = source
+            .split("fn stop_tx_dma_and_reset_ring0(")
+            .nth(1)
+            .unwrap()
+            .split("fn configure_mgmt_tx_ring(")
+            .next()
+            .unwrap();
+        assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
+        assert!(!reset.contains("write_active_wfdma(0xd4100"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
