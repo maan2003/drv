@@ -66,3 +66,19 @@ drain quantum); both physical periods completed on speaker stream 4 with LPIB
 advancement and exactly one post-command-drain IOC MSI each. The watchdog then
 restored `snd_hda_intel` and ALC256, while `wlan0` stayed the active route and
 no IOMMU, FIFO, or descriptor fault appeared.
+
+## Sustained playback and restart evidence
+
+On no-plastic boot `0cbedbab-c8f7-4d40-8c4b-ce26a3662011`, one guarded physical
+daemon accepted two sequential, untargeted stock `pw-cat` sessions, each with
+one second (48,000 frames) of S16LE/48 kHz/stereo PCM. Both clients exited 0
+with empty stderr. Including each client's final silent drain quantum, the same
+ADR and physical endpoint advanced to 96,960 frames across 202 BDL periods,
+proving client stop and restart without rebinding the device.
+
+At the 200-period checkpoint the backend reported 96,000 frames over 2,549 ms,
+LPIB `0..1856`, 200 IOC MSI events, and zero FIFO/descriptor underruns. Every
+period independently required LPIB movement and a post-command-drain IOC before
+clean stream stop/reset. The watchdog finally restored `snd_hda_intel` and the
+ALC256 proc node; `wlan0` remained the active route and no IOMMU, FIFO, or
+descriptor fault was logged.

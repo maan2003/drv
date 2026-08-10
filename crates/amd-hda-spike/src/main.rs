@@ -16,6 +16,7 @@ use std::{
     path::PathBuf,
     ptr::NonNull,
     sync::atomic::{Ordering, fence},
+    time::Instant,
 };
 
 const VFIO_TYPE: u64 = b';' as u64;
@@ -200,6 +201,11 @@ unsafe impl Send for VfioHda {}
 struct PhysicalHdaEndpoint {
     controller: Controller<VfioHda>,
     frames: u64,
+    periods: u64,
+    ioc_irqs: u64,
+    underruns: u64,
+    started_at: Option<Instant>,
+    last_lpib: (u32, u32),
 }
 impl PlaybackEndpoint for PhysicalHdaEndpoint {
     fn format(&self) -> PcmFormat {
@@ -218,30 +224,55 @@ impl PlaybackEndpoint for PhysicalHdaEndpoint {
             .into_iter()
             .flat_map(i16::to_le_bytes)
             .collect::<Vec<_>>();
-        let report = self
-            .controller
-            .play_pcm_period(0, &processed)
-            .map_err(|error| {
+        let report = match self.controller.play_pcm_period(0, &processed) {
+            Ok(report) => report,
+            Err(error) => {
+                self.underruns += 1;
                 eprintln!("physical HDA period failed: {error:?}");
-                EndpointError::PositionOverflow
-            })?;
+                return Err(EndpointError::PositionOverflow);
+            }
+        };
+        self.started_at.get_or_insert_with(Instant::now);
         self.frames = self
             .frames
             .checked_add((processed.len() / 4) as u64)
             .ok_or(EndpointError::PositionOverflow)?;
-        println!(
-            "physical HDA {:?} stream={} LPIB={}..{} MSI={} frames={}",
-            report.route,
-            report.stream_index,
-            report.start_position,
-            report.end_position,
-            report.irq_count,
-            self.frames
-        );
+        self.periods += 1;
+        self.ioc_irqs += report.irq_count;
+        self.last_lpib = (report.start_position, report.end_position);
+        if self.periods == 1 || self.periods.is_multiple_of(25) {
+            println!(
+                "physical HDA {:?} stream={} elapsed_ms={} periods={} LPIB={}..{} IOC={} frames={} underruns={}",
+                report.route,
+                report.stream_index,
+                self.started_at.unwrap().elapsed().as_millis(),
+                self.periods,
+                report.start_position,
+                report.end_position,
+                self.ioc_irqs,
+                self.frames,
+                self.underruns
+            );
+        }
         Ok(())
     }
     fn frame_position(&self) -> u64 {
         self.frames
+    }
+}
+impl Drop for PhysicalHdaEndpoint {
+    fn drop(&mut self) {
+        println!(
+            "physical HDA summary duration_ms={} periods={} frames={} LPIB={}..{} IOC={} underruns={}",
+            self.started_at
+                .map_or(0, |start| start.elapsed().as_millis()),
+            self.periods,
+            self.frames,
+            self.last_lpib.0,
+            self.last_lpib.1,
+            self.ioc_irqs,
+            self.underruns
+        );
     }
 }
 impl VfioHda {
@@ -552,6 +583,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = PhysicalHdaEndpoint {
             controller,
             frames: 0,
+            periods: 0,
+            ioc_irqs: 0,
+            underruns: 0,
+            started_at: None,
+            last_lpib: (0, 0),
         };
         return protocol::serve_daemon_with_physical_sink(&listener, Box::new(endpoint))
             .map_err(Into::into);
