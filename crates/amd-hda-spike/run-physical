@@ -3,6 +3,17 @@ set -euo pipefail
 
 watchdog_seconds=${DRV_HDA_WATCHDOG_SECONDS:-20}
 fail() { printf 'amd-hda physical guard: %s\n' "$*" >&2; exit 2; }
+[[ $(hostname -s) == no-plastic ]] || fail "physical experiments require hostname no-plastic (current: $(hostname -s))"
+
+printf 'amd-hda: current class-0403 functions on no-plastic:\n' >&2
+for audio in /sys/bus/pci/devices/*; do
+  [[ -r $audio/class && $(cat "$audio/class") == 0x0403* ]] || continue
+  printf '  %s %s:%s subsystem %s:%s driver=%s group=%s\n' \
+    "${audio##*/}" "$(cat "$audio/vendor")" "$(cat "$audio/device")" \
+    "$(cat "$audio/subsystem_vendor")" "$(cat "$audio/subsystem_device")" \
+    "$(basename "$(readlink -f "$audio/driver")" 2>/dev/null || printf none)" \
+    "$(basename "$(readlink -f "$audio/iommu_group")" 2>/dev/null || printf none)" >&2
+done
 
 # PCI numbering and IOMMU group numbers are not stable across boots. Select by
 # the complete hardware identity and class on every invocation.
@@ -30,6 +41,21 @@ for member in "${members[@]}"; do
 done
 [[ ${#members[@]} == 1 && ${members[0]} == "$bdf" ]] || fail "IOMMU group ${group##*/} is not isolated: ${members[*]}"
 [[ $(basename "$(readlink -f "$dev/driver")") == snd_hda_intel ]] || fail 'snd_hda_intel does not own the function'
+
+# Correlate the analog codec through the sound children of this exact PCI
+# function before detaching it. HDMI HDA controllers cannot satisfy this gate.
+shopt -s nullglob
+codec_matches=()
+for card_path in "$dev"/sound/card*; do
+  [[ -e $card_path ]] || continue
+  codec="/proc/asound/${card_path##*/}/codec#0"
+  [[ -r $codec ]] || continue
+  grep -q '^Codec: Realtek ALC256$' "$codec" || continue
+  grep -qi '^Vendor Id: 0x10ec0256$' "$codec" || continue
+  codec_matches+=("$codec")
+done
+[[ ${#codec_matches[@]} == 1 ]] || fail "$bdf does not expose exactly one correlated Realtek ALC256 codec#0 (found ${#codec_matches[@]})"
+printf 'amd-hda: selected analog target %s group=%s codec=%s\n' "$bdf" "${group##*/}" "${codec_matches[0]}" >&2
 [[ $EUID == 0 ]] || fail "selected $bdf in isolated group ${group##*/}; rerun as root"
 
 # iommufd can be modular. Only diagnose the device node after trying to load it.
