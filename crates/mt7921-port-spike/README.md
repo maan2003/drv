@@ -1387,3 +1387,78 @@ final state was mt7921e in D0/runtime-active, iwd active, rfkill unblocked,
 `wlan10` associated with IPv4/default route, gateway ping successful, and the
 watchdog inactive. This control clears the anomalous-backoff question only; it
 does not add evidence for any further hardware mutation.
+
+### Next active-path boundary: conn-on ownership
+
+The temporary physical early return remains before the general active-resource
+path. A source trace of that path shows that after its persistent PCI INTx
+disable and `MT_PCIE_MAC_INT_ENABLE = 0` store, constructing `VfioOwnership`
+has no device effect. The first device operation in
+`acquire_driver_ownership` is `write_clear_own`: one aligned volatile 32-bit
+store of `0x00000002` (`PCIE_LPCR_HOST_CLR_OWN`) to direct BAR0 offset
+`0xe0010`. The next operation is a volatile 32-bit read of the same offset,
+polling `PCIE_LPCR_HOST_OWN_SYNC` clear. No IRQ installation, reset, DMA
+mapping, firmware operation, WFDMA access, or radio operation is between the
+interrupt-latch store and this ownership-command store. The general path has
+already allocated unrelated DMA arenas before entering the mutation closure,
+but an isolated boundary does not need them; it needs only BAR0 page
+`0xe0000` read-write in addition to the already-proven preflight pages.
+
+At pinned Linux commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`mt792x_regs.h` defines physical `MT_CONN_ON_LPCTL = 0x7c060010`,
+`PCIE_LPCR_HOST_SET_OWN = BIT(0)`, `CLR_OWN = BIT(1)`, and `OWN_SYNC = BIT(2)`.
+The fixed map in `mt7921/pci.c::__mt7921_reg_addr` maps physical base
+`0x7c060000` to BAR0 `0xe0000`, producing direct offset `0xe0010` without an
+L1 selector transaction. `mt792x_core.c::__mt792xe_mcu_drv_pmctrl` writes
+`CLR_OWN`, optionally waits 2--3 ms when PCIe ASPM is supported, and polls
+`OWN_SYNC == 0` for 50 ms at 1 ms ticks, repeating for at most ten attempts.
+This is Linux PCI transport ownership below Fuchsia SoftMAC, not a Fuchsia
+firmware or radio contract.
+
+The register is a command/status handshake, not an ordinary saved-value
+latch. `CLR_OWN` requests host ownership; its command bit is not expected to
+remain set. A read with either `SET_OWN` or `CLR_OWN` asserted is outside the
+state Linux relies on. `OWN_SYNC == 0` is driver-owned and `OWN_SYNC == BIT(2)`
+is firmware-owned. Unknown non-command bits are status, so rollback cannot be
+specified as writing a saved full word. The pinned inverse operation is
+`mt792xe_mcu_fw_pmctrl`: write only `PCIE_LPCR_HOST_SET_OWN`, then poll
+`OWN_SYNC == BIT(2)` with the same ten 50 ms attempts. State restoration is
+therefore equality of the initial ownership state, with command bits clear,
+not raw full-word equality.
+
+Required state is the already-established VFIO/iommufd attachment, D0,
+Memory-Space Enable set, Bus Master Enable clear, persistent PCI INTx disable,
+the PCIe MAC interrupt latch at zero, and a writable mapping of only conn-on
+page `0xe0000`. Firmware/conn-infra must be powered enough to acknowledge the
+handshake; the earlier isolated physical ownership run observed
+`MT_CONN_ON_MISC = 1` (firmware power set), N9 readiness clear, DMA disabled,
+and acquired driver ownership on the first write with status zero. That report,
+`/var/lib/wifi-driver-lab/reports/20260802T170812Z-0000_05_00.0.log`, proves
+the command alone on this adapter, but it restored only by VFIO function reset
+and did not prove the inverse `SET_OWN` handshake or this exact composite
+state.
+
+The current helper is not ready for another physical claim. The target module
+has `disable_aspm=N`, while `acquire_driver_ownership` currently polls
+immediately and has no representation of Linux's conditional 2--3 ms ASPM
+settling delay. Actual ASPM support is derived by Linux from both endpoint and
+parent Link Control state, so it must not be guessed from that module parameter.
+Also, current active containment and the earlier standalone run use VFIO reset,
+not the pinned inverse ownership handshake, as rollback.
+
+The smallest independently reversible next gate is consequently an isolated
+ownership round trip, not the full active helper: read `MT_CONN_ON_LPCTL` once,
+reject all ones or asserted command bits, and save only the semantic initial
+`OWN_SYNC` state; if firmware-owned, issue only `CLR_OWN`, honor the pinned ASPM
+delay conservatively, and poll only `OWN_SYNC` clear within the pinned bound;
+then issue only `SET_OWN` and poll the original firmware-owned state before
+unmapping. If initially driver-owned, the CLR command is idempotent and no SET
+command may be issued because that would change the initial state. On every
+exit after issuing CLR from an initially firmware-owned state, attempt SET and
+the semantic-state poll before unmap even if the CLR poll failed, then restore
+the exact saved interrupt latch and PCI Command.
+Durable markers must precede every command, poll phase, inverse, and unmap.
+This gate stops before WFSYS reset, WFDMA reads or writes, IRQ installation,
+DMA mapping, firmware loading, or radio work. No hardware run is authorized
+until the ASPM delay and inverse rollback are represented and separately
+reviewed.
