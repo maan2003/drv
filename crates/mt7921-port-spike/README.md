@@ -2245,3 +2245,31 @@ After reboot, the patched system, profile, kernel, generation-25 default, and
 `keep_d0_on_remove=Y` invariants remained intact; native WPA3 association,
 carrier, and connectivity were healthy on `wlan0`, with no lab state. No
 rerun was attempted.
+
+After adding bounded descriptor-consumption proof and demultiplexing management
+completions before MCU response parsing, one guarded run was launched as
+`wifi-sae-exchange19` from integrated commit `6107c58002b3`. The explicitly
+feature-enabled release and staged artifact shared SHA-256
+`5ea552601bc3b44cc6156f44e073790c85c4f2fcba6c193cf40a07d2fa3ef3ac`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T193355Z-0000_05_00.0.log`
+records the dynamic target, firmware and beacon gates, commit publication, and
+`sae_tx_ring0_consumed didx=1 descriptor_done=true`.
+
+The post-publication IRQ was `0x0c400010`. Ring 4 then delivered and routed
+an acknowledged TX status for WCID 19 and PID 3, followed by TX-free for WCID
+19, token 0, with `dropped=false` and one attempt. Their dual correlation
+produced `sae_commit_tx_acked`, the first fully proven local SAE commit
+transmission. The bounded peer-response wait received no matching SAE commit,
+so the run stopped with `bounded SAE peer response timed out`. There is no
+peer commit RX, confirm publication or RX, PMK derivation, or authenticated
+marker.
+
+Containment and cleanup quiesced the transport, released DMA mappings, reset
+VFIO, verified the post-reset safe state, and restored the native driver with
+`RESTORE end failed=0`. Native `mt7921e`, D0, iwd, WPA3 association, IPv4,
+the default route, and gateway connectivity recovered in 20608 ms on the
+renamed `wlan1`; the watchdog was disarmed without a reboot. The patched
+system, profile, kernel, generation-25 default, `keep_d0_on_remove=Y`, and
+empty lab-state invariants remained intact. There was no page-pool warning or
+kernel warning/oops. No rerun was attempted.
