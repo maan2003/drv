@@ -1661,3 +1661,33 @@ BME, WFDMA, the MSI eventfd/source, firmware DMA, or MCU publication was
 enabled during this run, and no userspace cleanup can be claimed. The
 watchdog recovery again rebound `mt7921e`; `iwd` was active, `wlan0` connected,
 and the watchdog inactive. This was the only authorized rerun.
+
+### Contained pre-engine WFDMA preparation
+
+The passed DMA-resource coordinator now also represents Linux's coherent
+pre-engine transport preparation. With BME and WFDMA engines initially off it
+sanitizes the global configuration, waits for idle, configures the extended
+and DMASHDL bypass state, toggles the WFDMA index reset, programs the existing
+global rings, installs the selected MSI eventfd, requires empty interrupt
+status, and writes the source-derived queue configuration. It then enables
+BME while leaving TX/RX engine bits clear and both host and PCIe MAC source
+masks zero. No MCU/FWDL CPU index or firmware descriptor is published.
+
+Cleanup retains the passed containment order: host and MAC masks zero, WFDMA
+disabled and idle, BME clear, MSI disabled, all active DMA/BAR/IOAS resources
+released, VFIO reset, and the established safe-state verification. Focused
+source-shape coverage proves the preparation precedes BME, no engine-enable
+construction or response-source mask is present, and unmap precedes reset.
+
+The single guarded attempt used binary SHA-256
+`5c1e64e3375095f44bcfef7938407f093c5fb6650ed789fe539a59c88b986b32`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T134859Z-0000_05_00.0.log`.
+It durably reached both `vfio_wfdma_prep_begin` and
+`vfio_wfdma_prep_complete` with engines, host IRQ, and MAC IRQ disabled, BME
+enabled, and MSI owned. Immediate cleanup disabled BME and MSI, released the
+resources before reset, and passed `vfio_dma_safe_state_verified`. Userspace
+ended with `rc=0` and supervisor restore with `failed=0`. The wrapper lost its
+SSH heartbeat and conservatively left watchdog recovery armed, but the durable
+report is complete. After recovery `mt7921e` was rebound, `iwd` active,
+`wlan0` connected, and the watchdog inactive. No follow-on attempt was made.
