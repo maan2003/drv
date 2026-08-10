@@ -1238,13 +1238,13 @@ where
             attempt,
             at_ms: now.saturating_sub(start),
         });
-        transport
-            .write_clear_own()
-            .map_err(OwnershipError::Transport)?;
-        event(OwnershipEvent::ClearOwnWritten {
-            attempt,
-            at_ms: transport.now_ms().saturating_sub(start),
-        });
+        let clear_result = transport.write_clear_own();
+        if clear_result.is_ok() {
+            event(OwnershipEvent::ClearOwnWritten {
+                attempt,
+                at_ms: transport.now_ms().saturating_sub(start),
+            });
+        }
         if aspm_supported {
             transport.sleep_us_range(DRIVER_OWN_ASPM_DELAY_MIN_US, DRIVER_OWN_ASPM_DELAY_MAX_US);
             event(OwnershipEvent::AspmDelay {
@@ -1254,6 +1254,7 @@ where
                 maximum_us: DRIVER_OWN_ASPM_DELAY_MAX_US,
             });
         }
+        clear_result.map_err(OwnershipError::Transport)?;
         let attempt_deadline = transport.now_ms().saturating_add(DRIVER_OWN_ATTEMPT_MS);
         loop {
             event(OwnershipEvent::StatusReadBefore {
@@ -7069,6 +7070,7 @@ mod tests {
         set_writes: u8,
         reads: u8,
         fail_read: Option<u8>,
+        fail_clear_after_write: bool,
         fail_set: bool,
         fail_set_after_write: bool,
         aspm_delays: Vec<(u64, u64)>,
@@ -7083,6 +7085,9 @@ mod tests {
             self.clear_writes += 1;
             if self.clear_after_writes == Some(self.clear_writes) {
                 self.status &= !PCIE_LPCR_HOST_OWN_SYNC;
+            }
+            if self.fail_clear_after_write {
+                return Err("clear");
             }
             Ok(())
         }
@@ -7131,6 +7136,7 @@ mod tests {
             set_writes: 0,
             reads: 0,
             fail_read: None,
+            fail_clear_after_write: false,
             fail_set: false,
             fail_set_after_write: false,
             aspm_delays: Vec::new(),
@@ -7192,6 +7198,24 @@ mod tests {
             )))
         );
         assert_eq!(transport.clear_writes, 1);
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
+    }
+
+    #[test]
+    fn ambiguous_clear_error_settles_for_aspm_before_rollback() {
+        let mut transport = round_trip_fake(OwnershipState::FirmwareOwned);
+        transport.fail_clear_after_write = true;
+        assert_eq!(
+            round_trip_driver_ownership(&mut transport, true, |_| {}),
+            Err(OwnershipRoundTripError::Acquire(OwnershipError::Transport(
+                "clear"
+            )))
+        );
+        assert_eq!(
+            transport.aspm_delays,
+            vec![(DRIVER_OWN_ASPM_DELAY_MIN_US, DRIVER_OWN_ASPM_DELAY_MAX_US)]
+        );
         assert_eq!(transport.set_writes, 1);
         assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
     }
