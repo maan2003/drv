@@ -2066,3 +2066,28 @@ state were unchanged. This excludes the target's ACPI scan, bounded credential
 read, and direct exec path as the exchange-11 stall, leaving the
 `wifi-driver-lab` native-to-VFIO handoff and its page-pool shutdown as the
 active blocker.
+
+A guarded run after deploying the proposed pre-unbind quiesce wrapper was
+launched as `wifi-sae-exchange12` from commit `6d5348ffd6fa`; the release
+binary SHA-256 was
+`9bd501540921cefb4e9e4e7fa124378d7aca8b01dde42e6ac467ac6e12a36833`.
+Report
+`/var/lib/wifi-driver-lab/reports/20260810T175018Z-0000_05_00.0.log`
+records VFIO acquisition, BAR discovery, firmware patch and RAM startup, NIC
+capability, EEPROM and CLC configuration, passive receive preparation, and
+five bounded channel-36 scans. Two scans received beacons from
+`f2:a3:18:4f:30:76`, but the configured target was
+`42:50:fd:67:3a:88`; the run therefore stopped before SAE with
+`target beacon did not authorize channel 36`.
+
+Cleanup disabled bus mastering, quiesced the transport, released DMA mappings,
+reset the VFIO device, verified the safe state, and restored the native driver
+with `RESTORE end failed=0`. Association, key, and data effects remained
+disabled. The report contains no `QUIESCE` netdev line: review found that the
+wrapper compared each resolved netdev device path with an unresolved
+`/sys/bus/pci/devices` symlink, so the new netdev gate matched nothing and
+vacuously succeeded. The later page-pool warning occurred during the watchdog
+reboot after the already-successful native restore; the supervisor deliberately
+kept the watchdog armed because the experiment returned nonzero. Native
+`mt7921e`, iwd, and carrier recovered on the next boot. No further physical
+mutation was attempted pending a canonicalized, nonempty quiesce match.
