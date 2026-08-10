@@ -526,6 +526,7 @@ dependencies = [
  "fuchsia-softmac-port",
  "fuchsia-trace",
  "futures",
+ "ieee80211",
  "mt7921-port-spike",
  "mt7921-softmac-adapter",
  "wlan-common",

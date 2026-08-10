@@ -3447,11 +3447,15 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if rxd1 & (1 << 13) == 0 {
         return Err(PassiveRxError::MissingRxVector);
     }
-    let rxv = bytes.get(offset..offset + 8).ok_or(PassiveRxError::Truncated)?;
+    let rxv = bytes
+        .get(offset..offset + 8)
+        .ok_or(PassiveRxError::Truncated)?;
     let mut rcpi = u32::from_le_bytes(rxv[4..8].try_into().expect("fixed field"));
     offset += 8;
     if rxd1 & (1 << 15) != 0 {
-        let group5 = bytes.get(offset..offset + 72).ok_or(PassiveRxError::Truncated)?;
+        let group5 = bytes
+            .get(offset..offset + 72)
+            .ok_or(PassiveRxError::Truncated)?;
         // Pinned Linux skips the first 24 bytes of GROUP_5, takes its
         // overriding RCPI field, then advances across the remaining 48.
         rcpi = u32::from_le_bytes(group5[24..28].try_into().expect("fixed field"));
@@ -9556,3 +9560,15 @@ mod tests {
         );
     }
 }
+
+/// The actual affine provenance carrier and its owning session are deliberately
+/// binary-private and cannot be constructed by an external crate.
+///
+/// ```compile_fail
+/// let _ = mt7921_port_spike::ProvenanceHandle {
+///     session: unsafe { std::num::NonZeroU64::new_unchecked(1) },
+///     generation: 1,
+///     index: 0,
+/// };
+/// ```
+pub struct PrivateProvenanceIsNotExported;

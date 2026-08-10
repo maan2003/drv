@@ -28,6 +28,7 @@ fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a9
 fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
 fuchsia-trace = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/trace/rust" }
 fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
+ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/ieee80211" }
 futures = "=0.3.32"
 wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/common/rust" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
