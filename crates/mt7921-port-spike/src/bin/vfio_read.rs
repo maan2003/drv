@@ -1583,7 +1583,7 @@ fn run() -> Result<(), String> {
             record_sae_stage("vfio_attached_d0_preflight_already_ready");
         }
 
-        if operation.uses_contained_transport_gate() {
+        let active_device_info = if operation.records_active_transport_stages() {
             let mut device_info = DeviceInfo {
                 argsz: size::<DeviceInfo>(),
                 ..Default::default()
@@ -1608,7 +1608,15 @@ fn run() -> Result<(), String> {
                 "vfio_device_get_info_after argsz={} flags={:#x} num_regions={} num_irqs={}",
                 device_info.argsz, device_info.flags, device_info.num_regions, device_info.num_irqs
             ));
+            Some(device_info)
+        } else {
+            None
+        };
 
+        if operation.uses_contained_transport_gate() {
+            let device_info = active_device_info
+                .as_ref()
+                .expect("contained transport recorded VFIO device info");
             let mut bar0 = None;
             for index in 0..device_info.num_regions {
                 let mut region = RegionInfo {
@@ -10206,6 +10214,8 @@ mod tests {
 
     #[test]
     fn sae_records_the_shared_host_preflight_and_vfio_boundaries() {
+        assert!(Operation::RunOneShotSaeAuth.records_active_transport_stages());
+        assert!(!Operation::RunOneShotSaeAuth.uses_contained_transport_gate());
         let source = include_str!("vfio_read.rs");
         let startup = source
             .split("record_sae_stage(\"credential_read\");")
@@ -10237,10 +10247,11 @@ mod tests {
         let d0_marker = post_attach
             .find("vfio_attached_d0_preflight_already_ready")
             .unwrap();
+        let device_info = post_attach.find("vfio_device_get_info_before").unwrap();
         let contained = post_attach
             .find("if operation.uses_contained_transport_gate()")
             .unwrap();
-        assert!(d0 < d0_marker && d0_marker < contained);
+        assert!(d0 < d0_marker && d0_marker < device_info && device_info < contained);
     }
 
     #[test]
