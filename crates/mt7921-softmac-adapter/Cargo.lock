@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,17 +530,23 @@ name = "mt7921-softmac-adapter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fdf",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",
+ "fuchsia-inspect",
  "fuchsia-softmac-port",
  "fuchsia-trace",
  "futures",
  "mt7921-port-spike",
+ "wlan-common",
  "wlan-mlme",
+ "wlan-sme",
+ "wlancfg-selection",
  "zx",
 ]
 
@@ -1135,6 +1152,30 @@ name = "wlan-trace"
 version = "0.1.0"
 dependencies = [
  "fuchsia-trace",
+]
+
+[[package]]
+name = "wlancfg-selection"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "async-trait",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fuchsia-async",
+ "fuchsia-inspect",
+ "fuchsia-inspect-contrib",
+ "futures",
+ "ieee80211",
+ "log",
+ "rand 0.9.4",
+ "wlan-common",
+ "wlan-sme",
+ "zx",
 ]
 
 [[package]]
