@@ -786,3 +786,13 @@ absence result for this non-VGA function; useful discovery completed through
 the PCI configuration region at index 7. The `EBUSY` result separately shows
 that discovery cleanup must close or detach the VFIO device before destroying
 its attached IOAS.
+
+The corrected discovery-only run uses `VFIO_DEVICE_DETACH_IOMMUFD_PT` before
+IOAS destruction and treats `EINVAL` only on non-required region slots as an
+absent region. Report
+`/var/lib/wifi-driver-lab/reports/20260810T100543Z-0000_05_00.0.log` records
+index 8 as absent, then reaches both `vfio_region_discovery_complete` and
+`vfio_region_discovery_released_safe`. Userspace exited zero and supervisor
+restoration ended with `failed=0`; there was no BAR mapping and no watchdog
+reboot. The boot ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`, and the
+native driver returned in D0 with iwd and the default route active.
