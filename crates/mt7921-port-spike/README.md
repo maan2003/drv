@@ -918,3 +918,36 @@ observed association, IPv4 `192.168.235.6/24`, the default route, and a
 successful gateway ping together; it disarmed the watchdog at
 `16:00:35.356926`. The native driver remained bound in D0 and iwd remained
 active.
+
+### Next boundary after dynamic identity
+
+The temporary `--run-one-shot-sae-auth` preflight currently stops and releases
+VFIO immediately after the proven `MT_HW_CHIPID` and `MT_HW_REV` reads. It must
+not be advanced by merely deleting that return: the continuation acquires the
+full active-MCU resource set and eventually reaches interrupt, reset, WFDMA,
+firmware, and radio operations.
+
+At pinned Linux commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`mt7921/pci.c:mt7921_pci_probe` reads `MT_HW_CHIPID`, conditionally reads
+`MT_HW_BOUND`, then reads `MT_HW_REV`. `mt792x_regs.h` defines
+`MT_HW_BOUND = 0x70010020`; under the already proven L1 base `0x7001` this is
+one aligned volatile 32-bit read at BAR0 offset `0x40020`. Linux tests only bit
+7 when the chip ID is `0x7961`: set changes the effective chip ID to `0x7920`,
+clear retains `0x7961`. It does not write this register and does not interpret
+the other bits. The low eight bits of the subsequent revision word form the
+low byte of Linux's composite ASIC revision.
+
+Pinned Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3` has no PCI,
+L1-remap, or MT7921 identity operation at this point. Its client MLME begins at
+the `DeviceOps`/SoftMAC contract after hardware initialization, so this read is
+Linux-derived transport mechanics rather than Fuchsia policy.
+
+The smallest independently reversible next boundary is therefore to extend
+the existing narrow preflight with exactly the `MT_HW_BOUND` read, not to enter
+the full continuation. It must retain the read-only `0x40000` window mapping,
+derive selector `0x7001` from the complete saved selector, verify the posted
+selector write, reject a chip ID other than `0x7961`, perform no window access
+other than the three closed identity offsets, restore and verify the exact
+saved selector on every exit, then unmap and release. An all-ones read must
+fail closed as invalid MMIO evidence. No PCI command, interrupt gate, WFSYS,
+WFDMA, firmware, DMA, or radio operation belongs in this boundary.

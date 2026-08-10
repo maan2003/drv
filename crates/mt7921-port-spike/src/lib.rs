@@ -1234,8 +1234,8 @@ where
     let operation = (|| {
         select_l1(transport, saved, 0x7001, &mut event)?;
         let chip_id = read_l1(transport, "chip_id", 0x7001_0200, &mut event)?;
-        let revision = read_l1(transport, "revision", 0x7001_0204, &mut event)?;
         let hardware_bound = read_l1(transport, "hardware_bound", 0x7001_0020, &mut event)?;
+        let revision = read_l1(transport, "revision", 0x7001_0204, &mut event)?;
         select_l1(transport, saved, 0x1806, &mut event)?;
         let top_low_power_control =
             read_l1(transport, "top_low_power_control", 0x1806_0010, &mut event)?;
@@ -6854,6 +6854,14 @@ mod tests {
         assert_eq!(status.revision, 0x7001_0204);
         assert_eq!(status.hardware_bound, 0x7001_0020);
         assert_eq!(status.top_low_power_control, 0x1806_0010);
+        let reads = events
+            .iter()
+            .filter_map(|event| match event {
+                DynamicL1Event::RegisterRead { physical, .. } => Some(*physical),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads, [0x7001_0200, 0x7001_0020, 0x7001_0204, 0x1806_0010]);
         assert_eq!(transport.selector, 0xabcd_1234);
         assert_eq!(transport.writes, [0xabcd_7001, 0xabcd_1806, 0xabcd_1234]);
         assert_eq!(
