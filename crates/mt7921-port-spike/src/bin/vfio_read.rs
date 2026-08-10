@@ -723,6 +723,7 @@ fn run_contained_dma_resource_round_trip(
     wfdma: &ReadPage,
     pcie_mac: &ReadPage,
     selected_irq: PciIrqCapability,
+    firmware_images: Option<(&[u8], &[u8])>,
 ) -> Result<(), String> {
     record_sae_stage("vfio_dma_resource_round_trip_begin");
     capsule.active = Some(ActiveVfioResources::default());
@@ -901,6 +902,66 @@ fn run_contained_dma_resource_round_trip(
         record_sae_stage(
             "vfio_wfdma_activation_complete engines=true host_irq=wm_wm2 mac_irq=true top_owned=true l0s_disabled=true swdef_normal=true firmware_published=false",
         );
+        if let Some((patch_bytes, ram_bytes)) = firmware_images {
+            record_sae_stage("vfio_firmware_transport_ready");
+            let signal = ActiveSignalGuard::install()?;
+            let conn = ReadPage::map(&capsule.device, info, 0xe0000, true)?;
+            let mcu = ActiveMcuIo {
+                wfdma,
+                irq: active.irq.as_mut().expect("IRQ installed"),
+                signal: &signal,
+                tx_ring: active.mcu_tx_ring.as_mut().expect("mapped"),
+                payload: active.command_payload.as_mut().expect("mapped"),
+                wm: ActiveMcuRx {
+                    rx_ring: active.mcu_rx_ring.as_mut().expect("mapped"),
+                    rx_buffers: active.mcu_rx_buffers.as_ref().expect("mapped"),
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 0,
+                    rx_count: 8,
+                    irq_bit: WM_RX_IRQ_BIT,
+                },
+                wm2: Some(ActiveMcuRx {
+                    rx_ring: active.mcu_wa_rx_ring.as_mut().expect("mapped"),
+                    rx_buffers: active.mcu_wa_rx_buffers.as_ref().expect("mapped"),
+                    rx_tail: 0,
+                    rx_head: 7,
+                    rx_ring_index: 4,
+                    rx_count: 8,
+                    irq_bit: WM2_RX_IRQ_BIT,
+                }),
+                extra_irq_mask: 0,
+                unsolicited: Vec::new(),
+                normal_rx_frames: Vec::new(),
+                descriptor_provenance: DescriptorProvenance::new(),
+            };
+            let mut loader = VfioFirmwareLoader {
+                mcu,
+                conn: &conn,
+                pcie_mac,
+                bdf,
+                fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
+                fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
+                sequence: 0,
+                command_index: 0,
+                fwdl_index: 0,
+                pending_scatter: None,
+                start: Instant::now(),
+            };
+            let patch = Patch::parse(patch_bytes)
+                .map_err(|error| format!("parse patch for contained loader: {error:?}"))?;
+            let firmware = Firmware::parse(ram_bytes)
+                .map_err(|error| format!("parse RAM for contained loader: {error:?}"))?;
+            let report = load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
+                .map_err(|error| format!("contained firmware bootstrap: {error:?}"))?;
+            record_sae_stage(&format!(
+                "vfio_firmware_bootstrap_complete patch_sections={} ram_regions={} scatter_chunks={} capability_elements={} eeprom=false calibration=false radio=false",
+                report.patch_sections,
+                report.ram_regions,
+                report.scatter_chunks,
+                report.nic_capability.element_count,
+            ));
+        }
         Ok(())
     })();
 
@@ -1126,9 +1187,23 @@ fn run() -> Result<(), String> {
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     #[cfg(feature = "fuchsia-passive")]
-    if operation == Operation::RunOneShotSaeAuth {
-        record_sae_stage("process_enter");
+    if operation.uses_contained_transport_gate() {
+        record_sae_stage(if operation == Operation::RunOneShotFirmware {
+            "vfio_firmware_process_started"
+        } else {
+            "process_enter"
+        });
     }
+    let contained_firmware_images = if operation == Operation::RunOneShotFirmware {
+        let patch = decompress_patch()?;
+        let ram = decompress_ram()?;
+        Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+        Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+        record_sae_stage("vfio_firmware_artifacts_ready");
+        Some((patch, ram))
+    } else {
+        None
+    };
     #[cfg(feature = "fuchsia-passive")]
     let power_target = if matches!(
         operation,
@@ -1164,7 +1239,7 @@ fn run() -> Result<(), String> {
         .then(verify_external_watchdog_armed)
         .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("watchdog_verified");
     }
     let containment = operation
@@ -1172,7 +1247,7 @@ fn run() -> Result<(), String> {
         .then(|| ContainmentLedger::acquire(watchdog))
         .transpose()?;
 
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("vfio_cdev_open_before");
     }
     let device = Arc::new(
@@ -1182,7 +1257,7 @@ fn run() -> Result<(), String> {
             .open(&vfio)
             .map_err(|error| format!("open {vfio}: {error}"))?,
     );
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("vfio_cdev_open_after");
         record_sae_stage("iommufd_open_before");
     }
@@ -1193,20 +1268,20 @@ fn run() -> Result<(), String> {
             .open("/dev/iommu")
             .map_err(|error| format!("open /dev/iommu: {error}"))?,
     );
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("iommufd_open_after");
     }
     let mut capsule = ActiveVfioCapsule::new(device, iommu, containment);
     // Advisory preflight facts are re-read with the complete resource owner
     // installed, before the first stateful VFIO operation is attempted.
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("second_pci_identity_before");
     }
     verify_pci_identity(&bdf)?;
-    if operation == Operation::RunOneShotSaeAuth {
+    if operation.uses_contained_transport_gate() {
         record_sae_stage("second_pci_identity_after");
     }
-    if operation != Operation::RunOneShotSaeAuth {
+    if !operation.uses_contained_transport_gate() {
         verify_pci_dma_disabled(&bdf)?;
     }
 
@@ -1220,7 +1295,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::VfioBound);
         }
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("vfio_bind_iommufd_before");
         }
         ioctl_mut(
@@ -1229,7 +1304,7 @@ fn run() -> Result<(), String> {
             &mut bind,
             "bind iommufd",
         )?;
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("vfio_bind_iommufd_after");
         }
         capsule
@@ -1242,7 +1317,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAllocated);
         }
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("ioas_allocate_before");
         }
         ioctl_mut(
@@ -1251,7 +1326,7 @@ fn run() -> Result<(), String> {
             &mut alloc,
             "allocate IOAS",
         )?;
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("ioas_allocate_after");
         }
         capsule.ioas = Some(Ioas {
@@ -1268,7 +1343,7 @@ fn run() -> Result<(), String> {
         if let Some(ledger) = capsule.containment.as_mut() {
             ledger.mark_possibly_active(Hazard::IoasAttached);
         }
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("vfio_attach_iommufd_pt_before");
         }
         ioctl_mut(
@@ -1278,11 +1353,11 @@ fn run() -> Result<(), String> {
             "attach IOAS",
         )?;
         capsule.ioas_attached = true;
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             record_sae_stage("vfio_attach_iommufd_pt_after");
         }
 
-        if operation == Operation::RunOneShotSaeAuth {
+        if operation.uses_contained_transport_gate() {
             verify_pci_dma_disabled(&bdf).map_err(|error| {
                 format!("vfio_attached_d0_preflight_not_ready; refusing reset: {error}")
             })?;
@@ -1869,6 +1944,9 @@ fn run() -> Result<(), String> {
                                 &wfdma_page,
                                 &pcie_mac_page,
                                 selected_irq,
+                                contained_firmware_images
+                                    .as_ref()
+                                    .map(|(patch, ram)| (patch.as_slice(), ram.as_slice())),
                             )
                         });
                         record_sae_stage("vfio_irq_reset_wfdma_munmap_before page=0xd4000");
@@ -8228,6 +8306,20 @@ enum Operation {
 }
 
 impl Operation {
+    fn uses_contained_transport_gate(self) -> bool {
+        if self == Self::RunOneShotFirmware {
+            return true;
+        }
+        #[cfg(feature = "fuchsia-passive")]
+        {
+            self == Self::RunOneShotSaeAuth
+        }
+        #[cfg(not(feature = "fuchsia-passive"))]
+        {
+            false
+        }
+    }
+
     #[cfg(feature = "fuchsia-passive")]
     fn passive_scan_attempt_limit(self) -> usize {
         if matches!(self, Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth) {
@@ -9262,6 +9354,10 @@ mod tests {
             .split("pub fn main")
             .next()
             .unwrap();
+        let activation_only = boundary
+            .split("if let Some((patch_bytes, ram_bytes)) = firmware_images")
+            .next()
+            .unwrap();
         let mapped = boundary.find("acquire_active_vfio_resources(").unwrap();
         let disabled = boundary.find("vfio_dma_pre_bme_verified").unwrap();
         let prep = boundary.find("vfio_wfdma_prep_begin").unwrap();
@@ -9288,13 +9384,40 @@ mod tests {
         assert!(complete < activation && activation < engine && engine < activated);
         assert!(activated < mask && mask < idle && idle < bme_off);
         assert!(bme_off < unmap && unmap < reset);
-        assert!(!boundary.contains("load_mt7921_firmware"));
-        assert!(!boundary.contains("publish_mcu_command"));
-        assert!(!boundary.contains("dma_and_response_irq_enabled"));
-        assert!(!boundary.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
-        assert!(!boundary.contains("publish_mcu_bytes"));
-        assert!(!boundary.contains("write_active_wfdma(0xd4408"));
-        assert!(!boundary.contains("write_active_wfdma(0xd4418"));
+        assert!(!activation_only.contains("load_mt7921_firmware"));
+        assert!(!activation_only.contains("publish_mcu_command"));
+        assert!(!activation_only.contains("dma_and_response_irq_enabled"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4204, response_irq_mask)"));
+        assert!(!activation_only.contains("publish_mcu_bytes"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4408"));
+        assert!(!activation_only.contains("write_active_wfdma(0xd4418"));
+    }
+
+    #[test]
+    fn firmware_bootstrap_reuses_contained_transport_source_shape() {
+        assert!(Operation::RunOneShotFirmware.uses_contained_transport_gate());
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
+        let ready = boundary.find("vfio_firmware_transport_ready").unwrap();
+        let loader = boundary.find("load_mt7921_firmware_bootstrap").unwrap();
+        let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
+        assert!(activated < ready && ready < loader && loader < cleanup);
+
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let process = run.find("vfio_firmware_process_started").unwrap();
+        let artifacts = run.find("vfio_firmware_artifacts_ready").unwrap();
+        let attach = run.find("VFIO_DEVICE_BIND_IOMMUFD").unwrap();
+        assert!(process < artifacts && artifacts < attach);
     }
 
     #[test]
