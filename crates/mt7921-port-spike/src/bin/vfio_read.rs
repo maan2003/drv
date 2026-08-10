@@ -815,6 +815,13 @@ fn run_contained_dma_resource_round_trip(
             )
             .map_err(|error| format!("prepare contained RX rings: {error:?}"))?;
             wfdma.write_rx_ring_slot(
+                2,
+                active.data_rx_ring.as_ref().expect("mapped").iova as u32,
+                8,
+                7,
+                0,
+            )?;
+            wfdma.write_rx_ring_slot(
                 4,
                 active.mcu_wa_rx_ring.as_ref().expect("mapped").iova as u32,
                 8,
@@ -2851,6 +2858,7 @@ fn run() -> Result<(), String> {
                     log_global_rx_ring_event,
                 )
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
+                wfdma.write_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
             capsule
@@ -6782,7 +6790,6 @@ struct PassiveMacExecutor<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PassivePrepareStep {
     MacMmio,
-    ProgramDataRing,
     VerifyDataRing,
     AuthorizeDataIrq,
     EnableDataIrq,
@@ -6795,7 +6802,6 @@ fn run_passive_prepare_steps<E>(
 ) -> Result<(), E> {
     for step in [
         PassivePrepareStep::MacMmio,
-        PassivePrepareStep::ProgramDataRing,
         PassivePrepareStep::VerifyDataRing,
         PassivePrepareStep::AuthorizeDataIrq,
         PassivePrepareStep::EnableDataIrq,
@@ -7316,14 +7322,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     }
                     .execute()
                     .map_err(PhysicalPassiveError)?;
-                }
-                PassivePrepareStep::ProgramDataRing => {
-                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                    self.loader
-                        .mcu
-                        .wfdma
-                        .write_rx_ring_slot(2, self.data.rx_ring.iova as u32, 8, 7, 0)
-                        .map_err(PhysicalPassiveError)?;
                 }
                 PassivePrepareStep::VerifyDataRing => self
                     .loader
@@ -9608,8 +9606,23 @@ mod tests {
     }
 
     #[test]
-    fn contained_rx2_ext_ctrl_is_source_exact_and_precedes_rx_dma() {
+    fn contained_rx2_lifecycle_is_source_exact_and_precedes_rx_dma() {
         let source = include_str!("vfio_read.rs");
+        let resource_prep = source
+            .split("fn acquire_active_vfio_resources")
+            .nth(1)
+            .unwrap()
+            .split("fn run_contained_dma_resource_round_trip")
+            .next()
+            .unwrap();
+        let data_descriptors = resource_prep
+            .find("let prepared_data = prepare_mcu_rx_ring")
+            .unwrap();
+        let data_fence = resource_prep
+            .find("atomic::fence(std::sync::atomic::Ordering::Release)")
+            .unwrap();
+        assert!(data_descriptors < data_fence);
+
         let boundary = source
             .split("fn run_contained_dma_resource_round_trip")
             .nth(1)
@@ -9618,13 +9631,16 @@ mod tests {
             .next()
             .unwrap();
         let rx_rings = boundary.find("prepare_global_rx_rings(").unwrap();
+        let rx2_identity = boundary
+            .find("active.data_rx_ring.as_ref().expect(\"mapped\").iova as u32")
+            .unwrap();
         let rx2_ext = boundary
             .find("write_active_wfdma(0xd4688, 0x0040_0004)")
             .unwrap();
         let rx_dma = boundary
             .find("write_active_wfdma(0xd4208, enabled)")
             .unwrap();
-        assert!(rx_rings < rx2_ext && rx2_ext < rx_dma);
+        assert!(rx_rings < rx2_identity && rx2_identity < rx2_ext && rx2_ext < rx_dma);
         assert!(active_wfdma_write_allowed(
             0xd4688,
             0x0040_0004,
@@ -9643,6 +9659,22 @@ mod tests {
             (0xd4690, 0x00c0_0004),
         ]));
         assert!(!accepts(&[(0xd4680, 4), (0xd4690, 0x00c0_0004)]));
+
+        let accepts_identity = |base, count, cidx, didx| {
+            base == 0x0101_0000 && count == 8 && cidx == 7 && didx == 0
+        };
+        assert!(accepts_identity(0x0101_0000, 8, 7, 0));
+        assert!(!accepts_identity(0x0100_3000, 8, 0, 0));
+
+        let passive_prepare = source
+            .split("fn prepare_passive_receive(&mut self)")
+            .nth(1)
+            .unwrap()
+            .split("fn command(")
+            .next()
+            .unwrap();
+        assert!(!passive_prepare.contains("write_rx_ring_slot"));
+        assert!(!passive_prepare.contains("ProgramDataRing"));
     }
 
     #[test]
@@ -11609,7 +11641,6 @@ mod tests {
     fn passive_prepare_order_stops_at_every_injected_failure() {
         let expected = [
             PassivePrepareStep::MacMmio,
-            PassivePrepareStep::ProgramDataRing,
             PassivePrepareStep::VerifyDataRing,
             PassivePrepareStep::AuthorizeDataIrq,
             PassivePrepareStep::EnableDataIrq,
