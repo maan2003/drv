@@ -1691,3 +1691,31 @@ ended with `rc=0` and supervisor restore with `failed=0`. The wrapper lost its
 SSH heartbeat and conservatively left watchdog recovery armed, but the durable
 report is complete. After recovery `mt7921e` was rebound, `iwd` active,
 `wlan0` connected, and the watchdog inactive. No follow-on attempt was made.
+
+### Contained transport activation without firmware
+
+The same contained coordinator now continues from passed pre-engine state
+through the remaining Linux pre-firmware transport activation as one boundary:
+it enables WFDMA TX/RX with the source-derived global configuration, opens the
+PCIe MAC and WM/WM2 host response sources, acquires top-driver ownership,
+disables PCIe L0s, and selects normal SWDEF mode. It does not publish an MCU,
+FWDL, or firmware-ring CPU index, construct a loader, or issue an MCU command.
+
+Containment immediately masks the host and MAC sources, clears the WFDMA
+engine and related configuration bits, waits for DMA idle, clears BME,
+disables MSI, releases resources, resets VFIO, and verifies the established
+safe state. Focused source-shape coverage proves activation precedes masking
+and containment, and rejects every firmware publication primitive.
+
+The single guarded attempt used binary SHA-256
+`c3a5038a902e356fcf18dfd9d1f050453882d78d308b73d30474251832763d62`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T135553Z-0000_05_00.0.log`.
+It durably completed `vfio_wfdma_activation_begin` and
+`vfio_wfdma_activation_complete` with engines enabled, WM/WM2 and MAC sources
+enabled, top ownership acquired, L0s disabled, SWDEF normal, and firmware
+publication false. Immediate containment disabled BME, released mappings
+before reset, and passed `vfio_dma_safe_state_verified`. Userspace ended with
+`rc=0` and supervisor restore with `failed=0`. After the conservative wrapper
+heartbeat loss, native `mt7921e` rebound, `iwd` was active, `wlan1` connected,
+and the watchdog inactive. No firmware attempt followed.
