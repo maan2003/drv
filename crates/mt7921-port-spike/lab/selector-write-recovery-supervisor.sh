@@ -30,8 +30,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
+device_path=$(readlink -f "/sys/bus/pci/devices/$bdf")
+connected_bssid=
+connected_frequency=
+for net in /sys/class/net/*; do
+  [[ -e $net/device && $(readlink -f "$net/device") == "$device_path" ]] || continue
+  link=$(timeout 2 iw dev "$(basename "$net")" link 2>/dev/null) || continue
+  bssid=$(awk '/^Connected to / { print $3; exit }' <<< "$link")
+  frequency=$(awk '/^[[:space:]]*freq:/ { print $2; exit }' <<< "$link")
+  [[ $bssid =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $frequency =~ ^[0-9]+$ ]] \
+    || continue
+  [[ -z $connected_bssid ]] || {
+    echo "multiple connected target Wi-Fi interfaces; refusing handoff" >&2
+    exit 1
+  }
+  connected_bssid=$bssid
+  connected_frequency=$frequency
+done
+[[ -n $connected_bssid ]] || {
+  echo "target Wi-Fi interface is not connected; refusing handoff" >&2
+  exit 1
+}
+case $connected_frequency in
+  5[0-9][0-9][0-9])
+    (((connected_frequency - 5000) % 5 == 0)) || exit 1
+    connected_channel=$(((connected_frequency - 5000) / 5))
+    case $connected_channel in
+      36|40|44|48|52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144|149|153|157|161|165) ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *)
+    echo "connected target is outside the source-exact 5 GHz SAE boundary" >&2
+    exit 1
+    ;;
+esac
+export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel
 token=$(wifi-lab-watchdog arm) || exit 1
 printf 'START realtime=%s bdf=%s\n' "$start" "$bdf" >> "$timeline"
+printf 'TARGET bssid=%s channel=%s frequency=%s\n' \
+  "$connected_bssid" "$connected_channel" "$connected_frequency" >> "$timeline"
 sync -f "$timeline"
 
 wifi-driver-lab "$bdf" 300 -- "$@"
@@ -48,7 +86,6 @@ default_route=false
 connectivity=false
 association_failure=false
 connectivity_ms=-1
-device_path=$(readlink -f "/sys/bus/pci/devices/$bdf")
 for sample in $(seq 0 54); do
   now=$(date --iso-8601=ns)
   driver=none

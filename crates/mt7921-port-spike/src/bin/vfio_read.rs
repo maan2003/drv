@@ -1470,8 +1470,41 @@ fn run() -> Result<(), String> {
         if ssid.is_empty() || ssid.len() > 32 {
             return Err("power-setup SSID length is invalid".into());
         }
+        let channel = env::var("DRV_SAE_CHANNEL")
+            .map_err(|_| "DRV_SAE_CHANNEL is required for power setup")?
+            .parse::<u8>()
+            .map_err(|_| "DRV_SAE_CHANNEL is invalid")?;
+        if !matches!(
+            channel,
+            36 | 40
+                | 44
+                | 48
+                | 52
+                | 56
+                | 60
+                | 64
+                | 100
+                | 104
+                | 108
+                | 112
+                | 116
+                | 120
+                | 124
+                | 128
+                | 132
+                | 136
+                | 140
+                | 144
+                | 149
+                | 153
+                | 157
+                | 161
+                | 165
+        ) {
+            return Err("DRV_SAE_CHANNEL is unsupported".into());
+        }
         verify_no_usable_mt792x_acpi_sar()?;
-        Some((bssid, ssid))
+        Some((bssid, ssid, channel))
     } else {
         None
     };
@@ -3231,10 +3264,12 @@ fn run() -> Result<(), String> {
                                     format!("derive pinned SME channels: {error:?}")
                                 })?,
                                 Operation::RunOneShotPowerSetup => {
-                                    channels_for(WlanBand::FiveGhz, &[36])
+                                    let channel = power_target.as_ref().expect("power target").2;
+                                    channels_for(WlanBand::FiveGhz, &[channel])
                                 }
                                 Operation::RunOneShotSaeAuth => {
-                                    channels_for(WlanBand::FiveGhz, &[36])
+                                    let channel = power_target.as_ref().expect("SAE target").2;
+                                    channels_for(WlanBand::FiveGhz, &[channel])
                                 }
                                 _ => unreachable!("passive scan operation matched above"),
                             };
@@ -3295,7 +3330,7 @@ fn run() -> Result<(), String> {
                                 }
                             }
                             let mut beacon_authorizer =
-                                power_target.as_ref().map(|(bssid, ssid)| {
+                                power_target.as_ref().map(|(bssid, ssid, _)| {
                                     BeaconHintAuthorizer::new(*bssid, ssid.clone())
                                 });
                             let mut beacon_authorization = None;
@@ -3397,7 +3432,7 @@ fn run() -> Result<(), String> {
                             ) {
                                 let beacon_authorization = beacon_authorization
                                     .as_ref()
-                                    .ok_or("target beacon did not authorize channel 36")?;
+                                    .ok_or("target beacon did not authorize current channel")?;
                                 let beacon_authorizer = beacon_authorizer
                                     .as_ref()
                                     .expect("power setup created beacon authorizer");
@@ -11527,6 +11562,67 @@ mod tests {
         for forbidden in ["OpenOptions", "File::", "sync_all", "SAE_STAGE_PATH"] {
             assert!(!recorder.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn recovery_supervisor_disarms_after_proven_restore_even_when_experiment_failed() {
+        let source = include_str!("../../lab/selector-write-recovery-supervisor.sh");
+        let recovered = source
+            .split("if ((${#states[@]} == 0))")
+            .nth(1)
+            .unwrap()
+            .split("sleep 2")
+            .next()
+            .unwrap();
+        assert!(!recovered.contains("experiment_rc == 0"));
+        for proof in [
+            "! $unsafe",
+            "driver == mt7921e",
+            "power == D0",
+            "iwd_active == active",
+            "$association && $dhcp && $default_route && $connectivity",
+        ] {
+            assert!(recovered.contains(proof), "{proof}");
+        }
+        let failure = recovered.find("experiment_rc != 0").unwrap();
+        let disarm = recovered.find("wifi-lab-watchdog disarm").unwrap();
+        let complete = recovered.find("COMPLETE realtime=").unwrap();
+        assert!(disarm < failure && failure < complete);
+        assert!(recovered.contains("reason=experiment_rc_$experiment_rc"));
+    }
+
+    #[test]
+    fn recovery_supervisor_binds_sae_target_to_live_bss_and_channel_before_handoff() {
+        let supervisor = include_str!("../../lab/selector-write-recovery-supervisor.sh");
+        let derive = supervisor.find("device_path=$(readlink -f").unwrap();
+        let iw = supervisor.find("iw dev").unwrap();
+        let export = supervisor
+            .find("export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel")
+            .unwrap();
+        let handoff = supervisor.find("wifi-driver-lab \"$bdf\" 300").unwrap();
+        assert!(derive < iw && iw < export && export < handoff);
+        assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));
+        assert!(supervisor.contains("target Wi-Fi interface is not connected"));
+
+        let source = include_str!("vfio_read.rs");
+        let target = source
+            .split("let power_target =")
+            .nth(1)
+            .unwrap()
+            .split("let mut sae_credential")
+            .next()
+            .unwrap();
+        assert!(target.contains("DRV_SAE_CHANNEL"));
+        assert!(target.contains("Some((bssid, ssid, channel))"));
+        let channels = source
+            .split("let channels = match operation")
+            .nth(1)
+            .unwrap()
+            .split("let mut adapter")
+            .next()
+            .unwrap();
+        assert!(channels.contains("power_target.as_ref().expect(\"SAE target\").2"));
+        assert!(!channels.contains("WlanBand::FiveGhz, &[36]"));
     }
 
     #[test]
