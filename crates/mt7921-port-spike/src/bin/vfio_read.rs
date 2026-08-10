@@ -131,10 +131,7 @@ const PATCH_IMAGE_BYTES: usize = 92_192;
 const RAM_IMAGE_BYTES: usize = 792_036;
 const WATCHDOG_STATUS_PATH: &str = "/run/current-system/sw/bin/wifi-lab-watchdog";
 #[cfg(feature = "fuchsia-passive")]
-fn emit_sae_stage_best_effort(
-    event: &str,
-    emit: impl FnOnce(&str) -> std::io::Result<()>,
-) {
+fn emit_sae_stage_best_effort(event: &str, emit: impl FnOnce(&str) -> std::io::Result<()>) {
     // Diagnostic output must never become an ownership or cleanup gate. In
     // production the supervisor already captures stderr into the run report.
     let _ = emit(event);
@@ -3402,8 +3399,7 @@ fn run() -> Result<(), String> {
                                     let target_rcpi = target_bss
                                         .as_ref()
                                         .map(|bss| {
-                                            ((i16::from(bss.rssi_dbm) + 110) * 2)
-                                                .clamp(0, 220)
+                                            ((i16::from(bss.rssi_dbm) + 110) * 2).clamp(0, 220)
                                                 as u8
                                         })
                                         .ok_or("target BSS was not retained")?;
@@ -5847,12 +5843,9 @@ fn validate_uni_request(expected_cid: u8, encoded: &[u8]) -> Result<u8, String> 
     let expected_txd0 = u32::from(total) | (2 << 23) | (0x20 << 25);
     let expected_txd1 = (1u32 << 31) | (1 << 16);
     if encoded.len() < 48
-        || u32::from_le_bytes(encoded[0..4].try_into().expect("checked envelope"))
-            != expected_txd0
-        || u32::from_le_bytes(encoded[4..8].try_into().expect("checked envelope"))
-            != expected_txd1
-        || u16::from_le_bytes(encoded[32..34].try_into().expect("checked envelope"))
-            != total - 32
+        || u32::from_le_bytes(encoded[0..4].try_into().expect("checked envelope")) != expected_txd0
+        || u32::from_le_bytes(encoded[4..8].try_into().expect("checked envelope")) != expected_txd1
+        || u16::from_le_bytes(encoded[32..34].try_into().expect("checked envelope")) != total - 32
         || u16::from_le_bytes(encoded[34..36].try_into().expect("checked envelope"))
             != u16::from(expected_cid)
         || encoded[36] != 0
@@ -5945,17 +5938,13 @@ fn encode_legacy_wme_add_wcid_command(
         return Err("WCID add omitted valid sequence".into());
     }
     let mut bytes = vec![
-        176, 0, 0, 65, 0, 0, 1, 128, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        144, 0, 3, 0, 0, 160, 0, sequence, 0, 0, 0, 7, 0, 0, 0, 0,
-        bss_index, wcid, 5, 0, 1, 0, 0, 0, 0, 0, 20, 0, 2, 0, 1, 0,
-        2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 21, 0, 12, 0,
-        1, 0, 8, 0, 0, rcpi, 0, 0, 1, 0, 16, 0, 64, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 12, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 13, 0, 60, 0, wcid, 1, 4, 0, 0, 0, 0, 0,
-        0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0,
-        6, 0, 8, 0, 1, 0, 1, 0, 13, 0, 8, 0, 1, 0, 1, 0,
+        176, 0, 0, 65, 0, 0, 1, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 144, 0, 3, 0, 0, 160, 0, sequence, 0, 0, 0, 7, 0, 0, 0, 0, bss_index, wcid, 5, 0,
+        1, 0, 0, 0, 0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 21, 0, 12, 0, 1,
+        0, 8, 0, 0, rcpi, 0, 0, 1, 0, 16, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 12, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 13, 0, 60, 0, wcid, 1, 4, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0, 6, 0, 8, 0, 1, 0, 1,
+        0, 13, 0, 8, 0, 1, 0, 1, 0,
     ];
     bytes[66..68].copy_from_slice(&aid.to_le_bytes());
     bytes[68..74].copy_from_slice(&peer);
@@ -6038,7 +6027,8 @@ fn encode_disable_keys_command(
     wcid: u8,
     muar_index: u8,
 ) -> Result<SensitiveUniCommand, String> {
-    let mut command = encode_key_v2_command(sequence, bss_index, wcid, muar_index, 0, &[0; 16], None)?;
+    let mut command =
+        encode_key_v2_command(sequence, bss_index, wcid, muar_index, 0, &[0; 16], None)?;
     let bytes = &mut command.0;
     bytes[58..60].copy_from_slice(&8u16.to_le_bytes());
     bytes[60] = 1;
@@ -6121,6 +6111,92 @@ impl Drop for RetainedGtk {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientDataGeneration {
+    Association(u64),
+    Authorized(u64),
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy)]
+struct ClientRxCandidate {
+    generation: ClientDataGeneration,
+    eapol: bool,
+    wcid: u8,
+    tid: u8,
+    group: bool,
+    key_id: u8,
+    security_mode: u8,
+    cm: bool,
+    clm: bool,
+    icv_error: bool,
+    mic_error: bool,
+    fcs_error: bool,
+    pn: [u8; 6],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn connac2_group1_pn(group1: &[u8]) -> Result<[u8; 6], String> {
+    let pn = group1.get(..6).ok_or("Connac2 GROUP1 omitted CCMP PN")?;
+    Ok([pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]])
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_client_data_txwi(
+    payload_len: usize,
+    payload_iova: u64,
+    token: u16,
+    pid: u8,
+    eapol: bool,
+    protected: bool,
+) -> Result<[u8; 64], String> {
+    if payload_len == 0
+        || payload_len > 0x0fff
+        || payload_iova
+            .checked_add(payload_len as u64 - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || token >= 8192
+        || !(3..127).contains(&pid)
+    {
+        return Err("client data TX escaped TXWI/TXP bounds".into());
+    }
+    let mut bytes = [0u8; 64];
+    let words = if eapol {
+        [
+            0x0600_0000 | (payload_len as u32 + 32),
+            0x8072_6807,
+            0x8000_2028,
+            0x1000_7800 | u32::from(protected) * 2,
+            0,
+            0x400 | u32::from(pid),
+            0x004b_0004,
+            0x0028_0000,
+        ]
+    } else {
+        if !protected {
+            return Err("normal client data requires PTK protection".into());
+        }
+        [
+            0x0200_0000 | (payload_len as u32 + 32),
+            0x8000_8007,
+            0x0000_0028,
+            0x0000_7802,
+            0,
+            0x400 | u32::from(pid),
+            0,
+            0x0028_0000,
+        ]
+    };
+    for (index, word) in words.into_iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    bytes[40..44].copy_from_slice(&(payload_iova as u32).to_le_bytes());
+    bytes[44..46].copy_from_slice(&((payload_len as u16) | 0x8000).to_le_bytes());
+    Ok(bytes)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct ClientFirmwareEffectsState {
     association: Option<LegacyWmeAssociation>,
@@ -6132,10 +6208,21 @@ struct ClientFirmwareEffectsState {
     broadcast_keys_dirty: bool,
     controlled_port_open: bool,
     firmware_uncertain: bool,
+    next_generation: u64,
+    association_generation: Option<u64>,
+    authorized_generation: Option<u64>,
+    outstanding_tx: Vec<(u16, ClientDataGeneration)>,
+    ptk_rx_pn: Option<[u64; 16]>,
+    gtk_rx_pn: Option<(u8, [u64; 16])>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
 impl ClientFirmwareEffectsState {
+    fn mint_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.next_generation
+    }
+
     fn next_sequence(&mut self) -> u8 {
         self.sequence = self.sequence % 15 + 1;
         self.sequence
@@ -6172,15 +6259,20 @@ impl ClientFirmwareEffectsState {
             return Err(format!("WCID add failed: {error}; rollback={rollback:?}"));
         }
         self.association = Some(association);
+        self.association_generation = Some(self.mint_generation());
         Ok(())
     }
 
     fn install_ptk(
         &mut self,
         key: &[u8],
+        rsc: u64,
         mut submit: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("PTK install requires WCID ACK")?;
+        if rsc >> 48 != 0 {
+            return Err("PTK RSC exceeds 48 bits".into());
+        }
         let command = encode_ptk_command(
             self.next_sequence(),
             association.bss_index,
@@ -6194,9 +6286,12 @@ impl ClientFirmwareEffectsState {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
-            return Err(format!("PTK install failed: {error}; rollback={rollback:?}"));
+            return Err(format!(
+                "PTK install failed: {error}; rollback={rollback:?}"
+            ));
         }
         self.ptk_installed = true;
+        self.ptk_rx_pn = Some([rsc; 16]);
         Ok(())
     }
 
@@ -6204,21 +6299,28 @@ impl ClientFirmwareEffectsState {
         &mut self,
         key_id: u8,
         key: &[u8],
+        rsc: u64,
         mut submit: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
+        if rsc >> 48 != 0 {
+            return Err("GTK RSC exceeds 48 bits".into());
+        }
         let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
         self.broadcast_keys_dirty = true;
         if let Err(error) = submit(command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
-            return Err(format!("GTK install failed: {error}; rollback={rollback:?}"));
+            return Err(format!(
+                "GTK install failed: {error}; rollback={rollback:?}"
+            ));
         }
         self.gtk = Some(RetainedGtk {
             id: key_id,
             bytes: key.try_into().expect("encoder required 16 bytes"),
         });
+        self.gtk_rx_pn = Some((key_id, [rsc; 16]));
         Ok(())
     }
 
@@ -6230,7 +6332,10 @@ impl ClientFirmwareEffectsState {
     ) -> Result<(), String> {
         let association = self.association.ok_or("IGTK install requires WCID ACK")?;
         let sequence = self.next_sequence();
-        let gtk = self.gtk.as_ref().ok_or("IGTK install requires retained GTK ACK")?;
+        let gtk = self
+            .gtk
+            .as_ref()
+            .ok_or("IGTK install requires retained GTK ACK")?;
         let command = encode_igtk_command(
             sequence,
             association.bss_index,
@@ -6244,7 +6349,9 @@ impl ClientFirmwareEffectsState {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
-            return Err(format!("IGTK install failed: {error}; rollback={rollback:?}"));
+            return Err(format!(
+                "IGTK install failed: {error}; rollback={rollback:?}"
+            ));
         }
         self.igtk_installed = true;
         Ok(())
@@ -6253,9 +6360,15 @@ impl ClientFirmwareEffectsState {
     fn set_controlled_port(&mut self, open: bool) -> Result<(), String> {
         if !open {
             self.controlled_port_open = false;
+            self.authorized_generation = None;
             return Ok(());
         }
-        let association = self.association.ok_or("controlled port requires WCID ACK")?;
+        if self.controlled_port_open {
+            return Ok(());
+        }
+        let association = self
+            .association
+            .ok_or("controlled port requires WCID ACK")?;
         if self.firmware_uncertain
             || !self.ptk_installed
             || self.gtk.is_none()
@@ -6264,6 +6377,73 @@ impl ClientFirmwareEffectsState {
             return Err("controlled port requires all mandatory key ACKs".into());
         }
         self.controlled_port_open = true;
+        self.authorized_generation = Some(self.mint_generation());
+        Ok(())
+    }
+
+    fn tx_generation(&self, eapol: bool) -> Result<ClientDataGeneration, String> {
+        if eapol {
+            self.association_generation
+                .map(ClientDataGeneration::Association)
+                .ok_or("EAPOL TX requires association generation".into())
+        } else {
+            self.authorized_generation
+                .map(ClientDataGeneration::Authorized)
+                .ok_or("data TX requires authorized generation".into())
+        }
+    }
+
+    fn publish_tx(&mut self, token: u16, generation: ClientDataGeneration) -> Result<(), String> {
+        if self.tx_generation(matches!(generation, ClientDataGeneration::Association(_)))?
+            != generation
+            || self.outstanding_tx.iter().any(|(used, _)| *used == token)
+        {
+            return Err("stale or duplicate client TX publication".into());
+        }
+        self.outstanding_tx.push((token, generation));
+        Ok(())
+    }
+
+    fn complete_tx(&mut self, token: u16) -> Result<(), String> {
+        let index = self
+            .outstanding_tx
+            .iter()
+            .position(|(used, _)| *used == token)
+            .ok_or("unknown client TX completion")?;
+        self.outstanding_tx.swap_remove(index);
+        Ok(())
+    }
+
+    fn deliver_rx(&mut self, rx: ClientRxCandidate) -> Result<(), String> {
+        if self.tx_generation(rx.eapol)? != rx.generation || rx.wcid != 7 || rx.tid >= 16 {
+            return Err("stale or foreign client RX".into());
+        }
+        if rx.security_mode == 0 && rx.eapol {
+            return Ok(());
+        }
+        if rx.security_mode != 4 || rx.cm || rx.clm || rx.icv_error || rx.mic_error || rx.fcs_error
+        {
+            return Err("client RX failed CCMP status".into());
+        }
+        let pn = u64::from_be_bytes([
+            0, 0, rx.pn[0], rx.pn[1], rx.pn[2], rx.pn[3], rx.pn[4], rx.pn[5],
+        ]);
+        let retained = if rx.group {
+            let (id, counters) = self.gtk_rx_pn.as_mut().ok_or("group RX lacks GTK ACK")?;
+            if *id != rx.key_id {
+                return Err("group RX key id is stale".into());
+            }
+            &mut counters[usize::from(rx.tid)]
+        } else {
+            if rx.key_id != 0 {
+                return Err("pairwise RX key id is invalid".into());
+            }
+            &mut self.ptk_rx_pn.as_mut().ok_or("unicast RX lacks PTK ACK")?[usize::from(rx.tid)]
+        };
+        if pn <= *retained {
+            return Err("client RX replayed PN".into());
+        }
+        *retained = pn;
         Ok(())
     }
 
@@ -6272,12 +6452,20 @@ impl ClientFirmwareEffectsState {
         mut submit: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         self.controlled_port_open = false;
+        self.authorized_generation = None;
+        if !self.outstanding_tx.is_empty() {
+            self.firmware_uncertain = true;
+            return Err("client TX must be contained before key teardown".into());
+        }
         let Some(association) = self.association else {
             self.gtk = None;
             self.ptk_installed = false;
             self.ptk_dirty = false;
             self.igtk_installed = false;
             self.broadcast_keys_dirty = false;
+            self.association_generation = None;
+            self.ptk_rx_pn = None;
+            self.gtk_rx_pn = None;
             return Ok(());
         };
         if self.broadcast_keys_dirty {
@@ -6288,6 +6476,7 @@ impl ClientFirmwareEffectsState {
                     format!("client firmware broadcast-key teardown failed: {error}")
                 })?;
             self.gtk = None;
+            self.gtk_rx_pn = None;
             self.igtk_installed = false;
             self.broadcast_keys_dirty = false;
         }
@@ -6304,6 +6493,7 @@ impl ClientFirmwareEffectsState {
                 format!("client firmware pairwise-key teardown failed: {error}")
             })?;
             self.ptk_installed = false;
+            self.ptk_rx_pn = None;
             self.ptk_dirty = false;
         }
         encode_remove_wcid_command(
@@ -6320,6 +6510,7 @@ impl ClientFirmwareEffectsState {
             format!("client firmware WCID teardown failed: {error}")
         })?;
         self.association = None;
+        self.association_generation = None;
         self.firmware_uncertain = false;
         Ok(())
     }
@@ -7901,10 +8092,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         {
             return Err(zx::Status::INVALID_ARGS);
         }
-        let association = self
-            .firmware
-            .association
-            .ok_or(zx::Status::BAD_STATE)?;
+        let association = self.firmware.association.ok_or(zx::Status::BAD_STATE)?;
         let key = configuration
             .key
             .as_deref()
@@ -7917,7 +8105,10 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && key_id == 0
                     && configuration.cipher_type == Some(4) =>
             {
-                self.firmware.install_ptk(key, |command| submit(command))
+                self.firmware
+                    .install_ptk(key, configuration.rsc.unwrap_or(0), |command| {
+                        submit(command)
+                    })
             }
             fidl_ieee80211::KeyType::Group
                 if configuration.peer_addr == Some([0xff; 6])
@@ -7925,7 +8116,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && configuration.cipher_type == Some(4) =>
             {
                 self.firmware
-                    .install_gtk(key_id, key, |command| submit(command))
+                    .install_gtk(key_id, key, configuration.rsc.unwrap_or(0), |command| {
+                        submit(command)
+                    })
             }
             fidl_ieee80211::KeyType::Igtk
                 if configuration.peer_addr == Some([0xff; 6])
@@ -7974,10 +8167,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        let association = self
-            .firmware
-            .association
-            .ok_or(zx::Status::BAD_STATE)?;
+        let association = self.firmware.association.ok_or(zx::Status::BAD_STATE)?;
         if request.peer_addr != Some(association.peer) {
             return Err(zx::Status::INVALID_ARGS);
         }
@@ -10110,9 +10300,19 @@ mod tests {
         assert_eq!(encoded.len(), 176);
         assert_eq!(validate_uni_request(3, &encoded).unwrap(), 9);
         assert_eq!(&encoded[48..56], &[0, 7, 5, 0, 1, 0, 0, 0]);
-        assert_eq!(&encoded[56..76], &[0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 3, 0]);
+        assert_eq!(
+            &encoded[56..76],
+            &[
+                0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 3, 0
+            ]
+        );
         assert_eq!(&encoded[116..124], &[13, 0, 60, 0, 7, 1, 4, 0]);
-        assert_eq!(&encoded[128..148], &[0, 0, 20, 0, 16, 32, 48, 64, 80, 96, 0, 0, 0, 1, 0, 0, 42, 0, 0, 0]);
+        assert_eq!(
+            &encoded[128..148],
+            &[
+                0, 0, 20, 0, 16, 32, 48, 64, 80, 96, 0, 0, 0, 1, 0, 0, 42, 0, 0, 0
+            ]
+        );
         assert_eq!(&encoded[168..176], &[13, 0, 8, 0, 1, 0, 1, 0]);
     }
 
@@ -10123,7 +10323,10 @@ mod tests {
         assert_eq!(ptk.as_bytes().len(), 136);
         assert_eq!(validate_uni_request(3, ptk.as_bytes()).unwrap(), 1);
         assert_eq!(&ptk.as_bytes()[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
-        assert_eq!(&ptk.as_bytes()[56..68], &[17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16]);
+        assert_eq!(
+            &ptk.as_bytes()[56..68],
+            &[17, 0, 44, 0, 0, 1, 0, 0, 5, 36, 0, 16]
+        );
 
         let gtk = encode_gtk_command(2, 0, 2, &[0x22; 16]).unwrap();
         assert_eq!(&gtk.as_bytes()[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
@@ -10157,35 +10360,48 @@ mod tests {
         };
         let mut state = ClientFirmwareEffectsState::default();
         assert!(state.set_controlled_port(true).is_err());
-        state.associate(association, |command| {
-            assert_eq!(command.len(), 176);
-            validate_uni_request(3, command).map(|_| ())
-        }).unwrap();
+        state
+            .associate(association, |command| {
+                assert_eq!(command.len(), 176);
+                validate_uni_request(3, command).map(|_| ())
+            })
+            .unwrap();
         assert!(state.association.is_some());
         assert!(state.set_controlled_port(true).is_err());
-        state.install_ptk(&[0x11; 16], |command| {
-            assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
-            Ok(())
-        }).unwrap();
-        state.install_gtk(2, &[0x22; 16], |command| {
-            assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
-            Ok(())
-        }).unwrap();
+        state
+            .install_ptk(&[0x11; 16], 0, |command| {
+                assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
+                Ok(())
+            })
+            .unwrap();
+        state
+            .install_gtk(2, &[0x22; 16], 0, |command| {
+                assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
+                Ok(())
+            })
+            .unwrap();
         assert!(state.set_controlled_port(true).is_err());
-        state.install_igtk(4, &[0x44; 16], |command| {
-            assert_eq!(&command[68..84], &[0x22; 16]);
-            assert_eq!(&command[104..120], &[0x44; 16]);
-            Ok(())
-        }).unwrap();
+        state
+            .install_igtk(4, &[0x44; 16], |command| {
+                assert_eq!(&command[68..84], &[0x22; 16]);
+                assert_eq!(&command[104..120], &[0x44; 16]);
+                Ok(())
+            })
+            .unwrap();
         state.set_controlled_port(true).unwrap();
         assert!(state.controlled_port_open);
 
         let mut teardown = Vec::new();
-        state.teardown(|command| {
-            teardown.push((command.len(), command[49], command[58], command[60]));
-            Ok(())
-        }).unwrap();
-        assert_eq!(teardown, vec![(136, 19, 8, 1), (136, 7, 8, 1), (88, 7, 20, 2)]);
+        state
+            .teardown(|command| {
+                teardown.push((command.len(), command[49], command[58], command[60]));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            teardown,
+            vec![(136, 19, 8, 1), (136, 7, 8, 1), (88, 7, 20, 2)]
+        );
         assert!(!state.controlled_port_open);
         assert!(state.association.is_none());
         assert!(state.gtk.is_none());
@@ -10205,14 +10421,149 @@ mod tests {
         };
         let mut state = ClientFirmwareEffectsState::default();
         state.associate(association, |_| Ok(())).unwrap();
-        state.install_ptk(&[1; 16], |_| Ok(())).unwrap();
-        assert!(state.install_gtk(1, &[2; 16], |_| Err("negative ACK".into())).is_err());
+        state.install_ptk(&[1; 16], 0, |_| Ok(())).unwrap();
+        assert!(
+            state
+                .install_gtk(1, &[2; 16], 0, |_| Err("negative ACK".into()))
+                .is_err()
+        );
         assert!(state.firmware_uncertain);
         assert!(!state.controlled_port_open);
         assert!(state.set_controlled_port(true).is_err());
         state.teardown(|_| Ok(())).unwrap();
         assert!(!state.firmware_uncertain);
         assert!(state.association.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn client_data_txwi_txp_matches_pinned_eapol_and_ethernet_fixtures() {
+        let eapol = encode_client_data_txwi(120, 0x1234_5000, 7, 9, true, false).unwrap();
+        let data = encode_client_data_txwi(100, 0x2234_5000, 8, 10, false, true).unwrap();
+        let words = |bytes: &[u8; 64]| {
+            (0..8)
+                .map(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            words(&eapol),
+            vec![
+                0x0600_0098,
+                0x8072_6807,
+                0x8000_2028,
+                0x1000_7800,
+                0,
+                0x409,
+                0x004b_0004,
+                0x0028_0000
+            ]
+        );
+        assert_eq!(
+            words(&data),
+            vec![
+                0x0200_0084,
+                0x8000_8007,
+                0x28,
+                0x7802,
+                0,
+                0x40a,
+                0,
+                0x0028_0000
+            ]
+        );
+        assert_eq!(
+            &eapol[32..46],
+            &[7, 128, 0, 0, 0, 0, 0, 0, 0, 80, 52, 18, 120, 128]
+        );
+        assert!(encode_client_data_txwi(100, 0x1000, 1, 9, false, false).is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn client_data_generations_replay_and_teardown_fail_closed() {
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid: 7,
+            aid: 42,
+            peer: [1, 2, 3, 4, 5, 6],
+            rcpi: 100,
+            negotiated_qos: true,
+            mfp_required: false,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        state.associate(association, |_| Ok(())).unwrap();
+        let association_generation =
+            ClientDataGeneration::Association(state.association_generation.unwrap());
+        assert!(
+            state
+                .deliver_rx(ClientRxCandidate {
+                    generation: association_generation,
+                    eapol: true,
+                    wcid: 7,
+                    tid: 7,
+                    group: false,
+                    key_id: 0,
+                    security_mode: 0,
+                    cm: false,
+                    clm: false,
+                    icv_error: false,
+                    mic_error: false,
+                    fcs_error: false,
+                    pn: [0; 6],
+                })
+                .is_ok()
+        );
+        assert!(
+            state
+                .install_ptk(&[1; 16], 1 << 48, |_| panic!("invalid RSC submitted"))
+                .is_err()
+        );
+        state.install_ptk(&[1; 16], 5, |_| Ok(())).unwrap();
+        state.install_gtk(2, &[2; 16], 9, |_| Ok(())).unwrap();
+        state.set_controlled_port(true).unwrap();
+        let authorized = ClientDataGeneration::Authorized(state.authorized_generation.unwrap());
+        let normal = ClientRxCandidate {
+            generation: authorized,
+            eapol: false,
+            wcid: 7,
+            tid: 3,
+            group: false,
+            key_id: 0,
+            security_mode: 4,
+            cm: false,
+            clm: false,
+            icv_error: false,
+            mic_error: false,
+            fcs_error: false,
+            pn: [0, 0, 0, 0, 0, 6],
+        };
+        state.deliver_rx(normal).unwrap();
+        assert!(state.deliver_rx(normal).is_err());
+        let mut wrong_crypto = normal;
+        wrong_crypto.pn[5] = 7;
+        wrong_crypto.cm = true;
+        assert!(state.deliver_rx(wrong_crypto).is_err());
+
+        state.publish_tx(11, authorized).unwrap();
+        state.set_controlled_port(false).unwrap();
+        assert!(state.authorized_generation.is_none());
+        assert!(state.publish_tx(12, authorized).is_err());
+        assert!(state.deliver_rx(normal).is_err());
+        assert!(state.teardown(|_| Ok(())).is_err());
+        assert!(state.association.is_some());
+        state.complete_tx(11).unwrap();
+        state.teardown(|_| Ok(())).unwrap();
+        assert!(state.association_generation.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn connac2_group1_ccmp_pn_uses_pinned_linux_byte_order() {
+        assert_eq!(
+            connac2_group1_pn(&[6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert!(connac2_group1_pn(&[0; 5]).is_err());
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -10242,8 +10593,8 @@ mod tests {
         assert_eq!(submitted.lock().unwrap().len(), 1);
         assert!(!effects.firmware.controlled_port_open);
 
-        let key = |key_type, peer_addr, key_idx, cipher_type, byte| {
-            fidl_softmac::WlanKeyConfiguration {
+        let key =
+            |key_type, peer_addr, key_idx, cipher_type, byte| fidl_softmac::WlanKeyConfiguration {
                 protection: Some(fidl_softmac::WlanProtection::RxTx),
                 cipher_oui: Some([0, 15, 172]),
                 cipher_type: Some(cipher_type),
@@ -10252,8 +10603,7 @@ mod tests {
                 key_idx: Some(key_idx),
                 key: Some(vec![byte; 16]),
                 rsc: Some(0),
-            }
-        };
+            };
         effects
             .install_key(&key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11))
             .unwrap();
@@ -10296,7 +10646,9 @@ mod tests {
             .split("fn send_passive_command(")
             .next()
             .unwrap();
-        let validate = submit.find("validate_uni_request(expected_cid, encoded)").unwrap();
+        let validate = submit
+            .find("validate_uni_request(expected_cid, encoded)")
+            .unwrap();
         let irq = submit.find("write_active_wfdma(0xd4204").unwrap();
         let publish = submit.find("publish_mcu_bytes(").unwrap();
         assert!(validate < irq && irq < publish);
@@ -10333,7 +10685,10 @@ mod tests {
         ring.write_descriptor_at(
             2,
             DmaDescriptor::tx(
-                DmaSegment { iova: 0x1000, len: 8 },
+                DmaSegment {
+                    iova: 0x1000,
+                    len: 8,
+                },
                 None,
                 0,
             )
@@ -10341,11 +10696,13 @@ mod tests {
         );
         reclaim_uni_dma_slot(&mut ring, &mut payload, 2).unwrap();
         assert_eq!(ring.read_descriptor_at(2), DmaDescriptor::reset());
-        assert!(payload
-            .read_bytes(0, MCU_COMMAND_PAYLOAD_BYTES)
-            .unwrap()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            payload
+                .read_bytes(0, MCU_COMMAND_PAYLOAD_BYTES)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         unsafe {
             munmap(ring.ptr.as_ptr(), ring.len);
             munmap(payload.ptr.as_ptr(), payload.len);
@@ -10397,9 +10754,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            active_cleanup
-                .find("if !bme_disabled")
-                .unwrap()
+            active_cleanup.find("if !bme_disabled").unwrap()
                 < active_cleanup.find("attempt_all_cleanup").unwrap()
         );
     }
@@ -10993,9 +11348,8 @@ mod tests {
         ]));
         assert!(!accepts(&[(0xd4680, 4), (0xd4690, 0x00c0_0004)]));
 
-        let accepts_identity = |base, count, cidx, didx| {
-            base == 0x0101_0000 && count == 8 && cidx == 7 && didx == 0
-        };
+        let accepts_identity =
+            |base, count, cidx, didx| base == 0x0101_0000 && count == 8 && cidx == 7 && didx == 0;
         assert!(accepts_identity(0x0101_0000, 8, 7, 0));
         assert!(!accepts_identity(0x0100_3000, 8, 0, 0));
 
