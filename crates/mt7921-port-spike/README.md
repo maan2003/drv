@@ -893,3 +893,28 @@ transition failed in this rerun; the only error was the recovered initial
 status-77 authentication response. The earlier watchdog recovery remains an
 unreproduced association/netconfig failure rather than evidence of failed
 mt7921e reprobe or a deterministic selector identity-write side effect.
+
+The first changed-selector boundary then used only the pinned
+`mt7921_reg_map_l1` sequence needed for the two identity words. Report
+`/var/lib/wifi-driver-lab/reports/20260810T103027Z-0000_05_00.0.log` records
+the runtime selector `0x18451800`, one selection write to `0x18457001` for L1
+base `0x7001`, and posted-write verification before any indirect read. The
+read-only window returned `MT_HW_CHIPID = 0x00007961` from physical
+`0x70010200` and `MT_HW_REV = 0x00008a10` from `0x70010204`. The run then
+wrote back the exact saved selector, verified full equality with
+`0x18451800`, unmapped both pages, and reached safe VFIO release. It performed
+no other window read, firmware action, DMA mapping, or radio operation.
+
+Userspace and restoration both returned zero without changing boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8`. The fsynced recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T103027Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:00:29.159243 IST`; native mt7921e had logged ASIC revision `79610010`
+at `16:00:29.043032`, firmware identity by `16:00:29.129854`, and iwd started
+at `16:00:29.149974`. iwd announced the usable `wlan3` at
+`16:00:30.522528` and reached connected state at `16:00:34.825973`. At
+`16:00:35.296528`, 6.14 seconds after restore returned, the supervisor
+observed association, IPv4 `192.168.235.6/24`, the default route, and a
+successful gateway ping together; it disarmed the watchdog at
+`16:00:35.356926`. The native driver remained bound in D0 and iwd remained
+active.
