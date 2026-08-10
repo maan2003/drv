@@ -1638,9 +1638,26 @@ report ends after `USERSPACE begin`: the existing general-path JSON output was
 still buffered, so no firmware, DMA/IRQ, ready, or cleanup milestone became
 durable. This attempt is therefore inconclusive and does not physically prove
 firmware publication, an MCU response, or userspace cleanup. No second attempt
-was made. After watchdog recovery `mt7921e` rebound, `iwd` was active, `wlan0`
-was connected, and the watchdog was inactive. The native driver independently
-reported the same patch build and WM firmware version during recovery, but
-that is recovery evidence, not proof of the userspace bootstrap. The coherent
+was initially made. After watchdog recovery `mt7921e` rebound, `iwd` was
+active, `wlan0` was connected, and the watchdog was inactive. The native
+driver independently reported the same patch build and WM firmware version
+during recovery, but that is recovery evidence, not proof of the userspace
+bootstrap. The coherent
 bootstrap and cleanup markers now explicitly flush stdout for any future
 authorized run.
+
+One rerun was subsequently authorized after adding flushed phase markers for
+transport readiness, patch completion, RAM completion plus firmware-start
+acknowledgement, N9 readiness, NIC capability, and containment. It used binary
+SHA-256
+`2ae603a90af3123c8353327c5b7319b8e4557eafe16f7898c4027ebd186b193d`;
+the report is
+`/var/lib/wifi-driver-lab/reports/20260810T133639Z-0000_05_00.0.log`.
+The host again stopped responding and watchdog-rebooted, and the exact last
+durable milestone remained supervisor `USERSPACE begin`: none of the flushed
+transport-ready or later markers was reached. Consequently the boundary is
+blocked before proven transport readiness; there is no durable evidence that
+BME, WFDMA, the MSI eventfd/source, firmware DMA, or MCU publication was
+enabled during this run, and no userspace cleanup can be claimed. The
+watchdog recovery again rebound `mt7921e`; `iwd` was active, `wlan0` connected,
+and the watchdog inactive. This was the only authorized rerun.
