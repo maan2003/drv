@@ -20,6 +20,10 @@ use fuchsia_softmac_port::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
+#[cfg(feature = "fuchsia-passive")]
+use num_bigint::BigUint;
+#[cfg(feature = "fuchsia-passive")]
+use sha2::{Digest as _, Sha256};
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
@@ -3623,6 +3627,9 @@ fn run() -> Result<(), String> {
                                             "build pinned SAE authentication frame failed"
                                                 .to_string()
                                         })?;
+                                        if sae_sequence == 1 {
+                                            record_sae_commit_structure(&frame)?;
+                                        }
                                         sequence_control = sequence_control.wrapping_add(0x10);
                                         DeviceOps::send_wlan_frame(
                                             &mut device,
@@ -8116,6 +8123,84 @@ struct ReceivedSaeAuth {
     sequence: u16,
     status: fidl_ieee80211::StatusCode,
     fields: Vec<u8>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
+    let fixed = frame
+        .get(..128)
+        .ok_or("SAE commit is shorter than the group-19 fixed body")?;
+    let algorithm = u16::from_le_bytes(fixed[24..26].try_into().unwrap());
+    let transaction = u16::from_le_bytes(fixed[26..28].try_into().unwrap());
+    let status = u16::from_le_bytes(fixed[28..30].try_into().unwrap());
+    let group = u16::from_le_bytes(fixed[30..32].try_into().unwrap());
+    if algorithm != 3 || transaction != 1 || status != 126 || group != 19 {
+        return Err(format!(
+            "unexpected SAE commit header algorithm={algorithm} transaction={transaction} status={status} group={group}"
+        ));
+    }
+    let scalar = &fixed[32..64];
+    let element = &fixed[64..128];
+    let scalar_value = BigUint::from_bytes_be(scalar);
+    let order = BigUint::parse_bytes(
+        b"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        16,
+    )
+    .unwrap();
+    let scalar_range = scalar_value > BigUint::from(1u8) && scalar_value < order;
+    let p = BigUint::parse_bytes(
+        b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+        16,
+    )
+    .unwrap();
+    let b = BigUint::parse_bytes(
+        b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+        16,
+    )
+    .unwrap();
+    let x = BigUint::from_bytes_be(&element[..32]);
+    let y = BigUint::from_bytes_be(&element[32..]);
+    let three_x = (&x * BigUint::from(3u8)) % &p;
+    let rhs = (x.modpow(&BigUint::from(3u8), &p) + (&p - three_x) + b) % &p;
+    let p256_on_curve = x < p && y < p && y.modpow(&BigUint::from(2u8), &p) == rhs;
+    let mut tail = frame.len().saturating_sub(128);
+    let mut tail_ies = Vec::new();
+    let mut offset = 128;
+    while tail != 0 {
+        let header = frame
+            .get(offset..offset + 2)
+            .ok_or("SAE commit has a truncated tail IE header")?;
+        let len = usize::from(header[1]);
+        frame
+            .get(offset + 2..offset + 2 + len)
+            .ok_or("SAE commit has a truncated tail IE body")?;
+        tail_ies.push(format!("{}:{len}", header[0]));
+        offset += 2 + len;
+        tail = frame.len().saturating_sub(offset);
+    }
+    let receiver = &frame[4..10];
+    let transmitter = &frame[10..16];
+    let bssid = &frame[16..22];
+    let sequence_control = u16::from_le_bytes(frame[22..24].try_into().unwrap());
+    println!(
+        r#"{{"sae_commit_structure":{{"fc":"0x{:04x}","receiver":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","transmitter":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","bssid":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","seq_control":{},"algorithm":{},"transaction":{},"status":{},"group":{},"body_len":{},"scalar_sha256":"{}","element_sha256":"{}","scalar_range":{},"p256_on_curve":{},"tail_ies":"{}"}}}}"#,
+        u16::from_le_bytes(frame[0..2].try_into().unwrap()),
+        receiver[0], receiver[1], receiver[2], receiver[3], receiver[4], receiver[5],
+        transmitter[0], transmitter[1], transmitter[2], transmitter[3], transmitter[4], transmitter[5],
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+        sequence_control, algorithm, transaction, status, group, frame.len() - 30,
+        sha256_hex(scalar), sha256_hex(element), scalar_range, p256_on_curve,
+        tail_ies.join(",")
+    );
+    Ok(())
 }
 
 #[cfg(feature = "fuchsia-passive")]

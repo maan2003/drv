@@ -530,6 +530,8 @@ dependencies = [
  "ieee80211",
  "mt7921-port-spike",
  "mt7921-softmac-adapter",
+ "num-bigint",
+ "sha2",
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
