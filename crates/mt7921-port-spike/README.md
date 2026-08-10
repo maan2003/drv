@@ -2056,3 +2056,13 @@ association, key, and data effects remained disabled. The watchdog rebooted;
 native `mt7921e`, iwd, and `wlan0` carrier recovered on the next boot, with no
 active recovery or report-sync units and no `/run/wifi-driver-lab` state. No
 further physical mutation was attempted.
+
+A subsequent no-hardware isolation invoked the same release binary directly as
+root, outside `wifi-driver-lab`, with a dummy declared eight-byte credential
+and both PCI-BDF and VFIO environment absent. It returned in 24 ms, emitted
+`credential_read`, and then failed with the expected
+`DRV_PCI_BDF is required` error. Native `mt7921e`, iwd, carrier, and lab
+state were unchanged. This excludes the target's ACPI scan, bounded credential
+read, and direct exec path as the exchange-11 stall, leaving the
+`wifi-driver-lab` native-to-VFIO handoff and its page-pool shutdown as the
+active blocker.
