@@ -10,6 +10,12 @@ shift
 shift
 (($# > 0)) || exit 2
 
+normalize_iw_frequency() {
+  local frequency=$1
+  [[ $frequency =~ ^[0-9]+([.]0)?$ ]] || return 1
+  printf '%s\n' "${frequency%.0}"
+}
+
 root=/var/lib/wifi-driver-lab
 stamp=$(date --utc +%Y%m%dT%H%M%SZ)
 timeline=$root/selector-write-recovery-$stamp.log
@@ -38,8 +44,8 @@ for net in /sys/class/net/*; do
   link=$(timeout 2 iw dev "$(basename "$net")" link 2>/dev/null) || continue
   bssid=$(awk '/^Connected to / { print $3; exit }' <<< "$link")
   frequency=$(awk '/^[[:space:]]*freq:/ { print $2; exit }' <<< "$link")
-  [[ $bssid =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $frequency =~ ^[0-9]+$ ]] \
-    || continue
+  [[ $bssid =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+  frequency=$(normalize_iw_frequency "$frequency") || continue
   [[ -z $connected_bssid ]] || {
     echo "multiple connected target Wi-Fi interfaces; refusing handoff" >&2
     exit 1

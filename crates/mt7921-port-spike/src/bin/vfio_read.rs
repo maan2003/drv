@@ -11626,6 +11626,35 @@ mod tests {
     }
 
     #[test]
+    fn recovery_supervisor_accepts_only_integer_or_dot_zero_iw_frequency() {
+        let supervisor = include_str!("../../lab/selector-write-recovery-supervisor.sh");
+        let function = supervisor
+            .split("normalize_iw_frequency() {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        let invoke = |value: &str| {
+            Command::new("/run/current-system/sw/bin/bash")
+                .arg("-c")
+                .arg(format!(
+                    "normalize_iw_frequency() {{{function}\n}}; normalize_iw_frequency '{value}'"
+                ))
+                .output()
+                .unwrap()
+        };
+        for (fixture, expected) in [("5180", "5180\n"), ("5180.0", "5180\n")] {
+            let output = invoke(fixture);
+            assert!(output.status.success(), "{fixture}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+        for rejected in ["5180.5", "5180.", ".0", "five"] {
+            assert!(!invoke(rejected).status.success(), "{rejected}");
+        }
+    }
+
+    #[test]
     fn sae_routes_to_consolidated_firmware_transport_not_early_dma_gate() {
         assert!(!Operation::RunOneShotSaeAuth.uses_contained_transport_gate());
         assert!(Operation::RunOneShotSaeAuth.records_active_transport_stages());
