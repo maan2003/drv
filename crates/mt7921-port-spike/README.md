@@ -1775,3 +1775,38 @@ wrapper conservatively returned unknown after losing SSH, but the durable
 report is complete. Native `mt7921e` rebound, `iwd` was active, `wlan1`
 was connected, both watchdog units were inactive, and no lab state directory
 remained. No second attempt was made.
+
+### Consolidated receive-only channel-1 boundary
+
+The channel-1 passive operation now enters the same contained transport and
+configuration path. After world/indoor CLC it sends the separately gated
+39-channel `NO_IR` domain, owns data RX ring 2 and its interrupt, applies the
+source-exact passive MAC plan, tunes channel 1, and requests one passive dwell
+with zero SSIDs and zero probes. The existing pinned Fuchsia processing path
+must parse at least one real beacon or probe response and observe matching scan
+completion within the bounded dwell/deadline. The contained source has no
+active-scan, probe-frame, management/data-frame, rate-power, or SAE publication
+call and does not allocate the SAE TX arenas.
+
+The one guarded attempt used binary SHA-256
+`fad60861c85997913a8e5eede2f41d08f9d6ec177edd3641be1a11999541cf3a`;
+its report is
+`/var/lib/wifi-driver-lab/reports/20260810T141847Z-0000_05_00.0.log`.
+Firmware, NIC capability, eFuse, CLC, and the channel-domain TX completion all
+passed. The passive hook then stopped before MAC setup, channel tune, or scan
+because the newly consolidated coordinator had not advanced its containment
+phase from `Contained` to `DmaAndResponseIrqEnabled`. Thus this run proves
+no receive observation and performed no intentional RF transmission.
+Transport quiesce and outer containment still disabled BME, released mappings
+before reset, and passed safe-state verification; userspace ended with
+`rc=1` and supervisor restore with `failed=0`. Native `mt7921e` rebound,
+`iwd` was active, `wlan0` was connected, both watchdogs were inactive, and
+no lab state remained.
+
+The coordinator now records the contained DMA-disabled and
+DMA/response-enabled phases explicitly and passes the actual passive operation
+into shared resource acquisition, so the existing passive BAR pages and data
+RX arenas are retained for the hook. All 73 integrated tests and the release
+build pass after that correction (release SHA-256
+`ae7dda3efc61165aa97ab418b8e1ca2861b824ece8306f3f5dfd452c587724a7`).
+Per the one-run limit, the corrected path has not been rerun physically.
