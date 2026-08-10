@@ -1934,3 +1934,19 @@ the supervisor's local status operation. A separate stage-recording predicate
 now includes SAE without restoring the early return, so future durable
 evidence can distinguish host preflight from VFIO acquisition without adding
 new instrumentation.
+
+Exactly one diagnostic run of that marker correction was launched as
+`wifi-sae-exchange6`. Its report is
+`/var/lib/wifi-driver-lab/reports/20260810T160250Z-0000_05_00.0.log`; the exact
+last durable stage is `vfio_attach_iommufd_pt_after`. This proves that the
+shared environment parsing, PCI identity checks, external-watchdog check,
+VFIO cdev and iommufd opens, iommufd bind, IOAS allocation, and device attach
+completed. It does not prove the subsequent BAR-region query or mappings,
+firmware startup, passive RX, SAE commit, or RF TX.
+
+The kernel later reported a 60-second page-pool shutdown stall for pool 19
+with seven inflight buffers, and the watchdog rebooted before userspace end or
+supervisor restore could be recorded. After reboot, native `mt7921e` rebound,
+iwd was active, `wlan0` had carrier, all recovery and watchdog units were
+inactive, and `/run/wifi-driver-lab` was absent. No further physical mutation
+was attempted.
