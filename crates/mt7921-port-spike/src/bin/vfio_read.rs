@@ -6076,6 +6076,233 @@ fn encode_igtk_command(
     )
 }
 
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy)]
+struct LegacyWmeAssociation {
+    bss_index: u8,
+    peer_wcid: u8,
+    aid: u16,
+    peer: [u8; 6],
+    rcpi: u8,
+    negotiated_qos: bool,
+    mfp_required: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct RetainedGtk {
+    id: u8,
+    bytes: [u8; 16],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for RetainedGtk {
+    fn drop(&mut self) {
+        for byte in &mut self.bytes {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct ClientFirmwareEffectsState {
+    association: Option<LegacyWmeAssociation>,
+    sequence: u8,
+    ptk_installed: bool,
+    gtk: Option<RetainedGtk>,
+    igtk_installed: bool,
+    controlled_port_open: bool,
+    firmware_uncertain: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ClientFirmwareEffectsState {
+    fn next_sequence(&mut self) -> u8 {
+        self.sequence = self.sequence % 15 + 1;
+        self.sequence
+    }
+
+    fn associate(
+        &mut self,
+        association: LegacyWmeAssociation,
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.association.is_some() || self.firmware_uncertain {
+            return Err("client firmware association state is not clean".into());
+        }
+        let command = encode_legacy_wme_add_wcid_command(
+            self.next_sequence(),
+            association.bss_index,
+            association.peer_wcid,
+            association.aid,
+            association.peer,
+            association.rcpi,
+        )?;
+        if let Err(error) = submit(&command) {
+            self.controlled_port_open = false;
+            let rollback = encode_remove_wcid_command(
+                self.next_sequence(),
+                association.bss_index,
+                association.peer_wcid,
+                association.aid,
+                association.peer,
+                association.negotiated_qos,
+            )
+            .and_then(|command| submit(&command));
+            self.firmware_uncertain = rollback.is_err();
+            return Err(format!("WCID add failed: {error}; rollback={rollback:?}"));
+        }
+        self.association = Some(association);
+        Ok(())
+    }
+
+    fn install_ptk(
+        &mut self,
+        key: &[u8],
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let association = self.association.ok_or("PTK install requires WCID ACK")?;
+        let command = encode_ptk_command(
+            self.next_sequence(),
+            association.bss_index,
+            association.peer_wcid,
+            key,
+        )?;
+        if let Err(error) = submit(command.as_bytes()) {
+            self.controlled_port_open = false;
+            self.firmware_uncertain = true;
+            let rollback = self.teardown(&mut submit);
+            return Err(format!("PTK install failed: {error}; rollback={rollback:?}"));
+        }
+        self.ptk_installed = true;
+        Ok(())
+    }
+
+    fn install_gtk(
+        &mut self,
+        key_id: u8,
+        key: &[u8],
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let association = self.association.ok_or("GTK install requires WCID ACK")?;
+        let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
+        if let Err(error) = submit(command.as_bytes()) {
+            self.controlled_port_open = false;
+            self.firmware_uncertain = true;
+            let rollback = self.teardown(&mut submit);
+            return Err(format!("GTK install failed: {error}; rollback={rollback:?}"));
+        }
+        self.gtk = Some(RetainedGtk {
+            id: key_id,
+            bytes: key.try_into().expect("encoder required 16 bytes"),
+        });
+        Ok(())
+    }
+
+    fn install_igtk(
+        &mut self,
+        key_id: u8,
+        key: &[u8],
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let association = self.association.ok_or("IGTK install requires WCID ACK")?;
+        let sequence = self.next_sequence();
+        let gtk = self.gtk.as_ref().ok_or("IGTK install requires retained GTK ACK")?;
+        let command = encode_igtk_command(
+            sequence,
+            association.bss_index,
+            key_id,
+            key,
+            gtk.id,
+            &gtk.bytes,
+        )?;
+        if let Err(error) = submit(command.as_bytes()) {
+            self.controlled_port_open = false;
+            self.firmware_uncertain = true;
+            let rollback = self.teardown(&mut submit);
+            return Err(format!("IGTK install failed: {error}; rollback={rollback:?}"));
+        }
+        self.igtk_installed = true;
+        Ok(())
+    }
+
+    fn set_controlled_port(&mut self, open: bool) -> Result<(), String> {
+        if !open {
+            self.controlled_port_open = false;
+            return Ok(());
+        }
+        let association = self.association.ok_or("controlled port requires WCID ACK")?;
+        if self.firmware_uncertain
+            || !self.ptk_installed
+            || self.gtk.is_none()
+            || (association.mfp_required && !self.igtk_installed)
+        {
+            return Err("controlled port requires all mandatory key ACKs".into());
+        }
+        self.controlled_port_open = true;
+        Ok(())
+    }
+
+    fn teardown(
+        &mut self,
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.controlled_port_open = false;
+        let Some(association) = self.association else {
+            self.gtk = None;
+            self.ptk_installed = false;
+            self.igtk_installed = false;
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        if self.gtk.is_some() || self.igtk_installed {
+            match encode_disable_keys_command(self.next_sequence(), association.bss_index, 19, 0x0e)
+                .and_then(|command| submit(command.as_bytes()))
+            {
+                Ok(()) => {
+                    self.gtk = None;
+                    self.igtk_installed = false;
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        if self.ptk_installed {
+            match encode_disable_keys_command(
+                self.next_sequence(),
+                association.bss_index,
+                association.peer_wcid,
+                0,
+            )
+            .and_then(|command| submit(command.as_bytes()))
+            {
+                Ok(()) => self.ptk_installed = false,
+                Err(error) => errors.push(error),
+            }
+        }
+        match encode_remove_wcid_command(
+            self.next_sequence(),
+            association.bss_index,
+            association.peer_wcid,
+            association.aid,
+            association.peer,
+            association.negotiated_qos,
+        )
+        .and_then(|command| submit(&command))
+        {
+            Ok(()) => self.association = None,
+            Err(error) => errors.push(error),
+        }
+        if errors.is_empty() {
+            self.firmware_uncertain = false;
+            Ok(())
+        } else {
+            self.firmware_uncertain = true;
+            Err(format!("client firmware teardown failed: {errors:?}"))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveArenaKind {
     #[cfg(feature = "fuchsia-passive")]
@@ -9790,6 +10017,78 @@ mod tests {
         assert_eq!(disabled.as_bytes().len(), 136);
         assert_eq!(&disabled.as_bytes()[56..64], &[17, 0, 8, 0, 1, 0, 0, 0]);
         assert!(disabled.as_bytes()[64..].iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn client_firmware_effects_ack_before_readiness_and_teardown_in_order() {
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid: 7,
+            aid: 42,
+            peer: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            rcpi: 100,
+            negotiated_qos: true,
+            mfp_required: true,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        assert!(state.set_controlled_port(true).is_err());
+        state.associate(association, |command| {
+            assert_eq!(command.len(), 176);
+            validate_uni_request(3, command).map(|_| ())
+        }).unwrap();
+        assert!(state.association.is_some());
+        assert!(state.set_controlled_port(true).is_err());
+        state.install_ptk(&[0x11; 16], |command| {
+            assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
+            Ok(())
+        }).unwrap();
+        state.install_gtk(2, &[0x22; 16], |command| {
+            assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
+            Ok(())
+        }).unwrap();
+        assert!(state.set_controlled_port(true).is_err());
+        state.install_igtk(4, &[0x44; 16], |command| {
+            assert_eq!(&command[68..84], &[0x22; 16]);
+            assert_eq!(&command[104..120], &[0x44; 16]);
+            Ok(())
+        }).unwrap();
+        state.set_controlled_port(true).unwrap();
+        assert!(state.controlled_port_open);
+
+        let mut teardown = Vec::new();
+        state.teardown(|command| {
+            teardown.push((command.len(), command[49], command[58], command[60]));
+            Ok(())
+        }).unwrap();
+        assert_eq!(teardown, vec![(136, 19, 8, 1), (136, 7, 8, 1), (88, 7, 20, 2)]);
+        assert!(!state.controlled_port_open);
+        assert!(state.association.is_none());
+        assert!(state.gtk.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn client_firmware_effect_failure_revokes_port_and_requires_teardown() {
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid: 7,
+            aid: 42,
+            peer: [1, 2, 3, 4, 5, 6],
+            rcpi: 100,
+            negotiated_qos: true,
+            mfp_required: false,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        state.associate(association, |_| Ok(())).unwrap();
+        state.install_ptk(&[1; 16], |_| Ok(())).unwrap();
+        assert!(state.install_gtk(1, &[2; 16], |_| Err("negative ACK".into())).is_err());
+        assert!(state.firmware_uncertain);
+        assert!(!state.controlled_port_open);
+        assert!(state.set_controlled_port(true).is_err());
+        state.teardown(|_| Ok(())).unwrap();
+        assert!(!state.firmware_uncertain);
+        assert!(state.association.is_none());
     }
 
     #[cfg(feature = "fuchsia-passive")]
