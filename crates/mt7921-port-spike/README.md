@@ -807,3 +807,21 @@ or DMA mapping occurred. Userspace returned zero, restoration ended with
 `failed=0`, and the watchdog disarmed automatically after its absolute-path
 health checks observed the native driver, iwd, and the default route. The boot
 ID remained `87e137b8-3d23-493d-af4c-4c1ff447876a`.
+
+Pinned Linux `mt792x_regs.h` defines `MT_INFRA_CFG_BASE` as direct BAR offset
+`0xfe000` and `MT_HIF_REMAP_L1` as `MT_INFRA(0x24c)`, yielding direct BAR0
+offset `0xfe24c`. Pinned `mt7921_reg_map_l1` passes that register to
+`mt76_rmw_field` and then reads it with `mt76_rr` to push the selector write;
+the existing `VfioDynamicL1::read_selector` likewise reads exactly
+`MT_HIF_REMAP_L1_BAR_OFFSET` before any selector update. This establishes the
+selector itself as a directly addressed readable register, unlike the
+identity targets behind its indirect window.
+
+The guarded read-only follow-up mapped only BAR0 page `0xfe000`, executed one
+volatile 32-bit read at `0xfe24c`, and observed `0x18451800`. Report
+`/var/lib/wifi-driver-lab/reports/20260810T101318Z-0000_05_00.0.log` contains
+the durable before/after read markers and the subsequent munmap and safe
+release markers. It performed no selector write, indirect-window read, other
+MMIO access, firmware action, DMA, or radio operation. Userspace and restore
+both returned success, the watchdog disarmed automatically, and the unchanged
+boot returned the native driver in D0 with iwd and the default route healthy.
