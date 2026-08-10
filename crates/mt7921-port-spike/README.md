@@ -951,3 +951,38 @@ other than the three closed identity offsets, restore and verify the exact
 saved selector on every exit, then unmap and release. An all-ones read must
 fail closed as invalid MMIO evidence. No PCI command, interrupt gate, WFSYS,
 WFDMA, firmware, DMA, or radio operation belongs in this boundary.
+
+That boundary completed in report
+`/var/lib/wifi-driver-lab/reports/20260810T104105Z-0000_05_00.0.log` using
+release binary SHA-256
+`56481a2b11a98be13535db50e27027eeaec113b884350172dce28c3eb928386a`.
+Under one saved selector `0x18451800`, the run selected and verified
+`0x18457001`, then read in pinned Linux order: `MT_HW_CHIPID = 0x00007961`,
+`MT_HW_BOUND = 0x00000018`, and `MT_HW_REV = 0x00008a10`. Bound bit 7 is clear,
+so Linux retains effective chip ID `0x7961`; combining it with revision low
+byte `0x10` yields composite revision `0x79610010`, matching the native
+driver's ASIC log. The run restored and verified exact selector equality with
+`0x18451800`, unmapped both pages, reached safe VFIO release, and returned zero.
+The temporary early return remained in place, so no PCI command, interrupt,
+reset/WFSYS/WFDMA, firmware, DMA, or radio operation followed.
+
+The recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260810T104105Z.log`, with
+the bounded kernel/iwd window in the adjacent `.messages.log`. Restore returned
+at `16:11:07.612080 IST`; mt7921e was already bound in D0 and iwd active. Native
+firmware identity completed by `16:11:07.578832`, iwd announced usable `wlan4`
+at `16:11:08.984206`, and reached connected state at `16:11:12.918349`.
+Association, IPv4 `192.168.235.6/24`, default route, and gateway ping were all
+observed at `16:11:13.750197`, 6.14 seconds after restore. The watchdog
+disarmed at `16:11:13.812929`; boot ID
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8` remained unchanged.
+
+Verification remains deliberately scoped. The release workspace passed all 69
+`mt7921-passive-scan` tests and a locked release build, with existing upstream
+unused-code/import warnings. The root/default-feature `mt7921-port-spike` test
+command remains blocked by pre-existing unrelated errors: firmware-inspect
+calls `world_clc_commands` without its fourth argument, and non-
+`fuchsia-passive` compilation references the cfg-gated SAE operation/stage
+logger. A rustfmt check of `vfio_read.rs` likewise still reports pre-existing
+formatting drift around the device-info marker and discovery-release marker;
+those unrelated lines were not changed.
