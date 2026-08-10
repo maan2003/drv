@@ -1099,3 +1099,51 @@ disarmed at `16:20:00.171036`. Boot ID
 release-workspace tests and the locked release build passed with the existing
 upstream warnings; the previously recorded standalone default-feature and
 rustfmt limitations remain unchanged.
+
+### VFIO query boundary under temporary INTx disable
+
+The real active path has an important ordering distinction. Its
+`active_preflight` queries IRQ and reset capabilities before allocating active
+resources and before persistently disabling INTx. After later
+`disable_pci_intx`, the literal next device operation is not a query: it is a
+volatile zero write to `MT_PCIE_MAC_INT_ENABLE` at BAR0 `0x10188`. That write
+currently has no local saved-state rollback and must remain outside the next
+gate. Repeating the already-required query preflight while Command is
+temporarily `0x0402` is the smallest way to advance evidence without reaching
+that BAR write.
+
+At pinned Linux UAPI commit `e8efe09d4f378992c890d181d65e2ed8d8cb1194`,
+`VFIO_DEVICE_GET_IRQ_INFO` is ioctl number `VFIO_BASE + 9`. The caller supplies
+the 16-byte `vfio_irq_info` with `argsz` and `index`; the kernel returns
+`flags` and `count`. PCI indices 0, 1, and 2 are respectively INTx, MSI, and
+MSI-X. A zero count denotes an unimplemented type. Flag bit 0
+`VFIO_IRQ_INFO_EVENTFD` says that index supports eventfd signaling; bits 1, 2,
+and 3 report maskable, automasked, and no-resize behavior. This query does not
+install an eventfd, select an IRQ mode, mask/unmask a source, or alter device
+interrupt state. Those effects require the distinct `VFIO_DEVICE_SET_IRQS`
+ioctl, which is excluded.
+
+`VFIO_DEVICE_GET_INFO` is ioctl number `VFIO_BASE + 7`. The caller supplies
+`vfio_device_info.argsz`; the kernel returns `flags`, `num_regions`,
+`num_irqs`, and `cap_offset`. Flag bit 0 `VFIO_DEVICE_FLAGS_RESET` only
+advertises that the device supports reset; the query does not reset it. Reset
+requires the distinct `VFIO_DEVICE_RESET` ioctl (`VFIO_BASE + 11`), which is
+excluded. Both GET ioctls are therefore read-only capability queries against
+the already-open VFIO device fd. The current cdev path has already bound the
+device to iommufd and attached its empty IOAS before identity; no IRQ install,
+BAR mapping, or DMA mapping is an ioctl prerequisite. Existing code maps BAR
+pages before active preflight only because the broader resource owner batches
+later operations, not because either query uses them.
+
+The smallest next boundary retains the early return and the two identity pages
+only. After preflight saves Command `0x0002`, it writes and fully verifies
+temporary `0x0402`; while that value is selected, it queries IRQ indices 0, 1,
+and 2 in order and durably records each complete `argsz`, `flags`, and `count`.
+It then selects MSI-X over MSI over INTx only when count is nonzero and EVENTFD
+is set, fails closed if no such source exists or if only INTx wins, queries
+complete device info, and requires RESET plus PCI flags without invoking reset.
+The existing unconditional Command restore must run after query success or
+failure and fully verify exact `0x0002` before unmapping and release. The gate
+must stop before `VFIO_DEVICE_SET_IRQS`, `VFIO_DEVICE_RESET`, DMA mapping, BAR
+`0x10188`, firmware, WFDMA, or radio. Pinned Fuchsia owns none of these VFIO or
+PCI mechanics; its SoftMAC boundary remains downstream of transport setup.
