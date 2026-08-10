@@ -2518,6 +2518,14 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
             pcie_mac.disable_pcie_l0s()?;
             swdef.write_swdef_normal()?;
+            if operation == Operation::RunOneShotFirmware {
+                println!(
+                    "{{\"firmware_bootstrap_event\":\"transport_ready\",\"bme\":true,\"wfdma_global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\",\"rings\":[\"fwdl_tx\",\"mcu_tx\",\"wm_rx\",\"wm2_rx\"]}}"
+                );
+                std::io::stdout().flush().map_err(|error| {
+                    format!("flush firmware transport-ready milestone: {error}")
+                })?;
+            }
             if operation.loads_firmware() {
                 let (patch_bytes, ram_bytes) = firmware_images
                     .as_ref()
@@ -6048,6 +6056,18 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        let milestone = match command {
+            DownloadCommand::PatchFinish => Some("patch_published_and_finished"),
+            DownloadCommand::FirmwareStart { .. } => Some("ram_published_firmware_start_acked"),
+            DownloadCommand::GetNicCapability => Some("nic_capability_response"),
+            _ => None,
+        };
+        if let Some(event) = milestone {
+            println!("{{\"firmware_bootstrap_event\":\"{event}\",\"sequence\":{sequence}}}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush firmware command milestone: {error}"))?;
+        }
         Ok(completion)
     }
 
@@ -6240,7 +6260,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
 
     fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
         self.mcu.cancelled()?;
-        Ok(self.conn.read(0xe00f0)? & 3 == 3)
+        let ready = self.conn.read(0xe00f0)? & 3 == 3;
+        if ready {
+            println!("{{\"firmware_bootstrap_event\":\"n9_ready\"}}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush N9-ready milestone: {error}"))?;
+        }
+        Ok(ready)
     }
 
     fn now_ms(&self) -> u64 {
@@ -9128,7 +9155,9 @@ mod tests {
             .next()
             .unwrap();
         let mask = cleanup.find("write_active_wfdma(0xd4204, 0)").unwrap();
-        let disable_dma = cleanup.find("write_active_wfdma(0xd4208, disabled)").unwrap();
+        let disable_dma = cleanup
+            .find("write_active_wfdma(0xd4208, disabled)")
+            .unwrap();
         let bme = cleanup.find("set_pci_bus_master(&bdf, false)").unwrap();
         let irq = cleanup.find("installed.disable()").unwrap();
         let unmap = cleanup.find("attempt_all_cleanup(").unwrap();
