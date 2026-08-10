@@ -986,3 +986,59 @@ calls `world_clc_commands` without its fourth argument, and non-
 logger. A rustfmt check of `vfio_read.rs` likewise still reports pre-existing
 formatting drift around the device-info marker and discovery-release marker;
 those unrelated lines were not changed.
+
+### Next active-acquisition boundary after identity
+
+The exact continuation behind the temporary early return first re-queries BAR0
+region metadata and maps BAR pages `0xd4000`, `0x10000`, and `0xe0000`; mapping
+alone does not dereference a register or change device state. The first
+device-visible operation in `active_preflight` is then
+`verify_pci_dma_disabled`: a read-only 256-byte PCI configuration snapshot. It
+reads the 16-bit Command register at configuration offset `0x04`, requires
+Memory Space Enable (bit 1) set and Bus Master Enable (bit 2) clear, walks the
+standard capability list from offset `0x34`, and requires the Power Management
+Control/Status Register power-state field to report D0 (`00b`). IRQ-capability
+and VFIO reset-capability queries follow, but are not part of this boundary.
+DMA mappings occur only after those preconditions.
+
+The first later state mutation is `disable_pci_intx`, which reads the same
+Command word and sets Interrupt Disable bit 10 (`0x0400`). This is an adapted
+userspace form of pinned Linux
+`drivers/pci/pci.c:pci_intx(pdev, 0)` at commit
+`e8efe09d4f378992c890d181d65e2ed8d8cb1194`; pinned
+`include/uapi/linux/pci_regs.h` defines Command offset `0x04`, Memory Space
+Enable `0x0002`, Bus Master Enable `0x0004`, and INTx Disable `0x0400`.
+Requiring BME clear during handoff is stricter lab containment: normal pinned
+`mt7921_pci_probe` enables memory decoding and bus mastering during native
+probe. Pinned Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3`
+does not own PCI Command or PMCSR; its SoftMAC `DeviceOps` boundary begins
+after transport initialization.
+
+The smallest next physical boundary is therefore read-only: while retaining
+the temporary early return, take and durably record the complete post-identity
+PCI Command word plus the located PM capability offset and raw PMCSR, verify
+MSE=1, BME=0, and D0, then release exactly as the identity boundary does. It
+needs no restoration because it performs no write, and it must stop before
+`VFIO_DEVICE_GET_IRQ_INFO`, active-resource allocation, DMA mapping, interrupt
+installation, reset, or any BAR dereference. This also proves that the selector
+transaction did not perturb PCI command/power state.
+
+If the subsequent INTx-disable write is later admitted, it must be a separate
+boundary: save the entire 16-bit Command word; compute only
+`selected = saved | 0x0400`; write exactly those two bytes at offset `0x04`;
+read back and require full equality with `selected`; restore the exact saved
+word on every exit; and read back full equality before release. If bit 10 was
+already set, that boundary is an identical-value write and still requires the
+same durable write/readback/restore evidence. It must not touch the PCIe MAC
+interrupt gate at BAR0 `0x10188` in the same run.
+
+The existing verification failures do not change these hardware semantics.
+The locked `mt7921-passive-scan` build used for physical gates enables
+`fuchsia-passive` by default and compiles this path. The standalone
+`mt7921-port-spike` default-feature failure is configuration-specific: the same
+source file references cfg-gated SAE names without that feature; the separate
+firmware-inspect missing argument is unrelated. Rustfmt drift is also
+non-semantic, although one reported hunk is nearby in the device-info marker
+and the other is in the unreachable discovery-release continuation. A future
+implementation should format only its changed lines or separately fix that
+pre-existing drift; neither issue authorizes weakening the boundary.
