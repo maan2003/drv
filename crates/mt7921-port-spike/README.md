@@ -825,3 +825,18 @@ release markers. It performed no selector write, indirect-window read, other
 MMIO access, firmware action, DMA, or radio operation. Userspace and restore
 both returned success, the watchdog disarmed automatically, and the unchanged
 boot returned the native driver in D0 with iwd and the default route healthy.
+
+The minimal write boundary did not hardcode that observation: it mapped only
+BAR0 page `0xfe000` read/write, read and retained the selector, wrote that exact
+runtime value back once, and read it once more. Report
+`/var/lib/wifi-driver-lab/reports/20260810T101540Z-0000_05_00.0.log` records
+saved value `0x18451800`, the single identity write of `0x18451800`, and equal
+readback `0x18451800`, followed by munmap and safe release. No selector bits
+changed and there was no indirect-window access, other MMIO, firmware, DMA, or
+radio operation. Userspace returned zero and supervisor restoration reported
+`failed=0`, but the native network did not become remotely reachable before
+the watchdog deadline. Recovery therefore rebooted to
+`cd298031-f2f5-4911-8c90-8d9e89bb40b8`, where the patched kernel, native driver
+in D0, iwd, and the default route were healthy. Thus the identical-value write
+is mechanically verified but, unlike the read-only boundary, does not yet
+prove reboot-free native-network recovery.
