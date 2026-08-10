@@ -1268,6 +1268,51 @@ fn run() -> Result<(), String> {
                 "vfio_dynamic_identity_complete chip_id={chip_id:#010x} hardware_bound={hardware_bound:#010x} revision={revision:#010x} effective_chip_id={effective_chip_id:#010x} composite_revision={composite_revision:#010x}"
             ));
 
+            record_sae_stage("vfio_post_identity_pci_preflight_before config_bytes=256");
+            let config_path = format!("/sys/bus/pci/devices/{bdf}/config");
+            let mut config_file = File::open(&config_path)
+                .map_err(|error| format!("open post-identity PCI config: {error}"))?;
+            let mut config = [0u8; 256];
+            config_file
+                .read_exact(&mut config)
+                .map_err(|error| format!("read post-identity PCI config: {error}"))?;
+            let command = u16::from_le_bytes(config[4..6].try_into().expect("fixed field"));
+            let mut capability = usize::from(config[0x34] & !3);
+            let mut power = None;
+            for _ in 0..48 {
+                if capability < 0x40 || capability + 6 > config.len() {
+                    break;
+                }
+                if config[capability] == 1 {
+                    let pmcsr = u16::from_le_bytes(
+                        config[capability + 4..capability + 6]
+                            .try_into()
+                            .expect("fixed field"),
+                    );
+                    power = Some((capability, pmcsr));
+                    break;
+                }
+                capability = usize::from(config[capability + 1] & !3);
+            }
+            let (pm_capability_offset, pmcsr) =
+                power.ok_or("post-identity PCI PM capability is absent")?;
+            let mse = command & (1 << 1) != 0;
+            let bme = command & (1 << 2) != 0;
+            let power_state = pmcsr & 3;
+            record_sae_stage(&format!(
+                "vfio_post_identity_pci_preflight_after command={command:#06x} pm_capability_offset={pm_capability_offset:#04x} pmcsr={pmcsr:#06x} mse={mse} bme={bme} power_state={power_state}"
+            ));
+            if !mse || bme {
+                return Err(format!(
+                    "post-identity PCI command requires MSE=1 BME=0, read {command:#06x}"
+                ));
+            }
+            if power_state != 0 {
+                return Err(format!(
+                    "post-identity PCI device is not in D0: PMCSR {pmcsr:#06x}"
+                ));
+            }
+
             record_sae_stage(&format!(
                 "vfio_bar0_munmap_before page={MT_HIF_REMAP_WINDOW_BAR_OFFSET:#x} length=4096"
             ));
