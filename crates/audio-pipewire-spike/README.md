@@ -46,6 +46,11 @@ drv-audio-pipewire-spike -- serve`, then use the unmodified `pw-cli ls Node` or
 
 An unmodified client can connect, discover, and bind both globals. `pw-cli info
 2`, `pw-cli info 3`, and `pw-cli enum-params 2 EnumFormat` (or object 3) receive
-standard Node/Port Info and the S16LE/48 kHz/stereo format POD. The next frontend
-gap is stream object/link creation, followed by shared-buffer negotiation,
-activation, clock/quantum scheduling, and processing.
+standard Node/Port Info and the S16LE/48 kHz/stereo format POD. The server also
+accepts the stock playback client's standard
+`Core.CreateObject("client-node")` and `ClientNode.GetNode`, including bounded
+properties, versions, and collision-free client proxy IDs. A stock `pw-cat`
+playback now reaches `ClientNode.Update`, which is the exact next unsupported
+operation. That update and subsequent PortUpdate must describe the client
+stream before transport FDs, shared-buffer negotiation, activation,
+clock/quantum scheduling, and PCM processing can be implemented.

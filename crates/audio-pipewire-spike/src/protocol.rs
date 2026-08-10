@@ -24,6 +24,7 @@ const CORE_ID: u32 = 0;
 const CLIENT_ID: u32 = 1;
 const CORE_SYNC: u8 = 2;
 const CORE_GET_REGISTRY: u8 = 5;
+const CORE_CREATE_OBJECT: u8 = 6;
 const CLIENT_UPDATE_PROPERTIES: u8 = 2;
 const CORE_DONE: u8 = 1;
 const REGISTRY_GLOBAL: u8 = 0;
@@ -76,6 +77,12 @@ struct BoundObject {
     kind: BoundKind,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClientNodeObject {
+    proxy_id: u32,
+    node_proxy_id: Option<u32>,
+}
+
 /// Accept one standard PipeWire native client and finish after its post-registry sync.
 pub fn serve_one(listener: &UnixListener) -> io::Result<()> {
     let (mut stream, _) = listener.accept()?;
@@ -86,6 +93,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
     let mut out_seq = 0;
     let mut registry_id = None;
     let mut bound_objects: Vec<BoundObject> = Vec::new();
+    let mut client_nodes: Vec<ClientNodeObject> = Vec::new();
 
     loop {
         let (header, payload) = match read_message(stream) {
@@ -107,11 +115,7 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
 
         if Some(header.id) == registry_id && header.opcode == REGISTRY_BIND {
             let object = decode_bind(&payload)?;
-            if Some(object.proxy_id) == registry_id
-                || bound_objects
-                    .iter()
-                    .any(|bound| bound.proxy_id == object.proxy_id)
-            {
+            if proxy_id_in_use(object.proxy_id, registry_id, &bound_objects, &client_nodes) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "duplicate PipeWire proxy id",
@@ -119,6 +123,44 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
             }
             write_object_info(stream, object, &mut out_seq)?;
             bound_objects.push(object);
+            continue;
+        }
+
+        if let Some(client_node_index) = client_nodes
+            .iter()
+            .position(|client_node| client_node.proxy_id == header.id)
+        {
+            match header.opcode {
+                1 => {
+                    let node_proxy_id = decode_get_node(&payload)?;
+                    if client_nodes[client_node_index].node_proxy_id.is_some()
+                        || proxy_id_in_use(
+                            node_proxy_id,
+                            registry_id,
+                            &bound_objects,
+                            &client_nodes,
+                        )
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate ClientNode Node proxy id",
+                        ));
+                    }
+                    client_nodes[client_node_index].node_proxy_id = Some(node_proxy_id);
+                }
+                2 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "ClientNode.Update is the next unsupported PipeWire operation",
+                    ));
+                }
+                opcode => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("unsupported ClientNode opcode {opcode}"),
+                    ));
+                }
+            }
             continue;
         }
 
@@ -166,6 +208,21 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
                 )?;
                 registry_id = Some(new_registry_id);
             }
+            (CORE_ID, CORE_CREATE_OBJECT) => {
+                let client_node = decode_create_client_node(&payload)?;
+                if proxy_id_in_use(
+                    client_node.proxy_id,
+                    registry_id,
+                    &bound_objects,
+                    &client_nodes,
+                ) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate ClientNode proxy id",
+                    ));
+                }
+                client_nodes.push(client_node);
+            }
             (CORE_ID, CORE_SYNC) => {
                 let (id, seq) = decode_sync(&payload)?;
                 let body = encode_struct(|builder| builder.push_int(id).push_int(seq))?;
@@ -192,6 +249,82 @@ fn serve_connection(stream: &mut UnixStream) -> io::Result<()> {
             }
         }
     }
+}
+
+fn proxy_id_in_use(
+    id: u32,
+    registry_id: Option<u32>,
+    bound_objects: &[BoundObject],
+    client_nodes: &[ClientNodeObject],
+) -> bool {
+    id < 2
+        || Some(id) == registry_id
+        || bound_objects.iter().any(|object| object.proxy_id == id)
+        || client_nodes
+            .iter()
+            .any(|object| object.proxy_id == id || object.node_proxy_id == Some(id))
+}
+
+fn decode_create_client_node(payload: &[u8]) -> io::Result<ClientNodeObject> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            let factory = fields.pop_string()?;
+            let interface = fields.pop_string()?;
+            let version = fields.pop_int()?;
+            fields.pop_struct(|properties| {
+                let count = properties.pop_int()?;
+                if !(0..=128).contains(&count) {
+                    return Err(pipewire_native_spa::pod::Error::Invalid(
+                        "invalid ClientNode property count".into(),
+                    ));
+                }
+                for _ in 0..count {
+                    properties.pop_string()?;
+                    properties.pop_string()?;
+                }
+                if properties.available() != 0 {
+                    return Err(pipewire_native_spa::pod::Error::Invalid(
+                        "trailing ClientNode properties".into(),
+                    ));
+                }
+                Ok(())
+            })?;
+            let proxy_id = fields.pop_int()?;
+            if factory != "client-node"
+                || interface != "PipeWire:Interface:ClientNode"
+                || !(1..=6).contains(&version)
+                || proxy_id < 2
+                || fields.available() != 0
+            {
+                return Err(pipewire_native_spa::pod::Error::Invalid(
+                    "unsupported Core.CreateObject request".into(),
+                ));
+            }
+            Ok(ClientNodeObject {
+                proxy_id: proxy_id as u32,
+                node_proxy_id: None,
+            })
+        })
+        .map(|(object, _)| object)
+        .map_err(invalid_pod)
+}
+
+fn decode_get_node(payload: &[u8]) -> io::Result<u32> {
+    let mut parser = Parser::new(payload);
+    parser
+        .pop_struct(|fields| {
+            let version = fields.pop_int()?;
+            let proxy_id = fields.pop_int()?;
+            if !(1..=3).contains(&version) || proxy_id < 2 || fields.available() != 0 {
+                return Err(pipewire_native_spa::pod::Error::Invalid(
+                    "invalid ClientNode.GetNode request".into(),
+                ));
+            }
+            Ok(proxy_id as u32)
+        })
+        .map(|(proxy_id, _)| proxy_id)
+        .map_err(invalid_pod)
 }
 
 fn decode_bind(payload: &[u8]) -> io::Result<BoundObject> {
@@ -713,5 +846,55 @@ mod tests {
         read_message(&mut client).unwrap();
         drop(client);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn creates_client_node_and_accepts_get_node_before_update_boundary() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || serve_connection(&mut server));
+
+        client
+            .write_all(&request(CORE_ID, 1, |b| b.push_int(3)))
+            .unwrap();
+        client
+            .write_all(&request(CLIENT_ID, CLIENT_UPDATE_PROPERTIES, |b| {
+                b.push_struct(|b| b.push_int(0))
+            }))
+            .unwrap();
+        client
+            .write_all(&request(CORE_ID, CORE_GET_REGISTRY, |b| {
+                b.push_int(3).push_int(7)
+            }))
+            .unwrap();
+        read_message(&mut client).unwrap();
+        read_message(&mut client).unwrap();
+        client
+            .write_all(&request(CORE_ID, CORE_SYNC, |b| b.push_int(0).push_int(1)))
+            .unwrap();
+        read_message(&mut client).unwrap();
+
+        client
+            .write_all(&request(CORE_ID, CORE_CREATE_OBJECT, |b| {
+                b.push_string("client-node")
+                    .push_string("PipeWire:Interface:ClientNode")
+                    .push_int(6)
+                    .push_struct(|b| {
+                        b.push_int(2)
+                            .push_string("media.class")
+                            .push_string("Stream/Output/Audio")
+                            .push_string("target.object")
+                            .push_string("2")
+                    })
+                    .push_int(8)
+            }))
+            .unwrap();
+        client
+            .write_all(&request(8, 1, |b| b.push_int(3).push_int(9)))
+            .unwrap();
+        client.write_all(&request(8, 2, |b| b.push_int(0))).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("ClientNode.Update"));
     }
 }

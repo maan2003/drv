@@ -1,4 +1,4 @@
-use std::{env, fs, os::unix::net::UnixListener, path::PathBuf};
+use std::{env, fs, os::unix::net::UnixListener, path::PathBuf, process};
 
 use drv_audio_pipewire_spike::{
     PlaybackEndpoint, VIRTUAL_SINK_FORMAT, VirtualPcmEndpoint, enum_format_pod, protocol,
@@ -13,7 +13,11 @@ fn main() {
         fs::create_dir_all(&runtime_dir).expect("create runtime directory");
         let socket = runtime_dir.join("pipewire-0");
         let listener = UnixListener::bind(&socket).expect("bind pipewire-0");
-        protocol::serve_one(&listener).expect("serve PipeWire discovery client");
+        if let Err(error) = protocol::serve_one(&listener) {
+            eprintln!("PipeWire probe stopped: {error}");
+            let _ = fs::remove_file(&socket);
+            process::exit(2);
+        }
         fs::remove_file(socket).expect("remove pipewire-0");
         return;
     }
