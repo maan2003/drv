@@ -52,6 +52,7 @@ host_patches=(
   "$patch_dir/wlan-fidl-ext-host.patch"
   "$patch_dir/wlan-rsn-host.patch"
   "$patch_dir/wlan-sme-host.patch"
+  "$patch_dir/wlan-sme-provenance-host.patch"
   "$patch_dir/wlancfg-selection-host.patch"
   "$patch_dir/wlan-trace-host.patch"
   "$patch_dir/wlan-timer-host.patch"

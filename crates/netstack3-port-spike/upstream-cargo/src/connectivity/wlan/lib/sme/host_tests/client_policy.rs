@@ -166,3 +166,196 @@ fn open_connect_crosses_pinned_sme_mlme_boundary() {
         matches!(sme.status(), ClientSmeStatus::Connected(ref ap) if ap.bssid.as_array() == &bss.bssid)
     );
 }
+
+#[test]
+fn trusted_private_carrier_crosses_actual_scheduler_and_seals_once() {
+    struct PrivateIndex(u64);
+
+    let inspector = fuchsia_inspect::Inspector::default();
+    let inspect_node = inspector.root().create_child("trusted-sme");
+    let (mut sme, _mlme_sink, mut mlme_stream, _time_stream) = ClientSme::new(
+        ClientConfig::default(),
+        device_info(),
+        inspector,
+        inspect_node,
+        SecuritySupport::default(),
+        SpectrumManagementSupport::default(),
+    );
+    let mut state = wlan_sme::client::TrustedScanState::<PrivateIndex>::new(7);
+    let txn_id = sme
+        .start_trusted_scan(
+            &mut state,
+            ScanRequest::Passive(PassiveScanRequest { channels: vec![1] }),
+        )
+        .unwrap();
+    assert!(
+        matches!(mlme_stream.try_recv(), Ok(MlmeRequest::Scan(ref scan)) if scan.txn_id == txn_id)
+    );
+
+    sme.on_trusted_mlme_scan_result(
+        fidl_fuchsia_wlan_mlme::ScanResult {
+            txn_id,
+            timestamp_nanos: 100,
+            bss: open_bss(),
+        },
+        PrivateIndex(41),
+        &mut state,
+    )
+    .unwrap();
+    let terminal = sme
+        .on_trusted_mlme_scan_end(
+            ScanEnd {
+                txn_id,
+                code: ScanResultCode::Success,
+            },
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(terminal.generation(), 7);
+    assert_eq!(terminal.txn_id(), txn_id);
+    assert_eq!(terminal.bss_description_list().len(), 1);
+    let input_provenance = terminal.input_provenance().collect::<Vec<_>>();
+    assert_eq!(input_provenance.len(), 1);
+    assert_eq!(input_provenance[0].0, 41);
+    assert!(matches!(
+        sme.on_trusted_mlme_scan_end(
+            ScanEnd {
+                txn_id,
+                code: ScanResultCode::Success
+            },
+            &mut state,
+        ),
+        Err(wlan_sme::client::TrustedScanError::DuplicateOrLate)
+    ));
+    assert!(mlme_stream.try_recv().is_err());
+}
+
+#[test]
+fn trusted_guard_rejects_ordinary_responder_without_request_or_output() {
+    let inspector = fuchsia_inspect::Inspector::default();
+    let inspect_node = inspector.root().create_child("trusted-guard");
+    let (mut sme, _mlme_sink, mut mlme_stream, _time_stream) = ClientSme::new(
+        ClientConfig::default(),
+        device_info(),
+        inspector,
+        inspect_node,
+        SecuritySupport::default(),
+        SpectrumManagementSupport::default(),
+    );
+    let mut state = wlan_sme::client::TrustedScanState::<u64>::new(9);
+    let txn_id = sme
+        .start_trusted_scan(
+            &mut state,
+            ScanRequest::Passive(PassiveScanRequest { channels: vec![1] }),
+        )
+        .unwrap();
+    assert!(matches!(mlme_stream.try_recv(), Ok(MlmeRequest::Scan(_))));
+
+    let mut ordinary = sme.on_scan_command(ScanRequest::Passive(PassiveScanRequest {
+        channels: vec![1],
+    }));
+    assert_eq!(ordinary.try_recv(), Ok(None));
+    assert!(mlme_stream.try_recv().is_err());
+    assert!(matches!(
+        sme.on_trusted_mlme_scan_end(
+            ScanEnd {
+                txn_id,
+                code: ScanResultCode::Success
+            },
+            &mut state,
+        ),
+        Err(wlan_sme::client::TrustedScanError::Failed)
+    ));
+    assert_eq!(ordinary.try_recv(), Ok(None));
+    assert!(mlme_stream.try_recv().is_err());
+}
+
+#[test]
+fn trusted_mismatch_retains_affine_input_and_emits_nothing() {
+    let inspector = fuchsia_inspect::Inspector::default();
+    let inspect_node = inspector.root().create_child("trusted-mismatch");
+    let (mut sme, _mlme_sink, mut mlme_stream, _time_stream) = ClientSme::new(
+        ClientConfig::default(),
+        device_info(),
+        inspector,
+        inspect_node,
+        SecuritySupport::default(),
+        SpectrumManagementSupport::default(),
+    );
+    let mut state = wlan_sme::client::TrustedScanState::<Box<u64>>::new(11);
+    let txn_id = sme
+        .start_trusted_scan(
+            &mut state,
+            ScanRequest::Passive(PassiveScanRequest { channels: vec![1] }),
+        )
+        .unwrap();
+    assert!(matches!(mlme_stream.try_recv(), Ok(MlmeRequest::Scan(_))));
+    assert!(matches!(
+        sme.on_trusted_mlme_scan_result(
+            fidl_fuchsia_wlan_mlme::ScanResult {
+                txn_id: txn_id + 1,
+                timestamp_nanos: 0,
+                bss: open_bss(),
+            },
+            Box::new(3),
+            &mut state,
+        ),
+        Err(wlan_sme::client::TrustedScanError::Mismatch)
+    ));
+    assert!(state.is_failed());
+    assert!(mlme_stream.try_recv().is_err());
+}
+
+#[test]
+fn connecting_shortcut_cannot_bypass_active_trusted_guard() {
+    let inspector = fuchsia_inspect::Inspector::default();
+    let inspect_node = inspector.root().create_child("trusted-connecting");
+    let (mut sme, _mlme_sink, mut mlme_stream, _time_stream) = ClientSme::new(
+        ClientConfig::default(),
+        device_info(),
+        inspector,
+        inspect_node,
+        SecuritySupport::default(),
+        SpectrumManagementSupport::default(),
+    );
+    let bss = open_bss();
+    let _connect_transaction = sme.on_connect_command(ConnectRequest {
+        ssid: b"open".to_vec(),
+        bss_description: bss,
+        multiple_bss_candidates: false,
+        authentication: Authentication {
+            protocol: Protocol::Open,
+            credentials: None,
+        },
+        deprecated_scan_type: ScanType::Passive,
+    });
+    assert!(matches!(
+        mlme_stream.try_recv(),
+        Ok(MlmeRequest::Connect(_))
+    ));
+
+    let mut state = wlan_sme::client::TrustedScanState::<u64>::new(13);
+    let txn_id = sme
+        .start_trusted_scan(
+            &mut state,
+            ScanRequest::Passive(PassiveScanRequest { channels: vec![1] }),
+        )
+        .unwrap();
+    assert!(matches!(mlme_stream.try_recv(), Ok(MlmeRequest::Scan(_))));
+    let mut ordinary = sme.on_scan_command(ScanRequest::Passive(PassiveScanRequest {
+        channels: vec![1],
+    }));
+    assert_eq!(ordinary.try_recv(), Ok(None));
+    assert!(mlme_stream.try_recv().is_err());
+    assert!(matches!(
+        sme.on_trusted_mlme_scan_end(
+            ScanEnd {
+                txn_id,
+                code: ScanResultCode::Success
+            },
+            &mut state,
+        ),
+        Err(wlan_sme::client::TrustedScanError::Failed)
+    ));
+    assert_eq!(ordinary.try_recv(), Ok(None));
+}

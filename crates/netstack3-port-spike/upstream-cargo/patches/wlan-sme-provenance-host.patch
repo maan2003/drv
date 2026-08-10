@@ -1,0 +1,475 @@
+--- a/src/connectivity/wlan/lib/sme/src/client/scan.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/scan.rs
+@@ -103,6 +103,89 @@
+         Self { scan_results_sender, bss_map: HashMap::new() }
+     }
+ }
++/// Opaque, caller-owned affine state for one private trusted scan. Generic SME
++/// code carries `P` structurally but never interprets it or confers trust.
++pub struct TrustedScanState<P> {
++    generation: u64,
++    txn_id: Option<ScanTxnId>,
++    terminal_seen: bool,
++    failed: bool,
++    input_provenance: Vec<P>,
++    #[cfg(not(target_os = "fuchsia"))]
++    panic_after_result_retained: bool,
++}
++
++impl<P> TrustedScanState<P> {
++    pub fn new(generation: u64) -> Self {
++        Self {
++            generation,
++            txn_id: None,
++            terminal_seen: false,
++            failed: false,
++            input_provenance: Vec::new(),
++            #[cfg(not(target_os = "fuchsia"))]
++            panic_after_result_retained: false,
++        }
++    }
++
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++    pub fn txn_id(&self) -> Option<u64> {
++        self.txn_id
++    }
++    pub fn is_failed(&self) -> bool {
++        self.failed
++    }
++    #[cfg(not(target_os = "fuchsia"))]
++    pub fn inject_result_aggregation_panic_for_test(&mut self) {
++        self.panic_after_result_retained = true;
++    }
++}
++
++/// Opaque terminal returned to the co-located owner. Its affine carriers can
++/// only be inspected by reference, so owner validation never transfers them
++/// into an untrusted callback frame.
++pub struct TrustedScanTerminal<P> {
++    generation: u64,
++    txn_id: u64,
++    bss_description_list: Vec<BssDescription>,
++    input_provenance: Vec<P>,
++}
++
++impl<P> TrustedScanTerminal<P> {
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++    pub fn txn_id(&self) -> u64 {
++        self.txn_id
++    }
++    pub fn bss_description_list(&self) -> &[BssDescription] {
++        &self.bss_description_list
++    }
++    pub fn input_provenance(&self) -> impl ExactSizeIterator<Item = &P> {
++        self.input_provenance.iter()
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum TrustedScanError {
++    Busy,
++    Exhausted,
++    Inactive,
++    Collision,
++    Mismatch,
++    DuplicateOrLate,
++    Failed,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct TrustedScanTag {
++    generation: u64,
++    txn_id: ScanTxnId,
++    poisoned: bool,
++}
++
+ pub struct ScanScheduler<T> {
+     // The currently running scan. We assume that MLME can handle a single concurrent scan
+     // regardless of its own state.
+@@ -114,6 +197,13 @@
+     // Map of active scheduled scan transaction IDs to their internal states.
+     pub(crate) scheduled_scan_receivers: HashMap<ScanTxnId, ScheduledScanState>,
+     last_mlme_txn_id: ScanTxnId,
++    // Private routing guard only. Every affine `P` remains in caller-owned
++    // `TrustedScanState<P>` across the actual scheduler calls.
++    trusted: Option<TrustedScanTag>,
++    trusted_quarantine: Vec<DiscoveryScan<T>>,
++    trusted_scheduled_quarantine: Vec<Responder<Result<(), i32>>>,
++    trusted_scheduled_senders: Vec<mpsc::UnboundedSender<fidl::Vmo>>,
++    trusted_value_quarantine: Vec<HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>>,
+ }
+ 
+ #[derive(Debug)]
+@@ -124,6 +214,11 @@
+         mlme_txn_id: ScanTxnId,
+         bss_map: HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>,
+     },
++    ScanningTrusted {
++        generation: u64,
++        mlme_txn_id: ScanTxnId,
++        bss_map: HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>,
++    },
+ }
+ 
+ #[derive(Debug)]
+@@ -145,6 +240,11 @@
+             spectrum_management_support,
+             scheduled_scan_receivers: HashMap::new(),
+             last_mlme_txn_id: 0,
++            trusted: None,
++            trusted_quarantine: Vec::new(),
++            trusted_scheduled_quarantine: Vec::new(),
++            trusted_scheduled_senders: Vec::new(),
++            trusted_value_quarantine: Vec::new(),
+         }
+     }
+ 
+@@ -155,6 +255,11 @@
+         &mut self,
+         s: DiscoveryScan<T>,
+     ) -> Option<fidl_mlme::ScanRequest> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            self.trusted_quarantine.push(s);
++            return None;
++        }
+         if let ScanState::ScanningToDiscover { cmd, .. } = &mut self.current
+             && cmd.matches(&s)
+         {
+@@ -175,12 +280,205 @@
+         self.last_mlme_txn_id
+     }
+ 
++    pub(crate) fn has_trusted_scan(&self) -> bool {
++        self.trusted.is_some()
++    }
++
++    pub fn start_trusted_scan<P>(
++        &mut self,
++        state: &mut TrustedScanState<P>,
++        scan_request: fidl_sme::ScanRequest,
++    ) -> Result<fidl_mlme::ScanRequest, TrustedScanError> {
++        if self.trusted.is_some()
++            || !matches!(self.current, ScanState::NotScanning)
++            || !self.pending_discovery.is_empty()
++            || !self.scheduled_scan_receivers.is_empty()
++            || !self.trusted_quarantine.is_empty()
++            || !self.trusted_scheduled_quarantine.is_empty()
++            || !self.trusted_scheduled_senders.is_empty()
++            || !self.trusted_value_quarantine.is_empty()
++            || !state.input_provenance.is_empty()
++            || state.txn_id.is_some()
++            || state.terminal_seen
++            || state.failed
++        {
++            if let Some(tag) = &mut self.trusted {
++                tag.poisoned = true;
++            }
++            state.failed = true;
++            return Err(TrustedScanError::Busy);
++        }
++        let txn_id = self.last_mlme_txn_id.checked_add(1).ok_or_else(|| {
++            state.failed = true;
++            TrustedScanError::Exhausted
++        })?;
++        self.last_mlme_txn_id = txn_id;
++        state.txn_id = Some(txn_id);
++        self.current = ScanState::ScanningTrusted {
++            generation: state.generation,
++            mlme_txn_id: txn_id,
++            bss_map: HashMap::new(),
++        };
++        self.trusted = Some(TrustedScanTag {
++            generation: state.generation,
++            txn_id,
++            poisoned: false,
++        });
++        Ok(new_scan_request(
++            txn_id,
++            scan_request,
++            vec![],
++            &self.device_info,
++            self.spectrum_management_support.clone(),
++        ))
++    }
++
++    pub fn on_trusted_mlme_scan_result<P>(
++        &mut self,
++        msg: fidl_mlme::ScanResult,
++        provenance: P,
++        state: &mut TrustedScanState<P>,
++    ) -> Result<(), TrustedScanError> {
++        let Some(tag) = &mut self.trusted else {
++            state.failed = true;
++            state.input_provenance.push(provenance);
++            return Err(TrustedScanError::Inactive);
++        };
++        if self.scheduled_scan_receivers.contains_key(&msg.txn_id) {
++            tag.poisoned = true;
++            state.failed = true;
++            // Retain the affine carrier until its owner invalidates the session.
++            state.input_provenance.push(provenance);
++            return Err(TrustedScanError::Collision);
++        }
++        if tag.poisoned || state.failed {
++            tag.poisoned = true;
++            state.failed = true;
++            state.input_provenance.push(provenance);
++            return Err(TrustedScanError::Failed);
++        }
++        if state.terminal_seen {
++            tag.poisoned = true;
++            state.failed = true;
++            state.input_provenance.push(provenance);
++            return Err(TrustedScanError::DuplicateOrLate);
++        }
++        if tag.txn_id != msg.txn_id
++            || tag.generation != state.generation
++            || state.txn_id != Some(msg.txn_id)
++        {
++            tag.poisoned = true;
++            state.failed = true;
++            state.input_provenance.push(provenance);
++            return Err(TrustedScanError::Mismatch);
++        }
++        match &mut self.current {
++            ScanState::ScanningTrusted { generation, mlme_txn_id, bss_map }
++                if *generation == state.generation && *mlme_txn_id == msg.txn_id =>
++            {
++                // Stay poisoned across the panic-capable aggregation mutation.
++                // Only the successful return clears this in-progress guard.
++                tag.poisoned = true;
++                state.input_provenance.push(provenance);
++                #[cfg(not(target_os = "fuchsia"))]
++                if mem::take(&mut state.panic_after_result_retained) {
++                    panic!("injected trusted scan result aggregation panic");
++                }
++                maybe_insert_bss(bss_map, msg.bss);
++                tag.poisoned = false;
++                Ok(())
++            }
++            _ => {
++                tag.poisoned = true;
++                state.failed = true;
++                state.input_provenance.push(provenance);
++                Err(TrustedScanError::Mismatch)
++            }
++        }
++    }
++
++    pub fn on_trusted_mlme_scan_end<P>(
++        &mut self,
++        msg: fidl_mlme::ScanEnd,
++        state: &mut TrustedScanState<P>,
++        sme_inspect: &Arc<inspect::SmeTree>,
++    ) -> Result<TrustedScanTerminal<P>, TrustedScanError> {
++        if state.terminal_seen {
++            state.failed = true;
++            if let Some(tag) = &mut self.trusted {
++                tag.poisoned = true;
++            }
++            return Err(TrustedScanError::DuplicateOrLate);
++        }
++        state.terminal_seen = true;
++        let Some(tag) = self.trusted.as_mut() else {
++            state.failed = true;
++            return Err(TrustedScanError::Inactive);
++        };
++        let ordinary_empty = self.pending_discovery.is_empty()
++            && self.scheduled_scan_receivers.is_empty()
++            && self.trusted_quarantine.is_empty()
++            && self.trusted_scheduled_quarantine.is_empty()
++            && self.trusted_scheduled_senders.is_empty()
++            && self.trusted_value_quarantine.is_empty();
++        let current = mem::replace(&mut self.current, ScanState::NotScanning);
++        let ScanState::ScanningTrusted { generation, mlme_txn_id, bss_map } = current else {
++            if let ScanState::ScanningToDiscover { cmd, bss_map, .. } = current {
++                self.trusted_quarantine.push(cmd);
++                self.trusted_value_quarantine.push(bss_map);
++            }
++            tag.poisoned = true;
++            state.failed = true;
++            return Err(TrustedScanError::Mismatch);
++        };
++        let clean = !tag.poisoned
++            && !state.failed
++            && tag.txn_id == msg.txn_id
++            && tag.generation == state.generation
++            && state.txn_id == Some(msg.txn_id)
++            && mlme_txn_id == msg.txn_id
++            && generation == state.generation
++            && msg.code == fidl_mlme::ScanResultCode::Success
++            && ordinary_empty;
++        if !clean {
++            self.trusted_value_quarantine.push(bss_map);
++            tag.poisoned = true;
++            state.failed = true;
++            return Err(if tag.txn_id != msg.txn_id || tag.generation != state.generation {
++                TrustedScanError::Mismatch
++            } else {
++                TrustedScanError::Failed
++            });
++        }
++        let terminal = TrustedScanTerminal {
++            generation,
++            txn_id: mlme_txn_id,
++            bss_description_list: convert_bss_map(bss_map, None::<Ssid>, sme_inspect),
++            input_provenance: mem::take(&mut state.input_provenance),
++        };
++        self.trusted = None;
++        Ok(terminal)
++    }
++
+     pub(crate) fn start_scheduled_scan(
+         &mut self,
+         req: fidl_common::ScheduledScanRequest,
+         mlme_sink: MlmeSink,
+         responder: Responder<Result<(), i32>>,
+     ) -> ScheduledScanReceiver {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            // No request, response, or stop-on-drop may escape this rejection.
++            self.trusted_scheduled_quarantine.push(responder);
++            let (sender, receiver) = mpsc::unbounded();
++            self.trusted_scheduled_senders.push(sender);
++            return ScheduledScanReceiver {
++                scan_results_receiver: receiver,
++                txn_id: 0,
++                mlme_sink,
++                stopped_by_firmware: true,
++            };
++        }
+         // Send start request to MLME with a new transaction ID
+         let txn_id = self.get_next_mlme_txn_id();
+         let mlme_req = fidl_mlme::MlmeStartScheduledScanRequest { txn_id, req };
+@@ -194,6 +492,10 @@
+ 
+     // Should be called for every OnScanResult event received from MLME.
+     pub fn on_mlme_scan_result(&mut self, msg: fidl_mlme::ScanResult) -> Result<(), Error> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return Err(Error::ScanResultWrongTxnId);
++        }
+         // First check if this belongs to a scheduled scan session.
+         if let Some(session) = self.scheduled_scan_receivers.get_mut(&msg.txn_id) {
+             maybe_insert_bss(&mut session.bss_map, msg.bss);
+@@ -209,6 +511,7 @@
+                 maybe_insert_bss(bss_map, msg.bss);
+                 Ok(())
+             }
++            ScanState::ScanningTrusted { .. } => Err(Error::ScanResultWrongTxnId),
+         }
+     }
+ 
+@@ -220,6 +523,10 @@
+         device_info: &fidl_mlme::DeviceInfo,
+         security_support: &fidl_common::SecuritySupport,
+     ) {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return;
++        }
+         if let Some(session) = self.scheduled_scan_receivers.get_mut(&txn_id) {
+             #[cfg(target_os = "fuchsia")]
+             let bss_map = std::mem::take(&mut session.bss_map);
+@@ -253,6 +560,10 @@
+     }
+ 
+     pub(crate) fn on_scheduled_scan_stopped_by_firmware(&mut self, txn_id: ScanTxnId) {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return;
++        }
+         let _ = self.scheduled_scan_receivers.remove(&txn_id);
+     }
+ 
+@@ -263,6 +574,10 @@
+         msg: fidl_mlme::ScanEnd,
+         sme_inspect: &Arc<inspect::SmeTree>,
+     ) -> Result<(ScanEnd<T>, Option<fidl_mlme::ScanRequest>), Error> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return Err(Error::ScanEndWrongTxnId);
++        }
+         match mem::replace(&mut self.current, ScanState::NotScanning) {
+             ScanState::NotScanning => Err(Error::ScanEndNotScanning),
+             ScanState::ScanningToDiscover { mlme_txn_id, .. } if mlme_txn_id != msg.txn_id => {
+@@ -278,6 +593,10 @@
+                 let request = self.start_next_scan();
+                 Ok((scan_end, request))
+             }
++            ScanState::ScanningTrusted { bss_map, .. } => {
++                self.trusted_value_quarantine.push(bss_map);
++                Err(Error::ScanEndWrongTxnId)
++            }
+         }
+     }
+ 
+--- a/src/connectivity/wlan/lib/sme/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+@@ -16,7 +16,9 @@
+ 
+ use self::event::Event;
+ use self::protection::{Protection, SecurityContext};
+-pub use self::scan::ScheduledScanReceiver;
++pub use self::scan::{
++    ScheduledScanReceiver, TrustedScanError, TrustedScanState, TrustedScanTerminal,
++};
+ use self::scan::{DiscoveryScan, ScanScheduler};
+ use self::state::{ClientState, ConnectCommand};
+ use crate::responder::Responder;
+@@ -812,13 +814,49 @@
+         self.context.inspect.update_pulse(self.status());
+     }
+ 
++    /// Starts a host-private trusted scan on the actual scheduler. The caller
++    /// retains every affine provenance carrier in `state`; this method only
++    /// installs the scheduler routing tag and emits the real MLME request.
++    pub fn start_trusted_scan<P>(
++        &mut self,
++        state: &mut TrustedScanState<P>,
++        scan_request: fidl_sme::ScanRequest,
++    ) -> Result<u64, TrustedScanError> {
++        let request = self.scan_sched.start_trusted_scan(state, scan_request)?;
++        let txn_id = request.txn_id;
++        self.send_scan_request(Some(request));
++        Ok(txn_id)
++    }
++
++    pub fn on_trusted_mlme_scan_result<P>(
++        &mut self,
++        result: fidl_mlme::ScanResult,
++        provenance: P,
++        state: &mut TrustedScanState<P>,
++    ) -> Result<(), TrustedScanError> {
++        self.scan_sched.on_trusted_mlme_scan_result(result, provenance, state)
++    }
++
++    pub fn on_trusted_mlme_scan_end<P>(
++        &mut self,
++        end: fidl_mlme::ScanEnd,
++        state: &mut TrustedScanState<P>,
++    ) -> Result<TrustedScanTerminal<P>, TrustedScanError> {
++        self.scan_sched
++            .on_trusted_mlme_scan_end(end, state, &self.context.inspect)
++    }
++
+     pub fn on_scan_command(
+         &mut self,
+         scan_request: fidl_sme::ScanRequest,
+     ) -> oneshot::Receiver<Result<Vec<wlan_common::scan::ScanResult>, fidl_mlme::ScanResultCode>>
+     {
+         let (responder, receiver) = Responder::new();
+-        if self.status().is_connecting() {
++        if self.scan_sched.has_trusted_scan() {
++            let scan = DiscoveryScan::new(responder, scan_request);
++            let req = self.scan_sched.enqueue_scan_to_discover(scan);
++            self.send_scan_request(req);
++        } else if self.status().is_connecting() {
+             info!("SME ignoring scan request because a connect is in progress");
+             responder.respond(Err(fidl_mlme::ScanResultCode::ShouldWait));
+         } else {

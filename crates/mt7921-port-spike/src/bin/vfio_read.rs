@@ -2656,6 +2656,11 @@ struct CarriedScanResult {
     result: fidl_fuchsia_wlan_mlme::ScanResult,
 }
 
+#[cfg(all(test, feature = "fuchsia-passive"))]
+struct ValidatedSmeAggregate {
+    terminal: wlan_sme::client::TrustedScanTerminal<ProvenanceHandle>,
+}
+
 /// Binary-private, compile/test-only B2a arena. It owns the actual B1
 /// occurrences and the only sink allowed to validate and export a scan result.
 #[cfg(all(test, feature = "fuchsia-passive"))]
@@ -2671,6 +2676,16 @@ struct ProvenanceSession {
     result_rx: futures::channel::mpsc::UnboundedReceiver<CarriedScanResult>,
     carried_results: Vec<CarriedScanResult>,
     outstanding_results: usize,
+    sme: wlan_sme::client::ClientSme,
+    sme_requests: futures::channel::mpsc::UnboundedReceiver<wlan_sme::MlmeRequest>,
+    sme_state: wlan_sme::client::TrustedScanState<ProvenanceHandle>,
+    sme_output: Option<ValidatedSmeAggregate>,
+    reject_next_sme_output: bool,
+    panic_next_sme_validation: bool,
+    panic_next_sme_result_aggregation: bool,
+    sme_started: bool,
+    sme_terminal_accepted: bool,
+    expected_sme_txn_id: Option<u64>,
     next_observe_index: usize,
     last_admitted_occurrence: Option<u64>,
     next_handle_drop_order_probe: Option<Arc<AtomicBool>>,
@@ -2687,6 +2702,32 @@ impl ProvenanceSession {
         let source = DescriptorProvenance::new();
         let id = source.owner;
         let (result_tx, result_rx) = futures::channel::mpsc::unbounded();
+        let inspector = fuchsia_inspect::Inspector::default();
+        let inspect_node = inspector.root().create_child("private-provenance-sme");
+        let (sme, _sme_sink, sme_requests, _sme_time) = wlan_sme::client::ClientSme::new(
+            wlan_sme::client::ClientConfig::default(),
+            fidl_fuchsia_wlan_mlme::DeviceInfo {
+                sta_addr: [2, 0, 0, 0, 0, 1],
+                factory_addr: [2, 0, 0, 0, 0, 1],
+                role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
+                bands: vec![fidl_fuchsia_wlan_mlme::BandCapability {
+                    band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                    basic_rates: vec![2, 4, 11, 22],
+                    ht_cap: None,
+                    vht_cap: None,
+                    primary_channels: vec![fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                        band: fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+                        number: 1,
+                    }],
+                }],
+                softmac_hardware_capability: 0,
+                qos_capable: false,
+            },
+            inspector,
+            inspect_node,
+            Default::default(),
+            Default::default(),
+        );
         Self {
             source,
             id,
@@ -2699,6 +2740,16 @@ impl ProvenanceSession {
             result_rx,
             carried_results: Vec::new(),
             outstanding_results: 0,
+            sme,
+            sme_requests,
+            sme_state: wlan_sme::client::TrustedScanState::new(1),
+            sme_output: None,
+            reject_next_sme_output: false,
+            panic_next_sme_validation: false,
+            panic_next_sme_result_aggregation: false,
+            sme_started: false,
+            sme_terminal_accepted: false,
+            expected_sme_txn_id: None,
             next_observe_index: 0,
             last_admitted_occurrence: None,
             next_handle_drop_order_probe: None,
@@ -2854,6 +2905,167 @@ impl ProvenanceSession {
         Ok(handle.index)
     }
 
+    fn validate_produced(&self, handle: &ProvenanceHandle) -> Result<usize, String> {
+        if self.closed
+            || self.poisoned
+            || handle.session != self.id
+            || handle.generation != self.generation
+        {
+            return Err("provenance session handle mismatch".into());
+        }
+        let registration = self
+            .registrations
+            .get(handle.index)
+            .ok_or_else(|| "provenance session index mismatch".to_string())?;
+        if registration.generation != self.generation
+            || registration.disposition != RegistrationDisposition::Produced
+        {
+            return Err("provenance registration was not produced".into());
+        }
+        self.source.validate(&registration.occurrence)?;
+        Ok(handle.index)
+    }
+
+    fn start_sme_scan(
+        &mut self,
+        request: fidl_fuchsia_wlan_sme::ScanRequest,
+    ) -> Result<fidl_fuchsia_wlan_mlme::ScanRequest, String> {
+        if self.closed
+            || self.poisoned
+            || self.outstanding_results != 0
+            || self.sme_started
+            || self.sme_terminal_accepted
+            || self.expected_sme_txn_id.is_some()
+        {
+            self.fail_close();
+            return Err("private SME scan start has nonempty owner state".into());
+        }
+        self.sme
+            .start_trusted_scan(&mut self.sme_state, request)
+            .map_err(|error| {
+                self.fail_close();
+                format!("private SME scan start rejected: {error:?}")
+            })?;
+        match self.sme_requests.try_recv() {
+            Ok(wlan_sme::MlmeRequest::Scan(request)) if self.sme_requests.try_recv().is_err() => {
+                self.sme_started = true;
+                self.expected_sme_txn_id = Some(request.txn_id);
+                Ok(request)
+            }
+            _ => {
+                self.fail_close();
+                Err("private SME scan did not emit exactly one scan request".into())
+            }
+        }
+    }
+
+    fn route_next_sme_result(&mut self) -> Result<bool, String> {
+        let carried = match self.result_rx.try_recv() {
+            Ok(carried) => carried,
+            Err(_) => return Ok(false),
+        };
+        self.outstanding_results = self.outstanding_results.checked_sub(1).ok_or_else(|| {
+            self.fail_close();
+            "private SME result ledger underflow".to_string()
+        })?;
+        if self.validate_produced(&carried.provenance).is_err() {
+            self.fail_close();
+            drop(carried);
+            return Err("private SME result owner validation failed".into());
+        }
+        if std::mem::take(&mut self.panic_next_sme_result_aggregation) {
+            self.sme_state.inject_result_aggregation_panic_for_test();
+        }
+        if let Err(error) = self.sme.on_trusted_mlme_scan_result(
+            carried.result,
+            carried.provenance,
+            &mut self.sme_state,
+        ) {
+            self.fail_close();
+            return Err(format!("private SME result routing failed: {error:?}"));
+        }
+        Ok(true)
+    }
+
+    fn finish_sme_scan(&mut self, end: fidl_fuchsia_wlan_mlme::ScanEnd) -> Result<(), String> {
+        if self.closed
+            || self.poisoned
+            || self.outstanding_results != 0
+            || self.sme_output.is_some()
+            || !self.sme_started
+            || self.sme_terminal_accepted
+            || self.expected_sme_txn_id != Some(end.txn_id)
+        {
+            self.fail_close();
+            return Err("private SME terminal has undrained input or prior output".into());
+        }
+        let expected_txn_id = end.txn_id;
+        let terminal = match self.sme.on_trusted_mlme_scan_end(end, &mut self.sme_state) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.fail_close();
+                return Err(format!("private SME terminal rejected: {error:?}"));
+            }
+        };
+        // Store the opaque aggregate under the owner before any validation can
+        // reject or unwind. Owner Drop therefore invalidates before affine P.
+        self.sme_output = Some(ValidatedSmeAggregate { terminal });
+        if std::mem::take(&mut self.panic_next_sme_validation) {
+            panic!("injected private SME terminal validation panic");
+        }
+        let expected = self
+            .registrations
+            .iter()
+            .filter(|registration| registration.disposition == RegistrationDisposition::Produced)
+            .count();
+        let terminal = &self.sme_output.as_ref().expect("stored above").terminal;
+        let valid = terminal.generation() == self.generation
+            && terminal.txn_id() == expected_txn_id
+            && terminal.input_provenance().len() == expected
+            && terminal
+                .input_provenance()
+                .enumerate()
+                .all(|(ordinal, provenance)| {
+                    provenance.session == self.id
+                        && provenance.generation == self.generation
+                        && self
+                            .registrations
+                            .get(provenance.index)
+                            .is_some_and(|registration| {
+                                registration.generation == self.generation
+                                    && registration.disposition == RegistrationDisposition::Produced
+                                    && self.source.validate(&registration.occurrence).is_ok()
+                            })
+                        && self
+                            .registrations
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, registration)| {
+                                registration.disposition == RegistrationDisposition::Produced
+                            })
+                            .nth(ordinal)
+                            .map(|(index, _)| index)
+                            == Some(provenance.index)
+                });
+        if !valid || std::mem::take(&mut self.reject_next_sme_output) {
+            self.fail_close();
+            return Err("private SME terminal owner validation failed".into());
+        }
+        self.sme_terminal_accepted = true;
+        Ok(())
+    }
+
+    fn inspect_sme_output(&self, inspect: impl FnOnce(&ValidatedSmeAggregate)) -> bool {
+        if !self.sme_terminal_accepted {
+            return false;
+        }
+        let Some(output) = self.sme_output.as_ref() else {
+            return false;
+        };
+        inspect(output);
+        true
+    }
+
     fn inspect_next_result(&mut self, inspect: impl FnOnce(&CarriedScanResult)) -> bool {
         let Ok(carried) = self.result_rx.try_recv() else {
             return false;
@@ -2881,6 +3093,11 @@ impl ProvenanceSession {
         self.source.invalidate(DescriptorInvalidation::Run).ok();
         self.invalidated = true;
         self.result_tx.take();
+        self.sme_output.take();
+        self.sme_state = wlan_sme::client::TrustedScanState::new(self.generation);
+        self.sme_started = false;
+        self.sme_terminal_accepted = false;
+        self.expected_sme_txn_id = None;
         while self.result_rx.try_recv().is_ok() {}
         self.outstanding_results = 0;
         self.next_observe_index = 0;
@@ -2902,6 +3119,7 @@ impl ProvenanceSession {
             || !self.quarantine.is_empty()
             || self.outstanding_results != 0
             || self.next_observe_index != self.registrations.len()
+            || self.sme_started != self.sme_terminal_accepted
             || self
                 .registrations
                 .iter()
@@ -2918,6 +3136,7 @@ impl ProvenanceSession {
         // Carried results remain session-owned until after their registrations
         // have been retired under this exclusive access.
         self.carried_results.clear();
+        self.sme_output.take();
         self.registrations.clear();
         self.observed_order.clear();
         self.last_admitted_occurrence = None;
@@ -2979,7 +3198,11 @@ impl wlan_mlme::ScanResultObserver<ProvenanceHandle> for ProvenanceSession {
             }
         };
         self.registrations[index].disposition = classification;
-        wlan_mlme::ScanResultObserverControl::Continue
+        if classification == RegistrationDisposition::Produced {
+            wlan_mlme::ScanResultObserverControl::Suppress
+        } else {
+            wlan_mlme::ScanResultObserverControl::Continue
+        }
     }
 
     fn observe_transport_failure(&mut self) {
@@ -6624,6 +6847,264 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn produced_subsequence_crosses_futures_into_actual_client_sme_once() {
+        let mut session = ProvenanceSession::new();
+        let scan = session
+            .start_sme_scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![1] },
+            ))
+            .unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let carried = session
+                .source
+                .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+                .unwrap();
+            let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+                occurrence: Some(occurrence),
+                ..
+            }) = carried
+            else {
+                panic!("actual B1 occurrence was not minted");
+            };
+            handles.push(session.admit(occurrence).unwrap());
+            session
+                .source
+                .rearm(DescriptorOccurrenceRoute::DataRx, 2, 0)
+                .unwrap();
+        }
+        let ignored = handles.remove(0);
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Ignored(
+                wlan_mlme::ScanResultIgnore::NonAdvertisement,
+            ),
+            ignored,
+        );
+        let conversion = handles.remove(0);
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::ConversionDrop,
+            conversion,
+        );
+        let produced = handles.remove(0);
+        let produced_index = produced.index;
+        let mut result = b2a_scan_result(9);
+        result.txn_id = scan.txn_id;
+        result.bss.ies = vec![0, 1, b'x', 1, 4, 2, 4, 11, 22];
+        assert_eq!(
+            wlan_mlme::ScanResultObserver::observe(
+                &mut session,
+                &wlan_mlme::ScanResultDisposition::Produced(&result),
+                produced,
+            ),
+            wlan_mlme::ScanResultObserverControl::Suppress
+        );
+        assert!(session.route_next_sme_result().unwrap());
+        assert!(!session.route_next_sme_result().unwrap());
+        session
+            .finish_sme_scan(fidl_fuchsia_wlan_mlme::ScanEnd {
+                txn_id: scan.txn_id,
+                code: fidl_fuchsia_wlan_mlme::ScanResultCode::Success,
+            })
+            .unwrap();
+        assert!(session.inspect_sme_output(|output| {
+            assert_eq!(output.terminal.generation(), 1);
+            assert_eq!(output.terminal.txn_id(), scan.txn_id);
+            assert_eq!(output.terminal.input_provenance().len(), 1);
+            assert_eq!(
+                output
+                    .terminal
+                    .input_provenance()
+                    .next()
+                    .expect("one produced carrier")
+                    .index,
+                produced_index
+            );
+            assert_eq!(output.terminal.bss_description_list().len(), 1);
+        }));
+        session.finish().unwrap();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn trusted_sme_cannot_finish_without_consuming_terminal() {
+        let mut session = ProvenanceSession::new();
+        let scan = session
+            .start_sme_scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![1] },
+            ))
+            .unwrap();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let mut result = b2a_scan_result(5);
+        result.txn_id = scan.txn_id;
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        session.route_next_sme_result().unwrap();
+        assert!(session.finish().is_err());
+        assert!(session.invalidated);
+        assert!(session.sme_output.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn trusted_sme_sink_failure_invalidates_owner_before_affine_release() {
+        let mut session = ProvenanceSession::new();
+        let released_after_invalidation = Arc::new(AtomicBool::new(false));
+        session.next_handle_drop_order_probe = Some(Arc::clone(&released_after_invalidation));
+        let scan = session
+            .start_sme_scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![1] },
+            ))
+            .unwrap();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let mut result = b2a_scan_result(4);
+        result.txn_id = scan.txn_id;
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        session.route_next_sme_result().unwrap();
+        session.reject_next_sme_output = true;
+        assert!(
+            session
+                .finish_sme_scan(fidl_fuchsia_wlan_mlme::ScanEnd {
+                    txn_id: scan.txn_id,
+                    code: fidl_fuchsia_wlan_mlme::ScanResultCode::Success,
+                })
+                .is_err()
+        );
+        assert!(session.invalidated);
+        assert!(session.poisoned);
+        assert!(released_after_invalidation.load(Ordering::Acquire));
+        assert!(session.sme_output.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn trusted_sme_result_aggregation_panic_retains_affine_input_until_invalidation() {
+        let mut session = ProvenanceSession::new();
+        let released_after_invalidation = Arc::new(AtomicBool::new(false));
+        session.next_handle_drop_order_probe = Some(Arc::clone(&released_after_invalidation));
+        let scan = session
+            .start_sme_scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![1] },
+            ))
+            .unwrap();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let mut result = b2a_scan_result(7);
+        result.txn_id = scan.txn_id;
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        session.panic_next_sme_result_aggregation = true;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.route_next_sme_result().unwrap();
+        }));
+        assert!(unwind.is_err());
+        assert!(!session.inspect_sme_output(|_| panic!("result panic emitted output")));
+        assert!(!released_after_invalidation.load(Ordering::Acquire));
+        assert!(
+            session
+                .finish_sme_scan(fidl_fuchsia_wlan_mlme::ScanEnd {
+                    txn_id: scan.txn_id,
+                    code: fidl_fuchsia_wlan_mlme::ScanResultCode::Success,
+                })
+                .is_err()
+        );
+        assert!(session.invalidated);
+        assert!(!session.inspect_sme_output(|_| panic!("poisoned output escaped")));
+        assert!(released_after_invalidation.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn trusted_sme_validation_panic_keeps_affine_input_under_owner_until_invalidation() {
+        let mut session = ProvenanceSession::new();
+        let released_after_invalidation = Arc::new(AtomicBool::new(false));
+        session.next_handle_drop_order_probe = Some(Arc::clone(&released_after_invalidation));
+        let scan = session
+            .start_sme_scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![1] },
+            ))
+            .unwrap();
+        let carried = session
+            .source
+            .seal_frame(DescriptorOccurrenceRoute::DataRx, 2, 0, vec![])
+            .unwrap();
+        let PrivateFrameSeal::Carried(PrivateRawFrameCarrier {
+            occurrence: Some(occurrence),
+            ..
+        }) = carried
+        else {
+            panic!("actual B1 occurrence was not minted");
+        };
+        let handle = session.admit(occurrence).unwrap();
+        let mut result = b2a_scan_result(6);
+        result.txn_id = scan.txn_id;
+        wlan_mlme::ScanResultObserver::observe(
+            &mut session,
+            &wlan_mlme::ScanResultDisposition::Produced(&result),
+            handle,
+        );
+        session.route_next_sme_result().unwrap();
+        session.panic_next_sme_validation = true;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session
+                .finish_sme_scan(fidl_fuchsia_wlan_mlme::ScanEnd {
+                    txn_id: scan.txn_id,
+                    code: fidl_fuchsia_wlan_mlme::ScanResultCode::Success,
+                })
+                .unwrap();
+        }));
+        assert!(unwind.is_err());
+        assert!(!session.inspect_sme_output(|_| panic!("unvalidated output escaped")));
+        assert!(!released_after_invalidation.load(Ordering::Acquire));
+        drop(session);
+        assert!(released_after_invalidation.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn private_session_owns_actual_b1_registration_and_invalidates_once() {
         let mut session = ProvenanceSession::new();
         let carried = session
@@ -6838,19 +7319,10 @@ mod tests {
                 mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, rx, &mut session).await;
             }
             assert_eq!(session.observed_order, expected);
-            let emitted = events
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|event| match event {
-                    fidl_fuchsia_wlan_mlme::MlmeEvent::OnScanResult { result } => {
-                        (*result.bss.ies.last().unwrap(), result.bss.rssi_dbm)
-                    }
-                    other => panic!("unexpected MLME event: {other:?}"),
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(emitted, [(b'1', -50), (b'2', -60), (b'3', -70)]);
-            for (expected_tag, expected_rssi) in emitted {
+            // Produced-only private admission suppresses the parallel ordinary
+            // MLME event; the futures sidecar is the sole SME input ledger.
+            assert!(events.lock().unwrap().is_empty());
+            for (expected_tag, expected_rssi) in [(b'1', -50), (b'2', -60), (b'3', -70)] {
                 assert!(session.inspect_next_result(|carried| {
                     assert_eq!(*carried.result.bss.ies.last().unwrap(), expected_tag);
                     assert_eq!(carried.result.bss.rssi_dbm, expected_rssi);
@@ -6974,7 +7446,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn real_client_mlme_transport_failure_invalidates_already_carried_handle() {
+    fn produced_only_route_bypasses_parallel_mlme_event_transport() {
         futures::executor::block_on(async {
             use wlan_mlme::MlmeImpl;
 
@@ -7017,12 +7489,13 @@ mod tests {
 
             mt7921_softmac_adapter::handle_pinned_client_rx(&mut mlme, admitted, &mut session)
                 .await;
-            assert!(session.invalidated);
-            assert!(session.poisoned);
-            assert_eq!(session.outstanding_results, 0);
-            assert!(session.result_rx.try_recv().is_err());
-            assert!(session.carried_results.is_empty());
+            assert!(!session.invalidated);
+            assert!(!session.poisoned);
+            assert_eq!(session.outstanding_results, 1);
             assert!(events.lock().unwrap().is_empty());
+            session.fail_close();
+            assert!(session.invalidated);
+            assert_eq!(session.outstanding_results, 0);
         });
     }
 
