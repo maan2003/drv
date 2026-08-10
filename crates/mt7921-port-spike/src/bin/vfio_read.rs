@@ -2073,12 +2073,7 @@ fn run() -> Result<(), String> {
                                             let ring = mgmt_tx_ring
                                                 .as_deref_mut()
                                                 .ok_or("SAE TX ring arena missing")?;
-                                            mechanics.loader.mcu.wfdma.write_tx_ring_slot(
-                                                0,
-                                                ring.iova as u32,
-                                                128,
-                                                0,
-                                            )?;
+                                            println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
                                             mechanics.transmit_one_sae_auth(
                                                 ring,
                                                 mgmt_txwi
@@ -4292,6 +4287,7 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
         0xd4690 => value == 0x00c0_0004,
         0xd4640 => value == 0x0340_0004,
         0xd4644 => value == 0x0380_0004,
+        0xd4600 => value == 0x0140_0004,
         0xd4308 | 0xd4408 => value < 128,
         0xd4418 => value < 256,
         _ => false,
@@ -5707,6 +5703,65 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn stop_tx_dma_and_reset_ring0(&mut self) -> Result<(), String> {
+        let global = self.loader.mcu.wfdma.read(0xd4208)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4208, global & !1)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while self.loader.mcu.wfdma.read(0xd4208)? & 2 != 0 {
+            if Instant::now() >= deadline {
+                return Err("REBOOT REQUIRED: TX DMA did not quiesce".into());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+        }
+        let reset = self.loader.mcu.wfdma.read(0xd4100)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4100, reset & !(1 << 4))?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4100, reset | (1 << 4))?;
+        if self.loader.mcu.wfdma.read(0xd430c)? != 0 {
+            return Err("REBOOT REQUIRED: ring-0 DIDX remained nonzero after reset".into());
+        }
+        Ok(())
+    }
+
+    fn configure_mgmt_tx_ring(&mut self, ring: &DmaArena) -> Result<(), String> {
+        self.stop_tx_dma_and_reset_ring0()?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_tx_ring_slot(0, ring.iova as u32, 128, 0)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4600, 0x0140_0004)?;
+        for (offset, expected) in [
+            (0xd4300, ring.iova as u32),
+            (0xd4304, 128),
+            (0xd4308, 0),
+            (0xd430c, 0),
+            (0xd4600, 0x0140_0004),
+        ] {
+            let actual = self.loader.mcu.wfdma.read(offset)?;
+            if actual != expected {
+                return Err(format!(
+                    "REBOOT REQUIRED: ring-0 readback {offset:#x}={actual:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+        let global = self.loader.mcu.wfdma.read(0xd4208)?;
+        self.loader
+            .mcu
+            .wfdma
+            .write_active_wfdma(0xd4208, global | 1)
+    }
+
     fn transmit_one_sae_auth(
         &mut self,
         ring: &mut DmaArena,
@@ -5717,16 +5772,17 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if !self.tx_completions.is_empty() {
             return Err("management TX began with stale completion state".into());
         }
-        frame_arena.write_bytes(frame)?;
-        let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
-            .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
-        txwi.write_bytes(&encoded.txwi)?;
-        ring.write_descriptor_at(0, encoded.descriptor);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
+        self.configure_mgmt_tx_ring(ring)?;
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut completion_state = MgmtTxCompletionState::default();
         let result = (|| -> Result<(), String> {
+            frame_arena.write_bytes(frame)?;
+            let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
+                .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
+            txwi.write_bytes(&encoded.txwi)?;
+            ring.write_descriptor_at(0, encoded.descriptor);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
                 self.loader.mcu.cancelled()?;
                 self.loader.mcu.handle_irq(None)?;
@@ -5750,12 +5806,25 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         })();
+        let contained = self.stop_tx_dma_and_reset_ring0();
+        if let Err(error) = contained {
+            return Err(format!(
+                "REBOOT REQUIRED: management TX outcome={result:?}; containment failed: {error}"
+            ));
+        }
         ring.write_descriptor_at(0, DmaDescriptor::reset());
         let txwi_reset = txwi.zero_bytes(PAGE);
         let frame_reset = frame_arena.zero_bytes(PAGE);
-        result?;
-        txwi_reset?;
-        frame_reset
+        if let Err(error) = result {
+            txwi_reset
+                .map_err(|wipe| format!("REBOOT REQUIRED: {error}; TXWI reclaim failed: {wipe}"))?;
+            frame_reset.map_err(|wipe| {
+                format!("REBOOT REQUIRED: {error}; frame reclaim failed: {wipe}")
+            })?;
+            return Err(format!("REBOOT REQUIRED: SAE spike failed: {error}"));
+        }
+        txwi_reset.map_err(|error| format!("REBOOT REQUIRED: TXWI reclaim failed: {error}"))?;
+        frame_reset.map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))
     }
 }
 
@@ -9599,6 +9668,8 @@ mod tests {
             passive
         ));
         assert!(active_wfdma_write_allowed(0xd4204, passive, passive));
+        assert!(active_wfdma_write_allowed(0xd4600, 0x0140_0004, passive));
+        assert!(!active_wfdma_write_allowed(0xd4600, 0, passive));
         assert!(Operation::RunOneShotPassiveChannel1.wfdma_writable());
         assert!(Operation::RunOneShotPassiveChannel1.conn_writable());
         assert!(Operation::RunOneShotPassiveChannel1.loads_firmware());
@@ -10130,6 +10201,7 @@ mod tests {
         for completions in [
             [
                 MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1,
@@ -10147,6 +10219,7 @@ mod tests {
                     acked: true,
                 }),
                 MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1,
@@ -10169,6 +10242,7 @@ mod tests {
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 1,
                     dropped: false,
                     attempts: 1
@@ -10177,6 +10251,7 @@ mod tests {
         );
         state
             .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: None,
                 token: 0,
                 dropped: true,
                 attempts: 1,
@@ -10185,6 +10260,7 @@ mod tests {
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: None,
                     token: 0,
                     dropped: false,
                     attempts: 1

@@ -3474,15 +3474,24 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if frame.len() < 2 {
         return Err(PassiveRxError::Truncated);
     }
-    Ok(Connac2RxFrame { bytes: frame.to_vec(), band, channel, rssi_dbm })
+    Ok(Connac2RxFrame {
+        bytes: frame.to_vec(),
+        band,
+        channel,
+        rssi_dbm
+    })
 }
 
 /// Parse the exact Connac2 normal-RX envelope far enough to deliver only raw
 /// beacon/probe-response material to pinned Fuchsia. Data/control frames,
 /// translated headers, RX errors, absent P-RXV RSSI, and 6 GHz fail closed.
 pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement, PassiveRxError> {
-    let Connac2RxFrame { bytes: frame, band, channel, rssi_dbm } =
-        parse_connac2_rx_frame(bytes)?;
+    let Connac2RxFrame {
+        bytes: frame,
+        band,
+        channel,
+        rssi_dbm
+    } = parse_connac2_rx_frame(bytes)?;
     let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
     let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
     let probe_response = match frame_control & 0x00fc {
@@ -4781,6 +4790,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mt7921TxFree {
+    pub wcid: Option<u16>,
     pub token: u16,
     pub dropped: bool,
     pub attempts: u16,
@@ -4818,7 +4828,7 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
         return Err(Mt7921TxCompletionError::WrongPacketType);
     }
     let reported_len = (header & 0xffff) as usize;
-    if reported_len != 12 {
+    if reported_len != 12 && reported_len != 16 {
         return Err(Mt7921TxCompletionError::InvalidFormat);
     }
     let bytes = bytes
@@ -4827,17 +4837,30 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
     if header >> 16 & 0x03ff != 1 {
         return Err(Mt7921TxCompletionError::MultipleOrPaired);
     }
-    let info = u32::from_le_bytes(
+    let first = u32::from_le_bytes(
         bytes
             .get(8..12)
             .ok_or(Mt7921TxCompletionError::Truncated)?
             .try_into()
             .expect("fixed field"),
     );
-    if info & (1 << 31) != 0 {
-        return Err(Mt7921TxCompletionError::MultipleOrPaired);
-    }
+    let (wcid, info) = if first & (1 << 31) != 0 {
+        if reported_len != 16 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        let info = u32::from_le_bytes(bytes[12..16].try_into().expect("fixed field"));
+        if info & (1 << 31) != 0 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        (Some(((first >> 14) & 0x03ff) as u16), info)
+    } else {
+        if reported_len != 12 {
+            return Err(Mt7921TxCompletionError::InvalidFormat);
+        }
+        (None, first)
+    };
     Ok(Mt7921TxFree {
+        wcid,
         token: ((info >> 16) & 0x7fff) as u16,
         dropped: (info >> 13) & 0x3 != 0,
         attempts: (info & 0x1fff) as u16,
@@ -6448,6 +6471,7 @@ mod tests {
         assert_eq!(
             parse_mt7921_tx_free(&free),
             Ok(Mt7921TxFree {
+                wcid: None,
                 token: 7,
                 dropped: false,
                 attempts: 1
@@ -6483,9 +6507,16 @@ mod tests {
         );
         let mut stale_free_tail = [0u8; 16];
         stale_free_tail[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        stale_free_tail[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+        stale_free_tail[12..16].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
         assert_eq!(
             parse_mt7921_tx_free(&stale_free_tail),
-            Err(Mt7921TxCompletionError::InvalidFormat)
+            Ok(Mt7921TxFree {
+                wcid: Some(19),
+                token: 7,
+                dropped: false,
+                attempts: 1
+            })
         );
     }
 
