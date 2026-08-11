@@ -40,3 +40,7 @@ wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6
 [[bin]]
 name = "mt7921-passive-scan"
 path = "src/main.rs"
+
+[patch.crates-io]
+trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
+trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }
