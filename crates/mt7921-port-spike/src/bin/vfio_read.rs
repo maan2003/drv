@@ -1586,8 +1586,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         && expected_peer[68..74] == expected_peer[132..138]
         && expected_peer[148..156] == [1, 0, 12, 0, 0, 1, 1, 1]
         && expected_peer[160..168] == [6, 0, 8, 0, 1, 0, 1, 0];
+    let unavailable_readback =
+        classify_wtbl_peer_readback(&peer, Err(WtblPeerReadback::Unavailable));
+    let all_ones_readback = classify_wtbl_peer_readback(&peer, Err(WtblPeerReadback::AllOnes));
     if activation_commands != [(3, expected_preauth), (2, expected_bss), (3, expected_peer)]
         || !wtbl_structure
+        || unavailable_readback != WtblPeerReadback::Unavailable
+        || all_ones_readback != WtblPeerReadback::AllOnes
         || !rx_gate.bss_programmed
         || !rx_gate.association.is_some_and(|active| {
             active.bss_index == 0
@@ -1604,7 +1609,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 wtbl_reset_set=true nested_generic_peer_match=true rx_lookup=true no_rx_trans=true bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 wtbl_reset_set=true nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
@@ -7871,6 +7876,46 @@ impl std::fmt::Display for PhysicalPassiveError {
 impl std::error::Error for PhysicalPassiveError {}
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WtblPeerReadback {
+    Match,
+    Mismatch,
+    Unavailable,
+    AllOnes,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl WtblPeerReadback {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Unavailable => "unavailable",
+            Self::AllOnes => "all_ones",
+        }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn classify_wtbl_peer_readback(
+    peer: &[u8],
+    words: Result<(u32, u32), WtblPeerReadback>,
+) -> WtblPeerReadback {
+    let (word0, word1) = match words {
+        Ok(words) => words,
+        Err(category) => return category,
+    };
+    if peer.len() == 6
+        && word0 as u16 == u16::from_le_bytes([peer[4], peer[5]])
+        && word1 == u32::from_le_bytes(peer[..4].try_into().unwrap())
+    {
+        WtblPeerReadback::Match
+    } else {
+        WtblPeerReadback::Mismatch
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct PassiveMacExecutor<'a> {
     pages: &'a [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
 }
@@ -7937,15 +7982,24 @@ impl PassiveMacExecutor<'_> {
         }
     }
 
-    fn wtbl_peer_matches(&self, wcid: u8, peer: &[u8]) -> Result<bool, String> {
+    fn wtbl_peer_readback(&self, wcid: u8, peer: &[u8]) -> WtblPeerReadback {
         if wcid != 7 || peer.len() != 6 {
-            return Err("bounded WTBL readback escaped WCID7 peer shape".into());
+            return WtblPeerReadback::Unavailable;
         }
         let address = 0x820d_8000 | (u32::from(wcid) << 8);
-        let word0 = self.read(address)?;
-        let word1 = self.read(address + 4)?;
-        Ok(word0 as u16 == u16::from_le_bytes([peer[4], peer[5]])
-            && word1 == u32::from_le_bytes(peer[..4].try_into().unwrap()))
+        let read = |address| {
+            self.read(address).map_err(|error| {
+                if error.contains("returned all ones") {
+                    WtblPeerReadback::AllOnes
+                } else {
+                    WtblPeerReadback::Unavailable
+                }
+            })
+        };
+        classify_wtbl_peer_readback(
+            peer,
+            read(address).and_then(|word0| read(address + 4).map(|word1| (word0, word1))),
+        )
     }
 
     fn execute(&self) -> Result<(), String> {
@@ -9735,22 +9789,59 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
-        let associated_wcid = (expected_cid == 3 && encoded.len() == 176)
+        let sta_update_wcid = (expected_cid == 3 && encoded.len() == 176)
             .then(|| encoded.get(49).copied())
             .flatten();
-        if let Some(wcid) = associated_wcid {
-            PassiveMacExecutor {
+        let structure = sta_update_wcid.map(|wcid| {
+            let peer_match = encoded[68..74] == encoded[132..138];
+            let reset_and_set =
+                encoded[120] == wcid && encoded[121] == 1 && encoded[122..124] == [4, 0];
+            let rx_lookup = encoded[148..156] == [1, 0, 12, 0, 0, 1, 1, 1];
+            let no_rx_trans = encoded[160..168] == [6, 0, 8, 0, 1, 0, 1, 0];
+            (wcid, peer_match, reset_and_set, rx_lookup, no_rx_trans)
+        });
+        if let Some((wcid, peer_match, reset_and_set, rx_lookup, no_rx_trans)) = structure
+            && !(peer_match && reset_and_set && rx_lookup && no_rx_trans)
+        {
+            record_sae_stage(&format!(
+                "firmware_wtbl_update result=error stage=command_structure wcid={wcid} nested_generic_peer_match={peer_match} reset_and_set={reset_and_set} rx_lookup={rx_lookup} no_rx_trans={no_rx_trans}"
+            ));
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        if let Some(wcid) = sta_update_wcid {
+            if let Err(error) = (PassiveMacExecutor {
                 pages: self.mac_pages,
-            }
+            })
             .clear_wtbl_admission_counts(wcid)
-            .map_err(|_| zx::Status::IO)?;
+            {
+                let category = if error.contains("all ones") {
+                    "all_ones"
+                } else if error.contains("busy") {
+                    "busy_timeout"
+                } else {
+                    "unavailable"
+                };
+                record_sae_stage(&format!(
+                    "firmware_wtbl_update result=error stage=admission_clear wcid={wcid} category={category}"
+                ));
+                return Err(zx::Status::IO);
+            }
             record_sae_stage(&format!(
                 "linux_sta_update_precondition wcid={wcid} admission_counts_cleared=true"
             ));
         }
-        self.loader
+        if self
+            .loader
             .send_acknowledged_uni_command(expected_cid, encoded)
-            .map_err(|_| zx::Status::IO)?;
+            .is_err()
+        {
+            if let Some(wcid) = sta_update_wcid {
+                record_sae_stage(&format!(
+                    "firmware_wtbl_update result=error stage=cid3_ack wcid={wcid}"
+                ));
+            }
+            return Err(zx::Status::IO);
+        }
         // Linux's association STA add is CID 3 with this exact five-TLV
         // fixture. Observe, but never mutate, the source-owned RX state after
         // its ACK so a no-data run distinguishes filtering from ring ingress.
@@ -9760,16 +9851,14 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             };
             let wcid = encoded[49];
             let peer = &encoded[68..74];
-            let basic_peer_match = peer == &encoded[132..138];
-            let wtbl_reset_set =
-                encoded[120] == wcid && encoded[121] == 1 && encoded[122..124] == [4, 0];
-            let rx_lookup = encoded[148..156] == [1, 0, 12, 0, 0, 1, 1, 1];
-            let header_translation = encoded[160..168] == [6, 0, 8, 0, 1, 0, 1, 0];
-            let peer_readback = mac
-                .wtbl_peer_matches(wcid, peer)
-                .map_err(|_| zx::Status::IO)?;
+            let (_, basic_peer_match, wtbl_reset_set, rx_lookup, header_translation) =
+                structure.expect("176-byte CID3 structure was validated before publication");
             record_sae_stage(&format!(
-                "firmware_wtbl_attestation wcid={wcid} basic_peer_match={basic_peer_match} nested_generic_peer_match={basic_peer_match} reset_and_set={wtbl_reset_set} rx_lookup={rx_lookup} no_rx_trans={header_translation} peer_readback_match={peer_readback}"
+                "firmware_wtbl_readback result=attempt wcid={wcid} authoritative=false"
+            ));
+            let peer_readback = mac.wtbl_peer_readback(wcid, peer).label();
+            record_sae_stage(&format!(
+                "firmware_wtbl_update result=acked wcid={wcid} basic_peer_match={basic_peer_match} nested_generic_peer_match={basic_peer_match} reset_and_set={wtbl_reset_set} rx_lookup={rx_lookup} no_rx_trans={header_translation} peer_readback={peer_readback} readback_authoritative=false"
             ));
             let rfcr = [
                 mac.read(0x820e_5000),
