@@ -6630,6 +6630,35 @@ impl VfioFirmwareLoader<'_> {
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+        let pre_cidx = self.mcu.wfdma.read(0xd4418).map_err(|error| {
+            println!(
+                "{{\"active_mcu_event\":\"uni_ring_read_error\",\"stage\":\"pre_publish_cidx\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index}}}"
+            );
+            error
+        })?;
+        let pre_didx = self.mcu.wfdma.read(0xd441c).map_err(|error| {
+            println!(
+                "{{\"active_mcu_event\":\"uni_ring_read_error\",\"stage\":\"pre_publish_didx\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index}}}"
+            );
+            error
+        })?;
+        let pre_owned_by_cpu = self
+            .mcu
+            .tx_ring
+            .read_descriptor_at(descriptor_index)
+            .is_dma_done();
+        println!(
+            "{{\"active_mcu_event\":\"uni_ring_pre_publish\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index},\"cidx\":{pre_cidx},\"didx\":{pre_didx},\"cpu_owned\":{pre_owned_by_cpu}}}"
+        );
+        if pre_cidx != descriptor_index as u32
+            || pre_didx != descriptor_index as u32
+            || !pre_owned_by_cpu
+        {
+            self.uni_terminal_poisoned = true;
+            return Err(format!(
+                "unified MCU ring ownership mismatch before publication; containment required: descriptor={descriptor_index} cidx={pre_cidx} didx={pre_didx} cpu_owned={pre_owned_by_cpu}"
+            ));
+        }
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
@@ -6652,6 +6681,32 @@ impl VfioFirmwareLoader<'_> {
         }
         publication.published().expect("publication completed");
         self.command_index = next;
+        let post_cidx = self.mcu.wfdma.read(0xd4418).map_err(|error| {
+            self.uni_terminal_poisoned = true;
+            println!(
+                "{{\"active_mcu_event\":\"uni_ring_read_error\",\"stage\":\"post_publish_cidx\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index}}}"
+            );
+            format!(
+                "unified MCU producer read failed after publication; containment required: {error}"
+            )
+        })?;
+        let post_didx = self.mcu.wfdma.read(0xd441c).map_err(|error| {
+            self.uni_terminal_poisoned = true;
+            println!(
+                "{{\"active_mcu_event\":\"uni_ring_read_error\",\"stage\":\"post_publish_didx\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index}}}"
+            );
+            format!(
+                "unified MCU consumer read failed after publication; containment required: {error}"
+            )
+        })?;
+        let post_owned_by_cpu = self
+            .mcu
+            .tx_ring
+            .read_descriptor_at(descriptor_index)
+            .is_dma_done();
+        println!(
+            "{{\"active_mcu_event\":\"uni_ring_post_publish\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index},\"cidx\":{post_cidx},\"didx\":{post_didx},\"cpu_owned\":{post_owned_by_cpu}}}"
+        );
         let response = self
             .mcu
             .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3));
@@ -6664,12 +6719,24 @@ impl VfioFirmwareLoader<'_> {
                 Ok(value) => value,
                 Err(error) => {
                     self.uni_terminal_poisoned = true;
+                    println!(
+                        "{{\"active_mcu_event\":\"uni_ring_read_error\",\"stage\":\"ownership_wait_didx\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index}}}"
+                    );
                     return Err(format!(
                         "unified MCU ownership read failed; containment required: {error}"
                     ));
                 }
             };
             if dma_index_completed(didx, next as u32) {
+                let cpu_owned = self
+                    .mcu
+                    .tx_ring
+                    .read_descriptor_at(descriptor_index)
+                    .is_dma_done();
+                println!(
+                    "{{\"active_mcu_event\":\"uni_ring_consumed\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index},\"cidx\":{},\"didx\":{didx},\"cpu_owned\":{cpu_owned}}}",
+                    self.command_index
+                );
                 break true;
             }
             if Instant::now() >= deadline {
@@ -6679,6 +6746,16 @@ impl VfioFirmwareLoader<'_> {
         };
         if uni_command_reclaim(consumed) == UniCommandReclaim::ContainWithDmaOwned {
             self.uni_terminal_poisoned = publication.requires_containment();
+            let final_cidx = self.mcu.wfdma.read(0xd4418);
+            let final_didx = self.mcu.wfdma.read(0xd441c);
+            let cpu_owned = self
+                .mcu
+                .tx_ring
+                .read_descriptor_at(descriptor_index)
+                .is_dma_done();
+            println!(
+                "{{\"active_mcu_event\":\"uni_ring_timeout\",\"sequence\":{sequence},\"cid\":{expected_cid},\"tx_descriptor\":{descriptor_index},\"cidx\":\"{final_cidx:?}\",\"didx\":\"{final_didx:?}\",\"cpu_owned\":{cpu_owned}}}"
+            );
             return Err(format!(
                 "unified MCU command sequence {sequence} timed out with DMA slot still device-owned; containment required"
             ));
@@ -11490,6 +11567,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2, 3]
         );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn long_session_cid2_uses_the_next_synchronous_uni_slot() {
+        let mut command_index = 0;
+        for _ in 0..43 {
+            let next = next_dma_index(command_index, MCU_TX_RING_COUNT);
+            assert!(dma_index_completed(next as u32, next as u32));
+            command_index = next;
+        }
+        let cid = 2;
+        let next = next_dma_index(command_index, MCU_TX_RING_COUNT);
+        assert_eq!((cid, command_index, next), (2, 43, 44));
+
+        let source = include_str!("vfio_read.rs");
+        let submit = source
+            .split("fn send_acknowledged_uni_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn send_passive_command(")
+            .next()
+            .unwrap();
+        assert!(submit.contains("uni_ring_pre_publish"));
+        assert!(submit.contains("uni_ring_post_publish"));
+        assert!(submit.contains("uni_ring_consumed"));
+        assert!(submit.contains("uni_ring_timeout"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
