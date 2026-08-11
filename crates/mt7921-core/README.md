@@ -24,3 +24,6 @@ they do not reorder hardware effects.
 Excluded ownership: Fuchsia SME/MLME/SoftMAC policy, credentials, CLI/lab
 orchestration, Netstack, and Linux mac80211/cfg80211 protocol state. Generic
 VFIO/iommufd memory and interrupt ownership lives in `userspace-vfio`.
+Device-neutral bounded completion, publication ownership, IRQ lifecycle, and
+structured transcript primitives live in `driver-runtime`; this crate retains
+the MT7921 register, command, firmware-image, and descriptor protocols.

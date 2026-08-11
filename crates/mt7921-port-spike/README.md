@@ -2,7 +2,8 @@
 
 The Linux-derived hardware implementation has moved to `../mt7921-core` and
 this package preserves its prior Rust API by re-export. Generic VFIO/iommufd
-ownership lives in `../userspace-vfio`. The binaries and documentation below
+ownership lives in `../userspace-vfio`; device-neutral deadline, publication,
+IRQ-lifecycle, and transcript state lives in `../driver-runtime`. The binaries and documentation below
 remain here because they own CLI, lab, credential, Fuchsia SoftMAC, and
 production Netstack orchestration rather than reusable hardware behavior.
 

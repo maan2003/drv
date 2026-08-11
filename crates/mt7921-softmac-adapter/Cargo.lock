@@ -467,6 +467,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "eapol"
 version = "0.1.0"
 dependencies = [
@@ -1056,11 +1060,15 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mt7921-core"
 version = "0.1.0"
+dependencies = [
+ "driver-runtime",
+]
 
 [[package]]
 name = "mt7921-port-spike"
 version = "0.1.0"
 dependencies = [
+ "driver-runtime",
  "mt7921-core",
  "userspace-vfio",
 ]

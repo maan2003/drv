@@ -7,3 +7,6 @@ version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+driver-runtime = { path = "../driver-runtime" }

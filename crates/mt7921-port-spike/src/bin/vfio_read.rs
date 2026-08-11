@@ -3,6 +3,8 @@
 #![allow(unexpected_cfgs)]
 
 #[cfg(feature = "fuchsia-passive")]
+use driver_runtime::{PublicationState, TranscriptEvent};
+#[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_common as fidl_common;
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_driver as fidl_driver;
@@ -157,7 +159,10 @@ fn emit_sae_stage_best_effort(event: &str, emit: impl FnOnce(&str) -> std::io::R
 #[cfg(feature = "fuchsia-passive")]
 fn record_sae_stage(event: &str) {
     emit_sae_stage_best_effort(event, |event| {
-        eprintln!(r#"{{"sae_auth_event":"{event}"}}"#);
+        eprintln!(
+            "{}",
+            TranscriptEvent::public("sae_auth_event", event).json()
+        );
         Ok(())
     });
 }
@@ -6606,6 +6611,7 @@ impl VfioFirmwareLoader<'_> {
         expected_cid: u8,
         encoded: &[u8],
     ) -> Result<(), String> {
+        let mut publication = PublicationState::Local;
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         let sequence = validate_uni_request(expected_cid, encoded)?;
@@ -6617,6 +6623,7 @@ impl VfioFirmwareLoader<'_> {
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+        publication.begin().expect("fresh publication state");
         if let Err(error) = publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
@@ -6633,6 +6640,7 @@ impl VfioFirmwareLoader<'_> {
                 "unified MCU publication failed with uncertain DMA ownership; containment required: {error}"
             ));
         }
+        publication.published().expect("publication completed");
         self.command_index = next;
         let response = self
             .mcu
@@ -6660,7 +6668,7 @@ impl VfioFirmwareLoader<'_> {
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
         if uni_command_reclaim(consumed) == UniCommandReclaim::ContainWithDmaOwned {
-            self.uni_terminal_poisoned = true;
+            self.uni_terminal_poisoned = publication.requires_containment();
             return Err(format!(
                 "unified MCU command sequence {sequence} timed out with DMA slot still device-owned; containment required"
             ));
@@ -6669,7 +6677,11 @@ impl VfioFirmwareLoader<'_> {
         // Key-bearing CID3 commands will use this same boundary. Once DIDX
         // proves reclamation safe, cleanup runs for timeout and negative ACK.
         reclaim_uni_dma_slot(self.mcu.tx_ring, self.mcu.payload, descriptor_index)?;
-        classify_uni_ack(expected_cid, &response?)
+        let result = classify_uni_ack(expected_cid, &response?);
+        if result.is_ok() {
+            publication.acknowledged().expect("published command");
+        }
+        result
     }
 
     fn send_passive_command(

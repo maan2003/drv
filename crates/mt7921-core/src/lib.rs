@@ -12,6 +12,12 @@ use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub use driver_runtime::{
+    Completion as FirmwareCompletion, CompletionTracker as FirmwareCompletionTracker,
+    IrqCapability as PciIrqCapability, IrqKind as PciIrqKind, IrqLifecycle, IrqLifecycleError,
+    select_irq as select_vfio_irq,
+};
+
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
 const DMA_MAX_SEGMENT_LEN: u16 = 0x3fff;
@@ -1958,48 +1964,6 @@ where
     descriptor_reset.map_err(DisabledFirmwareStageError::Reset)?;
     payload_zeroed.map_err(DisabledFirmwareStageError::Reset)?;
     operation
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FirmwareCompletion {
-    Partial { completed: u16, total: u16 },
-    Complete,
-    TimedOut { completed: u16, total: u16 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FirmwareCompletionTracker {
-    total: u16,
-    completed: u16,
-    deadline_ms: u64,
-}
-impl FirmwareCompletionTracker {
-    pub fn new(total: u16, start_ms: u64, timeout_ms: u64) -> Option<Self> {
-        Some(Self {
-            total: (total != 0).then_some(total)?,
-            completed: 0,
-            deadline_ms: start_ms.checked_add(timeout_ms)?,
-        })
-    }
-    pub fn observe(&mut self, completed: u16, now_ms: u64) -> Option<FirmwareCompletion> {
-        if completed < self.completed || completed > self.total {
-            return None;
-        }
-        self.completed = completed;
-        if completed == self.total {
-            Some(FirmwareCompletion::Complete)
-        } else if now_ms >= self.deadline_ms {
-            Some(FirmwareCompletion::TimedOut {
-                completed,
-                total: self.total,
-            })
-        } else {
-            Some(FirmwareCompletion::Partial {
-                completed,
-                total: self.total,
-            })
-        }
-    }
 }
 
 pub const MT7921_TX_RING_SLOTS: usize = 18;
@@ -4369,86 +4333,6 @@ fn finish_firmware_loader<T: FirmwareLoaderTransport>(
             failure: Some(failure),
             source,
         }),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PciIrqKind {
-    Intx,
-    Msi,
-    Msix,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PciIrqCapability {
-    pub kind: PciIrqKind,
-    pub count: u32,
-    pub eventfd: bool,
-}
-
-/// Select the same interrupt preference used by PCI drivers without admitting
-/// an interrupt source which cannot be drained through an installed eventfd.
-pub fn select_vfio_irq(capabilities: &[PciIrqCapability]) -> Option<PciIrqCapability> {
-    [PciIrqKind::Msix, PciIrqKind::Msi, PciIrqKind::Intx]
-        .into_iter()
-        .find_map(|kind| {
-            capabilities.iter().copied().find(|capability| {
-                capability.kind == kind && capability.count != 0 && capability.eventfd
-            })
-        })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IrqLifecycle {
-    Uninstalled,
-    EventfdInstalled(PciIrqCapability),
-    DeviceSourceEnabled(PciIrqCapability),
-    EventObserved(PciIrqCapability),
-    Disabled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IrqLifecycleError {
-    InvalidTransition,
-    EmptyEvent,
-}
-
-impl IrqLifecycle {
-    pub fn install(self, capability: PciIrqCapability) -> Result<Self, IrqLifecycleError> {
-        if self != Self::Uninstalled || capability.count == 0 || !capability.eventfd {
-            return Err(IrqLifecycleError::InvalidTransition);
-        }
-        Ok(Self::EventfdInstalled(capability))
-    }
-
-    pub fn enable_device_source(self) -> Result<Self, IrqLifecycleError> {
-        match self {
-            Self::EventfdInstalled(capability) => Ok(Self::DeviceSourceEnabled(capability)),
-            _ => Err(IrqLifecycleError::InvalidTransition),
-        }
-    }
-
-    pub fn observe_event(self, counter: u64) -> Result<Self, IrqLifecycleError> {
-        if counter == 0 {
-            return Err(IrqLifecycleError::EmptyEvent);
-        }
-        match self {
-            Self::DeviceSourceEnabled(capability) => Ok(Self::EventObserved(capability)),
-            _ => Err(IrqLifecycleError::InvalidTransition),
-        }
-    }
-
-    pub fn disable(self) -> Result<Self, IrqLifecycleError> {
-        match self {
-            Self::EventfdInstalled(_) | Self::DeviceSourceEnabled(_) | Self::EventObserved(_) => {
-                Ok(Self::Disabled)
-            }
-            _ => Err(IrqLifecycleError::InvalidTransition),
-        }
-    }
-
-    pub const fn may_unmask_device(self) -> bool {
-        matches!(self, Self::EventfdInstalled(_))
     }
 }
 
