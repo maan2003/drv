@@ -1,10 +1,13 @@
 # MT7921 hardware core
 
-This `no_std` crate owns the hardware-facing MT76/MT7921 behavior used by the
-userspace driver: DMA descriptors and rings, firmware/MCU encodings and
-completions, WFDMA sequencing, register/ownership/reset state, channel-domain
-commands, BSS/WCID/key commands, management/data TX and RX parsing, and ordered
-teardown.
+This `no_std` crate owns MT7921 device policy and preserves the existing public
+compatibility facade for the userspace driver: the MT7921 PCI 32-bit DMA-mask
+gate and ring allocation, WFDMA sequencing, register/ownership/reset state,
+firmware/NIC/channel policy, BSS/WCID/key commands, MT7921 TX/RX handling, and
+ordered teardown. Shared Linux mt76 descriptor/ring-format primitives, Connac
+image and MCU envelope formats, MMIO semantics, and PCI capability policy live
+in the dependency crate `mt76-core` and are re-exported here where compatibility
+requires it. Producer publication and ring ownership remain device-specific.
 
 ## Pinned authority
 
@@ -16,7 +19,7 @@ there is therefore no deployed-firmware/source semantic change in this
 extraction. `SOURCE-MAP.md` and `SOURCE-ITEMS.tsv` remain the symbol-level
 provenance inventory.
 
-The operation groups follow Linux v7.1 boundaries (`dma`, `pci`/`pci_mac`,
+The operation groups follow Linux v7.1.5 boundaries (`dma`, `pci`/`pci_mac`,
 `mcu`/`pci_mcu`, `mac`, `init`/`main`) in their names and call order. Rust trait
 boundaries replace kernel allocation, MMIO, clocks, workqueues, and bus access;
 they do not reorder hardware effects.

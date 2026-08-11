@@ -43,10 +43,10 @@ use mt7921_port_spike::{
     encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
     load_mt7921_firmware, load_mt7921_firmware_bootstrap,
     load_mt7921_firmware_through_channel_domain, mask_ack_disabled_fwdl_interrupt,
-    mt76_pci_aspm_supported, mt7921_packet_type, parse_clc_set_response, parse_download_response,
-    parse_eeprom_block, parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability,
-    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx, mt7921_packet_type,
+    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
+    parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
+    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
     round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
@@ -4495,7 +4495,7 @@ fn publish_mcu_bytes(
         return Err("MCU command payload arena exhausted".into());
     }
     payload.write_bytes_at(payload_offset, bytes)?;
-    let descriptor = DmaDescriptor::tx(
+    let descriptor = mt7921_dma_tx(
         DmaSegment {
             iova: payload.iova + payload_offset as u64,
             len: bytes.len() as u16,
@@ -6286,7 +6286,7 @@ fn drain_rx_queue(
             };
 
             let refill_index = queue.rx_head;
-            let refill = DmaDescriptor::rx(DmaSegment {
+            let refill = mt7921_dma_rx(DmaSegment {
                 iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
                 len: 2048,
             })
@@ -7112,7 +7112,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         self.fwdl_payload.write_bytes(chunk)?;
         let descriptor_index = self.fwdl_index;
         let next = next_dma_index(descriptor_index, 128);
-        let descriptor = DmaDescriptor::tx(
+        let descriptor = mt7921_dma_tx(
             DmaSegment {
                 iova: self.fwdl_payload.iova,
                 len: chunk.len() as u16,
@@ -7523,7 +7523,7 @@ fn drain_data_rx_queue(
             };
 
             let refill_index = queue.rx_head;
-            let refill = DmaDescriptor::rx(DmaSegment {
+            let refill = mt7921_dma_rx(DmaSegment {
                 iova: queue.rx_buffers.iova + (refill_index * 2048) as u64,
                 len: 2048,
             })
@@ -8361,7 +8361,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     eapol,
                     control & 0x4000 != 0,
                 )?;
-                let descriptor = DmaDescriptor::tx(
+                let descriptor = mt7921_dma_tx(
                     DmaSegment {
                         iova: txwi.iova,
                         len: encoded.len() as u16,
@@ -11364,7 +11364,7 @@ mod tests {
         let mut payload = arena(0xa5, MCU_COMMAND_PAYLOAD_BYTES);
         ring.write_descriptor_at(
             2,
-            DmaDescriptor::tx(
+            mt7921_dma_tx(
                 DmaSegment {
                     iova: 0x1000,
                     len: 8,

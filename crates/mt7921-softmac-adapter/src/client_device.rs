@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use wlan_mlme::MlmeImpl;
 use wlan_mlme::device::{DeviceOps, LinkStatus};
 use wlan_sme::Station;
+use wlan_softmac_class_support::{LifecycleAuthorization, PublicWlanIdentity};
 
 use crate::Mt7921SoftmacAdapter;
 use crate::ethernet::{
@@ -114,7 +115,9 @@ impl Mt7921AssociationState {
         if self.wcid.is_some() || wcid >= 20 {
             return Err(zx::Status::BAD_STATE);
         }
-        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        let peer = PublicWlanIdentity::new(configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?)
+            .map_err(|_| zx::Status::INVALID_ARGS)?
+            .bytes();
         if configuration.aid.is_none_or(|aid| aid == 0) {
             return Err(zx::Status::INVALID_ARGS);
         }
@@ -422,7 +425,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         let event = match backend.scan.next_scan_event() {
             Ok(event) => event,
             Err(_) => {
-                backend.revoked = true;
+                backend.authorization.invalidate_scan();
                 backend.effects.revoke_scan();
                 if let Some(scan_id) = backend.active_scan_id.take() {
                     let _ = backend.effects.complete_passive_scan(scan_id, false);
@@ -434,13 +437,13 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
             match event {
                 HardwareScanEvent::Observation(observation) => {
                     let Some(scan_id) = backend.active_scan_id else {
-                        backend.revoked = true;
+                        backend.authorization.invalidate_scan();
                         backend.effects.revoke_scan();
                         return Err(zx::Status::BAD_STATE);
                     };
                     if let Err(status) = backend.effects.observe_passive_scan(scan_id, observation)
                     {
-                        backend.revoked = true;
+                        backend.authorization.invalidate_scan();
                         backend.effects.revoke_scan();
                         backend.active_scan_id = None;
                         let _ = backend.effects.complete_passive_scan(scan_id, false);
@@ -449,23 +452,27 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
                 }
                 HardwareScanEvent::Complete { scan_id, success } => {
                     if backend.active_scan_id != Some(*scan_id) {
-                        backend.revoked = true;
+                        backend.authorization.invalidate_scan();
                         backend.effects.revoke_scan();
                         return Err(zx::Status::BAD_STATE);
                     }
                     if !success {
-                        backend.revoked = true;
+                        backend.authorization.invalidate_scan();
                         backend.effects.revoke_scan();
                     }
                     if let Err(status) = backend.effects.complete_passive_scan(*scan_id, *success) {
-                        backend.revoked = true;
+                        backend.authorization.invalidate_scan();
                         backend.effects.revoke_scan();
                         backend.active_scan_id = None;
                         return Err(status);
                     }
                     backend.active_scan_id = None;
-                    backend.revoked = !success || backend.lifecycle_poisoned;
-                    if backend.revoked {
+                    if *success {
+                        backend.authorization.authorize_scan();
+                    } else {
+                        backend.authorization.invalidate_scan();
+                    }
+                    if !backend.authorization.permits_tx() {
                         backend.effects.revoke_scan();
                     }
                 }
@@ -488,6 +495,8 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         let Some(ClientRxFrame { bytes, status, .. }) = frame else {
             return Ok(false);
         };
+        let status = wlan_softmac_class_support::rx_carrier(&bytes, status, false)
+            .map_or(status, |carrier| carrier.status);
         wlan_mlme::MlmeImpl::handle_mac_frame_rx(mlme, &bytes, status, fuchsia_trace::Id::new())
             .await;
         Ok(true)
@@ -497,8 +506,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     /// abandon any in-process scan transaction.
     pub fn reset(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        backend.revoked = true;
-        backend.lifecycle_poisoned = true;
+        backend.authorization.invalidate_lifecycle();
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
         if let Some(ethernet) = backend.ethernet.as_mut() {
@@ -511,8 +519,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     /// scan transaction.
     pub fn stop(&self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        backend.revoked = true;
-        backend.lifecycle_poisoned = true;
+        backend.authorization.invalidate_lifecycle();
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
         if let Some(ethernet) = backend.ethernet.as_mut() {
@@ -759,8 +766,7 @@ struct ComposedBackend<E, S> {
     effects: E,
     scan: S,
     active_scan_id: Option<u64>,
-    revoked: bool,
-    lifecycle_poisoned: bool,
+    authorization: LifecycleAuthorization,
     ethernet: Option<MlmeEthernetSink>,
 }
 
@@ -790,8 +796,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 effects,
                 scan: NoClientScan,
                 active_scan_id: None,
-                revoked: false,
-                lifecycle_poisoned: false,
+                authorization: LifecycleAuthorization::new(true),
                 ethernet: None,
             })),
             support,
@@ -814,8 +819,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             effects,
             scan,
             active_scan_id: None,
-            revoked: scan_state == ClientRuntimeScanState::Revoked,
-            lifecycle_poisoned: false,
+            authorization: LifecycleAuthorization::new(
+                scan_state != ClientRuntimeScanState::Revoked,
+            ),
             ethernet: None,
         }));
         let runner = Mt7921ScanRunner {
@@ -844,14 +850,18 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             .query
             .sta_addr
             .ok_or(EthernetPortConfigError::InvalidMacAddress)?;
+        let mac = PublicWlanIdentity::new(mac)
+            .map_err(|_| EthernetPortConfigError::InvalidMacAddress)?
+            .bytes();
         let (ethernet_device, ethernet_tx, ethernet_sink) = ethernet_port(mac, queue_capacity)?;
         let scan_state = effects.prepare_runtime_handoff();
         let backend = Arc::new(Mutex::new(ComposedBackend {
             effects,
             scan,
             active_scan_id: None,
-            revoked: scan_state == ClientRuntimeScanState::Revoked,
-            lifecycle_poisoned: false,
+            authorization: LifecycleAuthorization::new(
+                scan_state != ClientRuntimeScanState::Revoked,
+            ),
             ethernet: Some(ethernet_sink),
         }));
         let runner = Mt7921ScanRunner {
@@ -925,10 +935,13 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         _async_id: Option<fuchsia_trace::Id>,
     ) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        if backend.revoked {
+        if !backend.authorization.permits_tx() {
             return Err(zx::Status::ACCESS_DENIED);
         }
+        let associated = backend.authorization.permits_tx();
         let ComposedBackend { effects, scan, .. } = &mut *backend;
+        let tx_flags = wlan_softmac_class_support::tx_carrier(&buffer, tx_flags, associated)
+            .map_or(tx_flags, |carrier| carrier.flags);
         effects.send_wlan_frame(&buffer, tx_flags, scan)
     }
 
@@ -982,7 +995,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        backend.revoked = true;
+        backend.authorization.invalidate_scan();
         backend.effects.revoke_scan();
         let response = backend.scan.start_passive_scan(request.clone())?;
         let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
@@ -991,7 +1004,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
             .effects
             .begin_passive_scan(scan_id, request.channels.as_deref().unwrap_or_default())
         {
-            backend.revoked = true;
+            backend.authorization.invalidate_scan();
             let _ = backend
                 .scan
                 .cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest {
@@ -1231,11 +1244,9 @@ mod tests {
         let metadata_len = 24 + 16 + 16 + 8 + 8 + 2;
         let reported_len = metadata_len + 24 + body.len();
         let mut envelope = vec![0xcc; 140];
-        envelope[0..4]
-            .copy_from_slice(&((2u32 << 27) | reported_len as u32).to_le_bytes());
-        envelope[4..8].copy_from_slice(
-            &((1u32 << 14) | (1 << 11) | (1 << 12) | (1 << 13)).to_le_bytes(),
-        );
+        envelope[0..4].copy_from_slice(&((2u32 << 27) | reported_len as u32).to_le_bytes());
+        envelope[4..8]
+            .copy_from_slice(&((1u32 << 14) | (1 << 11) | (1 << 12) | (1 << 13)).to_le_bytes());
         envelope[8..12].copy_from_slice(&(1u32 << 14).to_le_bytes());
         envelope[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
         envelope[24..40].fill(0xa5);
@@ -1461,7 +1472,12 @@ mod tests {
             .unwrap();
             let (mut device, runner) =
                 Mt7921ClientDevice::new(FakeEffects::default(), passive, support());
-            runner.backend.lock().unwrap().revoked = false;
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             DeviceOps::set_channel(
                 &mut device,
                 channel(36),
@@ -1804,7 +1820,12 @@ mod tests {
                 ..Default::default()
             }]);
             let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-            runner.backend.lock().unwrap().revoked = false;
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             let mut support_info = support();
             support_info.security.mfp = Some(fidl_common::MfpFeature {
                 supported: Some(true),
@@ -1843,7 +1864,15 @@ mod tests {
             assert_eq!(name, "Connect");
             assert!(detail.contains("IO_REFUSED"), "{detail}");
             assert!(!detail.contains("synthetic-password"));
-            assert!(runtime.runner.backend.lock().unwrap().lifecycle_poisoned);
+            assert!(
+                !runtime
+                    .runner
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .authorization
+                    .is_live()
+            );
         });
     }
 
@@ -1878,7 +1907,12 @@ mod tests {
             }]);
             let (device, runner, mut ethernet, _tx) =
                 Mt7921ClientDevice::new_with_ethernet(effects, passive, device_support, 8).unwrap();
-            runner.backend.lock().unwrap().revoked = false;
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             let support_info = support();
             let inspector = fuchsia_inspect::Inspector::default();
             let mut runtime = PinnedClientRuntime::new(
@@ -2021,7 +2055,12 @@ mod tests {
             .unwrap();
             let (device, runner) =
                 Mt7921ClientDevice::new(FakeEffects::default(), passive, support());
-            runner.backend.lock().unwrap().revoked = false;
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             let support_info = support();
             let inspector = fuchsia_inspect::Inspector::default();
             let mut timed = PinnedClientRuntime::new(
@@ -2041,7 +2080,7 @@ mod tests {
                     .await,
                 Err(PinnedConnectError::Timeout)
             );
-            assert!(timed.runner.backend.lock().unwrap().lifecycle_poisoned);
+            assert!(!timed.runner.backend.lock().unwrap().authorization.is_live());
         });
     }
 

@@ -17,14 +17,7 @@ pub use driver_runtime::{
     IrqCapability as PciIrqCapability, IrqKind as PciIrqKind, IrqLifecycle, IrqLifecycleError,
     select_irq as select_vfio_irq,
 };
-
-/// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
-pub const DMA_DESCRIPTOR_LEN: usize = 16;
-const DMA_MAX_SEGMENT_LEN: u16 = 0x3fff;
-const DMA_CTL_LAST_SEC1: u32 = 1 << 14;
-const DMA_CTL_SD_LEN0_SHIFT: u32 = 16;
-const DMA_CTL_LAST_SEC0: u32 = 1 << 30;
-const DMA_CTL_DMA_DONE: u32 = 1 << 31;
+pub use mt76_core::*;
 
 /// A buffer segment representable by the MT7921 PCI DMA setup.
 ///
@@ -36,14 +29,20 @@ pub struct DmaSegment {
     pub len: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DescriptorError {
-    IovaAbove32Bits,
-    SegmentTooLong,
-    InvalidArena,
-}
-
-/// The four little-endian words of `struct mt76_desc`.
+/// MT7921-compatible view of one Linux `struct mt76_desc`.
+///
+/// The local type preserves the original MT7921 API and applies the device's
+/// 32-bit PCI DMA mask before delegating byte layout to `mt76-core`.
+///
+/// ```
+/// use mt7921_core::{DmaDescriptor, DmaSegment};
+///
+/// let segment = DmaSegment { iova: 0x1020_3000, len: 64 };
+/// let tx = DmaDescriptor::tx(segment, None, 0).unwrap();
+/// let rx = DmaDescriptor::rx(segment).unwrap();
+/// assert_eq!(tx.buf0, 0x1020_3000);
+/// assert_eq!(rx.buf0, 0x1020_3000);
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmaDescriptor {
     pub buf0: u32,
@@ -53,87 +52,54 @@ pub struct DmaDescriptor {
 }
 
 impl DmaDescriptor {
-    /// Encode one or two TX segments as `mt76_dma_add_buf` does.
-    ///
-    /// `info` is the caller-owned TX metadata word. Token allocation, ownership
-    /// publication, ring indices, and cache synchronization are intentionally
-    /// outside this format-only function.
     pub fn tx(
         first: DmaSegment,
         second: Option<DmaSegment>,
         info: u32,
     ) -> Result<Self, DescriptorError> {
-        validate_segment(first)?;
-        if let Some(segment) = second {
-            validate_segment(segment)?;
-        }
-
-        let mut ctrl = u32::from(first.len) << DMA_CTL_SD_LEN0_SHIFT;
-        let buf1 = if let Some(segment) = second {
-            ctrl |= u32::from(segment.len) | DMA_CTL_LAST_SEC1;
-            segment.iova as u32
-        } else {
-            ctrl |= DMA_CTL_LAST_SEC0;
-            0
-        };
-
-        Ok(Self {
-            buf0: first.iova as u32,
-            ctrl,
-            buf1,
-            info,
-        })
+        mt7921_dma_tx(first, second, info)
     }
 
-    /// Encode one device-owned RX buffer as `mt76_dma_add_rx_buf` does.
     pub fn rx(buffer: DmaSegment) -> Result<Self, DescriptorError> {
-        validate_segment(buffer)?;
-        Ok(Self {
-            buf0: buffer.iova as u32,
-            ctrl: u32::from(buffer.len) << DMA_CTL_SD_LEN0_SHIFT,
-            buf1: 0,
-            info: 0,
-        })
+        mt7921_dma_rx(buffer)
     }
 
-    /// Descriptor state used by `mt76_dma_queue_reset` before device ownership.
     pub const fn reset() -> Self {
-        Self {
-            buf0: 0,
-            ctrl: DMA_CTL_DMA_DONE,
-            buf1: 0,
-            info: 0,
-        }
+        Self::from_mt76(mt76_core::DmaDescriptor::reset())
     }
 
     pub const fn to_le_bytes(self) -> [u8; DMA_DESCRIPTOR_LEN] {
-        let mut bytes = [0; DMA_DESCRIPTOR_LEN];
-        let buf0 = self.buf0.to_le_bytes();
-        let ctrl = self.ctrl.to_le_bytes();
-        let buf1 = self.buf1.to_le_bytes();
-        let info = self.info.to_le_bytes();
-        bytes[0] = buf0[0];
-        bytes[1] = buf0[1];
-        bytes[2] = buf0[2];
-        bytes[3] = buf0[3];
-        bytes[4] = ctrl[0];
-        bytes[5] = ctrl[1];
-        bytes[6] = ctrl[2];
-        bytes[7] = ctrl[3];
-        bytes[8] = buf1[0];
-        bytes[9] = buf1[1];
-        bytes[10] = buf1[2];
-        bytes[11] = buf1[3];
-        bytes[12] = info[0];
-        bytes[13] = info[1];
-        bytes[14] = info[2];
-        bytes[15] = info[3];
-        bytes
+        self.into_mt76().to_le_bytes()
     }
 
     pub const fn is_dma_done(self) -> bool {
-        self.ctrl & DMA_CTL_DMA_DONE != 0
+        self.into_mt76().is_dma_done()
     }
+
+    const fn from_mt76(descriptor: mt76_core::DmaDescriptor) -> Self {
+        Self {
+            buf0: descriptor.buf0,
+            ctrl: descriptor.ctrl,
+            buf1: descriptor.buf1,
+            info: descriptor.info,
+        }
+    }
+
+    const fn into_mt76(self) -> mt76_core::DmaDescriptor {
+        mt76_core::DmaDescriptor {
+            buf0: self.buf0,
+            ctrl: self.ctrl,
+            buf1: self.buf1,
+            info: self.info,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DescriptorError {
+    IovaAbove32Bits,
+    SegmentTooLong,
+    InvalidArena,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,7 +212,7 @@ impl WfdmaRing {
             return Err(RingError::Full);
         }
         let index = self.producer;
-        let descriptor = DmaDescriptor::tx(first, second, info).map_err(RingError::Descriptor)?;
+        let descriptor = mt7921_dma_tx(first, second, info).map_err(RingError::Descriptor)?;
         publisher
             .write_descriptor(index, descriptor)
             .map_err(RingError::Publish)?;
@@ -266,7 +232,7 @@ impl WfdmaRing {
         let Some(descriptor) = self.descriptors.get_mut(usize::from(index)) else {
             return false;
         };
-        descriptor.ctrl |= DMA_CTL_DMA_DONE;
+        descriptor.ctrl |= 1 << 31;
         true
     }
 
@@ -292,181 +258,43 @@ impl WfdmaRing {
     }
 }
 
-fn validate_segment(segment: DmaSegment) -> Result<(), DescriptorError> {
+pub fn mt7921_dma_tx(
+    first: DmaSegment,
+    second: Option<DmaSegment>,
+    info: u32,
+) -> Result<DmaDescriptor, DescriptorError> {
+    validate_mt7921_segment(first)?;
+    if let Some(segment) = second {
+        validate_mt7921_segment(segment)?;
+    }
+    mt76_core::DmaDescriptor::tx(
+        (first.iova, first.len),
+        second.map(|segment| (segment.iova, segment.len)),
+        info,
+    )
+    .map(DmaDescriptor::from_mt76)
+    .map_err(map_descriptor_error)
+}
+pub fn mt7921_dma_rx(buffer: DmaSegment) -> Result<DmaDescriptor, DescriptorError> {
+    validate_mt7921_segment(buffer)?;
+    mt76_core::DmaDescriptor::rx((buffer.iova, buffer.len))
+        .map(DmaDescriptor::from_mt76)
+        .map_err(map_descriptor_error)
+}
+fn map_descriptor_error(error: mt76_core::DescriptorError) -> DescriptorError {
+    match error {
+        mt76_core::DescriptorError::AddressAbove36Bits => DescriptorError::IovaAbove32Bits,
+        mt76_core::DescriptorError::SegmentTooLong => DescriptorError::SegmentTooLong,
+    }
+}
+fn validate_mt7921_segment(segment: DmaSegment) -> Result<(), DescriptorError> {
     if segment.iova > u64::from(u32::MAX) {
         return Err(DescriptorError::IovaAbove32Bits);
     }
-    if segment.len > DMA_MAX_SEGMENT_LEN {
+    if segment.len > 0x3fff {
         return Err(DescriptorError::SegmentTooLong);
     }
     Ok(())
-}
-
-pub const FW_TRAILER_LEN: usize = 36;
-pub const FW_REGION_LEN: usize = 40;
-pub const FW_FEATURE_NON_DL: u8 = 1 << 6;
-pub const FW_TYPE_CLC: u8 = 2;
-pub const PATCH_HEADER_LEN: usize = 96;
-pub const PATCH_SECTION_LEN: usize = 64;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FirmwareError {
-    MissingTrailer,
-    RegionTableTooLarge,
-    PayloadLengthOverflow,
-    PayloadOverlapsMetadata,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PatchError {
-    MissingHeader,
-    RegionTableTooLarge,
-    UnsupportedSectionType,
-    PayloadOutOfBounds,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PatchHeader<'a> {
-    pub build_date: &'a [u8; 16],
-    pub platform: &'a [u8; 4],
-    pub hardware_software_version: u32,
-    pub patch_version: u32,
-    pub checksum: u16,
-    pub descriptor_patch_version: u32,
-    pub subsystem: u32,
-    pub feature: u32,
-    pub crc: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PatchSection<'a> {
-    pub address: u32,
-    pub security_info: u32,
-    pub payload: &'a [u8],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Patch<'a> {
-    bytes: &'a [u8],
-    region_count: u32,
-    pub header: PatchHeader<'a>,
-}
-
-impl<'a> Patch<'a> {
-    /// Parse `mt76_connac2_patch_hdr` and `mt76_connac2_patch_sec` exactly as
-    /// pinned Linux `mt76_connac2_load_patch` consumes their big-endian fields.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, PatchError> {
-        let header = bytes
-            .get(..PATCH_HEADER_LEN)
-            .ok_or(PatchError::MissingHeader)?;
-        let region_count = be_u32(&header[44..48]);
-        let table_len = (region_count as usize)
-            .checked_mul(PATCH_SECTION_LEN)
-            .and_then(|length| PATCH_HEADER_LEN.checked_add(length))
-            .ok_or(PatchError::RegionTableTooLarge)?;
-        if table_len > bytes.len() {
-            return Err(PatchError::RegionTableTooLarge);
-        }
-        for index in 0..region_count as usize {
-            let start = PATCH_HEADER_LEN + index * PATCH_SECTION_LEN;
-            let section = &bytes[start..start + PATCH_SECTION_LEN];
-            if be_u32(&section[0..4]) & 0xffff != 2 {
-                return Err(PatchError::UnsupportedSectionType);
-            }
-            let offset = be_u32(&section[4..8]) as usize;
-            let length = be_u32(&section[16..20]) as usize;
-            let end = offset
-                .checked_add(length)
-                .ok_or(PatchError::PayloadOutOfBounds)?;
-            if offset < table_len || end > bytes.len() {
-                return Err(PatchError::PayloadOutOfBounds);
-            }
-        }
-        Ok(Self {
-            bytes,
-            region_count,
-            header: PatchHeader {
-                build_date: header[0..16].try_into().expect("fixed field"),
-                platform: header[16..20].try_into().expect("fixed field"),
-                hardware_software_version: be_u32(&header[20..24]),
-                patch_version: be_u32(&header[24..28]),
-                checksum: u16::from_be_bytes(header[28..30].try_into().expect("fixed field")),
-                descriptor_patch_version: be_u32(&header[32..36]),
-                subsystem: be_u32(&header[36..40]),
-                feature: be_u32(&header[40..44]),
-                crc: be_u32(&header[48..52]),
-            },
-        })
-    }
-
-    pub const fn region_count(&self) -> u32 {
-        self.region_count
-    }
-
-    pub fn sections(&self) -> PatchSections<'a> {
-        PatchSections {
-            patch: *self,
-            index: 0,
-        }
-    }
-}
-
-pub struct PatchSections<'a> {
-    patch: Patch<'a>,
-    index: usize,
-}
-impl<'a> Iterator for PatchSections<'a> {
-    type Item = PatchSection<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index == self.patch.region_count as usize {
-            return None;
-        }
-        let start = PATCH_HEADER_LEN + self.index * PATCH_SECTION_LEN;
-        let section = &self.patch.bytes[start..start + PATCH_SECTION_LEN];
-        self.index += 1;
-        let offset = be_u32(&section[4..8]) as usize;
-        let length = be_u32(&section[16..20]) as usize;
-        Some(PatchSection {
-            address: be_u32(&section[12..16]),
-            security_info: be_u32(&section[20..24]),
-            payload: &self.patch.bytes[offset..offset + length],
-        })
-    }
-}
-
-fn be_u32(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes(bytes.try_into().expect("four-byte field"))
-}
-
-/// Parsed `struct mt76_connac2_fw_trailer` fields used by the Linux loader.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FirmwareTrailer<'a> {
-    pub chip_id: u8,
-    pub eco_code: u8,
-    pub format_version: u8,
-    pub format_flag: u8,
-    pub firmware_version: &'a [u8; 10],
-    pub build_date: &'a [u8; 15],
-    pub crc: u32,
-}
-
-/// One Connac2 firmware payload and its corresponding region metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FirmwareRegion<'a> {
-    pub address: u32,
-    pub feature_set: u8,
-    pub region_type: u8,
-    pub payload: &'a [u8],
-}
-
-impl FirmwareRegion<'_> {
-    pub const fn is_downloadable(&self) -> bool {
-        self.feature_set & FW_FEATURE_NON_DL == 0
-    }
-
-    pub const fn is_clc(&self) -> bool {
-        self.feature_set & FW_FEATURE_NON_DL != 0 && self.region_type == FW_TYPE_CLC
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -730,110 +558,6 @@ pub fn parse_clc_set_response(bytes: &[u8]) -> Result<ClcSetResponse, ClcSetResp
 
 /// A bounds-checked view of the Connac2 RAM firmware layout consumed by
 /// `mt76_connac_mcu_send_ram_firmware` and `mt7921_load_clc`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Firmware<'a> {
-    bytes: &'a [u8],
-    metadata_start: usize,
-    region_count: u8,
-    pub trailer: FirmwareTrailer<'a>,
-}
-
-impl<'a> Firmware<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, FirmwareError> {
-        let trailer_start = bytes
-            .len()
-            .checked_sub(FW_TRAILER_LEN)
-            .ok_or(FirmwareError::MissingTrailer)?;
-        let trailer = &bytes[trailer_start..];
-        let region_count = trailer[2];
-        let table_len = usize::from(region_count)
-            .checked_mul(FW_REGION_LEN)
-            .ok_or(FirmwareError::RegionTableTooLarge)?;
-        let metadata_start = trailer_start
-            .checked_sub(table_len)
-            .ok_or(FirmwareError::RegionTableTooLarge)?;
-
-        let firmware_version = trailer[7..17].try_into().expect("fixed slice length");
-        let build_date = trailer[17..32].try_into().expect("fixed slice length");
-        let parsed = Self {
-            bytes,
-            metadata_start,
-            region_count,
-            trailer: FirmwareTrailer {
-                chip_id: trailer[0],
-                eco_code: trailer[1],
-                format_version: trailer[3],
-                format_flag: trailer[4],
-                firmware_version,
-                build_date,
-                crc: le_u32(&trailer[32..36]),
-            },
-        };
-
-        // Validate all lengths up front so iteration cannot partially accept a
-        // malformed image before discovering that payload overlaps metadata.
-        let mut payload_end = 0usize;
-        for index in 0..usize::from(region_count) {
-            let record = parsed.region_record(index);
-            payload_end = payload_end
-                .checked_add(le_u32(&record[20..24]) as usize)
-                .ok_or(FirmwareError::PayloadLengthOverflow)?;
-            if payload_end > metadata_start {
-                return Err(FirmwareError::PayloadOverlapsMetadata);
-            }
-        }
-
-        Ok(parsed)
-    }
-
-    pub const fn region_count(&self) -> u8 {
-        self.region_count
-    }
-
-    pub fn regions(&self) -> FirmwareRegions<'a> {
-        FirmwareRegions {
-            firmware: *self,
-            index: 0,
-            payload_offset: 0,
-        }
-    }
-
-    fn region_record(&self, index: usize) -> &'a [u8] {
-        let start = self.metadata_start + index * FW_REGION_LEN;
-        &self.bytes[start..start + FW_REGION_LEN]
-    }
-}
-
-pub struct FirmwareRegions<'a> {
-    firmware: Firmware<'a>,
-    index: usize,
-    payload_offset: usize,
-}
-
-impl<'a> Iterator for FirmwareRegions<'a> {
-    type Item = FirmwareRegion<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index == usize::from(self.firmware.region_count) {
-            return None;
-        }
-        let record = self.firmware.region_record(self.index);
-        let len = le_u32(&record[20..24]) as usize;
-        let payload_start = self.payload_offset;
-        self.payload_offset += len;
-        self.index += 1;
-        Some(FirmwareRegion {
-            address: le_u32(&record[16..20]),
-            feature_set: record[24],
-            region_type: record[25],
-            payload: &self.firmware.bytes[payload_start..self.payload_offset],
-        })
-    }
-}
-
-fn le_u32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes.try_into().expect("four-byte field"))
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadRegister {
@@ -901,83 +625,6 @@ pub const DRIVER_OWN_ASPM_DELAY_MIN_US: u64 = 2_000;
 pub const DRIVER_OWN_ASPM_DELAY_MAX_US: u64 = 3_000;
 pub const DRIVER_OWN_ASPM_HARD_DEADLINE_MS: u64 = DRIVER_OWN_HARD_DEADLINE_MS
     + DRIVER_OWN_ATTEMPTS as u64 * DRIVER_OWN_ASPM_DELAY_MAX_US.div_ceil(1_000);
-
-const PCI_CAPABILITY_LIST: usize = 0x34;
-const PCI_STATUS: usize = 0x06;
-const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
-const PCI_CAP_ID_EXP: u8 = 0x10;
-const PCI_EXP_LNKCTL: usize = 0x10;
-const PCI_EXP_LNKCTL_ASPMC: u16 = 0x3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PcieLinkControlError {
-    ConfigTooShort,
-    InvalidCapabilityOffset(u8),
-    CapabilityLoop(u8),
-    TruncatedPcieCapability(u8),
-    PcieCapabilityAbsent,
-}
-
-/// Parse the standard PCIe capability's Link Control word.
-///
-/// Pinned Linux `pcie_capability_read_word(..., PCI_EXP_LNKCTL, ...)` first
-/// locates conventional capability ID `PCI_CAP_ID_EXP`, then reads the
-/// little-endian word at capability offset `PCI_EXP_LNKCTL`.
-pub fn pcie_link_control(config: &[u8]) -> Result<u16, PcieLinkControlError> {
-    if config.len() <= PCI_CAPABILITY_LIST {
-        return Err(PcieLinkControlError::ConfigTooShort);
-    }
-    let status = u16::from_le_bytes([config[PCI_STATUS], config[PCI_STATUS + 1]]);
-    if status & PCI_STATUS_CAP_LIST == 0 {
-        return Err(PcieLinkControlError::PcieCapabilityAbsent);
-    }
-    let mut offset = config[PCI_CAPABILITY_LIST] & !3;
-    if offset == 0 {
-        return Err(PcieLinkControlError::PcieCapabilityAbsent);
-    }
-    let mut visited = [false; 64];
-    for _ in 0..48 {
-        let index = usize::from(offset);
-        if index < 0x40 || index + 2 > config.len() {
-            return Err(PcieLinkControlError::InvalidCapabilityOffset(offset));
-        }
-        let slot = index / 4;
-        if visited[slot] {
-            return Err(PcieLinkControlError::CapabilityLoop(offset));
-        }
-        visited[slot] = true;
-        if config[index] == PCI_CAP_ID_EXP {
-            let link_control = index + PCI_EXP_LNKCTL;
-            if link_control + 2 > config.len() {
-                return Err(PcieLinkControlError::TruncatedPcieCapability(offset));
-            }
-            return Ok(u16::from_le_bytes([
-                config[link_control],
-                config[link_control + 1],
-            ]));
-        }
-        offset = config[index + 1] & !3;
-        if offset == 0 {
-            return Err(PcieLinkControlError::PcieCapabilityAbsent);
-        }
-    }
-    Err(PcieLinkControlError::CapabilityLoop(offset))
-}
-
-/// Reproduce pinned Linux `mt76_pci_aspm_supported`: ASPM is supported when
-/// either the endpoint or its optional parent bridge has L0s/L1 enabled in
-/// Link Control. Parsing errors are retained rather than guessed as false.
-pub fn mt76_pci_aspm_supported(
-    endpoint_config: &[u8],
-    parent_config: Option<&[u8]>,
-) -> Result<bool, PcieLinkControlError> {
-    let endpoint = pcie_link_control(endpoint_config)? & PCI_EXP_LNKCTL_ASPMC;
-    let parent = match parent_config {
-        Some(config) => pcie_link_control(config)? & PCI_EXP_LNKCTL_ASPMC,
-        None => 0,
-    };
-    Ok(endpoint != 0 || parent != 0)
-}
 
 pub trait OwnershipTransport {
     type Error;
@@ -1916,7 +1563,7 @@ where
     {
         return Err(DisabledFirmwareStageError::InvalidIova);
     }
-    let descriptor = DmaDescriptor::tx(
+    let descriptor = mt7921_dma_tx(
         DmaSegment {
             iova: payload_iova,
             len: payload.len() as u16,
@@ -2006,7 +1653,7 @@ pub fn prepare_mcu_rx_ring(
         .enumerate()
         .take(MT7921_MCU_RX_RING_COUNT - 1)
     {
-        *descriptor = DmaDescriptor::rx(DmaSegment {
+        *descriptor = mt7921_dma_rx(DmaSegment {
             iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
             len: MT7921_MCU_RX_BUFFER_BYTES as u16,
         })?;
@@ -2441,66 +2088,6 @@ where
     Ok(owned)
 }
 
-pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
-pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
-pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
-pub const PATCH_FINISH_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
-pub const FIRMWARE_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 8;
-pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
-pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
-pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
-pub const DL_MODE_WORKING_PDA_CR4: u32 = 1 << 4;
-pub const DL_MODE_ENCRYPTION_MODE_SELECT: u32 = 1 << 6;
-pub const DL_MODE_NEED_RESPONSE: u32 = 1 << 31;
-
-/// Translate a Connac2 RAM region feature byte into Linux's download mode.
-/// Address override and non-download are caller-side region controls and do
-/// not contribute mode bits.
-pub const fn firmware_download_mode(feature_set: u8, working_pda_cr4: bool) -> u32 {
-    let mut mode = DL_MODE_NEED_RESPONSE | ((feature_set as u32) & DL_MODE_KEY_INDEX);
-    if feature_set & (1 << 0) != 0 {
-        mode |= DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV;
-    }
-    if feature_set & (1 << 4) != 0 {
-        mode |= DL_MODE_ENCRYPTION_MODE_SELECT;
-    }
-    if working_pda_cr4 {
-        mode |= DL_MODE_WORKING_PDA_CR4;
-    }
-    mode
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PatchSecurityError {
-    UnsupportedEncryptionType(u8),
-}
-
-/// Translate a Connac2 patch section's security word into Linux's download
-/// mode. Unknown encryption types fail closed instead of merely being logged.
-pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError> {
-    let mut mode = DL_MODE_NEED_RESPONSE;
-    if security_info == u32::MAX {
-        return Ok(mode);
-    }
-    match (security_info >> 24) as u8 {
-        0 => {}
-        1 => {
-            mode |= DL_MODE_ENCRYPT
-                | ((security_info << 1) & DL_MODE_KEY_INDEX)
-                | DL_MODE_RESET_SECURITY_IV;
-        }
-        2 => {
-            mode |= DL_MODE_ENCRYPT | DL_MODE_ENCRYPTION_MODE_SELECT | DL_MODE_RESET_SECURITY_IV;
-        }
-        encryption_type => {
-            return Err(PatchSecurityError::UnsupportedEncryptionType(
-                encryption_type,
-            ));
-        }
-    }
-    Ok(mode)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
     NicPowerControl,
@@ -2533,23 +2120,6 @@ pub enum DownloadCommandError {
     InvalidLength,
     InvalidFirmwareStart,
     InvalidEepromAddress,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DownloadResponse {
-    pub length: u16,
-    pub packet_type: u16,
-    pub event_id: u8,
-    pub sequence: u8,
-    pub option: u8,
-    pub extended_event_id: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DownloadResponseError {
-    Truncated,
-    InvalidLength,
-    SequenceMismatch { expected: u8, actual: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2845,37 +2415,6 @@ pub fn parse_nic_capability(bytes: &[u8]) -> Result<NicCapability, NicCapability
         }
     }
     Ok(capability)
-}
-
-/// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
-pub fn parse_download_response(
-    bytes: &[u8],
-    expected_sequence: u8,
-) -> Result<DownloadResponse, DownloadResponseError> {
-    let header = bytes.get(..36).ok_or(DownloadResponseError::Truncated)?;
-    let length = u16::from_le_bytes(header[24..26].try_into().expect("fixed field"));
-    if 24usize
-        .checked_add(usize::from(length))
-        .is_none_or(|end| end > bytes.len())
-        || length < 12
-    {
-        return Err(DownloadResponseError::InvalidLength);
-    }
-    let sequence = header[29];
-    if sequence != expected_sequence {
-        return Err(DownloadResponseError::SequenceMismatch {
-            expected: expected_sequence,
-            actual: sequence,
-        });
-    }
-    Ok(DownloadResponse {
-        length,
-        packet_type: u16::from_le_bytes(header[26..28].try_into().expect("fixed field")),
-        event_id: header[28],
-        sequence,
-        option: header[30],
-        extended_event_id: header[32],
-    })
 }
 
 /// Encode the non-scatter MCU command which must precede firmware DMA.
@@ -3564,7 +3103,7 @@ pub fn validate_passive_mac_bar_read(
 /// then one `writel`. Linux returns the calculated value and does not require
 /// an immediate hardware readback to match it.
 pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
-    value | (initial & !mask)
+    mt76_mmio_rmw_value(initial, mask, value)
 }
 
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
@@ -5309,7 +4848,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
     txwi[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
     txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
     txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
-    let descriptor = DmaDescriptor::tx(
+    let descriptor = mt7921_dma_tx(
         DmaSegment {
             iova: txwi_iova,
             len: MT7921_MGMT_TXWI_BYTES as u16,
@@ -6020,11 +5559,6 @@ pub struct ClientRxCandidate {
     pub mic_error: bool,
     pub fcs_error: bool,
     pub pn: [u8; 6],
-}
-
-pub fn connac2_group1_pn(group1: &[u8]) -> Result<[u8; 6], String> {
-    let pn = group1.get(..6).ok_or("Connac2 GROUP1 omitted CCMP PN")?;
-    Ok([pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]])
 }
 
 pub fn encode_client_data_txwi(
@@ -10653,7 +10187,11 @@ mod tests {
 
     #[test]
     fn encodes_single_and_paired_dma_segments_like_mt76() {
-        let one = DmaDescriptor::tx(
+        let _: fn(DmaSegment, Option<DmaSegment>, u32) -> Result<DmaDescriptor, DescriptorError> =
+            DmaDescriptor::tx;
+        let _: fn(DmaSegment) -> Result<DmaDescriptor, DescriptorError> = DmaDescriptor::rx;
+
+        let one = mt7921_dma_tx(
             DmaSegment {
                 iova: 0x1234_5000,
                 len: 0x345,
@@ -10666,7 +10204,7 @@ mod tests {
         assert_eq!(one.buf1, 0);
         assert_eq!(one.to_le_bytes()[..4], [0x00, 0x50, 0x34, 0x12]);
 
-        let two = DmaDescriptor::tx(
+        let two = mt7921_dma_tx(
             DmaSegment {
                 iova: 0x1000,
                 len: 64,
@@ -10708,7 +10246,7 @@ mod tests {
     #[test]
     fn rejects_values_the_mt7921_pci_descriptor_cannot_represent() {
         assert_eq!(
-            DmaDescriptor::tx(
+            mt7921_dma_tx(
                 DmaSegment {
                     iova: 1u64 << 32,
                     len: 1
@@ -10719,7 +10257,7 @@ mod tests {
             Err(DescriptorError::IovaAbove32Bits)
         );
         assert_eq!(
-            DmaDescriptor::tx(
+            mt7921_dma_tx(
                 DmaSegment {
                     iova: 0,
                     len: 0x4000
