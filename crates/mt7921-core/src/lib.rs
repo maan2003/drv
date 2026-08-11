@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, format, string::{String}, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -6058,7 +6058,11 @@ impl ClientFirmwareEffectsState {
         }
     }
 
-    pub fn publish_tx(&mut self, token: u16, generation: ClientDataGeneration) -> Result<(), String> {
+    pub fn publish_tx(
+        &mut self,
+        token: u16,
+        generation: ClientDataGeneration,
+    ) -> Result<(), String> {
         if self.tx_generation(matches!(generation, ClientDataGeneration::Association(_)))?
             != generation
             || self.outstanding_tx.iter().any(|(used, _)| *used == token)
