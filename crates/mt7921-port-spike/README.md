@@ -2387,3 +2387,41 @@ generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
 were restored. The kernel later reported pool 28 with four inflight page-pool
 buffers at both 60 and 120 seconds while native connectivity remained healthy.
 No further physical attempt was made.
+
+The integrated group-fallback implementation adds group 20/P-384 H2E, the
+48-byte SHA-384 confirm path, strict status-77 fallback to group 19, and the
+Rejected Groups extension. The checked-in host overlay passed 94 fcg-crypto,
+188 RSN, 26 softmac-port, 100 physical-transport, 31 adapter, and 17 netstack
+tests, including all compile-fail documentation tests. Offline protocol tests
+prove the exact emitted sequence: a transaction-1/status-126 group-20 commit
+with 146 SAE-field bytes, followed only after a valid status-77 rejection by a
+103-byte group-19 commit whose final bytes are `ff 03 5c 14 00`. The
+privacy-safe structural validator was extended to validate either P-256 or
+P-384 scalar ranges and curve membership without retaining randomized or
+secret material. The freshly built and staged feature-enabled release had
+SHA-256
+`e4790dfadfec4fbffac12984271b3eabf7342a5cb7090e8e2edc675faf327810`.
+
+Exactly one guarded physical attempt, `wifi-sae-exchange24`, is recorded in
+`/var/lib/wifi-driver-lab/reports/20260811T051801Z-0000_05_00.0.log`.
+The port selected group 20 and emitted transaction 1/status 126 with 146
+SAE-field bytes, a 48-byte scalar, a 96-byte element, no tail, a valid scalar
+range, and an on-curve P-384 element. Ring-0 descriptor consumption was
+observed, but TX-free reported `dropped=true` after 15 attempts and no
+correlated acknowledged TX status arrived. The management completion
+therefore timed out and the run failed closed. Because local transmission was
+not acknowledged, the AP supplied no status-77 rejection; group-19 fallback
+and its Rejected Groups extension were not emitted in this physical attempt.
+There was consequently no peer commit, local or peer confirm, PMK derivation,
+or authenticated marker. As required by the one-shot boundary, association,
+key installation, and data traffic were not attempted. No rerun was made.
+
+Cleanup quiesced transport, released DMA mappings, reset VFIO, verified the
+safe state, and restored native `mt7921e` with `RESTORE end failed=0`. Native
+iwd, WPA3 association, IPv4, the default route, and gateway connectivity
+recovered in 30835 ms on `wlan5`; the watchdog was disarmed without a reboot.
+The original `c5md7...` system closure and profile, unchanged boot ID,
+generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
+remained intact. The kernel reported pool 31 with two inflight page-pool
+buffers at 60 seconds; there was no further stall report at 120 seconds, while
+native connectivity remained healthy.
