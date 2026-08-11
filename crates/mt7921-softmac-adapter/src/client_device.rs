@@ -357,6 +357,17 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 }
 
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
+    /// Borrow the already-connected pinned MLME as the only associated data
+    /// plane. The returned pump cannot outlive either the MLME or this runner.
+    pub fn associated_data_pump<'a>(
+        &'a self,
+        mlme: &'a mut wlan_mlme::client::ClientMlme<
+            Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>,
+        >,
+    ) -> crate::ethernet::PinnedAssociatedDataPump<'a, E, T> {
+        crate::ethernet::PinnedAssociatedDataPump::new(mlme, self)
+    }
+
     /// Run one short-lived physical operation without transferring the
     /// DeviceOps-owned backend or its revocation state.
     pub fn with_physical<R>(&self, operation: impl FnOnce(&mut Mt7921SoftmacAdapter<T>) -> R) -> R {
@@ -1280,8 +1291,21 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(runner.pump_client_rx(&mut mlme).await.unwrap());
-            assert!(!runner.pump_client_rx(&mut mlme).await.unwrap());
+            {
+                use crate::ethernet::{AssociatedDataPump, AssociatedSoftmacTx};
+                let mut pump = runner.associated_data_pump(&mut mlme);
+                assert!(pump.transmit_ethernet(&[0; 14]).is_err());
+                assert!(matches!(
+                    pump.pump_receive(std::time::Instant::now()),
+                    Err(crate::ethernet::PinnedDataPumpError::Rx(zx::Status::TIMED_OUT))
+                ));
+                assert!(pump
+                    .pump_receive(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                    .unwrap());
+                assert!(!pump
+                    .pump_receive(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                    .unwrap());
+            }
             runner.backend.lock().unwrap().effects.fail_on = Some("rx");
             assert_eq!(
                 runner.pump_client_rx(&mut mlme).await,

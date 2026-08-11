@@ -387,6 +387,81 @@ impl<D: wlan_mlme::device::DeviceOps> AssociatedSoftmacTx for wlan_mlme::client:
     }
 }
 
+/// The sole production associated-data owner. Both directions pass through
+/// the same pinned `ClientMlme`: TX enters its associated Ethernet handler and
+/// RX enters its raw MAC handler through the MT7921 runner. Consequently this
+/// type cannot be constructed around `OpenClientMlme` or an independently
+/// maintained association state.
+pub struct PinnedAssociatedDataPump<'a, E, T> {
+    mlme: &'a mut wlan_mlme::client::ClientMlme<
+        crate::client_device::Mt7921ClientDevice<E, crate::Mt7921SoftmacAdapter<T>>,
+    >,
+    runner: &'a crate::client_device::Mt7921ScanRunner<E, T>,
+}
+
+#[derive(Debug)]
+pub enum PinnedDataPumpError {
+    Tx(anyhow::Error),
+    Rx(zx::Status),
+}
+
+impl std::fmt::Display for PinnedDataPumpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tx(error) => write!(formatter, "pinned client Ethernet TX failed: {error}"),
+            Self::Rx(status) => write!(formatter, "pinned client MAC RX failed: {status}"),
+        }
+    }
+}
+
+impl std::error::Error for PinnedDataPumpError {}
+
+impl<'a, E, T> PinnedAssociatedDataPump<'a, E, T>
+where
+    E: crate::client_device::Mt7921ClientEffects,
+    T: crate::Mt7921PassiveTransport,
+{
+    pub fn new(
+        mlme: &'a mut wlan_mlme::client::ClientMlme<
+            crate::client_device::Mt7921ClientDevice<E, crate::Mt7921SoftmacAdapter<T>>,
+        >,
+        runner: &'a crate::client_device::Mt7921ScanRunner<E, T>,
+    ) -> Self {
+        Self { mlme, runner }
+    }
+}
+
+impl<E, T> AssociatedSoftmacTx for PinnedAssociatedDataPump<'_, E, T>
+where
+    E: crate::client_device::Mt7921ClientEffects,
+    T: crate::Mt7921PassiveTransport,
+{
+    type Error = PinnedDataPumpError;
+
+    fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
+        wlan_mlme::MlmeImpl::handle_eth_frame_tx(
+            self.mlme,
+            frame,
+            fuchsia_trace::Id::new(),
+        )
+        .map_err(PinnedDataPumpError::Tx)
+    }
+}
+
+impl<E, T> AssociatedDataPump for PinnedAssociatedDataPump<'_, E, T>
+where
+    E: crate::client_device::Mt7921ClientEffects,
+    T: crate::Mt7921PassiveTransport,
+{
+    fn pump_receive(&mut self, deadline: std::time::Instant) -> Result<bool, Self::Error> {
+        if std::time::Instant::now() >= deadline {
+            return Err(PinnedDataPumpError::Rx(zx::Status::TIMED_OUT));
+        }
+        futures::executor::block_on(self.runner.pump_client_rx(self.mlme))
+            .map_err(PinnedDataPumpError::Rx)
+    }
+}
+
 impl MlmeEthernetSink {
     pub(crate) fn deliver(&mut self, bytes: &[u8]) -> Result<(), EthernetIngressError> {
         let frame =
