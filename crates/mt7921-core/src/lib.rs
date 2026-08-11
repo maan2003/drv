@@ -14,6 +14,284 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub use mt76_core::*;
 
+/// A buffer segment representable by the MT7921 PCI DMA setup.
+///
+/// Linux selects a 32-bit DMA mask in `mt7921_pci_probe`, so this spike rejects
+/// IOVAs and lengths which the descriptor would otherwise silently truncate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaSegment {
+    pub iova: u64,
+    pub len: u16,
+}
+
+/// MT7921-compatible view of one Linux `struct mt76_desc`.
+///
+/// The local type preserves the original MT7921 API and applies the device's
+/// 32-bit PCI DMA mask before delegating byte layout to `mt76-core`.
+///
+/// ```
+/// use mt7921_core::{DmaDescriptor, DmaSegment};
+///
+/// let segment = DmaSegment { iova: 0x1020_3000, len: 64 };
+/// let tx = DmaDescriptor::tx(segment, None, 0).unwrap();
+/// let rx = DmaDescriptor::rx(segment).unwrap();
+/// assert_eq!(tx.buf0, 0x1020_3000);
+/// assert_eq!(rx.buf0, 0x1020_3000);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaDescriptor {
+    pub buf0: u32,
+    pub ctrl: u32,
+    pub buf1: u32,
+    pub info: u32,
+}
+
+impl DmaDescriptor {
+    pub fn tx(
+        first: DmaSegment,
+        second: Option<DmaSegment>,
+        info: u32,
+    ) -> Result<Self, DescriptorError> {
+        mt7921_dma_tx(first, second, info)
+    }
+
+    pub fn rx(buffer: DmaSegment) -> Result<Self, DescriptorError> {
+        mt7921_dma_rx(buffer)
+    }
+
+    pub const fn reset() -> Self {
+        Self::from_mt76(mt76_core::DmaDescriptor::reset())
+    }
+
+    pub const fn to_le_bytes(self) -> [u8; DMA_DESCRIPTOR_LEN] {
+        self.into_mt76().to_le_bytes()
+    }
+
+    pub const fn is_dma_done(self) -> bool {
+        self.into_mt76().is_dma_done()
+    }
+
+    const fn from_mt76(descriptor: mt76_core::DmaDescriptor) -> Self {
+        Self {
+            buf0: descriptor.buf0,
+            ctrl: descriptor.ctrl,
+            buf1: descriptor.buf1,
+            info: descriptor.info,
+        }
+    }
+
+    const fn into_mt76(self) -> mt76_core::DmaDescriptor {
+        mt76_core::DmaDescriptor {
+            buf0: self.buf0,
+            ctrl: self.ctrl,
+            buf1: self.buf1,
+            info: self.info,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DescriptorError {
+    IovaAbove32Bits,
+    SegmentTooLong,
+    InvalidArena,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingAllocation {
+    pub id: u64,
+    pub iova: u64,
+    pub len: usize,
+}
+
+pub trait Low32RingMemory {
+    type Error;
+    fn allocate_low32(&mut self, size: usize, align: usize) -> Result<RingAllocation, Self::Error>;
+    fn free(&mut self, allocation: RingAllocation);
+}
+
+pub trait RingPublisher {
+    type Error;
+    fn write_descriptor(
+        &mut self,
+        index: u16,
+        descriptor: DmaDescriptor,
+    ) -> Result<(), Self::Error>;
+    fn release_fence(&mut self);
+    fn publish_producer(&mut self, index: u16) -> Result<(), Self::Error>;
+    fn acquire_fence(&mut self);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RingError<E> {
+    InvalidCount,
+    Allocation(E),
+    AllocationTooSmall,
+    AllocationAbove32Bits,
+    Full,
+    Descriptor(DescriptorError),
+    Publish(E),
+}
+
+/// Inactive MT7921 WFDMA TX ring model ported from pinned Linux mt76 `dma.c`.
+///
+/// Allocation is constrained to addresses representable by the MT7921 PCI
+/// 32-bit DMA mask. Descriptors start CPU-owned (`DMA_DONE`), enqueue clears
+/// that bit, and producer publication follows a release fence like
+/// `mt76_dma_kick_queue`. Reclaim advances only from the consumer tail after a
+/// device completion and acquire fence. This type has no MMIO enable method.
+pub struct WfdmaRing {
+    allocation: RingAllocation,
+    descriptors: Vec<DmaDescriptor>,
+    producer: u16,
+    consumer: u16,
+    queued: u16,
+}
+
+impl WfdmaRing {
+    pub fn allocate<M: Low32RingMemory>(
+        memory: &mut M,
+        count: u16,
+    ) -> Result<Self, RingError<M::Error>> {
+        if count < 2 {
+            return Err(RingError::InvalidCount);
+        }
+        let size = usize::from(count)
+            .checked_mul(DMA_DESCRIPTOR_LEN)
+            .ok_or(RingError::InvalidCount)?;
+        let allocation = memory
+            .allocate_low32(size, DMA_DESCRIPTOR_LEN)
+            .map_err(RingError::Allocation)?;
+        if allocation.len < size {
+            memory.free(allocation);
+            return Err(RingError::AllocationTooSmall);
+        }
+        let end = allocation
+            .iova
+            .checked_add(size as u64 - 1)
+            .filter(|end| *end <= u64::from(u32::MAX));
+        if allocation.iova % DMA_DESCRIPTOR_LEN as u64 != 0 || end.is_none() {
+            memory.free(allocation);
+            return Err(RingError::AllocationAbove32Bits);
+        }
+        Ok(Self {
+            allocation,
+            descriptors: vec![DmaDescriptor::reset(); usize::from(count)],
+            producer: 0,
+            consumer: 0,
+            queued: 0,
+        })
+    }
+
+    pub const fn allocation(&self) -> RingAllocation {
+        self.allocation
+    }
+    pub const fn producer(&self) -> u16 {
+        self.producer
+    }
+    pub const fn consumer(&self) -> u16 {
+        self.consumer
+    }
+    pub const fn queued(&self) -> u16 {
+        self.queued
+    }
+
+    pub fn enqueue<P: RingPublisher>(
+        &mut self,
+        publisher: &mut P,
+        first: DmaSegment,
+        second: Option<DmaSegment>,
+        info: u32,
+    ) -> Result<u16, RingError<P::Error>> {
+        if usize::from(self.queued) == self.descriptors.len() {
+            return Err(RingError::Full);
+        }
+        let index = self.producer;
+        let descriptor = mt7921_dma_tx(first, second, info).map_err(RingError::Descriptor)?;
+        publisher
+            .write_descriptor(index, descriptor)
+            .map_err(RingError::Publish)?;
+        publisher.release_fence();
+        let next = (usize::from(index) + 1) % self.descriptors.len();
+        publisher
+            .publish_producer(next as u16)
+            .map_err(RingError::Publish)?;
+        self.descriptors[usize::from(index)] = descriptor;
+        self.producer = next as u16;
+        self.queued += 1;
+        Ok(index)
+    }
+
+    /// Model the device's DMA_DONE write for deterministic tests/backends.
+    pub fn complete(&mut self, index: u16) -> bool {
+        let Some(descriptor) = self.descriptors.get_mut(usize::from(index)) else {
+            return false;
+        };
+        descriptor.ctrl |= 1 << 31;
+        true
+    }
+
+    pub fn reclaim_one<P: RingPublisher>(&mut self, publisher: &mut P) -> Option<u16> {
+        if self.queued == 0 {
+            return None;
+        }
+        let index = self.consumer;
+        if !self.descriptors[usize::from(index)].is_dma_done() {
+            return None;
+        }
+        publisher.acquire_fence();
+        self.descriptors[usize::from(index)] = DmaDescriptor::reset();
+        self.consumer = ((usize::from(index) + 1) % self.descriptors.len()) as u16;
+        self.queued -= 1;
+        Some(index)
+    }
+
+    pub fn teardown<M: Low32RingMemory>(mut self, memory: &mut M) {
+        self.descriptors.fill(DmaDescriptor::reset());
+        self.queued = 0;
+        memory.free(self.allocation);
+    }
+}
+
+pub fn mt7921_dma_tx(
+    first: DmaSegment,
+    second: Option<DmaSegment>,
+    info: u32,
+) -> Result<DmaDescriptor, DescriptorError> {
+    validate_mt7921_segment(first)?;
+    if let Some(segment) = second {
+        validate_mt7921_segment(segment)?;
+    }
+    mt76_core::DmaDescriptor::tx(
+        (first.iova, first.len),
+        second.map(|segment| (segment.iova, segment.len)),
+        info,
+    )
+    .map(DmaDescriptor::from_mt76)
+    .map_err(map_descriptor_error)
+}
+pub fn mt7921_dma_rx(buffer: DmaSegment) -> Result<DmaDescriptor, DescriptorError> {
+    validate_mt7921_segment(buffer)?;
+    mt76_core::DmaDescriptor::rx((buffer.iova, buffer.len))
+        .map(DmaDescriptor::from_mt76)
+        .map_err(map_descriptor_error)
+}
+fn map_descriptor_error(error: mt76_core::DescriptorError) -> DescriptorError {
+    match error {
+        mt76_core::DescriptorError::AddressAbove36Bits => DescriptorError::IovaAbove32Bits,
+        mt76_core::DescriptorError::SegmentTooLong => DescriptorError::SegmentTooLong,
+    }
+}
+fn validate_mt7921_segment(segment: DmaSegment) -> Result<(), DescriptorError> {
+    if segment.iova > u64::from(u32::MAX) {
+        return Err(DescriptorError::IovaAbove32Bits);
+    }
+    if segment.len > 0x3fff {
+        return Err(DescriptorError::SegmentTooLong);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ClcDiscovery {
     pub segment_count: u16,
@@ -1280,7 +1558,7 @@ where
     {
         return Err(DisabledFirmwareStageError::InvalidIova);
     }
-    let descriptor = DmaDescriptor::tx(
+    let descriptor = mt7921_dma_tx(
         DmaSegment {
             iova: payload_iova,
             len: payload.len() as u16,
@@ -1412,7 +1690,7 @@ pub fn prepare_mcu_rx_ring(
         .enumerate()
         .take(MT7921_MCU_RX_RING_COUNT - 1)
     {
-        *descriptor = DmaDescriptor::rx(DmaSegment {
+        *descriptor = mt7921_dma_rx(DmaSegment {
             iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
             len: MT7921_MCU_RX_BUFFER_BYTES as u16,
         })?;
@@ -4687,7 +4965,7 @@ pub fn encode_mt7921_5ghz_auth_tx(
     txwi[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
     txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
     txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
-    let descriptor = DmaDescriptor::tx(
+    let descriptor = mt7921_dma_tx(
         DmaSegment {
             iova: txwi_iova,
             len: MT7921_MGMT_TXWI_BYTES as u16,
@@ -10026,7 +10304,11 @@ mod tests {
 
     #[test]
     fn encodes_single_and_paired_dma_segments_like_mt76() {
-        let one = DmaDescriptor::tx(
+        let _: fn(DmaSegment, Option<DmaSegment>, u32) -> Result<DmaDescriptor, DescriptorError> =
+            DmaDescriptor::tx;
+        let _: fn(DmaSegment) -> Result<DmaDescriptor, DescriptorError> = DmaDescriptor::rx;
+
+        let one = mt7921_dma_tx(
             DmaSegment {
                 iova: 0x1234_5000,
                 len: 0x345,
@@ -10039,7 +10321,7 @@ mod tests {
         assert_eq!(one.buf1, 0);
         assert_eq!(one.to_le_bytes()[..4], [0x00, 0x50, 0x34, 0x12]);
 
-        let two = DmaDescriptor::tx(
+        let two = mt7921_dma_tx(
             DmaSegment {
                 iova: 0x1000,
                 len: 64,
@@ -10081,7 +10363,7 @@ mod tests {
     #[test]
     fn rejects_values_the_mt7921_pci_descriptor_cannot_represent() {
         assert_eq!(
-            DmaDescriptor::tx(
+            mt7921_dma_tx(
                 DmaSegment {
                     iova: 1u64 << 32,
                     len: 1
@@ -10092,7 +10374,7 @@ mod tests {
             Err(DescriptorError::IovaAbove32Bits)
         );
         assert_eq!(
-            DmaDescriptor::tx(
+            mt7921_dma_tx(
                 DmaSegment {
                     iova: 0,
                     len: 0x4000
