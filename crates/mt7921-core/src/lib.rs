@@ -5857,6 +5857,53 @@ pub struct ClientTargetBssLease {
     authorized: Option<(ClientScanEvidence, ClientChannelLease)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreAssociationSaeAuth {
+    pub transaction: u16,
+    pub status: u16,
+}
+
+/// Safely classify only the fixed 802.11 Authentication envelope. SAE body
+/// interpretation remains owned by Fuchsia MLME/SME.
+pub fn classify_preassociation_sae_auth(
+    frame: &[u8],
+    client: [u8; 6],
+    peer: [u8; 6],
+) -> Result<Option<PreAssociationSaeAuth>, &'static str> {
+    let control = frame
+        .get(..2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .ok_or("truncated frame control")?;
+    if control & 0x00fc != 0x00b0 {
+        return Ok(None);
+    }
+    if !(30..=2304).contains(&frame.len()) {
+        return Err("authentication frame length is invalid");
+    }
+    if frame.get(4..10) != Some(&client)
+        || frame.get(10..16) != Some(&peer)
+        || frame.get(16..22) != Some(&peer)
+    {
+        return Err("authentication address tuple does not match selected BSS");
+    }
+    if frame.get(24..26) != Some(&3u16.to_le_bytes()) {
+        return Err("pre-association authentication algorithm is not SAE");
+    }
+    let transaction = u16::from_le_bytes([frame[26], frame[27]]);
+    if !(1..=2).contains(&transaction) {
+        return Err("SAE authentication transaction is invalid");
+    }
+    let status = u16::from_le_bytes([frame[28], frame[29]]);
+    let body = &frame[30..];
+    if status == 77 && (body.is_empty() || body.len() % 2 != 0) {
+        return Err("SAE rejected-groups body is malformed");
+    }
+    Ok(Some(PreAssociationSaeAuth {
+        transaction,
+        status,
+    }))
+}
+
 impl ClientTargetBssLease {
     pub fn retain(evidence: ClientScanEvidence) -> Result<Self, String> {
         if evidence.scan_id == 0 || evidence.observation_generation == 0 {
@@ -7896,6 +7943,41 @@ mod tests {
         ));
         lease.invalidate();
         assert!(!lease.permits_join(bssid, channel_lease));
+    }
+
+    #[test]
+    fn preassociation_sae_classifier_is_narrow_and_bounded() {
+        let client = [1, 2, 3, 4, 5, 6];
+        let peer = [6, 5, 4, 3, 2, 1];
+        let mut status77 = vec![0; 32];
+        status77[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        status77[4..10].copy_from_slice(&client);
+        status77[10..16].copy_from_slice(&peer);
+        status77[16..22].copy_from_slice(&peer);
+        status77[24..26].copy_from_slice(&3u16.to_le_bytes());
+        status77[26..28].copy_from_slice(&1u16.to_le_bytes());
+        status77[28..30].copy_from_slice(&77u16.to_le_bytes());
+        status77[30..32].copy_from_slice(&20u16.to_le_bytes());
+        assert_eq!(
+            classify_preassociation_sae_auth(&status77, client, peer),
+            Ok(Some(PreAssociationSaeAuth {
+                transaction: 1,
+                status: 77,
+            }))
+        );
+
+        let mut wrong = status77.clone();
+        wrong[10] ^= 1;
+        assert!(classify_preassociation_sae_auth(&wrong, client, peer).is_err());
+        let mut malformed = status77.clone();
+        malformed.pop();
+        assert!(classify_preassociation_sae_auth(&malformed, client, peer).is_err());
+        let mut non_auth = status77;
+        non_auth[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        assert_eq!(
+            classify_preassociation_sae_auth(&non_auth, client, peer),
+            Ok(None)
+        );
     }
 
     #[test]

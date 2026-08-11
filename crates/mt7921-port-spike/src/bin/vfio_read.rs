@@ -53,10 +53,11 @@ use mt7921_port_spike::{
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
     ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
-    connac2_group1_pn, encode_client_data_txwi, encode_client_management_tx,
-    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
-    encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
-    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_data_txwi,
+    encode_client_management_tx, encode_disable_keys_command, encode_gtk_command,
+    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
+    encode_pse_reg_read_command, encode_ptk_command, encode_remove_wcid_command,
+    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
     passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
     validate_passive_mac_bar_read,
@@ -76,6 +77,8 @@ use mt7921_softmac_adapter::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
+#[cfg(feature = "fuchsia-passive")]
+use std::collections::VecDeque;
 use std::{
     cell::Cell,
     env,
@@ -7284,6 +7287,13 @@ fn drain_data_rx_queue(
                 let bytes = queue
                     .rx_buffers
                     .read_bytes(completed_index * 2048, length)?;
+                record_sae_stage(&format!(
+                    "client_rx_descriptor ring={} descriptor={} len={} packet_type={:?}",
+                    queue.rx_ring_index,
+                    completed_index,
+                    length,
+                    mt7921_packet_type(&bytes)
+                ));
                 let completion = match mt7921_packet_type(&bytes) {
                     Some(6) => parse_mt7921_tx_free(&bytes)
                         .ok()
@@ -7302,7 +7312,21 @@ fn drain_data_rx_queue(
                     completions.push(completion);
                     Ok(None)
                 } else {
-                    match parse_passive_advertisement(&bytes) {
+                    let passive = match parse_connac2_rx_frame(&bytes) {
+                        Ok(frame)
+                            if frame
+                                .bytes
+                                .get(..2)
+                                .map(|control| {
+                                    u16::from_le_bytes([control[0], control[1]]) & 0x00fc == 0x00b0
+                                })
+                                .unwrap_or(false) =>
+                        {
+                            Err(PassiveRxError::UnsupportedFrame)
+                        }
+                        _ => parse_passive_advertisement(&bytes),
+                    };
+                    match passive {
                         Ok(advertisement) => Ok(Some(
                             match provenance.seal_frame(
                                 DescriptorOccurrenceRoute::DataRx,
@@ -7376,6 +7400,10 @@ fn drain_data_rx_queue(
                     wfdma.write_rx_cpu_index(queue.rx_ring_index, queue.rx_head as u32)
                 },
             )?;
+            record_sae_stage(&format!(
+                "client_rx_rearm ring={} consumed_descriptor={} refill_descriptor={} result=published",
+                queue.rx_ring_index, completed_index, refill_index
+            ));
             queue.rx_tail = next_dma_index(queue.rx_tail, queue.rx_count);
             if let Some(advertisement) = parsed? {
                 advertisements.push(advertisement);
@@ -7931,7 +7959,45 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .get(..2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-        if control & 0x000c == 0 && !self.firmware.accepts_joined_management(&frame.bytes) {
+        let authentication = control & 0x00fc == 0x00b0;
+        if authentication {
+            let admitted = {
+                let state = self.state.lock().unwrap();
+                state
+                    .channel
+                    .authorized_channel()
+                    .ok()
+                    .filter(|channel| {
+                        state.selection.permits_join(self.target, *channel)
+                            && channel.channel.band
+                                == match frame.status.primary.band {
+                                    WlanBand::TwoGhz => 0,
+                                    WlanBand::FiveGhz => 1,
+                                    _ => u8::MAX,
+                                }
+                            && channel.channel.primary == u16::from(frame.status.primary.number)
+                    })
+                    .is_some()
+            };
+            if !admitted {
+                record_sae_stage("client_rx_filtered reason=stale_or_wrong_channel subtype=auth");
+                return Ok(None);
+            }
+            match classify_preassociation_sae_auth(&frame.bytes, self.client, self.target) {
+                Ok(Some(auth)) => record_sae_stage(&format!(
+                    "client_rx_admitted subtype=auth transaction={} status={} address_match=true",
+                    auth.transaction, auth.status
+                )),
+                Ok(None) => unreachable!("authentication subtype was checked"),
+                Err(reason) => {
+                    record_sae_stage(&format!(
+                        "client_rx_filtered reason={reason} subtype=auth address_match=false"
+                    ));
+                    return Ok(None);
+                }
+            }
+        } else if control & 0x000c == 0 && !self.firmware.accepts_joined_management(&frame.bytes) {
+            record_sae_stage("client_rx_filtered reason=prejoin_non_auth_management");
             return Ok(None);
         }
         if control & 0x000c == 0x0008 {
@@ -7966,11 +8032,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         } else if control & 0x000c != 0 {
             return Err(zx::Status::IO_DATA_INTEGRITY);
-        } else if control & 0x00fc == 0x00b0
-            && frame.bytes.get(4..10) == Some(&self.client)
-            && frame.bytes.get(10..16) == Some(&self.target)
-            && frame.bytes.get(16..22) == Some(&self.target)
-        {
+        } else if authentication {
             let sequence = frame
                 .bytes
                 .get(26..28)
@@ -8326,6 +8388,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        record_sae_stage("next_client_rx poll=begin");
         self.loader
             .mcu
             .handle_irq(None)
@@ -8339,6 +8402,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         )
         .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         let Some(frame) = self.loader.mcu.normal_rx_frames.pop() else {
+            record_sae_stage("next_client_rx result=empty");
             return Ok(None);
         };
         if let Some(occurrence) = frame.occurrence.as_ref() {
@@ -8373,6 +8437,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         };
         let parsed =
             parse_connac2_rx_frame(&frame.bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        let subtype = parsed.bytes.first().map(|control| control >> 4);
+        record_sae_stage(&format!(
+            "next_client_rx result=frame len={} packet_type={:?} subtype={subtype:?}",
+            parsed.bytes.len(),
+            mt7921_packet_type(&frame.bytes)
+        ));
         let primary = ChannelNumber {
             band: match parsed.band {
                 mt7921_port_spike::PhysicalBand::Ghz2 => WlanBand::TwoGhz,
@@ -10063,6 +10133,7 @@ mod tests {
     struct TestClientIo {
         uni: Vec<Vec<u8>>,
         tx: Vec<Vec<u8>>,
+        rx: VecDeque<ClientRxFrame>,
         fail_uni: bool,
     }
 
@@ -10152,7 +10223,7 @@ mod tests {
             Ok(())
         }
         fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-            Ok(None)
+            Ok(self.rx.pop_front())
         }
     }
 
@@ -10939,6 +11010,95 @@ mod tests {
         assert_eq!(io.tx, vec![frame(2), frame(2)]);
         assert!(!effects.firmware.controlled_port_open);
         assert!(effects.firmware.association.is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn live_effects_admit_only_current_preassociation_sae_authentication() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let client = [6, 5, 4, 3, 2, 1];
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let mut effects = LiveClientEffects {
+            state: Arc::new(Mutex::new(LiveClientState::default())),
+            target: peer,
+            client,
+            rcpi: 100,
+            firmware: ClientFirmwareEffectsState::default(),
+        };
+        effects
+            .set_channel(
+                channel,
+                ChannelBandwidth::Cbw20,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+        install_selection_and_authorize(
+            &mut effects.state.lock().unwrap(),
+            peer,
+            channel,
+            ChannelBandwidth::Cbw20,
+        );
+
+        let auth = |transmitter: [u8; 6], body: &[u8], primary: ChannelNumber| {
+            let mut bytes = vec![0; 30];
+            bytes[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            bytes[4..10].copy_from_slice(&client);
+            bytes[10..16].copy_from_slice(&transmitter);
+            bytes[16..22].copy_from_slice(&peer);
+            bytes[24..26].copy_from_slice(&3u16.to_le_bytes());
+            bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+            bytes[28..30].copy_from_slice(&77u16.to_le_bytes());
+            bytes.extend_from_slice(body);
+            ClientRxFrame {
+                bytes,
+                status: fidl_softmac::WlanRxInfo {
+                    rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                    valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                    phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                    data_rate: 0,
+                    primary,
+                    bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
+                    vht_secondary_80_channel: ChannelNumber {
+                        number: 0,
+                        ..primary
+                    },
+                    mcs: 0,
+                    rssi_dbm: -40,
+                    snr_dbh: 0,
+                },
+                security: None,
+            }
+        };
+        let mut io = TestClientIo::default();
+        io.rx.push_back(auth(peer, &20u16.to_le_bytes(), channel));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+
+        io.rx.push_back(auth([9; 6], &20u16.to_le_bytes(), channel));
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        io.rx.push_back(auth(peer, &[20], channel));
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        let mut non_auth = auth(peer, &20u16.to_le_bytes(), channel);
+        non_auth.bytes[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
+        io.rx.push_back(non_auth);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        io.rx.push_back(auth(
+            peer,
+            &20u16.to_le_bytes(),
+            ChannelNumber {
+                number: 40,
+                ..channel
+            },
+        ));
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        effects.reset().unwrap();
+        io.rx.push_back(auth(peer, &20u16.to_le_bytes(), channel));
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -13275,6 +13435,93 @@ mod tests {
         frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
         frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
         rx
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn actual_data_drain_routes_status77_and_rearms_before_advancing() {
+        let ring_mapping = TestMapping::new(PAGE);
+        let buffer_mapping = TestMapping::new(8 * 2048);
+        let page_mapping = TestMapping::new(PAGE);
+        let mut ring = ring_mapping.dma(0x0102_0000);
+        let mut buffers = buffer_mapping.dma(0x0103_0000);
+        let page = page_mapping.read_page();
+        let client = [1, 2, 3, 4, 5, 6];
+        let peer = [6, 5, 4, 3, 2, 1];
+        let mut rx = vec![0; 24 + 8 + 32];
+        let length = rx.len() as u32;
+        rx[0..4].copy_from_slice(&((2u32 << 27) | length).to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        {
+            let auth = &mut rx[32..];
+            auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            auth[4..10].copy_from_slice(&client);
+            auth[10..16].copy_from_slice(&peer);
+            auth[16..22].copy_from_slice(&peer);
+            auth[24..26].copy_from_slice(&3u16.to_le_bytes());
+            auth[26..28].copy_from_slice(&1u16.to_le_bytes());
+            auth[28..30].copy_from_slice(&77u16.to_le_bytes());
+            auth[30..32].copy_from_slice(&20u16.to_le_bytes());
+        }
+        buffers.write_bytes_at(0, &rx).unwrap();
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: buffers.iova as u32,
+                ctrl: (1 << 31) | (1 << 30) | (length << 16),
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let mut queue = ActiveMcuRx {
+            rx_ring: &mut ring,
+            rx_buffers: &buffers,
+            rx_tail: 0,
+            rx_head: 7,
+            rx_ring_index: 2,
+            rx_count: 8,
+            irq_bit: DATA_RX_IRQ_BIT,
+        };
+        let mut provenance = DescriptorProvenance::new();
+        let mut normal = Vec::new();
+        assert!(
+            drain_data_rx_queue(
+                &page,
+                &mut queue,
+                &mut provenance,
+                &mut Vec::new(),
+                Some(&mut normal),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(normal.len(), 1);
+        let parsed = parse_connac2_rx_frame(&normal[0].bytes).unwrap();
+        assert_eq!(parsed.bytes, rx[32..]);
+        assert_eq!(
+            classify_preassociation_sae_auth(&parsed.bytes, client, peer)
+                .unwrap()
+                .unwrap(),
+            mt7921_port_spike::PreAssociationSaeAuth {
+                transaction: 1,
+                status: 77,
+            }
+        );
+        assert!(matches!(
+            provenance.effects.as_slice(),
+            [
+                DescriptorProvenanceEffect::Mint(_),
+                DescriptorProvenanceEffect::Rearm {
+                    route: DescriptorOccurrenceRoute::DataRx,
+                    ring: 2,
+                    slot: 7,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
     }
 
     #[cfg(feature = "fuchsia-passive")]
