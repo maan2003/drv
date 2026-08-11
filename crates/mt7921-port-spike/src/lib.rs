@@ -5173,6 +5173,269 @@ pub struct Mt7921MgmtTx {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921MgmtMatrixCase {
+    Reserved128,
+    Reserved129,
+    Reserved176,
+    InvalidGroup20,
+    Reserved128Repeat,
+}
+
+impl Mt7921MgmtMatrixCase {
+    const ALL: [Self; 5] = [
+        Self::Reserved128,
+        Self::Reserved129,
+        Self::Reserved176,
+        Self::InvalidGroup20,
+        Self::Reserved128Repeat,
+    ];
+
+    fn identity(self) -> (u16, u8, u16) {
+        match self {
+            Self::Reserved128 => (0, 3, 128),
+            Self::Reserved129 => (1, 4, 129),
+            Self::Reserved176 => (2, 5, 176),
+            Self::InvalidGroup20 => (3, 6, 176),
+            Self::Reserved128Repeat => (4, 7, 128),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Mt7921MgmtMatrixFrame {
+    pub case: Mt7921MgmtMatrixCase,
+    pub token: u16,
+    pub pid: u8,
+    pub sequence_control: u16,
+    bytes: Vec<u8>,
+}
+
+impl Mt7921MgmtMatrixFrame {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for Mt7921MgmtMatrixFrame {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Build synthetic directed Authentication MPDUs for the bounded management-TX
+/// matrix. None can authenticate: four use a reserved algorithm and the fifth
+/// has an invalid all-zero group-20 scalar and element.
+pub fn mt7921_privacy_safe_mgmt_matrix(
+    client: [u8; 6],
+    bssid: [u8; 6],
+) -> [Mt7921MgmtMatrixFrame; 5] {
+    Mt7921MgmtMatrixCase::ALL.map(|case| {
+        let (token, pid, frame_len) = case.identity();
+        let sequence_control = token << 4;
+        let mut bytes = vec![0u8; usize::from(frame_len)];
+        bytes[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        bytes[4..10].copy_from_slice(&bssid);
+        bytes[10..16].copy_from_slice(&client);
+        bytes[16..22].copy_from_slice(&bssid);
+        bytes[22..24].copy_from_slice(&sequence_control.to_le_bytes());
+        if case == Mt7921MgmtMatrixCase::InvalidGroup20 {
+            bytes[24..26].copy_from_slice(&3u16.to_le_bytes());
+            bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+            bytes[28..30].copy_from_slice(&126u16.to_le_bytes());
+            bytes[30..32].copy_from_slice(&20u16.to_le_bytes());
+            // bytes 32..176 remain the deliberately invalid zero scalar/element.
+        } else {
+            bytes[24..26].copy_from_slice(&u16::MAX.to_le_bytes());
+            bytes[26..28].copy_from_slice(&0u16.to_le_bytes());
+            bytes[28..30].copy_from_slice(&u16::MAX.to_le_bytes());
+            for (offset, byte) in bytes[30..].iter_mut().enumerate() {
+                *byte = (offset as u8).wrapping_mul(61).wrapping_add(17);
+            }
+        }
+        Mt7921MgmtMatrixFrame {
+            case,
+            token,
+            pid,
+            sequence_control,
+            bytes,
+        }
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Mt7921MgmtMatrixCompletion {
+    TxFree(Vec<u8>),
+    TxStatus(Vec<u8>),
+}
+
+pub trait Mt7921MgmtMatrixTransport {
+    type Error: core::fmt::Debug;
+
+    fn read_dmashdl_control(&mut self) -> Result<u32, Self::Error>;
+    fn publish_ring0(
+        &mut self,
+        case: Mt7921MgmtMatrixCase,
+        frame: &[u8],
+        encoded: &Mt7921MgmtTx,
+    ) -> Result<(), Self::Error>;
+    fn next_completion(&mut self) -> Result<Option<Mt7921MgmtMatrixCompletion>, Self::Error>;
+    /// Must stop/reset ring 0 and wipe its TXWI and frame DMA arenas. The
+    /// harness wipes its owned frame before invoking this boundary.
+    fn reclaim_ring0(
+        &mut self,
+        case: Mt7921MgmtMatrixCase,
+        wiped_frame: &[u8],
+    ) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921MgmtMatrixObservation {
+    pub case: Mt7921MgmtMatrixCase,
+    pub pre_dmashdl_control: u32,
+    pub post_dmashdl_control: u32,
+    pub raw_tx_free: Vec<u8>,
+    pub raw_tx_status: Vec<u8>,
+    pub tx_free_status: u8,
+    pub attempts: u16,
+    pub tx_status_ack_error: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mt7921MgmtMatrixError {
+    Transport,
+    DmashdlUnavailable,
+    DmashdlBypassDisabled,
+    MissingCompletion,
+    DuplicateCompletion,
+    UncorrelatedCompletion,
+    InvalidCompletion,
+    Reclaim,
+}
+
+fn raw_tx_free_status(bytes: &[u8]) -> Option<u8> {
+    let reported_len = usize::from(u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?));
+    let info_offset = match reported_len {
+        12 => 8,
+        16 => 12,
+        _ => return None,
+    };
+    let info = u32::from_le_bytes(bytes.get(info_offset..info_offset + 4)?.try_into().ok()?);
+    Some(((info >> 13) & 0x3) as u8)
+}
+
+fn raw_txs_ack_error(bytes: &[u8]) -> Option<u8> {
+    let txs0 = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    Some(((txs0 >> 16) & 0x7) as u8)
+}
+
+/// Run A-E serially. Only TX completion packets are accepted; no received
+/// Authentication frame can enter this harness or an authentication state
+/// machine.
+pub fn run_mt7921_privacy_safe_mgmt_matrix<T: Mt7921MgmtMatrixTransport>(
+    transport: &mut T,
+    client: [u8; 6],
+    bssid: [u8; 6],
+    txwi_iova: u64,
+    frame_iova: u64,
+) -> Result<Vec<Mt7921MgmtMatrixObservation>, Mt7921MgmtMatrixError> {
+    let mut observations = Vec::with_capacity(5);
+    for mut fixture in mt7921_privacy_safe_mgmt_matrix(client, bssid) {
+        let pre = transport
+            .read_dmashdl_control()
+            .map_err(|_| Mt7921MgmtMatrixError::Transport)?;
+        if pre == u32::MAX {
+            return Err(Mt7921MgmtMatrixError::DmashdlUnavailable);
+        }
+        if pre & (1 << 28) == 0 {
+            return Err(Mt7921MgmtMatrixError::DmashdlBypassDisabled);
+        }
+        let encoded = encode_mt7921_5ghz_auth_tx(
+            &fixture.bytes,
+            txwi_iova,
+            frame_iova,
+            fixture.token,
+            fixture.pid,
+            19,
+        )
+        .map_err(|_| Mt7921MgmtMatrixError::InvalidCompletion)?;
+
+        let result = (|| {
+            transport
+                .publish_ring0(fixture.case, &fixture.bytes, &encoded)
+                .map_err(|_| Mt7921MgmtMatrixError::Transport)?;
+            let mut raw_free = None;
+            let mut raw_status = None;
+            while raw_free.is_none() || raw_status.is_none() {
+                match transport
+                    .next_completion()
+                    .map_err(|_| Mt7921MgmtMatrixError::Transport)?
+                    .ok_or(Mt7921MgmtMatrixError::MissingCompletion)?
+                {
+                    Mt7921MgmtMatrixCompletion::TxFree(raw) => {
+                        if raw_free.is_some() {
+                            return Err(Mt7921MgmtMatrixError::DuplicateCompletion);
+                        }
+                        let parsed = parse_mt7921_tx_free(&raw)
+                            .map_err(|_| Mt7921MgmtMatrixError::InvalidCompletion)?;
+                        if parsed.token != fixture.token
+                            || parsed.wcid.is_some_and(|wcid| wcid != 19)
+                        {
+                            return Err(Mt7921MgmtMatrixError::UncorrelatedCompletion);
+                        }
+                        raw_free = Some((raw, parsed));
+                    }
+                    Mt7921MgmtMatrixCompletion::TxStatus(raw) => {
+                        if raw_status.is_some() {
+                            return Err(Mt7921MgmtMatrixError::DuplicateCompletion);
+                        }
+                        let parsed = parse_mt7921_tx_status(&raw)
+                            .map_err(|_| Mt7921MgmtMatrixError::InvalidCompletion)?;
+                        if parsed.pid != fixture.pid || parsed.wcid != 19 {
+                            return Err(Mt7921MgmtMatrixError::UncorrelatedCompletion);
+                        }
+                        raw_status = Some(raw);
+                    }
+                }
+            }
+            let post = transport
+                .read_dmashdl_control()
+                .map_err(|_| Mt7921MgmtMatrixError::Transport)?;
+            if post == u32::MAX {
+                return Err(Mt7921MgmtMatrixError::DmashdlUnavailable);
+            }
+            if post & (1 << 28) == 0 {
+                return Err(Mt7921MgmtMatrixError::DmashdlBypassDisabled);
+            }
+            let (raw_tx_free, parsed_free) = raw_free.expect("loop completed");
+            let raw_tx_status = raw_status.expect("loop completed");
+            Ok(Mt7921MgmtMatrixObservation {
+                case: fixture.case,
+                pre_dmashdl_control: pre,
+                post_dmashdl_control: post,
+                tx_free_status: raw_tx_free_status(&raw_tx_free)
+                    .ok_or(Mt7921MgmtMatrixError::InvalidCompletion)?,
+                attempts: parsed_free.attempts,
+                tx_status_ack_error: raw_txs_ack_error(&raw_tx_status)
+                    .ok_or(Mt7921MgmtMatrixError::InvalidCompletion)?,
+                raw_tx_free,
+                raw_tx_status,
+            })
+        })();
+        fixture.bytes.fill(0);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        if transport
+            .reclaim_ring0(fixture.case, &fixture.bytes)
+            .is_err()
+        {
+            return Err(Mt7921MgmtMatrixError::Reclaim);
+        }
+        observations.push(result?);
+    }
+    Ok(observations)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mt7921MgmtTxError {
     InvalidFrame,
     InvalidIova,
@@ -6943,6 +7206,213 @@ mod tests {
             assert_eq!(txp_len, frame_len as u16 | 0x8000);
             assert_eq!(tx.descriptor.ctrl, (64 << 16) | (1 << 30));
         }
+    }
+
+    struct MatrixTransport {
+        dmashdl: Vec<u32>,
+        completions: alloc::collections::VecDeque<Mt7921MgmtMatrixCompletion>,
+        published: Vec<(Mt7921MgmtMatrixCase, usize, u16, u8, u16)>,
+        reclaimed: Vec<Mt7921MgmtMatrixCase>,
+    }
+
+    impl MatrixTransport {
+        fn successful() -> Self {
+            Self {
+                dmashdl: vec![1 << 28; 10],
+                completions: alloc::collections::VecDeque::new(),
+                published: vec![],
+                reclaimed: vec![],
+            }
+        }
+
+        fn tx_free(token: u16, status: u8, attempts: u16) -> Vec<u8> {
+            let mut raw = vec![0u8; 16];
+            raw[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+            raw[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+            raw[12..16].copy_from_slice(
+                &((u32::from(token) << 16) | (u32::from(status) << 13) | u32::from(attempts))
+                    .to_le_bytes(),
+            );
+            raw
+        }
+
+        fn tx_status(pid: u8, ack_error: u8) -> Vec<u8> {
+            let mut raw = vec![0u8; 40];
+            raw[0..4].copy_from_slice(&40u32.to_le_bytes());
+            raw[8..12].copy_from_slice(&(u32::from(ack_error) << 16).to_le_bytes());
+            raw[16..20].copy_from_slice(&(19u32 << 16).to_le_bytes());
+            raw[20..24].copy_from_slice(&(u32::from(pid) << 24).to_le_bytes());
+            raw
+        }
+    }
+
+    impl Mt7921MgmtMatrixTransport for MatrixTransport {
+        type Error = ();
+
+        fn read_dmashdl_control(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.dmashdl.remove(0))
+        }
+
+        fn publish_ring0(
+            &mut self,
+            case: Mt7921MgmtMatrixCase,
+            frame: &[u8],
+            encoded: &Mt7921MgmtTx,
+        ) -> Result<(), Self::Error> {
+            let txp_token = u16::from_le_bytes(encoded.txwi[32..34].try_into().unwrap()) & 0x7fff;
+            let txp_len = u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()) & 0x0fff;
+            self.published
+                .push((case, frame.len(), txp_token, encoded.pid, txp_len));
+            // Exercise both legal completion orders.
+            if txp_token % 2 == 0 {
+                self.completions
+                    .push_back(Mt7921MgmtMatrixCompletion::TxFree(Self::tx_free(
+                        txp_token, 0, 1,
+                    )));
+                self.completions
+                    .push_back(Mt7921MgmtMatrixCompletion::TxStatus(Self::tx_status(
+                        encoded.pid,
+                        0,
+                    )));
+            } else {
+                self.completions
+                    .push_back(Mt7921MgmtMatrixCompletion::TxStatus(Self::tx_status(
+                        encoded.pid,
+                        0,
+                    )));
+                self.completions
+                    .push_back(Mt7921MgmtMatrixCompletion::TxFree(Self::tx_free(
+                        txp_token, 0, 1,
+                    )));
+            }
+            Ok(())
+        }
+
+        fn next_completion(&mut self) -> Result<Option<Mt7921MgmtMatrixCompletion>, Self::Error> {
+            Ok(self.completions.pop_front())
+        }
+
+        fn reclaim_ring0(
+            &mut self,
+            case: Mt7921MgmtMatrixCase,
+            wiped_frame: &[u8],
+        ) -> Result<(), Self::Error> {
+            assert!(wiped_frame.iter().all(|byte| *byte == 0));
+            self.reclaimed.push(case);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn privacy_safe_management_matrix_is_serial_correlated_and_wiped() {
+        let client = [2, 0, 0, 0, 0, 1];
+        let bssid = [2, 0, 0, 0, 0, 2];
+        let fixtures = mt7921_privacy_safe_mgmt_matrix(client, bssid);
+        assert_eq!(
+            fixtures.each_ref().map(|fixture| fixture.bytes.len()),
+            [128, 129, 176, 176, 128]
+        );
+        assert_eq!(fixtures[0].bytes[24..30], [0xff, 0xff, 0, 0, 0xff, 0xff]);
+        assert_eq!(fixtures[3].bytes[24..32], [3, 0, 1, 0, 126, 0, 20, 0]);
+        assert!(fixtures[3].bytes[32..].iter().all(|byte| *byte == 0));
+        let mut a = fixtures[0].bytes[..128].to_vec();
+        let mut b = fixtures[1].bytes[..128].to_vec();
+        let mut c = fixtures[2].bytes[..128].to_vec();
+        a[22..24].fill(0);
+        b[22..24].fill(0);
+        c[22..24].fill(0);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+
+        let mut transport = MatrixTransport::successful();
+        let observations = run_mt7921_privacy_safe_mgmt_matrix(
+            &mut transport,
+            client,
+            bssid,
+            0x0103_0000,
+            0x0103_1000,
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 5);
+        assert!(observations.iter().all(|observation| {
+            observation.pre_dmashdl_control == 1 << 28
+                && observation.post_dmashdl_control == 1 << 28
+                && observation.tx_free_status == 0
+                && observation.attempts == 1
+                && observation.tx_status_ack_error == 0
+                && !observation.raw_tx_free.is_empty()
+                && !observation.raw_tx_status.is_empty()
+        }));
+        assert_eq!(
+            transport.published,
+            [
+                (Mt7921MgmtMatrixCase::Reserved128, 128, 0, 3, 128),
+                (Mt7921MgmtMatrixCase::Reserved129, 129, 1, 4, 129),
+                (Mt7921MgmtMatrixCase::Reserved176, 176, 2, 5, 176),
+                (Mt7921MgmtMatrixCase::InvalidGroup20, 176, 3, 6, 176),
+                (Mt7921MgmtMatrixCase::Reserved128Repeat, 128, 4, 7, 128),
+            ]
+        );
+        assert_eq!(transport.reclaimed, Mt7921MgmtMatrixCase::ALL);
+    }
+
+    #[test]
+    fn privacy_safe_management_matrix_fails_before_publish_without_dmashdl_bypass() {
+        let mut transport = MatrixTransport::successful();
+        transport.dmashdl[0] = 0;
+        assert_eq!(
+            run_mt7921_privacy_safe_mgmt_matrix(
+                &mut transport,
+                [2, 0, 0, 0, 0, 1],
+                [2, 0, 0, 0, 0, 2],
+                0x0103_0000,
+                0x0103_1000,
+            ),
+            Err(Mt7921MgmtMatrixError::DmashdlBypassDisabled)
+        );
+        assert!(transport.published.is_empty());
+        assert!(transport.reclaimed.is_empty());
+    }
+
+    #[test]
+    fn privacy_safe_management_matrix_reclaims_after_bad_correlation() {
+        let mut transport = MatrixTransport::successful();
+        transport
+            .completions
+            .push_back(Mt7921MgmtMatrixCompletion::TxFree(
+                MatrixTransport::tx_free(7, 1, 15),
+            ));
+        // Prevent publish_ring0 from placing its valid TX_FREE first.
+        transport.dmashdl.truncate(2);
+        assert_eq!(
+            run_mt7921_privacy_safe_mgmt_matrix(
+                &mut transport,
+                [2, 0, 0, 0, 0, 1],
+                [2, 0, 0, 0, 0, 2],
+                0x0103_0000,
+                0x0103_1000,
+            ),
+            Err(Mt7921MgmtMatrixError::UncorrelatedCompletion)
+        );
+        assert_eq!(transport.reclaimed, [Mt7921MgmtMatrixCase::Reserved128]);
+    }
+
+    #[test]
+    fn privacy_safe_management_matrix_reclaims_when_dmashdl_changes_after_publish() {
+        let mut transport = MatrixTransport::successful();
+        transport.dmashdl[1] = 0;
+        assert_eq!(
+            run_mt7921_privacy_safe_mgmt_matrix(
+                &mut transport,
+                [2, 0, 0, 0, 0, 1],
+                [2, 0, 0, 0, 0, 2],
+                0x0103_0000,
+                0x0103_1000,
+            ),
+            Err(Mt7921MgmtMatrixError::DmashdlBypassDisabled)
+        );
+        assert_eq!(transport.published.len(), 1);
+        assert_eq!(transport.reclaimed, [Mt7921MgmtMatrixCase::Reserved128]);
     }
 
     #[test]
