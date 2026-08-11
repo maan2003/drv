@@ -1580,7 +1580,14 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(3, 0, 7, 42, peer, 100)
         .map_err(|error| format!("self-test association peer fixture: {error}"))?;
+    let wtbl_structure = expected_peer[120] == 7
+        && expected_peer[121] == 1
+        && expected_peer[122..124] == [4, 0]
+        && expected_peer[68..74] == expected_peer[132..138]
+        && expected_peer[148..156] == [1, 0, 12, 0, 0, 1, 1, 1]
+        && expected_peer[160..168] == [6, 0, 8, 0, 1, 0, 1, 0];
     if activation_commands != [(3, expected_preauth), (2, expected_bss), (3, expected_peer)]
+        || !wtbl_structure
         || !rx_gate.bss_programmed
         || !rx_gate.association.is_some_and(|active| {
             active.bss_index == 0
@@ -1597,7 +1604,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 wtbl_reset_set=true nested_generic_peer_match=true rx_lookup=true no_rx_trans=true bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
@@ -6467,8 +6474,8 @@ const WM_RX_IRQ_BIT: u32 = 1 << 0;
 const DATA_RX_IRQ_BIT: u32 = 1 << 2;
 const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
-const PASSIVE_MAC_BAR_PAGES: [usize; 8] = [
-    0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0xa1000, 0xa3000, 0xa4000,
+const PASSIVE_MAC_BAR_PAGES: [usize; 9] = [
+    0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0x38000, 0xa1000, 0xa3000, 0xa4000,
 ];
 
 const fn firmware_bootstrap_rx_irq_mask() -> u32 {
@@ -7912,6 +7919,33 @@ impl PassiveMacExecutor<'_> {
 
     fn write(&self, address: u32, value: u32) -> Result<(), String> {
         self.page(address)?.write_passive_mac(address, value)
+    }
+
+    fn clear_wtbl_admission_counts(&self, wcid: u8) -> Result<(), String> {
+        let address = 0x820d_4230;
+        let initial = self.read(address)?;
+        self.write(address, (initial & !0x03ff) | u32::from(wcid) | (1 << 12))?;
+        let deadline = Instant::now() + std::time::Duration::from_micros(5000);
+        loop {
+            if self.read(address)? & (1 << 31) == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("WTBL admission-count clear remained busy".into());
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn wtbl_peer_matches(&self, wcid: u8, peer: &[u8]) -> Result<bool, String> {
+        if wcid != 7 || peer.len() != 6 {
+            return Err("bounded WTBL readback escaped WCID7 peer shape".into());
+        }
+        let address = 0x820d_8000 | (u32::from(wcid) << 8);
+        let word0 = self.read(address)?;
+        let word1 = self.read(address + 4)?;
+        Ok(word0 as u16 == u16::from_le_bytes([peer[4], peer[5]])
+            && word1 == u32::from_le_bytes(peer[..4].try_into().unwrap()))
     }
 
     fn execute(&self) -> Result<(), String> {
@@ -9701,6 +9735,19 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        let associated_wcid = (expected_cid == 3 && encoded.len() == 176)
+            .then(|| encoded.get(49).copied())
+            .flatten();
+        if let Some(wcid) = associated_wcid {
+            PassiveMacExecutor {
+                pages: self.mac_pages,
+            }
+            .clear_wtbl_admission_counts(wcid)
+            .map_err(|_| zx::Status::IO)?;
+            record_sae_stage(&format!(
+                "linux_sta_update_precondition wcid={wcid} admission_counts_cleared=true"
+            ));
+        }
         self.loader
             .send_acknowledged_uni_command(expected_cid, encoded)
             .map_err(|_| zx::Status::IO)?;
@@ -9711,6 +9758,19 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let mac = PassiveMacExecutor {
                 pages: self.mac_pages,
             };
+            let wcid = encoded[49];
+            let peer = &encoded[68..74];
+            let basic_peer_match = peer == &encoded[132..138];
+            let wtbl_reset_set =
+                encoded[120] == wcid && encoded[121] == 1 && encoded[122..124] == [4, 0];
+            let rx_lookup = encoded[148..156] == [1, 0, 12, 0, 0, 1, 1, 1];
+            let header_translation = encoded[160..168] == [6, 0, 8, 0, 1, 0, 1, 0];
+            let peer_readback = mac
+                .wtbl_peer_matches(wcid, peer)
+                .map_err(|_| zx::Status::IO)?;
+            record_sae_stage(&format!(
+                "firmware_wtbl_attestation wcid={wcid} basic_peer_match={basic_peer_match} nested_generic_peer_match={basic_peer_match} reset_and_set={wtbl_reset_set} rx_lookup={rx_lookup} no_rx_trans={header_translation} peer_readback_match={peer_readback}"
+            ));
             let rfcr = [
                 mac.read(0x820e_5000),
                 mac.read(0x820e_5004),
@@ -16407,6 +16467,9 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
+        required.sort_unstable();
+        required.dedup();
+        required.push(passive_mac_bar_offset(0x820d_8700).unwrap() & !(PAGE - 1));
         required.sort_unstable();
         required.dedup();
         assert_eq!(required, PASSIVE_MAC_BAR_PAGES);

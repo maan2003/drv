@@ -3065,16 +3065,18 @@ pub fn passive_mac_bar_offset(address: u32) -> Result<usize, PassiveMacBarError>
         (0x820f_9000, 0x000a_3400, 0x0000_0200),
         (0x820f_d000, 0x000a_4800, 0x0000_0800),
     ];
-    if !passive_mac_mmio_plan()
-        .iter()
-        .any(|operation| match operation {
-            PassiveMacMmioOperation::Rmw {
-                address: expected, ..
-            }
-            | PassiveMacMmioOperation::WtblClear {
-                address: expected, ..
-            } => *expected == address,
-        })
+    let wtbl_peer_readback = matches!(address, 0x820d_8700 | 0x820d_8704);
+    if !wtbl_peer_readback
+        && !passive_mac_mmio_plan()
+            .iter()
+            .any(|operation| match operation {
+                PassiveMacMmioOperation::Rmw {
+                    address: expected, ..
+                }
+                | PassiveMacMmioOperation::WtblClear {
+                    address: expected, ..
+                } => *expected == address,
+            })
     {
         return Err(PassiveMacBarError::UnsupportedAddress(address));
     }
@@ -11197,6 +11199,8 @@ mod tests {
             (0x820c_d000, 0x0f000),
             (0x820c_d004, 0x0f004),
             (0x820d_4230, 0x34230),
+            (0x820d_8700, 0x38700),
+            (0x820d_8704, 0x38704),
             (0x820e_40f4, 0x210f4),
             (0x820e_5380, 0x21780),
             (0x820e_53c4, 0x217c4),
