@@ -7,6 +7,7 @@
 //! - `drivers/net/wireless/mediatek/mt76/dma.h`: `struct mt76_desc`.
 //! - `drivers/net/wireless/mediatek/mt76/dma.c`: descriptor encoding,
 //!   queue allocation, producer publication, completion, and teardown.
+//! - `drivers/net/wireless/mediatek/mt76/pci.c`: PCIe ASPM capability policy.
 //! - `drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c` and
 //!   `mt76_connac_mcu.h`: Connac firmware, patch, and CLC image formats.
 //!
@@ -571,4 +572,86 @@ impl<'a> Iterator for FirmwareRegions<'a> {
 
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("four-byte field"))
+}
+
+#[doc(hidden)]
+pub const PCI_CAPABILITY_LIST: usize = 0x34;
+#[doc(hidden)]
+pub const PCI_STATUS: usize = 0x06;
+#[doc(hidden)]
+pub const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
+#[doc(hidden)]
+pub const PCI_CAP_ID_EXP: u8 = 0x10;
+#[doc(hidden)]
+pub const PCI_EXP_LNKCTL: usize = 0x10;
+const PCI_EXP_LNKCTL_ASPMC: u16 = 0x3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcieLinkControlError {
+    ConfigTooShort,
+    InvalidCapabilityOffset(u8),
+    CapabilityLoop(u8),
+    TruncatedPcieCapability(u8),
+    PcieCapabilityAbsent,
+}
+
+/// Parse the standard PCIe capability's Link Control word.
+///
+/// Pinned Linux `pcie_capability_read_word(..., PCI_EXP_LNKCTL, ...)` first
+/// locates conventional capability ID `PCI_CAP_ID_EXP`, then reads the
+/// little-endian word at capability offset `PCI_EXP_LNKCTL`.
+pub fn pcie_link_control(config: &[u8]) -> Result<u16, PcieLinkControlError> {
+    if config.len() <= PCI_CAPABILITY_LIST {
+        return Err(PcieLinkControlError::ConfigTooShort);
+    }
+    let status = u16::from_le_bytes([config[PCI_STATUS], config[PCI_STATUS + 1]]);
+    if status & PCI_STATUS_CAP_LIST == 0 {
+        return Err(PcieLinkControlError::PcieCapabilityAbsent);
+    }
+    let mut offset = config[PCI_CAPABILITY_LIST] & !3;
+    if offset == 0 {
+        return Err(PcieLinkControlError::PcieCapabilityAbsent);
+    }
+    let mut visited = [false; 64];
+    for _ in 0..48 {
+        let index = usize::from(offset);
+        if index < 0x40 || index + 2 > config.len() {
+            return Err(PcieLinkControlError::InvalidCapabilityOffset(offset));
+        }
+        let slot = index / 4;
+        if visited[slot] {
+            return Err(PcieLinkControlError::CapabilityLoop(offset));
+        }
+        visited[slot] = true;
+        if config[index] == PCI_CAP_ID_EXP {
+            let link_control = index + PCI_EXP_LNKCTL;
+            if link_control + 2 > config.len() {
+                return Err(PcieLinkControlError::TruncatedPcieCapability(offset));
+            }
+            return Ok(u16::from_le_bytes([
+                config[link_control],
+                config[link_control + 1],
+            ]));
+        }
+        offset = config[index + 1] & !3;
+        if offset == 0 {
+            return Err(PcieLinkControlError::PcieCapabilityAbsent);
+        }
+    }
+    Err(PcieLinkControlError::CapabilityLoop(offset))
+}
+
+/// Reproduce pinned Linux `mt76_pci_aspm_supported`: ASPM is supported when
+/// either the endpoint or its optional parent bridge has L0s/L1 enabled in
+/// Link Control. Parsing errors are retained rather than guessed as false.
+pub fn mt76_pci_aspm_supported(
+    endpoint_config: &[u8],
+    parent_config: Option<&[u8]>,
+) -> Result<bool, PcieLinkControlError> {
+    let endpoint = pcie_link_control(endpoint_config)? & PCI_EXP_LNKCTL_ASPMC;
+    let parent = match parent_config {
+        Some(config) => pcie_link_control(config)? & PCI_EXP_LNKCTL_ASPMC,
+        None => 0,
+    };
+    Ok(endpoint != 0 || parent != 0)
 }
