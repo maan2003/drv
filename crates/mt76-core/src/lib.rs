@@ -11,13 +11,28 @@
 //! - `drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c` and
 //!   `mt76_connac_mcu.h`: Connac firmware/patch image formats and common
 //!   download-mode bit derivation.
+//! - `drivers/net/wireless/mediatek/mt76/mmio.c`: common RMW value semantics.
+//! - `drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h`: Connac2 GROUP1
+//!   packet-number byte order.
 //!
 //! Chip register maps, firmware policy, NIC/channel state, and device
 //! sequencing deliberately remain in the consuming device crate.
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
+
+/// Value produced by Linux `mt76_mmio_rmw`: one read, this calculation, then
+/// one `writel`. The helper deliberately does not invent readback semantics.
+pub const fn mt76_mmio_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
+    value | (initial & !mask)
+}
+
+/// Decode the CCMP PN from Connac2 RX GROUP1 in Linux byte order.
+pub fn connac2_group1_pn(group1: &[u8]) -> Result<[u8; 6], String> {
+    let pn = group1.get(..6).ok_or("Connac2 GROUP1 omitted CCMP PN")?;
+    Ok([pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]])
+}
 
 /// Size of `struct mt76_desc` from Linux `mt76/dma.h`.
 pub const DMA_DESCRIPTOR_LEN: usize = 16;
@@ -655,6 +670,90 @@ pub fn mt76_pci_aspm_supported(
         None => 0,
     };
     Ok(endpoint != 0 || parent != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_bytes_match_mt76_dma_layout() {
+        let descriptor = DmaDescriptor::tx(
+            DmaSegment {
+                iova: 0x1234_5000,
+                len: 64,
+            },
+            Some(DmaSegment {
+                iova: 0x2345_6000,
+                len: 32,
+            }),
+            0xa5a5_5a5a,
+        )
+        .unwrap();
+        assert_eq!(descriptor.buf0, 0x1234_5000);
+        assert_eq!(descriptor.buf1, 0x2345_6000);
+        assert_eq!(descriptor.ctrl, (64 << 16) | 32 | (1 << 14));
+        assert_eq!(
+            &descriptor.to_le_bytes()[12..],
+            &0xa5a5_5a5au32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn descriptor_constraints_fail_before_truncation() {
+        assert_eq!(
+            DmaDescriptor::rx(DmaSegment {
+                iova: 1u64 << 32,
+                len: 1,
+            }),
+            Err(DescriptorError::IovaAbove32Bits)
+        );
+        assert_eq!(
+            DmaDescriptor::rx(DmaSegment {
+                iova: 0,
+                len: 0x4000,
+            }),
+            Err(DescriptorError::SegmentTooLong)
+        );
+    }
+
+    #[test]
+    fn connac_download_modes_preserve_linux_bits() {
+        assert_eq!(firmware_download_mode(0, false), DL_MODE_NEED_RESPONSE);
+        assert_eq!(
+            patch_download_mode(1 << 24),
+            Ok(DL_MODE_NEED_RESPONSE | DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV)
+        );
+        assert_eq!(
+            patch_download_mode(3 << 24),
+            Err(PatchSecurityError::UnsupportedEncryptionType(3))
+        );
+    }
+
+    #[test]
+    fn pcie_link_control_walks_standard_capability_list() {
+        let mut config = [0u8; 256];
+        config[PCI_STATUS..PCI_STATUS + 2].copy_from_slice(&PCI_STATUS_CAP_LIST.to_le_bytes());
+        config[PCI_CAPABILITY_LIST] = 0x40;
+        config[0x40 + 1] = 0x60;
+        config[0x60] = PCI_CAP_ID_EXP;
+        config[0x60 + PCI_EXP_LNKCTL..0x60 + PCI_EXP_LNKCTL + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(pcie_link_control(&config), Ok(1));
+        assert_eq!(mt76_pci_aspm_supported(&config, None), Ok(true));
+    }
+
+    #[test]
+    fn shared_mmio_and_group1_helpers_are_source_exact() {
+        assert_eq!(
+            mt76_mmio_rmw_value(0x1234_5678, 0x00ff_0000, 0x005a_0000),
+            0x125a_5678
+        );
+        assert_eq!(
+            connac2_group1_pn(&[6, 5, 4, 3, 2, 1]),
+            Ok([1, 2, 3, 4, 5, 6])
+        );
+    }
 }
 
 pub const CONNAC2_MCU_TXD_BYTES: usize = 64;

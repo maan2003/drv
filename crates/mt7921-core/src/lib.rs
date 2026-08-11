@@ -2910,7 +2910,7 @@ pub fn validate_passive_mac_bar_read(
 /// then one `writel`. Linux returns the calculated value and does not require
 /// an immediate hardware readback to match it.
 pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
-    value | (initial & !mask)
+    mt76_mmio_rmw_value(initial, mask, value)
 }
 
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
@@ -5446,11 +5446,6 @@ pub struct ClientRxCandidate {
     pub mic_error: bool,
     pub fcs_error: bool,
     pub pn: [u8; 6],
-}
-
-pub fn connac2_group1_pn(group1: &[u8]) -> Result<[u8; 6], String> {
-    let pn = group1.get(..6).ok_or("Connac2 GROUP1 omitted CCMP PN")?;
-    Ok([pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]])
 }
 
 pub fn encode_client_data_txwi(
