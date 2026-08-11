@@ -1369,7 +1369,11 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
 struct SaeCommittedSelfTestMechanics {
     rx: VecDeque<ClientRxFrame>,
     status77: Option<ClientRxFrame>,
-    tx: Arc<Mutex<Vec<Vec<u8>>>>,
+    tx: Arc<Mutex<Vec<(Vec<u8>, u16, u8)>>>,
+    outstanding: MgmtTxOutstanding,
+    ring_cidx: u32,
+    ring_didx: u32,
+    descriptor_done: bool,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -1400,8 +1404,28 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         bytes: &[u8],
         _: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
-        self.tx.lock().unwrap().push(bytes.to_vec());
-        println!("self_test_management_tx outcome=committed");
+        if !self.outstanding.is_empty() {
+            println!("self_test_management_tx outcome=blocked reason=completion_outstanding");
+            return Err(zx::Status::SHOULD_WAIT);
+        }
+        if self.ring_cidx != 0 || self.ring_didx != 0 {
+            if self.ring_cidx != 1 || self.ring_didx != 1 || !self.descriptor_done {
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            self.ring_cidx = 0;
+            self.ring_didx = 0;
+            self.descriptor_done = false;
+            println!("self_test_management_tx stage=ring_local_reset result=complete");
+        }
+        let (token, pid) = self
+            .outstanding
+            .reserve()
+            .map_err(|_| zx::Status::NO_RESOURCES)?;
+        self.ring_cidx = 1;
+        self.ring_didx = 1;
+        self.descriptor_done = true;
+        self.tx.lock().unwrap().push((bytes.to_vec(), token, pid));
+        println!("self_test_management_tx outcome=committed token={token} pid={pid}");
         if bytes.get(28..32) == Some(&[126, 0, 20, 0]) {
             if let Some(frame) = self.status77.take() {
                 self.rx.push_back(frame);
@@ -1410,7 +1434,35 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         Ok(())
     }
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        if let Some(entry) = self.outstanding.entries.first() {
+            let (token, pid) = (entry.token, entry.pid);
+            self.outstanding
+                .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid,
+                    acked: true,
+                }))
+                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            self.outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(19),
+                    token,
+                    dropped: false,
+                    attempts: 1,
+                }))
+                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            println!("self_test_management_tx completion=paired token={token} pid={pid}");
+        }
         Ok(self.rx.pop_front())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for SaeCommittedSelfTestMechanics {
+    fn drop(&mut self) {
+        if !self.outstanding.is_empty() {
+            println!("self_test_management_tx teardown=contained outstanding=true reuse=false");
+        }
     }
 }
 
@@ -1450,6 +1502,29 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         },
         security: None,
     };
+    let missing_tx = Arc::new(Mutex::new(Vec::new()));
+    let mut missing_completion = SaeCommittedSelfTestMechanics {
+        rx: VecDeque::new(),
+        status77: None,
+        tx: Arc::clone(&missing_tx),
+        outstanding: MgmtTxOutstanding::default(),
+        ring_cidx: 0,
+        ring_didx: 0,
+        descriptor_done: false,
+    };
+    let mut synthetic_group20 = vec![0; 32];
+    synthetic_group20[28..32].copy_from_slice(&[126, 0, 20, 0]);
+    missing_completion
+        .transmit_client(&synthetic_group20, fidl_softmac::WlanTxInfoFlags::empty())
+        .map_err(|e| format!("self-test missing-completion first commit: {e}"))?;
+    if missing_completion
+        .transmit_client(&synthetic_group20, fidl_softmac::WlanTxInfoFlags::empty())
+        != Err(zx::Status::SHOULD_WAIT)
+        || missing_tx.lock().unwrap().len() != 1
+    {
+        return Err("self-test missing completion did not block ring reuse".into());
+    }
+    drop(missing_completion);
     let capability = mt7921_port_spike::NicCapability {
         element_count: 2,
         mac_address: Some(client),
@@ -1472,6 +1547,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             rx: VecDeque::new(),
             status77: Some(status77),
             tx: Arc::clone(&tx),
+            outstanding: MgmtTxOutstanding::default(),
+            ring_cidx: 0,
+            ring_didx: 0,
+            descriptor_done: false,
         },
         capability,
     )
@@ -1590,13 +1669,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     let tx = tx.lock().unwrap();
     if tx.len() < 2
-        || tx[0].get(28..32) != Some(&[126, 0, 20, 0])
-        || tx[1].get(28..32) != Some(&[126, 0, 19, 0])
+        || tx[0].0.get(28..32) != Some(&[126, 0, 20, 0])
+        || tx[1].0.get(28..32) != Some(&[126, 0, 19, 0])
+        || tx[0].1 == tx[1].1
+        || tx[0].2 == tx[1].2
     {
         return Err("self-test did not preserve group20 commit through status77 fallback".into());
     }
     println!(
-        "self_test_result=pass post_request_state=authenticating timer=refreshed status77=accepted fallback_group=19"
+        "self_test_result=pass post_request_state=authenticating timer=refreshed status77=accepted fallback_group=19 identities=distinct missing_completion=blocked teardown=contained"
     );
     Ok(())
 }
@@ -6280,7 +6361,7 @@ const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32)
         0xd4640 => value == 0x0340_0004,
         0xd4644 => value == 0x0380_0004,
         0xd4600 => value == 0x0140_0004,
-        0xd4308 | 0xd4408 => value < 128,
+        0xd4308 | 0xd430c | 0xd4408 => value < 128,
         0xd4418 => value < 256,
         _ => false,
     }
@@ -8740,8 +8821,19 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if global & 1 == 0 {
             return Err("REBOOT REQUIRED: global WFDMA TX unexpectedly disabled".into());
         }
-        // MT_WFDMA0_RST_DTX_PTR bit 0 resets ring 0 without resetting the RX paths.
-        self.loader.mcu.wfdma.write_active_wfdma(0xd420c, 1)?;
+        let before_cidx = self.loader.mcu.wfdma.read(0xd4308)?;
+        let before_didx = self.loader.mcu.wfdma.read(0xd430c)?;
+        record_sae_stage(&format!(
+            "management_tx_pre_submit stage=ring_local_reset before_cidx={before_cidx} before_didx={before_didx}"
+        ));
+        // mt76_dma_queue_reset resets one queue by writing its CPU and DMA
+        // indices. MT_WFDMA0_RST_DTX_PTR is the all-rings reset used while
+        // enabling WFDMA and does not provide the ring-local transition we
+        // need here.
+        if before_cidx != 0 || before_didx != 0 {
+            self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 0)?;
+            self.loader.mcu.wfdma.write_active_wfdma(0xd430c, 0)?;
+        }
         let cidx = self.loader.mcu.wfdma.read(0xd4308)?;
         let didx = self.loader.mcu.wfdma.read(0xd430c)?;
         if cidx != 0 || didx != 0 {
@@ -8752,6 +8844,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if self.loader.mcu.wfdma.read(0xd4208)? & 1 == 0 {
             return Err("REBOOT REQUIRED: ring-0 reset disabled global WFDMA TX".into());
         }
+        record_sae_stage("management_tx_pre_submit stage=global_tx result=enabled");
         record_sae_stage(&format!(
             "management_tx_ring_reclaimed cidx={cidx} didx={didx} global_tx_enabled=true uni_poisoned={}",
             self.loader.uni_terminal_poisoned
@@ -8760,6 +8853,21 @@ impl VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn configure_mgmt_tx_ring_for_submission(&mut self, ring: &DmaArena) -> Result<(), String> {
+        let cidx = self.loader.mcu.wfdma.read(0xd4308)?;
+        let didx = self.loader.mcu.wfdma.read(0xd430c)?;
+        let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
+        let outstanding = !self.mgmt_tx_outstanding.is_empty();
+        record_sae_stage(&format!(
+            "management_tx_pre_submit stage=ownership cidx={cidx} didx={didx} dma_done={descriptor_done} outstanding={outstanding}"
+        ));
+        if outstanding {
+            return Err("management TX completion is still outstanding; ring reuse blocked".into());
+        }
+        if (cidx != 0 || didx != 0) && (cidx != 1 || didx != 1 || !descriptor_done) {
+            return Err(format!(
+                "management TX ring is not safely reclaimable: cidx={cidx} didx={didx} dma_done={descriptor_done}"
+            ));
+        }
         self.reset_consumed_mgmt_tx_ring()?;
         self.loader
             .mcu
@@ -8783,6 +8891,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 ));
             }
         }
+        record_sae_stage("management_tx_pre_submit stage=configuration result=complete");
         Ok(())
     }
 
@@ -8794,7 +8903,19 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         frame: &[u8],
     ) -> Result<(), String> {
         self.retire_mgmt_tx_completions()?;
+        record_sae_stage(&format!(
+            "management_tx_pre_submit stage=completion_check result={}",
+            if self.mgmt_tx_outstanding.is_empty() {
+                "retired"
+            } else {
+                "blocked"
+            }
+        ));
+        if !self.mgmt_tx_outstanding.is_empty() {
+            return Err("management TX completion is still outstanding; ring reuse blocked".into());
+        }
         let (token, pid) = self.mgmt_tx_outstanding.reserve()?;
+        record_sae_stage("management_tx_pre_submit stage=identity result=allocated");
         if let Err(error) = self.configure_mgmt_tx_ring_for_submission(ring) {
             self.mgmt_tx_outstanding.abandon_last(token, pid);
             self.loader.uni_terminal_poisoned = true;
@@ -8802,6 +8923,13 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 "REBOOT REQUIRED: management ring configuration failed; MCU TX blocked until universal containment: {error}"
             ));
         }
+        ring.write_descriptor_at(0, DmaDescriptor::reset());
+        txwi.zero_bytes(PAGE)
+            .map_err(|error| format!("REBOOT REQUIRED: pre-submit TXWI wipe failed: {error}"))?;
+        frame_arena
+            .zero_bytes(PAGE)
+            .map_err(|error| format!("REBOOT REQUIRED: pre-submit frame wipe failed: {error}"))?;
+        record_sae_stage("management_tx_pre_submit stage=buffer_wipe result=complete");
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut outcome = MgmtTxPublicationOutcome::NotPublished;
         let result = (|| -> Result<(), String> {
@@ -8982,8 +9110,27 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::INVALID_ARGS);
         }
-        self.transmit_owned_client_frame(bytes)
-            .map_err(|_| zx::Status::IO)
+        self.transmit_owned_client_frame(bytes).map_err(|error| {
+            let category = if error.contains("completion is still outstanding") {
+                "completion_outstanding"
+            } else if error.contains("not safely reclaimable") {
+                "ownership_not_reclaimable"
+            } else if error.contains("ring-0 indices") {
+                "index_verify"
+            } else if error.contains("global WFDMA TX") {
+                "global_tx_disabled"
+            } else if error.contains("wipe") {
+                "buffer_wipe"
+            } else if error.contains("configuration") || error.contains("readback") {
+                "ring_configuration"
+            } else {
+                "pre_submit_io"
+            };
+            record_sae_stage(&format!(
+                "management_tx_pre_submit result=error category={category}"
+            ));
+            zx::Status::IO
+        })
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
@@ -15803,7 +15950,9 @@ mod tests {
             .split("fn configure_mgmt_tx_ring_for_submission(")
             .next()
             .unwrap();
-        assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
+        assert!(reset.contains("write_active_wfdma(0xd4308, 0)"));
+        assert!(reset.contains("write_active_wfdma(0xd430c, 0)"));
+        assert!(!reset.contains("write_active_wfdma(0xd420c"));
         assert!(reset.contains("read(0xd4308)"));
         assert!(reset.contains("read(0xd430c)"));
         assert!(reset.contains("management_tx_ring_reclaimed"));
