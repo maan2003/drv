@@ -632,7 +632,6 @@ name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "eapol",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
@@ -1074,6 +1073,7 @@ dependencies = [
  "mt7921-port-spike",
  "mt7921-softmac-adapter",
  "num-bigint",
+ "userspace-vfio",
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
@@ -1083,6 +1083,9 @@ dependencies = [
 [[package]]
 name = "mt7921-port-spike"
 version = "0.1.0"
+dependencies = [
+ "userspace-vfio",
+]
 
 [[package]]
 name = "mt7921-softmac-adapter"
@@ -2223,6 +2226,10 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "userspace-vfio"
+version = "0.1.0"
 
 [[package]]
 name = "utf8_iter"

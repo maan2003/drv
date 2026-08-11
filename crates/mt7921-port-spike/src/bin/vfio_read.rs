@@ -86,6 +86,7 @@ use std::{
     },
     time::Instant,
 };
+use userspace_vfio::{Ioas, RegionInfo, VfioIrq};
 #[cfg(feature = "fuchsia-passive")]
 use wlan_mlme::device::DeviceOps;
 
@@ -174,16 +175,6 @@ struct Detach {
     argsz: u32,
     flags: u32,
     pasid: u32,
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RegionInfo {
-    argsz: u32,
-    flags: u32,
-    index: u32,
-    cap_offset: u32,
-    size: u64,
-    offset: u64,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -758,7 +749,7 @@ fn run_contained_dma_resource_round_trip(
             capsule.active.as_mut().expect("active owner installed"),
             &capsule.device,
             &capsule.iommu,
-            capsule.ioas.as_ref().expect("IOAS acquired").id,
+            capsule.ioas.as_ref().expect("IOAS acquired").id(),
             info,
             operation,
             &mut capsule.acquisition,
@@ -859,7 +850,7 @@ fn run_contained_dma_resource_round_trip(
             .as_mut()
             .expect("guarded gate has containment ledger")
             .mark_possibly_active(Hazard::DeviceIrq);
-        active.irq = Some(VfioIrq::install(&capsule.device, selected_irq)?);
+        active.irq = Some(install_vfio_irq(&capsule.device, selected_irq)?);
         if active
             .irq
             .as_ref()
@@ -1631,15 +1622,11 @@ fn run() -> Result<(), String> {
         if operation.records_active_transport_stages() {
             record_sae_stage("ioas_allocate_after");
         }
-        capsule.ioas = Some(Ioas {
-            fd: Arc::clone(&capsule.iommu),
-            id: alloc.out_ioas_id,
-            destroyed: false,
-        });
+        capsule.ioas = Some(Ioas::from_allocated(&capsule.iommu, alloc.out_ioas_id));
         capsule.acquisition.record(AcquisitionIntent::AttachIoas)?;
         let mut attach = Attach {
             argsz: size::<Attach>(),
-            pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id,
+            pt_id: capsule.ioas.as_ref().expect("IOAS acquired").id(),
             ..Default::default()
         };
         if let Some(ledger) = capsule.containment.as_mut() {
@@ -2467,7 +2454,7 @@ fn run() -> Result<(), String> {
             let lifecycle = IrqLifecycle::Uninstalled
                 .install(selected)
                 .map_err(|error| format!("install IRQ lifecycle: {error:?}"))?;
-            let mut irq = VfioIrq::install(&device, selected)?;
+            let mut irq = install_vfio_irq(&device, selected)?;
             println!("{{\"vfio_irq_event\":\"eventfd_installed\"}}");
             if irq.try_read()?.is_some() {
                 return Err("unexpected IRQ before device source enable".into());
@@ -2573,7 +2560,7 @@ fn run() -> Result<(), String> {
         }
     }
     if operation == Operation::ProgramDisabledFwdlRing {
-        let mut arena = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
+        let mut arena = DmaArena::map(&iommu, ioas.id(), 0x0100_0000)?;
         arena.initialize_fwdl_descriptors()?;
         println!(
             "{{\"fwdl_ring_event\":\"arena_initialized\",\"iova\":\"{:#010x}\",\"mapped_bytes\":{},\"descriptor_bytes\":{}}}",
@@ -2646,8 +2633,8 @@ fn run() -> Result<(), String> {
             .payload
             .get(..MT7921_FWDL_CHUNK_BYTES)
             .ok_or("patch section is smaller than one firmware chunk")?;
-        let mut ring = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
-        let mut payload = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
+        let mut ring = DmaArena::map(&iommu, ioas.id(), 0x0100_0000)?;
+        let mut payload = DmaArena::map(&iommu, ioas.id(), 0x0100_1000)?;
         ring.write_descriptor(DmaDescriptor::reset());
         let payload_iova = payload.iova;
         let stage = {
@@ -2701,9 +2688,9 @@ fn run() -> Result<(), String> {
                 "PCIe MAC interrupt gate did not clear from {mac_irq:#010x}"
             ));
         }
-        let mut guard = DmaArena::map(&iommu, ioas.id, 0x0100_0000)?;
-        let mut fwdl = DmaArena::map(&iommu, ioas.id, 0x0100_1000)?;
-        let mut mcu = DmaArena::map(&iommu, ioas.id, 0x0100_2000)?;
+        let mut guard = DmaArena::map(&iommu, ioas.id(), 0x0100_0000)?;
+        let mut fwdl = DmaArena::map(&iommu, ioas.id(), 0x0100_1000)?;
+        let mut mcu = DmaArena::map(&iommu, ioas.id(), 0x0100_2000)?;
         guard.initialize_descriptor_page()?;
         fwdl.initialize_descriptor_page()?;
         mcu.initialize_descriptor_page()?;
@@ -2799,7 +2786,7 @@ fn run() -> Result<(), String> {
             capsule.active.as_mut().expect("active slots installed"),
             &capsule.device,
             &capsule.iommu,
-            capsule.ioas.as_ref().expect("IOAS acquired").id,
+            capsule.ioas.as_ref().expect("IOAS acquired").id(),
             &info,
             operation,
             acquisition_ledger,
@@ -2978,7 +2965,7 @@ fn run() -> Result<(), String> {
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::DeviceIrq);
             acquisition_ledger.record(AcquisitionIntent::InstallIrq)?;
-            *irq = Some(VfioIrq::install(&device, selected)?);
+            *irq = Some(install_vfio_irq(&device, selected)?);
             if irq.as_ref().expect("IRQ installed").try_read()?.is_some() {
                 return Err("unexpected IRQ before device source enable".into());
             }
@@ -3568,7 +3555,7 @@ fn run() -> Result<(), String> {
                                             )?;
                                             acquire_sae_tx_resources(
                                                 iommu,
-                                                ioas.id,
+                                                ioas.id(),
                                                 mechanics.mgmt_txwi,
                                                 mechanics.mgmt_frame,
                                                 mechanics.mgmt_tx_ring,
@@ -4482,13 +4469,7 @@ fn publish_mcu_bytes(
     if payload_offset + bytes.len() > payload.len {
         return Err("MCU command payload arena exhausted".into());
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            payload.ptr.as_ptr().add(payload_offset),
-            bytes.len(),
-        )
-    };
+    payload.write_bytes_at(payload_offset, bytes)?;
     let descriptor = DmaDescriptor::tx(
         DmaSegment {
             iova: payload.iova + payload_offset as u64,
@@ -9178,98 +9159,43 @@ fn verify_no_usable_mt792x_acpi_sar() -> Result<(), String> {
     Ok(())
 }
 
-struct Ioas {
-    fd: Arc<File>,
-    id: u32,
-    destroyed: bool,
-}
-
 struct DmaArena {
-    iommu: Arc<File>,
-    ioas: u32,
-    ptr: NonNull<u8>,
+    mapping: Option<userspace_vfio::DmaMapping>,
+    #[cfg(test)]
+    ptr: Option<NonNull<u8>>,
     len: usize,
     iova: u64,
-    mapped: bool,
 }
 impl DmaArena {
     fn map(iommu: &Arc<File>, ioas: u32, iova: u64) -> Result<Self, String> {
         Self::map_len(iommu, ioas, iova, PAGE)
     }
     fn map_len(iommu: &Arc<File>, ioas: u32, iova: u64, len: usize) -> Result<Self, String> {
-        if len == 0 || !len.is_multiple_of(PAGE) || !iova.is_multiple_of(PAGE as u64) {
-            return Err("DMA arena length and IOVA must be page aligned".into());
-        }
-        let ptr = NonNull::new(unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        })
-        .filter(|pointer| pointer.as_ptr() as isize != -1)
-        .ok_or_else(|| format!("allocate DMA arena: {}", std::io::Error::last_os_error()))?;
-        let mut map = IoasMap {
-            size: size::<IoasMap>(),
-            flags: IOMMU_MAP_FIXED | IOMMU_MAP_READABLE | IOMMU_MAP_WRITEABLE,
-            ioas_id: ioas,
-            user_va: ptr.as_ptr() as u64,
-            length: len as u64,
-            iova,
-            ..Default::default()
-        };
-        if let Err(error) = ioctl_mut(iommu.as_raw_fd(), IOMMU_IOAS_MAP, &mut map, "map DMA arena")
-        {
-            unsafe { munmap(ptr.as_ptr(), len) };
-            return Err(error);
-        }
-        if map.iova != iova || map.iova + len as u64 - 1 > u64::from(u32::MAX) {
-            let mut unmap = IoasUnmap {
-                size: size::<IoasUnmap>(),
-                ioas_id: ioas,
-                iova: map.iova,
-                length: len as u64,
-            };
-            let _ = ioctl_mut(
-                iommu.as_raw_fd(),
-                IOMMU_IOAS_UNMAP,
-                &mut unmap,
-                "unmap invalid arena",
-            );
-            unsafe { munmap(ptr.as_ptr(), len) };
-            return Err("iommufd did not honor low-32-bit fixed IOVA".into());
-        }
         Ok(Self {
-            iommu: Arc::clone(iommu),
-            ioas,
-            ptr,
+            mapping: Some(userspace_vfio::DmaMapping::map(
+                iommu, ioas, iova, len, PAGE,
+            )?),
+            #[cfg(test)]
+            ptr: None,
             len,
             iova,
-            mapped: true,
         })
     }
     fn initialize_fwdl_descriptors(&mut self) -> Result<(), String> {
         if MT7921_FWDL_RING_BYTES > self.len {
             return Err("firmware ring exceeds DMA arena".into());
         }
-        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        self.zero(0, self.len)?;
         for offset in (0..MT7921_FWDL_RING_BYTES).step_by(16) {
-            unsafe {
-                std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
-            };
+            self.write_word(offset + 4, 1 << 31)?;
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
     }
     fn initialize_descriptor_page(&mut self) -> Result<(), String> {
-        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len) };
+        self.zero(0, self.len)?;
         for offset in (0..self.len).step_by(16) {
-            unsafe {
-                std::ptr::write_volatile(self.ptr.as_ptr().add(offset + 4).cast::<u32>(), 1 << 31)
-            };
+            self.write_word(offset + 4, 1 << 31)?;
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         Ok(())
@@ -9284,31 +9210,45 @@ impl DmaArena {
         {
             return Err("DMA payload exceeds arena".into());
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.ptr.as_ptr().add(offset),
-                bytes.len(),
-            )
-        };
-        Ok(())
+        if let Some(mapping) = self.mapping.as_mut() {
+            mapping.write(offset, bytes)
+        } else {
+            #[cfg(test)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.ptr.unwrap().as_ptr().add(offset),
+                    bytes.len(),
+                );
+                Ok(())
+            }
+            #[cfg(not(test))]
+            unreachable!()
+        }
     }
     fn zero_bytes(&mut self, length: usize) -> Result<(), String> {
         if length > self.len {
             return Err("DMA zero exceeds arena".into());
         }
-        unsafe { std::ptr::write_bytes(self.ptr.as_ptr(), 0, length) };
-        Ok(())
+        self.zero(0, length)
     }
     fn secure_zero_bytes(&mut self, length: usize) -> Result<(), String> {
         if length > self.len {
             return Err("DMA secure zero exceeds arena".into());
         }
-        for offset in 0..length {
-            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(offset), 0) };
+        if let Some(mapping) = self.mapping.as_mut() {
+            mapping.secure_zero(length)
+        } else {
+            #[cfg(test)]
+            {
+                for offset in 0..length {
+                    unsafe { std::ptr::write_volatile(self.ptr.unwrap().as_ptr().add(offset), 0) }
+                }
+                Ok(())
+            }
+            #[cfg(not(test))]
+            unreachable!()
         }
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        Ok(())
     }
     fn write_descriptor(&mut self, descriptor: DmaDescriptor) {
         self.write_descriptor_at(0, descriptor)
@@ -9325,12 +9265,7 @@ impl DmaArena {
         .into_iter()
         .enumerate()
         {
-            unsafe {
-                std::ptr::write_volatile(
-                    self.ptr.as_ptr().add(offset).cast::<u32>().add(index),
-                    word,
-                )
-            };
+            self.write_word(offset + index * 4, word).unwrap();
         }
     }
     fn read_descriptor(&self) -> DmaDescriptor {
@@ -9339,9 +9274,7 @@ impl DmaArena {
     fn read_descriptor_at(&self, descriptor_index: usize) -> DmaDescriptor {
         let offset = descriptor_index * 16;
         assert!(offset + 16 <= self.len);
-        let word = |index| unsafe {
-            std::ptr::read_volatile(self.ptr.as_ptr().add(offset).cast::<u32>().add(index))
-        };
+        let word = |index: usize| self.read_word(offset + index * 4).unwrap();
         DmaDescriptor {
             buf0: word(0),
             ctrl: word(1),
@@ -9354,41 +9287,78 @@ impl DmaArena {
             .checked_add(length)
             .filter(|end| *end <= self.len)
             .ok_or("DMA read escaped arena")?;
-        let mut bytes = vec![0; length];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.as_ptr().add(offset),
-                bytes.as_mut_ptr(),
-                end - offset,
-            )
-        };
-        Ok(bytes)
+        if let Some(mapping) = self.mapping.as_ref() {
+            mapping.read(offset, end - offset)
+        } else {
+            #[cfg(test)]
+            {
+                let mut bytes = vec![0; end - offset];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.ptr.unwrap().as_ptr().add(offset),
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                    );
+                }
+                Ok(bytes)
+            }
+            #[cfg(not(test))]
+            unreachable!()
+        }
     }
     fn teardown(&mut self) -> Result<(), String> {
-        if !self.mapped {
-            return Ok(());
+        self.mapping
+            .as_mut()
+            .map_or(Ok(()), userspace_vfio::DmaMapping::teardown)
+    }
+
+    fn write_word(&mut self, offset: usize, value: u32) -> Result<(), String> {
+        if let Some(mapping) = self.mapping.as_mut() {
+            mapping.write_u32(offset, value)
+        } else {
+            #[cfg(test)]
+            {
+                unsafe {
+                    std::ptr::write_volatile(
+                        self.ptr.unwrap().as_ptr().add(offset).cast::<u32>(),
+                        value,
+                    )
+                };
+                Ok(())
+            }
+            #[cfg(not(test))]
+            unreachable!()
         }
-        let mut unmap = IoasUnmap {
-            size: size::<IoasUnmap>(),
-            ioas_id: self.ioas,
-            iova: self.iova,
-            length: self.len as u64,
-        };
-        ioctl_mut(
-            self.iommu.as_raw_fd(),
-            IOMMU_IOAS_UNMAP,
-            &mut unmap,
-            "unmap DMA arena",
-        )?;
-        if unmap.length != self.len as u64 {
-            return Err(format!(
-                "iommufd unmapped {} of {} bytes",
-                unmap.length, self.len
-            ));
+    }
+    fn read_word(&self, offset: usize) -> Result<u32, String> {
+        if let Some(mapping) = self.mapping.as_ref() {
+            mapping.read_u32(offset)
+        } else {
+            #[cfg(test)]
+            {
+                Ok(unsafe {
+                    std::ptr::read_volatile(self.ptr.unwrap().as_ptr().add(offset).cast::<u32>())
+                })
+            }
+            #[cfg(not(test))]
+            unreachable!()
         }
-        self.mapped = false;
-        unsafe { munmap(self.ptr.as_ptr(), self.len) };
-        Ok(())
+    }
+    fn zero(&mut self, offset: usize, length: usize) -> Result<(), String> {
+        if offset != 0 {
+            return self.write_bytes_at(offset, &vec![0; length]);
+        }
+        if let Some(mapping) = self.mapping.as_mut() {
+            mapping.zero(length)
+        } else {
+            #[cfg(test)]
+            {
+                unsafe { std::ptr::write_bytes(self.ptr.unwrap().as_ptr(), 0, length) };
+                Ok(())
+            }
+            #[cfg(not(test))]
+            unreachable!()
+        }
     }
 }
 
@@ -9424,151 +9394,35 @@ impl Drop for DmaArena {
         let _ = self.teardown();
     }
 }
-impl Drop for Ioas {
-    fn drop(&mut self) {
-        let _ = self.teardown();
-    }
-}
-
-impl Ioas {
-    fn teardown(&mut self) -> Result<(), String> {
-        if self.destroyed {
-            return Ok(());
-        }
-        let mut destroy = Destroy {
-            size: size::<Destroy>(),
-            id: self.id,
-        };
-        ioctl_mut(
-            self.fd.as_raw_fd(),
-            IOMMU_DESTROY,
-            &mut destroy,
-            "destroy IOAS",
-        )?;
-        self.destroyed = true;
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-struct VfioIrq {
-    device: Arc<File>,
-    event_fd: OwnedFd,
-    index: u32,
-    installed: bool,
-}
-#[allow(dead_code)]
-impl VfioIrq {
-    fn install(device: &Arc<File>, capability: PciIrqCapability) -> Result<Self, String> {
-        if capability.count == 0 || !capability.eventfd {
-            return Err("refused non-eventfd VFIO interrupt".into());
-        }
-        let index = match capability.kind {
-            PciIrqKind::Intx => 0,
-            PciIrqKind::Msi => 1,
-            PciIrqKind::Msix => 2,
-        };
-        let event_fd_raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-        if event_fd_raw < 0 {
-            return Err(format!(
-                "create IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let event_fd = unsafe { OwnedFd::from_raw_fd(event_fd_raw) };
-        let mut set = IrqSetEventfd {
-            header: IrqSetHeader {
-                argsz: size::<IrqSetEventfd>(),
-                flags: VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
-                index,
-                start: 0,
-                count: 1,
-            },
-            eventfd: event_fd.as_raw_fd(),
-        };
-        ioctl_mut(
-            device.as_raw_fd(),
-            VFIO_DEVICE_SET_IRQS,
-            &mut set,
-            "install VFIO IRQ eventfd",
-        )?;
-        Ok(Self {
-            device: Arc::clone(device),
-            event_fd,
-            index,
-            installed: true,
-        })
-    }
-    fn try_read(&self) -> Result<Option<u64>, String> {
-        let mut counter = 0u64;
-        let result = unsafe {
-            read(
-                self.event_fd.as_raw_fd(),
-                (&mut counter as *mut u64).cast::<u8>(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if result == std::mem::size_of::<u64>() as isize {
-            Ok(Some(counter))
-        } else if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
-            Ok(None)
-        } else {
-            Err(format!(
-                "read IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ))
-        }
-    }
-    fn disable(&mut self) -> Result<(), String> {
-        if !self.installed {
-            return Ok(());
-        }
-        let mut set = IrqSetHeader {
-            argsz: size::<IrqSetHeader>(),
-            flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
-            index: self.index,
-            start: 0,
-            count: 0,
-        };
-        ioctl_mut(
-            self.device.as_raw_fd(),
-            VFIO_DEVICE_SET_IRQS,
-            &mut set,
-            "disable VFIO IRQ eventfd",
-        )?;
-        self.installed = false;
-        Ok(())
-    }
-}
-impl Drop for VfioIrq {
-    fn drop(&mut self) {
-        let _ = self.disable();
-    }
-}
-
 fn disable_vfio_irq_index(device: &File, capability: PciIrqCapability) -> Result<(), String> {
     let index = match capability.kind {
         PciIrqKind::Intx => 0,
         PciIrqKind::Msi => 1,
         PciIrqKind::Msix => 2,
     };
-    let mut set = IrqSetHeader {
-        argsz: size::<IrqSetHeader>(),
-        flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
-        index,
-        start: 0,
-        count: 0,
+    userspace_vfio::disable_irq(device, index)
+}
+
+fn install_vfio_irq(device: &Arc<File>, capability: PciIrqCapability) -> Result<VfioIrq, String> {
+    let index = match capability.kind {
+        PciIrqKind::Intx => 0,
+        PciIrqKind::Msi => 1,
+        PciIrqKind::Msix => 2,
     };
-    ioctl_mut(
-        device.as_raw_fd(),
-        VFIO_DEVICE_SET_IRQS,
-        &mut set,
-        "explicitly disable VFIO IRQ index",
+    VfioIrq::install(
+        device,
+        userspace_vfio::IrqCapability {
+            index,
+            count: capability.count,
+            eventfd: capability.eventfd,
+        },
     )
 }
 
 struct ReadPage {
-    ptr: NonNull<u8>,
+    mapping: Option<userspace_vfio::RegionMapping>,
+    #[cfg(test)]
+    ptr: Option<NonNull<u8>>,
     bar_page: usize,
     active_rx_irq_mask: Cell<u32>,
     mapped: bool,
@@ -9584,25 +9438,12 @@ impl ReadPage {
             return Err("allowlisted BAR page is outside BAR 0".into());
         }
         validate_region_mapping(region, writable)?;
-        let ptr = NonNull::new(unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                PAGE,
-                PROT_READ | if writable { PROT_WRITE } else { 0 },
-                MAP_SHARED,
-                device.as_raw_fd(),
-                (region.offset + bar_page as u64) as i64,
-            )
-        })
-        .filter(|pointer| pointer.as_ptr() as isize != -1)
-        .ok_or_else(|| {
-            format!(
-                "map BAR page {bar_page:#x}: {}",
-                std::io::Error::last_os_error()
-            )
-        })?;
         Ok(Self {
-            ptr,
+            mapping: Some(userspace_vfio::RegionMapping::map(
+                device, region, bar_page, PAGE, writable,
+            )?),
+            #[cfg(test)]
+            ptr: None,
             bar_page,
             active_rx_irq_mask: Cell::new(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT),
             mapped: true,
@@ -9615,7 +9456,36 @@ impl ReadPage {
         if within % 4 != 0 || within + 4 > PAGE {
             return Err("register outside mapped page".into());
         }
-        Ok(unsafe { std::ptr::read_volatile(self.ptr.as_ptr().add(within).cast::<u32>()) })
+        if let Some(mapping) = self.mapping.as_ref() {
+            mapping.read_u32(within)
+        } else {
+            #[cfg(test)]
+            {
+                Ok(unsafe {
+                    std::ptr::read_volatile(self.ptr.unwrap().as_ptr().add(within).cast::<u32>())
+                })
+            }
+            #[cfg(not(test))]
+            unreachable!()
+        }
+    }
+    fn write_within(&self, within: usize, value: u32) -> Result<(), String> {
+        if let Some(mapping) = self.mapping.as_ref() {
+            mapping.write_u32(within, value)
+        } else {
+            #[cfg(test)]
+            {
+                unsafe {
+                    std::ptr::write_volatile(
+                        self.ptr.unwrap().as_ptr().add(within).cast::<u32>(),
+                        value,
+                    )
+                };
+                Ok(())
+            }
+            #[cfg(not(test))]
+            unreachable!()
+        }
     }
     fn write_clear_own(&self) -> Result<(), String> {
         let offset = ReadRegister::ConnOnLowPowerControl.bar_offset();
@@ -9623,12 +9493,7 @@ impl ReadPage {
         if self.bar_page != 0xe0000 || within + 4 > PAGE {
             return Err("CLR_OWN write escaped immutable allowlist".into());
         }
-        unsafe {
-            std::ptr::write_volatile(
-                self.ptr.as_ptr().add(within).cast::<u32>(),
-                PCIE_LPCR_HOST_CLR_OWN,
-            )
-        };
+        self.write_within(within, PCIE_LPCR_HOST_CLR_OWN)?;
         Ok(())
     }
     fn write_set_own(&self) -> Result<(), String> {
@@ -9637,12 +9502,7 @@ impl ReadPage {
         if self.bar_page != 0xe0000 || within + 4 > PAGE {
             return Err("SET_OWN write escaped immutable allowlist".into());
         }
-        unsafe {
-            std::ptr::write_volatile(
-                self.ptr.as_ptr().add(within).cast::<u32>(),
-                PCIE_LPCR_HOST_SET_OWN,
-            )
-        };
+        self.write_within(within, PCIE_LPCR_HOST_SET_OWN)?;
         Ok(())
     }
     fn write_remap_selector(&self, value: u32) -> Result<(), String> {
@@ -9650,7 +9510,7 @@ impl ReadPage {
         if self.bar_page != 0xfe000 || within + 4 > PAGE {
             return Err("remap selector write escaped immutable allowlist".into());
         }
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_top_driver_own(&self) -> Result<(), String> {
@@ -9659,12 +9519,7 @@ impl ReadPage {
         if self.bar_page != MT_HIF_REMAP_WINDOW_BAR_OFFSET || within + 4 > PAGE {
             return Err("MT_TOP driver-own write escaped immutable allowlist".into());
         }
-        unsafe {
-            std::ptr::write_volatile(
-                self.ptr.as_ptr().add(within).cast::<u32>(),
-                MT_TOP_LPCR_HOST_DRV_OWN,
-            )
-        };
+        self.write_within(within, MT_TOP_LPCR_HOST_DRV_OWN)?;
         Ok(())
     }
     fn read_dynamic_window(&self, offset: usize) -> Result<u32, String> {
@@ -9683,7 +9538,7 @@ impl ReadPage {
             return Err("WFSYS reset write escaped immutable target".into());
         }
         let within = offset - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -9720,7 +9575,7 @@ impl ReadPage {
             ));
         }
         let within = offset - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_pcie_mac_interrupt_enable_zero(&self) -> Result<(), String> {
@@ -9740,7 +9595,7 @@ impl ReadPage {
             return Err("PCIe MAC interrupt write escaped immutable allowlist".into());
         }
         let within = 0x10188 - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn disable_pcie_l0s(&self) -> Result<(), String> {
@@ -9754,7 +9609,7 @@ impl ReadPage {
         }
         let value = raw | (1 << 8);
         let within = offset - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         if self.read(offset)? & (1 << 8) == 0 {
             return Err("PCIe L0s disable did not latch".into());
         }
@@ -9768,7 +9623,7 @@ impl ReadPage {
         if self.read(0x9f23c)? == u32::MAX {
             return Err("SWDEF mode returned all ones".into());
         }
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), 0) };
+        self.write_within(within, 0)?;
         if self.read(0x9f23c)? != 0 {
             return Err("SWDEF normal mode did not latch".into());
         }
@@ -9785,7 +9640,7 @@ impl ReadPage {
         }
         let value = raw | (1 << 28);
         let within = offset - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_fwdl_ring(&self, register: DisabledFwdlWrite, value: u32) -> Result<(), String> {
@@ -9798,7 +9653,7 @@ impl ReadPage {
         if self.bar_page != 0xd4000 || within + 4 > PAGE {
             return Err("firmware ring write escaped immutable allowlist".into());
         }
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_tx_ring_slot(
@@ -9816,7 +9671,7 @@ impl ReadPage {
             .enumerate()
         {
             let within = 0x300 + index * 0x10 + word * 4;
-            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+            self.write_within(within, value)?;
         }
         Ok(())
     }
@@ -9825,7 +9680,7 @@ impl ReadPage {
             return Err("DTX reset escaped all-rings-only allowlist".into());
         }
         let within = 0xd420c - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_fwdl_interrupt_enable(&self, value: u32) -> Result<(), String> {
@@ -9833,7 +9688,7 @@ impl ReadPage {
             return Err("interrupt-mask write escaped zero-only allowlist".into());
         }
         let within = 0xd4204 - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn acknowledge_fwdl_interrupt(&self, value: u32) -> Result<(), String> {
@@ -9841,7 +9696,7 @@ impl ReadPage {
             return Err("interrupt acknowledgement escaped FWDL-only allowlist".into());
         }
         let within = 0xd4200 - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     fn write_rx_ring_slot(
@@ -9860,7 +9715,7 @@ impl ReadPage {
             .enumerate()
         {
             let within = 0x500 + index * 0x10 + word * 4;
-            unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+            self.write_within(within, value)?;
         }
         Ok(())
     }
@@ -9869,7 +9724,7 @@ impl ReadPage {
             return Err("RX producer write escaped slot allowlist".into());
         }
         let within = 0x500 + index * 0x10 + 8;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -9906,7 +9761,7 @@ impl ReadPage {
             ));
         }
         let within = offset - self.bar_page;
-        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(within).cast::<u32>(), value) };
+        self.write_within(within, value)?;
         Ok(())
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -9948,13 +9803,9 @@ impl ReadPage {
         if !self.mapped {
             return Ok(());
         }
-        if unsafe { munmap(self.ptr.as_ptr(), PAGE) } != 0 {
-            return Err(format!(
-                "unmap BAR page {:#x}: {}",
-                self.bar_page,
-                std::io::Error::last_os_error()
-            ));
-        }
+        self.mapping
+            .as_mut()
+            .map_or(Ok(()), userspace_vfio::RegionMapping::teardown)?;
         self.mapped = false;
         Ok(())
     }
@@ -9978,52 +9829,22 @@ fn vfio_irq_capabilities(device: &File) -> Result<Vec<PciIrqCapability>, String>
         .into_iter()
         .enumerate()
     {
-        let mut irq = IrqInfo {
-            argsz: size::<IrqInfo>(),
-            index: index as u32,
-            ..Default::default()
-        };
-        ioctl_mut(
-            device.as_raw_fd(),
-            VFIO_DEVICE_GET_IRQ_INFO,
-            &mut irq,
-            "query VFIO IRQ",
-        )?;
+        let irq = userspace_vfio::irq_capability(device, index as u32)?;
         capabilities.push(PciIrqCapability {
             kind,
             count: irq.count,
-            eventfd: irq.flags & 1 != 0,
+            eventfd: irq.eventfd,
         });
     }
     Ok(capabilities)
 }
 
 fn verify_vfio_reset_supported(device: &File) -> Result<(), String> {
-    let mut info = DeviceInfo {
-        argsz: size::<DeviceInfo>(),
-        ..Default::default()
-    };
-    ioctl_mut(
-        device.as_raw_fd(),
-        VFIO_DEVICE_GET_INFO,
-        &mut info,
-        "query VFIO reset capability",
-    )?;
-    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
-        return Err("VFIO device does not advertise reset support".into());
-    }
-    Ok(())
+    userspace_vfio::reset_device_supported(device)
 }
 
 fn reset_vfio_device(device: &File) -> Result<(), String> {
-    verify_vfio_reset_supported(device)?;
-    if unsafe { ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET) } < 0 {
-        return Err(format!(
-            "VFIO device reset: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+    userspace_vfio::reset_device(device)
 }
 
 struct VfioOwnership<'a> {
@@ -10448,7 +10269,7 @@ impl WfsysResetTransport for VfioIrqResetBoundary<'_> {
 impl IrqResetTransport for VfioIrqResetBoundary<'_> {
     fn install_irq(&mut self, capability: PciIrqCapability) -> Result<(), Self::Error> {
         self.ledger.mark_possibly_active(Hazard::DeviceIrq);
-        self.irq = Some(VfioIrq::install(self.device, capability)?);
+        self.irq = Some(install_vfio_irq(self.device, capability)?);
         Ok(())
     }
     fn mask_host_irq(&mut self) -> Result<(), Self::Error> {
@@ -11355,12 +11176,10 @@ mod tests {
             .unwrap();
             unsafe { std::ptr::write_bytes(ptr.as_ptr(), fill, len) };
             DmaArena {
-                iommu: Arc::new(File::open("/dev/null").unwrap()),
-                ioas: 0,
-                ptr,
+                mapping: None,
+                ptr: Some(ptr),
                 len,
                 iova: 0,
-                mapped: false,
             }
         }
         let mut ring = arena(0x5a, PAGE);
@@ -11387,8 +11206,8 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         unsafe {
-            munmap(ring.ptr.as_ptr(), ring.len);
-            munmap(payload.ptr.as_ptr(), payload.len);
+            munmap(ring.ptr.unwrap().as_ptr(), ring.len);
+            munmap(payload.ptr.unwrap().as_ptr(), payload.len);
         }
     }
 
@@ -11947,7 +11766,7 @@ mod tests {
         let sanitize = boundary
             .find("write_active_wfdma(0xd4208, disabled)")
             .unwrap();
-        let irq = boundary.find("VfioIrq::install").unwrap();
+        let irq = boundary.find("install_vfio_irq").unwrap();
         let bme = boundary.find("set_pci_bus_master(bdf, true)").unwrap();
         let complete = boundary.find("vfio_wfdma_prep_complete").unwrap();
         let activation = boundary.find("vfio_wfdma_activation_begin").unwrap();
@@ -13340,19 +13159,18 @@ mod tests {
 
         fn dma(&self, iova: u64) -> DmaArena {
             DmaArena {
-                iommu: Arc::new(File::open("/dev/null").unwrap()),
-                ioas: 0,
-                ptr: self.ptr,
+                mapping: None,
+                ptr: Some(self.ptr),
                 len: self.len,
                 iova,
-                mapped: false,
             }
         }
 
         fn read_page(&self) -> ReadPage {
             assert_eq!(self.len, PAGE);
             ReadPage {
-                ptr: self.ptr,
+                mapping: None,
+                ptr: Some(self.ptr),
                 bar_page: 0xd4000,
                 active_rx_irq_mask: Cell::new(WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT),
                 mapped: false,
@@ -14808,11 +14626,7 @@ mod tests {
         let iommu = Arc::new(File::open("/dev/null").unwrap());
         let ledger = ContainmentLedger::acquire(Some(ArmedWatchdog { deadline: 200 })).unwrap();
         let mut capsule = ActiveVfioCapsule::new(device, Arc::clone(&iommu), Some(ledger));
-        capsule.ioas = Some(Ioas {
-            fd: iommu,
-            id: 1,
-            destroyed: false,
-        });
+        capsule.ioas = Some(Ioas::from_allocated(&iommu, 1));
         let error = (|| -> Result<(), String> {
             finish_owned_acquisition!(
                 &mut capsule,
