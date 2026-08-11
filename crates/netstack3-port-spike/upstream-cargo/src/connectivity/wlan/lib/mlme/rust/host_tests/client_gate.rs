@@ -469,7 +469,19 @@ fn sme_connect_drives_production_sae_tx_and_both_timer_seams() {
                 other => panic!("unexpected SAE request {}", other.name()),
             }
         }
-        assert!(effects.lock().unwrap().frames.iter().any(|(frame, _)| frame[0] == 0));
+        let association_request = effects
+            .lock()
+            .unwrap()
+            .frames
+            .iter()
+            .find(|(frame, _)| frame[0] == 0)
+            .map(|(frame, _)| frame.clone())
+            .expect("association request");
+        assert_eq!(
+            u16::from_le_bytes(association_request[24..26].try_into().unwrap()),
+            0x0011,
+            "WPA3 association must advertise ESS and Privacy only",
+        );
 
         mlme.handle_mac_frame_rx(&peer_assoc_success(), rx_info(), 2.into()).await;
         let connect_conf = effects.lock().unwrap().events.remove(0);

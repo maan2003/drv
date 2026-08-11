@@ -12506,12 +12506,16 @@ mod tests {
         association_request[10..16].copy_from_slice(&effects.client);
         association_request[16..22].copy_from_slice(&peer);
         association_request[22..24].copy_from_slice(&(19u16 << 4).to_le_bytes());
-        association_request[24..26].copy_from_slice(&0x0431u16.to_le_bytes());
+        association_request[24..26].copy_from_slice(&0x0011u16.to_le_bytes());
         association_request[26..28].copy_from_slice(&10u16.to_le_bytes());
         association_request.extend_from_slice(&[0, 3, 1, 2, 3, 48, 2, 4, 5, 244, 1, 0x20]);
         assert_eq!(
             management_ie_id_lengths(&association_request, 28),
             "0:3,48:2,244:1"
+        );
+        assert_eq!(
+            u16::from_le_bytes(association_request[24..26].try_into().unwrap()),
+            0x0011
         );
         effects
             .send_wlan_frame(

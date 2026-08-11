@@ -17,6 +17,30 @@
          self.send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending open auth frame"), s))
      }
+@@ -133,7 +136,6 @@
+     pub fn send_assoc_req_frame(&mut self) -> Result<(), Error> {
+         let ssid = self.sta.ssid().clone();
+         let cap = &self.sta.client_capabilities.0;
+-        let capability_info = cap.capability_info.0;
+         let rates: Vec<u8> = cap.rates.iter().map(|r| r.rate()).collect();
+         let ht_cap = cap.ht_cap;
+         let vht_cap = cap.vht_cap;
+@@ -145,5 +147,6 @@
+             })
+             .transpose()?;
++        let capability_info = cap.capability_info.with_privacy(rsne.is_some());
+         let buffer = write_frame!({
+             headers: {
+                 mac::MgmtHdr: &mgmt_writer::mgmt_hdr_to_ap(
+@@ -157,7 +160,7 @@
+                         .with_seq_num(self.ctx.seq_mgr.next_sns1(&self.sta.bssid().into()) as u16)
+                 ),
+                 mac::AssocReqHdr: &mac::AssocReqHdr {
+-                    capabilities: mac::CapabilityInfo(capability_info),
++                    capabilities: capability_info,
+                     listen_interval: 0,
+                 },
+             },
 @@ -167,7 +170,38 @@
                  vht_cap?: vht_cap,
              },

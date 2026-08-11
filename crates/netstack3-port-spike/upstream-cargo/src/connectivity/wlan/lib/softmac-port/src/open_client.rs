@@ -315,6 +315,7 @@ impl OpenClientMlme {
             .then(|| rsne::from_bytes(&self.request.security_ie).map(|(_, rsne)| rsne))
             .transpose()
             .map_err(|_| ())?;
+        let capability_info = cap.capability_info.with_privacy(rsne.is_some());
         let mut frame = write_frame!({
             headers: {
                 mac::MgmtHdr: &mgmt_writer::mgmt_hdr_to_ap(
@@ -328,7 +329,7 @@ impl OpenClientMlme {
                     )
                 ),
                 mac::AssocReqHdr: &mac::AssocReqHdr {
-                    capabilities: cap.capability_info,
+                    capabilities: capability_info,
                     listen_interval: 0,
                 },
             },
@@ -728,6 +729,8 @@ mod tests {
         let MgmtBody::AssociationReq(assoc) = assoc.unwrap() else {
             panic!("not assoc request")
         };
+        let capabilities = assoc.assoc_req_hdr.capabilities;
+        assert_eq!(capabilities.raw(), 0x0001);
         let listen_interval = assoc.assoc_req_hdr.listen_interval;
         assert_eq!(listen_interval, 0);
         assert_eq!(assoc.ies().next(), Some((Id::SSID, &b"test"[..])));
@@ -773,6 +776,8 @@ mod tests {
         else {
             panic!("not association request")
         };
+        let capabilities = assoc.assoc_req_hdr.capabilities;
+        assert_eq!(capabilities.raw(), 0x0011);
         assert!(
             assoc
                 .ies()
