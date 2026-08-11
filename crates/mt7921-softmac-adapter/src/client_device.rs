@@ -593,9 +593,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
 }
 
 type SmeTimerAction = Box<dyn FnOnce(&mut wlan_sme::client::ClientSme)>;
-type MlmeTimerAction<E, T> = Box<
-    dyn FnOnce(&mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>),
->;
+type MlmeTimerAction = wlan_mlme::common::timer::Event<wlan_mlme::client::TimedEvent>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PinnedConnectError {
@@ -622,7 +620,7 @@ pub struct PinnedClientRuntime<E, T> {
     requests: wlan_sme::MlmeStream,
     events: mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>,
     sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
-    mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction<E, T>>>>,
+    mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
     timer_runtime: tokio::runtime::Runtime,
 }
 
@@ -664,18 +662,8 @@ where
                 },
             ),
         );
-        let mlme_timers = Box::pin(
-            wlan_mlme::common::timer::make_async_timed_event_stream(mlme_timer_stream).map(
-                |event| {
-                    Box::new(move |mlme: &mut wlan_mlme::client::ClientMlme<_>| {
-                        futures::executor::block_on(wlan_mlme::MlmeImpl::handle_timeout(
-                            mlme,
-                            event.event,
-                        ))
-                    }) as MlmeTimerAction<E, T>
-                },
-            ),
-        );
+        let mlme_timers =
+            Box::pin(wlan_mlme::common::timer::make_async_timed_event_stream(mlme_timer_stream));
         let timer_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -782,13 +770,22 @@ where
                 }
             }
         }
-        let _timer_context = self.timer_runtime.enter();
-        while let Some(action) = self.sme_timers.as_mut().next().now_or_never().flatten() {
+        while let Some(action) = self.timer_runtime.block_on(async {
+            tokio::task::yield_now().await;
+            self.sme_timers.as_mut().next().now_or_never().flatten()
+        }) {
             action(&mut self.sme);
             progressed = true;
         }
-        while let Some(action) = self.mlme_timers.as_mut().next().now_or_never().flatten() {
-            action(&mut self.mlme);
+        while let Some(event) = self.timer_runtime.block_on(async {
+            tokio::task::yield_now().await;
+            self.mlme_timers.as_mut().next().now_or_never().flatten()
+        }) {
+            println!(
+                "client_mlme_timer stage=stream_dequeued timer_id={} event={:?}",
+                event.id, event.event
+            );
+            wlan_mlme::MlmeImpl::handle_timeout(&mut self.mlme, event.event).await;
             progressed = true;
         }
         Ok(progressed)
@@ -1412,6 +1409,7 @@ mod tests {
         )>,
         join: Option<fidl_driver::JoinBssRequest>,
         frame: Option<Vec<u8>>,
+        frames: Vec<Vec<u8>>,
         flags: Option<fidl_softmac::WlanTxInfoFlags>,
         key: Option<fidl_softmac::WlanKeyConfiguration>,
         association: Option<fidl_softmac::WlanAssociationConfig>,
@@ -1495,6 +1493,7 @@ mod tests {
         ) -> Result<(), zx::Status> {
             self.hit("frame")?;
             self.frame = Some(bytes.to_vec());
+            self.frames.push(bytes.to_vec());
             self.flags = Some(flags);
             Ok(())
         }
@@ -2198,6 +2197,152 @@ mod tests {
                 Err(PinnedConnectError::Timeout)
             );
             assert!(!timed.runner.backend.lock().unwrap().authorization.is_live());
+        });
+    }
+
+    #[test]
+    fn pinned_runtime_drives_comeback_timer_and_disconnect_cancels_it() {
+        futures::executor::block_on(async {
+            let mut effects = FakeEffects::default();
+            effects.rx.push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
+            effects.rx.push_back(open_response(
+                0x01,
+                &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
+            ));
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                FakePassiveTransport::default(),
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let mut device_support = support();
+            device_support.query.sta_addr = nic().mac_address;
+            device_support.query.factory_addr = nic().mac_address;
+            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                basic_rates: Some(vec![0x82, 0x84]),
+                primary_channels: Some(vec![channel(36)]),
+                ..Default::default()
+            }]);
+            let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
+            runner.backend.lock().unwrap().authorization.authorize_scan();
+            let backend = Arc::clone(&runner.backend);
+            let support_info = support();
+            let mut runtime = PinnedClientRuntime::new(
+                device,
+                runner,
+                wlan_sme::client::ClientConfig::default(),
+                runtime_device_info(),
+                support_info.security,
+                support_info.spectrum_management,
+                fuchsia_inspect::Inspector::default(),
+            )
+            .await
+            .unwrap();
+            let responder = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    {
+                        let mut backend = backend.lock().unwrap();
+                        if backend.effects.frames.len() >= 3 {
+                            backend.effects.rx.push_back(open_response(
+                                0x01,
+                                &[1, 0, 0, 0, 0x2a, 0xc0, 1, 2, 0x82, 0x84],
+                            ));
+                            return;
+                        }
+                    }
+                    assert!(std::time::Instant::now() < deadline, "association retry not emitted");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let started = std::time::Instant::now();
+            runtime
+                .connect(
+                    open_connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            responder.join().unwrap();
+            assert!(started.elapsed() >= std::time::Duration::from_millis(15));
+            let backend = runtime.runner.backend.lock().unwrap();
+            assert_eq!(backend.effects.frames.len(), 3);
+            assert_ne!(
+                &backend.effects.frames[1][22..24],
+                &backend.effects.frames[2][22..24]
+            );
+            assert_eq!(
+                &backend.effects.frames[1][24..],
+                &backend.effects.frames[2][24..]
+            );
+            assert_eq!(backend.effects.association.as_ref().unwrap().aid, Some(42));
+            drop(backend);
+
+            let mut effects = FakeEffects::default();
+            effects.rx.push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
+            effects.rx.push_back(open_response(
+                0x01,
+                &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
+            ));
+            let passive = Mt7921SoftmacAdapter::new(
+                FakePassiveTransport::default(),
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let mut device_support = support();
+            device_support.query.sta_addr = nic().mac_address;
+            device_support.query.factory_addr = nic().mac_address;
+            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                basic_rates: Some(vec![0x82, 0x84]),
+                primary_channels: Some(vec![channel(36)]),
+                ..Default::default()
+            }]);
+            let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
+            runner.backend.lock().unwrap().authorization.authorize_scan();
+            let support_info = support();
+            let mut canceled = PinnedClientRuntime::new(
+                device,
+                runner,
+                wlan_sme::client::ClientConfig::default(),
+                runtime_device_info(),
+                support_info.security,
+                support_info.spectrum_management,
+                fuchsia_inspect::Inspector::default(),
+            )
+            .await
+            .unwrap();
+            let _transaction = canceled.sme.on_connect_command(open_connect_request());
+            for _ in 0..8 {
+                canceled.pump_once().await.unwrap();
+                if canceled.runner.backend.lock().unwrap().effects.frames.len() == 2 {
+                    break;
+                }
+            }
+            assert_eq!(canceled.runner.backend.lock().unwrap().effects.frames.len(), 2);
+            canceled.sme.on_disconnect_command(
+                fidl_sme::UserDisconnectReason::WlanSmeUnitTesting,
+                Default::default(),
+            );
+            for _ in 0..4 {
+                canceled.pump_once().await.unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            for _ in 0..4 {
+                canceled.pump_once().await.unwrap();
+            }
+            assert_eq!(
+                canceled.runner.backend.lock().unwrap().effects.frames.len(),
+                2,
+                "disconnect must cancel the generation-bound comeback timer"
+            );
         });
     }
 

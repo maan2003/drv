@@ -1,0 +1,48 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -347,12 +347,14 @@
+                 sta.sta.connect_timeout.take();
+                 self.comeback_timeout.take();
+                 self.comeback_generation = Some(generation);
+-                self.comeback_timeout.replace(sta.ctx.timer.schedule_after(
++                let timeout = sta.ctx.timer.schedule_after(
+                     zx::MonotonicDuration::from_nanos(duration_nanos),
+                     TimedEvent::AssociationComeback { generation },
+-                ));
++                );
++                let timer_id = timeout.id();
++                self.comeback_timeout.replace(timeout);
+                 crate::sae_disposition(format_args!(
+-                    "association_comeback scheduled=true generation={generation} tu={tu} ms={ms} attempt={}",
++                    "association_comeback scheduled=true timer_id={timer_id} generation={generation} deadline_after_ms={ms} tu={tu} attempt={}",
+                     self.association_attempts
+                 ));
+                 return Ok(None);
+@@ -1339,6 +1341,9 @@
+                 States::Associating(mut state)
+                     if state.comeback_generation == Some(generation) =>
+                 {
++                    crate::sae_disposition(format_args!(
++                        "association_comeback timer_disposition=current generation={generation}"
++                    ));
+                     state.comeback_timeout.take();
+                     state.comeback_generation = None;
+                     if state.association_attempts >= 3 {
+@@ -1363,7 +1368,7 @@
+                             sta.ctx.timer.schedule_after(duration, TimedEvent::Connecting);
+                         sta.sta.connect_timeout.replace(timeout);
+                         crate::sae_disposition(format_args!(
+-                            "association_comeback retry=true generation={generation} attempt={}",
++                            "association_comeback retry=true request_emitted=true generation={generation} attempt={}",
+                             state.association_attempts
+                         ));
+                         state.into()
+@@ -1371,7 +1376,7 @@
+                 }
+                 States::Associating(state) => {
+                     crate::sae_disposition(format_args!(
+-                        "association_comeback retry=false generation={generation} reason=stale"
++                        "association_comeback timer_disposition=stale generation={generation} retry=false"
+                     ));
+                     state.into()
+                 }

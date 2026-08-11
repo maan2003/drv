@@ -1368,12 +1368,97 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
 #[cfg(feature = "fuchsia-passive")]
 struct SaeCommittedSelfTestMechanics {
     rx: VecDeque<ClientRxFrame>,
+    open_auth_response: Option<ClientRxFrame>,
     status77: Option<ClientRxFrame>,
+    association_responses: VecDeque<ClientRxFrame>,
     tx: Arc<Mutex<Vec<(Vec<u8>, u16, u8)>>>,
     outstanding: MgmtTxOutstanding,
     ring_cidx: u32,
     ring_didx: u32,
     descriptor_done: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct ComebackSelfTestEffects;
+
+#[cfg(feature = "fuchsia-passive")]
+impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelfTestEffects {
+    fn revoke_scan(&mut self) {}
+    fn prepare_runtime_handoff(
+        &mut self,
+    ) -> mt7921_softmac_adapter::client_device::ClientRuntimeScanState {
+        mt7921_softmac_adapter::client_device::ClientRuntimeScanState::ExternalSelection
+    }
+    fn revoke_lifecycle(&mut self) {}
+    fn set_channel(
+        &mut self,
+        _: ChannelNumber,
+        _: ChannelBandwidth,
+        _: ChannelNumber,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn join_bss(&mut self, _: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn send_wlan_frame(
+        &mut self,
+        bytes: &[u8],
+        flags: fidl_softmac::WlanTxInfoFlags,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        io.transmit_client(bytes, flags)
+    }
+    fn install_key(
+        &mut self,
+        _: &fidl_softmac::WlanKeyConfiguration,
+        _: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn notify_association_complete(
+        &mut self,
+        _: &fidl_softmac::WlanAssociationConfig,
+        _: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn clear_association(
+        &mut self,
+        _: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+        _: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn next_rx(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<Option<ClientRxFrame>, zx::Status> {
+        io.next_client_rx()
+    }
+    fn begin_passive_scan(&mut self, _: u64, _: &[ChannelNumber]) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn observe_passive_scan(
+        &mut self,
+        _: u64,
+        _: &fuchsia_softmac_port::ScanObservation,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn complete_passive_scan(&mut self, _: u64, _: bool) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), zx::Status> {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -1444,6 +1529,20 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         println!("self_test_management_tx outcome=committed token={token} pid={pid}");
         if bytes.get(28..32) == Some(&[126, 0, 20, 0]) {
             if let Some(frame) = self.status77.take() {
+                self.rx.push_back(frame);
+            }
+        }
+        let control = bytes
+            .get(..2)
+            .map(|field| u16::from_le_bytes([field[0], field[1]]))
+            .unwrap_or(u16::MAX);
+        if control & 0x00fc == 0x00b0 {
+            if let Some(frame) = self.open_auth_response.take() {
+                self.rx.push_back(frame);
+            }
+        }
+        if control & 0x00fc == 0 {
+            if let Some(frame) = self.association_responses.pop_front() {
                 self.rx.push_back(frame);
             }
         }
@@ -1690,7 +1789,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let missing_tx = Arc::new(Mutex::new(Vec::new()));
     let mut missing_completion = SaeCommittedSelfTestMechanics {
         rx: VecDeque::new(),
+        open_auth_response: None,
         status77: None,
+        association_responses: VecDeque::new(),
         tx: Arc::clone(&missing_tx),
         outstanding: MgmtTxOutstanding::default(),
         ring_cidx: 0,
@@ -1726,11 +1827,151 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         chip_capability: None,
         unknown_elements: 0,
     };
+    let mut auth_response = vec![0u8; 24];
+    auth_response[0] = 0xb0;
+    auth_response[4..10].copy_from_slice(&client);
+    auth_response[10..16].copy_from_slice(&peer);
+    auth_response[16..22].copy_from_slice(&peer);
+    auth_response.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+    let mut comeback_response = vec![0u8; 24];
+    comeback_response[0] = 0x10;
+    comeback_response[4..10].copy_from_slice(&client);
+    comeback_response[10..16].copy_from_slice(&peer);
+    comeback_response[16..22].copy_from_slice(&peer);
+    comeback_response.extend_from_slice(&[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0]);
+    let comeback_tx = Arc::new(Mutex::new(Vec::new()));
+    let comeback_transport = SourceExactPassiveTransport::new(
+        SaeCommittedSelfTestMechanics {
+            rx: VecDeque::new(),
+            open_auth_response: Some(ClientRxFrame {
+                bytes: auth_response,
+                status: fidl_softmac::WlanRxInfo {
+                    rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                    valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                    phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                    data_rate: 0,
+                    primary: channel,
+                    bandwidth: ChannelBandwidth::Cbw80,
+                    vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                    mcs: 0,
+                    rssi_dbm: -40,
+                    snr_dbh: 0,
+                },
+                security: None,
+            }),
+            status77: None,
+            association_responses: VecDeque::from([ClientRxFrame {
+                bytes: comeback_response,
+                status: fidl_softmac::WlanRxInfo {
+                    rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                    valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                    phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                    data_rate: 0,
+                    primary: channel,
+                    bandwidth: ChannelBandwidth::Cbw80,
+                    vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                    mcs: 0,
+                    rssi_dbm: -40,
+                    snr_dbh: 0,
+                },
+                security: None,
+            }]),
+            tx: Arc::clone(&comeback_tx),
+            outstanding: MgmtTxOutstanding::default(),
+            ring_cidx: 0,
+            ring_didx: 0,
+            descriptor_done: false,
+        },
+        capability,
+    )
+    .map_err(|e| format!("self-test comeback transport: {e}"))?;
+    let candidates = candidate_channels(capability);
+    let comeback_adapter = Mt7921SoftmacAdapter::new(
+        comeback_transport,
+        capability,
+        candidates.clone(),
+        vec![channel],
+    )
+    .map_err(|e| format!("self-test comeback adapter: {e}"))?;
+    let comeback_support = live_client_support(query_from_capabilities(capability, &candidates));
+    let comeback_device_info = wlan_mlme::mlme_device_info_from_softmac(comeback_support.query.clone())
+        .map_err(|e| format!("self-test comeback device info: {e}"))?;
+    let (comeback_device, comeback_runner) = Mt7921ClientDevice::new(
+        ComebackSelfTestEffects,
+        comeback_adapter,
+        comeback_support.clone(),
+    );
+    let mut comeback_runtime = PinnedClientRuntime::new(
+        comeback_device,
+        comeback_runner,
+        wlan_sme::client::ClientConfig::default(),
+        comeback_device_info,
+        comeback_support.security,
+        comeback_support.spectrum_management,
+        fuchsia_inspect::Inspector::default(),
+    )
+    .await
+    .map_err(|e| format!("self-test comeback runtime: {e}"))?;
+    let comeback_request = fidl_sme::ConnectRequest {
+        ssid: b"test".to_vec(),
+        bss_description: fidl_ieee80211::BssDescription {
+            bssid: peer,
+            bss_type: fidl_ieee80211::BssType::Infrastructure,
+            beacon_period: 100,
+            capability_info: 1,
+            ies: vec![0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12],
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw80,
+            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+            rssi_dbm: -40,
+            snr_db: 20,
+        },
+        multiple_bss_candidates: false,
+        authentication: fidl_internal::Authentication {
+            protocol: fidl_internal::Protocol::Open,
+            credentials: None,
+        },
+        deprecated_scan_type: fidl_common::ScanType::Passive,
+    };
+    let comeback_started = Instant::now();
+    let comeback_result = comeback_runtime
+        .connect(
+            comeback_request,
+            Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await;
+    let association_requests: Vec<_> = comeback_tx
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(frame, _, _)| {
+            frame
+                .get(..2)
+                .is_some_and(|fc| u16::from_le_bytes([fc[0], fc[1]]) & 0x00fc == 0)
+        })
+        .map(|(frame, _, _)| frame.clone())
+        .collect();
+    if comeback_result != Err(mt7921_softmac_adapter::client_device::PinnedConnectError::Timeout)
+        || comeback_started.elapsed() < std::time::Duration::from_millis(15)
+        || association_requests.len() != 2
+        || association_requests[0][22..24] == association_requests[1][22..24]
+        || association_requests[0][24..] != association_requests[1][24..]
+    {
+        return Err(format!(
+            "self-test production comeback timer failed result={comeback_result:?} requests={}",
+            association_requests.len()
+        ));
+    }
+    println!(
+        "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 retry_requests=2 sequence=fresh body=identical outer_deadline_ms=100"
+    );
     let tx = Arc::new(Mutex::new(Vec::new()));
     let transport = SourceExactPassiveTransport::new(
         SaeCommittedSelfTestMechanics {
             rx: VecDeque::new(),
+            open_auth_response: None,
             status77: Some(status77),
+            association_responses: VecDeque::new(),
             tx: Arc::clone(&tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,
