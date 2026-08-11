@@ -983,7 +983,7 @@ fn run_contained_dma_resource_round_trip(
                 }),
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
-                normal_rx_frames: Vec::new(),
+                normal_rx_frames: VecDeque::new(),
                 tx_completions: Vec::new(),
                 descriptor_provenance: DescriptorProvenance::new(),
             };
@@ -3099,7 +3099,7 @@ fn run() -> Result<(), String> {
                     }),
                     extra_irq_mask: 0,
                     unsolicited: Vec::new(),
-                    normal_rx_frames: Vec::new(),
+                    normal_rx_frames: VecDeque::new(),
                     tx_completions: Vec::new(),
                     descriptor_provenance: DescriptorProvenance::new(),
                 };
@@ -3785,7 +3785,7 @@ fn run() -> Result<(), String> {
                 wm2: None,
                 extra_irq_mask: 0,
                 unsolicited: Vec::new(),
-                normal_rx_frames: Vec::new(),
+                normal_rx_frames: VecDeque::new(),
                 tx_completions: Vec::new(),
                 descriptor_provenance: DescriptorProvenance::new(),
             };
@@ -5736,6 +5736,16 @@ fn revoke_before_local_carrier_release<T>(
     Ok(())
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn revoke_before_local_frame_release<T>(
+    provenance: &mut DescriptorProvenance,
+    queued: &mut VecDeque<T>,
+) -> Result<(), String> {
+    provenance.invalidate(DescriptorInvalidation::Run)?;
+    queued.clear();
+    Ok(())
+}
+
 fn observe_signal_cancellation(
     provenance: &mut DescriptorProvenance,
     stop_requested: bool,
@@ -5808,7 +5818,7 @@ struct ActiveMcuIo<'a> {
     wm2: Option<ActiveMcuRx<'a>>,
     extra_irq_mask: u32,
     unsolicited: Vec<ReceivedMcuResponse>,
-    normal_rx_frames: Vec<PrivateRawFrameCarrier>,
+    normal_rx_frames: VecDeque<PrivateRawFrameCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
     descriptor_provenance: DescriptorProvenance,
 }
@@ -6177,7 +6187,7 @@ fn drain_rx_queue(
     queue: &mut ActiveMcuRx<'_>,
     expected_sequence: Option<u8>,
     unsolicited: &mut Vec<ReceivedMcuResponse>,
-    normal_rx_frames: &mut Vec<PrivateRawFrameCarrier>,
+    normal_rx_frames: &mut VecDeque<PrivateRawFrameCarrier>,
     tx_completions: &mut Vec<MgmtTxCompletion>,
     provenance: &mut DescriptorProvenance,
 ) -> Result<Option<ReceivedMcuResponse>, String> {
@@ -6313,7 +6323,7 @@ fn drain_rx_queue(
                         "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
                         queue.rx_ring_index
                     );
-                    normal_rx_frames.push(frame);
+                    normal_rx_frames.push_back(frame);
                     continue;
                 }
                 DrainedMcuRx::Response(parsed, response) => (parsed, response),
@@ -6359,7 +6369,7 @@ fn drain_rx_queue(
         Ok(matched)
     })();
     if result.is_err() {
-        revoke_before_local_carrier_release(provenance, normal_rx_frames)?;
+        revoke_before_local_frame_release(provenance, normal_rx_frames)?;
     }
     result
 }
@@ -6442,7 +6452,7 @@ impl ActiveMcuIo<'_> {
             Ok(matched)
         })();
         if result.is_err() {
-            revoke_before_local_carrier_release(
+            revoke_before_local_frame_release(
                 &mut self.descriptor_provenance,
                 &mut self.normal_rx_frames,
             )?;
@@ -7372,7 +7382,7 @@ fn drain_data_rx_queue(
     queue: &mut ActiveMcuRx<'_>,
     provenance: &mut DescriptorProvenance,
     completions: &mut Vec<MgmtTxCompletion>,
-    mut normal_rx_frames: Option<&mut Vec<PrivateRawFrameCarrier>>,
+    mut normal_rx_frames: Option<&mut VecDeque<PrivateRawFrameCarrier>>,
 ) -> Result<Vec<PrivateRawAdvertisementCarrier>, String> {
     let mut advertisements = Vec::new();
     let result = (|| -> Result<(), String> {
@@ -7505,7 +7515,7 @@ fn drain_data_rx_queue(
                                     occurrence: None,
                                 },
                             };
-                            normal_rx_frames.as_deref_mut().unwrap().push(frame);
+                            normal_rx_frames.as_deref_mut().unwrap().push_back(frame);
                             Ok(None)
                         }
                         Err(error) => {
@@ -8143,6 +8153,26 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Ok(None);
         }
         if control & 0x000c == 0x0008 {
+            let admitted = self.firmware.association.is_some()
+                && control & 0x0300 == 0x0200
+                && frame.bytes.get(4..10) == Some(&self.client)
+                && frame.bytes.get(10..16) == Some(&self.target)
+                && {
+                    let state = self.state.lock().unwrap();
+                    state.channel.authorized_channel().is_ok_and(|channel| {
+                        channel.channel.band
+                            == match frame.status.primary.band {
+                                WlanBand::TwoGhz => 0,
+                                WlanBand::FiveGhz => 1,
+                                _ => u8::MAX,
+                            }
+                            && channel.channel.primary == u16::from(frame.status.primary.number)
+                    })
+                };
+            if !admitted {
+                record_sae_stage("client_rx_filtered reason=preassociation_or_foreign_data");
+                return Ok(None);
+            }
             let eapol = frame
                 .bytes
                 .windows(8)
@@ -8548,7 +8578,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
             zx::Status::IO_DATA_INTEGRITY
         })?;
-        let Some(frame) = self.loader.mcu.normal_rx_frames.pop() else {
+        let Some(frame) = self.loader.mcu.normal_rx_frames.pop_front() else {
             record_sae_stage("next_client_rx result=empty");
             return Ok(None);
         };
@@ -8724,11 +8754,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         );
         let mut routed_frames = std::mem::take(&mut self.loader.mcu.normal_rx_frames);
         while !routed_frames.is_empty() {
-            let frame = routed_frames.remove(0);
+            let frame = routed_frames.pop_front().expect("queue is nonempty");
             match frame.parse() {
                 Ok(advertisement) => self.advertisements.push(advertisement),
                 Err((frame, error)) => {
-                    revoke_before_local_carrier_release(
+                    revoke_before_local_frame_release(
                         &mut self.loader.mcu.descriptor_provenance,
                         &mut routed_frames,
                     )
@@ -11295,6 +11325,11 @@ mod tests {
         io.rx.push_back(auth(peer, &20u16.to_le_bytes(), channel));
         assert!(effects.next_rx(&mut io).unwrap().is_some());
 
+        let mut preassociation_data = auth(peer, &20u16.to_le_bytes(), channel);
+        preassociation_data.bytes[0..2].copy_from_slice(&0x0208u16.to_le_bytes());
+        io.rx.push_back(preassociation_data);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+
         io.rx.push_back(auth([9; 6], &20u16.to_le_bytes(), channel));
         assert!(effects.next_rx(&mut io).unwrap().is_none());
         io.rx.push_back(auth(peer, &[20], channel));
@@ -11436,6 +11471,24 @@ mod tests {
         assert!(
             active_cleanup.find("if !bme_disabled").unwrap()
                 < active_cleanup.find("attempt_all_cleanup").unwrap()
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn normal_rx_burst_is_delivered_in_descriptor_order() {
+        let mut routed = VecDeque::new();
+        for descriptor in 0..4u8 {
+            routed.push_back(PrivateRawFrameCarrier {
+                bytes: vec![descriptor],
+                occurrence: None,
+            });
+        }
+        assert_eq!(
+            (0..4)
+                .map(|_| routed.pop_front().unwrap().bytes[0])
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
         );
     }
 
@@ -13575,7 +13628,7 @@ mod tests {
             irq_bit: WM2_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
-        let mut normal = Vec::new();
+        let mut normal = VecDeque::new();
         let mut completions = Vec::new();
         let mut provenance = DescriptorProvenance::new();
         assert!(
@@ -13642,7 +13695,7 @@ mod tests {
             irq_bit: WM_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
-        let mut normal = Vec::new();
+        let mut normal = VecDeque::new();
         let mut completions = Vec::new();
         let mut provenance = DescriptorProvenance::new();
         assert!(
@@ -13719,7 +13772,7 @@ mod tests {
             irq_bit: WM_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
-        let mut normal = Vec::new();
+        let mut normal = VecDeque::new();
         let mut completions = Vec::new();
         let mut provenance = DescriptorProvenance::new();
         let lease = Arc::clone(&provenance.lease);
@@ -13806,7 +13859,7 @@ mod tests {
             irq_bit: DATA_RX_IRQ_BIT,
         };
         let mut provenance = DescriptorProvenance::new();
-        let mut normal = Vec::new();
+        let mut normal = VecDeque::new();
         assert!(
             drain_data_rx_queue(
                 &page,
@@ -13899,7 +13952,7 @@ mod tests {
                 irq_bit: DATA_RX_IRQ_BIT,
             };
             let mut provenance = DescriptorProvenance::new();
-            let mut normal = Vec::new();
+            let mut normal = VecDeque::new();
             drain_data_rx_queue(
                 &page,
                 &mut queue,
@@ -13921,7 +13974,7 @@ mod tests {
                     }
                 ]
             ));
-            let parsed = parse_connac2_rx_frame(&normal.pop().unwrap().bytes).unwrap();
+            let parsed = parse_connac2_rx_frame(&normal.pop_front().unwrap().bytes).unwrap();
             let status77 = ClientRxFrame {
                 bytes: parsed.bytes,
                 status: fidl_softmac::WlanRxInfo {
