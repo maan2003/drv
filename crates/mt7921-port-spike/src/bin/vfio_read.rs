@@ -20,8 +20,6 @@ use fuchsia_softmac_port::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
-#[cfg(feature = "fuchsia-passive")]
-use num_bigint::BigUint;
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
@@ -65,6 +63,8 @@ use mt7921_softmac_adapter::{
     Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites, SourceExactPassiveMechanics,
     SourceExactPassiveTransport, query_from_capabilities,
 };
+#[cfg(feature = "fuchsia-passive")]
+use num_bigint::BigUint;
 use std::{
     cell::Cell,
     env,
@@ -8125,45 +8125,55 @@ struct ReceivedSaeAuth {
 
 #[cfg(feature = "fuchsia-passive")]
 fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
-    let fixed = frame
-        .get(..128)
-        .ok_or("SAE commit is shorter than the group-19 fixed body")?;
-    let algorithm = u16::from_le_bytes(fixed[24..26].try_into().unwrap());
-    let transaction = u16::from_le_bytes(fixed[26..28].try_into().unwrap());
-    let status = u16::from_le_bytes(fixed[28..30].try_into().unwrap());
-    let group = u16::from_le_bytes(fixed[30..32].try_into().unwrap());
-    if algorithm != 3 || transaction != 1 || status != 126 || group != 19 {
+    let header = frame
+        .get(..32)
+        .ok_or("SAE commit is shorter than the authentication header")?;
+    let algorithm = u16::from_le_bytes(header[24..26].try_into().unwrap());
+    let transaction = u16::from_le_bytes(header[26..28].try_into().unwrap());
+    let status = u16::from_le_bytes(header[28..30].try_into().unwrap());
+    let group = u16::from_le_bytes(header[30..32].try_into().unwrap());
+    if algorithm != 3 || transaction != 1 || status != 126 {
         return Err(format!(
             "unexpected SAE commit header algorithm={algorithm} transaction={transaction} status={status} group={group}"
         ));
     }
-    let scalar = &fixed[32..64];
-    let element = &fixed[64..128];
+    let (scalar_len, element_len, order_hex, p_hex, b_hex) = match group {
+        19 => (
+            32,
+            64,
+            b"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551".as_slice(),
+            b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff".as_slice(),
+            b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b".as_slice(),
+        ),
+        20 => (
+            48,
+            96,
+            b"ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973".as_slice(),
+            b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff".as_slice(),
+            b"b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef".as_slice(),
+        ),
+        _ => return Err(format!("unexpected SAE commit group {group}")),
+    };
+    let fixed_end = 32 + scalar_len + element_len;
+    let fixed = frame
+        .get(..fixed_end)
+        .ok_or("SAE commit is shorter than the selected group's fixed body")?;
+    let scalar = &fixed[32..32 + scalar_len];
+    let element = &fixed[32 + scalar_len..fixed_end];
     let scalar_value = BigUint::from_bytes_be(scalar);
-    let order = BigUint::parse_bytes(
-        b"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
-        16,
-    )
-    .unwrap();
+    let order = BigUint::parse_bytes(order_hex, 16).unwrap();
     let scalar_range = scalar_value > BigUint::from(1u8) && scalar_value < order;
-    let p = BigUint::parse_bytes(
-        b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
-        16,
-    )
-    .unwrap();
-    let b = BigUint::parse_bytes(
-        b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
-        16,
-    )
-    .unwrap();
-    let x = BigUint::from_bytes_be(&element[..32]);
-    let y = BigUint::from_bytes_be(&element[32..]);
+    let p = BigUint::parse_bytes(p_hex, 16).unwrap();
+    let b = BigUint::parse_bytes(b_hex, 16).unwrap();
+    let coordinate_len = element_len / 2;
+    let x = BigUint::from_bytes_be(&element[..coordinate_len]);
+    let y = BigUint::from_bytes_be(&element[coordinate_len..]);
     let three_x = (&x * BigUint::from(3u8)) % &p;
     let rhs = (x.modpow(&BigUint::from(3u8), &p) + (&p - three_x) + b) % &p;
-    let p256_on_curve = x < p && y < p && y.modpow(&BigUint::from(2u8), &p) == rhs;
-    let mut tail = frame.len().saturating_sub(128);
+    let element_on_curve = x < p && y < p && y.modpow(&BigUint::from(2u8), &p) == rhs;
+    let mut tail = frame.len().saturating_sub(fixed_end);
     let mut tail_ies = Vec::new();
-    let mut offset = 128;
+    let mut offset = fixed_end;
     while tail != 0 {
         let header = frame
             .get(offset..offset + 2)
@@ -8181,13 +8191,37 @@ fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
     let bssid = &frame[16..22];
     let sequence_control = u16::from_le_bytes(frame[22..24].try_into().unwrap());
     println!(
-        r#"{{"sae_commit_structure":{{"fc":"0x{:04x}","receiver":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","transmitter":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","bssid":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","seq_control":{},"algorithm":{},"transaction":{},"status":{},"group":{},"body_len":{},"scalar_len":{},"element_len":{},"tail_len":{},"scalar_range":{},"p256_on_curve":{},"tail_ies":"{}"}}}}"#,
+        r#"{{"sae_commit_structure":{{"fc":"0x{:04x}","receiver":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","transmitter":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","bssid":"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}","seq_control":{},"algorithm":{},"transaction":{},"status":{},"group":{},"body_len":{},"scalar_len":{},"element_len":{},"tail_len":{},"scalar_range":{},"element_on_curve":{},"tail_ies":"{}"}}}}"#,
         u16::from_le_bytes(frame[0..2].try_into().unwrap()),
-        receiver[0], receiver[1], receiver[2], receiver[3], receiver[4], receiver[5],
-        transmitter[0], transmitter[1], transmitter[2], transmitter[3], transmitter[4], transmitter[5],
-        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-        sequence_control, algorithm, transaction, status, group, frame.len() - 30,
-        scalar.len(), element.len(), frame.len() - 128, scalar_range, p256_on_curve,
+        receiver[0],
+        receiver[1],
+        receiver[2],
+        receiver[3],
+        receiver[4],
+        receiver[5],
+        transmitter[0],
+        transmitter[1],
+        transmitter[2],
+        transmitter[3],
+        transmitter[4],
+        transmitter[5],
+        bssid[0],
+        bssid[1],
+        bssid[2],
+        bssid[3],
+        bssid[4],
+        bssid[5],
+        sequence_control,
+        algorithm,
+        transaction,
+        status,
+        group,
+        frame.len() - 30,
+        scalar.len(),
+        element.len(),
+        frame.len() - fixed_end,
+        scalar_range,
+        element_on_curve,
         tail_ies.join(",")
     );
     Ok(())

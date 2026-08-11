@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn h2e_peer_and_local_support_emit_direct_group_19_commit() {
+    fn h2e_peer_and_local_support_emit_direct_group_20_commit() {
         let mut handshake = SaeHandshake::new(
             b"fixture".to_vec(),
             b"fixture passphrase".to_vec(),
@@ -458,7 +458,7 @@ mod tests {
                 status_code: StatusCode::SaeHashToElement,
                 sae_fields,
                 ..
-            }) if sae_fields.len() == 98 && sae_fields[..2] == [19, 0]
+            }) if sae_fields.len() == 146 && sae_fields[..2] == [20, 0]
         )));
     }
 
