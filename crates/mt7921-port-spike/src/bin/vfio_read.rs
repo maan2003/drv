@@ -1372,6 +1372,7 @@ struct SaeCommittedSelfTestMechanics {
     status77: Option<ClientRxFrame>,
     association_responses: VecDeque<ClientRxFrame>,
     queued_data_after_association: VecDeque<(usize, ClientRxFrame)>,
+    rx_during_cid2: Option<ClientRxFrame>,
     association_tx_count: usize,
     tx: Arc<Mutex<Vec<(Vec<u8>, u16, u8)>>>,
     outstanding: MgmtTxOutstanding,
@@ -1512,7 +1513,13 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
     fn confirm_scan_done(&mut self, _: u8) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+    fn submit_client_uni(&mut self, cid: u8, _: &[u8]) -> Result<(), zx::Status> {
+        if cid == 2
+            && let Some(frame) = self.rx_during_cid2.take()
+        {
+            self.rx.push_back(frame);
+            println!("self_test_control_wait_rx cid=2 queued=persistent");
+        }
         Ok(())
     }
     fn transmit_client(
@@ -1841,6 +1848,41 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_protected_management result=pass exact_ciphertext_len=42 pre_key=protected_unverified current_key=decrypted_dispatched reason=9 replay=filtered malformed=terminal comeback_retry=continues"
     );
+    let mut backlog = VecDeque::new();
+    let mut backlog_provenance = DescriptorProvenance::new();
+    for value in 0..CLIENT_RX_BACKLOG_CAPACITY {
+        enqueue_client_rx_backlog(
+            &mut backlog_provenance,
+            &mut backlog,
+            PrivateRawFrameCarrier {
+                bytes: vec![value as u8],
+                occurrence: None,
+            },
+        )?;
+    }
+    if !backlog
+        .iter()
+        .enumerate()
+        .all(|(index, frame)| frame.bytes == [index as u8])
+    {
+        return Err("self-test persistent RX backlog reordered frames".into());
+    }
+    if enqueue_client_rx_backlog(
+        &mut backlog_provenance,
+        &mut backlog,
+        PrivateRawFrameCarrier {
+            bytes: vec![0xff],
+            occurrence: None,
+        },
+    )
+    .is_ok()
+        || !backlog.is_empty()
+    {
+        return Err("self-test persistent RX backlog did not fail closed".into());
+    }
+    println!(
+        "self_test_control_wait_rx result=pass cid2_arrival=persistent fifo_order=true capacity=64 overflow=fail_closed teardown=wipe"
+    );
     let mut malformed = raw_eapol;
     malformed[0..4].copy_from_slice(&((2u32 << 27) | 55).to_le_bytes());
     if parse_connac2_rx_frame(&malformed) != Err(PassiveRxError::Truncated) {
@@ -1884,6 +1926,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         status77: None,
         association_responses: VecDeque::new(),
         queued_data_after_association: VecDeque::new(),
+        rx_during_cid2: None,
         association_tx_count: 0,
         tx: Arc::clone(&missing_tx),
         outstanding: MgmtTxOutstanding::default(),
@@ -2045,6 +2088,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                     },
                 ),
             ]),
+            rx_during_cid2: None,
             association_tx_count: 0,
             tx: Arc::clone(&comeback_tx),
             outstanding: MgmtTxOutstanding::default(),
@@ -2188,14 +2232,12 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 status: burst_status(),
                 security: None,
             }]),
-            queued_data_after_association: VecDeque::from([(
-                1,
-                ClientRxFrame {
-                    bytes: burst_m1,
-                    status: burst_status(),
-                    security: None,
-                },
-            )]),
+            queued_data_after_association: VecDeque::new(),
+            rx_during_cid2: Some(ClientRxFrame {
+                bytes: burst_m1,
+                status: burst_status(),
+                security: None,
+            }),
             association_tx_count: 0,
             tx: Arc::clone(&burst_tx),
             outstanding: MgmtTxOutstanding::default(),
@@ -2274,7 +2316,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     drop(order);
     println!(
-        "self_test_association_control_priority result=pass burst=assoc_response+m1 cid_order=2,3 before_m1=true m2=true"
+        "self_test_association_control_priority result=pass m1_arrival=during_cid2_wait persistent_fifo=true cid_order=2,3 before_m1=true m2=true"
     );
     let tx = Arc::new(Mutex::new(Vec::new()));
     let transport = SourceExactPassiveTransport::new(
@@ -2284,6 +2326,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             status77: Some(status77),
             association_responses: VecDeque::new(),
             queued_data_after_association: VecDeque::new(),
+            rx_during_cid2: None,
             association_tx_count: 0,
             tx: Arc::clone(&tx),
             outstanding: MgmtTxOutstanding::default(),
@@ -6802,12 +6845,33 @@ fn revoke_before_local_carrier_release<T>(
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn revoke_before_local_frame_release<T>(
+fn revoke_before_local_frame_release(
     provenance: &mut DescriptorProvenance,
-    queued: &mut VecDeque<T>,
+    queued: &mut VecDeque<PrivateRawFrameCarrier>,
 ) -> Result<(), String> {
     provenance.invalidate(DescriptorInvalidation::Run)?;
-    queued.clear();
+    while let Some(mut frame) = queued.pop_front() {
+        frame.bytes.fill(0);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+const CLIENT_RX_BACKLOG_CAPACITY: usize = 64;
+
+#[cfg(feature = "fuchsia-passive")]
+fn enqueue_client_rx_backlog(
+    provenance: &mut DescriptorProvenance,
+    queued: &mut VecDeque<PrivateRawFrameCarrier>,
+    frame: PrivateRawFrameCarrier,
+) -> Result<(), String> {
+    if queued.len() >= CLIENT_RX_BACKLOG_CAPACITY {
+        revoke_before_local_frame_release(provenance, queued)?;
+        let mut frame = frame;
+        frame.bytes.fill(0);
+        return Err("persistent client RX backlog capacity exceeded".into());
+    }
+    queued.push_back(frame);
     Ok(())
 }
 
@@ -6895,6 +6959,9 @@ impl Drop for ActiveMcuIo<'_> {
         let _ = self
             .descriptor_provenance
             .invalidate(DescriptorInvalidation::Interface);
+        while let Some(mut frame) = self.normal_rx_frames.pop_front() {
+            frame.bytes.fill(0);
+        }
     }
 }
 
@@ -7407,7 +7474,7 @@ fn drain_rx_queue(
                         "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{},\"rx_descriptor\":{completed_index},\"length\":{response_len}}}",
                         queue.rx_ring_index
                     );
-                    normal_rx_frames.push_back(frame);
+                    enqueue_client_rx_backlog(provenance, normal_rx_frames, frame)?;
                     continue;
                 }
                 DrainedMcuRx::Response(parsed, response) => (parsed, response),
@@ -8751,7 +8818,11 @@ fn drain_data_rx_queue(
                                     occurrence: None,
                                 },
                             };
-                            normal_rx_frames.as_deref_mut().unwrap().push_back(frame);
+                            enqueue_client_rx_backlog(
+                                provenance,
+                                normal_rx_frames.as_deref_mut().unwrap(),
+                                frame,
+                            )?;
                             Ok(None)
                         }
                         Err(PassiveRxError::RxError) => {
@@ -10160,6 +10231,23 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn preserve_client_rx_during_control_wait(&mut self) -> Result<(), String> {
+        self.loader.mcu.handle_irq(None)?;
+        drain_data_rx_queue(
+            self.loader.mcu.wfdma,
+            &mut self.data,
+            &mut self.loader.mcu.descriptor_provenance,
+            &mut self.tx_completions,
+            Some(&mut self.loader.mcu.normal_rx_frames),
+        )?;
+        self.retire_mgmt_tx_completions()?;
+        record_sae_stage(&format!(
+            "control_wait_rx_preserved backlog={} capacity={CLIENT_RX_BACKLOG_CAPACITY}",
+            self.loader.mcu.normal_rx_frames.len()
+        ));
+        Ok(())
+    }
+
     fn retire_mgmt_tx_completions(&mut self) -> Result<(), String> {
         self.tx_completions
             .append(&mut self.loader.mcu.tx_completions);
@@ -10432,30 +10520,39 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 Some(&mut self.loader.mcu.normal_rx_frames),
             )?;
             self.retire_mgmt_tx_completions()?;
-            let frames = std::mem::take(&mut self.loader.mcu.normal_rx_frames);
-            for frame in &frames {
+            let matching = self
+                .loader
+                .mcu
+                .normal_rx_frames
+                .iter()
+                .position(|frame| {
+                    parse_connac2_rx_frame(&frame.bytes)
+                        .ok()
+                        .and_then(|parsed| parsed.bytes.get(..30).map(<[u8]>::to_vec))
+                        .is_some_and(|auth| {
+                            u16::from_le_bytes([auth[0], auth[1]]) & 0x00fc == 0x00b0
+                                && auth[4..10] == client
+                                && auth[10..16] == peer
+                                && auth[16..22] == peer
+                        })
+                });
+            if let Some(index) = matching {
+                let frame = self
+                    .loader
+                    .mcu
+                    .normal_rx_frames
+                    .remove(index)
+                    .expect("matching persistent RX index exists");
                 if let Some(occurrence) = frame.occurrence.as_ref() {
                     self.loader.mcu.descriptor_provenance.retire(occurrence);
                 }
-            }
-            for frame in frames {
                 let parsed = parse_connac2_rx_frame(&frame.bytes)
                     .map_err(|error| format!("parse SAE Connac2 RX envelope: {error:?}"))?;
                 let bytes = parsed.bytes;
-                let Some(auth) = bytes.get(..30) else {
-                    return Err("truncated SAE authentication frame".into());
-                };
-                let frame_control = u16::from_le_bytes([auth[0], auth[1]]);
+                let auth = &bytes[..30];
                 let receiver: [u8; 6] = auth[4..10].try_into().expect("fixed field");
                 let transmitter: [u8; 6] = auth[10..16].try_into().expect("fixed field");
                 let bssid: [u8; 6] = auth[16..22].try_into().expect("fixed field");
-                if frame_control & 0x00fc != 0x00b0
-                    || receiver != client
-                    || transmitter != peer
-                    || bssid != peer
-                {
-                    continue;
-                }
                 let algorithm = u16::from_le_bytes([auth[24], auth[25]]);
                 let sequence = u16::from_le_bytes([auth[26], auth[27]]);
                 let status_raw = u16::from_le_bytes([auth[28], auth[29]]);
@@ -10526,11 +10623,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "linux_sta_update_precondition wcid={wcid} admission_counts_cleared=true"
             ));
         }
-        if self
+        let command = self
             .loader
-            .send_acknowledged_uni_command(expected_cid, encoded)
-            .is_err()
-        {
+            .send_acknowledged_uni_command(expected_cid, encoded);
+        let preserve = self.preserve_client_rx_during_control_wait();
+        if command.is_err() {
             if let Some(wcid) = sta_update_wcid {
                 record_sae_stage(&format!(
                     "firmware_wtbl_update result=error stage=cid3_ack wcid={wcid}"
@@ -10538,6 +10635,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             }
             return Err(zx::Status::IO);
         }
+        preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         // Linux's association STA add is CID 3 with this exact five-TLV
         // fixture. Observe, but never mutate, the source-owned RX state after
         // its ACK so a no-data run distinguishes filtering from ring ingress.
@@ -10594,7 +10692,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::INVALID_ARGS);
         }
-        self.transmit_owned_client_frame(bytes).map_err(|error| {
+        let transmit = self.transmit_owned_client_frame(bytes);
+        let preserve = self.preserve_client_rx_during_control_wait();
+        transmit.map_err(|error| {
             let category = if error.contains("completion is still outstanding") {
                 "completion_outstanding"
             } else if error.contains("not safely reclaimable") {
@@ -10614,7 +10714,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "management_tx_pre_submit result=error category={category}"
             ));
             zx::Status::IO
-        })
+        })?;
+        preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
