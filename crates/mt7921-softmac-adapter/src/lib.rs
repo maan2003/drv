@@ -164,6 +164,15 @@ pub trait Mt7921PassiveTransport {
     type Error: Error + 'static;
 
     fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error>;
+    fn set_channel_context(&mut self, context: PhysicalChannelContext) -> Result<(), Self::Error> {
+        if context.center_channel != context.channel.number as u8
+            || context.bandwidth != 0
+            || context.center_channel2 != 0
+        {
+            return self.set_channel(context.channel);
+        }
+        self.set_channel(context.channel)
+    }
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error>;
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error>;
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error>;
@@ -184,6 +193,14 @@ pub trait Mt7921PassiveTransport {
     fn next_client_rx(&mut self) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
         Ok(None)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalChannelContext {
+    pub channel: CandidateChannel,
+    pub center_channel: u8,
+    pub bandwidth: u8,
+    pub center_channel2: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +396,16 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
 
     fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error> {
+        self.set_channel_context(PhysicalChannelContext {
+            channel,
+            center_channel: channel.number as u8,
+            bandwidth: 0,
+            center_channel2: 0,
+        })
+    }
+
+    fn set_channel_context(&mut self, context: PhysicalChannelContext) -> Result<(), Self::Error> {
+        let channel = context.channel;
         if !self.initialized {
             self.prepare_receive_only()?;
             self.issue(PassiveMcuCommand::MacEnable)?;
@@ -393,6 +420,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         }
         self.issue(PassiveMcuCommand::ChannelSwitch {
             channel,
+            center_channel: context.center_channel,
+            bandwidth: context.bandwidth,
+            center_channel2: context.center_channel2,
             antenna_mask: self.antenna_mask,
         })?;
         self.selected = Some(channel);
@@ -512,6 +542,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                 if success && let Some(channel) = active.remaining.pop_front() {
                     self.issue(PassiveMcuCommand::ChannelSwitch {
                         channel,
+                        center_channel: channel.number as u8,
+                        bandwidth: 0,
+                        center_channel2: 0,
                         antenna_mask: self.antenna_mask,
                     })?;
                     self.selected = Some(channel);
@@ -616,7 +649,6 @@ pub struct Mt7921SoftmacAdapter<T> {
     authorized: Vec<ChannelNumber>,
     next_scan_id: u64,
     last_timestamp_nanos: Option<i64>,
-    selected_channel: Option<ChannelNumber>,
     state: ScanState,
 }
 
@@ -655,7 +687,6 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
             authorized,
             next_scan_id: 1,
             last_timestamp_nanos: None,
-            selected_channel: None,
             state: ScanState::Idle,
         })
     }
@@ -668,10 +699,6 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
     /// the adapter's scan/lifecycle ownership.
     pub fn with_transport_mut<R>(&mut self, operation: impl FnOnce(&mut T) -> R) -> R {
         operation(&mut self.transport)
-    }
-
-    pub fn selected_channel(&self) -> Option<ChannelNumber> {
-        self.selected_channel
     }
 
     /// Explicit rejection surface for callers that otherwise have active scan
@@ -788,22 +815,26 @@ impl<T: Mt7921PassiveTransport> SoftmacHardware for Mt7921SoftmacAdapter<T> {
     ) -> Result<(), Self::Error> {
         self.ensure_live()?;
         let primary = request.primary.ok_or(AdapterError::InvalidRequest)?;
-        if request.bandwidth != Some(ChannelBandwidth::Cbw20)
-            || request
-                .vht_secondary_80_channel
-                .is_some_and(|secondary| secondary.number != 0)
-        {
-            return Err(AdapterError::UnsupportedChannelWidth);
-        }
+        let bandwidth = request.bandwidth.ok_or(AdapterError::InvalidRequest)?;
+        let secondary = request
+            .vht_secondary_80_channel
+            .ok_or(AdapterError::InvalidRequest)?;
         if !self.authorized.contains(&primary) {
             return Err(AdapterError::UnauthorizedChannel(primary));
         }
         let candidate = channel_to_candidate(primary, &self.candidates)
             .ok_or(AdapterError::UnauthorizedChannel(primary))?;
+        let (center_channel, bandwidth, center_channel2) =
+            linux_channel_shape(primary.number, bandwidth, secondary.number)
+                .ok_or(AdapterError::UnsupportedChannelWidth)?;
         self.transport
-            .set_channel(candidate)
+            .set_channel_context(PhysicalChannelContext {
+                channel: candidate,
+                center_channel,
+                bandwidth,
+                center_channel2,
+            })
             .map_err(|error| self.transport_failure(error))?;
-        self.selected_channel = Some(primary);
         Ok(())
     }
 
@@ -921,6 +952,39 @@ fn channel_to_candidate(
         .iter()
         .copied()
         .find(|candidate| to_fuchsia_channel(*candidate) == Some(channel))
+}
+
+/// Convert Fuchsia's channel notation to Linux v7.1.5 mt7921 MCU chandef
+/// fields (`center_ch`, `bw`, `center_ch2`).
+pub fn linux_channel_shape(
+    primary: u8,
+    bandwidth: ChannelBandwidth,
+    secondary80: u8,
+) -> Option<(u8, u8, u8)> {
+    let center80 = match primary {
+        36..=48 => 42,
+        52..=64 => 58,
+        100..=112 => 106,
+        116..=128 => 122,
+        132..=144 => 138,
+        148..=161 => 155,
+        _ => 0,
+    };
+    match bandwidth {
+        ChannelBandwidth::Cbw20 => Some((primary, 0, 0)),
+        ChannelBandwidth::Cbw40 => primary.checked_add(2).map(|center| (center, 1, 0)),
+        ChannelBandwidth::Cbw40Below => primary.checked_sub(2).map(|center| (center, 1, 0)),
+        ChannelBandwidth::Cbw80 if center80 != 0 => Some((center80, 2, 0)),
+        ChannelBandwidth::Cbw160 => match primary {
+            36..=64 => Some((50, 3, 0)),
+            100..=128 => Some((114, 3, 0)),
+            _ => None,
+        },
+        ChannelBandwidth::Cbw80P80 if center80 != 0 && secondary80 != 0 => {
+            Some((center80, 6, secondary80))
+        }
+        _ => None,
+    }
 }
 
 fn to_fuchsia_channel(channel: CandidateChannel) -> Option<ChannelNumber> {

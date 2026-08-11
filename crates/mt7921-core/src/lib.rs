@@ -3120,6 +3120,9 @@ pub enum PassiveMcuCommand {
     },
     ChannelSwitch {
         channel: CandidateChannel,
+        center_channel: u8,
+        bandwidth: u8,
+        center_channel2: u8,
         antenna_mask: u8,
     },
     AddDevice {
@@ -3210,6 +3213,9 @@ pub fn encode_passive_mcu_command(
         return Err(PassiveMcuCommandError::InvalidSequence);
     }
     let channel_payload = |channel: CandidateChannel,
+                           center_channel: u8,
+                           bandwidth: u8,
+                           center_channel2: u8,
                            antenna_mask: u8,
                            switch_reason: u8,
                            channel_switch: bool|
@@ -3232,13 +3238,22 @@ pub fn encode_passive_mcu_command(
         if antenna_mask != 3 {
             return Err(PassiveMcuCommandError::InvalidAntennaMask);
         }
+        if !matches!(bandwidth, 0..=3 | 6)
+            || center_channel == 0
+            || (bandwidth == 0 && center_channel != channel.number as u8)
+            || (bandwidth != 6 && center_channel2 != 0)
+            || (bandwidth == 6 && center_channel2 == 0)
+        {
+            return Err(PassiveMcuCommandError::UnsupportedChannel);
+        }
         let mut payload = vec![0; 76];
         payload[0] = channel.number as u8;
-        payload[1] = channel.number as u8;
-        payload[2] = 0;
+        payload[1] = center_channel;
+        payload[2] = bandwidth;
         payload[3] = 2;
         payload[4] = if channel_switch { 2 } else { antenna_mask };
         payload[5] = switch_reason;
+        payload[7] = center_channel2;
         payload[10] = channel_band;
         Ok(payload)
     };
@@ -3253,16 +3268,35 @@ pub fn encode_passive_mcu_command(
         } => encode_legacy_mcu(
             0xed,
             0x4e,
-            &channel_payload(*channel, *antenna_mask, 0, false)?,
+            &channel_payload(
+                *channel,
+                channel.number as u8,
+                0,
+                0,
+                *antenna_mask,
+                0,
+                false,
+            )?,
             sequence,
         ),
         PassiveMcuCommand::ChannelSwitch {
             channel,
+            center_channel,
+            bandwidth,
+            center_channel2,
             antenna_mask,
         } => encode_legacy_mcu(
             0xed,
             0x08,
-            &channel_payload(*channel, *antenna_mask, 9, true)?,
+            &channel_payload(
+                *channel,
+                *center_channel,
+                *bandwidth,
+                *center_channel2,
+                *antenna_mask,
+                9,
+                true,
+            )?,
             sequence,
         ),
         PassiveMcuCommand::AddDevice { mac } => {
@@ -5782,7 +5816,96 @@ pub struct LegacyWmeAssociation {
 pub struct JoinedClientBss {
     pub bssid: [u8; 6],
     pub channel: u16,
+    pub channel_generation: u64,
     pub beacon_interval: u16,
+}
+
+/// The physical channel identity programmed by the mt7921 channel-switch
+/// command. This mirrors Linux v7.1.5 `mt7921_mcu_set_chan_info`'s complete
+/// chandef identity rather than duplicating a protocol-layer approximation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientPhysicalChannel {
+    pub band: u8,
+    pub primary: u16,
+    pub center: u16,
+    pub bandwidth: u8,
+    pub center2: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientChannelLease {
+    pub channel: ClientPhysicalChannel,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientPhysicalChannelEnsure {
+    Current(ClientChannelLease),
+    TransitionRequired {
+        current: Option<ClientChannelLease>,
+        requested: ClientPhysicalChannel,
+    },
+}
+
+#[derive(Default)]
+pub struct ClientChannelContext {
+    current: Option<ClientChannelLease>,
+    authorized_generation: Option<u64>,
+    next_generation: u64,
+}
+
+impl ClientChannelContext {
+    pub fn ensure_channel(&self, requested: ClientPhysicalChannel) -> ClientPhysicalChannelEnsure {
+        match self.current {
+            Some(current) if current.channel == requested => {
+                ClientPhysicalChannelEnsure::Current(current)
+            }
+            current => ClientPhysicalChannelEnsure::TransitionRequired { current, requested },
+        }
+    }
+
+    pub fn establish_channel(
+        &mut self,
+        channel: ClientPhysicalChannel,
+    ) -> Result<ClientChannelLease, String> {
+        if let ClientPhysicalChannelEnsure::Current(current) = self.ensure_channel(channel) {
+            return Ok(current);
+        }
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or("client channel generation exhausted")?;
+        let lease = ClientChannelLease {
+            channel,
+            generation: self.next_generation,
+        };
+        self.current = Some(lease);
+        self.authorized_generation = None;
+        Ok(lease)
+    }
+
+    pub fn authorize_channel(
+        &mut self,
+        channel: ClientPhysicalChannel,
+    ) -> Result<ClientChannelLease, String> {
+        let ClientPhysicalChannelEnsure::Current(current) = self.ensure_channel(channel) else {
+            return Err("client channel authorization does not match physical context".into());
+        };
+        self.authorized_generation = Some(current.generation);
+        Ok(current)
+    }
+
+    pub fn authorized_channel(&self) -> Result<ClientChannelLease, String> {
+        let current = self.current.ok_or("client physical channel is absent")?;
+        if self.authorized_generation != Some(current.generation) {
+            return Err("client physical channel generation is not authorized".into());
+        }
+        Ok(current)
+    }
+
+    pub fn revoke_authorization(&mut self) {
+        self.authorized_generation = None;
+    }
 }
 
 pub struct RetainedGtk {
@@ -5935,12 +6058,10 @@ impl ClientFirmwareEffectsState {
     pub fn bind_join(
         &mut self,
         bssid: [u8; 6],
-        tuned_channel: u16,
-        requested_channel: u16,
+        channel: ClientChannelLease,
         beacon_interval: u16,
     ) -> Result<(), String> {
         if bssid == [0; 6]
-            || tuned_channel != requested_channel
             || beacon_interval == 0
             || self.association.is_some()
             || self.bss_programmed
@@ -5950,7 +6071,8 @@ impl ClientFirmwareEffectsState {
         }
         let joined = JoinedClientBss {
             bssid,
-            channel: requested_channel,
+            channel: channel.channel.primary,
+            channel_generation: channel.generation,
             beacon_interval,
         };
         if self.joined.is_some_and(|current| current != joined) {
@@ -5980,12 +6102,17 @@ impl ClientFirmwareEffectsState {
     pub fn associate(
         &mut self,
         association: LegacyWmeAssociation,
+        channel: ClientChannelLease,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let joined = self
             .joined
-            .filter(|joined| joined.bssid == association.peer)
-            .ok_or("association requires the joined target")?;
+            .filter(|joined| {
+                joined.bssid == association.peer
+                    && joined.channel == channel.channel.primary
+                    && joined.channel_generation == channel.generation
+            })
+            .ok_or("association requires the current joined channel generation")?;
         if self.association.is_some() || self.bss_programmed || self.firmware_uncertain {
             return Err("client firmware association state is not clean".into());
         }
@@ -7602,6 +7729,45 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn client_channel_context_owns_identity_generation_and_authorization() {
+        let channel36 = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 36,
+            bandwidth: 0,
+            center2: 0,
+        };
+        let channel40 = ClientPhysicalChannel {
+            band: 1,
+            primary: 40,
+            center: 40,
+            bandwidth: 0,
+            center2: 0,
+        };
+        let mut context = ClientChannelContext::default();
+        assert!(matches!(
+            context.ensure_channel(channel36),
+            ClientPhysicalChannelEnsure::TransitionRequired { current: None, .. }
+        ));
+        let first = context.establish_channel(channel36).unwrap();
+        assert_eq!(
+            context.ensure_channel(channel36),
+            ClientPhysicalChannelEnsure::Current(first)
+        );
+        assert_eq!(context.establish_channel(channel36).unwrap(), first);
+        assert_eq!(context.authorize_channel(channel36).unwrap(), first);
+
+        let second = context.establish_channel(channel40).unwrap();
+        assert_eq!(second.generation, first.generation + 1);
+        assert!(context.authorized_channel().is_err());
+        assert!(matches!(
+            context.ensure_channel(channel36),
+            ClientPhysicalChannelEnsure::TransitionRequired { current: Some(current), .. }
+                if current == second
+        ));
+    }
+
+    #[test]
     fn client_join_association_and_teardown_match_linux_v71_bss_wcid_order() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let association = LegacyWmeAssociation {
@@ -7614,16 +7780,38 @@ mod tests {
             mfp_required: false,
         };
         let mut state = ClientFirmwareEffectsState::default();
-        assert!(state.bind_join(peer, 36, 40, 100).is_err());
-        state.bind_join(peer, 36, 36, 100).unwrap();
+        let mut channels = ClientChannelContext::default();
+        let physical = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 36,
+            bandwidth: 0,
+            center2: 0,
+        };
+        let lease = channels.establish_channel(physical).unwrap();
+        assert!(channels.authorized_channel().is_err());
+        assert_eq!(channels.authorize_channel(physical).unwrap(), lease);
+        state.bind_join(peer, lease, 100).unwrap();
         assert!(state.accepts_joined_management(&[
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x10, 0x20, 0x30,
             0x40, 0x50, 0x60,
         ]));
+        assert!(
+            state
+                .associate(
+                    association,
+                    ClientChannelLease {
+                        generation: lease.generation + 1,
+                        ..lease
+                    },
+                    |_, _| Ok(())
+                )
+                .is_err()
+        );
 
         let mut transcript = Vec::new();
         state
-            .associate(association, |_, command| {
+            .associate(association, lease, |_, command| {
                 transcript.push(command.to_vec());
                 Ok(())
             })
@@ -7664,13 +7852,23 @@ mod tests {
             negotiated_qos: true,
             mfp_required: false,
         };
+        let lease = ClientChannelLease {
+            channel: ClientPhysicalChannel {
+                band: 1,
+                primary: 36,
+                center: 36,
+                bandwidth: 0,
+                center2: 0,
+            },
+            generation: 1,
+        };
 
         let mut rolled_back = ClientFirmwareEffectsState::default();
-        rolled_back.bind_join(peer, 36, 36, 100).unwrap();
+        rolled_back.bind_join(peer, lease, 100).unwrap();
         let mut transcript = Vec::new();
         assert!(
             rolled_back
-                .associate(association, |cid, command| {
+                .associate(association, lease, |cid, command| {
                     transcript.push((cid, command[56]));
                     if transcript.len() == 1 {
                         Err("ambiguous BSS add".into())
@@ -7685,10 +7883,10 @@ mod tests {
         assert!(!rolled_back.firmware_uncertain);
 
         let mut dirty = ClientFirmwareEffectsState::default();
-        dirty.bind_join(peer, 36, 36, 100).unwrap();
+        dirty.bind_join(peer, lease, 100).unwrap();
         assert!(
             dirty
-                .associate(association, |_, _| Err("no ACK".into()))
+                .associate(association, lease, |_, _| Err("no ACK".into()))
                 .is_err()
         );
         assert!(dirty.bss_programmed);
@@ -10691,6 +10889,9 @@ mod tests {
         let switch = encode_passive_mcu_command(
             &PassiveMcuCommand::ChannelSwitch {
                 channel,
+                center_channel: channel.number as u8,
+                bandwidth: 0,
+                center_channel2: 0,
                 antenna_mask: 3,
             },
             2,
@@ -10698,6 +10899,23 @@ mod tests {
         .unwrap();
         assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 2, 0, 8, 0, 1]);
         assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
+        let channel36 = CandidateChannel {
+            band: PhysicalBand::Ghz5,
+            number: 36,
+            frequency_mhz: 5180,
+        };
+        let wide = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel: channel36,
+                center_channel: 38,
+                bandwidth: 1,
+                center_channel2: 0,
+                antenna_mask: 3,
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(&wide[64..72], &[36, 38, 1, 2, 2, 9, 0, 0]);
 
         let scan = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
@@ -10731,6 +10949,9 @@ mod tests {
         let switch_5ghz = encode_passive_mcu_command(
             &PassiveMcuCommand::ChannelSwitch {
                 channel: channel_5ghz,
+                center_channel: channel_5ghz.number as u8,
+                bandwidth: 0,
+                center_channel2: 0,
                 antenna_mask: 3,
             },
             4,

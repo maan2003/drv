@@ -200,15 +200,15 @@ pub trait Mt7921ClientEffects {
     /// Immediately and durably poison every shared TX handle for lifecycle.
     fn revoke_lifecycle(&mut self);
 
-    /// True only while the scan-selected target/channel authorization
-    /// generation remains current for this exact ClientMlme request.
-    fn may_reuse_channel(
+    /// Resolve the protocol request against the driver's physical channel
+    /// context. `Current` means no second channel-switch command is allowed.
+    fn ensure_channel(
         &self,
         _: fidl_ieee80211::ChannelNumber,
         _: fidl_ieee80211::ChannelBandwidth,
         _: fidl_ieee80211::ChannelNumber,
-    ) -> bool {
-        false
+    ) -> Result<ClientChannelEnsure, zx::Status> {
+        Ok(ClientChannelEnsure::TransitionRequired)
     }
 
     fn set_channel(
@@ -267,8 +267,13 @@ pub trait Mt7921ClientEffects {
     fn stop(&mut self) -> Result<(), zx::Status>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientChannelEnsure {
+    Current,
+    TransitionRequired,
+}
+
 trait Mt7921ClientScan: Mt7921ClientIo {
-    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber>;
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -304,10 +309,6 @@ impl Mt7921ClientIo for NoClientScan {
 }
 
 impl Mt7921ClientScan for NoClientScan {
-    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber> {
-        None
-    }
-
     fn set_channel(
         &mut self,
         _: fidl_ieee80211::ChannelNumber,
@@ -331,10 +332,6 @@ impl Mt7921ClientScan for NoClientScan {
 }
 
 impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter<T> {
-    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber> {
-        self.selected_channel()
-    }
-
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -943,11 +940,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         vht_secondary_80_channel: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        let reuse = backend.scan.selected_channel() == Some(primary)
-            && backend
+        let current =
+            backend
                 .effects
-                .may_reuse_channel(primary, bandwidth, vht_secondary_80_channel);
-        let tuned = if reuse {
+                .ensure_channel(primary, bandwidth, vht_secondary_80_channel)?
+                == ClientChannelEnsure::Current;
+        let tuned = if current {
             Ok(())
         } else {
             backend
@@ -1290,13 +1288,19 @@ mod tests {
 
         fn revoke_lifecycle(&mut self) {}
 
-        fn may_reuse_channel(
+        fn ensure_channel(
             &self,
             primary: fidl_ieee80211::ChannelNumber,
             bandwidth: fidl_ieee80211::ChannelBandwidth,
             secondary: fidl_ieee80211::ChannelNumber,
-        ) -> bool {
-            self.reuse_channel && self.channel == Some((primary, bandwidth, secondary))
+        ) -> Result<ClientChannelEnsure, zx::Status> {
+            Ok(
+                if self.reuse_channel && self.channel == Some((primary, bandwidth, secondary)) {
+                    ClientChannelEnsure::Current
+                } else {
+                    ClientChannelEnsure::TransitionRequired
+                },
+            )
         }
 
         fn set_channel(
@@ -1404,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn client_mlme_reuses_only_the_current_authorized_physical_channel() {
+    fn client_mlme_replays_one_exact_physical_channel_context() {
         futures::executor::block_on(async {
             let transport = FakePassiveTransport::default();
             let calls = transport.0.clone();
@@ -1440,11 +1444,31 @@ mod tests {
             .unwrap();
             assert_eq!(calls.lock().unwrap().len(), 1);
 
+            DeviceOps::set_channel(
+                &mut device,
+                channel(36),
+                fidl_ieee80211::ChannelBandwidth::Cbw40,
+                channel(0),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 2);
+
+            DeviceOps::set_channel(
+                &mut device,
+                channel(36),
+                fidl_ieee80211::ChannelBandwidth::Cbw40,
+                channel(0),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 2);
+
             assert!(
                 DeviceOps::set_channel(
                     &mut device,
-                    channel(36),
-                    fidl_ieee80211::ChannelBandwidth::Cbw40,
+                    channel(40),
+                    fidl_ieee80211::ChannelBandwidth::Cbw20,
                     channel(0),
                 )
                 .await
