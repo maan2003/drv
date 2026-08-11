@@ -2599,3 +2599,49 @@ before reset, reset VFIO, verified the safe state, and restored native
 test unit were inactive, native iwd WPA3 connectivity returned on `wlan12`,
 the DHCP default route was present, and an HTTPS Internet probe succeeded
 without a reboot.
+
+The native-client-identity and preauthentication firmware-context integration
+preserves the validated local-unicast VIF address separately from the NIC's
+factory address. The same typed VIF identity feeds SoftMAC, DeviceInfo, SME,
+SAE headers, receive filtering, and Linux-v7.1-exact DEV/BSS programming.
+DEV_INFO_ACTIVE is marked dirty before submission and acknowledged before the
+initial BSS_INFO_BASIC for OMAC 0, BSS 0, WMM 0, and reserved WCID 19. The
+loader's mandatory cleanup invokes BSS disable before DEV disable while MCU
+transport remains live; ambiguous failures stay dirty and require reset
+containment. The canonical status-77 regression now exposes its peer response
+only after the initial group-20 transmission is synchronously acknowledged.
+
+The integration passed 111 core tests and its compile-fail doc test, the
+`userspace-vfio` and port-spike library tests, 38 full adapter tests and three
+doc tests, 109 passive-transport tests, both production Netstack
+DHCP/DNS/TCP/HTTP tests, the deterministic full status-77 fallback regression,
+the supervisor syntax and handoff tests, the root format check, and
+`git diff --check`. A fresh locked/offline release and sterile no-hardware
+gate passed.
+
+Exactly one guarded follow-up, `wifi-sae-e2e32`, used matching local, staged,
+and active release SHA-256
+`b40ad1f429364d022344092a3ff6d98b86418a038fdd13f76cce80ce663d8649`
+(11619352 bytes) and supervisor SHA-256
+`d336af59d0a18adb96d792ce0b462992e578865e42201176d70410c528bc4290`.
+Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260811T101738Z-0000_05_00.0.log`; the
+public recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260811T101738Z.log`.
+Neither contains a secret-bearing assignment.
+
+Before disconnect, the supervisor captured target BSSID
+`f2:a3:18:4f:30:76`, channel 36, and local-unicast VIF address
+`8a:fd:2a:8b:70:5a`. The existing `wifi-driver-lab` systemd environment
+allowlist forwarded BSSID and channel but not the newly introduced
+`DRV_SAE_CLIENT_MAC`, so userspace failed closed at its required-client-MAC
+gate. Firmware loading, DEV/BSS programming, group-20 transmission, peer
+status 77, group-19 fallback, association, keys, controlled port, and
+production Netstack Internet proof were not reached. No retry was made.
+
+Restore completed with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd
+WPA3 association, IPv4, the DHCP default route, and gateway connectivity
+recovered on `wlan13` in 6207 ms; a post-run HTTPS probe succeeded. Lab state
+was absent, the watchdog and test unit were inactive, and no reboot occurred.
+The explicit public-only `wifi-driver-lab` allowlist correction remains held
+for deployment and reverification before any future physical authorization.
