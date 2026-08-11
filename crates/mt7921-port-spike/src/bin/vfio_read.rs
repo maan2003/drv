@@ -1510,6 +1510,19 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         band: WlanBand::FiveGhz,
         number: 36,
     };
+    let mut valid_comeback = vec![0; 30];
+    valid_comeback.extend_from_slice(&[56, 5, 3, 20, 0, 0, 0]);
+    let mut malformed_comeback = vec![0; 30];
+    malformed_comeback.extend_from_slice(&[56, 4, 3, 20, 0, 0]);
+    if association_comeback_interval(&valid_comeback, 30) != Some((20, 20))
+        || association_comeback_interval(&malformed_comeback, 30).is_some()
+        || association_comeback_interval(&valid_comeback[..30], 30).is_some()
+    {
+        return Err("self-test association comeback IE contract failed".into());
+    }
+    println!(
+        "self_test_association_comeback result=pass ie_id_lengths=56:5 valid_tu=20 valid_ms=20 malformed=failure no_ie=failure"
+    );
     let raw_eapol = e2e48_translation_error_eapol_frame(client, peer);
     let parsed_eapol = parse_connac2_rx_frame(&raw_eapol)
         .map_err(|error| format!("self-test E2E48 raw EAPOL parse: {error:?}"))?;
@@ -8661,6 +8674,30 @@ fn management_ie_id_lengths(bytes: &[u8], offset: usize) -> String {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn association_comeback_interval(bytes: &[u8], offset: usize) -> Option<(u32, u64)> {
+    let mut cursor = offset;
+    let mut comeback = None;
+    while cursor < bytes.len() {
+        let header = bytes.get(cursor..cursor.checked_add(2)?)?;
+        let length = usize::from(header[1]);
+        let next = cursor.checked_add(2 + length)?;
+        let body = bytes.get(cursor + 2..next)?;
+        if header[0] == 56 {
+            if comeback.is_some() || body.len() != 5 || body[0] != 3 {
+                return None;
+            }
+            let tu = u32::from_le_bytes(body[1..5].try_into().ok()?);
+            if tu == 0 {
+                return None;
+            }
+            comeback = Some((tu, u64::from(tu) * 1024 / 1000));
+        }
+        cursor = next;
+    }
+    comeback
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn classify_client_data_frame(
     bytes: &[u8],
     client: [u8; 6],
@@ -9227,16 +9264,31 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 record_sae_stage(
                     "association_response_admitted address_match=true channel_generation_match=true",
                 );
+                record_sae_stage(&format!(
+                    "association_response_ies ie_id_lengths={}",
+                    management_ie_id_lengths(&frame.bytes, 30)
+                ));
                 let status = frame
                     .bytes
                     .get(26..28)
                     .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let comeback = association_comeback_interval(&frame.bytes, 30);
+                if let Some((tu, ms)) = comeback {
+                    record_sae_stage(&format!(
+                        "association_comeback advertised=true valid=true tu={tu} ms={ms}"
+                    ));
+                } else if status == Some(30) {
+                    record_sae_stage(
+                        "association_comeback advertised=unknown valid=false tu=unknown ms=unknown",
+                    );
+                }
                 record_sae_stage(&match status {
-                    Some(0) => "mlme_association_disposition result=success status=0 retry_supported=false".to_string(),
+                    Some(0) => "mlme_association_disposition result=success status=0 retry_supported=true".to_string(),
+                    Some(30) if comeback.is_some() => "mlme_association_disposition result=comeback status=30 retry_supported=true".to_string(),
                     Some(status) => format!(
                         "mlme_association_disposition result=failure status={status} retry_supported=false"
                     ),
-                    None => "mlme_association_disposition result=malformed status=unknown retry_supported=false".to_string(),
+                    None => "mlme_association_disposition result=malformed status=unknown retry_supported=true".to_string(),
                 });
             }
         }

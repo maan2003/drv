@@ -83,6 +83,29 @@ impl<E: fmt::Display> fmt::Display for OpenConnectError<E> {
 
 impl<E: Error + 'static> Error for OpenConnectError<E> {}
 
+fn association_comeback_tu(elements: &[u8]) -> Option<u32> {
+    let mut offset = 0usize;
+    let mut comeback = None;
+    while offset < elements.len() {
+        let header = elements.get(offset..offset.checked_add(2)?)?;
+        let len = usize::from(header[1]);
+        let next = offset.checked_add(2 + len)?;
+        let body = elements.get(offset + 2..next)?;
+        if header[0] == 56 {
+            if comeback.is_some() || body.len() != 5 || body[0] != 3 {
+                return None;
+            }
+            let tu = u32::from_le_bytes(body[1..5].try_into().ok()?);
+            if tu == 0 {
+                return None;
+            }
+            comeback = Some(tu);
+        }
+        offset = next;
+    }
+    comeback
+}
+
 /// Host-portable extraction of the pinned client MLME's open-network closure.
 pub struct OpenClientMlme {
     iface_mac: MacAddr,
@@ -91,6 +114,9 @@ pub struct OpenClientMlme {
     state: OpenClientState,
     sequence_manager: SequenceManager,
     timer: Option<ConnectTimer>,
+    comeback_timer_id: Option<u64>,
+    next_timer_id: u64,
+    association_attempts: u8,
     events: VecDeque<fidl_mlme::MlmeEvent>,
 }
 
@@ -107,6 +133,9 @@ impl OpenClientMlme {
             state: OpenClientState::Joined,
             sequence_manager: SequenceManager::new(),
             timer: None,
+            comeback_timer_id: None,
+            next_timer_id: 2,
+            association_attempts: 1,
             events: VecDeque::new(),
         }
     }
@@ -273,6 +302,46 @@ impl OpenClientMlme {
                 OpenClientState::Authenticating | OpenClientState::Associating
             )
         {
+            if self.comeback_timer_id == Some(timer_id) {
+                self.comeback_timer_id = None;
+                if self.association_attempts >= 3 {
+                    self.finish_failure(
+                        hardware,
+                        fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                let frame = match self.association_request_frame() {
+                    Ok(frame) => frame,
+                    Err(()) => {
+                        self.finish_failure(
+                            hardware,
+                            fidl_ieee80211::StatusCode::RefusedTemporarily,
+                            false,
+                        )?;
+                        return Err(OpenConnectError::FrameWrite);
+                    }
+                };
+                if let Err(error) = hardware.send_mgmt_frame(frame) {
+                    self.finish_failure(
+                        hardware,
+                        fidl_ieee80211::StatusCode::RefusedTemporarily,
+                        false,
+                    )?;
+                    return Err(OpenConnectError::Hardware(error));
+                }
+                self.association_attempts += 1;
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.timer = Some(ConnectTimer {
+                    id,
+                    duration_nanos: i64::from(self.request.selected_bss.beacon_period)
+                        * i64::from(self.request.connect_failure_timeout)
+                        * 1_024_000,
+                });
+                return Ok(());
+            }
             self.finish_failure(
                 hardware,
                 fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
@@ -384,6 +453,18 @@ impl OpenClientMlme {
     ) -> Result<(), OpenConnectError<H::Error>> {
         let status = Option::<fidl_ieee80211::StatusCode>::from(frame.assoc_resp_hdr.status_code)
             .unwrap_or(fidl_ieee80211::StatusCode::RefusedReasonUnspecified);
+        if status == fidl_ieee80211::StatusCode::RefusedTemporarily {
+            if let Some(tu) = association_comeback_tu(frame.elements) {
+                let id = self.next_timer_id;
+                self.next_timer_id += 1;
+                self.comeback_timer_id = Some(id);
+                self.timer = Some(ConnectTimer {
+                    id,
+                    duration_nanos: i64::from(tu) * 1_024_000,
+                });
+                return Ok(());
+            }
+        }
         if status != fidl_ieee80211::StatusCode::Success {
             self.finish_failure(hardware, status, false)?;
             return Ok(());
@@ -440,7 +521,7 @@ impl OpenClientMlme {
             )?;
             return Ok(());
         };
-        let aid = frame.assoc_resp_hdr.aid;
+        let aid = frame.assoc_resp_hdr.aid & 0x07ff;
         let association_ies = frame.elements.to_vec();
         let config = fidl_softmac::WlanAssociationConfig {
             bssid: Some(self.request.selected_bss.bssid),
@@ -472,6 +553,7 @@ impl OpenClientMlme {
             let _ = hardware.set_ethernet_up();
         }
         self.timer = None;
+        self.comeback_timer_id = None;
         self.state = OpenClientState::Associated;
         self.events.push_back(fidl_mlme::MlmeEvent::ConnectConf {
             resp: fidl_mlme::ConnectConfirm {
@@ -491,6 +573,7 @@ impl OpenClientMlme {
         clear_association: bool,
     ) -> Result<(), OpenConnectError<H::Error>> {
         self.timer = None;
+        self.comeback_timer_id = None;
         self.state = OpenClientState::Joined;
         self.events.push_back(fidl_mlme::MlmeEvent::ConnectConf {
             resp: fidl_mlme::ConnectConfirm {
@@ -724,6 +807,16 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    fn association_response_with_ies(
+        status: fidl_ieee80211::StatusCode,
+        ies: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = association_response(status, &[0x82]);
+        frame.truncate(frame.len() - 3);
+        frame.extend_from_slice(ies);
+        frame
     }
 
     fn connect_status(client: &mut OpenClientMlme) -> fidl_ieee80211::StatusCode {
@@ -1011,6 +1104,90 @@ mod tests {
             connect_status(&mut associating),
             fidl_ieee80211::StatusCode::RejectedSequenceTimeout
         );
+    }
+
+    #[test]
+    fn status30_valid_comeback_retries_only_after_generation_bound_timer() {
+        let mut client = client();
+        let mut hardware = FakeHardware::default();
+        client.start(&mut hardware).unwrap();
+        client
+            .on_mac_frame(
+                &mut hardware,
+                &auth_response(AP, fidl_ieee80211::StatusCode::Success),
+            )
+            .unwrap();
+        let first_request = hardware.frames.last().unwrap().clone();
+        client
+            .on_mac_frame(
+                &mut hardware,
+                &association_response_with_ies(
+                    fidl_ieee80211::StatusCode::RefusedTemporarily,
+                    &[56, 5, 3, 20, 0, 0, 0],
+                ),
+            )
+            .unwrap();
+        assert_eq!(client.state(), OpenClientState::Associating);
+        assert!(client.next_mlme_event().is_none());
+        assert!(hardware.associations.is_empty());
+        assert_eq!(
+            client.connect_timer(),
+            Some(ConnectTimer { id: 2, duration_nanos: 20_480_000 })
+        );
+
+        client.on_timeout(&mut hardware, 1).unwrap();
+        assert_eq!(hardware.frames.len(), 2, "stale deadline must not retry");
+        client.on_timeout(&mut hardware, 2).unwrap();
+        assert_eq!(hardware.frames.len(), 3);
+        let retry = hardware.frames.last().unwrap();
+        assert_ne!(&retry[22..24], &first_request[22..24]);
+        assert_eq!(&retry[24..], &first_request[24..]);
+
+        let mut success = association_response(fidl_ieee80211::StatusCode::Success, &[0x82]);
+        success[28..30].copy_from_slice(&0xc02au16.to_le_bytes());
+        client.on_mac_frame(&mut hardware, &success).unwrap();
+        assert_eq!(hardware.associations[0].aid, Some(42));
+        let fidl_mlme::MlmeEvent::ConnectConf { resp } = client.next_mlme_event().unwrap() else {
+            panic!("expected connect confirmation")
+        };
+        assert_eq!(resp.association_id, 42);
+    }
+
+    #[test]
+    fn status30_without_one_valid_comeback_ie_follows_failure_path() {
+        for ies in [
+            vec![],
+            vec![56, 5, 2, 20, 0, 0, 0],
+            vec![56, 5, 3, 0, 0, 0, 0],
+            vec![56, 4, 3, 20, 0, 0],
+            vec![56, 5, 3, 20, 0, 0],
+            vec![56, 5, 3, 20, 0, 0, 0, 56, 5, 3, 20, 0, 0, 0],
+        ] {
+            let mut client = client();
+            let mut hardware = FakeHardware::default();
+            client.start(&mut hardware).unwrap();
+            client
+                .on_mac_frame(
+                    &mut hardware,
+                    &auth_response(AP, fidl_ieee80211::StatusCode::Success),
+                )
+                .unwrap();
+            client
+                .on_mac_frame(
+                    &mut hardware,
+                    &association_response_with_ies(
+                        fidl_ieee80211::StatusCode::RefusedTemporarily,
+                        &ies,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(client.state(), OpenClientState::Joined);
+            assert_eq!(
+                connect_status(&mut client),
+                fidl_ieee80211::StatusCode::RefusedTemporarily
+            );
+            assert_eq!(hardware.frames.len(), 2, "malformed comeback must not retry");
+        }
     }
 
     #[test]
