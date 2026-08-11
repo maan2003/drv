@@ -1,0 +1,52 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -1136,6 +1136,37 @@
+             }
+         };
+ 
++        if let mac::MacFrame::Mgmt(mgmt_frame) = &mac_frame {
++            let subtype = match mgmt_frame.mgmt_subtype() {
++                mac::MgmtSubtype::DISASSOC => Some(10),
++                mac::MgmtSubtype::DEAUTH => Some(12),
++                _ => None,
++            };
++            if let Some(subtype) = subtype.filter(|_| mgmt_frame.body.deref().len() >= 2) {
++                let hdr = &mgmt_frame.mgmt_hdr;
++                let body = mgmt_frame.body.deref();
++                let reason = u16::from_le_bytes([body[0], body[1]]);
++                let frame_ctrl = hdr.frame_ctrl;
++                let seq_ctrl = hdr.seq_ctrl;
++                let addr1_is_client = hdr.addr1 == sta.sta.iface_mac;
++                let addr2_is_peer = hdr.addr2 == sta.sta.bssid().into();
++                let addr3_is_bssid = hdr.addr3 == sta.sta.bssid().into();
++                let channel_match =
++                    sta.channel_state.get_primary().is_some_and(|main| main == rx_info.primary);
++                let comeback_generation_active =
++                    matches!(&self, States::Associating(state) if state.comeback_generation.is_some());
++                let address_roles_match =
++                    addr1_is_client && addr2_is_peer && addr3_is_bssid;
++                crate::sae_disposition(format_args!(
++                    "disconnect_fixed subtype={subtype} reason={reason} retry={} sequence={} addr1_is_client={addr1_is_client} addr2_is_peer={addr2_is_peer} addr3_is_bssid={addr3_is_bssid} channel_match={channel_match} comeback_generation_active={comeback_generation_active} state={} mlme_disposition={}",
++                    frame_ctrl.retry(),
++                    seq_ctrl.seq_num(),
++                    self.sae_state_name(),
++                    if address_roles_match && channel_match { "dispatch" } else { "drop_foreign_or_channel" }
++                ));
++            }
++        }
++
+         let frame_class = mac::FrameClass::from(&mac_frame);
+         if !sta.sta.should_handle_frame(&mac_frame) {
+             crate::sae_disposition(format_args!(
+@@ -1253,6 +1284,11 @@
+                 // This case is highly unlikely and only added to improve interoperability with
+                 // buggy Access Points.
+                 mac::MgmtBody::Disassociation { disassoc_hdr, .. } => {
++                    let reason = disassoc_hdr.reason_code.0;
++                    crate::sae_disposition(format_args!(
++                        "disconnect_fixed subtype=10 reason={} state=associating mlme_disposition=accepted_connect_failure transition=authenticated",
++                        reason
++                    ));
+                     state.on_disassoc_frame(sta, &disassoc_hdr);
+                     state.transition_to(Authenticated).into()
+                 }

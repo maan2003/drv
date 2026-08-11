@@ -1371,7 +1371,8 @@ struct SaeCommittedSelfTestMechanics {
     open_auth_response: Option<ClientRxFrame>,
     status77: Option<ClientRxFrame>,
     association_responses: VecDeque<ClientRxFrame>,
-    queued_data_after_association: Option<ClientRxFrame>,
+    queued_data_after_association: VecDeque<(usize, ClientRxFrame)>,
+    association_tx_count: usize,
     tx: Arc<Mutex<Vec<(Vec<u8>, u16, u8)>>>,
     outstanding: MgmtTxOutstanding,
     ring_cidx: u32,
@@ -1557,10 +1558,16 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
             }
         }
         if control & 0x00fc == 0 {
+            self.association_tx_count += 1;
             if let Some(frame) = self.association_responses.pop_front() {
                 self.rx.push_back(frame);
             }
-            if let Some(frame) = self.queued_data_after_association.take() {
+            while self
+                .queued_data_after_association
+                .front()
+                .is_some_and(|(attempt, _)| *attempt == self.association_tx_count)
+            {
+                let (_, frame) = self.queued_data_after_association.pop_front().unwrap();
                 self.rx.push_back(frame);
             }
         }
@@ -1810,7 +1817,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         open_auth_response: None,
         status77: None,
         association_responses: VecDeque::new(),
-        queued_data_after_association: None,
+        queued_data_after_association: VecDeque::new(),
+        association_tx_count: 0,
         tx: Arc::clone(&missing_tx),
         outstanding: MgmtTxOutstanding::default(),
         ring_cidx: 0,
@@ -1858,6 +1866,16 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     comeback_response[10..16].copy_from_slice(&peer);
     comeback_response[16..22].copy_from_slice(&peer);
     comeback_response.extend_from_slice(&[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0]);
+    let mut foreign_reason9 = vec![0u8; 24];
+    foreign_reason9[0] = 0xa0;
+    foreign_reason9[4..10].copy_from_slice(&client);
+    foreign_reason9[10..16].copy_from_slice(&[2, 0, 0, 0, 0, 99]);
+    foreign_reason9[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 99]);
+    foreign_reason9[22..24].copy_from_slice(&(6u16 << 4).to_le_bytes());
+    foreign_reason9.extend_from_slice(&9u16.to_le_bytes());
+    let mut peer_reason9 = foreign_reason9.clone();
+    peer_reason9[10..16].copy_from_slice(&peer);
+    peer_reason9[16..22].copy_from_slice(&peer);
     let comeback_tx = Arc::new(Mutex::new(Vec::new()));
     let comeback_transport = SourceExactPassiveTransport::new(
         SaeCommittedSelfTestMechanics {
@@ -1895,7 +1913,47 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 },
                 security: None,
             }]),
-            queued_data_after_association: None,
+            queued_data_after_association: VecDeque::from([
+                (
+                    2,
+                    ClientRxFrame {
+                        bytes: foreign_reason9,
+                        status: fidl_softmac::WlanRxInfo {
+                            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                            data_rate: 0,
+                            primary: channel,
+                            bandwidth: ChannelBandwidth::Cbw80,
+                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            mcs: 0,
+                            rssi_dbm: -40,
+                            snr_dbh: 0,
+                        },
+                        security: None,
+                    },
+                ),
+                (
+                    2,
+                    ClientRxFrame {
+                        bytes: peer_reason9,
+                        status: fidl_softmac::WlanRxInfo {
+                            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                            data_rate: 0,
+                            primary: channel,
+                            bandwidth: ChannelBandwidth::Cbw80,
+                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            mcs: 0,
+                            rssi_dbm: -40,
+                            snr_dbh: 0,
+                        },
+                        security: None,
+                    },
+                ),
+            ]),
+            association_tx_count: 0,
             tx: Arc::clone(&comeback_tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,
@@ -1983,7 +2041,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         ));
     }
     println!(
-        "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 retry_requests=2 sequence=fresh body=identical outer_deadline_ms=100"
+        "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 retry_requests=2 sequence=fresh body=identical foreign_reason9=ignored peer_reason9=accepted_connect_failure outer_deadline_ms=100"
     );
     let mut burst_auth = vec![0u8; 24];
     burst_auth[0] = 0xb0;
@@ -2038,11 +2096,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 status: burst_status(),
                 security: None,
             }]),
-            queued_data_after_association: Some(ClientRxFrame {
-                bytes: burst_m1,
-                status: burst_status(),
-                security: None,
-            }),
+            queued_data_after_association: VecDeque::from([(
+                1,
+                ClientRxFrame {
+                    bytes: burst_m1,
+                    status: burst_status(),
+                    security: None,
+                },
+            )]),
+            association_tx_count: 0,
             tx: Arc::clone(&burst_tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,
@@ -2129,7 +2191,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             open_auth_response: None,
             status77: Some(status77),
             association_responses: VecDeque::new(),
-            queued_data_after_association: None,
+            queued_data_after_association: VecDeque::new(),
+            association_tx_count: 0,
             tx: Arc::clone(&tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,
