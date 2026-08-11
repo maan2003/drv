@@ -3202,6 +3202,44 @@ fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
     bytes
 }
 
+/// Linux v7.1 `mt76_connac_mcu_uni_add_dev` for the first station VIF.
+///
+/// This establishes OMAC/BSS index 0 and its reserved interface WCID 19 before
+/// authentication, including the exact public VIF address used by MLME/SME.
+pub fn encode_client_interface_commands(
+    client: [u8; 6],
+    enable: bool,
+    dev_sequence: u8,
+    bss_sequence: u8,
+) -> Result<[Vec<u8>; 2], String> {
+    if client == [0; 6]
+        || client[0] & 3 != 2
+        || !(1..=15).contains(&dev_sequence)
+        || !(1..=15).contains(&bss_sequence)
+        || dev_sequence == bss_sequence
+    {
+        return Err("client interface identity or sequence is invalid".into());
+    }
+    let mut dev = vec![0; 16];
+    // omac_idx=0, band_idx=0, DEV_INFO_ACTIVE, link_idx=0.
+    dev[4..8].copy_from_slice(&[0, 0, 12, 0]);
+    dev[8] = u8::from(enable);
+    dev[10..16].copy_from_slice(&client);
+
+    let mut bss = vec![0; 36];
+    // bss_idx=0, UNI_BSS_INFO_BASIC, first station VIF/WMM/band/OMAC.
+    bss[4..8].copy_from_slice(&[0, 0, 32, 0]);
+    bss[8] = u8::from(enable);
+    bss[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    bss[16] = 1;
+    bss[24..26].copy_from_slice(&19u16.to_le_bytes());
+    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+
+    let dev = encode_uni_mcu(1, &dev, dev_sequence);
+    let bss = encode_uni_mcu(2, &bss, bss_sequence);
+    Ok(if enable { [dev, bss] } else { [bss, dev] })
+}
+
 /// Encode only the pinned Linux commands required by the conservative passive
 /// one-channel milestone. START_HW_SCAN has no SSID, probe, IE, random-MAC, or
 /// transmit material and uses Connac2's firmware-selected dwell fields (zero).
@@ -7978,6 +8016,45 @@ mod tests {
             classify_preassociation_sae_auth(&non_auth, client, peer),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn client_interface_commands_bind_one_local_vif_identity_before_authentication() {
+        let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+        let [dev, bss] = encode_client_interface_commands(client, true, 14, 15).unwrap();
+        assert_eq!(u16::from_le_bytes(dev[34..36].try_into().unwrap()), 1);
+        assert_eq!(dev[39], 14);
+        assert_eq!(&dev[52..56], &[0, 0, 12, 0]);
+        assert_eq!(dev[56], 1);
+        assert_eq!(&dev[58..64], &client);
+        assert_eq!(u16::from_le_bytes(bss[34..36].try_into().unwrap()), 2);
+        assert_eq!(bss[39], 15);
+        assert_eq!(&bss[52..56], &[0, 0, 32, 0]);
+        assert_eq!(bss[56], 1);
+        assert_eq!(
+            u32::from_le_bytes(bss[60..64].try_into().unwrap()),
+            0x0001_0001
+        );
+        assert_eq!(u16::from_le_bytes(bss[72..74].try_into().unwrap()), 19);
+        assert_eq!(u16::from_le_bytes(bss[78..80].try_into().unwrap()), 19);
+
+        let [disable_bss, disable_dev] =
+            encode_client_interface_commands(client, false, 2, 1).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(disable_bss[34..36].try_into().unwrap()),
+            2
+        );
+        assert_eq!(disable_bss[56], 0);
+        assert_eq!(
+            u16::from_le_bytes(disable_dev[34..36].try_into().unwrap()),
+            1
+        );
+        assert_eq!(disable_dev[56], 0);
+
+        for invalid in [[0x50, 1, 2, 3, 4, 5], [0x8b, 1, 2, 3, 4, 5], [0; 6]] {
+            assert!(encode_client_interface_commands(invalid, true, 1, 2).is_err());
+        }
+        assert!(encode_client_interface_commands(client, true, 1, 1).is_err());
     }
 
     #[test]

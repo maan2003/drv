@@ -39,6 +39,7 @@ trap cleanup EXIT
 device_path=$(readlink -f "/sys/bus/pci/devices/$bdf")
 connected_bssid=
 connected_frequency=
+connected_client_mac=
 for net in /sys/class/net/*; do
   [[ -e $net/device && $(readlink -f "$net/device") == "$device_path" ]] || continue
   link=$(timeout 2 iw dev "$(basename "$net")" link 2>/dev/null) || continue
@@ -46,12 +47,20 @@ for net in /sys/class/net/*; do
   frequency=$(awk '/^[[:space:]]*freq:/ { print $2; exit }' <<< "$link")
   [[ $bssid =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
   frequency=$(normalize_iw_frequency "$frequency") || continue
+  client_mac=$(cat "$net/address" 2>/dev/null) || continue
+  [[ $client_mac =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+  first_octet=${client_mac%%:*}
+  (( (16#$first_octet & 3) == 2 )) || {
+    echo "connected target does not use a local unicast VIF address" >&2
+    exit 1
+  }
   [[ -z $connected_bssid ]] || {
     echo "multiple connected target Wi-Fi interfaces; refusing handoff" >&2
     exit 1
   }
   connected_bssid=$bssid
   connected_frequency=$frequency
+  connected_client_mac=$client_mac
 done
 [[ -n $connected_bssid ]] || {
   echo "target Wi-Fi interface is not connected; refusing handoff" >&2
@@ -71,11 +80,13 @@ case $connected_frequency in
     exit 1
     ;;
 esac
-export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel
+export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \
+  DRV_SAE_CLIENT_MAC=$connected_client_mac
 token=$(wifi-lab-watchdog arm) || exit 1
 printf 'START realtime=%s bdf=%s\n' "$start" "$bdf" >> "$timeline"
-printf 'TARGET bssid=%s channel=%s frequency=%s\n' \
-  "$connected_bssid" "$connected_channel" "$connected_frequency" >> "$timeline"
+printf 'TARGET bssid=%s channel=%s frequency=%s client_mac=%s\n' \
+  "$connected_bssid" "$connected_channel" "$connected_frequency" \
+  "$connected_client_mac" >> "$timeline"
 sync -f "$timeline"
 
 wifi-driver-lab "$bdf" 300 -- "$@"

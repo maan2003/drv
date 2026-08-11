@@ -54,10 +54,10 @@ use mt7921_port_spike::{
     ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_data_txwi,
-    encode_client_management_tx, encode_disable_keys_command, encode_gtk_command,
-    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
-    encode_pse_reg_read_command, encode_ptk_command, encode_remove_wcid_command,
-    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    encode_client_interface_commands, encode_client_management_tx, encode_disable_keys_command,
+    encode_gtk_command, encode_igtk_command, encode_key_v2_command,
+    encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
+    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
     passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
     validate_passive_mac_bar_read,
@@ -992,6 +992,8 @@ fn run_contained_dma_resource_round_trip(
                 sequence: 0,
                 command_index: 0,
                 uni_terminal_poisoned: false,
+                #[cfg(feature = "fuchsia-passive")]
+                client_interface: None,
                 fwdl_index: 0,
                 pending_scatter: None,
                 start: Instant::now(),
@@ -1519,8 +1521,12 @@ fn run() -> Result<(), String> {
         ) {
             return Err("DRV_SAE_CHANNEL is unsupported".into());
         }
+        let client = parse_client_mac(
+            &env::var("DRV_SAE_CLIENT_MAC")
+                .map_err(|_| "DRV_SAE_CLIENT_MAC is required for power setup")?,
+        )?;
         verify_no_usable_mt792x_acpi_sar()?;
-        Some((bssid, ssid, channel))
+        Some((bssid, ssid, channel, client))
     } else {
         None
     };
@@ -3102,6 +3108,8 @@ fn run() -> Result<(), String> {
                     sequence: 0,
                     command_index: 0,
                     uni_terminal_poisoned: false,
+                    #[cfg(feature = "fuchsia-passive")]
+                    client_interface: None,
                     fwdl_index: 0,
                     pending_scatter: None,
                     start: Instant::now(),
@@ -3349,7 +3357,7 @@ fn run() -> Result<(), String> {
                                 }
                             }
                             let mut beacon_authorizer =
-                                power_target.as_ref().map(|(bssid, ssid, _)| {
+                                power_target.as_ref().map(|(bssid, ssid, _, _)| {
                                     BeaconHintAuthorizer::new(*bssid, ssid.clone())
                                 });
                             let mut beacon_authorization = None;
@@ -3492,20 +3500,21 @@ fn run() -> Result<(), String> {
                                     let effects = LiveClientEffects {
                                         state: shared.clone(),
                                         target: power_target.as_ref().expect("SAE target").0,
-                                        client: report
-                                            .nic_capability
-                                            .mac_address
-                                            .ok_or("NIC omitted MAC address")?,
+                                        client: power_target
+                                            .as_ref()
+                                            .expect("SAE target")
+                                            .3
+                                            .bytes(),
                                         rcpi: target_rcpi,
                                         firmware: ClientFirmwareEffectsState::default(),
-                                        // Deliberately no physical key/WCID enable: mechanics is
-                                        // co-owned by the scan adapter. Only a future synchronous,
-                                        // lock-safe acknowledged sender may populate this seam.
+                                        // Peer/key WCID state remains association-owned. The
+                                        // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
-                                    let support = live_client_support(query_from_capabilities(
-                                        report.nic_capability,
-                                        &candidates,
-                                    ));
+                                    let mut query =
+                                        query_from_capabilities(report.nic_capability, &candidates);
+                                    query.sta_addr =
+                                        Some(power_target.as_ref().expect("SAE target").3.bytes());
+                                    let support = live_client_support(query);
                                     let device_info = wlan_mlme::mlme_device_info_from_softmac(
                                         support.query.clone(),
                                     )
@@ -3546,6 +3555,12 @@ fn run() -> Result<(), String> {
                                                 RunPhase::PassiveReady,
                                                 RunPhase::BeaconAuthorized,
                                             )?;
+                                            let client =
+                                                power_target.as_ref().expect("SAE target").3;
+                                            mechanics.loader.program_client_interface(client)?;
+                                            record_sae_stage(
+                                                "client_interface_programmed omac=0 bss=0 wcid=19 identity_match=true",
+                                            );
                                             program_live_rate_power(
                                                 mechanics,
                                                 report.nic_capability,
@@ -5813,9 +5828,19 @@ struct VfioFirmwareLoader<'a> {
     sequence: u8,
     command_index: usize,
     uni_terminal_poisoned: bool,
+    #[cfg(feature = "fuchsia-passive")]
+    client_interface: Option<ClientInterfaceFirmwareState>,
     fwdl_index: usize,
     pending_scatter: Option<(FirmwareImagePart, u8, usize, u32)>,
     start: Instant,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientInterfaceFirmwareState {
+    identity: ClientVifIdentity,
+    dev_maybe_active: bool,
+    bss_maybe_active: bool,
 }
 
 struct ReceivedMcuResponse {
@@ -6506,6 +6531,76 @@ impl VfioFirmwareLoader<'_> {
         }
     }
 
+    #[cfg(feature = "fuchsia-passive")]
+    fn program_client_interface(&mut self, identity: ClientVifIdentity) -> Result<(), String> {
+        if self.client_interface.is_some() {
+            return Err("client interface firmware context was already dirty".into());
+        }
+        let [dev, bss] = encode_client_interface_commands(identity.bytes(), true, 14, 15)?;
+        // Publication can become ambiguous at any point after entry. Mark each
+        // object dirty before submitting it so mandatory cleanup will disable
+        // every object firmware may have observed.
+        self.client_interface = Some(ClientInterfaceFirmwareState {
+            identity,
+            dev_maybe_active: true,
+            bss_maybe_active: false,
+        });
+        self.send_acknowledged_uni_command(1, &dev)?;
+        record_sae_stage("client_dev_info_active_acked omac=0 identity_match=true");
+
+        self.client_interface
+            .as_mut()
+            .expect("client interface state installed")
+            .bss_maybe_active = true;
+        self.send_acknowledged_uni_command(2, &bss)?;
+        record_sae_stage("client_bss_info_basic_acked bss=0 wmm=0 wcid=19");
+        Ok(())
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn disable_client_interface(&mut self) -> Result<(), String> {
+        let Some(state) = self.client_interface else {
+            return Ok(());
+        };
+        let [bss, dev] = encode_client_interface_commands(state.identity.bytes(), false, 12, 13)?;
+        let mut errors = Vec::new();
+        if state.bss_maybe_active {
+            match self.send_acknowledged_uni_command(2, &bss) {
+                Ok(()) => {
+                    self.client_interface
+                        .as_mut()
+                        .expect("client interface state retained")
+                        .bss_maybe_active = false;
+                    record_sae_stage("client_bss_info_basic_disabled_acked bss=0");
+                }
+                Err(error) => errors.push(format!("disable client BSS context: {error}")),
+            }
+        }
+        if state.dev_maybe_active {
+            match self.send_acknowledged_uni_command(1, &dev) {
+                Ok(()) => {
+                    self.client_interface
+                        .as_mut()
+                        .expect("client interface state retained")
+                        .dev_maybe_active = false;
+                    record_sae_stage("client_dev_info_active_disabled_acked omac=0");
+                }
+                Err(error) => errors.push(format!("disable client DEV context: {error}")),
+            }
+        }
+        if self
+            .client_interface
+            .is_some_and(|state| !state.bss_maybe_active && !state.dev_maybe_active)
+        {
+            self.client_interface = None;
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn send_acknowledged_uni_command(
         &mut self,
         expected_cid: u8,
@@ -7092,6 +7187,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
     fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
         println!(r#"{{"active_fwdl_event":"cleanup_started","state":"{state:?}"}}"#);
         let mut errors = Vec::new();
+        // The passive boundary always exits through this transaction, whether
+        // connect succeeded, failed, reset, or stopped. Disable firmware's BSS
+        // before DEV while command/RX transport is still live; ambiguity is
+        // retained as a cleanup error and contained by the mandatory reset.
+        #[cfg(feature = "fuchsia-passive")]
+        if let Err(error) = self.disable_client_interface() {
+            errors.push(format!("client interface teardown: {error}"));
+        }
         if let Err(error) = self.pcie_mac.write_pcie_mac_interrupt_enable_zero() {
             errors.push(error);
         }
@@ -8678,6 +8781,26 @@ fn parse_mac(value: &str) -> Result<[u8; 6], String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientVifIdentity([u8; 6]);
+
+#[cfg(feature = "fuchsia-passive")]
+impl ClientVifIdentity {
+    const fn bytes(self) -> [u8; 6] {
+        self.0
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn parse_client_mac(value: &str) -> Result<ClientVifIdentity, String> {
+    let address = parse_mac(value).map_err(|_| "invalid client MAC".to_string())?;
+    if address[0] & 3 != 2 {
+        return Err("client MAC must be a locally administered unicast address".into());
+    }
+    Ok(ClientVifIdentity(address))
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn verify_no_usable_mt792x_acpi_sar() -> Result<(), String> {
     fn inspect(path: &std::path::Path) -> Result<bool, String> {
         if path.is_dir() {
@@ -10230,6 +10353,7 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     struct FallbackMechanics {
         rx: VecDeque<ClientRxFrame>,
+        pending_status77: Option<ClientRxFrame>,
         tx: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
@@ -10267,6 +10391,14 @@ mod tests {
             _: fidl_softmac::WlanTxInfoFlags,
         ) -> Result<(), zx::Status> {
             self.tx.lock().unwrap().push(bytes.to_vec());
+            // This synchronous fake acknowledges publication by returning Ok.
+            // Make the peer response observable only after the initial
+            // group-20 commit has reached that acknowledgement boundary.
+            if bytes.get(28..32) == Some(&[126, 0, 20, 0]) {
+                if let Some(status77) = self.pending_status77.take() {
+                    self.rx.push_back(status77);
+                }
+            }
             Ok(())
         }
 
@@ -12051,14 +12183,22 @@ mod tests {
         let supervisor = include_str!("../../lab/selector-write-recovery-supervisor.sh");
         let derive = supervisor.find("device_path=$(readlink -f").unwrap();
         let iw = supervisor.find("iw dev").unwrap();
+        let address = supervisor
+            .find("client_mac=$(cat \"$net/address\"")
+            .unwrap();
         let export = supervisor
             .find("export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel")
             .unwrap();
         let handoff = supervisor.find("wifi-driver-lab \"$bdf\" 300").unwrap();
-        assert!(derive < iw && iw < export && export < handoff);
+        assert!(derive < iw && iw < address && address < export && export < handoff);
         assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));
         assert!(supervisor.contains("target Wi-Fi interface is not connected"));
-
+        assert!(supervisor.contains("DRV_SAE_CLIENT_MAC=$connected_client_mac"));
+        assert!(supervisor.contains("local unicast VIF address"));
+        let pre_handoff = &supervisor[..handoff];
+        for forbidden in ["passphrase", "password", ".psk", "/var/lib/iwd"] {
+            assert!(!pre_handoff.contains(forbidden), "{forbidden}");
+        }
         let source = include_str!("vfio_read.rs");
         let target = source
             .split("let power_target =")
@@ -12068,7 +12208,8 @@ mod tests {
             .next()
             .unwrap();
         assert!(target.contains("DRV_SAE_CHANNEL"));
-        assert!(target.contains("Some((bssid, ssid, channel))"));
+        assert!(target.contains("DRV_SAE_CLIENT_MAC"));
+        assert!(target.contains("Some((bssid, ssid, channel, client))"));
         let channels = source
             .split("let channels = match operation")
             .nth(1)
@@ -12107,6 +12248,102 @@ mod tests {
         for rejected in ["5180.5", "5180.", ".0", "five"] {
             assert!(!invoke(rejected).status.success(), "{rejected}");
         }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn handoff_client_identity_requires_one_local_unicast_address() {
+        assert_eq!(
+            parse_client_mac("8a:fd:2a:8b:70:5a").unwrap().bytes(),
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]
+        );
+        for invalid in [
+            "",
+            "50:5a:65:f6:f9:89",
+            "8b:fd:2a:8b:70:5a",
+            "00:00:00:00:00:00",
+            "not-a-mac",
+        ] {
+            assert!(parse_client_mac(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn preauth_interface_context_is_dirty_before_submit_and_disabled_before_quiesce() {
+        let source = include_str!("vfio_read.rs");
+        let program = source
+            .split("fn program_client_interface(")
+            .nth(1)
+            .unwrap()
+            .split("fn disable_client_interface(")
+            .next()
+            .unwrap();
+        let dev_dirty = program.find("dev_maybe_active: true").unwrap();
+        let dev_submit = program
+            .find("send_acknowledged_uni_command(1, &dev)")
+            .unwrap();
+        let bss_dirty = program.find(".bss_maybe_active = true").unwrap();
+        let bss_submit = program
+            .find("send_acknowledged_uni_command(2, &bss)")
+            .unwrap();
+        assert!(dev_dirty < dev_submit && dev_submit < bss_dirty && bss_dirty < bss_submit);
+
+        let disable = source
+            .split("fn disable_client_interface(")
+            .nth(1)
+            .unwrap()
+            .split("fn send_acknowledged_uni_command(")
+            .next()
+            .unwrap();
+        let bss_disable = disable
+            .find("send_acknowledged_uni_command(2, &bss)")
+            .unwrap();
+        let dev_disable = disable
+            .find("send_acknowledged_uni_command(1, &dev)")
+            .unwrap();
+        assert!(bss_disable < dev_disable);
+        assert!(disable.contains("errors.push"));
+
+        let cleanup = source
+            .split("fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState)")
+            .nth(1)
+            .unwrap()
+            .split("#[derive(Debug)]")
+            .next()
+            .unwrap();
+        let interface_disable = cleanup.find("self.disable_client_interface()").unwrap();
+        let irq_disable = cleanup
+            .find("write_pcie_mac_interrupt_enable_zero")
+            .unwrap();
+        let dma_disable = cleanup.find("write_active_wfdma(0xd4208").unwrap();
+        assert!(interface_disable < irq_disable && interface_disable < dma_disable);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn sae_uses_typed_vif_identity_without_overwriting_factory_identity() {
+        let source = include_str!("vfio_read.rs");
+        let target = source
+            .split("let power_target =")
+            .nth(1)
+            .unwrap()
+            .split("let mut sae_credential")
+            .next()
+            .unwrap();
+        assert!(target.contains("parse_client_mac"));
+        assert!(source.contains("struct ClientVifIdentity([u8; 6])"));
+
+        let runtime = source
+            .split("let effects = LiveClientEffects")
+            .find(|part| part.contains("program_client_interface(client)"))
+            .unwrap()
+            .split("let passphrase")
+            .next()
+            .unwrap();
+        assert!(runtime.matches(".bytes()").count() >= 2);
+        assert!(runtime.contains("program_client_interface(client)"));
+        assert!(!runtime.contains("query.factory_addr"));
     }
 
     #[test]
@@ -13688,7 +13925,8 @@ mod tests {
             let transmitted = Arc::new(Mutex::new(Vec::new()));
             let transport = SourceExactPassiveTransport::new(
                 FallbackMechanics {
-                    rx: VecDeque::from([status77]),
+                    rx: VecDeque::new(),
+                    pending_status77: Some(status77),
                     tx: Arc::clone(&transmitted),
                 },
                 capability,
