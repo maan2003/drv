@@ -1404,6 +1404,13 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         bytes: &[u8],
         _: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
+        println!(
+            "self_test_management_tx stage=ownership cidx={} didx={} dma_done={} outstanding={}",
+            self.ring_cidx,
+            self.ring_didx,
+            self.descriptor_done,
+            !self.outstanding.is_empty()
+        );
         if !self.outstanding.is_empty() {
             println!("self_test_management_tx outcome=blocked reason=completion_outstanding");
             return Err(zx::Status::SHOULD_WAIT);
@@ -8914,10 +8921,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if !self.mgmt_tx_outstanding.is_empty() {
             return Err("management TX completion is still outstanding; ring reuse blocked".into());
         }
-        let (token, pid) = self.mgmt_tx_outstanding.reserve()?;
-        record_sae_stage("management_tx_pre_submit stage=identity result=allocated");
         if let Err(error) = self.configure_mgmt_tx_ring_for_submission(ring) {
-            self.mgmt_tx_outstanding.abandon_last(token, pid);
             self.loader.uni_terminal_poisoned = true;
             return Err(format!(
                 "REBOOT REQUIRED: management ring configuration failed; MCU TX blocked until universal containment: {error}"
@@ -8930,6 +8934,8 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .zero_bytes(PAGE)
             .map_err(|error| format!("REBOOT REQUIRED: pre-submit frame wipe failed: {error}"))?;
         record_sae_stage("management_tx_pre_submit stage=buffer_wipe result=complete");
+        let (token, pid) = self.mgmt_tx_outstanding.reserve()?;
+        record_sae_stage("management_tx_pre_submit stage=identity result=allocated");
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut outcome = MgmtTxPublicationOutcome::NotPublished;
         let result = (|| -> Result<(), String> {
@@ -15985,12 +15991,18 @@ mod tests {
             .next()
             .unwrap();
         let publish = transmit.find("write_active_wfdma(0xd4308, 1)").unwrap();
+        let ownership = transmit
+            .find("configure_mgmt_tx_ring_for_submission(ring)")
+            .unwrap();
+        let wipe = transmit.find("stage=buffer_wipe result=complete").unwrap();
+        let identity = transmit.find("stage=identity result=allocated").unwrap();
         let didx = transmit.find("read(0xd430c)").unwrap();
         let descriptor_done = transmit.find("is_dma_done()").unwrap();
         let committed = transmit
             .find("MgmtTxPublicationOutcome::Committed")
             .unwrap();
         let enqueue_success = transmit.rfind("Ok(())").unwrap();
+        assert!(ownership < wipe && wipe < identity && identity < publish);
         assert!(publish < didx && didx < descriptor_done && descriptor_done < committed);
         assert!(committed < enqueue_success);
         assert!(!transmit.contains("drain_data_rx_queue("));
