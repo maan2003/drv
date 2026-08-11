@@ -3505,8 +3505,8 @@ fn run() -> Result<(), String> {
                                         channels[0],
                                         fidl_ieee80211::ChannelBandwidth::Cbw20,
                                         ChannelNumber {
-                                            band: WlanBand::TwoGhz,
                                             number: 0,
+                                            ..channels[0]
                                         },
                                     ))
                                     .map_err(|status| {
