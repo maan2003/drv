@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/amd-hda-spike", "crates/audio-pipewire-spike", "crates/bluetooth-hci-broker", "crates/bluetooth-sapphire-wasm", "crates/fuchsia-audio-processing", "crates/fuchsia-audio-timeline", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt7921-core", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe", "crates/userspace-vfio"]
+members = ["crates/amd-hda-spike", "crates/audio-pipewire-spike", "crates/bluetooth-hci-broker", "crates/bluetooth-sapphire-wasm", "crates/fuchsia-audio-processing", "crates/fuchsia-audio-timeline", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt76-core", "crates/mt7921-core", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe", "crates/userspace-vfio"]
 resolver = "3"
 exclude = ["crates/mt7921-softmac-adapter", "crates/mt7921-passive-scan"]
 

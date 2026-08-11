@@ -7,3 +7,6 @@ version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+mt76-core = { path = "../mt76-core" }

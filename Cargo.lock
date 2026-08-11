@@ -639,8 +639,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt76-core"
+version = "0.1.0"
+
+[[package]]
 name = "mt7921-core"
 version = "0.1.0"
+dependencies = [
+ "mt76-core",
+]
 
 [[package]]
 name = "mt7921-port-spike"
