@@ -632,7 +632,6 @@ name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "eapol",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
@@ -1068,6 +1067,7 @@ dependencies = [
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",
@@ -1083,6 +1083,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "tokio",
  "trust-dns-proto",
  "trust-dns-resolver",
  "wlan-common",
@@ -2500,7 +2501,6 @@ dependencies = [
  "fuchsia-inspect-contrib",
  "futures",
  "ieee80211",
- "itertools 0.14.0",
  "log",
  "rand 0.9.4",
  "wlan-common",

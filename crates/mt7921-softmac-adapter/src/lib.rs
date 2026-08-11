@@ -10,7 +10,6 @@ pub mod ethernet;
 // Host-portable OpenClientMlme orchestration is a diagnostic model only. The
 // production association/data owner is pinned `ClientMlme` + `ClientSme`.
 #[cfg(test)]
-pub mod one_shot;
 
 use fuchsia_softmac_port::{
     AdvertisementKind, Bssid, CapabilityInfo, ChannelBandwidth, ChannelNumber, DiscoverySupport,
