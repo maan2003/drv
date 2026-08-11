@@ -168,6 +168,25 @@ pub trait Mt7921PassiveTransport {
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error>;
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error>;
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error>;
+
+    /// Client operations deliberately use Zircon status rather than the scan
+    /// error type: unsupported scan-only fakes remain valid, while a physical
+    /// implementation must complete each operation synchronously.
+    fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn transmit_client(
+        &mut self,
+        _: &[u8],
+        _: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn next_client_rx(
+        &mut self,
+    ) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +223,21 @@ pub trait SourceExactPassiveMechanics {
         deadline_nanos: i64,
     ) -> Result<Option<PassiveMechanicsEvent>, Self::Error>;
     fn confirm_scan_done(&mut self, scan_sequence: u8) -> Result<(), Self::Error>;
+    fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn transmit_client(
+        &mut self,
+        _: &[u8],
+        _: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn next_client_rx(
+        &mut self,
+    ) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -332,6 +366,18 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
 
 impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassiveTransport<M> {
     type Error = SourceExactTransportError<M::Error>;
+
+    fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.mechanics.submit_client_uni(expected_cid, encoded)
+    }
+
+    fn transmit_client(&mut self, bytes: &[u8], flags: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+        self.mechanics.transmit_client(bytes, flags)
+    }
+
+    fn next_client_rx(&mut self) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
+        self.mechanics.next_client_rx()
+    }
 
     fn set_channel(&mut self, channel: CandidateChannel) -> Result<(), Self::Error> {
         if !self.initialized {

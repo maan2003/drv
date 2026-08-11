@@ -42,6 +42,36 @@ pub struct ClientSupport {
 pub struct ClientRxFrame {
     pub bytes: Vec<u8>,
     pub status: fidl_softmac::WlanRxInfo,
+    pub security: Option<ClientRxSecurity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientRxSecurity {
+    pub wcid: u16,
+    pub tid: u8,
+    pub key_id: u8,
+    pub security_mode: u8,
+    pub cm: bool,
+    pub clm: bool,
+    pub icv_error: bool,
+    pub mic_error: bool,
+    pub fcs_error: bool,
+    pub pn: Option<[u8; 6]>,
+}
+
+/// Synchronous, transport-owned client I/O boundary.  DeviceOps holds the
+/// composed backend lock while calling this interface, so an implementation
+/// owns the real mechanics directly and must not defer work or retain loader
+/// pointers. Successful UNI/TX returns include the matching firmware/device
+/// completion.
+pub trait Mt7921ClientIo {
+    fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status>;
+    fn transmit_client(
+        &mut self,
+        bytes: &[u8],
+        flags: fidl_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status>;
+    fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status>;
 }
 
 /// Hardware-owned association/WCID and controlled-port ordering state.
@@ -176,21 +206,25 @@ pub trait Mt7921ClientEffects {
         &mut self,
         bytes: &[u8],
         flags: fidl_softmac::WlanTxInfoFlags,
+        io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn install_key(
         &mut self,
         configuration: &fidl_softmac::WlanKeyConfiguration,
+        io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn notify_association_complete(
         &mut self,
         configuration: &fidl_softmac::WlanAssociationConfig,
+        io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn clear_association(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+        io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
-    fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status>;
+    fn next_rx(&mut self, io: &mut dyn Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status>;
 
     /// Begin one device-owned passive scan transaction.
     fn begin_passive_scan(
@@ -216,7 +250,7 @@ pub trait Mt7921ClientEffects {
     fn stop(&mut self) -> Result<(), zx::Status>;
 }
 
-trait Mt7921ClientScan {
+trait Mt7921ClientScan: Mt7921ClientIo {
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -234,6 +268,12 @@ trait Mt7921ClientScan {
 }
 
 struct NoClientScan;
+
+impl Mt7921ClientIo for NoClientScan {
+    fn submit_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> { Err(zx::Status::NOT_SUPPORTED) }
+    fn transmit_client(&mut self, _: &[u8], _: fidl_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> { Err(zx::Status::NOT_SUPPORTED) }
+    fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> { Ok(None) }
+}
 
 impl Mt7921ClientScan for NoClientScan {
     fn set_channel(
@@ -286,6 +326,18 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter
         request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
         SoftmacHardware::cancel_scan(self, request).map_err(|_| zx::Status::IO)
+    }
+}
+
+impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T> {
+    fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.submit_client_uni(expected_cid, encoded))
+    }
+    fn transmit_client(&mut self, bytes: &[u8], flags: fidl_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.transmit_client(bytes, flags))
+    }
+    fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        self.with_transport_mut(|transport| transport.next_client_rx())
     }
 }
 
@@ -374,8 +426,11 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         &self,
         mlme: &mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
     ) -> Result<bool, zx::Status> {
-        let frame = self.backend.lock().unwrap().effects.next_rx()?;
-        let Some(ClientRxFrame { bytes, status }) = frame else {
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        let frame = effects.next_rx(scan)?;
+        drop(backend);
+        let Some(ClientRxFrame { bytes, status, .. }) = frame else {
             return Ok(false);
         };
         wlan_mlme::MlmeImpl::handle_mac_frame_rx(mlme, &bytes, status, fuchsia_trace::Id::new())
@@ -535,10 +590,12 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     }
 }
 
-impl<E: Mt7921ClientEffects, S> Mt7921ClientDevice<E, S> {
+impl<E: Mt7921ClientEffects, S: Mt7921ClientIo> Mt7921ClientDevice<E, S> {
     /// Pop exactly one frame/status pair from the injected RX effect queue.
     pub fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-        self.backend.lock().unwrap().effects.next_rx()
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.next_rx(scan)
     }
 }
 
@@ -595,7 +652,8 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         if backend.revoked {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        backend.effects.send_wlan_frame(&buffer, tx_flags)
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.send_wlan_frame(&buffer, tx_flags, scan)
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
@@ -698,33 +756,27 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         &mut self,
         configuration: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .install_key(configuration)
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.install_key(configuration, scan)
     }
 
     async fn notify_association_complete(
         &mut self,
         configuration: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .notify_association_complete(&configuration)
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.notify_association_complete(&configuration, scan)
     }
 
     async fn clear_association(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .clear_association(request)
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.clear_association(request, scan)
     }
 
     async fn update_wmm_parameters(
@@ -907,6 +959,7 @@ mod tests {
             &mut self,
             bytes: &[u8],
             flags: fidl_softmac::WlanTxInfoFlags,
+            _: &mut dyn Mt7921ClientIo,
         ) -> Result<(), zx::Status> {
             self.hit("frame")?;
             self.frame = Some(bytes.to_vec());
@@ -917,6 +970,7 @@ mod tests {
         fn install_key(
             &mut self,
             configuration: &fidl_softmac::WlanKeyConfiguration,
+            _: &mut dyn Mt7921ClientIo,
         ) -> Result<(), zx::Status> {
             self.hit("key")?;
             self.key = Some(configuration.clone());
@@ -926,6 +980,7 @@ mod tests {
         fn notify_association_complete(
             &mut self,
             configuration: &fidl_softmac::WlanAssociationConfig,
+            _: &mut dyn Mt7921ClientIo,
         ) -> Result<(), zx::Status> {
             self.hit("association")?;
             self.association = Some(configuration.clone());
@@ -935,6 +990,7 @@ mod tests {
         fn clear_association(
             &mut self,
             request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+            _: &mut dyn Mt7921ClientIo,
         ) -> Result<(), zx::Status> {
             self.hit("clear")?;
             self.clear = Some(request.clone());
@@ -947,7 +1003,7 @@ mod tests {
             Ok(())
         }
 
-        fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        fn next_rx(&mut self, _: &mut dyn Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status> {
             if self.fail_on == Some("rx") {
                 return Err(zx::Status::IO_REFUSED);
             }
@@ -1178,6 +1234,7 @@ mod tests {
             effects.rx.push_back(ClientRxFrame {
                 bytes: vec![8, 1, 2, 3],
                 status,
+                security: None,
             });
             let mut device = Mt7921ClientDevice::new_offline_fake(effects, support());
             let mut stream = device.take_mlme_event_stream().unwrap();
@@ -1206,6 +1263,7 @@ mod tests {
                 // ownership path; the pinned MLME safely rejects its payload.
                 bytes: vec![8, 1, 2, 3],
                 status: rx_status(-47),
+                security: None,
             });
             let transport = FakePassiveTransport::default();
             let capability = nic();

@@ -314,6 +314,7 @@ impl Mt7921ClientEffects for ProductionBackend {
         &mut self,
         bytes: &[u8],
         _: fidl_softmac::WlanTxInfoFlags,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
         let power_authorized = state.programmed_power_dbm.is_some_and(|power| {
@@ -338,25 +339,27 @@ impl Mt7921ClientEffects for ProductionBackend {
         state.frames.push(bytes.to_vec());
         Ok(())
     }
-    fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
+    fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration, _: &mut dyn crate::client_device::Mt7921ClientIo) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn notify_association_complete(
         &mut self,
         _: &fidl_softmac::WlanAssociationConfig,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn clear_association(
         &mut self,
         _: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         Ok(())
     }
     fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
-    fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+    fn next_rx(&mut self, _: &mut dyn crate::client_device::Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status> {
         Ok(None)
     }
     fn begin_passive_scan(

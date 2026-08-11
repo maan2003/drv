@@ -56,7 +56,7 @@ use mt7921_port_spike::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
-    ClientRxFrame, ClientSupport, Mt7921ClientDevice, Mt7921ClientEffects,
+    ClientRxFrame, ClientRxSecurity, ClientSupport, Mt7921ClientDevice, Mt7921ClientEffects,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
@@ -1030,6 +1030,9 @@ fn run_contained_dma_resource_round_trip(
                             pending_scan_done: None,
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
+                            mgmt_txwi: &mut active.mgmt_txwi,
+                            mgmt_frame: &mut active.mgmt_frame,
+                            mgmt_tx_ring: &mut active.mgmt_tx_ring,
                         };
                         let transport =
                             SourceExactPassiveTransport::new(mechanics, report.nic_capability)
@@ -3155,6 +3158,9 @@ fn run() -> Result<(), String> {
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
+                                mgmt_txwi,
+                                mgmt_frame,
+                                mgmt_tx_ring,
                             };
                             let mut transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
@@ -3222,6 +3228,9 @@ fn run() -> Result<(), String> {
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
+                                mgmt_txwi,
+                                mgmt_frame,
+                                mgmt_tx_ring,
                             };
                             let transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
@@ -3466,7 +3475,6 @@ fn run() -> Result<(), String> {
                                         // Deliberately no physical key/WCID enable: mechanics is
                                         // co-owned by the scan adapter. Only a future synchronous,
                                         // lock-safe acknowledged sender may populate this seam.
-                                        uni_submit: None,
                                     };
                                     let support = live_client_support(query_from_capabilities(
                                         report.nic_capability,
@@ -3535,9 +3543,9 @@ fn run() -> Result<(), String> {
                                             acquire_sae_tx_resources(
                                                 iommu,
                                                 ioas.id,
-                                                mgmt_txwi,
-                                                mgmt_frame,
-                                                mgmt_tx_ring,
+                                                mechanics.mgmt_txwi,
+                                                mechanics.mgmt_frame,
+                                                mechanics.mgmt_tx_ring,
                                                 acquisition_ledger,
                                                 mechanics.ledger,
                                             )
@@ -3644,18 +3652,7 @@ fn run() -> Result<(), String> {
                                             adapter.with_transport_mut(|transport| {
                                                 let mechanics = transport.mechanics_mut();
                                                 println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
-                                                mechanics.transmit_one_sae_auth(
-                                                    mgmt_tx_ring
-                                                        .as_mut()
-                                                        .ok_or("SAE TX ring arena missing")?,
-                                                    mgmt_txwi
-                                                        .as_mut()
-                                                        .ok_or("SAE TXWI arena missing")?,
-                                                    mgmt_frame
-                                                        .as_mut()
-                                                        .ok_or("SAE frame arena missing")?,
-                                                    &frame,
-                                                )
+                                                mechanics.transmit_owned_client_frame(&frame)
                                             })
                                         })?;
                                         record_sae_stage(match sae_sequence {
@@ -6259,6 +6256,42 @@ fn encode_client_data_txwi(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn encode_client_management_tx(
+    frame: &[u8],
+    txwi_iova: u64,
+    frame_iova: u64,
+) -> Result<mt7921_port_spike::Mt7921MgmtTx, String> {
+    let control = frame
+        .get(..2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .ok_or("management frame omitted control")?;
+    if control & 0x000c != 0 || frame.len() < 30 {
+        return Err("client management TX requires one complete management MPDU".into());
+    }
+    // The existing golden encoder owns the complete Linux TXWI/TXP envelope.
+    // Management subtypes differ only in TXD2's frame-subtype nibble.
+    let mut auth_shape = frame.to_vec();
+    auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+    let mut encoded = encode_mt7921_5ghz_auth_tx(
+        &auth_shape,
+        txwi_iova,
+        frame_iova,
+        0,
+        3,
+        19,
+    )
+    .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
+    let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
+    txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
+    encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
+    // The auth-shaped padding is never published; TXP length is the original
+    // MPDU length and the DMA payload arena contains only `frame`.
+    encoded.txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
+    encoded.txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
+    Ok(encoded)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct ClientFirmwareEffectsState {
     association: Option<LegacyWmeAssociation>,
@@ -8280,11 +8313,6 @@ struct LiveClientEffects {
     client: [u8; 6],
     rcpi: u8,
     firmware: ClientFirmwareEffectsState,
-    /// Injectable only: the physical SAE path deliberately leaves this
-    /// absent because effects and mechanics share the adapter backend lock.
-    /// A future owner must provide a genuinely synchronous ACK boundary, not
-    /// a raw loader pointer or deferred command pump.
-    uni_submit: Option<Box<dyn FnMut(&[u8]) -> Result<(), String>>>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8298,11 +8326,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
     }
     fn revoke_lifecycle(&mut self) {
         *self.state.lock().unwrap() = LiveClientState::default();
-        if let Some(submit) = self.uni_submit.as_mut() {
-            let _ = self.firmware.teardown(|command| submit(command));
-        } else {
-            self.firmware = ClientFirmwareEffectsState::default();
-        }
+        // Device reset/stop owns transport containment. Do not issue new DMA
+        // after lifecycle revocation; forget only after the owner contained it.
+        self.firmware = ClientFirmwareEffectsState::default();
     }
     fn set_channel(
         &mut self,
@@ -8326,31 +8352,45 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         bytes: &[u8],
         flags: fidl_softmac::WlanTxInfoFlags,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        let sae = bytes.get(..2) == Some(&[0xb0, 0]);
         let mut state = self.state.lock().unwrap();
         if !state.scan_authorized
             || !state.power_rate_authorized
             || state.sae_generation.is_none()
             || state.authorized_channel != state.tuned_channel
-            || state.frame.is_some()
-            || bytes.get(..2) != Some(&[0xb0, 0])
             || bytes.get(4..10) != Some(&self.target)
             || bytes.get(10..16) != Some(&self.client)
-            || bytes.get(16..22) != Some(&self.target)
-            || bytes.get(24..26) != Some(&[3, 0])
-            || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
+            || (sae && bytes.get(16..22) != Some(&self.target))
         {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        state.frame = Some(PendingSaeTx {
-            generation: state.sae_generation.expect("checked generation"),
-            bytes: bytes.to_vec(),
-        });
-        Ok(())
+        if sae {
+            if state.frame.is_some()
+                || bytes.get(24..26) != Some(&[3, 0])
+                || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
+            {
+                return Err(zx::Status::ACCESS_DENIED);
+            }
+            state.frame = Some(PendingSaeTx {
+                generation: state.sae_generation.expect("checked generation"),
+                bytes: bytes.to_vec(),
+            });
+            return Ok(());
+        }
+        drop(state);
+        let eapol = bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        self.firmware.tx_generation(eapol).map_err(|_| zx::Status::ACCESS_DENIED)?;
+        if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        io.transmit_client(bytes, flags)
     }
     fn install_key(
         &mut self,
         configuration: &fidl_softmac::WlanKeyConfiguration,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         if configuration.protection != Some(fidl_softmac::WlanProtection::RxTx)
             || configuration.cipher_oui != Some([0, 15, 172])
@@ -8363,7 +8403,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .as_deref()
             .ok_or(zx::Status::INVALID_ARGS)?;
         let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
-        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
         let result = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
             fidl_ieee80211::KeyType::Pairwise
                 if configuration.peer_addr == Some(association.peer)
@@ -8372,7 +8411,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             {
                 self.firmware
                     .install_ptk(key, configuration.rsc.unwrap_or(0), |command| {
-                        submit(command)
+                        io.submit_uni(3, command).map_err(|status| status.to_string())
                     })
             }
             fidl_ieee80211::KeyType::Group
@@ -8382,7 +8421,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             {
                 self.firmware
                     .install_gtk(key_id, key, configuration.rsc.unwrap_or(0), |command| {
-                        submit(command)
+                        io.submit_uni(3, command).map_err(|status| status.to_string())
                     })
             }
             fidl_ieee80211::KeyType::Igtk
@@ -8391,7 +8430,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && configuration.cipher_type == Some(6) =>
             {
                 self.firmware
-                    .install_igtk(key_id, key, |command| submit(command))
+                    .install_igtk(key_id, key, |command| io.submit_uni(3, command).map_err(|status| status.to_string()))
             }
             _ => return Err(zx::Status::INVALID_ARGS),
         };
@@ -8400,6 +8439,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
     fn notify_association_complete(
         &mut self,
         configuration: &fidl_softmac::WlanAssociationConfig,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
         let aid = configuration
@@ -8409,7 +8449,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if peer != self.target {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
         self.firmware
             .associate(
                 LegacyWmeAssociation {
@@ -8424,21 +8463,21 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     // cannot become a mandatory readiness predicate here.
                     mfp_required: false,
                 },
-                |command| submit(command),
+                |command| io.submit_uni(3, command).map_err(|status| status.to_string()),
             )
             .map_err(|_| zx::Status::IO)
     }
     fn clear_association(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         let association = self.firmware.association.ok_or(zx::Status::BAD_STATE)?;
         if request.peer_addr != Some(association.peer) {
             return Err(zx::Status::INVALID_ARGS);
         }
-        let submit = self.uni_submit.as_mut().ok_or(zx::Status::NOT_SUPPORTED)?;
         self.firmware
-            .teardown(|command| submit(command))
+            .teardown(|command| io.submit_uni(3, command).map_err(|status| status.to_string()))
             .map_err(|_| zx::Status::IO)
     }
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
@@ -8446,8 +8485,32 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .set_controlled_port(up)
             .map_err(|_| zx::Status::BAD_STATE)
     }
-    fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-        Ok(None)
+    fn next_rx(&mut self, io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status> {
+        let Some(frame) = io.next_client_rx()? else { return Ok(None) };
+        let control = frame.bytes.get(..2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        if control & 0x000c == 0x0008 {
+            let eapol = frame.bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            let generation = self.firmware.tx_generation(eapol).map_err(|_| zx::Status::ACCESS_DENIED)?;
+            let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+            self.firmware.deliver_rx(ClientRxCandidate {
+                generation,
+                eapol,
+                wcid: security.wcid.try_into().map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
+                tid: security.tid,
+                group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
+                key_id: security.key_id,
+                security_mode: security.security_mode,
+                cm: security.cm,
+                clm: security.clm,
+                icv_error: security.icv_error,
+                mic_error: security.mic_error,
+                fcs_error: security.fcs_error,
+                pn: security.pn.unwrap_or([0; 6]),
+            }).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        } else if control & 0x000c != 0 {
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        Ok(Some(frame))
     }
     fn begin_passive_scan(
         &mut self,
@@ -8498,6 +8561,9 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
+    mgmt_txwi: &'c mut Option<DmaArena>,
+    mgmt_frame: &'c mut Option<DmaArena>,
+    mgmt_tx_ring: &'c mut Option<DmaArena>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8515,6 +8581,17 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn transmit_owned_client_frame(&mut self, frame: &[u8]) -> Result<(), String> {
+        let mut ring = self.mgmt_tx_ring.take().ok_or("client TX ring arena missing")?;
+        let mut txwi = self.mgmt_txwi.take().ok_or("client TXWI arena missing")?;
+        let mut payload = self.mgmt_frame.take().ok_or("client frame arena missing")?;
+        let result = self.transmit_one_sae_auth(&mut ring, &mut txwi, &mut payload, frame);
+        *self.mgmt_tx_ring = Some(ring);
+        *self.mgmt_txwi = Some(txwi);
+        *self.mgmt_frame = Some(payload);
+        result
+    }
+
     fn stop_tx_dma_and_reset_ring0(&mut self) -> Result<(), String> {
         let global = self.loader.mcu.wfdma.read(0xd4208)?;
         self.loader
@@ -8582,10 +8659,37 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         let mut completion_state = MgmtTxCompletionState::default();
         let result = (|| -> Result<(), String> {
             frame_arena.write_bytes(frame)?;
-            let encoded = encode_mt7921_5ghz_auth_tx(frame, txwi.iova, frame_arena.iova, 0, 3, 19)
-                .map_err(|error| format!("encode one SAE authentication MPDU: {error:?}"))?;
-            txwi.write_bytes(&encoded.txwi)?;
-            ring.write_descriptor_at(0, encoded.descriptor);
+            let control = frame
+                .get(..2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .ok_or("client TX omitted frame control")?;
+            let (txwi_bytes, descriptor) = if control & 0x000c == 0 {
+                let encoded = encode_client_management_tx(frame, txwi.iova, frame_arena.iova)?;
+                (encoded.txwi.to_vec(), encoded.descriptor)
+            } else if control & 0x000c == 0x0008 {
+                let eapol = frame.windows(8).any(|window| {
+                    window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
+                });
+                let encoded = encode_client_data_txwi(
+                    frame.len(),
+                    frame_arena.iova,
+                    0,
+                    3,
+                    eapol,
+                    control & 0x4000 != 0,
+                )?;
+                let descriptor = DmaDescriptor::tx(
+                    DmaSegment { iova: txwi.iova, len: encoded.len() as u16 },
+                    None,
+                    0,
+                )
+                .map_err(|error| format!("encode client data descriptor: {error:?}"))?;
+                (encoded.to_vec(), descriptor)
+            } else {
+                return Err("unsupported client TX frame type".into());
+            };
+            txwi.write_bytes(&txwi_bytes)?;
+            ring.write_descriptor_at(0, descriptor);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
@@ -8716,6 +8820,90 @@ impl VfioPassiveMechanics<'_, '_, '_> {
 #[cfg(feature = "fuchsia-passive")]
 impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
+
+    fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.loader
+            .send_acknowledged_uni_command(expected_cid, encoded)
+            .map_err(|_| zx::Status::IO)
+    }
+
+    fn transmit_client(
+        &mut self,
+        bytes: &[u8],
+        flags: fidl_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        let protected = bytes
+            .get(..2)
+            .map(|control| u16::from_le_bytes([control[0], control[1]]) & 0x4000 != 0)
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        self.transmit_owned_client_frame(bytes).map_err(|_| zx::Status::IO)
+    }
+
+    fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        self.loader.mcu.handle_irq(None).map_err(|_| zx::Status::IO)?;
+        drain_data_rx_queue(
+            self.loader.mcu.wfdma,
+            &mut self.data,
+            &mut self.loader.mcu.descriptor_provenance,
+            &mut self.tx_completions,
+            Some(&mut self.loader.mcu.normal_rx_frames),
+        )
+        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        let Some(frame) = self.loader.mcu.normal_rx_frames.pop() else {
+            return Ok(None);
+        };
+        if let Some(occurrence) = frame.occurrence.as_ref() {
+            self.loader.mcu.descriptor_provenance.retire(occurrence);
+        }
+        let header = frame.bytes.get(..24).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        let rxd1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let rxd2 = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let security = ClientRxSecurity {
+            wcid: (rxd1 & 0x03ff) as u16,
+            tid: ((rxd2 >> 16) & 0x0f) as u8,
+            key_id: ((rxd1 >> 21) & 0x03) as u8,
+            security_mode: ((rxd1 >> 16) & 0x1f) as u8,
+            cm: rxd1 & (1 << 23) != 0,
+            clm: rxd1 & (1 << 24) != 0,
+            icv_error: rxd1 & (1 << 25) != 0,
+            mic_error: rxd1 & (1 << 26) != 0,
+            fcs_error: rxd1 & (1 << 27) != 0,
+            pn: if rxd1 & (1 << 11) != 0 {
+                Some(connac2_group1_pn(frame.bytes.get(24..40).ok_or(zx::Status::IO_DATA_INTEGRITY)?)
+                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?)
+            } else {
+                None
+            },
+        };
+        let parsed = parse_connac2_rx_frame(&frame.bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        let primary = ChannelNumber {
+            band: match parsed.band {
+                mt7921_port_spike::PhysicalBand::Ghz2 => WlanBand::TwoGhz,
+                mt7921_port_spike::PhysicalBand::Ghz5 => WlanBand::FiveGhz,
+                mt7921_port_spike::PhysicalBand::Ghz6 => return Err(zx::Status::NOT_SUPPORTED),
+            },
+            number: parsed.channel,
+        };
+        Ok(Some(ClientRxFrame {
+            bytes: parsed.bytes,
+            status: fidl_softmac::WlanRxInfo {
+                rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                data_rate: 0,
+                primary,
+                bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: ChannelNumber { number: 0, ..primary },
+                mcs: 0,
+                rssi_dbm: parsed.rssi_dbm,
+                snr_dbh: 0,
+            },
+            security: Some(security),
+        }))
+    }
 
     fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
         self.ledger
@@ -10534,6 +10722,30 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "fuchsia-passive")]
+    #[derive(Default)]
+    struct TestClientIo {
+        uni: Vec<Vec<u8>>,
+        tx: Vec<Vec<u8>>,
+        fail_uni: bool,
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    impl mt7921_softmac_adapter::client_device::Mt7921ClientIo for TestClientIo {
+        fn submit_uni(&mut self, cid: u8, bytes: &[u8]) -> Result<(), zx::Status> {
+            if self.fail_uni || validate_uni_request(cid, bytes).is_err() {
+                return Err(zx::Status::IO);
+            }
+            self.uni.push(bytes.to_vec());
+            Ok(())
+        }
+        fn transmit_client(&mut self, bytes: &[u8], _: fidl_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+            self.tx.push(bytes.to_vec());
+            Ok(())
+        }
+        fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> { Ok(None) }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn sae_credential_declared_length_does_not_wait_for_eof() {
         use std::os::fd::IntoRawFd;
@@ -10857,21 +11069,28 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn client_management_encoder_binds_subtype_and_rejects_non_management() {
+        let mut association = vec![0u8; 30];
+        association[0..2].copy_from_slice(&0x0000u16.to_le_bytes());
+        let encoded = encode_client_management_tx(&association, 0x1000, 0x2000).unwrap();
+        assert_eq!(u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap()) & 0xf, 0);
+        assert_eq!(u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()), 0x801e);
+        association[0..2].copy_from_slice(&0x0008u16.to_le_bytes());
+        assert!(encode_client_management_tx(&association, 0x1000, 0x2000).is_err());
+        assert!(encode_client_management_tx(&association[..20], 0x1000, 0x2000).is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn live_client_effects_submit_cid3_synchronously_and_keep_physical_path_disabled() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
-        let submitted = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let submitted_for_effect = submitted.clone();
+        let mut io = TestClientIo::default();
         let mut effects = LiveClientEffects {
             state: Arc::new(Mutex::new(LiveClientState::default())),
             target: peer,
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
-            uni_submit: Some(Box::new(move |command| {
-                validate_uni_request(3, command)?;
-                submitted_for_effect.lock().unwrap().push(command.to_vec());
-                Ok(())
-            })),
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -10879,8 +11098,8 @@ mod tests {
             qos: Some(true),
             ..Default::default()
         };
-        effects.notify_association_complete(&association).unwrap();
-        assert_eq!(submitted.lock().unwrap().len(), 1);
+        effects.notify_association_complete(&association, &mut io).unwrap();
+        assert_eq!(io.uni.len(), 1);
         assert!(!effects.firmware.controlled_port_open);
 
         let key =
@@ -10895,20 +11114,20 @@ mod tests {
                 rsc: Some(0),
             };
         effects
-            .install_key(&key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11))
+            .install_key(&key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11), &mut io)
             .unwrap();
         assert_eq!(effects.set_link_up(true), Err(zx::Status::BAD_STATE));
         effects
-            .install_key(&key(fidl_ieee80211::KeyType::Group, [0xff; 6], 2, 4, 0x22))
+            .install_key(&key(fidl_ieee80211::KeyType::Group, [0xff; 6], 2, 4, 0x22), &mut io)
             .unwrap();
         effects.set_link_up(true).unwrap();
         assert!(effects.firmware.controlled_port_open);
         effects
             .clear_association(&fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
                 peer_addr: Some(peer),
-            })
+            }, &mut io)
             .unwrap();
-        assert_eq!(submitted.lock().unwrap().len(), 6);
+        assert_eq!(io.uni.len(), 6);
         assert!(effects.firmware.association.is_none());
 
         let mut physically_unbound = LiveClientEffects {
@@ -10917,11 +11136,10 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
-            uni_submit: None,
         };
         assert_eq!(
-            physically_unbound.notify_association_complete(&association),
-            Err(zx::Status::NOT_SUPPORTED)
+            { let mut failed = TestClientIo { fail_uni: true, ..Default::default() }; physically_unbound.notify_association_complete(&association, &mut failed) },
+            Err(zx::Status::IO)
         );
         assert!(physically_unbound.firmware.association.is_none());
     }
@@ -10936,13 +11154,13 @@ mod tests {
             number: 36,
         };
         let shared = Arc::new(Mutex::new(LiveClientState::default()));
+        let mut io = TestClientIo::default();
         let mut effects = LiveClientEffects {
             state: shared.clone(),
             target: peer,
             client,
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
-            uni_submit: None,
         };
         effects
             .set_channel(
@@ -10973,29 +11191,29 @@ mod tests {
         let mut foreign = frame(1);
         foreign[4] ^= 1;
         assert_eq!(
-            effects.send_wlan_frame(&foreign, fidl_softmac::WlanTxInfoFlags::empty()),
+            effects.send_wlan_frame(&foreign, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
             Err(zx::Status::ACCESS_DENIED)
         );
         assert_eq!(
-            effects.send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::PROTECTED,),
+            effects.send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::PROTECTED, &mut io),
             Err(zx::Status::ACCESS_DENIED)
         );
         let mut open_system = frame(1);
         open_system[24..26].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(
-            effects.send_wlan_frame(&open_system, fidl_softmac::WlanTxInfoFlags::empty()),
+            effects.send_wlan_frame(&open_system, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
             Err(zx::Status::ACCESS_DENIED)
         );
 
         effects
-            .send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::empty())
+            .send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
         effects.revoke_scan();
         assert!(shared.lock().unwrap().take_sae_for_publish().is_err());
 
         shared.lock().unwrap().authorize_sae(channel).unwrap();
         effects
-            .send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty())
+            .send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
         let publish = |bytes: &[u8]| {
             encode_mt7921_5ghz_auth_tx(bytes, 0x1000, 0x2000, 0, 3, 19)
