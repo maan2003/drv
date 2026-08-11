@@ -31,6 +31,40 @@ use crate::ethernet::{
 };
 use fuchsia_softmac_port::{HardwareScanEvent, SoftmacHardware};
 
+#[derive(Clone, Copy)]
+struct SafeAuthStage {
+    algorithm: u16,
+    transaction: u16,
+    status: u16,
+    rejected_group: Option<u16>,
+}
+
+fn safe_auth_stage(bytes: &[u8]) -> Option<SafeAuthStage> {
+    let control = u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?);
+    if control & 0x00fc != 0x00b0 {
+        return None;
+    }
+    let algorithm = u16::from_le_bytes(bytes.get(24..26)?.try_into().ok()?);
+    let transaction = u16::from_le_bytes(bytes.get(26..28)?.try_into().ok()?);
+    let status = u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?);
+    let rejected_group = if status == 77 {
+        Some(u16::from_le_bytes(bytes.get(30..32)?.try_into().ok()?))
+    } else {
+        None
+    };
+    Some(SafeAuthStage {
+        algorithm,
+        transaction,
+        status,
+        rejected_group,
+    })
+}
+
+fn safe_sae_group(frame: &fidl_mlme::SaeFrame) -> Option<u16> {
+    (frame.seq_num == 1 && frame.sae_fields.len() >= 2)
+        .then(|| u16::from_le_bytes([frame.sae_fields[0], frame.sae_fields[1]]))
+}
+
 /// Immutable values reported through the pinned `DeviceOps` query seams.
 #[derive(Clone)]
 pub struct ClientSupport {
@@ -497,8 +531,28 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         };
         let status = wlan_softmac_class_support::rx_carrier(&bytes, status, false)
             .map_or(status, |carrier| carrier.status);
+        if let Some(auth) = safe_auth_stage(&bytes) {
+            println!(
+                "client_mlme_rx stage=adapter_return algorithm={} transaction={} status={} rejected_group={:?} band={:?} primary={}",
+                auth.algorithm,
+                auth.transaction,
+                auth.status,
+                auth.rejected_group,
+                status.primary.band,
+                status.primary.number
+            );
+        }
         wlan_mlme::MlmeImpl::handle_mac_frame_rx(mlme, &bytes, status, fuchsia_trace::Id::new())
             .await;
+        if let Some(auth) = safe_auth_stage(&bytes) {
+            // ClientMlme does not expose its private state/disposition. This
+            // marker means the receive future completed, not that MLME
+            // accepted the frame; the following event marker proves that.
+            println!(
+                "client_mlme_rx stage=handle_complete algorithm={} transaction={} status={} rejected_group={:?}",
+                auth.algorithm, auth.transaction, auth.status, auth.rejected_group
+            );
+        }
         Ok(true)
     }
 
@@ -641,6 +695,14 @@ where
         loop {
             match self.requests.try_recv() {
                 Ok(request) => {
+                    if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
+                        println!(
+                            "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
+                            frame.seq_num,
+                            frame.status_code.into_primitive(),
+                            safe_sae_group(frame)
+                        );
+                    }
                     let name = request.name();
                     wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
                         .await
@@ -673,6 +735,14 @@ where
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
+                    if let fidl_mlme::MlmeEvent::OnSaeFrameRx { frame } = &event {
+                        println!(
+                            "client_sae_stage=mlme_sae_frame_rx algorithm=3 transaction={} status={} group={:?}",
+                            frame.seq_num,
+                            frame.status_code.into_primitive(),
+                            safe_sae_group(frame)
+                        );
+                    }
                     Station::on_mlme_event(&mut self.sme, event);
                     progressed = true;
                 }
@@ -1106,6 +1176,25 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_auth_telemetry_exposes_only_fixed_public_fields() {
+        let mut frame = vec![0; 32];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        frame[24..26].copy_from_slice(&3u16.to_le_bytes());
+        frame[26..28].copy_from_slice(&1u16.to_le_bytes());
+        frame[28..30].copy_from_slice(&77u16.to_le_bytes());
+        frame[30..32].copy_from_slice(&20u16.to_le_bytes());
+
+        let stage = safe_auth_stage(&frame).unwrap();
+        assert_eq!(stage.algorithm, 3);
+        assert_eq!(stage.transaction, 1);
+        assert_eq!(stage.status, 77);
+        assert_eq!(stage.rejected_group, Some(20));
+        assert!(safe_auth_stage(&frame[..31]).is_none());
+        frame[0] = 0x08;
+        assert!(safe_auth_stage(&frame).is_none());
+    }
     use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

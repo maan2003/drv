@@ -8404,6 +8404,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if self.loader.mcu.wfdma.read(0xd4208)? & 1 == 0 {
             return Err("REBOOT REQUIRED: ring-0 reset disabled global WFDMA TX".into());
         }
+        record_sae_stage(&format!(
+            "management_tx_ring_reclaimed cidx={cidx} didx={didx} global_tx_enabled=true uni_poisoned={}",
+            self.loader.uni_terminal_poisoned
+        ));
         Ok(())
     }
 
@@ -14037,14 +14041,16 @@ mod tests {
                 number: 36,
             };
 
-            let mut rx = vec![0; 24 + 8 + 32];
+            // Physical E2E shape: 24-byte RXD + GROUP4 + GROUP2 +
+            // GROUP3/RXV + 32-byte status-77 Authentication frame.
+            let mut rx = vec![0; 24 + 16 + 8 + 8 + 32];
             let length = rx.len() as u32;
-            rx[0..4].copy_from_slice(&((2u32 << 27) | length).to_le_bytes());
-            rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+            rx[0..4].copy_from_slice(&((7u32 << 27) | (1 << 16) | length).to_le_bytes());
+            rx[4..8].copy_from_slice(&((1u32 << 14) | (1 << 12) | (1 << 13)).to_le_bytes());
             rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
-            rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+            rx[52..56].copy_from_slice(&0x7878u32.to_le_bytes());
             {
-                let auth = &mut rx[32..];
+                let auth = &mut rx[56..];
                 auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
                 auth[4..10].copy_from_slice(&client);
                 auth[10..16].copy_from_slice(&peer);
@@ -14069,28 +14075,35 @@ mod tests {
                 rx_buffers: &buffers,
                 rx_tail: 0,
                 rx_head: 7,
-                rx_ring_index: 2,
+                rx_ring_index: 4,
                 rx_count: 8,
-                irq_bit: DATA_RX_IRQ_BIT,
+                irq_bit: WM2_RX_IRQ_BIT,
             };
             let mut provenance = DescriptorProvenance::new();
             let mut normal = VecDeque::new();
-            drain_data_rx_queue(
-                &page,
-                &mut queue,
-                &mut provenance,
-                &mut Vec::new(),
-                Some(&mut normal),
-            )
-            .unwrap();
+            let mut unsolicited = Vec::new();
+            let mut completions = Vec::new();
+            assert!(
+                drain_rx_queue(
+                    &page,
+                    &mut queue,
+                    None,
+                    &mut unsolicited,
+                    &mut normal,
+                    &mut completions,
+                    &mut provenance,
+                )
+                .unwrap()
+                .is_none()
+            );
             assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
             assert!(matches!(
                 provenance.effects.as_slice(),
                 [
                     DescriptorProvenanceEffect::Mint(_),
                     DescriptorProvenanceEffect::Rearm {
-                        route: DescriptorOccurrenceRoute::DataRx,
-                        ring: 2,
+                        route: DescriptorOccurrenceRoute::McuNormalRx,
+                        ring: 4,
                         slot: 7,
                         ..
                     }
@@ -15453,6 +15466,8 @@ mod tests {
         assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
         assert!(reset.contains("read(0xd4308)"));
         assert!(reset.contains("read(0xd430c)"));
+        assert!(reset.contains("management_tx_ring_reclaimed"));
+        assert!(reset.contains("uni_poisoned"));
         assert!(!reset.contains("write_active_wfdma(0xd4208"));
         assert!(!reset.contains("write_active_wfdma(0xd4100"));
         assert!(!reset.contains("write_rx_ring_slot"));
