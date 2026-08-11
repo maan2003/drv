@@ -10,7 +10,7 @@
 //! - `drivers/net/wireless/mediatek/mt76/pci.c`: PCIe ASPM capability policy.
 //! - `drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c` and
 //!   `mt76_connac_mcu.h`: Connac firmware/patch image formats and common
-//!   download-mode bit derivation.
+//!   download-mode bit derivation and common MCU RX response envelope.
 //! - `drivers/net/wireless/mediatek/mt76/mmio.c`: common RMW value semantics.
 //! - `drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h`: Connac2 GROUP1
 //!   packet-number byte order.
@@ -754,6 +754,23 @@ mod tests {
             Ok([1, 2, 3, 4, 5, 6])
         );
     }
+
+    #[test]
+    fn connac_mcu_response_is_length_and_sequence_bounded() {
+        let mut response = [0u8; 36];
+        response[24..26].copy_from_slice(&12u16.to_le_bytes());
+        response[26..28].copy_from_slice(&0xe000u16.to_le_bytes());
+        response[28] = 0x01;
+        response[29] = 7;
+        assert_eq!(parse_download_response(&response, 7).unwrap().sequence, 7);
+        assert_eq!(
+            parse_download_response(&response, 8),
+            Err(DownloadResponseError::SequenceMismatch {
+                expected: 8,
+                actual: 7
+            })
+        );
+    }
 }
 
 pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
@@ -814,4 +831,52 @@ pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError
         }
     }
     Ok(mode)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadResponse {
+    pub length: u16,
+    pub packet_type: u16,
+    pub event_id: u8,
+    pub sequence: u8,
+    pub option: u8,
+    pub extended_event_id: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadResponseError {
+    Truncated,
+    InvalidLength,
+    SequenceMismatch { expected: u8, actual: u8 },
+}
+
+/// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
+pub fn parse_download_response(
+    bytes: &[u8],
+    expected_sequence: u8,
+) -> Result<DownloadResponse, DownloadResponseError> {
+    let header = bytes.get(..36).ok_or(DownloadResponseError::Truncated)?;
+    let length = u16::from_le_bytes(header[24..26].try_into().expect("fixed field"));
+    if 24usize
+        .checked_add(usize::from(length))
+        .is_none_or(|end| end > bytes.len())
+        || length < 12
+    {
+        return Err(DownloadResponseError::InvalidLength);
+    }
+    let sequence = header[29];
+    if sequence != expected_sequence {
+        return Err(DownloadResponseError::SequenceMismatch {
+            expected: expected_sequence,
+            actual: sequence,
+        });
+    }
+    Ok(DownloadResponse {
+        length,
+        packet_type: u16::from_le_bytes(header[26..28].try_into().expect("fixed field")),
+        event_id: header[28],
+        sequence,
+        option: header[30],
+        extended_event_id: header[32],
+    })
 }

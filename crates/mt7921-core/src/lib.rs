@@ -1882,23 +1882,6 @@ pub enum DownloadCommandError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DownloadResponse {
-    pub length: u16,
-    pub packet_type: u16,
-    pub event_id: u8,
-    pub sequence: u8,
-    pub option: u8,
-    pub extended_event_id: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DownloadResponseError {
-    Truncated,
-    InvalidLength,
-    SequenceMismatch { expected: u8, actual: u8 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NicPhyCapability {
     pub ht: bool,
     pub vht: bool,
@@ -2191,37 +2174,6 @@ pub fn parse_nic_capability(bytes: &[u8]) -> Result<NicCapability, NicCapability
         }
     }
     Ok(capability)
-}
-
-/// Parse the fixed 36-byte Connac2 MCU RX header before command-specific data.
-pub fn parse_download_response(
-    bytes: &[u8],
-    expected_sequence: u8,
-) -> Result<DownloadResponse, DownloadResponseError> {
-    let header = bytes.get(..36).ok_or(DownloadResponseError::Truncated)?;
-    let length = u16::from_le_bytes(header[24..26].try_into().expect("fixed field"));
-    if 24usize
-        .checked_add(usize::from(length))
-        .is_none_or(|end| end > bytes.len())
-        || length < 12
-    {
-        return Err(DownloadResponseError::InvalidLength);
-    }
-    let sequence = header[29];
-    if sequence != expected_sequence {
-        return Err(DownloadResponseError::SequenceMismatch {
-            expected: expected_sequence,
-            actual: sequence,
-        });
-    }
-    Ok(DownloadResponse {
-        length,
-        packet_type: u16::from_le_bytes(header[26..28].try_into().expect("fixed field")),
-        event_id: header[28],
-        sequence,
-        option: header[30],
-        extended_event_id: header[32],
-    })
 }
 
 /// Encode the non-scatter MCU command which must precede firmware DMA.
