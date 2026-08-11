@@ -5616,6 +5616,8 @@ pub fn encode_client_data_txwi(
     pid: u8,
     eapol: bool,
     protected: bool,
+    qos: bool,
+    tid: u8,
 ) -> Result<[u8; 64], String> {
     if payload_len == 0
         || payload_len > 0x0fff
@@ -5624,20 +5626,22 @@ pub fn encode_client_data_txwi(
             .is_none_or(|end| end > u64::from(u32::MAX))
         || token >= 8192
         || !(3..127).contains(&pid)
+        || tid > 7
     {
         return Err("client data TX escaped TXWI/TXP bounds".into());
     }
     let mut bytes = [0u8; 64];
     let words = if eapol {
+        let subtype = u32::from(qos) * 8;
         [
             0x0600_0000 | (payload_len as u32 + 32),
-            0x8072_6807,
-            0x8000_2028,
+            0x8002_6007 | (u32::from(tid) << 20) | (u32::from(qos) << 11),
+            0x8000_2020 | subtype,
             0x1000_7800 | u32::from(protected) * 2,
             0,
             0x400 | u32::from(pid),
             0x004b_0004,
-            0x0028_0000,
+            0x0020_0000 | (subtype << 16),
         ]
     } else {
         if !protected {

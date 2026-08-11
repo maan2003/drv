@@ -2222,18 +2222,65 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     burst_m1.extend_from_slice(&[0x11; 32]);
     burst_m1.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
     burst_m1.extend_from_slice(&[0, 0]);
-    let start = eapol_start_frame(client, peer);
+    let start = eapol_start_frame(client, peer, true);
     if !is_authenticator_m1(&burst_m1)
-        || start.get(..2) != Some(&[0x08, 0x01])
+        || start.get(..2) != Some(&[0x88, 0x01])
         || start.get(4..10) != Some(&peer)
         || start.get(10..16) != Some(&client)
         || start.get(16..22) != Some(&[0x01, 0x80, 0xc2, 0, 0, 3])
-        || start.get(24..36) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0])
+        || start.get(24..38)
+            != Some(&[7, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0])
     {
         return Err("self-test EAPOL-Start standards fixture failed".into());
     }
+    let start_txwi = encode_client_data_txwi(
+        start.len(),
+        0x1234_5000,
+        7,
+        9,
+        true,
+        false,
+        true,
+        7,
+    )
+    .map_err(|error| format!("self-test EAPOL-Start TXWI: {error}"))?;
+    let linux_words = [
+        0x0600_0046u32,
+        0x8072_6807,
+        0x8000_2028,
+        0x1000_7800,
+        0,
+        0x409,
+        0x004b_0004,
+        0x0028_0000,
+        0x0000_8007,
+        0,
+        0x1234_5000,
+        0x0000_8026,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let linux_golden = linux_words
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let management_txwi = encode_client_management_tx(
+        &burst_auth,
+        0x2234_4000,
+        0x2234_5000,
+        8,
+        10,
+    )
+    .map_err(|error| format!("self-test management TXWI: {error}"))?;
+    if start_txwi.as_slice() != linux_golden
+        || management_txwi.txwi[..32] == start_txwi[..32]
+    {
+        return Err("self-test Linux EAPOL-Start descriptor golden diverged".into());
+    }
     println!(
-        "self_test_eapol_liveness result=pass type=start timer_ms=1000 one_shot=true immediate_m1=suppressed timeout_flood=false"
+        "self_test_eapol_liveness result=pass type=start timer_ms=1000 one_shot=true immediate_m1=suppressed timeout_flood=false linux_golden=exact qos=true tid=7 wcid=7 management_data=distinct missing_wcid=blocked"
     );
     let burst_status = || fidl_softmac::WlanRxInfo {
         rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
@@ -9453,12 +9500,18 @@ struct LiveClientEffects {
 const EAPOL_START_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(feature = "fuchsia-passive")]
-fn eapol_start_frame(client: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
-    let mut frame = vec![0x08, 0x01, 0, 0];
+fn eapol_start_frame(client: [u8; 6], peer: [u8; 6], qos: bool) -> Vec<u8> {
+    let mut frame = vec![if qos { 0x88 } else { 0x08 }, 0x01, 0, 0];
     frame.extend_from_slice(&peer);
     frame.extend_from_slice(&client);
     frame.extend_from_slice(&[0x01, 0x80, 0xc2, 0x00, 0x00, 0x03]);
-    frame.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    frame.extend_from_slice(&[0, 0]);
+    if qos {
+        // Linux/mac80211 maps the control-port packet to voice priority 7;
+        // the QoS control field is part of the 26-byte 802.11 header.
+        frame.extend_from_slice(&[7, 0]);
+    }
+    frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
     // The pinned EAPOL stack's IEEE802DOT1X2001 version, Start type, and an
     // empty packet body (IEEE 802.1X).
     frame.extend_from_slice(&[1, 1, 0, 0]);
@@ -9675,6 +9728,37 @@ impl Mt7921ClientEffects for LiveClientEffects {
         self.firmware
             .tx_generation(eapol)
             .map_err(|_| zx::Status::ACCESS_DENIED)?;
+        let association = self
+            .firmware
+            .association
+            .filter(|association| association.peer_wcid == 7 && association.peer == self.target)
+            .ok_or(zx::Status::BAD_STATE)?;
+        let to_ds = control & 0x0100 != 0;
+        let from_ds = control & 0x0200 != 0;
+        let qos = (control >> 4) & 8 != 0;
+        let qos_offset = if to_ds && from_ds { 30 } else { 24 };
+        let tid = if qos {
+            bytes
+                .get(qos_offset)
+                .map(|value| value & 15)
+                .ok_or(zx::Status::INVALID_ARGS)?
+        } else {
+            0
+        };
+        if eapol && qos != association.negotiated_qos {
+            return Err(zx::Status::BAD_STATE);
+        }
+        record_sae_stage(&format!(
+            "client_data_tx_public fc=0x{control:04x} protected={} to_ds={to_ds} qos={qos} tid={tid} frame_len={} wcid=7 qidx={} rate={} addr1_is_bssid={} addr2_is_sta={} addr3_is_pae_group={} ack_ra_unicast={} sequence_owner=hardware fcs_owner=hardware",
+            control & 0x4000 != 0,
+            bytes.len(),
+            if eapol { 3 } else { 1 },
+            if eapol { "ofdm6" } else { "auto" },
+            bytes.get(4..10) == Some(&self.target),
+            bytes.get(10..16) == Some(&self.client),
+            bytes.get(16..22) == Some(&[0x01, 0x80, 0xc2, 0, 0, 3]),
+            bytes.get(4).is_some_and(|byte| byte & 1 == 0),
+        ));
         if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::ACCESS_DENIED);
         }
@@ -9877,7 +9961,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     self.eapol_start_deadline = None;
                     self.eapol_start_emitted = true;
                     record_sae_stage("eapol_liveness type=start timer=expired one_shot=committed");
-                    let start = eapol_start_frame(self.client, self.target);
+                    let qos = self
+                        .firmware
+                        .association
+                        .expect("generation-checked association")
+                        .negotiated_qos;
+                    let start = eapol_start_frame(self.client, self.target, qos);
                     self.send_wlan_frame(&start, fidl_softmac::WlanTxInfoFlags::empty(), io)?;
                     record_sae_stage("eapol_liveness type=start timer=expired one_shot=completed");
                 }
@@ -10543,6 +10632,20 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 let eapol = frame
                     .windows(8)
                     .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+                let qos = (control >> 4) & 8 != 0;
+                let qos_offset = if control & 0x0300 == 0x0300 { 30 } else { 24 };
+                let tid = if qos {
+                    frame
+                        .get(qos_offset)
+                        .map(|value| value & 15)
+                        .ok_or("QoS client data omitted QoS control")?
+                } else if eapol {
+                    // mac80211 control-port traffic retains voice priority
+                    // even when the peer did not negotiate QoS.
+                    7
+                } else {
+                    0
+                };
                 let encoded = encode_client_data_txwi(
                     frame.len(),
                     frame_arena.iova,
@@ -10550,7 +10653,21 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     pid,
                     eapol,
                     control & 0x4000 != 0,
+                    qos,
+                    tid,
                 )?;
+                let dwords = (0..8)
+                    .map(|index| {
+                        u32::from_le_bytes(encoded[index * 4..index * 4 + 4].try_into().unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                let descriptor_hash = encoded.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                });
+                record_sae_stage(&format!(
+                    "client_data_tx_descriptor txd={dwords:08x?} txp_len={} txp_token={} descriptor_hash=fnv1a64:{descriptor_hash:016x}",
+                    frame.len(), token
+                ));
                 let descriptor = mt7921_dma_tx(
                     DmaSegment {
                         iova: txwi.iova,
@@ -13048,8 +13165,10 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn client_data_txwi_txp_matches_pinned_eapol_and_ethernet_fixtures() {
-        let eapol = encode_client_data_txwi(120, 0x1234_5000, 7, 9, true, false).unwrap();
-        let data = encode_client_data_txwi(100, 0x2234_5000, 8, 10, false, true).unwrap();
+        let eapol =
+            encode_client_data_txwi(120, 0x1234_5000, 7, 9, true, false, true, 7).unwrap();
+        let data =
+            encode_client_data_txwi(100, 0x2234_5000, 8, 10, false, true, false, 0).unwrap();
         let words = |bytes: &[u8; 64]| {
             (0..8)
                 .map(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
@@ -13085,7 +13204,56 @@ mod tests {
             &eapol[32..46],
             &[7, 128, 0, 0, 0, 0, 0, 0, 0, 80, 52, 18, 120, 128]
         );
-        assert!(encode_client_data_txwi(100, 0x1000, 1, 9, false, false).is_err());
+        let start_frame = eapol_start_frame([6, 5, 4, 3, 2, 1], [1, 2, 3, 4, 5, 6], true);
+        let start = encode_client_data_txwi(
+            start_frame.len(),
+            0x1234_5000,
+            7,
+            9,
+            true,
+            false,
+            true,
+            7,
+        )
+        .unwrap();
+        let all_words = (0..16)
+            .map(|i| u32::from_le_bytes(start[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_words,
+            vec![
+                0x0600_0046,
+                0x8072_6807,
+                0x8000_2028,
+                0x1000_7800,
+                0,
+                0x409,
+                0x004b_0004,
+                0x0028_0000,
+                0x0000_8007,
+                0,
+                0x1234_5000,
+                0x0000_8026,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+        let mut management = vec![0; 30];
+        management[..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        let management = encode_client_management_tx(
+            &management,
+            0x2234_4000,
+            0x2234_5000,
+            8,
+            10,
+        )
+        .unwrap();
+        assert_ne!(&management.txwi[..32], &start[..32]);
+        assert!(
+            encode_client_data_txwi(100, 0x1000, 1, 9, false, false, false, 0).is_err()
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -13555,7 +13723,10 @@ mod tests {
         let generation = effects.firmware.association_generation.unwrap();
         effects.eapol_start_deadline = Some((Instant::now(), generation));
         assert!(effects.next_rx(&mut io).unwrap().is_none());
-        assert_eq!(io.tx.last(), Some(&eapol_start_frame(effects.client, peer)));
+        assert_eq!(
+            io.tx.last(),
+            Some(&eapol_start_frame(effects.client, peer, true))
+        );
         assert!(effects.eapol_start_emitted);
         let tx_after_start = io.tx.len();
         assert!(effects.next_rx(&mut io).unwrap().is_none());
@@ -13634,11 +13805,11 @@ mod tests {
         });
         assert!(effects.next_rx(&mut io).unwrap().is_none());
 
-        let mut eapol = vec![0x08, 0x01, 0, 0];
+        let mut eapol = vec![0x88, 0x01, 0, 0];
         eapol.extend_from_slice(&peer);
         eapol.extend_from_slice(&effects.client);
         eapol.extend_from_slice(&peer);
-        eapol.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
+        eapol.extend_from_slice(&[0, 0, 7, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
         effects
             .send_wlan_frame(&eapol, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
@@ -13708,7 +13879,7 @@ mod tests {
             [
                 sae,
                 association_request,
-                eapol_start_frame(effects.client, peer),
+                eapol_start_frame(effects.client, peer, true),
                 eapol,
                 data
             ]
@@ -13743,6 +13914,16 @@ mod tests {
             .firmware
             .bind_join(peer, test_channel_lease(36), 100)
             .unwrap();
+        let mut no_wcid_io = TestClientIo::default();
+        assert_eq!(
+            physically_unbound.send_wlan_frame(
+                &eapol_start_frame(physically_unbound.client, peer, true),
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                &mut no_wcid_io,
+            ),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        assert!(no_wcid_io.tx.is_empty());
         assert_eq!(
             {
                 let mut failed = TestClientIo {
