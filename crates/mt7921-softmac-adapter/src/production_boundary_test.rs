@@ -339,7 +339,11 @@ impl Mt7921ClientEffects for ProductionBackend {
         state.frames.push(bytes.to_vec());
         Ok(())
     }
-    fn install_key(&mut self, _: &fidl_softmac::WlanKeyConfiguration, _: &mut dyn crate::client_device::Mt7921ClientIo) -> Result<(), zx::Status> {
+    fn install_key(
+        &mut self,
+        _: &fidl_softmac::WlanKeyConfiguration,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn notify_association_complete(
@@ -359,7 +363,10 @@ impl Mt7921ClientEffects for ProductionBackend {
     fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
-    fn next_rx(&mut self, _: &mut dyn crate::client_device::Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status> {
+    fn next_rx(
+        &mut self,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
+    ) -> Result<Option<ClientRxFrame>, zx::Status> {
         Ok(None)
     }
     fn begin_passive_scan(

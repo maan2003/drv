@@ -5608,6 +5608,45 @@ pub fn encode_legacy_wme_add_wcid_command(
     Ok(bytes)
 }
 
+/// Linux v7.1 `mt76_connac_mcu_uni_add_bss` station BASIC+QBSS request.
+/// The BSS is programmed immediately before the associated WCID, matching
+/// `mt7921_mac_sta_event(MT76_STA_EVENT_ASSOC)`.
+pub fn encode_client_bss_command(
+    sequence: u8,
+    bss_index: u8,
+    bssid: [u8; 6],
+    channel: u16,
+    beacon_interval: u16,
+    qos: bool,
+    enable: bool,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bssid == [0; 6]
+        || beacon_interval == 0
+        || !(1..=177).contains(&channel)
+    {
+        return Err("BSS update escaped station BASIC bounds".into());
+    }
+    let mut payload = vec![0; 48];
+    payload[0] = bss_index;
+    payload[4..6].copy_from_slice(&0u16.to_le_bytes());
+    payload[6..8].copy_from_slice(&36u16.to_le_bytes());
+    payload[8] = u8::from(enable);
+    payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    payload[16] = u8::from(!enable);
+    payload[18..24].copy_from_slice(&bssid);
+    payload[24..26].copy_from_slice(&19u16.to_le_bytes());
+    payload[26..28].copy_from_slice(&beacon_interval.to_le_bytes());
+    payload[28] = 1;
+    payload[29] = if channel <= 14 { 0x4e } else { 0xb1 };
+    payload[30..32].copy_from_slice(&19u16.to_le_bytes());
+    payload[32..34].copy_from_slice(&(if channel <= 14 { 2u16 } else { 1u16 }).to_le_bytes());
+    payload[40..42].copy_from_slice(&15u16.to_le_bytes());
+    payload[42..44].copy_from_slice(&8u16.to_le_bytes());
+    payload[44] = u8::from(qos);
+    Ok(encode_uni_mcu(2, &payload, sequence))
+}
+
 pub struct SensitiveUniCommand(Vec<u8>);
 
 impl SensitiveUniCommand {
@@ -5739,6 +5778,13 @@ pub struct LegacyWmeAssociation {
     pub mfp_required: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JoinedClientBss {
+    pub bssid: [u8; 6],
+    pub channel: u16,
+    pub beacon_interval: u16,
+}
+
 pub struct RetainedGtk {
     id: u8,
     bytes: [u8; 16],
@@ -5865,6 +5911,8 @@ pub fn encode_client_management_tx(
 
 #[derive(Default)]
 pub struct ClientFirmwareEffectsState {
+    pub joined: Option<JoinedClientBss>,
+    pub bss_programmed: bool,
     pub association: Option<LegacyWmeAssociation>,
     pub sequence: u8,
     pub ptk_installed: bool,
@@ -5883,6 +5931,41 @@ pub struct ClientFirmwareEffectsState {
 }
 
 impl ClientFirmwareEffectsState {
+    pub fn bind_join(
+        &mut self,
+        bssid: [u8; 6],
+        tuned_channel: u16,
+        requested_channel: u16,
+        beacon_interval: u16,
+    ) -> Result<(), String> {
+        if bssid == [0; 6]
+            || tuned_channel != requested_channel
+            || beacon_interval == 0
+            || self.association.is_some()
+            || self.bss_programmed
+            || self.firmware_uncertain
+        {
+            return Err("join target/channel is not current and clean".into());
+        }
+        let joined = JoinedClientBss {
+            bssid,
+            channel: requested_channel,
+            beacon_interval,
+        };
+        if self.joined.is_some_and(|current| current != joined) {
+            return Err("join target changed without teardown".into());
+        }
+        self.joined = Some(joined);
+        Ok(())
+    }
+
+    pub fn accepts_joined_management(&self, frame: &[u8]) -> bool {
+        let Some(joined) = self.joined else {
+            return false;
+        };
+        frame.get(10..16) == Some(&joined.bssid) && frame.get(16..22) == Some(&joined.bssid)
+    }
+
     fn mint_generation(&mut self) -> u64 {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.next_generation
@@ -5896,11 +5979,26 @@ impl ClientFirmwareEffectsState {
     pub fn associate(
         &mut self,
         association: LegacyWmeAssociation,
-        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.association.is_some() || self.firmware_uncertain {
+        let joined = self
+            .joined
+            .filter(|joined| joined.bssid == association.peer)
+            .ok_or("association requires the joined target")?;
+        if self.association.is_some() || self.bss_programmed || self.firmware_uncertain {
             return Err("client firmware association state is not clean".into());
         }
+        let bss = encode_client_bss_command(
+            self.next_sequence(),
+            association.bss_index,
+            joined.bssid,
+            joined.channel,
+            joined.beacon_interval,
+            association.negotiated_qos,
+            true,
+        )?;
+        submit(2, &bss).map_err(|error| format!("BSS add failed: {error}"))?;
+        self.bss_programmed = true;
         let command = encode_legacy_wme_add_wcid_command(
             self.next_sequence(),
             association.bss_index,
@@ -5909,9 +6007,9 @@ impl ClientFirmwareEffectsState {
             association.peer,
             association.rcpi,
         )?;
-        if let Err(error) = submit(&command) {
+        if let Err(error) = submit(3, &command) {
             self.controlled_port_open = false;
-            let rollback = encode_remove_wcid_command(
+            let rollback_wcid = encode_remove_wcid_command(
                 self.next_sequence(),
                 association.bss_index,
                 association.peer_wcid,
@@ -5919,9 +6017,22 @@ impl ClientFirmwareEffectsState {
                 association.peer,
                 association.negotiated_qos,
             )
-            .and_then(|command| submit(&command));
-            self.firmware_uncertain = rollback.is_err();
-            return Err(format!("WCID add failed: {error}; rollback={rollback:?}"));
+            .and_then(|command| submit(3, &command));
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            self.bss_programmed = rollback_bss.is_err();
+            self.firmware_uncertain = rollback_wcid.is_err() || rollback_bss.is_err();
+            return Err(format!(
+                "WCID add failed: {error}; rollback_wcid={rollback_wcid:?}; rollback_bss={rollback_bss:?}"
+            ));
         }
         self.association = Some(association);
         self.association_generation = Some(self.mint_generation());
@@ -5932,7 +6043,7 @@ impl ClientFirmwareEffectsState {
         &mut self,
         key: &[u8],
         rsc: u64,
-        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("PTK install requires WCID ACK")?;
         if rsc >> 48 != 0 {
@@ -5947,7 +6058,7 @@ impl ClientFirmwareEffectsState {
         // A timeout can hide a successful firmware install. Record the
         // target before publication so teardown cannot skip its disable.
         self.ptk_dirty = true;
-        if let Err(error) = submit(command.as_bytes()) {
+        if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
@@ -5965,7 +6076,7 @@ impl ClientFirmwareEffectsState {
         key_id: u8,
         key: &[u8],
         rsc: u64,
-        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
         if rsc >> 48 != 0 {
@@ -5973,7 +6084,7 @@ impl ClientFirmwareEffectsState {
         }
         let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
         self.broadcast_keys_dirty = true;
-        if let Err(error) = submit(command.as_bytes()) {
+        if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
@@ -5993,7 +6104,7 @@ impl ClientFirmwareEffectsState {
         &mut self,
         key_id: u8,
         key: &[u8],
-        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("IGTK install requires WCID ACK")?;
         let sequence = self.next_sequence();
@@ -6010,7 +6121,7 @@ impl ClientFirmwareEffectsState {
             &gtk.bytes,
         )?;
         self.broadcast_keys_dirty = true;
-        if let Err(error) = submit(command.as_bytes()) {
+        if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
             let rollback = self.teardown(&mut submit);
@@ -6118,7 +6229,7 @@ impl ClientFirmwareEffectsState {
 
     pub fn teardown(
         &mut self,
-        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         self.controlled_port_open = false;
         self.authorized_generation = None;
@@ -6139,7 +6250,7 @@ impl ClientFirmwareEffectsState {
         };
         if self.broadcast_keys_dirty {
             encode_disable_keys_command(self.next_sequence(), association.bss_index, 19, 0x0e)
-                .and_then(|command| submit(command.as_bytes()))
+                .and_then(|command| submit(3, command.as_bytes()))
                 .map_err(|error| {
                     self.firmware_uncertain = true;
                     format!("client firmware broadcast-key teardown failed: {error}")
@@ -6156,7 +6267,7 @@ impl ClientFirmwareEffectsState {
                 association.peer_wcid,
                 0,
             )
-            .and_then(|command| submit(command.as_bytes()))
+            .and_then(|command| submit(3, command.as_bytes()))
             .map_err(|error| {
                 self.firmware_uncertain = true;
                 format!("client firmware pairwise-key teardown failed: {error}")
@@ -6173,12 +6284,29 @@ impl ClientFirmwareEffectsState {
             association.peer,
             association.negotiated_qos,
         )
-        .and_then(|command| submit(&command))
+        .and_then(|command| submit(3, &command))
         .map_err(|error| {
             self.firmware_uncertain = true;
             format!("client firmware WCID teardown failed: {error}")
         })?;
+        let joined = self.joined.expect("association retained joined BSS");
+        encode_client_bss_command(
+            self.next_sequence(),
+            association.bss_index,
+            joined.bssid,
+            joined.channel,
+            joined.beacon_interval,
+            association.negotiated_qos,
+            false,
+        )
+        .and_then(|command| submit(2, &command))
+        .map_err(|error| {
+            self.firmware_uncertain = true;
+            format!("client firmware BSS teardown failed: {error}")
+        })?;
+        self.bss_programmed = false;
         self.association = None;
+        self.joined = None;
         self.association_generation = None;
         self.firmware_uncertain = false;
         Ok(())
@@ -7419,6 +7547,57 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn client_join_association_and_teardown_match_linux_v71_bss_wcid_order() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid: 7,
+            aid: 42,
+            peer,
+            rcpi: 100,
+            negotiated_qos: true,
+            mfp_required: false,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        assert!(state.bind_join(peer, 36, 40, 100).is_err());
+        state.bind_join(peer, 36, 36, 100).unwrap();
+        assert!(state.accepts_joined_management(&[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x10, 0x20, 0x30,
+            0x40, 0x50, 0x60,
+        ]));
+
+        let mut transcript = Vec::new();
+        state
+            .associate(association, |_, command| {
+                transcript.push(command.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        state
+            .teardown(|_, command| {
+                transcript.push(command.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(transcript.len(), 4);
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|command| u16::from_le_bytes([command[34], command[35]]))
+                .collect::<Vec<_>>(),
+            [2, 3, 3, 2]
+        );
+        let bss_add = &transcript[0];
+        assert_eq!(&bss_add[66..72], &peer);
+        assert_eq!(bss_add[56], 1);
+        assert_eq!(bss_add[92], 1);
+        assert_eq!(transcript[3][56], 0);
+        assert!(state.joined.is_none());
+        assert!(!state.bss_programmed);
+    }
 
     #[test]
     fn source_exact_conservative_rate_power_batches_fail_closed() {

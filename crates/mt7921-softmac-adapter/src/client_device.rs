@@ -200,6 +200,17 @@ pub trait Mt7921ClientEffects {
     /// Immediately and durably poison every shared TX handle for lifecycle.
     fn revoke_lifecycle(&mut self);
 
+    /// True only while the scan-selected target/channel authorization
+    /// generation remains current for this exact ClientMlme request.
+    fn may_reuse_channel(
+        &self,
+        _: fidl_ieee80211::ChannelNumber,
+        _: fidl_ieee80211::ChannelBandwidth,
+        _: fidl_ieee80211::ChannelNumber,
+    ) -> bool {
+        false
+    }
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -257,6 +268,7 @@ pub trait Mt7921ClientEffects {
 }
 
 trait Mt7921ClientScan: Mt7921ClientIo {
+    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber>;
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -292,6 +304,10 @@ impl Mt7921ClientIo for NoClientScan {
 }
 
 impl Mt7921ClientScan for NoClientScan {
+    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber> {
+        None
+    }
+
     fn set_channel(
         &mut self,
         _: fidl_ieee80211::ChannelNumber,
@@ -315,6 +331,10 @@ impl Mt7921ClientScan for NoClientScan {
 }
 
 impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter<T> {
+    fn selected_channel(&self) -> Option<fidl_ieee80211::ChannelNumber> {
+        self.selected_channel()
+    }
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -501,12 +521,20 @@ type MlmeTimerAction<E, T> = Box<
     dyn FnOnce(&mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>),
 >;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PinnedConnectError {
     Timeout,
     Failed,
-    Driver,
+    Driver(PinnedDriverError),
     Containment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PinnedDriverError {
+    MlmeRequest { name: &'static str, detail: String },
+    ClientRx(zx::Status),
+    RequestStreamClosed,
+    EventStreamClosed,
 }
 
 /// Bounded production owner for SME, MLME, timers, device events, and MT7921
@@ -600,20 +628,32 @@ where
         loop {
             match self.requests.try_recv() {
                 Ok(request) => {
+                    let name = request.name();
                     wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
                         .await
-                        .map_err(|_| PinnedConnectError::Driver)?;
+                        .map_err(|error| {
+                            PinnedConnectError::Driver(PinnedDriverError::MlmeRequest {
+                                name,
+                                // Pinned MLME errors contain status/contract names,
+                                // never request frame or credential bytes.
+                                detail: error.to_string(),
+                            })
+                        })?;
                     progressed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Closed) => return Err(PinnedConnectError::Driver),
+                Err(mpsc::TryRecvError::Closed) => {
+                    return Err(PinnedConnectError::Driver(
+                        PinnedDriverError::RequestStreamClosed,
+                    ));
+                }
             }
         }
         if self
             .runner
             .pump_client_rx(&mut self.mlme)
             .await
-            .map_err(|_| PinnedConnectError::Driver)?
+            .map_err(|status| PinnedConnectError::Driver(PinnedDriverError::ClientRx(status)))?
         {
             progressed = true;
         }
@@ -624,7 +664,11 @@ where
                     progressed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Closed) => return Err(PinnedConnectError::Driver),
+                Err(mpsc::TryRecvError::Closed) => {
+                    return Err(PinnedConnectError::Driver(
+                        PinnedDriverError::EventStreamClosed,
+                    ));
+                }
             }
         }
         let _timer_context = self.timer_runtime.enter();
@@ -899,9 +943,17 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         vht_secondary_80_channel: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        let tuned = backend
-            .scan
-            .set_channel(primary, bandwidth, vht_secondary_80_channel);
+        let reuse = backend.scan.selected_channel() == Some(primary)
+            && backend
+                .effects
+                .may_reuse_channel(primary, bandwidth, vht_secondary_80_channel);
+        let tuned = if reuse {
+            Ok(())
+        } else {
+            backend
+                .scan
+                .set_channel(primary, bandwidth, vht_secondary_80_channel)
+        };
         match tuned {
             Err(zx::Status::NOT_SUPPORTED) => {}
             Err(status) => return Err(status),
@@ -1136,6 +1188,24 @@ mod tests {
         }
     }
 
+    fn live_shape_wpa3_connect_request() -> fidl_sme::ConnectRequest {
+        let mut request = open_connect_request();
+        request.bss_description.capability_info = 0x11;
+        request.bss_description.ies = vec![
+            0, 4, b't', b'e', b's', b't', 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+            0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0,
+        ];
+        request.authentication = fidl_fuchsia_wlan_internal::Authentication {
+            protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa3Personal,
+            credentials: Some(Box::new(fidl_fuchsia_wlan_internal::Credentials::Wpa(
+                fidl_fuchsia_wlan_internal::WpaCredentials::Passphrase(
+                    b"synthetic-password".to_vec(),
+                ),
+            ))),
+        };
+        request
+    }
+
     fn open_response(subtype: u8, body: &[u8]) -> ClientRxFrame {
         let mut bytes = vec![0u8; 24];
         bytes[0] = subtype << 4;
@@ -1184,6 +1254,7 @@ mod tests {
         link_up: Option<bool>,
         rx: VecDeque<ClientRxFrame>,
         fail_on: Option<&'static str>,
+        reuse_channel: bool,
     }
 
     // Deliberately redacted: frames and keys may contain SAE/RSN material.
@@ -1218,6 +1289,15 @@ mod tests {
         fn revoke_scan(&mut self) {}
 
         fn revoke_lifecycle(&mut self) {}
+
+        fn may_reuse_channel(
+            &self,
+            primary: fidl_ieee80211::ChannelNumber,
+            bandwidth: fidl_ieee80211::ChannelBandwidth,
+            secondary: fidl_ieee80211::ChannelNumber,
+        ) -> bool {
+            self.reuse_channel && self.channel == Some((primary, bandwidth, secondary))
+        }
 
         fn set_channel(
             &mut self,
@@ -1321,6 +1401,56 @@ mod tests {
         fn stop(&mut self) -> Result<(), zx::Status> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn client_mlme_reuses_only_the_current_authorized_physical_channel() {
+        futures::executor::block_on(async {
+            let transport = FakePassiveTransport::default();
+            let calls = transport.0.clone();
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                transport,
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let (mut device, runner) =
+                Mt7921ClientDevice::new(FakeEffects::default(), passive, support());
+            runner.backend.lock().unwrap().revoked = false;
+            DeviceOps::set_channel(
+                &mut device,
+                channel(36),
+                fidl_ieee80211::ChannelBandwidth::Cbw20,
+                channel(0),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+
+            runner.backend.lock().unwrap().effects.reuse_channel = true;
+            DeviceOps::set_channel(
+                &mut device,
+                channel(36),
+                fidl_ieee80211::ChannelBandwidth::Cbw20,
+                channel(0),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+
+            assert!(
+                DeviceOps::set_channel(
+                    &mut device,
+                    channel(36),
+                    fidl_ieee80211::ChannelBandwidth::Cbw40,
+                    channel(0),
+                )
+                .await
+                .is_err()
+            );
+        });
     }
 
     fn support() -> ClientSupport {
@@ -1582,6 +1712,75 @@ mod tests {
                 runner.pump_client_rx(&mut mlme).await,
                 Err(zx::Status::IO_REFUSED)
             );
+        });
+    }
+
+    #[test]
+    fn pinned_runtime_reports_live_shape_connect_driver_stage_without_credentials() {
+        futures::executor::block_on(async {
+            let effects = FakeEffects {
+                fail_on: Some("channel"),
+                ..Default::default()
+            };
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                FakePassiveTransport::default(),
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            let mut device_support = support();
+            device_support.query.sta_addr = nic().mac_address;
+            device_support.query.factory_addr = nic().mac_address;
+            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                basic_rates: Some(vec![0x82, 0x84]),
+                primary_channels: Some(vec![channel(36)]),
+                ..Default::default()
+            }]);
+            let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
+            runner.backend.lock().unwrap().revoked = false;
+            let mut support_info = support();
+            support_info.security.mfp = Some(fidl_common::MfpFeature {
+                supported: Some(true),
+            });
+            support_info
+                .security
+                .sae
+                .as_mut()
+                .unwrap()
+                .hash_to_element_supported = Some(true);
+            let mut sme_config = wlan_sme::client::ClientConfig::default();
+            sme_config.wpa3_supported = true;
+            let mut runtime = PinnedClientRuntime::new(
+                device,
+                runner,
+                sme_config,
+                runtime_device_info(),
+                support_info.security,
+                support_info.spectrum_management,
+                fuchsia_inspect::Inspector::default(),
+            )
+            .await
+            .unwrap();
+
+            let error = runtime
+                .connect(
+                    live_shape_wpa3_connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap_err();
+            let PinnedConnectError::Driver(PinnedDriverError::MlmeRequest { name, detail }) = error
+            else {
+                panic!("expected stage-specific MLME request failure: {error:?}")
+            };
+            assert_eq!(name, "Connect");
+            assert!(detail.contains("IO_REFUSED"), "{detail}");
+            assert!(!detail.contains("synthetic-password"));
+            assert!(runtime.runner.backend.lock().unwrap().lifecycle_poisoned);
         });
     }
 

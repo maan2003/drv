@@ -1053,8 +1053,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mt7921-core"
+version = "0.1.0"
+
+[[package]]
 name = "mt7921-port-spike"
 version = "0.1.0"
+dependencies = [
+ "mt7921-core",
+ "userspace-vfio",
+]
 
 [[package]]
 name = "mt7921-softmac-adapter"
@@ -2205,6 +2213,10 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "userspace-vfio"
+version = "0.1.0"
 
 [[package]]
 name = "utf8_iter"

@@ -439,12 +439,8 @@ where
     type Error = PinnedDataPumpError;
 
     fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
-        wlan_mlme::MlmeImpl::handle_eth_frame_tx(
-            self.mlme,
-            frame,
-            fuchsia_trace::Id::new(),
-        )
-        .map_err(PinnedDataPumpError::Tx)
+        wlan_mlme::MlmeImpl::handle_eth_frame_tx(self.mlme, frame, fuchsia_trace::Id::new())
+            .map_err(PinnedDataPumpError::Tx)
     }
 }
 

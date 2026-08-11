@@ -181,9 +181,7 @@ pub trait Mt7921PassiveTransport {
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
-    fn next_client_rx(
-        &mut self,
-    ) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
+    fn next_client_rx(&mut self) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
         Ok(None)
     }
 }
@@ -232,9 +230,7 @@ pub trait SourceExactPassiveMechanics {
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
-    fn next_client_rx(
-        &mut self,
-    ) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
+    fn next_client_rx(&mut self) -> Result<Option<client_device::ClientRxFrame>, zx::Status> {
         Ok(None)
     }
 }
@@ -370,7 +366,11 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         self.mechanics.submit_client_uni(expected_cid, encoded)
     }
 
-    fn transmit_client(&mut self, bytes: &[u8], flags: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+    fn transmit_client(
+        &mut self,
+        bytes: &[u8],
+        flags: fidl_fuchsia_wlan_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
         self.mechanics.transmit_client(bytes, flags)
     }
 
@@ -616,6 +616,7 @@ pub struct Mt7921SoftmacAdapter<T> {
     authorized: Vec<ChannelNumber>,
     next_scan_id: u64,
     last_timestamp_nanos: Option<i64>,
+    selected_channel: Option<ChannelNumber>,
     state: ScanState,
 }
 
@@ -654,6 +655,7 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
             authorized,
             next_scan_id: 1,
             last_timestamp_nanos: None,
+            selected_channel: None,
             state: ScanState::Idle,
         })
     }
@@ -666,6 +668,10 @@ impl<T: Mt7921PassiveTransport> Mt7921SoftmacAdapter<T> {
     /// the adapter's scan/lifecycle ownership.
     pub fn with_transport_mut<R>(&mut self, operation: impl FnOnce(&mut T) -> R) -> R {
         operation(&mut self.transport)
+    }
+
+    pub fn selected_channel(&self) -> Option<ChannelNumber> {
+        self.selected_channel
     }
 
     /// Explicit rejection surface for callers that otherwise have active scan
@@ -796,7 +802,9 @@ impl<T: Mt7921PassiveTransport> SoftmacHardware for Mt7921SoftmacAdapter<T> {
             .ok_or(AdapterError::UnauthorizedChannel(primary))?;
         self.transport
             .set_channel(candidate)
-            .map_err(|error| self.transport_failure(error))
+            .map_err(|error| self.transport_failure(error))?;
+        self.selected_channel = Some(primary);
+        Ok(())
     }
 
     fn start_passive_scan(

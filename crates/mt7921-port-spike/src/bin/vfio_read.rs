@@ -7596,6 +7596,21 @@ impl Mt7921ClientEffects for LiveClientEffects {
         // after lifecycle revocation; forget only after the owner contained it.
         self.firmware = ClientFirmwareEffectsState::default();
     }
+    fn may_reuse_channel(
+        &self,
+        primary: fidl_ieee80211::ChannelNumber,
+        bandwidth: fidl_ieee80211::ChannelBandwidth,
+        secondary: fidl_ieee80211::ChannelNumber,
+    ) -> bool {
+        let state = self.state.lock().unwrap();
+        bandwidth == fidl_ieee80211::ChannelBandwidth::Cbw20
+            && secondary.number == 0
+            && state.scan_authorized
+            && state.power_rate_authorized
+            && state.sae_generation.is_some()
+            && state.tuned_channel == Some(primary)
+            && state.authorized_channel == Some(primary)
+    }
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -7610,8 +7625,31 @@ impl Mt7921ClientEffects for LiveClientEffects {
         state.tuned_channel = Some(primary);
         Ok(())
     }
-    fn join_bss(&mut self, _: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
-        Ok(())
+    fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
+        let bssid = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        if bssid != self.target
+            || request.bss_type != Some(fidl_ieee80211::BssType::Infrastructure)
+            || request.remote != Some(true)
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let state = self.state.lock().unwrap();
+        let tuned = state.tuned_channel.ok_or(zx::Status::BAD_STATE)?;
+        if !state.scan_authorized
+            || state.authorized_channel != Some(tuned)
+            || state.sae_generation.is_none()
+        {
+            return Err(zx::Status::BAD_STATE);
+        }
+        drop(state);
+        self.firmware
+            .bind_join(
+                bssid,
+                u16::from(tuned.number),
+                u16::from(tuned.number),
+                request.beacon_period.ok_or(zx::Status::INVALID_ARGS)?,
+            )
+            .map_err(|_| zx::Status::BAD_STATE)
     }
     fn send_wlan_frame(
         &mut self,
@@ -7692,8 +7730,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && configuration.cipher_type == Some(4) =>
             {
                 self.firmware
-                    .install_ptk(key, configuration.rsc.unwrap_or(0), |command| {
-                        io.submit_uni(3, command)
+                    .install_ptk(key, configuration.rsc.unwrap_or(0), |cid, command| {
+                        io.submit_uni(cid, command)
                             .map_err(|status| status.to_string())
                     })
             }
@@ -7702,19 +7740,23 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && (1..=3).contains(&key_id)
                     && configuration.cipher_type == Some(4) =>
             {
-                self.firmware
-                    .install_gtk(key_id, key, configuration.rsc.unwrap_or(0), |command| {
-                        io.submit_uni(3, command)
+                self.firmware.install_gtk(
+                    key_id,
+                    key,
+                    configuration.rsc.unwrap_or(0),
+                    |cid, command| {
+                        io.submit_uni(cid, command)
                             .map_err(|status| status.to_string())
-                    })
+                    },
+                )
             }
             fidl_ieee80211::KeyType::Igtk
                 if configuration.peer_addr == Some([0xff; 6])
                     && (4..=5).contains(&key_id)
                     && configuration.cipher_type == Some(6) =>
             {
-                self.firmware.install_igtk(key_id, key, |command| {
-                    io.submit_uni(3, command)
+                self.firmware.install_igtk(key_id, key, |cid, command| {
+                    io.submit_uni(cid, command)
                         .map_err(|status| status.to_string())
                 })
             }
@@ -7756,8 +7798,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     // cannot become a mandatory readiness predicate here.
                     mfp_required: false,
                 },
-                |command| {
-                    io.submit_uni(3, command)
+                |cid, command| {
+                    io.submit_uni(cid, command)
                         .map_err(|status| status.to_string())
                 },
             )
@@ -7775,8 +7817,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Err(zx::Status::INVALID_ARGS);
         }
         self.firmware
-            .teardown(|command| {
-                io.submit_uni(3, command)
+            .teardown(|cid, command| {
+                io.submit_uni(cid, command)
                     .map_err(|status| status.to_string())
             })
             .map_err(|_| zx::Status::IO)
@@ -7804,6 +7846,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .get(..2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        if control & 0x000c == 0 && !self.firmware.accepts_joined_management(&frame.bytes) {
+            return Ok(None);
+        }
         if control & 0x000c == 0x0008 {
             let eapol = frame
                 .bytes
@@ -10096,30 +10141,35 @@ mod tests {
             mfp_required: true,
         };
         let mut state = ClientFirmwareEffectsState::default();
+        state.bind_join(association.peer, 36, 36, 100).unwrap();
         assert!(state.set_controlled_port(true).is_err());
+        let mut association_commands = Vec::new();
         state
-            .associate(association, |command| {
-                assert_eq!(command.len(), 176);
-                validate_uni_request(3, command).map(|_| ())
+            .associate(association, |_, command| {
+                association_commands.push(command.to_vec());
+                Ok(())
             })
             .unwrap();
+        assert_eq!(association_commands.len(), 2);
+        validate_uni_request(2, &association_commands[0]).unwrap();
+        validate_uni_request(3, &association_commands[1]).unwrap();
         assert!(state.association.is_some());
         assert!(state.set_controlled_port(true).is_err());
         state
-            .install_ptk(&[0x11; 16], 0, |command| {
+            .install_ptk(&[0x11; 16], 0, |_, command| {
                 assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
                 Ok(())
             })
             .unwrap();
         state
-            .install_gtk(2, &[0x22; 16], 0, |command| {
+            .install_gtk(2, &[0x22; 16], 0, |_, command| {
                 assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
                 Ok(())
             })
             .unwrap();
         assert!(state.set_controlled_port(true).is_err());
         state
-            .install_igtk(4, &[0x44; 16], |command| {
+            .install_igtk(4, &[0x44; 16], |_, command| {
                 assert_eq!(&command[68..84], &[0x22; 16]);
                 assert_eq!(&command[104..120], &[0x44; 16]);
                 Ok(())
@@ -10130,14 +10180,19 @@ mod tests {
 
         let mut teardown = Vec::new();
         state
-            .teardown(|command| {
+            .teardown(|_, command| {
                 teardown.push((command.len(), command[49], command[58], command[60]));
                 Ok(())
             })
             .unwrap();
         assert_eq!(
             teardown,
-            vec![(136, 19, 8, 1), (136, 7, 8, 1), (88, 7, 20, 2)]
+            vec![
+                (136, 19, 8, 1),
+                (136, 7, 8, 1),
+                (88, 7, 20, 2),
+                (96, 0, 0, 1)
+            ]
         );
         assert!(!state.controlled_port_open);
         assert!(state.association.is_none());
@@ -10157,17 +10212,18 @@ mod tests {
             mfp_required: false,
         };
         let mut state = ClientFirmwareEffectsState::default();
-        state.associate(association, |_| Ok(())).unwrap();
-        state.install_ptk(&[1; 16], 0, |_| Ok(())).unwrap();
+        state.bind_join(association.peer, 36, 36, 100).unwrap();
+        state.associate(association, |_, _| Ok(())).unwrap();
+        state.install_ptk(&[1; 16], 0, |_, _| Ok(())).unwrap();
         assert!(
             state
-                .install_gtk(1, &[2; 16], 0, |_| Err("negative ACK".into()))
+                .install_gtk(1, &[2; 16], 0, |_, _| Err("negative ACK".into()))
                 .is_err()
         );
         assert!(state.firmware_uncertain);
         assert!(!state.controlled_port_open);
         assert!(state.set_controlled_port(true).is_err());
-        state.teardown(|_| Ok(())).unwrap();
+        state.teardown(|_, _| Ok(())).unwrap();
         assert!(!state.firmware_uncertain);
         assert!(state.association.is_none());
     }
@@ -10228,7 +10284,8 @@ mod tests {
             mfp_required: false,
         };
         let mut state = ClientFirmwareEffectsState::default();
-        state.associate(association, |_| Ok(())).unwrap();
+        state.bind_join(association.peer, 36, 36, 100).unwrap();
+        state.associate(association, |_, _| Ok(())).unwrap();
         let association_generation =
             ClientDataGeneration::Association(state.association_generation.unwrap());
         assert!(
@@ -10252,11 +10309,11 @@ mod tests {
         );
         assert!(
             state
-                .install_ptk(&[1; 16], 1 << 48, |_| panic!("invalid RSC submitted"))
+                .install_ptk(&[1; 16], 1 << 48, |_, _| panic!("invalid RSC submitted"))
                 .is_err()
         );
-        state.install_ptk(&[1; 16], 5, |_| Ok(())).unwrap();
-        state.install_gtk(2, &[2; 16], 9, |_| Ok(())).unwrap();
+        state.install_ptk(&[1; 16], 5, |_, _| Ok(())).unwrap();
+        state.install_gtk(2, &[2; 16], 9, |_, _| Ok(())).unwrap();
         state.set_controlled_port(true).unwrap();
         let authorized = ClientDataGeneration::Authorized(state.authorized_generation.unwrap());
         let normal = ClientRxCandidate {
@@ -10286,10 +10343,10 @@ mod tests {
         assert!(state.authorized_generation.is_none());
         assert!(state.publish_tx(12, authorized).is_err());
         assert!(state.deliver_rx(normal).is_err());
-        assert!(state.teardown(|_| Ok(())).is_err());
+        assert!(state.teardown(|_, _| Ok(())).is_err());
         assert!(state.association.is_some());
         state.complete_tx(11).unwrap();
-        state.teardown(|_| Ok(())).unwrap();
+        state.teardown(|_, _| Ok(())).unwrap();
         assert!(state.association_generation.is_none());
     }
 
@@ -10324,7 +10381,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn live_client_effects_submit_cid3_synchronously_and_keep_physical_path_disabled() {
+    fn live_client_effects_close_sae_eapol_keys_port_data_and_teardown_in_order() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let mut io = TestClientIo::default();
         let mut effects = LiveClientEffects {
@@ -10340,11 +10397,58 @@ mod tests {
             qos: Some(true),
             ..Default::default()
         };
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        effects
+            .set_channel(
+                channel,
+                ChannelBandwidth::Cbw20,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+        {
+            let mut state = effects.state.lock().unwrap();
+            state.power_rate_authorized = true;
+            state.authorize_sae(channel).unwrap();
+        }
+        effects
+            .join_bss(&fidl_driver::JoinBssRequest {
+                bssid: Some(peer),
+                bss_type: Some(fidl_ieee80211::BssType::Infrastructure),
+                remote: Some(true),
+                beacon_period: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut sae = vec![0; 30];
+        sae[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        sae[4..10].copy_from_slice(&peer);
+        sae[10..16].copy_from_slice(&effects.client);
+        sae[16..22].copy_from_slice(&peer);
+        sae[24..26].copy_from_slice(&3u16.to_le_bytes());
+        sae[26..28].copy_from_slice(&2u16.to_le_bytes());
+        effects
+            .send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
-        assert_eq!(io.uni.len(), 1);
+        assert_eq!(io.uni.len(), 2);
         assert!(!effects.firmware.controlled_port_open);
+
+        let mut eapol = vec![0x08, 0x01, 0, 0];
+        eapol.extend_from_slice(&peer);
+        eapol.extend_from_slice(&effects.client);
+        eapol.extend_from_slice(&peer);
+        eapol.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
+        effects
+            .send_wlan_frame(&eapol, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
 
         let key =
             |key_type, peer_addr, key_idx, cipher_type, byte| fidl_softmac::WlanKeyConfiguration {
@@ -10372,6 +10476,14 @@ mod tests {
             .unwrap();
         effects.set_link_up(true).unwrap();
         assert!(effects.firmware.controlled_port_open);
+        let mut data = vec![0x08, 0x01, 0, 0];
+        data.extend_from_slice(&peer);
+        data.extend_from_slice(&effects.client);
+        data.extend_from_slice(&peer);
+        data.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 9, 8]);
+        effects
+            .send_wlan_frame(&data, fidl_softmac::WlanTxInfoFlags::PROTECTED, &mut io)
+            .unwrap();
         effects
             .clear_association(
                 &fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
@@ -10380,7 +10492,8 @@ mod tests {
                 &mut io,
             )
             .unwrap();
-        assert_eq!(io.uni.len(), 6);
+        assert_eq!(io.uni.len(), 8);
+        assert_eq!(io.tx, [sae, eapol, data]);
         assert!(effects.firmware.association.is_none());
 
         let mut physically_unbound = LiveClientEffects {
@@ -10390,6 +10503,10 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
         };
+        physically_unbound
+            .firmware
+            .bind_join(peer, 36, 36, 100)
+            .unwrap();
         assert_eq!(
             {
                 let mut failed = TestClientIo {
