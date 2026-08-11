@@ -5913,6 +5913,7 @@ pub fn encode_client_management_tx(
 pub struct ClientFirmwareEffectsState {
     pub joined: Option<JoinedClientBss>,
     pub bss_programmed: bool,
+    bss_binding: Option<(u8, bool)>,
     pub association: Option<LegacyWmeAssociation>,
     pub sequence: u8,
     pub ptk_installed: bool,
@@ -5997,8 +5998,32 @@ impl ClientFirmwareEffectsState {
             association.negotiated_qos,
             true,
         )?;
-        submit(2, &bss).map_err(|error| format!("BSS add failed: {error}"))?;
+        // Submission failure can be post-publication. Retain enough binding
+        // state to remove the BSS later unless the immediate rollback is ACKed.
         self.bss_programmed = true;
+        self.bss_binding = Some((association.bss_index, association.negotiated_qos));
+        self.firmware_uncertain = true;
+        if let Err(error) = submit(2, &bss) {
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            if rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
+                self.firmware_uncertain = false;
+            }
+            return Err(format!(
+                "BSS add failed: {error}; rollback_bss={rollback_bss:?}"
+            ));
+        }
+        self.firmware_uncertain = false;
         let command = encode_legacy_wme_add_wcid_command(
             self.next_sequence(),
             association.bss_index,
@@ -6029,6 +6054,9 @@ impl ClientFirmwareEffectsState {
             )
             .and_then(|command| submit(2, &command));
             self.bss_programmed = rollback_bss.is_err();
+            if rollback_bss.is_ok() {
+                self.bss_binding = None;
+            }
             self.firmware_uncertain = rollback_wcid.is_err() || rollback_bss.is_err();
             return Err(format!(
                 "WCID add failed: {error}; rollback_wcid={rollback_wcid:?}; rollback_bss={rollback_bss:?}"
@@ -6246,6 +6274,30 @@ impl ClientFirmwareEffectsState {
             self.association_generation = None;
             self.ptk_rx_pn = None;
             self.gtk_rx_pn = None;
+            if self.bss_programmed {
+                let joined = self.joined.ok_or("programmed BSS lost its join binding")?;
+                let (bss_index, negotiated_qos) = self
+                    .bss_binding
+                    .ok_or("programmed BSS lost its firmware binding")?;
+                encode_client_bss_command(
+                    self.next_sequence(),
+                    bss_index,
+                    joined.bssid,
+                    joined.channel,
+                    joined.beacon_interval,
+                    negotiated_qos,
+                    false,
+                )
+                .and_then(|command| submit(2, &command))
+                .map_err(|error| {
+                    self.firmware_uncertain = true;
+                    format!("client firmware BSS teardown failed: {error}")
+                })?;
+                self.bss_programmed = false;
+                self.bss_binding = None;
+                self.joined = None;
+                self.firmware_uncertain = false;
+            }
             return Ok(());
         };
         if self.broadcast_keys_dirty {
@@ -6305,6 +6357,7 @@ impl ClientFirmwareEffectsState {
             format!("client firmware BSS teardown failed: {error}")
         })?;
         self.bss_programmed = false;
+        self.bss_binding = None;
         self.association = None;
         self.joined = None;
         self.association_generation = None;
@@ -7597,6 +7650,60 @@ mod tests {
         assert_eq!(transcript[3][56], 0);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
+    }
+
+    #[test]
+    fn ambiguous_bss_add_rolls_back_or_retains_dirty_teardown_binding() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid: 7,
+            aid: 42,
+            peer,
+            rcpi: 100,
+            negotiated_qos: true,
+            mfp_required: false,
+        };
+
+        let mut rolled_back = ClientFirmwareEffectsState::default();
+        rolled_back.bind_join(peer, 36, 36, 100).unwrap();
+        let mut transcript = Vec::new();
+        assert!(
+            rolled_back
+                .associate(association, |cid, command| {
+                    transcript.push((cid, command[56]));
+                    if transcript.len() == 1 {
+                        Err("ambiguous BSS add".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(transcript, [(2, 1), (2, 0)]);
+        assert!(!rolled_back.bss_programmed);
+        assert!(!rolled_back.firmware_uncertain);
+
+        let mut dirty = ClientFirmwareEffectsState::default();
+        dirty.bind_join(peer, 36, 36, 100).unwrap();
+        assert!(
+            dirty
+                .associate(association, |_, _| Err("no ACK".into()))
+                .is_err()
+        );
+        assert!(dirty.bss_programmed);
+        assert!(dirty.firmware_uncertain);
+        let mut teardown = Vec::new();
+        dirty
+            .teardown(|cid, command| {
+                teardown.push((cid, command[56]));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(teardown, [(2, 0)]);
+        assert!(!dirty.bss_programmed);
+        assert!(!dirty.firmware_uncertain);
+        assert!(dirty.joined.is_none());
     }
 
     #[test]
