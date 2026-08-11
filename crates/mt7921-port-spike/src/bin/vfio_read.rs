@@ -1419,10 +1419,19 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
             if self.ring_cidx != 1 || self.ring_didx != 1 || !self.descriptor_done {
                 return Err(zx::Status::IO_DATA_INTEGRITY);
             }
-            self.ring_cidx = 0;
+            // A normal DIDX write is ignored; only ring-0's DTX pointer reset
+            // transitions the device-owned index.
+            let didx_after_direct_write = self.ring_didx;
+            if didx_after_direct_write != 1 {
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            println!("self_test_management_tx stage=direct_didx_write result=ignored");
             self.ring_didx = 0;
+            self.ring_cidx = 0;
             self.descriptor_done = false;
-            println!("self_test_management_tx stage=ring_local_reset result=complete");
+            println!(
+                "self_test_management_tx stage=ring_local_reset register=dtx_ptr bit=0 result=complete"
+            );
         }
         let (token, pid) = self
             .outstanding
@@ -8863,16 +8872,33 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(&format!(
             "management_tx_pre_submit stage=ring_local_reset before_cidx={before_cidx} before_didx={before_didx}"
         ));
-        // mt76_dma_queue_reset resets one queue by writing its CPU and DMA
-        // indices. MT_WFDMA0_RST_DTX_PTR is the all-rings reset used while
-        // enabling WFDMA and does not provide the ring-local transition we
-        // need here.
+        // CIDX is host-owned. DIDX is device-owned on this WFDMA generation:
+        // a direct write is ignored, so reset only ring 0 through the
+        // corresponding MT_WFDMA0_RST_DTX_PTR bit and wait for its device
+        // index transition to become observable.
         if before_cidx != 0 || before_didx != 0 {
+            self.loader.mcu.wfdma.write_active_wfdma(0xd420c, 1)?;
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 0)?;
-            self.loader.mcu.wfdma.write_active_wfdma(0xd430c, 0)?;
         }
-        let cidx = self.loader.mcu.wfdma.read(0xd4308)?;
-        let didx = self.loader.mcu.wfdma.read(0xd430c)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(10);
+        let (cidx, didx) = loop {
+            let indices = (
+                self.loader.mcu.wfdma.read(0xd4308)?,
+                self.loader.mcu.wfdma.read(0xd430c)?,
+            );
+            if indices == (0, 0) || Instant::now() >= deadline {
+                break indices;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+        };
+        record_sae_stage(&format!(
+            "management_tx_pre_submit stage=reset_verify register=dtx_ptr ring_bit=0 after_cidx={cidx} after_didx={didx} result={}",
+            if cidx == 0 && didx == 0 {
+                "complete"
+            } else {
+                "timeout"
+            }
+        ));
         if cidx != 0 || didx != 0 {
             return Err(format!(
                 "REBOOT REQUIRED: ring-0 indices remained nonzero after reset: cidx={cidx} didx={didx}"
@@ -16034,8 +16060,8 @@ mod tests {
             .next()
             .unwrap();
         assert!(reset.contains("write_active_wfdma(0xd4308, 0)"));
-        assert!(reset.contains("write_active_wfdma(0xd430c, 0)"));
-        assert!(!reset.contains("write_active_wfdma(0xd420c"));
+        assert!(!reset.contains("write_active_wfdma(0xd430c"));
+        assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
         assert!(reset.contains("read(0xd4308)"));
         assert!(reset.contains("read(0xd430c)"));
         assert!(reset.contains("management_tx_ring_reclaimed"));
