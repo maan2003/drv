@@ -3144,7 +3144,8 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
-    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+    // Bit 28 is BAND_IDX on Connac2, not an RX error.
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0
         || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
     {
         return Err(PassiveRxError::RxError);
@@ -5012,7 +5013,8 @@ pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError
     if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
-    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+    // Bit 28 is BAND_IDX on Connac2, not an RX error.
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0
         || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
     {
         return Err(PassiveRxError::RxError);
@@ -10738,7 +10740,8 @@ mod tests {
         let mut rx = vec![0; 24 + 8 + 36 + 5];
         let rxd0 = (2u32 << 27) | rx.len() as u32;
         rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
-        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        // Connac2 BAND_IDX is bit 28 and must not be classified as an RX error.
+        rx[4..8].copy_from_slice(&((1u32 << 13) | (1 << 28)).to_le_bytes());
         rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
         rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
         let frame = &mut rx[32..];

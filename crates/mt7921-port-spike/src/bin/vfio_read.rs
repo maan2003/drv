@@ -7926,6 +7926,36 @@ fn drain_data_rx_queue(
                             normal_rx_frames.as_deref_mut().unwrap().push_back(frame);
                             Ok(None)
                         }
+                        Err(PassiveRxError::RxError) => {
+                            let class = bytes.get(..12).map_or("unknown", |header| {
+                                let rxd1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                                let rxd2 = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                                if rxd1 & (1 << 27) != 0 {
+                                    "fcs"
+                                } else if rxd1 & (1 << 26) != 0 {
+                                    "mic"
+                                } else if rxd1 & (1 << 25) != 0 {
+                                    "integrity"
+                                } else if rxd2 & (1 << 23) != 0 {
+                                    "amsdu"
+                                } else if rxd2 & (1 << 24) != 0 {
+                                    "length"
+                                } else if rxd2 & (1 << 25) != 0 {
+                                    "translation"
+                                } else {
+                                    "unknown"
+                                }
+                            });
+                            provenance.consume_without_mint(
+                                DescriptorOccurrenceRoute::DataRx,
+                                queue.rx_ring_index,
+                                completed_index,
+                            );
+                            record_sae_stage(&format!(
+                                "client_rx_filtered reason=hardware_rx_error class={class} rearm=pending"
+                            ));
+                            Ok(None)
+                        }
                         Err(error) => {
                             provenance.consume_without_mint(
                                 DescriptorOccurrenceRoute::DataRx,
@@ -14834,6 +14864,53 @@ mod tests {
                 DescriptorProvenanceEffect::Invalidate(DescriptorInvalidation::Run),
             ]
         ));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn hardware_bad_rx_frame_is_rearmed_and_filtered_nonterminally() {
+        let ring_mapping = TestMapping::new(PAGE);
+        let buffer_mapping = TestMapping::new(8 * 2048);
+        let page_mapping = TestMapping::new(PAGE);
+        let mut ring = ring_mapping.dma(0x0102_0000);
+        let mut buffers = buffer_mapping.dma(0x0103_0000);
+        let page = page_mapping.read_page();
+        let mut rx = vec![0; 34];
+        let rx_len = rx.len() as u32;
+        rx[0..4].copy_from_slice(&((2u32 << 27) | rx_len).to_le_bytes());
+        rx[4..8].copy_from_slice(&((1u32 << 13) | (1 << 27)).to_le_bytes());
+        rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        buffers.write_bytes_at(0, &rx).unwrap();
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: buffers.iova as u32,
+                ctrl: (1 << 31) | (1 << 30) | (rx_len << 16),
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let mut queue = ActiveMcuRx {
+            rx_ring: &mut ring,
+            rx_buffers: &buffers,
+            rx_tail: 0,
+            rx_head: 7,
+            rx_ring_index: 2,
+            rx_count: 8,
+            irq_bit: DATA_RX_IRQ_BIT,
+        };
+        assert!(
+            drain_data_rx_queue(
+                &page,
+                &mut queue,
+                &mut DescriptorProvenance::new(),
+                &mut Vec::new(),
+                Some(&mut VecDeque::new()),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
     }
 
     #[test]
