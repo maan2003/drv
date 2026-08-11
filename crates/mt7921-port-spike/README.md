@@ -2485,3 +2485,34 @@ native driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3,
 IPv4, the default route, and gateway connectivity recovered on `wlan9` in
 6205 ms. The watchdog disarmed without reboot, both watchdog units were
 inactive, and lab state was absent.
+
+The typed optional-secondary boundary and audited same-band zero placeholder
+were verified by 108 core tests and its compile-fail doc, 38 full adapter tests
+and three docs, 103 passive-transport tests, the production Netstack
+DHCP/DNS/TCP/HTTP tests, and locked release/format/no-hardware gates. Exactly
+one guarded follow-up, `wifi-sae-e2e29`, used matching local and staged
+release SHA-256
+`dfd48b6d8f3d26b14326f2ef44829925ae826bd898a8a9569be034f54128d77f`.
+Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260811T090534Z-0000_05_00.0.log`.
+
+Firmware and regulatory setup completed, and the target `ph1` beacon was
+retained on channel 36. The core context correctly required the initial Cbw20
+transition from no context, then required the legitimate retained-target Cbw80
+transition from generation 1; firmware acknowledged the corresponding
+control-36/center-42/bandwidth-2 switch. Rate/power setup and SAE TX resource
+acquisition completed. The run then failed closed at
+`SAE authorization requires scan and rate-power readiness`: the retained
+target came from the direct pre-client scan, but the later ClientEffects-owned
+scan produced no observation, so its `scan_seen` authorization evidence
+remained false. The later ClientMlme exact-channel replay was not reached, and
+there was no SAE commit, status-77/group-19 fallback, BSS/WCID association,
+EAPOL, keys, controlled port, or production Netstack Internet evidence. The
+report contains no secret-bearing assignment. No retry was made.
+
+Cleanup disabled PCI bus mastering, quiesced transport, released DMA mappings
+before reset, reset VFIO, verified the safe state, and restored the native
+driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3, IPv4,
+the default route, and gateway connectivity recovered on `wlan10` in
+10313 ms. The watchdog disarmed without reboot, both watchdog units were
+inactive, and lab state was absent.
