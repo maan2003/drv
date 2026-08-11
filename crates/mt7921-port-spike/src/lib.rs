@@ -5194,7 +5194,9 @@ pub fn encode_mt7921_5ghz_auth_tx(
     pid: u8,
     wcid: u16,
 ) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
-    if frame.len() < 30 || frame.len() > 0x7fff {
+    // mt76_connac_write_hw_txp masks each TXP buffer length with
+    // MT_TXD_LEN_MASK (GENMASK(11, 0)); bit 15 is the independent LAST flag.
+    if frame.len() < 30 || frame.len() > 0x0fff {
         return Err(Mt7921MgmtTxError::InvalidFrame);
     }
     let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
@@ -6894,6 +6896,56 @@ mod tests {
     }
 
     #[test]
+    fn group_20_sae_auth_preserves_the_source_exact_dma_envelope() {
+        // 24-byte management header + 6-byte authentication fixed fields +
+        // group 20's 146-byte H2E commit fields. Payload contents after the
+        // public group ID are intentionally synthetic: TX treats them as
+        // opaque MPDU bytes.
+        let mut frame = vec![0xa5; 176];
+        frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        frame[24..26].copy_from_slice(&3u16.to_le_bytes());
+        frame[26..28].copy_from_slice(&1u16.to_le_bytes());
+        frame[28..30].copy_from_slice(&126u16.to_le_bytes());
+        frame[30..32].copy_from_slice(&20u16.to_le_bytes());
+
+        let tx = encode_mt7921_5ghz_auth_tx(&frame, 0x0103_0000, 0x0103_1000, 0, 3, 19).unwrap();
+        assert_eq!(
+            tx.txwi,
+            [
+                0xd0, 0x00, 0x00, 0x20, 0x13, 0x60, 0x02, 0x80, 0x0b, 0x20, 0x00, 0x80, 0x00, 0x78,
+                0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00, 0x04, 0x00, 0x4b, 0x00,
+                0x00, 0x00, 0x0b, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+                0x03, 0x01, 0xb0, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            tx.descriptor,
+            DmaDescriptor {
+                buf0: 0x0103_0000,
+                ctrl: (64 << 16) | (1 << 30),
+                buf1: 0,
+                info: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn management_payload_lengths_do_not_change_the_wfdma_envelope() {
+        for frame_len in [128usize, 129, 176, 4095] {
+            let mut frame = vec![0u8; frame_len];
+            frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            let tx =
+                encode_mt7921_5ghz_auth_tx(&frame, 0x0103_0000, 0x0103_1000, 0, 3, 19).unwrap();
+            let txd0 = u32::from_le_bytes(tx.txwi[0..4].try_into().unwrap());
+            let txp_len = u16::from_le_bytes(tx.txwi[44..46].try_into().unwrap());
+            assert_eq!(txd0 & 0xffff, (frame_len + 32) as u32);
+            assert_eq!(txp_len, frame_len as u16 | 0x8000);
+            assert_eq!(tx.descriptor.ctrl, (64 << 16) | (1 << 30));
+        }
+    }
+
+    #[test]
     fn management_tx_encoder_rejects_non_auth_and_unrepresentable_identity() {
         let mut frame = vec![0u8; 30];
         frame[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
@@ -6930,6 +6982,12 @@ mod tests {
         oversized[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
         assert_eq!(
             encode_mt7921_5ghz_auth_tx(&oversized, 0x1000, 0x2000, 0, 3, 19),
+            Err(Mt7921MgmtTxError::InvalidFrame)
+        );
+        let mut txp_oversized = vec![0u8; 0x1000];
+        txp_oversized[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        assert_eq!(
+            encode_mt7921_5ghz_auth_tx(&txp_oversized, 0x1000, 0x2000, 0, 3, 19),
             Err(Mt7921MgmtTxError::InvalidFrame)
         );
     }
