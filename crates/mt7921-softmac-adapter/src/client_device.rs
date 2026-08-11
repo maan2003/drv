@@ -106,6 +106,7 @@ pub struct ClientRxSecurity {
 /// completion.
 pub trait Mt7921ClientIo {
     fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status>;
+    fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn transmit_client(
         &mut self,
         bytes: &[u8],
@@ -346,6 +347,9 @@ impl Mt7921ClientIo for NoClientScan {
     fn submit_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn submit_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn transmit_client(
         &mut self,
         _: &[u8],
@@ -411,6 +415,9 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter
 impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T> {
     fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.submit_client_uni(expected_cid, encoded))
+    }
+    fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.submit_client_edca(encoded))
     }
     fn transmit_client(
         &mut self,

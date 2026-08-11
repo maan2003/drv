@@ -184,6 +184,9 @@ pub trait Mt7921PassiveTransport {
     fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn transmit_client(
         &mut self,
         _: &[u8],
@@ -239,6 +242,9 @@ pub trait SourceExactPassiveMechanics {
     ) -> Result<Option<PassiveMechanicsEvent>, Self::Error>;
     fn confirm_scan_done(&mut self, scan_sequence: u8) -> Result<(), Self::Error>;
     fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn transmit_client(
@@ -382,6 +388,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
         self.mechanics.submit_client_uni(expected_cid, encoded)
+    }
+    fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.mechanics.submit_client_edca(encoded)
     }
 
     fn transmit_client(

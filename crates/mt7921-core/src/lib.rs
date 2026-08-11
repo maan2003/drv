@@ -5323,6 +5323,56 @@ pub struct LegacyWmeAssociation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientEdcaAc {
+    pub cw_min: u16,
+    pub cw_max: u16,
+    pub txop: u16,
+    pub aifs: u16,
+    pub acm: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientEdcaParameters {
+    /// Linux/mac80211 order: VO, VI, BE, BK.
+    pub ac: [ClientEdcaAc; 4],
+}
+
+/// Pinned Linux 7.1 `mt7921_mcu_set_tx` CE SET_EDCA_PARMS request.
+pub fn encode_client_edca_command(
+    sequence: u8,
+    bss_index: u8,
+    params: ClientEdcaParameters,
+) -> Result<Vec<u8>, String> {
+    if sequence == 0 || sequence > 15 || bss_index != 0 {
+        return Err("client EDCA identity escaped the single station VIF".into());
+    }
+    if params.ac.iter().any(|ac| {
+        ac.cw_min == 0
+            || ac.cw_max < ac.cw_min
+            || ac.aifs == 0
+            || ac.aifs > 15
+            || ac.cw_max > 0x7fff
+    }) {
+        return Err("client EDCA parameters escaped firmware bounds".into());
+    }
+    let mut payload = [0u8; 44];
+    // Firmware slot order is the source-owned to_aci[] permutation.
+    for (ac, slot) in [1usize, 0, 2, 3].into_iter().enumerate() {
+        let value = params.ac[ac];
+        let offset = slot * 10;
+        payload[offset..offset + 2].copy_from_slice(&value.cw_min.to_le_bytes());
+        payload[offset + 2..offset + 4].copy_from_slice(&value.cw_max.to_le_bytes());
+        payload[offset + 4..offset + 6].copy_from_slice(&value.txop.to_le_bytes());
+        payload[offset + 6..offset + 8].copy_from_slice(&value.aifs.to_le_bytes());
+        payload[offset + 9] = u8::from(value.acm);
+    }
+    payload[40] = bss_index;
+    payload[41] = 1;
+    payload[42] = 0;
+    Ok(encode_legacy_mcu(0x1d, 0, &payload, sequence))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JoinedClientBss {
     pub bssid: [u8; 6],
     pub channel: u16,
@@ -5706,6 +5756,7 @@ pub struct ClientFirmwareEffectsState {
     bss_binding: Option<(u8, bool)>,
     pub preauth_peer: Option<LegacyWmeAssociation>,
     pub association: Option<LegacyWmeAssociation>,
+    pub edca_programmed: Option<ClientEdcaParameters>,
     pub sequence: u8,
     pub ptk_installed: bool,
     pub ptk_dirty: bool,
@@ -5723,6 +5774,31 @@ pub struct ClientFirmwareEffectsState {
 }
 
 impl ClientFirmwareEffectsState {
+    pub fn program_edca(
+        &mut self,
+        params: ClientEdcaParameters,
+        mut submit: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let association = self.association.ok_or("EDCA requires an ACKed association")?;
+        if !association.negotiated_qos || self.edca_programmed.is_some() || self.firmware_uncertain {
+            return Err("EDCA state is not clean negotiated QoS".into());
+        }
+        let command = encode_client_edca_command(
+            self.next_sequence(),
+            association.bss_index,
+            params,
+        )?;
+        self.firmware_uncertain = true;
+        submit(&command)?;
+        self.edca_programmed = Some(params);
+        self.firmware_uncertain = false;
+        Ok(())
+    }
+
+    pub fn qos_tx_ready(&self) -> bool {
+        self.association.is_some_and(|association| !association.negotiated_qos)
+            || self.edca_programmed.is_some()
+    }
     pub fn bind_join(
         &mut self,
         bssid: [u8; 6],
@@ -6186,6 +6262,7 @@ impl ClientFirmwareEffectsState {
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         self.controlled_port_open = false;
+        self.edca_programmed = None;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
             self.firmware_uncertain = true;
@@ -7772,6 +7849,27 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert!(!state.qos_tx_ready());
+        let edca = ClientEdcaParameters {
+            ac: [
+                ClientEdcaAc { cw_min: 3, cw_max: 7, txop: 47, aifs: 2, acm: false },
+                ClientEdcaAc { cw_min: 7, cw_max: 15, txop: 94, aifs: 2, acm: false },
+                ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 3, acm: false },
+                ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 7, acm: false },
+            ],
+        };
+        let mut edca_command = Vec::new();
+        state
+            .program_edca(edca, |command| {
+                edca_command = command.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        assert!(state.qos_tx_ready());
+        assert_eq!(edca_command.len(), 108);
+        assert_eq!(&edca_command[36..39], &[0x1d, 0xa0, 1]);
+        assert_eq!(&edca_command[64..74], &[7, 0, 15, 0, 94, 0, 2, 0, 0, 0]);
+        assert_eq!(&edca_command[74..84], &[3, 0, 7, 0, 47, 0, 2, 0, 0, 0]);
         state
             .teardown(|_, command| {
                 transcript.push(command.to_vec());

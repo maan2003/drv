@@ -3183,7 +3183,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1347	enumerator	MCU_CE_CMD_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1348	enumerator	MCU_CE_CMD_SET_BSS_ABORT	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1349	enumerator	MCU_CE_CMD_CANCEL_HW_SCAN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1350	enumerator	MCU_CE_CMD_SET_ROC	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1351	enumerator	MCU_CE_CMD_SET_EDCA_PARMS	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1351	enumerator	MCU_CE_CMD_SET_EDCA_PARMS	encode_client_edca_command	exact	CE command 0x1d envelope and packed four-AC payload
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1352	enumerator	MCU_CE_CMD_SET_P2P_OPPPS	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1353	enumerator	MCU_CE_CMD_SET_CLC	encode_clc_set_command	exact	installed-rule TXD fixture; cap bit 0 controls wait_resp; WM ring 0 plus WM2 ring 4 required
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1354	enumerator	MCU_CE_CMD_SET_RATE_TX_POWER	-	unmapped	-
@@ -3847,7 +3847,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	660	struct	__anone31f438c0508	-	
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	661	member	ctrlid	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	662	member	rsv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	670	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	672	function	mt7921_mcu_set_tx	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	672	function	mt7921_mcu_set_tx	encode_client_edca_command	exact	VO/VI/BE/BK queue params, to_aci permutation, BSS/WMM identity, DMA-completed CE publication
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	675	struct	edca	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	676	member	cw_min	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	677	member	cw_max	-	unmapped	-

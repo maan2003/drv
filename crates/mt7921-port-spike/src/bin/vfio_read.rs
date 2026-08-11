@@ -53,10 +53,11 @@ use mt7921_port_spike::{
 use mt7921_port_spike::{
     ClientChannelContext, ClientDataGeneration, ClientFirmwareEffectsState, ClientPhysicalChannel,
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
+    ClientEdcaAc, ClientEdcaParameters,
     ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
-    encode_client_data_txwi, encode_client_interface_commands, encode_client_management_tx,
+    encode_client_data_txwi, encode_client_edca_command, encode_client_interface_commands, encode_client_management_tx,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
@@ -1430,6 +1431,24 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
         configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        if let Some(wmm) = configuration.wmm_params {
+            let ac = |value: fidl_driver::WlanWmmAccessCategoryParameters| ClientEdcaAc {
+                cw_min: (1u16 << value.ecw_min) - 1,
+                cw_max: (1u16 << value.ecw_max) - 1,
+                txop: value.txop_limit,
+                aifs: u16::from(value.aifsn),
+                acm: value.acm,
+            };
+            let encoded = encode_client_edca_command(
+                1,
+                0,
+                ClientEdcaParameters {
+                    ac: [ac(wmm.ac_vo_params), ac(wmm.ac_vi_params), ac(wmm.ac_be_params), ac(wmm.ac_bk_params)],
+                },
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+            io.submit_edca(&encoded)?;
+        }
         self.order.lock().unwrap().push(
             if configuration.qos == Some(true) && configuration.wmm_params.is_some() {
                 "wmm"
@@ -1529,6 +1548,20 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
             self.rx.push_back(frame);
             println!("self_test_control_wait_rx cid=2 queued=persistent");
         }
+        Ok(())
+    }
+    fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        if encoded.len() != 108
+            || encoded.get(36..39) != Some(&[0x1d, 0xa0, 1])
+            || encoded.get(64..84)
+                != Some(&[
+                    7, 0, 15, 0, 94, 0, 2, 0, 0, 0, 3, 0, 7, 0, 47, 0, 2, 0, 0, 0,
+                ])
+            || encoded.get(104..107) != Some(&[0, 1, 0])
+        {
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        println!("self_test_wmm_edca completion=true dma_consumed=true firmware_ack=not_requested_linux ac_vo=aifs2,cwmin3,cwmax7,txop47 ac_vi=aifs2,cwmin7,cwmax15,txop94 ac_be=aifs3,cwmin15,cwmax1023,txop0 ac_bk=aifs7,cwmin15,cwmax1023,txop0 tid7_ac=vo qidx3_programmed=true data_ring=0");
         Ok(())
     }
     fn transmit_client(
@@ -7794,6 +7827,46 @@ impl ActiveMcuIo<'_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioFirmwareLoader<'_> {
+    fn send_client_edca_bytes(&mut self, encoded: &[u8]) -> Result<(), String> {
+        self.ensure_mcu_tx_allowed()?;
+        self.mcu.cancelled()?;
+        if encoded.len() != 108 || encoded.get(36..39) != Some(&[0x1d, 0xa0, 1]) {
+            return Err("client EDCA escaped CE SET_EDCA_PARMS".into());
+        }
+        self.sequence = self.sequence % 15 + 1;
+        let sequence = self.sequence;
+        let mut encoded = encoded.to_vec();
+        encoded[39] = sequence;
+        let descriptor_index = self.command_index;
+        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+        publish_mcu_bytes(
+            self.mcu.wfdma,
+            self.mcu.tx_ring,
+            self.mcu.payload,
+            &encoded,
+            sequence,
+            descriptor_index,
+        )?;
+        self.command_index = next;
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            self.mcu.cancelled()?;
+            let _ = self.mcu.handle_irq(None)?;
+            if dma_index_completed(self.mcu.wfdma.read(0xd441c)?, next as u32) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.uni_terminal_poisoned = true;
+                return Err(format!(
+                    "EDCA command DMA consumption timed out at descriptor {descriptor_index}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        reclaim_uni_dma_slot(self.mcu.tx_ring, self.mcu.payload, descriptor_index)?;
+        Ok(())
+    }
+
     fn ensure_mcu_tx_allowed(&self) -> Result<(), String> {
         if self.uni_terminal_poisoned {
             Err("MCU TX transport is terminally poisoned; containment required".into())
@@ -9769,6 +9842,10 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if eapol && qos != association.negotiated_qos {
             return Err(zx::Status::BAD_STATE);
         }
+        if qos && !self.firmware.qos_tx_ready() {
+            record_sae_stage("client_data_tx_blocked reason=edca_not_programmed");
+            return Err(zx::Status::BAD_STATE);
+        }
         record_sae_stage(&format!(
             "client_data_tx_public fc=0x{control:04x} protected={} to_ds={to_ds} qos={qos} tid={tid} frame_len={} wcid=7 qidx={} rate={} addr1_is_bssid={} addr2_is_sta={} addr3_is_pae_group={} ack_ra_unicast={} sequence_owner=hardware fcs_owner=hardware",
             control & 0x4000 != 0,
@@ -9915,6 +9992,47 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 },
             )
             .map_err(|_| zx::Status::IO)?;
+        if let Some(wmm) = configuration.wmm_params {
+            let convert = |ac: fidl_driver::WlanWmmAccessCategoryParameters| {
+                if ac.ecw_min > 14 || ac.ecw_max > 14 || ac.ecw_max < ac.ecw_min {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                Ok(ClientEdcaAc {
+                    cw_min: (1u16 << ac.ecw_min) - 1,
+                    cw_max: (1u16 << ac.ecw_max) - 1,
+                    txop: ac.txop_limit,
+                    aifs: u16::from(ac.aifsn),
+                    acm: ac.acm,
+                })
+            };
+            let params = ClientEdcaParameters {
+                ac: [
+                    convert(wmm.ac_vo_params)?,
+                    convert(wmm.ac_vi_params)?,
+                    convert(wmm.ac_be_params)?,
+                    convert(wmm.ac_bk_params)?,
+                ],
+            };
+            if let Err(error) = self
+                .firmware
+                .program_edca(params, |command| {
+                    io.submit_edca(command).map_err(|status| status.to_string())
+                })
+            {
+                record_sae_stage(&format!("wmm_edca_program result=error reason={error}"));
+                let _ = self.firmware.teardown(|cid, command| {
+                    io.submit_uni(cid, command).map_err(|status| status.to_string())
+                });
+                return Err(zx::Status::IO);
+            }
+            record_sae_stage(&format!(
+                "wmm_edca_program result=complete completion=true readback=transport_owned bss=0 wmm=0 ac_vo=aifs{},cwmin{},cwmax{},txop{},acm{} ac_vi=aifs{},cwmin{},cwmax{},txop{},acm{} ac_be=aifs{},cwmin{},cwmax{},txop{},acm{} ac_bk=aifs{},cwmin{},cwmax{},txop{},acm{} tid7_ac=vo qidx3_programmed=true data_ring=0 shared_with_management=true",
+                params.ac[0].aifs, params.ac[0].cw_min, params.ac[0].cw_max, params.ac[0].txop, params.ac[0].acm,
+                params.ac[1].aifs, params.ac[1].cw_min, params.ac[1].cw_max, params.ac[1].txop, params.ac[1].acm,
+                params.ac[2].aifs, params.ac[2].cw_min, params.ac[2].cw_max, params.ac[2].txop, params.ac[2].acm,
+                params.ac[3].aifs, params.ac[3].cw_min, params.ac[3].cw_max, params.ac[3].txop, params.ac[3].acm,
+            ));
+        }
         let generation = self
             .firmware
             .association_generation
@@ -10939,6 +11057,19 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 _ => record_sae_stage("association_rx_config result=read_unavailable"),
             }
         }
+        Ok(())
+    }
+
+    fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.loader.send_client_edca_bytes(encoded).map_err(|error| {
+            record_sae_stage(&format!(
+                "wmm_edca_program result=error completion=false reason={error}"
+            ));
+            zx::Status::IO
+        })?;
+        record_sae_stage(
+            "wmm_edca_transport completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux",
+        );
         Ok(())
     }
 
@@ -12854,6 +12985,13 @@ mod tests {
             self.uni.push(bytes.to_vec());
             Ok(())
         }
+        fn submit_edca(&mut self, bytes: &[u8]) -> Result<(), zx::Status> {
+            if bytes.get(36..39) != Some(&[0x1d, 0xa0, 1]) || bytes.len() != 108 {
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            self.uni.push(bytes.to_vec());
+            Ok(())
+        }
         fn transmit_client(
             &mut self,
             bytes: &[u8],
@@ -13773,12 +13911,14 @@ mod tests {
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
-        assert_eq!(io.uni.len(), 3);
+        assert_eq!(io.uni.len(), 4);
         assert_eq!(u16::from_le_bytes(io.uni[2][66..68].try_into().unwrap()), 4);
         assert_eq!(
             u16::from_le_bytes(io.uni[2][144..146].try_into().unwrap()),
             4
         );
+        assert_eq!(io.uni[3].get(36..39), Some(&[0x1d, 0xa0, 1][..]));
+        assert!(effects.firmware.qos_tx_ready());
         assert_eq!(
             u16::from_le_bytes(association_response[28..30].try_into().unwrap()),
             0xc004
@@ -13940,7 +14080,7 @@ mod tests {
                 &mut io,
             )
             .unwrap();
-        assert_eq!(io.uni.len(), 9);
+        assert_eq!(io.uni.len(), 10);
         assert_eq!(
             io.tx,
             [
