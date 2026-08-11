@@ -7,6 +7,7 @@
 
 pub mod client_device;
 pub mod ethernet;
+pub mod one_shot;
 
 use fuchsia_softmac_port::{
     AdvertisementKind, Bssid, CapabilityInfo, ChannelBandwidth, ChannelNumber, DiscoverySupport,
