@@ -8,6 +8,7 @@
 pub mod client_device;
 pub mod ethernet;
 
+use fidl_fuchsia_wlan_ieee80211::{HtCapabilities, VhtCapabilities};
 use fuchsia_softmac_port::{
     AdvertisementKind, Bssid, CapabilityInfo, ChannelBandwidth, ChannelNumber, DiscoverySupport,
     HardwareScanEvent, ScanObservation, SoftmacHardware, TimeUnit, WlanBand, WlanPhyType,
@@ -1046,21 +1047,28 @@ pub fn query_from_capabilities(
             .collect::<Vec<_>>()
     };
     let mut band_caps = Vec::new();
+    let phy = nic.phy;
     for (physical, wlan) in [
         (PhysicalBand::Ghz2, WlanBand::TwoGhz),
         (PhysicalBand::Ghz5, WlanBand::FiveGhz),
     ] {
         let primary_channels = channels_for(physical, wlan);
         if !primary_channels.is_empty() {
+            let (ht_caps, vht_caps) = phy
+                .filter(|phy| phy.ht)
+                .map(mt7921_ht_vht_capabilities)
+                .unwrap_or((None, None));
             band_caps.push(WlanSoftmacBandCapability {
                 band: Some(wlan),
+                ht_caps,
+                vht_caps: (wlan == WlanBand::FiveGhz).then_some(vht_caps).flatten(),
                 primary_channels: Some(primary_channels),
                 ..Default::default()
             });
         }
     }
     let mut phys = vec![WlanPhyType::Ofdm];
-    if let Some(phy) = nic.phy {
+    if let Some(phy) = phy {
         if phy.ht {
             phys.push(WlanPhyType::Ht);
         }
@@ -1080,10 +1088,90 @@ pub fn query_from_capabilities(
     }
 }
 
+// Linux v7.1.5 mt76/mac80211.c::mt76_init_sband and
+// mt7921/init.c::mt7921_register_device. The firmware NIC PHY TLV supplies
+// the supported modes and stream count; this host representation deliberately
+// omits HE because the pinned Fuchsia BandCapability has no HE field.
+fn mt7921_ht_vht_capabilities(
+    phy: mt7921_port_spike::NicPhyCapability,
+) -> (Option<HtCapabilities>, Option<VhtCapabilities>) {
+    let streams = usize::from(phy.spatial_streams.clamp(1, 8));
+    let mut ht = [0; 26];
+    // LDPC | 20/40 | greenfield | SGI20 | SGI40 | RX-STBC-1 | max AMSDU.
+    let mut ht_cap = 0x0973u16;
+    if streams > 1 {
+        ht_cap |= 0x0080;
+    }
+    ht[0..2].copy_from_slice(&ht_cap.to_le_bytes());
+    ht[2] = 3; // IEEE80211_HT_MAX_AMPDU_64K, default density zero.
+    ht[3..3 + streams.min(10)].fill(0xff);
+    ht[15] = 1; // IEEE80211_HT_MCS_TX_DEFINED.
+
+    let vht = phy.vht.then(|| {
+        let mut bytes = [0; 12];
+        // MPDU-11454 | RX-LDPC | SGI80 | RX-STBC-1 | SU/MU beamformee |
+        // beamformee STS-3 | max AMPDU exponent | invariant antenna patterns.
+        let mut cap = 0x3390_7132u32;
+        if streams > 1 {
+            cap |= 0x0000_0080;
+        }
+        bytes[0..4].copy_from_slice(&cap.to_le_bytes());
+        let mut mcs_map = 0u16;
+        for stream in 0..8 {
+            let supported = if stream < streams { 2 } else { 3 };
+            mcs_map |= supported << (stream * 2);
+        }
+        bytes[4..6].copy_from_slice(&mcs_map.to_le_bytes());
+        bytes[8..10].copy_from_slice(&mcs_map.to_le_bytes());
+        VhtCapabilities { bytes }
+    });
+    (Some(HtCapabilities { bytes: ht }), vht)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn mt7921_two_stream_5ghz_query_reports_linux_ht_vht_subset() {
+        let nic = NicCapability {
+            element_count: 1,
+            mac_address: Some([2, 0, 0, 0, 0, 1]),
+            phy: Some(mt7921_port_spike::NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 3,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let query = query_from_capabilities(
+            nic,
+            &[CandidateChannel {
+                band: PhysicalBand::Ghz5,
+                number: 36,
+                frequency_mhz: 5180,
+            }],
+        );
+        let band = &query.band_caps.unwrap()[0];
+        let ht = band.ht_caps.unwrap().bytes;
+        let vht = band.vht_caps.unwrap().bytes;
+        assert_eq!(&ht[0..3], &[0xf3, 0x09, 0x03]);
+        assert_eq!(&ht[3..15], &[0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ht[15], 1);
+        assert_eq!(&ht[16..], &[0; 10]);
+        assert_eq!(
+            vht,
+            [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+        );
+        assert!(query.supported_phys.unwrap().contains(&WlanPhyType::He));
+    }
 
     fn connac2_envelope(mcu_normal: bool, group5: bool) -> (Vec<u8>, Vec<u8>) {
         let mut frame = vec![0x80, 0, 0, 0];

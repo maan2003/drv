@@ -11883,22 +11883,41 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn live_support_satisfies_pinned_device_info_contract() {
-        let support = live_client_support(fidl_softmac::WlanSoftmacQueryResponse {
-            sta_addr: Some([2, 3, 4, 5, 6, 7]),
-            band_caps: Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
-                primary_channels: Some(vec![ChannelNumber {
-                    band: WlanBand::FiveGhz,
-                    number: 36,
-                }]),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        });
+        let capability = mt7921_port_spike::NicCapability {
+            element_count: 1,
+            mac_address: Some([2, 3, 4, 5, 6, 7]),
+            phy: Some(mt7921_port_spike::NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 3,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let candidates = candidate_channels(capability);
+        let support = live_client_support(query_from_capabilities(capability, &candidates));
         let info = wlan_mlme::mlme_device_info_from_softmac(support.query).unwrap();
         assert_eq!(info.role, fidl_common::WlanMacRole::Client);
-        assert_eq!(info.bands.len(), 1);
-        assert!(!info.bands[0].basic_rates.is_empty());
+        let band = info
+            .bands
+            .iter()
+            .find(|band| band.band == WlanBand::FiveGhz)
+            .unwrap();
+        assert_eq!(
+            band.basic_rates,
+            [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]
+        );
+        assert_eq!(band.ht_cap.as_ref().unwrap().bytes[0..3], [0xf3, 0x09, 3]);
+        assert_eq!(
+            band.vht_cap.as_ref().unwrap().bytes,
+            [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+        );
+        assert_eq!(info.softmac_hardware_capability, 0);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -12507,7 +12526,7 @@ mod tests {
         association_request[16..22].copy_from_slice(&peer);
         association_request[22..24].copy_from_slice(&(19u16 << 4).to_le_bytes());
         association_request[24..26].copy_from_slice(&0x0011u16.to_le_bytes());
-        association_request[26..28].copy_from_slice(&10u16.to_le_bytes());
+        association_request[26..28].copy_from_slice(&5u16.to_le_bytes());
         association_request.extend_from_slice(&[0, 3, 1, 2, 3, 48, 2, 4, 5, 244, 1, 0x20]);
         assert_eq!(
             management_ie_id_lengths(&association_request, 28),
@@ -12516,6 +12535,10 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes(association_request[24..26].try_into().unwrap()),
             0x0011
+        );
+        assert_eq!(
+            u16::from_le_bytes(association_request[26..28].try_into().unwrap()),
+            5
         );
         effects
             .send_wlan_frame(

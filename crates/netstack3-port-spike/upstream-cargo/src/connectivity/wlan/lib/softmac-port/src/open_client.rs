@@ -330,7 +330,8 @@ impl OpenClientMlme {
                 ),
                 mac::AssocReqHdr: &mac::AssocReqHdr {
                     capabilities: capability_info,
-                    listen_interval: 0,
+                    // Linux mac80211 defaults max_listen_interval to five beacons.
+                    listen_interval: 5,
                 },
             },
             ies: {
@@ -444,7 +445,7 @@ impl OpenClientMlme {
         let config = fidl_softmac::WlanAssociationConfig {
             bssid: Some(self.request.selected_bss.bssid),
             aid: Some(aid),
-            listen_interval: Some(0),
+            listen_interval: Some(5),
             primary: Some(self.request.selected_bss.primary),
             bandwidth: Some(self.request.selected_bss.bandwidth),
             vht_secondary_80_channel: Some(self.request.selected_bss.vht_secondary_80_channel),
@@ -514,6 +515,8 @@ mod tests {
     use fidl_fuchsia_wlan_ieee80211::{
         BssDescription, BssType, ChannelBandwidth, ChannelNumber, WlanBand,
     };
+    use wlan_common::capabilities::derive_join_capabilities;
+    use wlan_common::channel::{Bandwidth, Channel};
     use wlan_common::ie::SupportedRate;
 
     const CLIENT: [u8; 6] = [2, 2, 2, 2, 2, 2];
@@ -625,6 +628,55 @@ mod tests {
         })
     }
 
+    fn mt7921_channel36_request(protected: bool) -> fidl_mlme::ConnectRequest {
+        let mut request = request();
+        request.selected_bss.capability_info = if protected { 0x11 } else { 1 };
+        request.selected_bss.primary = ChannelNumber { band: WlanBand::FiveGhz, number: 36 };
+        request.selected_bss.bandwidth = ChannelBandwidth::Cbw80;
+        request.selected_bss.vht_secondary_80_channel =
+            ChannelNumber { band: WlanBand::FiveGhz, number: 0 };
+        request.selected_bss.ies = vec![
+            0, 4, b't', b'e', b's', b't', 1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60,
+            0x6c,
+        ];
+        if protected {
+            request.auth_type = fidl_mlme::AuthenticationTypes::Sae;
+            request.security_ie = WPA3_SAE_RSNE.to_vec();
+            request.selected_bss.ies.extend_from_slice(&[244, 1, 0x20]);
+        }
+        request
+    }
+
+    fn mt7921_channel36_capabilities() -> ClientCapabilities {
+        let device = fidl_mlme::DeviceInfo {
+            sta_addr: CLIENT,
+            factory_addr: CLIENT,
+            role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
+            bands: vec![fidl_mlme::BandCapability {
+                band: WlanBand::FiveGhz,
+                basic_rates: vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c],
+                ht_cap: Some(Box::new(fidl_ieee80211::HtCapabilities {
+                    bytes: [0xf3, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                })),
+                vht_cap: Some(Box::new(fidl_ieee80211::VhtCapabilities {
+                    bytes: [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0],
+                })),
+                primary_channels: vec![ChannelNumber { band: WlanBand::FiveGhz, number: 36 }],
+            }],
+            softmac_hardware_capability: 0,
+            qos_capable: true,
+        };
+        derive_join_capabilities(
+            Channel::new(36, Bandwidth::Cbw80, WlanBand::FiveGhz),
+            &[
+                0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c,
+            ]
+            .map(SupportedRate),
+            &device,
+        )
+        .unwrap()
+    }
+
     fn client() -> OpenClientMlme {
         OpenClientMlme::new(CLIENT.into(), request(), capabilities(vec![0x82, 0x84]))
     }
@@ -732,7 +784,7 @@ mod tests {
         let capabilities = assoc.assoc_req_hdr.capabilities;
         assert_eq!(capabilities.raw(), 0x0001);
         let listen_interval = assoc.assoc_req_hdr.listen_interval;
-        assert_eq!(listen_interval, 0);
+        assert_eq!(listen_interval, 5);
         assert_eq!(assoc.ies().next(), Some((Id::SSID, &b"test"[..])));
 
         client
@@ -751,6 +803,57 @@ mod tests {
             connect_status(&mut client),
             fidl_ieee80211::StatusCode::Success
         );
+    }
+
+    #[test]
+    fn channel36_device_info_closes_open_and_wpa3_request_transcripts() {
+        for protected in [false, true] {
+            let request = mt7921_channel36_request(protected);
+            let mut client = OpenClientMlme::new(
+                CLIENT.into(),
+                request,
+                mt7921_channel36_capabilities(),
+            );
+            let mut hardware = FakeHardware::default();
+            if protected {
+                client.start_protected_association(&mut hardware).unwrap();
+            } else {
+                client.start(&mut hardware).unwrap();
+                client
+                    .on_mac_frame(
+                        &mut hardware,
+                        &auth_response(AP, fidl_ieee80211::StatusCode::Success),
+                    )
+                    .unwrap();
+            }
+            let frame = hardware.frames.last().unwrap();
+            let (_, Some(MgmtBody::AssociationReq(assoc))) =
+                mac::MgmtFrame::parse(&frame[..], false).unwrap().try_into_mgmt_body()
+            else {
+                panic!("not association request")
+            };
+            let capabilities = assoc.assoc_req_hdr.capabilities;
+            let listen_interval = assoc.assoc_req_hdr.listen_interval;
+            assert_eq!(capabilities.raw(), if protected { 0x0011 } else { 0x0001 });
+            assert_eq!(listen_interval, 5);
+            let ies = assoc.ies().map(|(id, body)| (id.0, body.len())).collect::<Vec<_>>();
+            let mut expected = vec![(0, 4), (1, 8)];
+            if protected {
+                expected.push((48, 20));
+            }
+            expected.extend([(45, 26), (191, 12)]);
+            if protected {
+                expected.push((244, 1));
+            }
+            assert_eq!(ies, expected);
+            let ht = assoc.ies().find(|(id, _)| *id == Id::HT_CAPABILITIES).unwrap().1;
+            assert_eq!(&ht[..3], &[0x73, 0x09, 3]);
+            let vht = assoc.ies().find(|(id, _)| *id == Id::VHT_CAPABILITIES).unwrap().1;
+            assert_eq!(
+                vht,
+                &[0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
---- a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 19:12:40.786028069 +0000
-+++ b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 19:12:40.855743684 +0000
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
 @@ -16,6 +16,7 @@
  use ieee80211::{Bssid, MacAddr, MacAddrBytes};
  use log::error;
@@ -17,7 +17,7 @@
          self.send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending open auth frame"), s))
      }
-@@ -133,7 +136,6 @@
+@@ -130,7 +133,6 @@
      pub fn send_assoc_req_frame(&mut self) -> Result<(), Error> {
          let ssid = self.sta.ssid().clone();
          let cap = &self.sta.client_capabilities.0;
@@ -25,23 +25,27 @@
          let rates: Vec<u8> = cap.rates.iter().map(|r| r.rate()).collect();
          let ht_cap = cap.ht_cap;
          let vht_cap = cap.vht_cap;
-@@ -145,5 +147,6 @@
+@@ -142,6 +144,7 @@
+                 Err(e) => Err(format_err!("error parsing rsne {:?} : {:?}", security_ie, e)),
              })
              .transpose()?;
 +        let capability_info = cap.capability_info.with_privacy(rsne.is_some());
          let buffer = write_frame!({
              headers: {
                  mac::MgmtHdr: &mgmt_writer::mgmt_hdr_to_ap(
-@@ -157,7 +160,7 @@
+@@ -154,8 +157,9 @@
                          .with_seq_num(self.ctx.seq_mgr.next_sns1(&self.sta.bssid().into()) as u16)
                  ),
                  mac::AssocReqHdr: &mac::AssocReqHdr {
 -                    capabilities: mac::CapabilityInfo(capability_info),
+-                    listen_interval: 0,
 +                    capabilities: capability_info,
-                     listen_interval: 0,
++                    // Linux mac80211 defaults max_listen_interval to five beacons.
++                    listen_interval: 5,
                  },
              },
-@@ -167,7 +170,38 @@
+             ies: {
+@@ -167,7 +171,38 @@
                  vht_cap?: vht_cap,
              },
          })?;
@@ -81,7 +85,7 @@
              .map_err(|s| Error::Status(format!("error sending assoc req frame"), s))
      }
  
-@@ -190,6 +224,8 @@
+@@ -190,6 +225,8 @@
                  ),
              },
          })?;
@@ -90,7 +94,7 @@
          self.ctx
              .device
              .send_wlan_frame(buffer, fidl_softmac::WlanTxInfoFlags::empty(), None)
-@@ -213,6 +249,8 @@
+@@ -213,6 +250,8 @@
                  },
              },
          })?;
@@ -99,7 +103,7 @@
          let result = self
              .send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending deauthenticate frame"), s));
-@@ -328,12 +366,16 @@
+@@ -328,12 +367,16 @@
          // Adjust the start of the slice stored in the ArenaBox.
          //
          // Safety: buffer is a valid pointer to a slice allocated in arena.
@@ -116,7 +120,7 @@
          self.ctx.device.send_wlan_frame(buffer, tx_flags, Some(async_id)).map_err(|s| {
              if !async_id_provided {
                  wtrace::async_end_wlansoftmac_tx(async_id, s);
-@@ -417,6 +459,8 @@
+@@ -417,6 +460,8 @@
                  },
              },
          })?;
@@ -125,6 +129,15 @@
          self.send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending PS-Poll frame"), s))
      }
+@@ -711,7 +756,7 @@
+                 0x10, 0, // Sequence Control
+                 // Association Request header:
+                 0x34, 0x12, // capability info
+-                0, 0, // listen interval
++                5, 0, // listen interval
+                 // IEs
+                 0, 4, // SSID id and length
+                 11, 22, 33, 44, // SSID
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/device.rs b/src/connectivity/wlan/lib/mlme/rust/src/device.rs
 --- a/src/connectivity/wlan/lib/mlme/rust/src/device.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/device.rs
@@ -342,3 +355,17 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
  async fn main_loop_impl<T: MlmeImpl>(
      mut mlme_impl: T,
      minstrel: Option<MinstrelWrapper>,
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -363,9 +363,8 @@
+         let assoc_cfg = fidl_softmac::WlanAssociationConfig {
+             bssid: Some(sta.sta.bssid().to_array()),
+             aid: Some(aid),
+-            // In the association request we sent out earlier, listen_interval is always set to 0,
+-            // indicating the client never enters power save mode.
+-            listen_interval: Some(0),
++            // Match the five-beacon interval carried in the association request.
++            listen_interval: Some(5),
+             primary: Some(main_channel),
+             bandwidth: sta.channel_state.get_bandwidth(),
+             vht_secondary_80_channel: sta.channel_state.get_vht_secondary_80_channel(),

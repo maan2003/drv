@@ -31,7 +31,7 @@ const CLIENT: [u8; 6] = [7; 6];
 const AP: [u8; 6] = [6; 6];
 
 fn channel(number: u8) -> fidl_ieee80211::ChannelNumber {
-    fidl_ieee80211::ChannelNumber { band: fidl_ieee80211::WlanBand::TwoGhz, number }
+    fidl_ieee80211::ChannelNumber { band: fidl_ieee80211::WlanBand::FiveGhz, number }
 }
 
 fn wpa3_bss() -> fidl_ieee80211::BssDescription {
@@ -42,12 +42,13 @@ fn wpa3_bss() -> fidl_ieee80211::BssDescription {
         capability_info: 0x11,
         ies: vec![
             0, 4, b't', b'e', b's', b't',
-            1, 4, 0x82, 0x84, 0x8b, 0x96,
+            1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c,
             48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
             0x0f, 0xac, 8, 0xcc, 0,
+            244, 1, 0x20,
         ],
-        primary: channel(6),
-        bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
+        primary: channel(36),
+        bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw80,
         vht_secondary_80_channel: channel(0),
         rssi_dbm: -40,
         snr_db: 30,
@@ -60,11 +61,15 @@ fn device_info() -> fidl_mlme::DeviceInfo {
         factory_addr: CLIENT,
         role: fidl_common::WlanMacRole::Client,
         bands: vec![fidl_mlme::BandCapability {
-            band: fidl_ieee80211::WlanBand::TwoGhz,
-            basic_rates: vec![0x82, 0x84, 0x8b, 0x96],
-            ht_cap: None,
-            vht_cap: None,
-            primary_channels: vec![channel(6)],
+            band: fidl_ieee80211::WlanBand::FiveGhz,
+            basic_rates: vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c],
+            ht_cap: Some(Box::new(fidl_ieee80211::HtCapabilities {
+                bytes: [0xf3, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            })),
+            vht_cap: Some(Box::new(fidl_ieee80211::VhtCapabilities {
+                bytes: [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0],
+            })),
+            primary_channels: vec![channel(36)],
         }],
         softmac_hardware_capability: 0,
         qos_capable: false,
@@ -90,7 +95,7 @@ fn parse_rsne(bytes: &[u8]) -> Rsne {
 fn authenticator(supplicant_rsne: &[u8]) -> Authenticator {
     let gtk = GtkProvider::new(Cipher { oui: OUI, suite_type: CCMP_128 }, 1, 0).unwrap();
     let igtk = IgtkProvider::new(DEFAULT_GROUP_MGMT_CIPHER).unwrap();
-    let a_rsne = parse_rsne(&wpa3_bss().ies[12..]);
+    let a_rsne = parse_rsne(&wpa3_bss().ies[16..38]);
     Authenticator::new_wpa3(
         NonceReader::new(&MacAddr::from(AP)).unwrap(),
         Arc::new(FuchsiaMutex::new(gtk)),
@@ -111,7 +116,7 @@ fn rx_info() -> fidl_softmac::WlanRxInfo {
         valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
         phy: fidl_ieee80211::WlanPhyType::Erp,
         data_rate: 0,
-        primary: channel(6),
+        primary: channel(36),
         bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
         vht_secondary_80_channel: channel(0),
         mcs: 0,
@@ -139,7 +144,7 @@ fn peer_assoc_success() -> Vec<u8> {
     bytes.extend_from_slice(&AP);
     bytes.extend_from_slice(&[0, 0]);
     bytes.extend_from_slice(&[0x11, 0, 0, 0, 42, 0]);
-    bytes.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
+    bytes.extend_from_slice(&[1, 4, 0x8c, 0x12, 0x98, 0x24]);
     bytes
 }
 
@@ -196,9 +201,11 @@ impl DeviceOps for FakeDeviceOps {
             mac_role: Some(fidl_common::WlanMacRole::Client),
             hardware_capability: Some(0),
             band_caps: Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                band: Some(fidl_ieee80211::WlanBand::TwoGhz),
-                basic_rates: Some(vec![0x82, 0x84, 0x8b, 0x96]),
-                primary_channels: Some(vec![channel(6)]),
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                ht_caps: device_info().bands[0].ht_cap.clone().map(|cap| *cap),
+                vht_caps: device_info().bands[0].vht_cap.clone().map(|cap| *cap),
+                basic_rates: Some(vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]),
+                primary_channels: Some(vec![channel(36)]),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -481,6 +488,22 @@ fn sme_connect_drives_production_sae_tx_and_both_timer_seams() {
             u16::from_le_bytes(association_request[24..26].try_into().unwrap()),
             0x0011,
             "WPA3 association must advertise ESS and Privacy only",
+        );
+        assert_eq!(u16::from_le_bytes(association_request[26..28].try_into().unwrap()), 5);
+        let mut ies = vec![];
+        let mut offset = 28;
+        while offset < association_request.len() {
+            let len = usize::from(association_request[offset + 1]);
+            ies.push((association_request[offset], len));
+            offset += 2 + len;
+        }
+        assert_eq!(ies, [(0, 4), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1)]);
+        let ht = association_request.windows(2).position(|bytes| bytes == [45, 26]).unwrap();
+        assert_eq!(&association_request[ht + 2..ht + 5], &[0x73, 0x09, 3]);
+        let vht = association_request.windows(2).position(|bytes| bytes == [191, 12]).unwrap();
+        assert_eq!(
+            &association_request[vht + 2..vht + 14],
+            &[0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
 
         mlme.handle_mac_frame_rx(&peer_assoc_success(), rx_info(), 2.into()).await;
