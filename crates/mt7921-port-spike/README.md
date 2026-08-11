@@ -2431,3 +2431,30 @@ generation-25 default, `keep_d0_on_remove=Y`, and empty lab-state invariants
 remained intact. The kernel reported pool 31 with two inflight page-pool
 buffers at 60 seconds; there was no further stall report at 120 seconds, while
 native connectivity remained healthy.
+
+The next authorized full-client attempt, `wifi-sae-e2e27`, used the
+Linux-v7.1-derived core and pinned Fuchsia SME/MLME lineage
+`18d7d7b7` plus `d4e13177`. Immediately before activation, the local and
+staged release artifacts shared SHA-256
+`91feeab548ff4be1af5c815da26f3943d84f1eda18ef3b17fc8e2dd67d73a742`;
+the staged binary also passed the no-hardware CLI gate by stopping at the
+missing-BSSID validation. The sole guarded run is recorded in
+`/var/lib/wifi-driver-lab/reports/20260811T082309Z-0000_05_00.0.log`.
+
+The transport loaded firmware, selected the observed `ph1` BSS on channel
+36, completed the bounded passive channel gate, and acquired the SAE TX
+resources after rate and power setup. The pinned SME/MLME connect then failed
+closed at its `Connect` device request with
+`Error setting device channel; IO`. Consequently it emitted no group-20
+commit, status-77 handling, group-19 fallback, BSS/WCID association, EAPOL,
+PTK/GTK/IGTK installation, controlled-port transition, or production
+Netstack DHCP/DNS/TCP/HTTP evidence. The report contains no secret-bearing
+passphrase, password, PSK, or secret assignment.
+
+Cleanup disabled PCI bus mastering, quiesced the transport, released DMA
+mappings before reset, reset VFIO, verified the post-reset safe state, and
+restored the native driver with `RESTORE end failed=0`. Native `mt7921e`,
+D0, iwd, WPA3 association, IPv4, the default route, and gateway connectivity
+recovered on `wlan8` in 6202 ms. The watchdog disarmed without a reboot,
+both watchdog units were inactive, and the lab state was absent. No retry was
+made.
