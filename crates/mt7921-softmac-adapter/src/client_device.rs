@@ -1242,6 +1242,7 @@ mod tests {
         envelope[40..46].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
         envelope[68..72].copy_from_slice(&0x7878u32.to_le_bytes());
         let frame = &mut envelope[metadata_len..reported_len];
+        frame.fill(0);
         frame[0] = subtype << 4;
         frame[4..10].copy_from_slice(&nic().mac_address.unwrap());
         frame[10..16].copy_from_slice(&BSSID);
