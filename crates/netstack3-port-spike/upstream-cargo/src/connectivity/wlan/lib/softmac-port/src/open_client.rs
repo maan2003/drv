@@ -315,7 +315,7 @@ impl OpenClientMlme {
             .then(|| rsne::from_bytes(&self.request.security_ie).map(|(_, rsne)| rsne))
             .transpose()
             .map_err(|_| ())?;
-        write_frame!({
+        let mut frame = write_frame!({
             headers: {
                 mac::MgmtHdr: &mgmt_writer::mgmt_hdr_to_ap(
                     mac::FrameControl(0)
@@ -341,7 +341,32 @@ impl OpenClientMlme {
                 vht_cap?: vht_cap,
             },
         })
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+        if self.request.auth_type == fidl_mlme::AuthenticationTypes::Sae {
+            if let Some(rsnxe) = self.selected_h2e_rsnxe()? {
+                frame.extend_from_slice(rsnxe);
+            }
+        }
+        Ok(frame)
+    }
+
+    fn selected_h2e_rsnxe(&self) -> Result<Option<&[u8]>, ()> {
+        let ies = &self.request.selected_bss.ies;
+        let mut cursor = 0;
+        let mut rsnxe = None;
+        while cursor < ies.len() {
+            let header = ies.get(cursor..cursor + 2).ok_or(())?;
+            let next = cursor.checked_add(2 + usize::from(header[1])).ok_or(())?;
+            let raw = ies.get(cursor..next).ok_or(())?;
+            if header[0] == Id::RSNXE.0 {
+                if rsnxe.is_some() || header[1] != 1 {
+                    return Err(());
+                }
+                rsnxe = Some(raw);
+            }
+            cursor = next;
+        }
+        Ok(rsnxe.filter(|raw| raw[2] & 0x20 != 0))
     }
 
     fn ssid(&self) -> Option<&[u8]> {
@@ -730,6 +755,10 @@ mod tests {
         let mut protected = request();
         protected.auth_type = fidl_mlme::AuthenticationTypes::Sae;
         protected.security_ie = WPA3_SAE_RSNE.to_vec();
+        protected
+            .selected_bss
+            .ies
+            .extend_from_slice(&[244, 1, 0x20]);
         let mut client =
             OpenClientMlme::new(CLIENT.into(), protected, capabilities(vec![0x82, 0x84]));
         let mut hardware = FakeHardware::default();
@@ -749,6 +778,10 @@ mod tests {
                 .ies()
                 .any(|(id, body)| { id == Id::RSNE && body == &WPA3_SAE_RSNE[2..] })
         );
+        assert_eq!(
+            assoc.ies().collect::<Vec<_>>().last(),
+            Some(&(Id::RSNXE, &[0x20][..]))
+        );
 
         client
             .on_mac_frame(
@@ -759,6 +792,27 @@ mod tests {
         assert_eq!(client.state(), OpenClientState::Associated);
         assert_eq!(hardware.associations.len(), 1);
         assert_eq!(hardware.ethernet_up, 0);
+    }
+
+    #[test]
+    fn sae_h2e_rejects_malformed_or_duplicate_selected_bss_rsnxe() {
+        for suffix in [
+            vec![244, 0],
+            vec![244, 2, 0x20, 0],
+            vec![244, 1, 0x20, 244, 1, 0x20],
+            vec![244, 1],
+        ] {
+            let mut protected = request();
+            protected.auth_type = fidl_mlme::AuthenticationTypes::Sae;
+            protected.security_ie = WPA3_SAE_RSNE.to_vec();
+            protected.selected_bss.ies.extend_from_slice(&suffix);
+            let mut client =
+                OpenClientMlme::new(CLIENT.into(), protected, capabilities(vec![0x82, 0x84]));
+            assert!(matches!(
+                client.start_protected_association(&mut FakeHardware::default()),
+                Err(OpenConnectError::FrameWrite)
+            ));
+        }
     }
 
     #[test]

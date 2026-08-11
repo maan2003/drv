@@ -1,6 +1,5 @@
-diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
---- a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
-+++ b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 19:12:40.786028069 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 19:12:40.855743684 +0000
 @@ -16,6 +16,7 @@
  use ieee80211::{Bssid, MacAddr, MacAddrBytes};
  use log::error;
@@ -18,16 +17,47 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connec
          self.send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending open auth frame"), s))
      }
-@@ -167,6 +170,8 @@
+@@ -167,7 +170,38 @@
                  vht_cap?: vht_cap,
              },
          })?;
+-        self.send_mgmt_or_ctrl_frame(buffer)
 +        #[cfg(not(target_os = "fuchsia"))]
-+        let buffer = buffer.into();
-         self.send_mgmt_or_ctrl_frame(buffer)
++        let mut buffer: Vec<u8> = buffer.into();
++        #[cfg(not(target_os = "fuchsia"))]
++        if self.sta.connect_req.auth_type == fidl_mlme::AuthenticationTypes::Sae {
++            let ies = self.sta.connect_req.selected_bss.ies();
++            let mut cursor: usize = 0;
++            let mut rsnxe = None;
++            while cursor < ies.len() {
++                let header = ies.get(cursor..cursor + 2).ok_or_else(|| {
++                    format_err!("malformed selected-BSS IE header")
++                })?;
++                let next = cursor
++                    .checked_add(2 + usize::from(header[1]))
++                    .ok_or_else(|| format_err!("selected-BSS IE length overflow"))?;
++                let raw = ies.get(cursor..next).ok_or_else(|| {
++                    format_err!("truncated selected-BSS IE")
++                })?;
++                if header[0] == ie::Id::RSNXE.0 {
++                    if rsnxe.is_some() || header[1] != 1 {
++                        return Err(Error::Internal(format_err!(
++                            "malformed or duplicate selected-BSS RSNXE"
++                        )));
++                    }
++                    rsnxe = Some(raw);
++                }
++                cursor = next;
++            }
++            if let Some(rsnxe) = rsnxe.filter(|raw| raw[2] & 0x20 != 0) {
++                buffer.extend_from_slice(rsnxe);
++            }
++        }
++        self.send_mgmt_or_ctrl_frame(buffer.into())
              .map_err(|s| Error::Status(format!("error sending assoc req frame"), s))
      }
-@@ -190,6 +195,8 @@
+ 
+@@ -190,6 +224,8 @@
                  ),
              },
          })?;
@@ -36,7 +66,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connec
          self.ctx
              .device
              .send_wlan_frame(buffer, fidl_softmac::WlanTxInfoFlags::empty(), None)
-@@ -213,6 +220,8 @@
+@@ -213,6 +249,8 @@
                  },
              },
          })?;
@@ -45,7 +75,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connec
          let result = self
              .send_mgmt_or_ctrl_frame(buffer)
              .map_err(|s| Error::Status(format!("error sending deauthenticate frame"), s));
-@@ -328,12 +337,16 @@
+@@ -328,12 +366,16 @@
          // Adjust the start of the slice stored in the ArenaBox.
          //
          // Safety: buffer is a valid pointer to a slice allocated in arena.
@@ -62,7 +92,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connec
          self.ctx.device.send_wlan_frame(buffer, tx_flags, Some(async_id)).map_err(|s| {
              if !async_id_provided {
                  wtrace::async_end_wlansoftmac_tx(async_id, s);
-@@ -417,6 +430,8 @@
+@@ -417,6 +459,8 @@
                  },
              },
          })?;
