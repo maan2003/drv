@@ -43,9 +43,8 @@ use mt7921_port_spike::{
     load_mt7921_firmware_through_channel_domain, mask_ack_disabled_fwdl_interrupt,
     mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx, mt7921_packet_type,
     parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
-    parse_mt7921_tx_status, parse_nic_capability,
-    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring,
-    program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
+    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
     round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
