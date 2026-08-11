@@ -1227,6 +1227,35 @@ mod tests {
         }
     }
 
+    fn source_exact_140_byte_open_response(subtype: u8, body: &[u8]) -> ClientRxFrame {
+        let metadata_len = 24 + 16 + 16 + 8 + 8 + 2;
+        let reported_len = metadata_len + 24 + body.len();
+        let mut envelope = vec![0xcc; 140];
+        envelope[0..4]
+            .copy_from_slice(&((2u32 << 27) | reported_len as u32).to_le_bytes());
+        envelope[4..8].copy_from_slice(
+            &((1u32 << 14) | (1 << 11) | (1 << 12) | (1 << 13)).to_le_bytes(),
+        );
+        envelope[8..12].copy_from_slice(&(1u32 << 14).to_le_bytes());
+        envelope[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        envelope[24..40].fill(0xa5);
+        envelope[40..46].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
+        envelope[68..72].copy_from_slice(&0x7878u32.to_le_bytes());
+        let frame = &mut envelope[metadata_len..reported_len];
+        frame[0] = subtype << 4;
+        frame[4..10].copy_from_slice(&nic().mac_address.unwrap());
+        frame[10..16].copy_from_slice(&BSSID);
+        frame[16..22].copy_from_slice(&BSSID);
+        frame[24..].copy_from_slice(body);
+        let parsed = mt7921_port_spike::parse_connac2_rx_frame(&envelope).unwrap();
+        assert_eq!(parsed.pn, Some([1, 2, 3, 4, 5, 6]));
+        ClientRxFrame {
+            bytes: parsed.bytes,
+            status: rx_status(parsed.rssi_dbm),
+            security: None,
+        }
+    }
+
     fn runtime_device_info() -> fidl_mlme::DeviceInfo {
         fidl_mlme::DeviceInfo {
             sta_addr: nic().mac_address.unwrap(),
@@ -1824,9 +1853,10 @@ mod tests {
             effects
                 .rx
                 .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
-            effects
-                .rx
-                .push_back(open_response(0x01, &[1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84]));
+            effects.rx.push_back(source_exact_140_byte_open_response(
+                0x01,
+                &[1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84],
+            ));
             let capability = nic();
             let passive = Mt7921SoftmacAdapter::new(
                 FakePassiveTransport::default(),

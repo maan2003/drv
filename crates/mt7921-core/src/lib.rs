@@ -3623,6 +3623,7 @@ pub struct Connac2RxFrame {
     pub band: PhysicalBand,
     pub channel: u8,
     pub rssi_dbm: i8,
+    pub pn: Option<[u8; 6]>,
 }
 
 /// Strip exactly one Connac2 data/MCU-normal RX envelope into the complete
@@ -3658,12 +3659,24 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     };
     let mut offset = 24usize;
     if rxd1 & (1 << 14) != 0 {
+        bytes
+            .get(offset..offset + 16)
+            .ok_or(PassiveRxError::Truncated)?;
         offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
     }
-    if rxd1 & (1 << 11) != 0 {
+    let pn = if rxd1 & (1 << 11) != 0 {
+        let group1 = bytes
+            .get(offset..offset + 16)
+            .ok_or(PassiveRxError::Truncated)?;
         offset = offset.checked_add(16).ok_or(PassiveRxError::Truncated)?;
-    }
+        Some(connac2_group1_pn(group1).expect("GROUP1 is exactly 16 bytes"))
+    } else {
+        None
+    };
     if rxd1 & (1 << 12) != 0 {
+        bytes
+            .get(offset..offset + 8)
+            .ok_or(PassiveRxError::Truncated)?;
         offset = offset.checked_add(8).ok_or(PassiveRxError::Truncated)?;
     }
     if rxd1 & (1 << 13) == 0 {
@@ -3701,6 +3714,7 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
         band,
         channel,
         rssi_dbm,
+        pn,
     })
 }
 
@@ -3713,6 +3727,7 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
         band,
         channel,
         rssi_dbm,
+        ..
     } = parse_connac2_rx_frame(bytes)?;
     let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
     let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
@@ -11381,6 +11396,58 @@ mod tests {
                 assert_eq!(advertisement.rssi_dbm, if with_group_5 { -60 } else { -50 });
                 assert_eq!(advertisement.ies, stripped.bytes[36..]);
             }
+        }
+    }
+
+    #[test]
+    fn connac2_group1_follows_group4_and_descriptor_padding_is_not_frame_data() {
+        // Linux 7.1.5 mt7921_mac_fill_rx consumes GROUP4 before GROUP1, then
+        // GROUP2, GROUP3 and the two-byte RXD2 header offset. The DMA length
+        // may include bytes beyond RXD0's reported packet length.
+        let metadata_len = 24 + 16 + 16 + 8 + 8 + 2;
+        let frame_len = 24 + 10;
+        let reported_len = metadata_len + frame_len;
+        let mut rx = vec![0xcc; 140];
+        rx[0..4].copy_from_slice(&((2u32 << 27) | reported_len as u32).to_le_bytes());
+        rx[4..8].copy_from_slice(&((1u32 << 14) | (1 << 11) | (1 << 12) | (1 << 13)).to_le_bytes());
+        rx[8..12].copy_from_slice(&(1u32 << 14).to_le_bytes());
+        rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        rx[24..40].fill(0xa5); // GROUP4 is not a packet number.
+        rx[40..46].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
+        rx[68..72].copy_from_slice(&0x7878u32.to_le_bytes());
+        rx[72..74].fill(0xee);
+        {
+            let frame = &mut rx[metadata_len..reported_len];
+            frame[0..2].copy_from_slice(&0x0010u16.to_le_bytes());
+            frame[24..34].copy_from_slice(&[1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84]);
+        }
+
+        let parsed = parse_connac2_rx_frame(&rx).unwrap();
+        assert_eq!(parsed.pn, Some([1, 2, 3, 4, 5, 6]));
+        assert_eq!(parsed.bytes, rx[metadata_len..reported_len]);
+        assert_eq!(parsed.bytes.len(), frame_len);
+    }
+
+    #[test]
+    fn connac2_rejects_each_truncated_valid_group_and_header_padding() {
+        for (rxd1, rxd2, len) in [
+            (1u32 << 14, 0, 39),
+            (1u32 << 11, 0, 39),
+            (1u32 << 12, 0, 31),
+            (1u32 << 13, 0, 31),
+            ((1u32 << 13) | (1 << 15), 0, 103),
+            (1u32 << 13, 1u32 << 14, 33),
+        ] {
+            let mut rx = vec![0; len];
+            rx[0..4].copy_from_slice(&((2u32 << 27) | len as u32).to_le_bytes());
+            rx[4..8].copy_from_slice(&rxd1.to_le_bytes());
+            rx[8..12].copy_from_slice(&rxd2.to_le_bytes());
+            rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+            assert_eq!(
+                parse_connac2_rx_frame(&rx),
+                Err(PassiveRxError::Truncated),
+                "rxd1={rxd1:#x} rxd2={rxd2:#x} len={len}"
+            );
         }
     }
 

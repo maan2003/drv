@@ -7397,6 +7397,33 @@ fn drain_data_rx_queue(
                     length,
                     mt7921_packet_type(&bytes)
                 ));
+                if let Some(header) = bytes.get(..16) {
+                    let rxd0 = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                    let rxd1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                    let rxd2 = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                    let rxd3 = u32::from_le_bytes(header[12..16].try_into().unwrap());
+                    let groups = (rxd1 >> 11) & 0x1f;
+                    let metadata_len = 24
+                        + if groups & 0x08 != 0 { 16 } else { 0 }
+                        + if groups & 0x01 != 0 { 16 } else { 0 }
+                        + if groups & 0x02 != 0 { 8 } else { 0 }
+                        + if groups & 0x04 != 0 { 8 } else { 0 }
+                        + if groups & 0x10 != 0 { 72 } else { 0 }
+                        + 2 * ((rxd2 >> 14) & 0x3);
+                    record_sae_stage(&format!(
+                        "client_rx_rxd rxd0={rxd0:#010x} rxd1={rxd1:#010x} rxd2={rxd2:#010x} rxd3={rxd3:#010x} reported_len={} groups={groups:#04x} hdr_trans={} hdr_offset={} metadata_len={} channel={} wcid={} tid={} security_mode={} key_id={} errors={:#010x}",
+                        rxd0 & 0xffff,
+                        rxd2 >> 13 & 1,
+                        rxd2 >> 14 & 0x3,
+                        metadata_len,
+                        rxd3 >> 8 & 0xff,
+                        rxd1 & 0x03ff,
+                        rxd2 >> 16 & 0x0f,
+                        rxd1 >> 16 & 0x1f,
+                        rxd1 >> 21 & 0x03,
+                        (rxd1 & 0x1e00_0000) | (rxd2 & 0x0380_0000),
+                    ));
+                }
                 let completion = match mt7921_packet_type(&bytes) {
                     Some(6) => parse_mt7921_tx_free(&bytes)
                         .ok()
@@ -8503,7 +8530,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             &mut self.tx_completions,
             Some(&mut self.loader.mcu.normal_rx_frames),
         )
-        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        .map_err(|error| {
+            record_sae_stage(&format!(
+                "next_client_rx result=error stage=drain reason={error}"
+            ));
+            zx::Status::IO_DATA_INTEGRITY
+        })?;
         let Some(frame) = self.loader.mcu.normal_rx_frames.pop() else {
             record_sae_stage("next_client_rx result=empty");
             return Ok(None);
@@ -8514,6 +8546,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let header = frame.bytes.get(..24).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
         let rxd1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let rxd2 = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let parsed = parse_connac2_rx_frame(&frame.bytes).map_err(|error| {
+            record_sae_stage(&format!(
+                "next_client_rx result=error stage=envelope reason={error:?}"
+            ));
+            zx::Status::IO_DATA_INTEGRITY
+        })?;
         let security = ClientRxSecurity {
             wcid: (rxd1 & 0x03ff) as u16,
             tid: ((rxd2 >> 16) & 0x0f) as u8,
@@ -8524,22 +8562,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             icv_error: rxd1 & (1 << 25) != 0,
             mic_error: rxd1 & (1 << 26) != 0,
             fcs_error: rxd1 & (1 << 27) != 0,
-            pn: if rxd1 & (1 << 11) != 0 {
-                Some(
-                    connac2_group1_pn(
-                        frame
-                            .bytes
-                            .get(24..40)
-                            .ok_or(zx::Status::IO_DATA_INTEGRITY)?,
-                    )
-                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
-                )
-            } else {
-                None
-            },
+            pn: parsed.pn,
         };
-        let parsed =
-            parse_connac2_rx_frame(&frame.bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         let subtype = parsed.bytes.first().map(|control| control >> 4);
         record_sae_stage(&format!(
             "next_client_rx result=frame len={} packet_type={:?} subtype={subtype:?}",
