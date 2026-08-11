@@ -2645,3 +2645,59 @@ recovered on `wlan13` in 6207 ms; a post-run HTTPS probe succeeded. Lab state
 was absent, the watchdog and test unit were inactive, and no reboot occurred.
 The explicit public-only `wifi-driver-lab` allowlist correction remains held
 for deployment and reverification before any future physical authorization.
+
+The public-only `wifi-driver-lab` allowlist correction was subsequently
+integrated from Nix source commit `c3d6e81641e2c7febee379bcbb060f8635363d99`.
+Formatting, its focused passthru test, the wrapper package, and the complete
+no-plastic closure built successfully. Closure
+`gz1hhspih1mzvkwkl508jhvcm3fjcgkc` was deployed without reboot and installed
+wrapper `28l758k3a59y5xf5466j1b33kkws2p5z` with SHA-256
+`fb0dac1e60bd6be1a6616b9c3fc284dbfad3293e4988180906e5dcdafeb9e09d`.
+Sterile installed-wrapper tests proved exact BSSID/channel/local-unicast VIF
+MAC forwarding and rejected missing, partial, zero, global, multicast,
+uppercase, malformed, and BSSID-colliding identities. No unrelated `DRV_`
+or credential variable is forwarded.
+
+The held driver lineage was then reverified with 111 core tests and its
+compile-fail doc test, the `userspace-vfio` and port-spike library tests, 38
+full adapter tests and three doc tests, 109 passive-transport tests, both
+production Netstack DHCP/DNS/TCP/HTTP tests, the deterministic full status-77
+fallback regression, locked/offline release, sterile local and remote
+no-hardware gates, formatting, supervisor syntax, and `git diff --check`.
+
+Exactly one guarded follow-up, `wifi-sae-e2e33`, used matching local, staged,
+and active release SHA-256
+`6fda4caef08b3cdc01b5599835b1012d8340e841310ed86b5dc2ff63403338d8`
+(11619432 bytes). Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260811T103742Z-0000_05_00.0.log`; the
+public recovery timeline is
+`/var/lib/wifi-driver-lab/selector-write-recovery-20260811T103742Z.log`.
+Neither contains a secret-bearing assignment.
+
+The supervisor captured VIF MAC `8a:fd:2a:8b:70:5a`, and that exact identity
+appeared in the acknowledged DEV_INFO_ACTIVE context, acknowledged initial
+BSS_INFO_BASIC context, SoftMAC/SME state, and transmitted SAE headers. The
+pinned owner emitted and received an ACK for its group-20 H2E commit. The AP's
+transaction-1/status-77 response was admitted, causing an acknowledged valid
+group-19 commit with the `ff 03 5c 14 00` Rejected Groups tail. The AP's
+group-19 transaction-1/status-126 commit was admitted, the local confirm was
+acknowledged, and the AP transaction-2/status-0 confirm was admitted. This is
+the first physical proof of complete SAE authentication in the port.
+
+Subsequent management frames arrived. The first physical data-RX ring-2
+descriptor was observed with length 140 and packet type 2, then rearmed before
+advancing. Client RX rejected the resulting frame with `IO_DATA_INTEGRITY`
+before association completed. Consequently peer/BSS WCID association, EAPOL,
+key installation, controlled-port transition, and production Netstack
+Internet proof were not reached. No retry was made.
+
+Mandatory cleanup invoked BSS disable before DEV disable while MCU transport
+was live. The BSS-disable sequence timed out with its DMA slot still
+device-owned, terminally poisoning further unified MCU submission, so DEV
+disable could not be acknowledged. Reset containment then disabled bus
+mastering, released mappings, reset VFIO, and verified the safe state.
+`RESTORE end failed=0`; native `mt7921e`, iwd WPA3, IPv4, the DHCP default
+route, and gateway connectivity recovered on `wlan14` in 6197 ms, and an
+HTTPS probe succeeded. Lab state was absent, watchdog and test units were
+inactive, the boot ID was unchanged, and the corrected Nix closure remained
+active.
