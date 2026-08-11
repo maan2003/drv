@@ -1371,6 +1371,7 @@ struct SaeCommittedSelfTestMechanics {
     open_auth_response: Option<ClientRxFrame>,
     status77: Option<ClientRxFrame>,
     association_responses: VecDeque<ClientRxFrame>,
+    queued_data_after_association: Option<ClientRxFrame>,
     tx: Arc<Mutex<Vec<(Vec<u8>, u16, u8)>>>,
     outstanding: MgmtTxOutstanding,
     ring_cidx: u32,
@@ -1380,7 +1381,10 @@ struct SaeCommittedSelfTestMechanics {
 
 #[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
-struct ComebackSelfTestEffects;
+struct ComebackSelfTestEffects {
+    order: Arc<Mutex<Vec<&'static str>>>,
+    fail_association: bool,
+}
 
 #[cfg(feature = "fuchsia-passive")]
 impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelfTestEffects {
@@ -1420,8 +1424,15 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
     fn notify_association_complete(
         &mut self,
         _: &fidl_softmac::WlanAssociationConfig,
-        _: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        io.submit_uni(2, &[])?;
+        self.order.lock().unwrap().push("cid2");
+        if self.fail_association {
+            return Err(zx::Status::IO_REFUSED);
+        }
+        io.submit_uni(3, &[])?;
+        self.order.lock().unwrap().push("cid3");
         Ok(())
     }
     fn clear_association(
@@ -1438,7 +1449,11 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
-        io.next_client_rx()
+        let frame = io.next_client_rx()?;
+        if frame.is_some() {
+            self.order.lock().unwrap().push("rx");
+        }
+        Ok(frame)
     }
     fn begin_passive_scan(&mut self, _: u64, _: &[ChannelNumber]) -> Result<(), zx::Status> {
         Ok(())
@@ -1543,6 +1558,9 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         }
         if control & 0x00fc == 0 {
             if let Some(frame) = self.association_responses.pop_front() {
+                self.rx.push_back(frame);
+            }
+            if let Some(frame) = self.queued_data_after_association.take() {
                 self.rx.push_back(frame);
             }
         }
@@ -1792,6 +1810,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         open_auth_response: None,
         status77: None,
         association_responses: VecDeque::new(),
+        queued_data_after_association: None,
         tx: Arc::clone(&missing_tx),
         outstanding: MgmtTxOutstanding::default(),
         ring_cidx: 0,
@@ -1876,6 +1895,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 },
                 security: None,
             }]),
+            queued_data_after_association: None,
             tx: Arc::clone(&comeback_tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,
@@ -1897,7 +1917,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let comeback_device_info = wlan_mlme::mlme_device_info_from_softmac(comeback_support.query.clone())
         .map_err(|e| format!("self-test comeback device info: {e}"))?;
     let (comeback_device, comeback_runner) = Mt7921ClientDevice::new(
-        ComebackSelfTestEffects,
+        ComebackSelfTestEffects::default(),
         comeback_adapter,
         comeback_support.clone(),
     );
@@ -1936,7 +1956,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let comeback_started = Instant::now();
     let comeback_result = comeback_runtime
         .connect(
-            comeback_request,
+            comeback_request.clone(),
             Instant::now() + std::time::Duration::from_millis(100),
         )
         .await;
@@ -1965,6 +1985,143 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 retry_requests=2 sequence=fresh body=identical outer_deadline_ms=100"
     );
+    let mut burst_auth = vec![0u8; 24];
+    burst_auth[0] = 0xb0;
+    burst_auth[4..10].copy_from_slice(&client);
+    burst_auth[10..16].copy_from_slice(&peer);
+    burst_auth[16..22].copy_from_slice(&peer);
+    burst_auth.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+    let mut burst_assoc = vec![0u8; 24];
+    burst_assoc[0] = 0x10;
+    burst_assoc[4..10].copy_from_slice(&client);
+    burst_assoc[10..16].copy_from_slice(&peer);
+    burst_assoc[16..22].copy_from_slice(&peer);
+    burst_assoc.extend_from_slice(&[
+        1, 0, 0, 0, 42, 0, 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
+        0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+    ]);
+    let mut burst_m1 = vec![0x08, 0x02, 0, 0];
+    burst_m1.extend_from_slice(&client);
+    burst_m1.extend_from_slice(&peer);
+    burst_m1.extend_from_slice(&peer);
+    burst_m1.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    burst_m1.extend_from_slice(&[1, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+    burst_m1.extend_from_slice(&1u64.to_be_bytes());
+    burst_m1.extend_from_slice(&[0x11; 32]);
+    burst_m1.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+    burst_m1.extend_from_slice(&[0, 0]);
+    let burst_status = || fidl_softmac::WlanRxInfo {
+        rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+        valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+        phy: fidl_ieee80211::WlanPhyType::Ofdm,
+        data_rate: 0,
+        primary: channel,
+        bandwidth: ChannelBandwidth::Cbw80,
+        vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+        mcs: 0,
+        rssi_dbm: -40,
+        snr_dbh: 0,
+    };
+    let burst_tx = Arc::new(Mutex::new(Vec::new()));
+    let burst_order = Arc::new(Mutex::new(Vec::new()));
+    let burst_transport = SourceExactPassiveTransport::new(
+        SaeCommittedSelfTestMechanics {
+            rx: VecDeque::new(),
+            open_auth_response: Some(ClientRxFrame {
+                bytes: burst_auth,
+                status: burst_status(),
+                security: None,
+            }),
+            status77: None,
+            association_responses: VecDeque::from([ClientRxFrame {
+                bytes: burst_assoc,
+                status: burst_status(),
+                security: None,
+            }]),
+            queued_data_after_association: Some(ClientRxFrame {
+                bytes: burst_m1,
+                status: burst_status(),
+                security: None,
+            }),
+            tx: Arc::clone(&burst_tx),
+            outstanding: MgmtTxOutstanding::default(),
+            ring_cidx: 0,
+            ring_didx: 0,
+            descriptor_done: false,
+        },
+        capability,
+    )
+    .map_err(|e| format!("self-test burst transport: {e}"))?;
+    let burst_adapter = Mt7921SoftmacAdapter::new(
+        burst_transport,
+        capability,
+        candidates.clone(),
+        vec![channel],
+    )
+    .map_err(|e| format!("self-test burst adapter: {e}"))?;
+    let burst_support = live_client_support(query_from_capabilities(capability, &candidates));
+    let burst_info = wlan_mlme::mlme_device_info_from_softmac(burst_support.query.clone())
+        .map_err(|e| format!("self-test burst device info: {e}"))?;
+    let (burst_device, burst_runner) = Mt7921ClientDevice::new(
+        ComebackSelfTestEffects {
+            order: Arc::clone(&burst_order),
+            fail_association: false,
+        },
+        burst_adapter,
+        burst_support.clone(),
+    );
+    let mut burst_runtime = PinnedClientRuntime::new(
+        burst_device,
+        burst_runner,
+        wlan_sme::client::ClientConfig::default(),
+        burst_info,
+        burst_support.security,
+        burst_support.spectrum_management,
+        fuchsia_inspect::Inspector::default(),
+    )
+    .await
+    .map_err(|e| format!("self-test burst runtime: {e}"))?;
+    let mut burst_request = comeback_request.clone();
+    burst_request.bss_description.capability_info = 0x11;
+    burst_request.bss_description.ies.extend_from_slice(&[
+        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0,
+        0,
+    ]);
+    burst_request.authentication = fidl_internal::Authentication {
+        protocol: fidl_internal::Protocol::Wpa2Personal,
+        credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
+            fidl_internal::WpaCredentials::Psk([1; 32]),
+        ))),
+    };
+    let _ = burst_runtime
+        .connect(
+            burst_request,
+            Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await;
+    let order = burst_order.lock().unwrap();
+    let cid2 = order.iter().position(|stage| *stage == "cid2");
+    let cid3 = order.iter().position(|stage| *stage == "cid3");
+    let m1_rx = order
+        .iter()
+        .enumerate()
+        .filter(|(_, stage)| **stage == "rx")
+        .nth(2)
+        .map(|(index, _)| index);
+    let m2 = burst_tx.lock().unwrap().iter().any(|(frame, _, _)| {
+        frame
+            .windows(8)
+            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+    });
+    if !matches!((cid2, cid3, m1_rx), (Some(a), Some(b), Some(c)) if a < b && b < c) || !m2 {
+        return Err(format!(
+            "self-test association control priority failed order={order:?} m2={m2}"
+        ));
+    }
+    drop(order);
+    println!(
+        "self_test_association_control_priority result=pass burst=assoc_response+m1 cid_order=2,3 before_m1=true m2=true"
+    );
     let tx = Arc::new(Mutex::new(Vec::new()));
     let transport = SourceExactPassiveTransport::new(
         SaeCommittedSelfTestMechanics {
@@ -1972,6 +2129,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             open_auth_response: None,
             status77: Some(status77),
             association_responses: VecDeque::new(),
+            queued_data_after_association: None,
             tx: Arc::clone(&tx),
             outstanding: MgmtTxOutstanding::default(),
             ring_cidx: 0,

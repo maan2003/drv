@@ -523,6 +523,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         mlme: &mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
     ) -> Result<bool, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
+        if let Some(status) = backend.association_activation_failure {
+            return Err(status);
+        }
         let ComposedBackend { effects, scan, .. } = &mut *backend;
         let frame = effects.next_rx(scan)?;
         drop(backend);
@@ -687,9 +690,10 @@ where
         self.runner.associated_data_pump(&mut self.mlme)
     }
 
-    async fn pump_once(&mut self) -> Result<bool, PinnedConnectError> {
+    async fn drain_control(&mut self, budget: usize) -> Result<(bool, bool), PinnedConnectError> {
         let mut progressed = false;
-        loop {
+        for _ in 0..budget {
+            let mut cycle_progressed = false;
             match self.requests.try_recv() {
                 Ok(request) => {
                     let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
@@ -726,24 +730,15 @@ where
                         println!("client_eapol_stage=mlme_tx_request_complete");
                     }
                     progressed = true;
+                    cycle_progressed = true;
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Closed) => {
                     return Err(PinnedConnectError::Driver(
                         PinnedDriverError::RequestStreamClosed,
                     ));
                 }
             }
-        }
-        if self
-            .runner
-            .pump_client_rx(&mut self.mlme)
-            .await
-            .map_err(|status| PinnedConnectError::Driver(PinnedDriverError::ClientRx(status)))?
-        {
-            progressed = true;
-        }
-        loop {
             match self.events.try_recv() {
                 Ok(event) => {
                     if let fidl_mlme::MlmeEvent::OnSaeFrameRx { frame } = &event {
@@ -761,23 +756,37 @@ where
                     }
                     Station::on_mlme_event(&mut self.sme, event);
                     progressed = true;
+                    cycle_progressed = true;
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Closed) => {
                     return Err(PinnedConnectError::Driver(
                         PinnedDriverError::EventStreamClosed,
                     ));
                 }
             }
+            if !cycle_progressed {
+                return Ok((progressed, true));
+            }
         }
-        while let Some(action) = self.timer_runtime.block_on(async {
+        Ok((progressed, false))
+    }
+
+    async fn pump_once(&mut self) -> Result<bool, PinnedConnectError> {
+        const CONTROL_BUDGET: usize = 64;
+
+        let (mut progressed, mut control_quiescent) =
+            self.drain_control(CONTROL_BUDGET).await?;
+
+        if let Some(action) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
             self.sme_timers.as_mut().next().now_or_never().flatten()
         }) {
             action(&mut self.sme);
             progressed = true;
+            control_quiescent = false;
         }
-        while let Some(event) = self.timer_runtime.block_on(async {
+        if let Some(event) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
             self.mlme_timers.as_mut().next().now_or_never().flatten()
         }) {
@@ -787,6 +796,34 @@ where
             );
             wlan_mlme::MlmeImpl::handle_timeout(&mut self.mlme, event.event).await;
             progressed = true;
+            control_quiescent = false;
+        }
+
+        if !control_quiescent {
+            let (control_progressed, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
+            progressed |= control_progressed;
+            control_quiescent = quiescent;
+        }
+        if !control_quiescent {
+            println!(
+                "client_runtime_control stage=budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
+            );
+            return Ok(progressed);
+        }
+
+        if self
+            .runner
+            .pump_client_rx(&mut self.mlme)
+            .await
+            .map_err(|status| PinnedConnectError::Driver(PinnedDriverError::ClientRx(status)))?
+        {
+            progressed = true;
+            let (_, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
+            if !quiescent {
+                println!(
+                    "client_runtime_control stage=post_rx_budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
+                );
+            }
         }
         Ok(progressed)
     }
@@ -862,6 +899,7 @@ struct ComposedBackend<E, S> {
     scan: S,
     active_scan_id: Option<u64>,
     authorization: LifecycleAuthorization,
+    association_activation_failure: Option<zx::Status>,
     ethernet: Option<MlmeEthernetSink>,
 }
 
@@ -892,6 +930,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 scan: NoClientScan,
                 active_scan_id: None,
                 authorization: LifecycleAuthorization::new(true),
+                association_activation_failure: None,
                 ethernet: None,
             })),
             support,
@@ -917,6 +956,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             authorization: LifecycleAuthorization::new(
                 scan_state != ClientRuntimeScanState::Revoked,
             ),
+            association_activation_failure: None,
             ethernet: None,
         }));
         let runner = Mt7921ScanRunner {
@@ -957,6 +997,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             authorization: LifecycleAuthorization::new(
                 scan_state != ClientRuntimeScanState::Revoked,
             ),
+            association_activation_failure: None,
             ethernet: Some(ethernet_sink),
         }));
         let runner = Mt7921ScanRunner {
@@ -1159,8 +1200,17 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         configuration: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        let ComposedBackend { effects, scan, .. } = &mut *backend;
-        effects.notify_association_complete(&configuration, scan)
+        let result = {
+            let ComposedBackend { effects, scan, .. } = &mut *backend;
+            effects.notify_association_complete(&configuration, scan)
+        };
+        if let Err(status) = result {
+            backend.association_activation_failure = Some(status);
+            println!(
+                "client_runtime_control stage=association_activation_failed status={status} rx_dequeued=false"
+            );
+        }
+        result
     }
 
     async fn clear_association(
@@ -1340,6 +1390,46 @@ mod tests {
         request
     }
 
+    fn wpa2_connect_request() -> fidl_sme::ConnectRequest {
+        let mut request = open_connect_request();
+        request.bss_description.capability_info = 0x11;
+        request.bss_description.ies = vec![
+            0, 4, b't', b'e', b's', b't', 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1,
+            0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+        ];
+        request.authentication = fidl_fuchsia_wlan_internal::Authentication {
+            protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa2Personal,
+            credentials: Some(Box::new(fidl_fuchsia_wlan_internal::Credentials::Wpa(
+                fidl_fuchsia_wlan_internal::WpaCredentials::Psk([1; 32]),
+            ))),
+        };
+        request
+    }
+
+    fn wpa2_message_1() -> ClientRxFrame {
+        let mut bytes = vec![0x08, 0x02, 0, 0];
+        bytes.extend_from_slice(&nic().mac_address.unwrap());
+        bytes.extend_from_slice(&BSSID);
+        bytes.extend_from_slice(&BSSID);
+        bytes.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        bytes.extend_from_slice(&[1, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        bytes.extend_from_slice(&[0, 0]);
+        ClientRxFrame { bytes, status: rx_status(-30), security: None }
+    }
+
+    fn wpa2_association_response() -> ClientRxFrame {
+        open_response(
+            0x01,
+            &[
+                1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+                0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+            ],
+        )
+    }
+
     fn open_response(subtype: u8, body: &[u8]) -> ClientRxFrame {
         let mut bytes = vec![0u8; 24];
         bytes[0] = subtype << 4;
@@ -1416,6 +1506,7 @@ mod tests {
         clear: Option<fidl_softmac::WlanSoftmacBaseClearAssociationRequest>,
         link_up: Option<bool>,
         rx: VecDeque<ClientRxFrame>,
+        rx_dequeued: usize,
         fail_on: Option<&'static str>,
         reuse_channel: bool,
     }
@@ -1541,7 +1632,12 @@ mod tests {
             if self.fail_on == Some("rx") {
                 return Err(zx::Status::IO_REFUSED);
             }
-            Ok(self.rx.pop_front())
+            let frame = self.rx.pop_front();
+            if frame.is_some() {
+                self.order.push("rx");
+                self.rx_dequeued += 1;
+            }
+            Ok(frame)
         }
 
         fn begin_passive_scan(
@@ -2197,6 +2293,117 @@ mod tests {
                 Err(PinnedConnectError::Timeout)
             );
             assert!(!timed.runner.backend.lock().unwrap().authorization.is_live());
+        });
+    }
+
+    #[test]
+    fn pinned_runtime_quiesces_association_before_queued_eapol_rx() {
+        futures::executor::block_on(async {
+            let capability = nic();
+            let make_runtime = |effects| async move {
+                let passive = Mt7921SoftmacAdapter::new(
+                    FakePassiveTransport::default(),
+                    capability,
+                    mt7921_port_spike::candidate_channels(capability),
+                    vec![channel(36)],
+                )
+                .unwrap();
+                let mut device_support = support();
+                device_support.query.sta_addr = nic().mac_address;
+                device_support.query.factory_addr = nic().mac_address;
+                device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+                device_support.query.band_caps =
+                    Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                        band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                        basic_rates: Some(vec![0x82, 0x84]),
+                        primary_channels: Some(vec![channel(36)]),
+                        ..Default::default()
+                    }]);
+                let (device, runner) =
+                    Mt7921ClientDevice::new(effects, passive, device_support);
+                runner.backend.lock().unwrap().authorization.authorize_scan();
+                let support_info = support();
+                PinnedClientRuntime::new(
+                    device,
+                    runner,
+                    wlan_sme::client::ClientConfig::default(),
+                    runtime_device_info(),
+                    support_info.security,
+                    support_info.spectrum_management,
+                    fuchsia_inspect::Inspector::default(),
+                )
+                .await
+                .unwrap()
+            };
+
+            let mut effects = FakeEffects::default();
+            effects.rx.extend([
+                open_response(0x0b, &[0, 0, 2, 0, 0, 0]),
+                wpa2_association_response(),
+                wpa2_message_1(),
+            ]);
+            let mut runtime = make_runtime(effects).await;
+            let _transaction = runtime.sme.on_connect_command(wpa2_connect_request());
+            for _ in 0..16 {
+                runtime.pump_once().await.unwrap();
+                let backend = runtime.runner.backend.lock().unwrap();
+                if backend.effects.rx_dequeued == 3 && backend.effects.frames.len() >= 3 {
+                    break;
+                }
+            }
+            let backend = runtime.runner.backend.lock().unwrap();
+            assert_eq!(backend.effects.rx_dequeued, 3);
+            assert!(
+                backend.effects.association.is_some(),
+                "effects={:?}",
+                backend.effects
+            );
+            let association = backend
+                .effects
+                .order
+                .iter()
+                .position(|effect| *effect == "association")
+                .unwrap();
+            let third_rx = backend
+                .effects
+                .order
+                .iter()
+                .enumerate()
+                .filter(|(_, effect)| **effect == "rx")
+                .nth(2)
+                .unwrap()
+                .0;
+            assert!(association < third_rx, "M1 dequeued before association activation");
+            assert!(backend.effects.frames.iter().any(|frame| {
+                frame.get(..2).is_some_and(|fc| {
+                    u16::from_le_bytes([fc[0], fc[1]]) & 0x000c == 0x0008
+                }) && frame.windows(8).any(|window| {
+                    window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
+                })
+            }));
+            drop(backend);
+
+            let mut effects = FakeEffects { fail_on: Some("association"), ..Default::default() };
+            effects.rx.extend([
+                open_response(0x0b, &[0, 0, 2, 0, 0, 0]),
+                wpa2_association_response(),
+                wpa2_message_1(),
+            ]);
+            let mut failed = make_runtime(effects).await;
+            let failure = failed
+                .connect(
+                    wpa2_connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await;
+            assert!(failure.is_err(), "association activation failure must be terminal");
+            let backend = failed.runner.backend.lock().unwrap();
+            assert_eq!(backend.effects.rx_dequeued, 2);
+            assert_eq!(backend.effects.rx.len(), 1, "queued M1 carrier was consumed");
+            assert!(!backend.effects.frames.iter().any(|frame| {
+                frame.windows(8)
+                    .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+            }));
         });
     }
 
