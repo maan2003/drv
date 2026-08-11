@@ -5633,9 +5633,10 @@ pub fn encode_client_data_txwi(
     let mut bytes = [0u8; 64];
     let words = if eapol {
         let subtype = u32::from(qos) * 8;
+        let descriptor_tid = if qos { tid } else { 0 };
         [
             0x0600_0000 | (payload_len as u32 + 32),
-            0x8002_6007 | (u32::from(tid) << 20) | (u32::from(qos) << 11),
+            0x8002_6007 | (u32::from(descriptor_tid) << 20) | (u32::from(qos) << 11),
             0x8000_2020 | subtype,
             0x1000_7800 | u32::from(protected) * 2,
             0,

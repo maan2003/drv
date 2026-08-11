@@ -1322,7 +1322,9 @@ fn read_sae_credential_exact(
 #[cfg(feature = "fuchsia-passive")]
 fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientSupport {
     query.mac_role = Some(fidl_common::WlanMacRole::Client);
-    query.hardware_capability = Some(0);
+    query.hardware_capability = Some(
+        fidl_driver::WlanSoftmacHardwareCapabilityBit::Qos as u32,
+    );
     for band in query.band_caps.get_or_insert_default() {
         band.basic_rates.get_or_insert_with(|| match band.band {
             Some(fidl_ieee80211::WlanBand::TwoGhz) => {
@@ -1425,9 +1427,16 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
     }
     fn notify_association_complete(
         &mut self,
-        _: &fidl_softmac::WlanAssociationConfig,
+        configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        self.order.lock().unwrap().push(
+            if configuration.qos == Some(true) && configuration.wmm_params.is_some() {
+                "wmm"
+            } else {
+                "non_wmm"
+            },
+        );
         io.submit_uni(2, &[])?;
         self.order.lock().unwrap().push("cid2");
         if self.fail_association {
@@ -2212,6 +2221,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         1, 0, 0, 0, 42, 0, 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac,
         4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ]);
+    burst_assoc.extend_from_slice(&[
+        0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x80, 0x00, 0x03, 0xa4, 0x00,
+        0x00, 0x27, 0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
+    ]);
     let mut burst_m1 = vec![0x08, 0x02, 0, 0];
     burst_m1.extend_from_slice(&client);
     burst_m1.extend_from_slice(&peer);
@@ -2376,6 +2389,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         )
         .await;
     let order = burst_order.lock().unwrap();
+    let wmm = order.iter().position(|stage| *stage == "wmm");
     let cid2 = order.iter().position(|stage| *stage == "cid2");
     let cid3 = order.iter().position(|stage| *stage == "cid3");
     let m1_rx = order
@@ -2389,14 +2403,21 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
     });
-    if !matches!((cid2, cid3, m1_rx), (Some(a), Some(b), Some(c)) if a < b && b < c) || !m2 {
+    let wmm_request = burst_tx.lock().unwrap().iter().any(|(frame, _, _)| {
+        frame.first() == Some(&0x00)
+            && frame.ends_with(&[0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00])
+    });
+    if !matches!((wmm, cid2, cid3, m1_rx), (Some(w), Some(a), Some(b), Some(c)) if w < a && a < b && b < c)
+        || !m2
+        || !wmm_request
+    {
         return Err(format!(
-            "self-test association control priority failed order={order:?} m2={m2}"
+            "self-test association control priority failed order={order:?} m2={m2} wmm_request={wmm_request}"
         ));
     }
     drop(order);
     println!(
-        "self_test_association_control_priority result=pass m1_arrival=during_cid2_wait persistent_fifo=true cid_order=2,3 before_m1=true m2=true"
+        "self_test_association_control_priority result=pass m1_arrival=during_cid2_wait persistent_fifo=true cid_order=2,3 before_m1=true m2=true wmm_request=true negotiated_qos=true ac_params_installed=true"
     );
     let tx = Arc::new(Mutex::new(Vec::new()));
     let transport = SourceExactPassiveTransport::new(
@@ -9856,6 +9877,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
             record_sae_stage("association_config_validation result=denied clause=foreign_bssid");
             return Err(zx::Status::ACCESS_DENIED);
         }
+        let negotiated_qos = configuration.qos.unwrap_or(false);
+        if negotiated_qos != configuration.wmm_params.is_some() {
+            record_sae_stage(
+                "association_config_validation result=invalid clause=wmm_negotiation",
+            );
+            return Err(zx::Status::INVALID_ARGS);
+        }
         record_sae_stage(&format!(
             "association_config_validation result=pass bssid_match=true normalized_aid={aid} keys=false port_open=false protected_management=closed"
         ));
@@ -9874,7 +9902,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     aid,
                     peer,
                     rcpi: self.rcpi,
-                    negotiated_qos: configuration.qos.unwrap_or(false),
+                    negotiated_qos,
                     // This FIDL association seam does not carry RSN MFP
                     // negotiation. IGTK installation remains supported but
                     // cannot become a mandatory readiness predicate here.
@@ -12948,7 +12976,11 @@ mod tests {
             band.vht_cap.as_ref().unwrap().bytes,
             [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
-        assert_eq!(info.softmac_hardware_capability, 0);
+        assert!(info.qos_capable);
+        assert_eq!(
+            info.softmac_hardware_capability,
+            fidl_driver::WlanSoftmacHardwareCapabilityBit::Qos as u32
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -13200,6 +13232,10 @@ mod tests {
                 0x0028_0000
             ]
         );
+        let non_qos_eapol =
+            encode_client_data_txwi(36, 0x3234_5000, 9, 11, true, false, false, 7).unwrap();
+        assert_eq!(words(&non_qos_eapol)[1], 0x8002_6007);
+        assert_eq!(words(&non_qos_eapol)[2], 0x8000_2020);
         assert_eq!(
             &eapol[32..46],
             &[7, 128, 0, 0, 0, 0, 0, 0, 0, 80, 52, 18, 120, 128]
@@ -13567,6 +13603,37 @@ mod tests {
             // MLME has already removed the reserved on-wire AID bits.
             aid: Some(4),
             qos: Some(true),
+            wmm_params: Some(fidl_driver::WlanWmmParameters {
+                apsd: false,
+                ac_be_params: fidl_driver::WlanWmmAccessCategoryParameters {
+                    ecw_min: 4,
+                    ecw_max: 10,
+                    aifsn: 3,
+                    txop_limit: 0,
+                    acm: false,
+                },
+                ac_bk_params: fidl_driver::WlanWmmAccessCategoryParameters {
+                    ecw_min: 4,
+                    ecw_max: 10,
+                    aifsn: 7,
+                    txop_limit: 0,
+                    acm: false,
+                },
+                ac_vi_params: fidl_driver::WlanWmmAccessCategoryParameters {
+                    ecw_min: 3,
+                    ecw_max: 4,
+                    aifsn: 2,
+                    txop_limit: 94,
+                    acm: false,
+                },
+                ac_vo_params: fidl_driver::WlanWmmAccessCategoryParameters {
+                    ecw_min: 2,
+                    ecw_max: 3,
+                    aifsn: 2,
+                    txop_limit: 47,
+                    acm: false,
+                },
+            }),
             ..Default::default()
         };
         let channel = ChannelNumber {

@@ -45,7 +45,7 @@
                  },
              },
              ies: {
-@@ -167,7 +171,38 @@
+@@ -167,7 +171,40 @@
                  vht_cap?: vht_cap,
              },
          })?;
@@ -81,6 +81,8 @@
 +                buffer.extend_from_slice(rsnxe);
 +            }
 +        }
++        #[cfg(not(target_os = "fuchsia"))]
++        buffer.extend_from_slice(&[0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00]);
 +        self.send_mgmt_or_ctrl_frame(buffer.into())
              .map_err(|s| Error::Status(format!("error sending assoc req frame"), s))
      }
@@ -369,3 +371,95 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
              primary: Some(main_channel),
              bandwidth: sta.channel_state.get_bandwidth(),
              vht_secondary_80_channel: sta.channel_state.get_vht_secondary_80_channel(),
+
+--- a/src/connectivity/wlan/lib/mlme/rust/src/ddk_converter.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/ddk_converter.rs
+@@ -81,7 +81,8 @@
+         factory_addr: required(query_response.sta_addr, "sta_addr")?,
+         role: required(query_response.mac_role, "mac_role")?,
+         bands: required(band_caps, "band_caps")?,
+-        qos_capable: false,
++        qos_capable: required(query_response.hardware_capability, "hardware_capability")? & 0x0200
++            != 0,
+         // TODO(https://fxbug.dev/349155104): This seems to only be required for an AP MLME and should not
+         // be enforced for clients.
+         softmac_hardware_capability: required(
+
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
+@@ -505,6 +505,7 @@
+     pub rates: Vec<ie::SupportedRate>,
+     pub ht_cap: Option<ie::HtCapabilities>,
+     pub vht_cap: Option<ie::VhtCapabilities>,
++    pub wmm_param: Option<ie::WmmParam>,
+ }
+ 
+ impl ParsedAssociateResp {
+@@ -515,6 +516,7 @@
+             rates: vec![],
+             ht_cap: None,
+             vht_cap: None,
++            wmm_param: None,
+         };
+         for (id, body) in assoc_resp_frame.ies() {
+             match id {
+@@ -546,7 +548,13 @@
+                         parsed.vht_cap = Some(*vht_cap);
+                     }
+                 },
+-                // TODO(https://fxbug.dev/42120297): parse vendor ID and include WMM param if exists
++                Id::VENDOR_SPECIFIC => match ie::parse_vendor_ie(body) {
++                    Ok(ie::VendorIe::WmmParam(body)) => match ie::parse_wmm_param(body) {
++                        Ok(param) => parsed.wmm_param = Some(*param),
++                        Err(e) => warn!("invalid WMM Parameter: {}", e),
++                    },
++                    _ => {}
++                },
+                 _ => {}
+             }
+         }
+
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -343,13 +343,25 @@
+             }
+         };
+ 
+-        // TODO(https://fxbug.dev/42104064): Determine for each outbound data frame,
+-        // given the result of the dynamic capability negotiation, data frame
+-        // classification, and QoS policy.
+-        //
+-        // Aruba / Ubiquiti are confirmed to be compatible with QoS field for the
+-        // BlockAck session, independently of 40MHz operation.
+-        let qos = negotiated_cap.ht_cap.is_some();
++        let wmm_params = parsed_assoc_resp.wmm_param.map(|param| {
++            let convert_ac = |ac: ie::WmmAcParams| {
++                fidl_fuchsia_wlan_driver::WlanWmmAccessCategoryParameters {
++                    ecw_min: ac.ecw_min_max.ecw_min(),
++                    ecw_max: ac.ecw_min_max.ecw_max(),
++                    aifsn: ac.aci_aifsn.aifsn(),
++                    txop_limit: ac.txop_limit,
++                    acm: ac.aci_aifsn.acm(),
++                }
++            };
++            fidl_fuchsia_wlan_driver::WlanWmmParameters {
++                apsd: param.wmm_info.ap_wmm_info().uapsd(),
++                ac_be_params: convert_ac(param.ac_be_params),
++                ac_bk_params: convert_ac(param.ac_bk_params),
++                ac_vi_params: convert_ac(param.ac_vi_params),
++                ac_vo_params: convert_ac(param.ac_vo_params),
++            }
++        });
++        let qos = wmm_params.is_some();
+ 
+         let assoc_cfg = fidl_softmac::WlanAssociationConfig {
+             bssid: Some(sta.sta.bssid().to_array()),
+@@ -361,7 +373,7 @@
+             bandwidth: sta.channel_state.get_bandwidth(),
+             vht_secondary_80_channel: sta.channel_state.get_vht_secondary_80_channel(),
+             qos: Some(qos),
+-            wmm_params: None,
++            wmm_params,
+             rates: Some(negotiated_cap.rates.iter().map(|r| r.0).collect()),
+             capability_info: Some(negotiated_cap.capability_info.raw()),
+             ht_cap: negotiated_cap.ht_cap.map(Into::into),
