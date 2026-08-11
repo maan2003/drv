@@ -8382,29 +8382,33 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         result
     }
 
-    fn stop_tx_dma_and_reset_ring0(&mut self) -> Result<(), String> {
+    /// Reset only management TX ring 0 after its descriptor is CPU-owned.
+    ///
+    /// Linux v7.1.5 keeps `MT_WFDMA0_GLO_CFG_TX_DMA_EN` enabled for the device
+    /// lifetime and clears it only in universal DMA cleanup/suspend. Ring-local
+    /// reuse uses `MT_WFDMA0_RST_DTX_PTR`; it must not stop the MCU TX ring.
+    fn reset_consumed_mgmt_tx_ring(&mut self) -> Result<(), String> {
         let global = self.loader.mcu.wfdma.read(0xd4208)?;
-        self.loader
-            .mcu
-            .wfdma
-            .write_active_wfdma(0xd4208, global & !1)?;
-        let deadline = Instant::now() + std::time::Duration::from_millis(100);
-        while self.loader.mcu.wfdma.read(0xd4208)? & 2 != 0 {
-            if Instant::now() >= deadline {
-                return Err("REBOOT REQUIRED: TX DMA did not quiesce".into());
-            }
-            std::thread::sleep(std::time::Duration::from_micros(10));
+        if global & 1 == 0 {
+            return Err("REBOOT REQUIRED: global WFDMA TX unexpectedly disabled".into());
         }
         // MT_WFDMA0_RST_DTX_PTR bit 0 resets ring 0 without resetting the RX paths.
         self.loader.mcu.wfdma.write_active_wfdma(0xd420c, 1)?;
-        if self.loader.mcu.wfdma.read(0xd430c)? != 0 {
-            return Err("REBOOT REQUIRED: ring-0 DIDX remained nonzero after reset".into());
+        let cidx = self.loader.mcu.wfdma.read(0xd4308)?;
+        let didx = self.loader.mcu.wfdma.read(0xd430c)?;
+        if cidx != 0 || didx != 0 {
+            return Err(format!(
+                "REBOOT REQUIRED: ring-0 indices remained nonzero after reset: cidx={cidx} didx={didx}"
+            ));
+        }
+        if self.loader.mcu.wfdma.read(0xd4208)? & 1 == 0 {
+            return Err("REBOOT REQUIRED: ring-0 reset disabled global WFDMA TX".into());
         }
         Ok(())
     }
 
-    fn configure_mgmt_tx_ring(&mut self, ring: &DmaArena) -> Result<(), String> {
-        self.stop_tx_dma_and_reset_ring0()?;
+    fn configure_mgmt_tx_ring_for_submission(&mut self, ring: &DmaArena) -> Result<(), String> {
+        self.reset_consumed_mgmt_tx_ring()?;
         self.loader
             .mcu
             .wfdma
@@ -8427,11 +8431,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 ));
             }
         }
-        let global = self.loader.mcu.wfdma.read(0xd4208)?;
-        self.loader
-            .mcu
-            .wfdma
-            .write_active_wfdma(0xd4208, global | 1)
+        Ok(())
     }
 
     fn transmit_one_sae_auth(
@@ -8444,9 +8444,16 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if !self.tx_completions.is_empty() || !self.loader.mcu.tx_completions.is_empty() {
             return Err("management TX began with stale completion state".into());
         }
-        self.configure_mgmt_tx_ring(ring)?;
+        if let Err(error) = self.configure_mgmt_tx_ring_for_submission(ring) {
+            self.loader.uni_terminal_poisoned = true;
+            return Err(format!(
+                "REBOOT REQUIRED: management ring configuration failed; MCU TX blocked until universal containment: {error}"
+            ));
+        }
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut completion_state = MgmtTxCompletionState::default();
+        let mut publication_may_have_happened = false;
+        let mut descriptor_consumed = false;
         let result = (|| -> Result<(), String> {
             frame_arena.write_bytes(frame)?;
             let control = frame
@@ -8484,11 +8491,15 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             txwi.write_bytes(&txwi_bytes)?;
             ring.write_descriptor_at(0, descriptor);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            // A failed doorbell write is ambiguous: record intent first and do
+            // not reclaim this slot unless DIDX and DMA_DONE later prove it.
+            publication_may_have_happened = true;
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
                 let didx = self.loader.mcu.wfdma.read(0xd430c)?;
                 let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
                 if didx == 1 && descriptor_done {
+                    descriptor_consumed = true;
                     record_sae_stage("sae_tx_ring0_consumed didx=1 descriptor_done=true");
                     break;
                 }
@@ -8525,10 +8536,17 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         })();
-        let contained = self.stop_tx_dma_and_reset_ring0();
-        if let Err(error) = contained {
+        if publication_may_have_happened && !descriptor_consumed {
+            self.loader.uni_terminal_poisoned = true;
             return Err(format!(
-                "REBOOT REQUIRED: management TX outcome={result:?}; containment failed: {error}"
+                "REBOOT REQUIRED: management TX outcome={result:?}; ring-0 descriptor ownership is uncertain; MCU TX blocked until universal containment"
+            ));
+        }
+        let contained = self.reset_consumed_mgmt_tx_ring();
+        if let Err(error) = contained {
+            self.loader.uni_terminal_poisoned = true;
+            return Err(format!(
+                "REBOOT REQUIRED: management TX outcome={result:?}; ring-local reclaim failed and MCU TX is blocked until universal containment: {error}"
             ));
         }
         ring.write_descriptor_at(0, DmaDescriptor::reset());
@@ -15423,20 +15441,32 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn management_tx_resets_only_ring0_descriptor_pointer() {
+    fn management_tx_reclaims_only_ring0_and_preserves_global_tx() {
         let source = include_str!("vfio_read.rs");
         let reset = source
-            .split("fn stop_tx_dma_and_reset_ring0(")
+            .split("fn reset_consumed_mgmt_tx_ring(")
             .nth(1)
             .unwrap()
-            .split("fn configure_mgmt_tx_ring(")
+            .split("fn configure_mgmt_tx_ring_for_submission(")
             .next()
             .unwrap();
         assert!(reset.contains("write_active_wfdma(0xd420c, 1)"));
+        assert!(reset.contains("read(0xd4308)"));
+        assert!(reset.contains("read(0xd430c)"));
+        assert!(!reset.contains("write_active_wfdma(0xd4208"));
         assert!(!reset.contains("write_active_wfdma(0xd4100"));
         assert!(!reset.contains("write_rx_ring_slot"));
         assert!(!reset.contains("write_rx_cpu_index"));
         assert!(!reset.contains("0xd45"));
+
+        let configure = source
+            .split("fn configure_mgmt_tx_ring_for_submission(")
+            .nth(1)
+            .unwrap()
+            .split("fn transmit_one_sae_auth(")
+            .next()
+            .unwrap();
+        assert!(!configure.contains("write_active_wfdma(0xd4208"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -15455,6 +15485,47 @@ mod tests {
         let descriptor_done = transmit.find("is_dma_done()").unwrap();
         let drain = transmit.find("drain_data_rx_queue(").unwrap();
         assert!(publish < didx && didx < descriptor_done && descriptor_done < drain);
+        let publication_intent = transmit
+            .find("publication_may_have_happened = true")
+            .unwrap();
+        let poison = publication_intent
+            + transmit[publication_intent..]
+                .find("self.loader.uni_terminal_poisoned = true")
+                .unwrap();
+        let ring_reset = transmit.find("reset_consumed_mgmt_tx_ring()").unwrap();
+        assert!(publication_intent < publish);
+        assert!(publish < poison && poison < ring_reset);
+        assert!(!transmit.contains("write_active_wfdma(0xd4208"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn completed_management_burst_leaves_mcu_transport_enabled() {
+        let source = include_str!("vfio_read.rs");
+        let transmit = source
+            .split("fn transmit_one_sae_auth(")
+            .nth(1)
+            .unwrap()
+            .split("fn receive_one_sae_auth(")
+            .next()
+            .unwrap();
+        assert!(transmit.contains("descriptor_consumed = true"));
+        assert!(transmit.contains("reset_consumed_mgmt_tx_ring()"));
+        assert!(!transmit.contains("global & !1"));
+
+        let unified = source
+            .split("fn send_acknowledged_uni_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn send_passive_command(")
+            .next()
+            .unwrap();
+        assert!(unified.contains("uni_ring_pre_publish"));
+        assert!(unified.contains("publish_mcu_bytes("));
+        assert!(!unified.contains("configure_mgmt_tx_ring"));
+
+        let cleanup = source.split("fn fail_closed_cleanup(").nth(1).unwrap();
+        assert!(cleanup.contains("write_active_wfdma(0xd4208, disabled)"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
