@@ -7,6 +7,8 @@
 //! - `drivers/net/wireless/mediatek/mt76/dma.h`: `struct mt76_desc`.
 //! - `drivers/net/wireless/mediatek/mt76/dma.c`: descriptor encoding,
 //!   queue allocation, producer publication, completion, and teardown.
+//! - `drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c` and
+//!   `mt76_connac_mcu.h`: Connac firmware, patch, and CLC image formats.
 //!
 //! Chip register maps, firmware policy, NIC/channel state, and device
 //! sequencing deliberately remain in the consuming device crate.
@@ -297,4 +299,276 @@ fn validate_segment(segment: DmaSegment) -> Result<(), DescriptorError> {
         return Err(DescriptorError::SegmentTooLong);
     }
     Ok(())
+}
+
+pub const FW_TRAILER_LEN: usize = 36;
+pub const FW_REGION_LEN: usize = 40;
+pub const FW_FEATURE_NON_DL: u8 = 1 << 6;
+pub const FW_TYPE_CLC: u8 = 2;
+pub const PATCH_HEADER_LEN: usize = 96;
+pub const PATCH_SECTION_LEN: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareError {
+    MissingTrailer,
+    RegionTableTooLarge,
+    PayloadLengthOverflow,
+    PayloadOverlapsMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchError {
+    MissingHeader,
+    RegionTableTooLarge,
+    UnsupportedSectionType,
+    PayloadOutOfBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatchHeader<'a> {
+    pub build_date: &'a [u8; 16],
+    pub platform: &'a [u8; 4],
+    pub hardware_software_version: u32,
+    pub patch_version: u32,
+    pub checksum: u16,
+    pub descriptor_patch_version: u32,
+    pub subsystem: u32,
+    pub feature: u32,
+    pub crc: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatchSection<'a> {
+    pub address: u32,
+    pub security_info: u32,
+    pub payload: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Patch<'a> {
+    bytes: &'a [u8],
+    region_count: u32,
+    pub header: PatchHeader<'a>,
+}
+
+impl<'a> Patch<'a> {
+    /// Parse `mt76_connac2_patch_hdr` and `mt76_connac2_patch_sec` exactly as
+    /// pinned Linux `mt76_connac2_load_patch` consumes their big-endian fields.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, PatchError> {
+        let header = bytes
+            .get(..PATCH_HEADER_LEN)
+            .ok_or(PatchError::MissingHeader)?;
+        let region_count = be_u32(&header[44..48]);
+        let table_len = (region_count as usize)
+            .checked_mul(PATCH_SECTION_LEN)
+            .and_then(|length| PATCH_HEADER_LEN.checked_add(length))
+            .ok_or(PatchError::RegionTableTooLarge)?;
+        if table_len > bytes.len() {
+            return Err(PatchError::RegionTableTooLarge);
+        }
+        for index in 0..region_count as usize {
+            let start = PATCH_HEADER_LEN + index * PATCH_SECTION_LEN;
+            let section = &bytes[start..start + PATCH_SECTION_LEN];
+            if be_u32(&section[0..4]) & 0xffff != 2 {
+                return Err(PatchError::UnsupportedSectionType);
+            }
+            let offset = be_u32(&section[4..8]) as usize;
+            let length = be_u32(&section[16..20]) as usize;
+            let end = offset
+                .checked_add(length)
+                .ok_or(PatchError::PayloadOutOfBounds)?;
+            if offset < table_len || end > bytes.len() {
+                return Err(PatchError::PayloadOutOfBounds);
+            }
+        }
+        Ok(Self {
+            bytes,
+            region_count,
+            header: PatchHeader {
+                build_date: header[0..16].try_into().expect("fixed field"),
+                platform: header[16..20].try_into().expect("fixed field"),
+                hardware_software_version: be_u32(&header[20..24]),
+                patch_version: be_u32(&header[24..28]),
+                checksum: u16::from_be_bytes(header[28..30].try_into().expect("fixed field")),
+                descriptor_patch_version: be_u32(&header[32..36]),
+                subsystem: be_u32(&header[36..40]),
+                feature: be_u32(&header[40..44]),
+                crc: be_u32(&header[48..52]),
+            },
+        })
+    }
+
+    pub const fn region_count(&self) -> u32 {
+        self.region_count
+    }
+
+    pub fn sections(&self) -> PatchSections<'a> {
+        PatchSections {
+            patch: *self,
+            index: 0,
+        }
+    }
+}
+
+pub struct PatchSections<'a> {
+    patch: Patch<'a>,
+    index: usize,
+}
+impl<'a> Iterator for PatchSections<'a> {
+    type Item = PatchSection<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.patch.region_count as usize {
+            return None;
+        }
+        let start = PATCH_HEADER_LEN + self.index * PATCH_SECTION_LEN;
+        let section = &self.patch.bytes[start..start + PATCH_SECTION_LEN];
+        self.index += 1;
+        let offset = be_u32(&section[4..8]) as usize;
+        let length = be_u32(&section[16..20]) as usize;
+        Some(PatchSection {
+            address: be_u32(&section[12..16]),
+            security_info: be_u32(&section[20..24]),
+            payload: &self.patch.bytes[offset..offset + length],
+        })
+    }
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("four-byte field"))
+}
+
+/// Parsed `struct mt76_connac2_fw_trailer` fields used by the Linux loader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareTrailer<'a> {
+    pub chip_id: u8,
+    pub eco_code: u8,
+    pub format_version: u8,
+    pub format_flag: u8,
+    pub firmware_version: &'a [u8; 10],
+    pub build_date: &'a [u8; 15],
+    pub crc: u32,
+}
+
+/// One Connac2 firmware payload and its corresponding region metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareRegion<'a> {
+    pub address: u32,
+    pub feature_set: u8,
+    pub region_type: u8,
+    pub payload: &'a [u8],
+}
+
+impl FirmwareRegion<'_> {
+    pub const fn is_downloadable(&self) -> bool {
+        self.feature_set & FW_FEATURE_NON_DL == 0
+    }
+
+    pub const fn is_clc(&self) -> bool {
+        self.feature_set & FW_FEATURE_NON_DL != 0 && self.region_type == FW_TYPE_CLC
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Firmware<'a> {
+    bytes: &'a [u8],
+    metadata_start: usize,
+    region_count: u8,
+    pub trailer: FirmwareTrailer<'a>,
+}
+
+impl<'a> Firmware<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, FirmwareError> {
+        let trailer_start = bytes
+            .len()
+            .checked_sub(FW_TRAILER_LEN)
+            .ok_or(FirmwareError::MissingTrailer)?;
+        let trailer = &bytes[trailer_start..];
+        let region_count = trailer[2];
+        let table_len = usize::from(region_count)
+            .checked_mul(FW_REGION_LEN)
+            .ok_or(FirmwareError::RegionTableTooLarge)?;
+        let metadata_start = trailer_start
+            .checked_sub(table_len)
+            .ok_or(FirmwareError::RegionTableTooLarge)?;
+
+        let firmware_version = trailer[7..17].try_into().expect("fixed slice length");
+        let build_date = trailer[17..32].try_into().expect("fixed slice length");
+        let parsed = Self {
+            bytes,
+            metadata_start,
+            region_count,
+            trailer: FirmwareTrailer {
+                chip_id: trailer[0],
+                eco_code: trailer[1],
+                format_version: trailer[3],
+                format_flag: trailer[4],
+                firmware_version,
+                build_date,
+                crc: le_u32(&trailer[32..36]),
+            },
+        };
+
+        // Validate all lengths up front so iteration cannot partially accept a
+        // malformed image before discovering that payload overlaps metadata.
+        let mut payload_end = 0usize;
+        for index in 0..usize::from(region_count) {
+            let record = parsed.region_record(index);
+            payload_end = payload_end
+                .checked_add(le_u32(&record[20..24]) as usize)
+                .ok_or(FirmwareError::PayloadLengthOverflow)?;
+            if payload_end > metadata_start {
+                return Err(FirmwareError::PayloadOverlapsMetadata);
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    pub const fn region_count(&self) -> u8 {
+        self.region_count
+    }
+
+    pub fn regions(&self) -> FirmwareRegions<'a> {
+        FirmwareRegions {
+            firmware: *self,
+            index: 0,
+            payload_offset: 0,
+        }
+    }
+
+    fn region_record(&self, index: usize) -> &'a [u8] {
+        let start = self.metadata_start + index * FW_REGION_LEN;
+        &self.bytes[start..start + FW_REGION_LEN]
+    }
+}
+
+pub struct FirmwareRegions<'a> {
+    firmware: Firmware<'a>,
+    index: usize,
+    payload_offset: usize,
+}
+
+impl<'a> Iterator for FirmwareRegions<'a> {
+    type Item = FirmwareRegion<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == usize::from(self.firmware.region_count) {
+            return None;
+        }
+        let record = self.firmware.region_record(self.index);
+        let len = le_u32(&record[20..24]) as usize;
+        let payload_start = self.payload_offset;
+        self.payload_offset += len;
+        self.index += 1;
+        Some(FirmwareRegion {
+            address: le_u32(&record[16..20]),
+            feature_set: record[24],
+            region_type: record[25],
+            payload: &self.firmware.bytes[payload_start..self.payload_offset],
+        })
+    }
+}
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("four-byte field"))
 }
