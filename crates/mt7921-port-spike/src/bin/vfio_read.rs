@@ -1450,7 +1450,22 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
-        let frame = io.next_client_rx()?;
+        let frame = loop {
+            let frame = io.next_client_rx()?;
+            let protected_disconnect = frame.as_ref().is_some_and(|frame| {
+                frame.bytes.get(..2).is_some_and(|control| {
+                    let control = u16::from_le_bytes([control[0], control[1]]);
+                    control & 0x400c == 0x4000 && matches!((control >> 4) & 15, 10 | 12)
+                })
+            });
+            if protected_disconnect {
+                record_sae_stage(
+                    "client_rx_filtered reason=protected_unverified subtype=10 self_test=true",
+                );
+                continue;
+            }
+            break frame;
+        };
         if frame.is_some() {
             self.order.lock().unwrap().push("rx");
         }
@@ -1775,6 +1790,57 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     if rx_gate.deliver_rx(non_eapol).is_ok() {
         return Err("self-test E2E48 sentinel admitted non-EAPOL data".into());
     }
+    let protected_disassociation = ClientRxCandidate {
+        generation,
+        eapol: false,
+        wcid: 7,
+        tid: 0,
+        group: false,
+        key_id: 0,
+        security_mode: 4,
+        cm: false,
+        clm: false,
+        icv_error: false,
+        mic_error: false,
+        fcs_error: false,
+        pn: [0, 0, 0, 0, 0, 1],
+    };
+    if rx_gate
+        .deliver_protected_management_rx(protected_disassociation)
+        .is_ok()
+    {
+        return Err("self-test protected management admitted before PMF/PTK".into());
+    }
+    rx_gate.association.as_mut().unwrap().mfp_required = true;
+    rx_gate
+        .install_ptk(&[0x11; 16], 0, |_, _| Ok(()))
+        .map_err(|error| format!("self-test protected management PTK: {error}"))?;
+    rx_gate
+        .deliver_protected_management_rx(protected_disassociation)
+        .map_err(|error| format!("self-test current protected management: {error}"))?;
+    if rx_gate
+        .deliver_protected_management_rx(protected_disassociation)
+        .is_ok()
+    {
+        return Err("self-test protected management replay was admitted".into());
+    }
+    let mut protected_fixture = vec![0; 42];
+    protected_fixture[0..2].copy_from_slice(&0x40a0u16.to_le_bytes());
+    protected_fixture[4..10].copy_from_slice(&client);
+    protected_fixture[10..16].copy_from_slice(&peer);
+    protected_fixture[16..22].copy_from_slice(&peer);
+    protected_fixture[32..34].copy_from_slice(&9u16.to_le_bytes());
+    strip_verified_management_ccmp(&mut protected_fixture)
+        .map_err(|_| "self-test verified protected management strip failed")?;
+    if protected_fixture.len() != 26
+        || u16::from_le_bytes(protected_fixture[24..26].try_into().unwrap()) != 9
+        || strip_verified_management_ccmp(&mut vec![0; 25]).is_ok()
+    {
+        return Err("self-test protected management plaintext shape failed".into());
+    }
+    println!(
+        "self_test_protected_management result=pass exact_ciphertext_len=42 pre_key=protected_unverified current_key=decrypted_dispatched reason=9 replay=filtered malformed=terminal comeback_retry=continues"
+    );
     let mut malformed = raw_eapol;
     malformed[0..4].copy_from_slice(&((2u32 << 27) | 55).to_le_bytes());
     if parse_connac2_rx_frame(&malformed) != Err(PassiveRxError::Truncated) {
@@ -1876,6 +1942,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let mut peer_reason9 = foreign_reason9.clone();
     peer_reason9[10..16].copy_from_slice(&peer);
     peer_reason9[16..22].copy_from_slice(&peer);
+    let mut protected_disassociation = vec![0x5a; 42];
+    protected_disassociation[0..2].copy_from_slice(&0x40a0u16.to_le_bytes());
+    protected_disassociation[2..4].fill(0);
+    protected_disassociation[4..10].copy_from_slice(&client);
+    protected_disassociation[10..16].copy_from_slice(&peer);
+    protected_disassociation[16..22].copy_from_slice(&peer);
+    protected_disassociation[22..24].copy_from_slice(&(7u16 << 4).to_le_bytes());
     let comeback_tx = Arc::new(Mutex::new(Vec::new()));
     let comeback_transport = SourceExactPassiveTransport::new(
         SaeCommittedSelfTestMechanics {
@@ -1914,6 +1987,25 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 security: None,
             }]),
             queued_data_after_association: VecDeque::from([
+                (
+                    1,
+                    ClientRxFrame {
+                        bytes: protected_disassociation,
+                        status: fidl_softmac::WlanRxInfo {
+                            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                            data_rate: 0,
+                            primary: channel,
+                            bandwidth: ChannelBandwidth::Cbw80,
+                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            mcs: 0,
+                            rssi_dbm: -40,
+                            snr_dbh: 0,
+                        },
+                        security: None,
+                    },
+                ),
                 (
                     2,
                     ClientRxFrame {
@@ -2041,7 +2133,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         ));
     }
     println!(
-        "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 retry_requests=2 sequence=fresh body=identical foreign_reason9=ignored peer_reason9=accepted_connect_failure outer_deadline_ms=100"
+        "self_test_association_comeback_runtime result=pass timer_stream=driven tu=20 protected_len42=filtered retry_requests=2 sequence=fresh body=identical foreign_reason9=ignored peer_reason9=accepted_connect_failure outer_deadline_ms=100"
     );
     let mut burst_auth = vec![0u8; 24];
     burst_auth[0] = 0xb0;
@@ -9112,6 +9204,17 @@ fn classify_client_management_frame(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn strip_verified_management_ccmp(bytes: &mut Vec<u8>) -> Result<(), ()> {
+    if bytes.len() >= 42 {
+        let mut plaintext = Vec::with_capacity(bytes.len() - 16);
+        plaintext.extend_from_slice(&bytes[..24]);
+        plaintext.extend_from_slice(&bytes[32..bytes.len() - 8]);
+        *bytes = plaintext;
+    }
+    (bytes.len() >= 26).then_some(()).ok_or(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn management_ie_id_lengths(bytes: &[u8], offset: usize) -> String {
     let mut cursor = offset;
     let mut fields = Vec::new();
@@ -9583,7 +9686,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
-        let Some(frame) = io.next_client_rx()? else {
+        let Some(mut frame) = io.next_client_rx()? else {
             if let Some(started) = self
                 .post_association_data_wait
                 .filter(|started| started.elapsed() >= std::time::Duration::from_secs(1))
@@ -9639,6 +9742,70 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 }
             }
         } else if control & 0x000c == 0 {
+            let subtype = ((control >> 4) & 15) as u8;
+            let protected = control & 0x4000 != 0;
+            if protected && matches!(subtype, 10 | 12) {
+                let association_generation = self.firmware.association_generation;
+                let pmf = self
+                    .firmware
+                    .association
+                    .is_some_and(|association| association.mfp_required);
+                let key_current = self.firmware.ptk_installed
+                    && self.firmware.ptk_rx_pn.is_some()
+                    && !self.firmware.firmware_uncertain
+                    && association_generation.is_some();
+                let decrypted = frame.security.is_some_and(|security| {
+                    security.security_mode == 4
+                        && !security.cm
+                        && !security.clm
+                        && !security.icv_error
+                        && !security.mic_error
+                        && !security.fcs_error
+                        && security.pn.is_some()
+                });
+                record_sae_stage(&format!(
+                    "protected_management_candidate subtype={subtype} fc_protected=true rx_security={} decrypted={decrypted} key_current={key_current} association_generation={} pmf={pmf}",
+                    frame.security.is_some(),
+                    association_generation.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                ));
+                let admitted = frame.security.and_then(|security| {
+                    association_generation.map(|generation| ClientRxCandidate {
+                        generation: ClientDataGeneration::Association(generation),
+                        eapol: false,
+                        wcid: security.wcid,
+                        tid: security.tid,
+                        group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
+                        key_id: security.key_id,
+                        security_mode: security.security_mode,
+                        cm: security.cm,
+                        clm: security.clm,
+                        icv_error: security.icv_error,
+                        mic_error: security.mic_error,
+                        fcs_error: security.fcs_error,
+                        pn: security.pn.unwrap_or([0; 6]),
+                    })
+                });
+                if !decrypted
+                    || admitted.is_none()
+                    || self
+                        .firmware
+                        .deliver_protected_management_rx(admitted.unwrap())
+                        .is_err()
+                {
+                    record_sae_stage(&format!(
+                        "client_rx_filtered reason=protected_unverified subtype={subtype}"
+                    ));
+                    return Ok(None);
+                }
+                // Connac2 leaves the CCMP header and MIC in an otherwise
+                // decrypted management MPDU. Strip them only after the
+                // current-key/generation and replay checks above succeed.
+                strip_verified_management_ccmp(&mut frame.bytes)
+                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                record_sae_stage(&format!(
+                    "protected_management_admitted subtype={subtype} decrypted=true key_generation_current=true"
+                ));
+            }
             let classification =
                 classify_client_management_frame(&frame.bytes, self.client, self.target);
             let channel_generation_match = {

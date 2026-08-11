@@ -6135,6 +6135,47 @@ impl ClientFirmwareEffectsState {
         Ok(())
     }
 
+    pub fn deliver_protected_management_rx(
+        &mut self,
+        rx: ClientRxCandidate,
+    ) -> Result<(), String> {
+        let association = self
+            .association
+            .ok_or("protected management RX lacks association")?;
+        let generation = self
+            .association_generation
+            .map(ClientDataGeneration::Association)
+            .ok_or("protected management RX lacks association generation")?;
+        if rx.generation != generation
+            || !association.mfp_required
+            || !self.ptk_installed
+            || self.firmware_uncertain
+            || rx.eapol
+            || rx.group
+            || rx.wcid != u16::from(association.peer_wcid)
+            || rx.tid >= 16
+            || rx.key_id != 0
+        {
+            return Err("protected management RX lacks current pairwise PMF state".into());
+        }
+        if rx.security_mode != 4 || rx.cm || rx.clm || rx.icv_error || rx.mic_error || rx.fcs_error
+        {
+            return Err("protected management RX failed CCMP status".into());
+        }
+        let pn = u64::from_be_bytes([
+            0, 0, rx.pn[0], rx.pn[1], rx.pn[2], rx.pn[3], rx.pn[4], rx.pn[5],
+        ]);
+        let retained = &mut self
+            .ptk_rx_pn
+            .as_mut()
+            .ok_or("protected management RX lacks PTK replay state")?[usize::from(rx.tid)];
+        if pn <= *retained {
+            return Err("protected management RX replayed PN".into());
+        }
+        *retained = pn;
+        Ok(())
+    }
+
     pub fn teardown(
         &mut self,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
