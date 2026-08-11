@@ -8549,6 +8549,30 @@ fn classify_client_management_frame(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn management_ie_id_lengths(bytes: &[u8], offset: usize) -> String {
+    let mut cursor = offset;
+    let mut fields = Vec::new();
+    while cursor < bytes.len() {
+        let Some(header) = bytes.get(cursor..cursor + 2) else {
+            fields.push("malformed".to_string());
+            break;
+        };
+        let length = usize::from(header[1]);
+        fields.push(format!("{}:{length}", header[0]));
+        let Some(next) = cursor.checked_add(2 + length) else {
+            fields.push("overflow".to_string());
+            break;
+        };
+        if next > bytes.len() {
+            fields.push("truncated".to_string());
+            break;
+        }
+        cursor = next;
+    }
+    fields.join(",")
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn classify_client_data_frame(
     bytes: &[u8],
     client: [u8; 6],
@@ -8746,6 +8770,28 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             if sae && bytes.get(26..28) == Some(&[1, 0]) {
                 record_sae_commit_structure(bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            }
+            if control & 0x00fc == 0 {
+                let capability = bytes
+                    .get(24..26)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let listen_interval = bytes
+                    .get(26..28)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let sequence = bytes
+                    .get(22..24)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]) >> 4);
+                record_sae_stage(&format!(
+                    "association_request_structure capability={} listen_interval={} retry={} sequence={} ie_id_lengths={} fixed_fields_complete={}",
+                    capability
+                        .map_or_else(|| "unknown".to_string(), |value| format!("0x{value:04x}")),
+                    listen_interval
+                        .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    control & 0x0800 != 0,
+                    sequence.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    management_ie_id_lengths(bytes, 28),
+                    capability.is_some() && listen_interval.is_some() && sequence.is_some(),
+                ));
             }
             drop(state);
             if sae && self.firmware.preauth_peer.is_none() {
@@ -9030,6 +9076,35 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     })
             };
             if classification.subtype == 1 {
+                let capability = frame
+                    .bytes
+                    .get(24..26)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let status = frame
+                    .bytes
+                    .get(26..28)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let raw_aid = frame
+                    .bytes
+                    .get(28..30)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let sequence = frame
+                    .bytes
+                    .get(22..24)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]) >> 4);
+                record_sae_stage(&format!(
+                    "association_response_structure capability={} status={} raw_aid={} retry={} sequence={} fixed_fields_complete={}",
+                    capability
+                        .map_or_else(|| "unknown".to_string(), |value| format!("0x{value:04x}")),
+                    status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    raw_aid.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    control & 0x0800 != 0,
+                    sequence.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                    capability.is_some()
+                        && status.is_some()
+                        && raw_aid.is_some()
+                        && sequence.is_some(),
+                ));
                 record_sae_stage(&format!(
                     "association_response_candidate addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} channel_generation_match={channel_generation_match}",
                     classification.addr1_is_client,
@@ -9064,6 +9139,17 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 record_sae_stage(
                     "association_response_admitted address_match=true channel_generation_match=true",
                 );
+                let status = frame
+                    .bytes
+                    .get(26..28)
+                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                record_sae_stage(&match status {
+                    Some(0) => "mlme_association_disposition result=success status=0 retry_supported=false".to_string(),
+                    Some(status) => format!(
+                        "mlme_association_disposition result=failure status={status} retry_supported=false"
+                    ),
+                    None => "mlme_association_disposition result=malformed status=unknown retry_supported=false".to_string(),
+                });
             }
         }
         if control & 0x000c == 0x0008 {
@@ -12265,6 +12351,22 @@ mod tests {
         effects
             .send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
+        let mut association_request = vec![0; 28];
+        association_request[..2].copy_from_slice(&0x0800u16.to_le_bytes());
+        association_request[4..10].copy_from_slice(&peer);
+        association_request[10..16].copy_from_slice(&effects.client);
+        association_request[16..22].copy_from_slice(&peer);
+        association_request[22..24].copy_from_slice(&(19u16 << 4).to_le_bytes());
+        association_request[24..26].copy_from_slice(&0x0431u16.to_le_bytes());
+        association_request[26..28].copy_from_slice(&10u16.to_le_bytes());
+        association_request.extend_from_slice(&[0, 3, 1, 2, 3, 48, 2, 4, 5]);
+        effects
+            .send_wlan_frame(
+                &association_request,
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                &mut io,
+            )
+            .unwrap();
         let rx_status = fidl_softmac::WlanRxInfo {
             rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
             valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
@@ -12295,6 +12397,20 @@ mod tests {
         assert!(effects.firmware.association.is_none());
 
         association_response[4..10].copy_from_slice(&effects.client);
+        association_response[26..28].copy_from_slice(&30u16.to_le_bytes());
+        io.rx.push_back(ClientRxFrame {
+            bytes: association_response.clone(),
+            status: rx_status.clone(),
+            security: None,
+        });
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            association_response
+        );
+        assert!(effects.firmware.association.is_none());
+        assert_eq!(io.uni.len(), 1);
+
+        association_response[26..28].copy_from_slice(&0u16.to_le_bytes());
         io.rx.push_back(ClientRxFrame {
             bytes: association_response.clone(),
             status: rx_status.clone(),
@@ -12436,7 +12552,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(io.uni.len(), 9);
-        assert_eq!(io.tx, [sae, eapol, data]);
+        assert_eq!(io.tx, [sae, association_request, eapol, data]);
         assert!(effects.firmware.association.is_none());
 
         let mut physically_unbound = LiveClientEffects {
