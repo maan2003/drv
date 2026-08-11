@@ -1516,6 +1516,20 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     if parsed_eapol.bytes.get(24..32) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
         return Err("self-test E2E48 raw EAPOL decapsulation failed".into());
     }
+    let m1 = classify_client_data_frame(&parsed_eapol.bytes, client, peer);
+    if m1.frame_type != 2
+        || m1.subtype != 0
+        || m1.to_ds
+        || !m1.from_ds
+        || !m1.addr1_is_client
+        || !m1.addr2_is_peer
+        || !m1.addr3_is_bssid
+        || !m1.snap_present
+        || m1.ether_type != Some(0x888e)
+        || m1.llc_result != "valid"
+    {
+        return Err("self-test exact AP-to-STA EAPOL M1 classification failed".into());
+    }
     let association = LegacyWmeAssociation {
         bss_index: 0,
         peer_wcid: 7,
@@ -1599,7 +1613,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         return Err("self-test E2E48 malformed descriptor was not terminal".into());
     }
     println!(
-        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true eapol=admitted wcid=1023 non_eapol=filtered malformed=terminal"
+        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true from_ds=true rfc1042=true ether_type=0x888e eapol_m1=admitted wcid=1023 non_eapol=filtered malformed=terminal"
     );
     let mut auth = vec![0; 32];
     auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
@@ -8473,6 +8487,89 @@ fn retain_client_selection(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientDataFrameClassification {
+    frame_type: u8,
+    subtype: u8,
+    to_ds: bool,
+    from_ds: bool,
+    protected: bool,
+    addr1_is_client: bool,
+    addr2_is_peer: bool,
+    addr3_is_bssid: bool,
+    snap_present: bool,
+    ether_type: Option<u16>,
+    llc_result: &'static str,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn classify_client_data_frame(
+    bytes: &[u8],
+    client: [u8; 6],
+    peer: [u8; 6],
+) -> ClientDataFrameClassification {
+    let control = bytes
+        .get(..2)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        .unwrap_or(0);
+    let frame_type = ((control >> 2) & 3) as u8;
+    let subtype = ((control >> 4) & 15) as u8;
+    let to_ds = control & 0x0100 != 0;
+    let from_ds = control & 0x0200 != 0;
+    let protected = control & 0x4000 != 0;
+    let addr1_is_client = bytes.get(4..10) == Some(&client);
+    let addr2_is_peer = bytes.get(10..16) == Some(&peer);
+    let addr3_is_bssid = bytes.get(16..22) == Some(&peer);
+
+    let mut body_offset = 24usize;
+    if to_ds && from_ds {
+        body_offset += 6;
+    }
+    let qos = subtype & 8 != 0;
+    let amsdu = if qos {
+        let value = bytes.get(body_offset..body_offset + 2);
+        body_offset += 2;
+        value.is_some_and(|value| value[0] & 0x80 != 0)
+    } else {
+        false
+    };
+    // Pinned Fuchsia `DataFrame::parse_frame_type_unchecked` consumes HT
+    // control whenever FrameControl::htc_order() is set, after Addr4/QoS.
+    if control & 0x8000 != 0 {
+        body_offset += 4;
+    }
+    let (llc_result, snap_present, ether_type) = if frame_type != 2 {
+        ("not_data", false, None)
+    } else if amsdu {
+        ("amsdu", false, None)
+    } else if bytes.len() < body_offset {
+        ("header_truncated", false, None)
+    } else if bytes.len() < body_offset + 8 {
+        ("llc_truncated", false, None)
+    } else {
+        let snap = bytes.get(body_offset..body_offset + 6) == Some(&[0xaa, 0xaa, 3, 0, 0, 0]);
+        let ether_type = Some(u16::from_be_bytes([
+            bytes[body_offset + 6],
+            bytes[body_offset + 7],
+        ]));
+        (if snap { "valid" } else { "non_snap" }, snap, ether_type)
+    };
+    ClientDataFrameClassification {
+        frame_type,
+        subtype,
+        to_ds,
+        from_ds,
+        protected,
+        addr1_is_client,
+        addr2_is_peer,
+        addr3_is_bssid,
+        snap_present,
+        ether_type,
+        llc_result,
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
@@ -8845,41 +8942,91 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     started.elapsed().as_millis()
                 ));
             }
-            let admitted = self.firmware.association.is_some()
-                && control & 0x0300 == 0x0200
-                && frame.bytes.get(4..10) == Some(&self.client)
-                && frame.bytes.get(10..16) == Some(&self.target)
-                && {
-                    let state = self.state.lock().unwrap();
-                    state.channel.authorized_channel().is_ok_and(|channel| {
-                        channel.channel.band
-                            == match frame.status.primary.band {
-                                WlanBand::TwoGhz => 0,
-                                WlanBand::FiveGhz => 1,
-                                _ => u8::MAX,
-                            }
-                            && channel.channel.primary == u16::from(frame.status.primary.number)
-                    })
-                };
-            if !admitted {
-                record_sae_stage("client_rx_filtered reason=preassociation_or_foreign_data");
-                return Ok(None);
-            }
-            let eapol = frame
-                .bytes
-                .windows(8)
-                .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            let classification = classify_client_data_frame(&frame.bytes, self.client, self.target);
             let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-            if security.wcid == 1023 && (!eapol || frame.bytes.get(16..22) != Some(&self.target)) {
-                record_sae_stage(
-                    "client_rx_filtered reason=unicast_search_miss_non_eapol subtype=data",
-                );
+            let eapol = classification.snap_present
+                && classification.ether_type == Some(0x888e)
+                && classification.llc_result == "valid";
+            let generation = self.firmware.tx_generation(eapol);
+            let association_generation_match =
+                self.firmware
+                    .association_generation
+                    .is_some_and(|expected| {
+                        generation == Ok(ClientDataGeneration::Association(expected))
+                    });
+            record_sae_stage(&format!(
+                "client_data_candidate frame_type={} subtype={} to_ds={} from_ds={} protected={} addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} snap_present={} ether_type={} llc_result={} wcid={} association_generation_match={association_generation_match}",
+                classification.frame_type,
+                classification.subtype,
+                classification.to_ds,
+                classification.from_ds,
+                classification.protected,
+                classification.addr1_is_client,
+                classification.addr2_is_peer,
+                classification.addr3_is_bssid,
+                classification.snap_present,
+                classification.ether_type.map_or(0, u16::from),
+                classification.llc_result,
+                security.wcid,
+            ));
+            let drop = |subreason| {
+                record_sae_stage(&format!(
+                    "client_data_drop subreason={subreason} wcid={} association_generation_match={association_generation_match}",
+                    security.wcid
+                ));
+            };
+            if self.firmware.association.is_none() {
+                drop("no_association");
                 return Ok(None);
             }
-            let generation = self
-                .firmware
-                .tx_generation(eapol)
-                .map_err(|_| zx::Status::ACCESS_DENIED)?;
+            if classification.to_ds || !classification.from_ds {
+                drop("direction_not_ap_to_sta");
+                return Ok(None);
+            }
+            if !classification.addr1_is_client {
+                drop("foreign_receiver");
+                return Ok(None);
+            }
+            if !classification.addr2_is_peer {
+                drop("foreign_transmitter");
+                return Ok(None);
+            }
+            let current_channel = {
+                let state = self.state.lock().unwrap();
+                state.channel.authorized_channel().is_ok_and(|channel| {
+                    channel.channel.band
+                        == match frame.status.primary.band {
+                            WlanBand::TwoGhz => 0,
+                            WlanBand::FiveGhz => 1,
+                            _ => u8::MAX,
+                        }
+                        && channel.channel.primary == u16::from(frame.status.primary.number)
+                })
+            };
+            if !current_channel {
+                drop("wrong_channel");
+                return Ok(None);
+            }
+            if security.wcid == 1023 && classification.llc_result != "valid" {
+                drop(match classification.llc_result {
+                    "llc_truncated" | "header_truncated" => "malformed_llc",
+                    "amsdu" => "amsdu_unicast_search_miss",
+                    _ => "non_snap_sentinel",
+                });
+                return Ok(None);
+            }
+            if security.wcid == 1023 && !eapol {
+                drop("non_eapol_sentinel");
+                return Ok(None);
+            }
+            if security.wcid == 1023 && !classification.addr3_is_bssid {
+                drop("foreign_bssid_sentinel");
+                return Ok(None);
+            }
+            let generation = generation.map_err(|_| {
+                drop("security_generation_gate");
+                zx::Status::ACCESS_DENIED
+            })?;
             self.firmware
                 .deliver_rx(ClientRxCandidate {
                     generation,
@@ -8896,7 +9043,14 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     fcs_error: security.fcs_error,
                     pn: security.pn.unwrap_or([0; 6]),
                 })
-                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                .map_err(|_| {
+                    drop("security_replay_or_integrity");
+                    zx::Status::IO_DATA_INTEGRITY
+                })?;
+            record_sae_stage(&format!(
+                "client_data_admitted eapol={eapol} wcid={} association_generation_match={association_generation_match}",
+                security.wcid
+            ));
         } else if control & 0x000c != 0 {
             return Err(zx::Status::IO_DATA_INTEGRITY);
         } else if authentication {
@@ -14765,6 +14919,50 @@ mod tests {
         assert_eq!(
             parse_connac2_rx_frame(&malformed),
             Err(PassiveRxError::Truncated)
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn data_candidate_classification_uses_exact_ds_qos_ht_and_llc_offsets() {
+        let client = [2, 0, 0, 0, 0, 1];
+        let peer = [2, 0, 0, 0, 0, 2];
+        let make = |control: u16, receiver: [u8; 6], ether_type: u16| {
+            let to_ds = control & 0x0100 != 0;
+            let from_ds = control & 0x0200 != 0;
+            let qos = (control >> 4) & 8 != 0;
+            let htc = control & 0x8000 != 0;
+            let header_len = 24
+                + usize::from(to_ds && from_ds) * 6
+                + usize::from(qos) * 2
+                + usize::from(htc) * 4;
+            let mut frame = vec![0; header_len + 10];
+            frame[..2].copy_from_slice(&control.to_le_bytes());
+            frame[4..10].copy_from_slice(&receiver);
+            frame[10..16].copy_from_slice(&peer);
+            frame[16..22].copy_from_slice(&peer);
+            frame[header_len..header_len + 8].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0, 0]);
+            frame[header_len + 6..header_len + 8].copy_from_slice(&ether_type.to_be_bytes());
+            frame
+        };
+
+        for control in [0x0208, 0x0288, 0x8388] {
+            let frame = make(control, client, 0x888e);
+            let classified = classify_client_data_frame(&frame, client, peer);
+            assert_eq!(classified.llc_result, "valid");
+            assert!(classified.snap_present);
+            assert_eq!(classified.ether_type, Some(0x888e));
+            assert!(classified.addr1_is_client);
+            assert!(classified.addr2_is_peer);
+            assert!(classified.addr3_is_bssid);
+        }
+
+        let foreign = make(0x0208, [9; 6], 0x888e);
+        assert!(!classify_client_data_frame(&foreign, client, peer).addr1_is_client);
+        let non_eapol = make(0x0208, client, 0x0800);
+        assert_eq!(
+            classify_client_data_frame(&non_eapol, client, peer).ether_type,
+            Some(0x0800)
         );
     }
 
