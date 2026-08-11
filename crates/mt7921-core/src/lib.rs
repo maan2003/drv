@@ -5838,6 +5838,99 @@ pub struct ClientChannelLease {
     pub generation: u64,
 }
 
+/// One completed selector scan result retained for the externally selected BSS.
+/// It is consumed exactly once when rate/power readiness authorizes SAE and is
+/// thereafter bound to the physical channel generation used by join.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ClientScanEvidence {
+    pub scan_id: u64,
+    pub observation_generation: u64,
+    pub observation_timestamp_nanos: i64,
+    pub bssid: [u8; 6],
+    pub channel: ClientPhysicalChannel,
+}
+
+#[derive(Default)]
+pub struct ClientTargetBssLease {
+    retained: Option<ClientScanEvidence>,
+    rate_power_ready: bool,
+    authorized: Option<(ClientScanEvidence, ClientChannelLease)>,
+}
+
+impl ClientTargetBssLease {
+    pub fn retain(evidence: ClientScanEvidence) -> Result<Self, String> {
+        if evidence.scan_id == 0 || evidence.observation_generation == 0 {
+            return Err("client selection evidence has no scan identity".into());
+        }
+        Ok(Self {
+            retained: Some(evidence),
+            rate_power_ready: false,
+            authorized: None,
+        })
+    }
+
+    pub fn mark_rate_power_ready(
+        &mut self,
+        bssid: [u8; 6],
+        channel: ClientPhysicalChannel,
+    ) -> Result<(), String> {
+        let evidence = self
+            .retained
+            .as_ref()
+            .ok_or("client selection evidence is absent or consumed")?;
+        if evidence.bssid != bssid || evidence.channel != channel {
+            return Err("rate-power readiness does not match selected BSS evidence".into());
+        }
+        self.rate_power_ready = true;
+        Ok(())
+    }
+
+    pub fn authorize_sae(
+        &mut self,
+        bssid: [u8; 6],
+        channel: ClientChannelLease,
+    ) -> Result<ClientChannelLease, String> {
+        let evidence = self
+            .retained
+            .as_ref()
+            .ok_or("client selection evidence is absent or consumed")?;
+        if !self.rate_power_ready || evidence.bssid != bssid || evidence.channel != channel.channel
+        {
+            return Err("SAE authorization does not match selected BSS readiness".into());
+        }
+        let evidence = self.retained.take().expect("retained evidence was checked");
+        self.rate_power_ready = false;
+        self.authorized = Some((evidence, channel));
+        Ok(channel)
+    }
+
+    pub fn permits_join(&self, bssid: [u8; 6], channel: ClientChannelLease) -> bool {
+        self.authorized
+            .as_ref()
+            .is_some_and(|(evidence, authorized)| evidence.bssid == bssid && *authorized == channel)
+    }
+
+    pub fn channel_changed(&mut self, channel: ClientPhysicalChannel) {
+        let matches_retained = self
+            .retained
+            .as_ref()
+            .is_some_and(|evidence| evidence.channel == channel);
+        let matches_authorized = self
+            .authorized
+            .as_ref()
+            .is_some_and(|(_, authorized)| authorized.channel == channel);
+        if !matches_retained && !matches_authorized {
+            self.invalidate();
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.retained = None;
+        self.rate_power_ready = false;
+        self.authorized = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientPhysicalChannelEnsure {
     Current(ClientChannelLease),
@@ -7765,6 +7858,44 @@ mod tests {
             ClientPhysicalChannelEnsure::TransitionRequired { current: Some(current), .. }
                 if current == second
         ));
+    }
+
+    #[test]
+    fn client_target_bss_evidence_is_one_shot_and_generation_bound() {
+        let channel = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 42,
+            bandwidth: 2,
+            center2: 0,
+        };
+        let bssid = [1, 2, 3, 4, 5, 6];
+        let evidence = ClientScanEvidence {
+            scan_id: 4,
+            observation_generation: 1,
+            observation_timestamp_nanos: 10,
+            bssid,
+            channel,
+        };
+        let channel_lease = ClientChannelLease {
+            channel,
+            generation: 2,
+        };
+        let mut lease = ClientTargetBssLease::retain(evidence).unwrap();
+        assert!(lease.authorize_sae(bssid, channel_lease).is_err());
+        lease.mark_rate_power_ready(bssid, channel).unwrap();
+        assert_eq!(lease.authorize_sae(bssid, channel_lease), Ok(channel_lease));
+        assert!(lease.authorize_sae(bssid, channel_lease).is_err());
+        assert!(lease.permits_join(bssid, channel_lease));
+        assert!(!lease.permits_join(
+            bssid,
+            ClientChannelLease {
+                generation: 3,
+                ..channel_lease
+            }
+        ));
+        lease.invalidate();
+        assert!(!lease.permits_join(bssid, channel_lease));
     }
 
     #[test]

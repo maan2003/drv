@@ -197,6 +197,13 @@ pub trait Mt7921ClientEffects {
     /// Immediately poison scan-derived authority in every shared TX handle.
     fn revoke_scan(&mut self);
 
+    /// Enter a newly constructed runtime without carrying TX authorization.
+    /// Externally selected BSS evidence may remain retained for Connect.
+    fn prepare_runtime_handoff(&mut self) -> ClientRuntimeScanState {
+        self.revoke_scan();
+        ClientRuntimeScanState::Revoked
+    }
+
     /// Immediately and durably poison every shared TX handle for lifecycle.
     fn revoke_lifecycle(&mut self);
 
@@ -271,6 +278,12 @@ pub trait Mt7921ClientEffects {
 pub enum ClientChannelEnsure {
     Current,
     TransitionRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientRuntimeScanState {
+    Revoked,
+    ExternalSelection,
 }
 
 trait Mt7921ClientScan: Mt7921ClientIo {
@@ -796,12 +809,12 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
         scan: Mt7921SoftmacAdapter<T>,
         support: ClientSupport,
     ) -> (Self, Mt7921ScanRunner<E, T>) {
-        effects.revoke_scan();
+        let scan_state = effects.prepare_runtime_handoff();
         let backend = Arc::new(Mutex::new(ComposedBackend {
             effects,
             scan,
             active_scan_id: None,
-            revoked: true,
+            revoked: scan_state == ClientRuntimeScanState::Revoked,
             lifecycle_poisoned: false,
             ethernet: None,
         }));
@@ -832,12 +845,12 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             .sta_addr
             .ok_or(EthernetPortConfigError::InvalidMacAddress)?;
         let (ethernet_device, ethernet_tx, ethernet_sink) = ethernet_port(mac, queue_capacity)?;
-        effects.revoke_scan();
+        let scan_state = effects.prepare_runtime_handoff();
         let backend = Arc::new(Mutex::new(ComposedBackend {
             effects,
             scan,
             active_scan_id: None,
-            revoked: true,
+            revoked: scan_state == ClientRuntimeScanState::Revoked,
             lifecycle_poisoned: false,
             ethernet: Some(ethernet_sink),
         }));
