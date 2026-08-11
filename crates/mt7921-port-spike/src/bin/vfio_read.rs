@@ -8503,6 +8503,33 @@ struct ClientDataFrameClassification {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientManagementFrameClassification {
+    subtype: u8,
+    addr1_is_client: bool,
+    addr2_is_peer: bool,
+    addr3_is_bssid: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn classify_client_management_frame(
+    bytes: &[u8],
+    client: [u8; 6],
+    peer: [u8; 6],
+) -> ClientManagementFrameClassification {
+    let control = bytes
+        .get(..2)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        .unwrap_or(0);
+    ClientManagementFrameClassification {
+        subtype: ((control >> 4) & 15) as u8,
+        addr1_is_client: bytes.get(4..10) == Some(&client),
+        addr2_is_peer: bytes.get(10..16) == Some(&peer),
+        addr3_is_bssid: bytes.get(16..22) == Some(&peer),
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn classify_client_data_frame(
     bytes: &[u8],
     client: [u8; 6],
@@ -8931,9 +8958,66 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     return Ok(None);
                 }
             }
-        } else if control & 0x000c == 0 && !self.firmware.accepts_joined_management(&frame.bytes) {
-            record_sae_stage("client_rx_filtered reason=prejoin_non_auth_management");
-            return Ok(None);
+        } else if control & 0x000c == 0 {
+            let classification =
+                classify_client_management_frame(&frame.bytes, self.client, self.target);
+            let channel_generation_match = {
+                let state = self.state.lock().unwrap();
+                state
+                    .channel
+                    .authorized_channel()
+                    .ok()
+                    .is_some_and(|channel| {
+                        self.firmware.joined.is_some_and(|joined| {
+                            joined.bssid == self.target
+                                && joined.channel == channel.channel.primary
+                                && joined.channel_generation == channel.generation
+                                && channel.channel.band
+                                    == match frame.status.primary.band {
+                                        WlanBand::TwoGhz => 0,
+                                        WlanBand::FiveGhz => 1,
+                                        _ => u8::MAX,
+                                    }
+                                && channel.channel.primary == u16::from(frame.status.primary.number)
+                        })
+                    })
+            };
+            if classification.subtype == 1 {
+                record_sae_stage(&format!(
+                    "association_response_candidate addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} channel_generation_match={channel_generation_match}",
+                    classification.addr1_is_client,
+                    classification.addr2_is_peer,
+                    classification.addr3_is_bssid,
+                ));
+            }
+            if !channel_generation_match
+                || !self
+                    .firmware
+                    .accepts_joined_management(&frame.bytes, self.client)
+            {
+                let reason = if !channel_generation_match {
+                    "stale_or_wrong_channel"
+                } else if !classification.addr1_is_client {
+                    "foreign_receiver"
+                } else {
+                    "foreign_bss"
+                };
+                if classification.subtype == 1 {
+                    record_sae_stage(&format!(
+                        "association_response_drop subreason={reason} channel_generation_match={channel_generation_match}"
+                    ));
+                }
+                record_sae_stage(&format!(
+                    "client_rx_filtered reason={reason} subtype={}",
+                    classification.subtype
+                ));
+                return Ok(None);
+            }
+            if classification.subtype == 1 {
+                record_sae_stage(
+                    "association_response_admitted address_match=true channel_generation_match=true",
+                );
+            }
         }
         if control & 0x000c == 0x0008 {
             if let Some(started) = self.post_association_data_wait.take() {
@@ -12084,12 +12168,6 @@ mod tests {
         effects
             .send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
-        effects
-            .notify_association_complete(&association, &mut io)
-            .unwrap();
-        assert_eq!(io.uni.len(), 2);
-        assert!(!effects.firmware.controlled_port_open);
-
         let rx_status = fidl_softmac::WlanRxInfo {
             rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
             valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
@@ -12105,6 +12183,36 @@ mod tests {
             rssi_dbm: -40,
             snr_dbh: 0,
         };
+        let mut association_response = vec![0; 30];
+        association_response[..2].copy_from_slice(&0x0010u16.to_le_bytes());
+        association_response[4..10].copy_from_slice(&[1, 1, 1, 1, 1, 1]);
+        association_response[10..16].copy_from_slice(&peer);
+        association_response[16..22].copy_from_slice(&peer);
+        association_response[28..30].copy_from_slice(&42u16.to_le_bytes());
+        io.rx.push_back(ClientRxFrame {
+            bytes: association_response.clone(),
+            status: rx_status.clone(),
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(effects.firmware.association.is_none());
+
+        association_response[4..10].copy_from_slice(&effects.client);
+        io.rx.push_back(ClientRxFrame {
+            bytes: association_response.clone(),
+            status: rx_status.clone(),
+            security: None,
+        });
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            association_response
+        );
+        assert!(effects.firmware.association.is_none());
+        effects
+            .notify_association_complete(&association, &mut io)
+            .unwrap();
+        assert_eq!(io.uni.len(), 2);
+        assert!(!effects.firmware.controlled_port_open);
         let sentinel_security = ClientRxSecurity {
             wcid: 1023,
             tid: 0,

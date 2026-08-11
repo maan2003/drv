@@ -5697,11 +5697,24 @@ impl ClientFirmwareEffectsState {
         Ok(())
     }
 
-    pub fn accepts_joined_management(&self, frame: &[u8]) -> bool {
+    pub fn accepts_joined_management(&self, frame: &[u8], client: [u8; 6]) -> bool {
         let Some(joined) = self.joined else {
             return false;
         };
-        frame.get(10..16) == Some(&joined.bssid) && frame.get(16..22) == Some(&joined.bssid)
+        let Some(control) = frame
+            .get(..2)
+            .map(|value| u16::from_le_bytes([value[0], value[1]]))
+        else {
+            return false;
+        };
+        let subtype = ((control >> 4) & 15) as u8;
+        let receiver = frame.get(4..10);
+        let selected_bss =
+            frame.get(10..16) == Some(&joined.bssid) && frame.get(16..22) == Some(&joined.bssid);
+        let client_directed = receiver == Some(&client);
+        let bss_advertisement =
+            matches!(subtype, 5 | 8) && receiver.is_some_and(|receiver| receiver[0] & 1 != 0);
+        control & 0x000c == 0 && selected_bss && (client_directed || bss_advertisement)
     }
 
     fn mint_generation(&mut self) -> u64 {
@@ -7523,10 +7536,15 @@ mod tests {
         assert!(channels.authorized_channel().is_err());
         assert_eq!(channels.authorize_channel(physical).unwrap(), lease);
         state.bind_join(peer, lease, 100).unwrap();
-        assert!(state.accepts_joined_management(&[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x10, 0x20, 0x30,
-            0x40, 0x50, 0x60,
-        ]));
+        let client = [6, 5, 4, 3, 2, 1];
+        let mut association_response = [0; 22];
+        association_response[..2].copy_from_slice(&0x0010u16.to_le_bytes());
+        association_response[4..10].copy_from_slice(&client);
+        association_response[10..16].copy_from_slice(&peer);
+        association_response[16..22].copy_from_slice(&peer);
+        assert!(state.accepts_joined_management(&association_response, client));
+        association_response[4..10].copy_from_slice(&[1, 1, 1, 1, 1, 1]);
+        assert!(!state.accepts_joined_management(&association_response, client));
         assert!(
             state
                 .associate(
