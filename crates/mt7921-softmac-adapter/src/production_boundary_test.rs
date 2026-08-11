@@ -750,8 +750,8 @@ fn reset_failure_revokes_before_first_frame_and_survives_later_scan() {
         ));
 
         let backend = runner.backend.lock().unwrap();
-        assert!(backend.revoked);
-        assert!(backend.lifecycle_poisoned);
+        assert!(!backend.authorization.permits_tx());
+        assert!(!backend.authorization.is_live());
         let state = state.lock().unwrap();
         assert!(state.frames.is_empty());
         assert!(state.lifecycle_poisoned);
@@ -787,8 +787,8 @@ fn stop_failure_revokes_and_clears_evidence_before_first_frame() {
     assert!(state.lock().unwrap().frames.is_empty());
     assert_eq!(runner.stop(), Err(zx::Status::IO));
     let backend = runner.backend.lock().unwrap();
-    assert!(backend.revoked);
-    assert!(backend.lifecycle_poisoned);
+    assert!(!backend.authorization.permits_tx());
+    assert!(!backend.authorization.is_live());
     let state = state.lock().unwrap();
     assert!(state.frames.is_empty());
     assert!(state.lifecycle_poisoned);

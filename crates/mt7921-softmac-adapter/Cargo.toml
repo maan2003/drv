@@ -29,6 +29,7 @@ tokio = { version = "=1.52.3", features = ["rt", "time"] }
 fuchsia-softmac-port = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/softmac-port" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme" }
+wlan-softmac-class-support = { path = "../wlan-softmac-class-support" }
 zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 
 [dev-dependencies]

@@ -632,7 +632,6 @@ name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "eapol",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
@@ -1098,6 +1097,7 @@ dependencies = [
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
+ "wlan-softmac-class-support",
  "wlancfg-selection",
  "zx",
 ]
@@ -2475,6 +2475,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-softmac-class-support"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-softmac",
+]
+
+[[package]]
 name = "wlan-statemachine"
 version = "0.1.0"
 dependencies = [
@@ -2514,7 +2522,6 @@ dependencies = [
  "fuchsia-inspect-contrib",
  "futures",
  "ieee80211",
- "itertools 0.14.0",
  "log",
  "rand 0.9.4",
  "wlan-common",

@@ -978,18 +978,11 @@ impl LinuxChannelShape {
         bandwidth: ChannelBandwidth,
         secondary80: Option<ChannelNumber>,
     ) -> Option<Self> {
-        let primary_number = primary.number;
-        let secondary_number = match (bandwidth, secondary80) {
-            (ChannelBandwidth::Cbw80P80, Some(secondary))
-                if secondary.band == primary.band && secondary.number != 0 =>
-            {
-                secondary.number
-            }
-            (ChannelBandwidth::Cbw80P80, _) => return None,
-            (_, None) => 0,
-            (_, Some(secondary)) if secondary.band == primary.band && secondary.number == 0 => 0,
-            _ => return None,
-        };
+        let definition =
+            wlan_softmac_class_support::ChannelDefinition::new(primary, bandwidth, secondary80)
+                .ok()?;
+        let primary_number = definition.primary().number;
+        let secondary_number = definition.secondary80().map_or(0, |channel| channel.number);
         let center80 = match primary_number {
             36..=48 => 42,
             52..=64 => 58,
