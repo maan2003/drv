@@ -639,9 +639,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt7921-core"
+version = "0.1.0"
+
+[[package]]
 name = "mt7921-port-spike"
 version = "0.1.0"
 dependencies = [
+ "mt7921-core",
  "userspace-vfio",
 ]
 

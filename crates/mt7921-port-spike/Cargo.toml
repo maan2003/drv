@@ -1,11 +1,12 @@
 [package]
 name = "mt7921-port-spike"
-description = "Exploratory, hardware-independent mt76/mt7921 format ports"
+description = "MT7921 userspace adapter, CLI, and lab orchestration"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
+mt7921-core = { path = "../mt7921-core" }
 userspace-vfio = { path = "../userspace-vfio" }
 
 [lib]

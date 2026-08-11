@@ -1,6 +1,12 @@
-# MT7921/MT7922 port spike (not yet a driver)
+# MT7921 userspace adapter and lab orchestration
 
-This crate is an exploratory port of two hardware-independent format seams from
+The Linux-derived hardware implementation has moved to `../mt7921-core` and
+this package preserves its prior Rust API by re-export. Generic VFIO/iommufd
+ownership lives in `../userspace-vfio`. The binaries and documentation below
+remain here because they own CLI, lab, credential, Fuchsia SoftMAC, and
+production Netstack orchestration rather than reusable hardware behavior.
+
+The extracted core began as an exploratory port of two hardware-independent format seams from
 Linux mt76: the 16-byte DMA descriptor construction and the Connac2 RAM firmware
 trailer/region parser. It does not access hardware, load firmware, implement
 802.11, or claim support for any device. Its purpose is to make a small amount
