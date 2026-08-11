@@ -10,7 +10,20 @@ use netstack3_port_spike::{
 };
 use std::collections::VecDeque;
 use std::fmt;
+use std::net::IpAddr;
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use netstack3_port_integration::{
+    Runtime,
+    service::{DhcpService, DhcpStatus},
+};
+use netstack3_port_spike::{
+    EthernetRunner, NetworkServiceEndpoint, RemoteIpAddress, RemoteIpVersion, RemoteSocketAddress,
+    RemoteSocketProvider,
+};
+use rand::{SeedableRng as _, rngs::StdRng};
 
 pub const MT7921_ETHERNET_MTU: u16 = 1500;
 
@@ -73,6 +86,201 @@ pub trait AssociatedSoftmacTx {
     /// Accept one Ethernet II frame without FCS. Success transfers ownership
     /// to the associated SoftMAC path.
     fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Production RX companion to [`AssociatedSoftmacTx`]. One call admits at
+/// most one already-validated associated data frame into the MLME Ethernet
+/// sink; it must not wait beyond `deadline`.
+pub trait AssociatedDataPump: AssociatedSoftmacTx {
+    fn pump_receive(&mut self, deadline: std::time::Instant) -> Result<bool, Self::Error>;
+}
+
+#[derive(Clone)]
+pub struct NetstackProofConfig {
+    pub dns_name: String,
+    pub server_port: NonZeroU16,
+    pub http_request: Vec<u8>,
+    pub expected_response_prefix: Vec<u8>,
+}
+
+/// The existing Netstack3 DHCP/DNS/socket stack wired to the MT7921 Ethernet
+/// port. This is a bounded driver, not a DHCP, DNS, TCP, or HTTP implementation.
+pub struct BoundedNetstackProof {
+    runner: EthernetRunner<DhcpService, Mt7921EthernetDevice>,
+    tx: Mt7921EthernetTx,
+    config: NetstackProofConfig,
+    now: Duration,
+    resolved: Option<[u8; 4]>,
+    socket: Option<netstack3_port_spike::RemoteSocketHandle>,
+}
+
+impl BoundedNetstackProof {
+    pub fn new(
+        device: Mt7921EthernetDevice,
+        tx: Mt7921EthernetTx,
+        config: NetstackProofConfig,
+    ) -> Result<Self, &'static str> {
+        let mac = device
+            .properties()
+            .ok_or("Ethernet port is closed")?
+            .mac_address;
+        let runtime = Runtime::new(
+            32,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            mac,
+            u32::from(MT7921_ETHERNET_MTU),
+        )
+        .map_err(|_| "Netstack runtime initialization failed")?;
+        Ok(Self {
+            runner: EthernetRunner::new(
+                DhcpService::new(runtime, StdRng::seed_from_u64(7), mac),
+                device,
+            ),
+            tx,
+            config,
+            now: Duration::ZERO,
+            resolved: None,
+            socket: None,
+        })
+    }
+
+    fn drive<T: AssociatedDataPump>(
+        &mut self,
+        target: &mut T,
+        deadline: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        if std::time::Instant::now() >= deadline {
+            return Err("Netstack proof deadline");
+        }
+        for _ in 0..8 {
+            while let Some(event) = self.runner.device_mut().take_event() {
+                if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
+                    self.runner.discard_pending();
+                    self.resolved = None;
+                    self.socket = None;
+                }
+                self.runner.stack_mut().on_device_event(event);
+            }
+            self.runner.stack_mut().poll_at(self.now, 64);
+            while self.runner.pump().transmitted != 0 {}
+            while self
+                .tx
+                .pump_one(target)
+                .map_err(|_| "associated data TX failed")?
+            {}
+            while target
+                .pump_receive(deadline)
+                .map_err(|_| "associated data RX failed")?
+            {}
+            while self.runner.pump().received != 0 {}
+        }
+        self.now += Duration::from_millis(100);
+        Ok(())
+    }
+
+    pub fn prove_dhcp<T: AssociatedDataPump>(
+        &mut self,
+        target: &mut T,
+        deadline: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        while self.runner.stack().status() != DhcpStatus::Bound {
+            self.drive(target, deadline)?;
+        }
+        Ok(())
+    }
+
+    pub fn prove_dns<T: AssociatedDataPump>(
+        &mut self,
+        target: &mut T,
+        deadline: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        if self.runner.stack().status() != DhcpStatus::Bound {
+            return Err("DNS requires DHCP");
+        }
+        let lookup = self
+            .runner
+            .stack_mut()
+            .lookup_ip(self.config.dns_name.clone())
+            .map_err(|_| "DNS start failed")?;
+        loop {
+            self.drive(target, deadline)?;
+            if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
+                let addresses = result.map_err(|_| "DNS lookup failed")?;
+                self.resolved = addresses.into_iter().find_map(|address| match address {
+                    IpAddr::V4(v4) => Some(v4.octets()),
+                    _ => None,
+                });
+                return self
+                    .resolved
+                    .map(|_| ())
+                    .ok_or("DNS returned no IPv4 address");
+            }
+        }
+    }
+
+    pub fn prove_tcp<T: AssociatedDataPump>(
+        &mut self,
+        target: &mut T,
+        deadline: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        let address = self.resolved.ok_or("TCP requires DNS")?;
+        let mut provider = self.runner.stack().socket_provider();
+        let client = provider
+            .open_client(NonZeroUsize::new(1).unwrap())
+            .map_err(|_| "socket client failed")?;
+        let socket = provider
+            .tcp_socket(client, RemoteIpVersion::V4)
+            .map_err(|_| "TCP socket failed")?;
+        provider
+            .tcp_connect(
+                socket,
+                RemoteSocketAddress {
+                    address: RemoteIpAddress::V4(address),
+                    port: self.config.server_port,
+                },
+            )
+            .map_err(|_| "TCP connect failed")?;
+        loop {
+            self.drive(target, deadline)?;
+            let ready = provider
+                .readiness(socket)
+                .map_err(|_| "TCP readiness failed")?;
+            if ready.writable {
+                self.socket = Some(socket);
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn prove_http<T: AssociatedDataPump>(
+        &mut self,
+        target: &mut T,
+        deadline: std::time::Instant,
+    ) -> Result<(), &'static str> {
+        let socket = self.socket.ok_or("HTTP requires TCP")?;
+        let mut provider = self.runner.stack().socket_provider();
+        let written = provider
+            .tcp_write(socket, &self.config.http_request)
+            .map_err(|_| "HTTP request failed")?;
+        if written != self.config.http_request.len() {
+            return Err("partial HTTP request");
+        }
+        let mut response = vec![0; 4096];
+        loop {
+            self.drive(target, deadline)?;
+            match provider.tcp_read(socket, &mut response) {
+                Ok(read) if read != 0 => {
+                    return response[..read]
+                        .starts_with(&self.config.expected_response_prefix)
+                        .then_some(())
+                        .ok_or("unexpected HTTP response");
+                }
+                Ok(_) | Err(netstack3_port_spike::RemoteSocketError::WouldBlock) => {}
+                Err(_) => return Err("HTTP response failed"),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

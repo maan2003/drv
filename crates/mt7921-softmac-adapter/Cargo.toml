@@ -20,6 +20,8 @@ fuchsia-trace = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939
 futures = "=0.3.32"
 mt7921-port-spike = { path = "../mt7921-port-spike" }
 netstack3-port-spike = { path = "../netstack3-port-spike" }
+netstack3-port-integration = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration" }
+rand = "=0.9.4"
 fuchsia-softmac-port = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/softmac-port" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
@@ -31,10 +33,8 @@ fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906ae
 fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
 net_types = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/net-types" }
 netstack3_base = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/base" }
-netstack3-port-integration = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration" }
 packet = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/network/packet" }
 packet_formats = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/packet-formats" }
-rand = "=0.9.4"
 trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0", default-features = false, features = ["testing"] }
 trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0", default-features = false, features = ["testing"] }
 wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/common/rust" }
