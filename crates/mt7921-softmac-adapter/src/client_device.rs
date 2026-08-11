@@ -695,6 +695,7 @@ where
         loop {
             match self.requests.try_recv() {
                 Ok(request) => {
+                    let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
                     if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
                         println!(
                             "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
@@ -714,6 +715,12 @@ where
                                 detail: error.to_string(),
                             })
                         })?;
+                    if sae_frame_tx {
+                        println!(
+                            "client_sae_stage=mlme_request_complete state={}",
+                            self.mlme.sae_state_name()
+                        );
+                    }
                     progressed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
