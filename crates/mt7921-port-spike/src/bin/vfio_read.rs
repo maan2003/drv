@@ -9,14 +9,17 @@ use fidl_fuchsia_wlan_driver as fidl_driver;
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
 #[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_internal as fidl_internal;
+#[cfg(feature = "fuchsia-passive")]
+use fidl_fuchsia_wlan_sme as fidl_sme;
+#[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 #[cfg(feature = "fuchsia-passive")]
 use fuchsia_softmac_port::{
     BeaconHintAuthorizer, ChannelBandwidth, ChannelNumber, ConservativeRegulatoryPolicy,
-    HardwareScanEvent, MlmeScanEvent, PassiveScanner, SaeHandshake, SaeHandshakeUpdate,
-    ScanRequest, ScanResultCode, ScanTypes, SoftmacHardware, WlanBand,
-    WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
-    allowed_passive_channels, build_sae_auth_frame,
+    HardwareScanEvent, MlmeScanEvent, PassiveScanner, ScanRequest, ScanResultCode, ScanTypes,
+    SoftmacHardware, WlanBand, WlanSoftmacBaseSetChannelRequest,
+    WlanSoftmacBaseStartPassiveScanRequest, allowed_passive_channels,
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
@@ -57,7 +60,10 @@ use mt7921_port_spike::{
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
     ClientRxFrame, ClientRxSecurity, ClientSupport, Mt7921ClientDevice, Mt7921ClientEffects,
+    PinnedClientRuntime,
 };
+#[cfg(feature = "fuchsia-passive")]
+use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig};
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
     Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites, SourceExactPassiveMechanics,
@@ -70,7 +76,7 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    num::NonZeroU64,
+    num::{NonZeroU16, NonZeroU64},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     process::{Command, Stdio},
     ptr::NonNull,
@@ -1256,6 +1262,13 @@ pub fn main() {
 struct SaeCredential(Vec<u8>);
 
 #[cfg(feature = "fuchsia-passive")]
+impl SaeCredential {
+    fn into_passphrase(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl Drop for SaeCredential {
     fn drop(&mut self) {
         self.0.fill(0);
@@ -1300,22 +1313,20 @@ fn read_sae_credential_exact(
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn find_ie(ies: &[u8], wanted: u8) -> Option<&[u8]> {
-    let mut offset = 0;
-    while offset + 2 <= ies.len() {
-        let length = usize::from(ies[offset + 1]);
-        let end = offset.checked_add(length + 2)?;
-        let ie = ies.get(offset..end)?;
-        if ie[0] == wanted {
-            return Some(ie);
-        }
-        offset = end;
+fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientSupport {
+    query.mac_role = Some(fidl_common::WlanMacRole::Client);
+    query.hardware_capability = Some(0);
+    for band in query.band_caps.get_or_insert_default() {
+        band.basic_rates.get_or_insert_with(|| match band.band {
+            Some(fidl_ieee80211::WlanBand::TwoGhz) => {
+                vec![0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]
+            }
+            Some(fidl_ieee80211::WlanBand::FiveGhz) => {
+                vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]
+            }
+            _ => vec![],
+        });
     }
-    None
-}
-
-#[cfg(feature = "fuchsia-passive")]
-fn live_client_support(query: fidl_softmac::WlanSoftmacQueryResponse) -> ClientSupport {
     ClientSupport {
         query,
         discovery: fidl_softmac::DiscoverySupport {
@@ -3480,8 +3491,23 @@ fn run() -> Result<(), String> {
                                         report.nic_capability,
                                         &candidates,
                                     ));
-                                    let (mut device, runner) =
-                                        Mt7921ClientDevice::new(effects, adapter, support);
+                                    let device_info = wlan_mlme::mlme_device_info_from_softmac(
+                                        support.query.clone(),
+                                    )
+                                    .map_err(|_| "convert SoftMAC device info failed")?;
+                                    let security_support = support.security.clone();
+                                    let spectrum_support = support.spectrum_management.clone();
+                                    let (mut device, runner, ethernet_device, ethernet_tx) =
+                                        Mt7921ClientDevice::new_with_ethernet(
+                                            effects, adapter, support, 32,
+                                        )
+                                        .map_err(
+                                            |error| {
+                                                format!(
+                                                    "construct pinned Ethernet boundary: {error}"
+                                                )
+                                            },
+                                        )?;
                                     futures::executor::block_on(DeviceOps::set_channel(
                                         &mut device,
                                         channels[0],
@@ -3561,139 +3587,78 @@ fn run() -> Result<(), String> {
                                     }
                                     let bss =
                                         target_bss.as_ref().ok_or("target BSS was not retained")?;
-                                    let rsne =
-                                        find_ie(&bss.ies, 48).ok_or("target BSS omitted RSNE")?;
-                                    let rsnxe = find_ie(&bss.ies, 244);
-                                    let client = report
-                                        .nic_capability
-                                        .mac_address
-                                        .ok_or("NIC omitted MAC address")?;
-                                    let credential = sae_credential
-                                        .as_mut()
-                                        .ok_or("SAE credential unavailable")?;
-                                    let mut handshake = SaeHandshake::new(
-                                        power_target.as_ref().unwrap().1.clone(),
-                                        credential.0.clone(),
-                                        client.into(),
-                                        power_target.as_ref().unwrap().0.into(),
-                                        rsne,
-                                        rsnxe,
-                                        true,
+                                    let passphrase = sae_credential
+                                        .take()
+                                        .ok_or("SAE credential unavailable")?
+                                        .into_passphrase();
+                                    let request = fidl_sme::ConnectRequest {
+                                        ssid: power_target.as_ref().expect("SAE target").1.clone(),
+                                        bss_description: bss.clone(),
+                                        multiple_bss_candidates: false,
+                                        authentication: fidl_internal::Authentication {
+                                            protocol: fidl_internal::Protocol::Wpa3Personal,
+                                            credentials: Some(Box::new(
+                                                fidl_internal::Credentials::Wpa(
+                                                    fidl_internal::WpaCredentials::Passphrase(
+                                                        passphrase,
+                                                    ),
+                                                ),
+                                            )),
+                                        },
+                                        deprecated_scan_type: fidl_common::ScanType::Passive,
+                                    };
+                                    let mut sme_config = wlan_sme::client::ClientConfig::default();
+                                    sme_config.wpa3_supported = true;
+                                    let mut runtime =
+                                        futures::executor::block_on(PinnedClientRuntime::new(
+                                            device,
+                                            runner,
+                                            sme_config,
+                                            device_info,
+                                            security_support,
+                                            spectrum_support,
+                                            fuchsia_inspect::Inspector::default(),
+                                        ))
+                                        .map_err(|_| "construct pinned SME/MLME runtime failed")?;
+                                    let deadline =
+                                        Instant::now() + std::time::Duration::from_secs(25);
+                                    futures::executor::block_on(runtime.connect(request, deadline))
+                                        .map_err(|error| {
+                                            format!("pinned SME/MLME connect failed: {error:?}")
+                                        })?;
+                                    record_sae_stage(
+                                        "pinned_sme_connected association=true key_install=true controlled_port=true",
+                                    );
+                                    let mut proof = BoundedNetstackProof::new(
+                                        ethernet_device,
+                                        ethernet_tx,
+                                        NetstackProofConfig {
+                                            dns_name: "example.com.".into(),
+                                            server_port: NonZeroU16::new(80).unwrap(),
+                                            http_request: b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+                                                .to_vec(),
+                                            expected_response_prefix: b"HTTP/1.".to_vec(),
+                                        },
                                     )
-                                    .map_err(|_| {
-                                        "initialize pinned SAE supplicant failed".to_string()
-                                    })?;
-                                    credential.0.fill(0);
-                                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-                                    let mut updates = handshake.start().map_err(|_| {
-                                        "start pinned SAE supplicant failed".to_string()
-                                    })?;
-                                    let peer = power_target.as_ref().unwrap().0;
-                                    let auth_deadline =
-                                        Instant::now() + std::time::Duration::from_secs(5);
-                                    let mut sequence_control = 0u16;
-                                    loop {
-                                        if updates.iter().any(|update| {
-                                            matches!(update, SaeHandshakeUpdate::Rejected)
-                                        }) {
-                                            return Err(
-                                                "pinned SAE supplicant rejected peer exchange"
-                                                    .into(),
-                                            );
-                                        }
-                                        if updates.iter().any(|update| {
-                                            matches!(update, SaeHandshakeUpdate::Authenticated)
-                                        }) {
-                                            record_sae_stage(
-                                                "sae_authenticated pmk_derived=true pmkid_state=not_exported association=false key_install=false data=false",
-                                            );
-                                            return Ok(());
-                                        }
-                                        let frames = updates
-                                            .into_iter()
-                                            .filter_map(|update| match update {
-                                                SaeHandshakeUpdate::TxFrame(frame) => Some(frame),
-                                                _ => None,
-                                            })
-                                            .collect::<Vec<_>>();
-                                        if frames.len() != 1 {
-                                            return Err(
-                                                "pinned SAE step did not produce exactly one frame"
-                                                    .into(),
-                                            );
-                                        }
-                                        let sae_sequence = frames[0].seq_num;
-                                        let frame = build_sae_auth_frame(
-                                            client.into(),
-                                            peer.into(),
-                                            sequence_control,
-                                            &frames[0],
-                                        )
-                                        .map_err(|_| {
-                                            "build pinned SAE authentication frame failed"
-                                                .to_string()
-                                        })?;
-                                        if sae_sequence == 1 {
-                                            record_sae_commit_structure(&frame)?;
-                                        }
-                                        sequence_control = sequence_control.wrapping_add(0x10);
-                                        DeviceOps::send_wlan_frame(
-                                            &mut device,
-                                            frame.into(),
-                                            fidl_softmac::WlanTxInfoFlags::empty(),
-                                            None,
-                                        )
-                                        .map_err(
-                                            |status| format!("DeviceOps SAE TX rejected: {status}"),
-                                        )?;
-                                        let frame =
-                                            shared.lock().unwrap().take_sae_for_publish()?;
-                                        runner.with_physical(|adapter| {
-                                            adapter.with_transport_mut(|transport| {
-                                                let mechanics = transport.mechanics_mut();
-                                                println!(r#"{{"sae_auth_event":"spike_only_not_production_safe","failure_recovery":"reboot_required"}}"#);
-                                                mechanics.transmit_owned_client_frame(&frame)
-                                            })
-                                        })?;
-                                        record_sae_stage(match sae_sequence {
-                                            1 => "sae_commit_tx_acked",
-                                            2 => "sae_confirm_tx_acked",
-                                            _ => "sae_protocol_tx_acked",
-                                        });
-                                        let received = runner.with_physical(|adapter| {
-                                            adapter.with_transport_mut(|transport| {
-                                                transport.mechanics_mut().receive_one_sae_auth(
-                                                    client,
-                                                    peer,
-                                                    auth_deadline,
-                                                )
-                                            })
-                                        })?;
-                                        record_sae_stage(match received.sequence {
-                                            1 => "sae_peer_commit_rx",
-                                            2 => "sae_peer_confirm_rx",
-                                            _ => "sae_peer_protocol_rx",
-                                        });
-                                        updates = handshake
-                                            .on_frame_rx(
-                                                received.receiver.into(),
-                                                received.transmitter.into(),
-                                                received.bssid.into(),
-                                                received.algorithm,
-                                                received.sequence,
-                                                received.status,
-                                                received.fields,
-                                            )
-                                            .map_err(|_| {
-                                                "pinned SAE supplicant rejected received frame"
-                                                    .to_string()
-                                            })?;
-                                        if Instant::now() >= auth_deadline {
-                                            return Err(
-                                                "bounded SAE authentication timed out".into()
-                                            );
-                                        }
-                                    }
+                                    .map_err(|error| format!("construct Netstack proof: {error}"))?;
+                                    let mut pump = runtime.associated_data_pump();
+                                    proof
+                                        .prove_dhcp(&mut pump, deadline)
+                                        .map_err(|error| format!("DHCP proof failed: {error}"))?;
+                                    record_sae_stage("internet_proof_dhcp=true");
+                                    proof
+                                        .prove_dns(&mut pump, deadline)
+                                        .map_err(|error| format!("DNS proof failed: {error}"))?;
+                                    record_sae_stage("internet_proof_dns=true");
+                                    proof
+                                        .prove_tcp(&mut pump, deadline)
+                                        .map_err(|error| format!("TCP proof failed: {error}"))?;
+                                    record_sae_stage("internet_proof_tcp=true");
+                                    proof
+                                        .prove_http(&mut pump, deadline)
+                                        .map_err(|error| format!("HTTP proof failed: {error}"))?;
+                                    record_sae_stage("internet_proof_http=true");
+                                    return Ok(());
                                 }
                                 let transport = adapter.into_transport();
                                 let mut mechanics = transport.into_mechanics();
@@ -6272,15 +6237,8 @@ fn encode_client_management_tx(
     // Management subtypes differ only in TXD2's frame-subtype nibble.
     let mut auth_shape = frame.to_vec();
     auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
-    let mut encoded = encode_mt7921_5ghz_auth_tx(
-        &auth_shape,
-        txwi_iova,
-        frame_iova,
-        0,
-        3,
-        19,
-    )
-    .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
+    let mut encoded = encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, 0, 3, 19)
+        .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
     let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
     txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
     encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
@@ -8261,12 +8219,6 @@ fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-struct PendingSaeTx {
-    generation: u64,
-    bytes: Vec<u8>,
-}
-
-#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct LiveClientState {
     scan_seen: bool,
@@ -8276,7 +8228,6 @@ struct LiveClientState {
     authorized_channel: Option<ChannelNumber>,
     next_sae_generation: u64,
     sae_generation: Option<u64>,
-    frame: Option<PendingSaeTx>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8290,19 +8241,6 @@ impl LiveClientState {
         self.authorized_channel = Some(channel);
         self.sae_generation = Some(self.next_sae_generation);
         Ok(self.next_sae_generation)
-    }
-
-    fn take_sae_for_publish(&mut self) -> Result<Vec<u8>, String> {
-        let pending = self
-            .frame
-            .take()
-            .ok_or("SAE publisher had no pending frame")?;
-        if self.sae_generation != Some(pending.generation)
-            || self.authorized_channel != self.tuned_channel
-        {
-            return Err("SAE authorization generation was revoked before publication".into());
-        }
-        Ok(pending.bytes)
     }
 }
 
@@ -8322,7 +8260,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
         state.scan_authorized = false;
         state.authorized_channel = None;
         state.sae_generation = None;
-        state.frame = None;
     }
     fn revoke_lifecycle(&mut self) {
         *self.state.lock().unwrap() = LiveClientState::default();
@@ -8340,7 +8277,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if state.tuned_channel != Some(primary) {
             state.authorized_channel = None;
             state.sae_generation = None;
-            state.frame = None;
         }
         state.tuned_channel = Some(primary);
         Ok(())
@@ -8354,8 +8290,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
         flags: fidl_softmac::WlanTxInfoFlags,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
-        let sae = bytes.get(..2) == Some(&[0xb0, 0]);
-        let mut state = self.state.lock().unwrap();
+        let control = bytes
+            .get(..2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        let management = control & 0x000c == 0;
+        let sae = control & 0x00fc == 0x00b0;
+        let state = self.state.lock().unwrap();
         if !state.scan_authorized
             || !state.power_rate_authorized
             || state.sae_generation.is_none()
@@ -8366,22 +8307,33 @@ impl Mt7921ClientEffects for LiveClientEffects {
         {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        if sae {
-            if state.frame.is_some()
-                || bytes.get(24..26) != Some(&[3, 0])
+        if management {
+            if (sae && bytes.get(24..26) != Some(&[3, 0]))
                 || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
             {
                 return Err(zx::Status::ACCESS_DENIED);
             }
-            state.frame = Some(PendingSaeTx {
-                generation: state.sae_generation.expect("checked generation"),
-                bytes: bytes.to_vec(),
-            });
+            if sae && bytes.get(26..28) == Some(&[1, 0]) {
+                record_sae_commit_structure(bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            }
+            drop(state);
+            io.transmit_client(bytes, flags)?;
+            if sae {
+                record_sae_stage(match bytes.get(26..28) {
+                    Some([1, 0]) => "sae_commit_tx_acked",
+                    Some([2, 0]) => "sae_confirm_tx_acked",
+                    _ => "sae_protocol_tx_acked",
+                });
+            }
             return Ok(());
         }
         drop(state);
-        let eapol = bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        self.firmware.tx_generation(eapol).map_err(|_| zx::Status::ACCESS_DENIED)?;
+        let eapol = bytes
+            .windows(8)
+            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        self.firmware
+            .tx_generation(eapol)
+            .map_err(|_| zx::Status::ACCESS_DENIED)?;
         if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::ACCESS_DENIED);
         }
@@ -8403,7 +8355,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .as_deref()
             .ok_or(zx::Status::INVALID_ARGS)?;
         let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
-        let result = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
+        let key_type = configuration.key_type.ok_or(zx::Status::INVALID_ARGS)?;
+        let result = match key_type {
             fidl_ieee80211::KeyType::Pairwise
                 if configuration.peer_addr == Some(association.peer)
                     && key_id == 0
@@ -8411,7 +8364,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             {
                 self.firmware
                     .install_ptk(key, configuration.rsc.unwrap_or(0), |command| {
-                        io.submit_uni(3, command).map_err(|status| status.to_string())
+                        io.submit_uni(3, command)
+                            .map_err(|status| status.to_string())
                     })
             }
             fidl_ieee80211::KeyType::Group
@@ -8421,7 +8375,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             {
                 self.firmware
                     .install_gtk(key_id, key, configuration.rsc.unwrap_or(0), |command| {
-                        io.submit_uni(3, command).map_err(|status| status.to_string())
+                        io.submit_uni(3, command)
+                            .map_err(|status| status.to_string())
                     })
             }
             fidl_ieee80211::KeyType::Igtk
@@ -8429,12 +8384,21 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && (4..=5).contains(&key_id)
                     && configuration.cipher_type == Some(6) =>
             {
-                self.firmware
-                    .install_igtk(key_id, key, |command| io.submit_uni(3, command).map_err(|status| status.to_string()))
+                self.firmware.install_igtk(key_id, key, |command| {
+                    io.submit_uni(3, command)
+                        .map_err(|status| status.to_string())
+                })
             }
             _ => return Err(zx::Status::INVALID_ARGS),
         };
-        result.map_err(|_| zx::Status::IO)
+        result.map_err(|_| zx::Status::IO)?;
+        record_sae_stage(match key_type {
+            fidl_ieee80211::KeyType::Pairwise => "traffic_key_ptk_installed=true",
+            fidl_ieee80211::KeyType::Group => "traffic_key_gtk_installed=true",
+            fidl_ieee80211::KeyType::Igtk => "traffic_key_igtk_installed=true",
+            _ => "traffic_key_installed=true",
+        });
+        Ok(())
     }
     fn notify_association_complete(
         &mut self,
@@ -8463,9 +8427,14 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     // cannot become a mandatory readiness predicate here.
                     mfp_required: false,
                 },
-                |command| io.submit_uni(3, command).map_err(|status| status.to_string()),
+                |command| {
+                    io.submit_uni(3, command)
+                        .map_err(|status| status.to_string())
+                },
             )
-            .map_err(|_| zx::Status::IO)
+            .map_err(|_| zx::Status::IO)?;
+        record_sae_stage("association_firmware_configured=true");
+        Ok(())
     }
     fn clear_association(
         &mut self,
@@ -8477,38 +8446,88 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Err(zx::Status::INVALID_ARGS);
         }
         self.firmware
-            .teardown(|command| io.submit_uni(3, command).map_err(|status| status.to_string()))
+            .teardown(|command| {
+                io.submit_uni(3, command)
+                    .map_err(|status| status.to_string())
+            })
             .map_err(|_| zx::Status::IO)
     }
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
         self.firmware
             .set_controlled_port(up)
-            .map_err(|_| zx::Status::BAD_STATE)
+            .map_err(|_| zx::Status::BAD_STATE)?;
+        record_sae_stage(if up {
+            "controlled_port_open=true"
+        } else {
+            "controlled_port_open=false"
+        });
+        Ok(())
     }
-    fn next_rx(&mut self, io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo) -> Result<Option<ClientRxFrame>, zx::Status> {
-        let Some(frame) = io.next_client_rx()? else { return Ok(None) };
-        let control = frame.bytes.get(..2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+    fn next_rx(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<Option<ClientRxFrame>, zx::Status> {
+        let Some(frame) = io.next_client_rx()? else {
+            return Ok(None);
+        };
+        let control = frame
+            .bytes
+            .get(..2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
         if control & 0x000c == 0x0008 {
-            let eapol = frame.bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-            let generation = self.firmware.tx_generation(eapol).map_err(|_| zx::Status::ACCESS_DENIED)?;
+            let eapol = frame
+                .bytes
+                .windows(8)
+                .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            let generation = self
+                .firmware
+                .tx_generation(eapol)
+                .map_err(|_| zx::Status::ACCESS_DENIED)?;
             let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-            self.firmware.deliver_rx(ClientRxCandidate {
-                generation,
-                eapol,
-                wcid: security.wcid.try_into().map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
-                tid: security.tid,
-                group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
-                key_id: security.key_id,
-                security_mode: security.security_mode,
-                cm: security.cm,
-                clm: security.clm,
-                icv_error: security.icv_error,
-                mic_error: security.mic_error,
-                fcs_error: security.fcs_error,
-                pn: security.pn.unwrap_or([0; 6]),
-            }).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            self.firmware
+                .deliver_rx(ClientRxCandidate {
+                    generation,
+                    eapol,
+                    wcid: security
+                        .wcid
+                        .try_into()
+                        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
+                    tid: security.tid,
+                    group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
+                    key_id: security.key_id,
+                    security_mode: security.security_mode,
+                    cm: security.cm,
+                    clm: security.clm,
+                    icv_error: security.icv_error,
+                    mic_error: security.mic_error,
+                    fcs_error: security.fcs_error,
+                    pn: security.pn.unwrap_or([0; 6]),
+                })
+                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         } else if control & 0x000c != 0 {
             return Err(zx::Status::IO_DATA_INTEGRITY);
+        } else if control & 0x00fc == 0x00b0
+            && frame.bytes.get(4..10) == Some(&self.client)
+            && frame.bytes.get(10..16) == Some(&self.target)
+            && frame.bytes.get(16..22) == Some(&self.target)
+        {
+            let sequence = frame
+                .bytes
+                .get(26..28)
+                .map(|value| u16::from_le_bytes([value[0], value[1]]))
+                .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+            let status = frame
+                .bytes
+                .get(28..30)
+                .map(|value| u16::from_le_bytes([value[0], value[1]]))
+                .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+            record_sae_stage(match sequence {
+                1 => "sae_peer_commit_rx",
+                2 => "sae_peer_confirm_rx",
+                _ => "sae_peer_protocol_rx",
+            });
+            println!(r#"{{"sae_peer_status":{{"sequence":{sequence},"status":{status}}}}}"#);
         }
         Ok(Some(frame))
     }
@@ -8582,7 +8601,10 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
     fn transmit_owned_client_frame(&mut self, frame: &[u8]) -> Result<(), String> {
-        let mut ring = self.mgmt_tx_ring.take().ok_or("client TX ring arena missing")?;
+        let mut ring = self
+            .mgmt_tx_ring
+            .take()
+            .ok_or("client TX ring arena missing")?;
         let mut txwi = self.mgmt_txwi.take().ok_or("client TXWI arena missing")?;
         let mut payload = self.mgmt_frame.take().ok_or("client frame arena missing")?;
         let result = self.transmit_one_sae_auth(&mut ring, &mut txwi, &mut payload, frame);
@@ -8667,9 +8689,9 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 let encoded = encode_client_management_tx(frame, txwi.iova, frame_arena.iova)?;
                 (encoded.txwi.to_vec(), encoded.descriptor)
             } else if control & 0x000c == 0x0008 {
-                let eapol = frame.windows(8).any(|window| {
-                    window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
-                });
+                let eapol = frame
+                    .windows(8)
+                    .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
                 let encoded = encode_client_data_txwi(
                     frame.len(),
                     frame_arena.iova,
@@ -8679,7 +8701,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     control & 0x4000 != 0,
                 )?;
                 let descriptor = DmaDescriptor::tx(
-                    DmaSegment { iova: txwi.iova, len: encoded.len() as u16 },
+                    DmaSegment {
+                        iova: txwi.iova,
+                        len: encoded.len() as u16,
+                    },
                     None,
                     0,
                 )
@@ -8839,11 +8864,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::INVALID_ARGS);
         }
-        self.transmit_owned_client_frame(bytes).map_err(|_| zx::Status::IO)
+        self.transmit_owned_client_frame(bytes)
+            .map_err(|_| zx::Status::IO)
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-        self.loader.mcu.handle_irq(None).map_err(|_| zx::Status::IO)?;
+        self.loader
+            .mcu
+            .handle_irq(None)
+            .map_err(|_| zx::Status::IO)?;
         drain_data_rx_queue(
             self.loader.mcu.wfdma,
             &mut self.data,
@@ -8872,13 +8901,21 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             mic_error: rxd1 & (1 << 26) != 0,
             fcs_error: rxd1 & (1 << 27) != 0,
             pn: if rxd1 & (1 << 11) != 0 {
-                Some(connac2_group1_pn(frame.bytes.get(24..40).ok_or(zx::Status::IO_DATA_INTEGRITY)?)
-                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?)
+                Some(
+                    connac2_group1_pn(
+                        frame
+                            .bytes
+                            .get(24..40)
+                            .ok_or(zx::Status::IO_DATA_INTEGRITY)?,
+                    )
+                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
+                )
             } else {
                 None
             },
         };
-        let parsed = parse_connac2_rx_frame(&frame.bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        let parsed =
+            parse_connac2_rx_frame(&frame.bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         let primary = ChannelNumber {
             band: match parsed.band {
                 mt7921_port_spike::PhysicalBand::Ghz2 => WlanBand::TwoGhz,
@@ -8896,7 +8933,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 data_rate: 0,
                 primary,
                 bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
-                vht_secondary_80_channel: ChannelNumber { number: 0, ..primary },
+                vht_secondary_80_channel: ChannelNumber {
+                    number: 0,
+                    ..primary
+                },
                 mcs: 0,
                 rssi_dbm: parsed.rssi_dbm,
                 snr_dbh: 0,
@@ -10738,11 +10778,17 @@ mod tests {
             self.uni.push(bytes.to_vec());
             Ok(())
         }
-        fn transmit_client(&mut self, bytes: &[u8], _: fidl_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+        fn transmit_client(
+            &mut self,
+            bytes: &[u8],
+            _: fidl_softmac::WlanTxInfoFlags,
+        ) -> Result<(), zx::Status> {
             self.tx.push(bytes.to_vec());
             Ok(())
         }
-        fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> { Ok(None) }
+        fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+            Ok(None)
+        }
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -10758,6 +10804,27 @@ mod tests {
         // The peer deliberately remains open: returning proves there was no
         // read-to-EOF dependency. Remaining bytes are discarded on close.
         drop(writer);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn live_support_satisfies_pinned_device_info_contract() {
+        let support = live_client_support(fidl_softmac::WlanSoftmacQueryResponse {
+            sta_addr: Some([2, 3, 4, 5, 6, 7]),
+            band_caps: Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                primary_channels: Some(vec![ChannelNumber {
+                    band: WlanBand::FiveGhz,
+                    number: 36,
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let info = wlan_mlme::mlme_device_info_from_softmac(support.query).unwrap();
+        assert_eq!(info.role, fidl_common::WlanMacRole::Client);
+        assert_eq!(info.bands.len(), 1);
+        assert!(!info.bands[0].basic_rates.is_empty());
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -11073,8 +11140,14 @@ mod tests {
         let mut association = vec![0u8; 30];
         association[0..2].copy_from_slice(&0x0000u16.to_le_bytes());
         let encoded = encode_client_management_tx(&association, 0x1000, 0x2000).unwrap();
-        assert_eq!(u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap()) & 0xf, 0);
-        assert_eq!(u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()), 0x801e);
+        assert_eq!(
+            u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap()) & 0xf,
+            0
+        );
+        assert_eq!(
+            u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()),
+            0x801e
+        );
         association[0..2].copy_from_slice(&0x0008u16.to_le_bytes());
         assert!(encode_client_management_tx(&association, 0x1000, 0x2000).is_err());
         assert!(encode_client_management_tx(&association[..20], 0x1000, 0x2000).is_err());
@@ -11098,7 +11171,9 @@ mod tests {
             qos: Some(true),
             ..Default::default()
         };
-        effects.notify_association_complete(&association, &mut io).unwrap();
+        effects
+            .notify_association_complete(&association, &mut io)
+            .unwrap();
         assert_eq!(io.uni.len(), 1);
         assert!(!effects.firmware.controlled_port_open);
 
@@ -11114,18 +11189,27 @@ mod tests {
                 rsc: Some(0),
             };
         effects
-            .install_key(&key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11), &mut io)
+            .install_key(
+                &key(fidl_ieee80211::KeyType::Pairwise, peer, 0, 4, 0x11),
+                &mut io,
+            )
             .unwrap();
         assert_eq!(effects.set_link_up(true), Err(zx::Status::BAD_STATE));
         effects
-            .install_key(&key(fidl_ieee80211::KeyType::Group, [0xff; 6], 2, 4, 0x22), &mut io)
+            .install_key(
+                &key(fidl_ieee80211::KeyType::Group, [0xff; 6], 2, 4, 0x22),
+                &mut io,
+            )
             .unwrap();
         effects.set_link_up(true).unwrap();
         assert!(effects.firmware.controlled_port_open);
         effects
-            .clear_association(&fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
-                peer_addr: Some(peer),
-            }, &mut io)
+            .clear_association(
+                &fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
+                    peer_addr: Some(peer),
+                },
+                &mut io,
+            )
             .unwrap();
         assert_eq!(io.uni.len(), 6);
         assert!(effects.firmware.association.is_none());
@@ -11138,7 +11222,13 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
         };
         assert_eq!(
-            { let mut failed = TestClientIo { fail_uni: true, ..Default::default() }; physically_unbound.notify_association_complete(&association, &mut failed) },
+            {
+                let mut failed = TestClientIo {
+                    fail_uni: true,
+                    ..Default::default()
+                };
+                physically_unbound.notify_association_complete(&association, &mut failed)
+            },
             Err(zx::Status::IO)
         );
         assert!(physically_unbound.firmware.association.is_none());
@@ -11146,7 +11236,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn live_client_pre_port_sae_generation_reaches_management_publisher_only_when_current() {
+    fn live_client_pre_port_sae_generation_reaches_physical_io_only_when_current() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let client = [6, 5, 4, 3, 2, 1];
         let channel = ChannelNumber {
@@ -11201,32 +11291,29 @@ mod tests {
         let mut open_system = frame(1);
         open_system[24..26].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(
-            effects.send_wlan_frame(&open_system, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
+            effects.send_wlan_frame(
+                &open_system,
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                &mut io
+            ),
             Err(zx::Status::ACCESS_DENIED)
         );
 
         effects
-            .send_wlan_frame(&frame(1), fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
+        assert_eq!(io.tx, vec![frame(2)]);
         effects.revoke_scan();
-        assert!(shared.lock().unwrap().take_sae_for_publish().is_err());
+        assert_eq!(
+            effects.send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty(), &mut io,),
+            Err(zx::Status::ACCESS_DENIED)
+        );
 
         shared.lock().unwrap().authorize_sae(channel).unwrap();
         effects
             .send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
-        let publish = |bytes: &[u8]| {
-            encode_mt7921_5ghz_auth_tx(bytes, 0x1000, 0x2000, 0, 3, 19)
-                .map_err(|error| format!("management publisher rejected frame: {error:?}"))
-        };
-        let bytes = shared.lock().unwrap().take_sae_for_publish().unwrap();
-        let descriptor = publish(&bytes).unwrap();
-        assert_eq!(descriptor.pid, 3);
-        assert_eq!(descriptor.token, 0);
-        assert_eq!(
-            u32::from_le_bytes(descriptor.txwi[0..4].try_into().unwrap()) & 0xffff,
-            62
-        );
+        assert_eq!(io.tx, vec![frame(2), frame(2)]);
         assert!(!effects.firmware.controlled_port_open);
         assert!(effects.firmware.association.is_none());
     }
@@ -12043,38 +12130,42 @@ mod tests {
     }
 
     #[test]
-    fn bounded_sae_exchange_reuses_pinned_state_and_stops_before_association() {
+    fn live_wpa3_path_uses_one_pinned_owner_through_http() {
         let source = include_str!("vfio_read.rs");
         let exchange = source
             .split("if operation == Operation::RunOneShotSaeAuth {")
-            .find(|segment| segment.contains("SaeHandshake::new"))
+            .find(|segment| segment.contains("PinnedClientRuntime::new"))
             .unwrap()
             .split("let transport = adapter.into_transport();")
             .next()
             .unwrap();
         for required in [
-            "SaeHandshake::new",
-            "find_ie(&bss.ies, 244)",
-            "credential.0.fill(0)",
-            ".start()",
-            "transmit_one_sae_auth",
-            "receive_one_sae_auth",
-            ".on_frame_rx",
-            "sae_commit_tx_acked",
-            "sae_peer_commit_rx",
-            "sae_confirm_tx_acked",
-            "sae_peer_confirm_rx",
-            "pmk_derived=true",
-            "association=false",
-            "key_install=false",
-            "data=false",
+            "Mt7921ClientDevice::new_with_ethernet",
+            "fidl_internal::Protocol::Wpa3Personal",
+            ".into_passphrase()",
+            "PinnedClientRuntime::new",
+            "runtime.connect(request, deadline)",
+            "runtime.associated_data_pump()",
+            ".prove_dhcp(&mut pump, deadline)",
+            ".prove_dns(&mut pump, deadline)",
+            ".prove_tcp(&mut pump, deadline)",
+            ".prove_http(&mut pump, deadline)",
         ] {
             assert!(exchange.contains(required), "{required}");
         }
-        assert!(exchange.contains("Duration::from_secs(5)"));
-        assert!(!exchange.contains("install_key("));
-        assert!(!exchange.contains("notify_association_complete("));
-        assert!(!exchange.contains("set_link_up("));
+        let connect = exchange.find("runtime.connect(request, deadline)").unwrap();
+        let dhcp = exchange.find(".prove_dhcp(&mut pump, deadline)").unwrap();
+        let dns = exchange.find(".prove_dns(&mut pump, deadline)").unwrap();
+        let tcp = exchange.find(".prove_tcp(&mut pump, deadline)").unwrap();
+        let http = exchange.find(".prove_http(&mut pump, deadline)").unwrap();
+        assert!(connect < dhcp && dhcp < dns && dns < tcp && tcp < http);
+        for forbidden in [
+            "SaeHandshake::new",
+            "receive_one_sae_auth(",
+            "association=false",
+        ] {
+            assert!(!exchange.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]
@@ -12212,7 +12303,7 @@ mod tests {
             "decompress_ram()",
             "load_mt7921_firmware_with_passive_boundary",
             "Operation::RunOneShotSaeAuth",
-            "SaeHandshake::new",
+            "PinnedClientRuntime::new",
         ] {
             assert!(consolidated.contains(required), "{required}");
         }
@@ -12282,16 +12373,17 @@ mod tests {
 
         let sae = source
             .split("if operation == Operation::RunOneShotSaeAuth {")
-            .find(|segment| segment.contains("SaeHandshake::new"))
+            .find(|segment| segment.contains("PinnedClientRuntime::new"))
             .unwrap()
             .split("let transport = adapter.into_transport();")
             .next()
             .unwrap();
         let power = sae.find("program_live_rate_power").unwrap();
         let acquire = sae.find("acquire_sae_tx_resources").unwrap();
-        let handshake = sae.find("SaeHandshake::new").unwrap();
-        let transmit = sae.find("transmit_one_sae_auth").unwrap();
-        assert!(power < acquire && acquire < handshake && handshake < transmit);
+        let runtime = sae.find("PinnedClientRuntime::new").unwrap();
+        let connect = sae.find("runtime.connect(request, deadline)").unwrap();
+        assert!(power < acquire && acquire < runtime && runtime < connect);
+        assert!(!sae.contains("transmit_one_sae_auth"));
 
         let cleanup = source
             .split("ledger.phase = RunPhase::Containing;")
