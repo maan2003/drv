@@ -60,8 +60,8 @@ use mt7921_port_spike::{
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary,
-    normalize_infrastructure_aid, parse_connac2_rx_frame, parse_passive_advertisement,
-    parse_passive_scan_done, parse_pse_reg_read_response, passive_mac_bar_offset,
+    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
+    parse_pse_reg_read_response, passive_mac_bar_offset,
     passive_mac_mmio_plan, passive_mac_source_rmw_value, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
@@ -9599,15 +9599,30 @@ impl Mt7921ClientEffects for LiveClientEffects {
         configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
-        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
-        let raw_aid = configuration
-            .aid
-            .filter(|aid| *aid != 0)
-            .ok_or(zx::Status::INVALID_ARGS)?;
-        let aid = normalize_infrastructure_aid(raw_aid).map_err(|_| zx::Status::INVALID_ARGS)?;
+        let Some(peer) = configuration.bssid else {
+            record_sae_stage("association_config_validation result=invalid clause=missing_bssid");
+            return Err(zx::Status::INVALID_ARGS);
+        };
+        let Some(aid) = configuration.aid else {
+            record_sae_stage("association_config_validation result=invalid clause=missing_aid");
+            return Err(zx::Status::INVALID_ARGS);
+        };
+        // Client MLME masks the five reserved on-wire AID bits before this
+        // FIDL boundary. Requiring their raw 0xc000 form here rejects every
+        // successful infrastructure association before firmware activation.
+        if !(1..=2007).contains(&aid) {
+            record_sae_stage(&format!(
+                "association_config_validation result=invalid clause=normalized_aid_range aid={aid}"
+            ));
+            return Err(zx::Status::INVALID_ARGS);
+        }
         if peer != self.target {
+            record_sae_stage("association_config_validation result=denied clause=foreign_bssid");
             return Err(zx::Status::ACCESS_DENIED);
         }
+        record_sae_stage(&format!(
+            "association_config_validation result=pass bssid_match=true normalized_aid={aid} keys=false port_open=false protected_management=closed"
+        ));
         let channel = self
             .state
             .lock()
@@ -9642,7 +9657,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .expect("successful association publishes its generation");
         self.post_association_data_wait = Some(Instant::now());
         record_sae_stage(&format!(
-            "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc raw_aid={raw_aid} normalized_aid={aid} peer_identity=true keys=false port_open=false"
+            "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc normalized_aid={aid} peer_identity=true keys=false port_open=false protected_management=closed"
         ));
         record_sae_stage(&format!(
             "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid=7 wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true"
@@ -13159,7 +13174,8 @@ mod tests {
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
-            aid: Some(0xc004),
+            // MLME has already removed the reserved on-wire AID bits.
+            aid: Some(4),
             qos: Some(true),
             ..Default::default()
         };
@@ -13282,12 +13298,12 @@ mod tests {
             association_response
         );
         assert!(effects.firmware.association.is_none());
-        for raw_aid in [0xc000, 0xc7d8, 4] {
+        for invalid_aid in [0, 2008, 0xc004] {
             assert_eq!(
                 effects.notify_association_complete(
                     &fidl_softmac::WlanAssociationConfig {
                         bssid: Some(peer),
-                        aid: Some(raw_aid),
+                        aid: Some(invalid_aid),
                         qos: Some(true),
                         ..Default::default()
                     },
@@ -13312,6 +13328,21 @@ mod tests {
         );
         assert_eq!(effects.firmware.association.unwrap().aid, 4);
         assert!(!effects.firmware.controlled_port_open);
+        assert!(!effects.firmware.ptk_installed);
+        assert!(effects.firmware.ptk_rx_pn.is_none());
+        let mut protected_disassociation = vec![0x5a; 42];
+        protected_disassociation[0..2].copy_from_slice(&0x40a0u16.to_le_bytes());
+        protected_disassociation[2..4].fill(0);
+        protected_disassociation[4..10].copy_from_slice(&effects.client);
+        protected_disassociation[10..16].copy_from_slice(&peer);
+        protected_disassociation[16..22].copy_from_slice(&peer);
+        protected_disassociation[22..24].fill(0);
+        io.rx.push_back(ClientRxFrame {
+            bytes: protected_disassociation.clone(),
+            status: rx_status.clone(),
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
         let peer_security = ClientRxSecurity {
             wcid: 7,
             tid: 0,
@@ -13356,7 +13387,7 @@ mod tests {
         };
         io.rx.push_back(ClientRxFrame {
             bytes: sentinel_data,
-            status: rx_status,
+            status: rx_status.clone(),
             security: Some(sentinel_security),
         });
         assert!(effects.next_rx(&mut io).unwrap().is_none());
@@ -13387,6 +13418,23 @@ mod tests {
                 &mut io,
             )
             .unwrap();
+        effects.firmware.association.as_mut().unwrap().mfp_required = true;
+        protected_disassociation[32..34].copy_from_slice(&9u16.to_le_bytes());
+        io.rx.push_back(ClientRxFrame {
+            bytes: protected_disassociation,
+            status: rx_status.clone(),
+            security: Some(ClientRxSecurity {
+                security_mode: 4,
+                pn: Some([0, 0, 0, 0, 0, 1]),
+                ..peer_security
+            }),
+        });
+        let admitted = effects.next_rx(&mut io).unwrap().unwrap();
+        assert_eq!(admitted.bytes.len(), 26);
+        assert_eq!(&admitted.bytes[24..26], &9u16.to_le_bytes());
+        // This association fixture does not negotiate MFP through FIDL; the
+        // mutation above solely exercises the verified post-key RX branch.
+        effects.firmware.association.as_mut().unwrap().mfp_required = false;
         assert_eq!(effects.set_link_up(true), Err(zx::Status::BAD_STATE));
         effects
             .install_key(
