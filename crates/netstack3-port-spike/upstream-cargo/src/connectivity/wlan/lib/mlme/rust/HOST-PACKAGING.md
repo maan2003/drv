@@ -12,6 +12,10 @@ of the shared pinned-source workspace.
 It makes no SAE, association, RSN, EAPOL, key, timeout, cancellation, frame
 parse/build, Minstrel, `MlmeImpl`, `ClientMlme`, or client-state change.
 
+`wlan-mlme-sae-disposition-host.patch` is applied last and adds only opt-in,
+privacy-safe host receive-disposition telemetry. It does not alter MLME state
+or frame handling.
+
 | Patch hunk | Host rationale |
 | --- | --- |
 | `lib.rs`: gate `ap` | AP runtime is unrelated to the client gate and retains Fuchsia endpoint dependencies. |

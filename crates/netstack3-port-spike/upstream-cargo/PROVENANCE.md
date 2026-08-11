@@ -99,3 +99,10 @@ client dependency closure without modifying the materialized source.
 `HOST-PACKAGING.md` records every post-fetch host-selection hunk and its
 rationale. Host allocation and monotonic-time facades are separately licensed;
 protocol and client state remain pinned Fuchsia source.
+
+`wlan-mlme-sae-disposition-host.patch` adds opt-in host diagnostics at the
+pinned client receive gates. `DRV_SAE_DISPOSITION_TELEMETRY` enables only
+coarse state/disposition, numeric channel, fixed Authentication header, and
+public SAE group fields. It changes no control flow and never emits frame
+bodies, addresses, IEs, credentials, key material, packet numbers, scalars, or
+elements.
