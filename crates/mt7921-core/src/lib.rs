@@ -5619,6 +5619,8 @@ pub fn encode_client_management_tx(
     frame: &[u8],
     txwi_iova: u64,
     frame_iova: u64,
+    token: u16,
+    pid: u8,
 ) -> Result<Mt7921MgmtTx, String> {
     let control = frame
         .get(..2)
@@ -5631,8 +5633,9 @@ pub fn encode_client_management_tx(
     // Management subtypes differ only in TXD2's frame-subtype nibble.
     let mut auth_shape = frame.to_vec();
     auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
-    let mut encoded = encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, 0, 3, 19)
-        .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
+    let mut encoded =
+        encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, token, pid, 19)
+            .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
     let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
     txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
     encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());

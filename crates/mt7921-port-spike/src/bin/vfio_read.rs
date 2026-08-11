@@ -1042,6 +1042,7 @@ fn run_contained_dma_resource_round_trip(
                             pending_scan_done: None,
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
+                            mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -3177,6 +3178,7 @@ fn run() -> Result<(), String> {
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
+                                mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -3247,6 +3249,7 @@ fn run() -> Result<(), String> {
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
+                                mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -7654,21 +7657,31 @@ enum MgmtTxCompletion {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-#[derive(Default)]
 struct MgmtTxCompletionState {
+    token: u16,
+    pid: u8,
     free: Option<Mt7921TxFree>,
     status: Option<Mt7921TxStatus>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
 impl MgmtTxCompletionState {
+    fn new(token: u16, pid: u8) -> Self {
+        Self {
+            token,
+            pid,
+            free: None,
+            status: None,
+        }
+    }
+
     fn observe(&mut self, completion: MgmtTxCompletion) -> Result<(), String> {
         match completion {
-            MgmtTxCompletion::Free(value) if value.token == 0 && self.free.is_none() => {
+            MgmtTxCompletion::Free(value) if value.token == self.token && self.free.is_none() => {
                 self.free = Some(value)
             }
             MgmtTxCompletion::Status(value)
-                if value.pid == 3 && value.wcid == 19 && self.status.is_none() =>
+                if value.pid == self.pid && value.wcid == 19 && self.status.is_none() =>
             {
                 self.status = Some(value)
             }
@@ -7684,6 +7697,81 @@ impl MgmtTxCompletionState {
         } else {
             Err("SAE authentication MPDU was not acknowledged".into())
         })
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MgmtTxPublicationOutcome {
+    NotPublished,
+    Committed,
+    Completed,
+    AmbiguousOwnership,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct MgmtTxOutstanding {
+    next_token: u16,
+    next_pid: u8,
+    entries: Vec<MgmtTxCompletionState>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl MgmtTxOutstanding {
+    fn reserve(&mut self) -> Result<(u16, u8), String> {
+        if self.next_token >= 8192 {
+            return Err("management TX token space exhausted before teardown".into());
+        }
+        let token = self.next_token;
+        let pid = 3u8
+            .checked_add(self.next_pid)
+            .filter(|pid| *pid < 127)
+            .ok_or("management TX PID space exhausted before teardown")?;
+        self.next_token += 1;
+        self.next_pid += 1;
+        self.entries.push(MgmtTxCompletionState::new(token, pid));
+        Ok((token, pid))
+    }
+
+    fn abandon_last(&mut self, token: u16, pid: u8) {
+        if self
+            .entries
+            .last()
+            .is_some_and(|entry| entry.token == token && entry.pid == pid)
+        {
+            self.entries.pop();
+        }
+    }
+
+    fn observe(
+        &mut self,
+        completion: MgmtTxCompletion,
+    ) -> Result<Option<MgmtTxPublicationOutcome>, String> {
+        let entry = match completion {
+            MgmtTxCompletion::Free(value) => self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.token == value.token),
+            MgmtTxCompletion::Status(value) => {
+                self.entries.iter_mut().find(|entry| entry.pid == value.pid)
+            }
+        }
+        .ok_or("uncorrelated management TX completion")?;
+        entry.observe(completion)?;
+        let Some(result) = entry.finished() else {
+            return Ok(None);
+        };
+        result?;
+        let token = entry.token;
+        let pid = entry.pid;
+        self.entries
+            .retain(|entry| entry.token != token || entry.pid != pid);
+        Ok(Some(MgmtTxPublicationOutcome::Completed))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -8348,6 +8436,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
+    mgmt_tx_outstanding: MgmtTxOutstanding,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -8356,6 +8445,12 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
 #[cfg(feature = "fuchsia-passive")]
 impl Drop for VfioPassiveMechanics<'_, '_, '_> {
     fn drop(&mut self) {
+        if !self.mgmt_tx_outstanding.is_empty() {
+            self.loader.uni_terminal_poisoned = true;
+            record_sae_stage(
+                "management_tx_teardown outcome=contained outstanding_completion=true token_reuse=false",
+            );
+        }
         // The tracker is borrowed through `loader`; revoke it before this
         // owner's queued advertisement carriers are released.
         let _ = self
@@ -8368,6 +8463,19 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn retire_mgmt_tx_completions(&mut self) -> Result<(), String> {
+        self.tx_completions
+            .append(&mut self.loader.mcu.tx_completions);
+        for completion in self.tx_completions.drain(..) {
+            if self.mgmt_tx_outstanding.observe(completion)?
+                == Some(MgmtTxPublicationOutcome::Completed)
+            {
+                record_sae_stage("management_tx_completion outcome=completed");
+            }
+        }
+        Ok(())
+    }
+
     fn transmit_owned_client_frame(&mut self, frame: &[u8]) -> Result<(), String> {
         let mut ring = self
             .mgmt_tx_ring
@@ -8445,19 +8553,17 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         frame_arena: &mut DmaArena,
         frame: &[u8],
     ) -> Result<(), String> {
-        if !self.tx_completions.is_empty() || !self.loader.mcu.tx_completions.is_empty() {
-            return Err("management TX began with stale completion state".into());
-        }
+        self.retire_mgmt_tx_completions()?;
+        let (token, pid) = self.mgmt_tx_outstanding.reserve()?;
         if let Err(error) = self.configure_mgmt_tx_ring_for_submission(ring) {
+            self.mgmt_tx_outstanding.abandon_last(token, pid);
             self.loader.uni_terminal_poisoned = true;
             return Err(format!(
                 "REBOOT REQUIRED: management ring configuration failed; MCU TX blocked until universal containment: {error}"
             ));
         }
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
-        let mut completion_state = MgmtTxCompletionState::default();
-        let mut publication_may_have_happened = false;
-        let mut descriptor_consumed = false;
+        let mut outcome = MgmtTxPublicationOutcome::NotPublished;
         let result = (|| -> Result<(), String> {
             frame_arena.write_bytes(frame)?;
             let control = frame
@@ -8465,7 +8571,8 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
                 .ok_or("client TX omitted frame control")?;
             let (txwi_bytes, descriptor) = if control & 0x000c == 0 {
-                let encoded = encode_client_management_tx(frame, txwi.iova, frame_arena.iova)?;
+                let encoded =
+                    encode_client_management_tx(frame, txwi.iova, frame_arena.iova, token, pid)?;
                 (encoded.txwi.to_vec(), encoded.descriptor)
             } else if control & 0x000c == 0x0008 {
                 let eapol = frame
@@ -8474,8 +8581,8 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 let encoded = encode_client_data_txwi(
                     frame.len(),
                     frame_arena.iova,
-                    0,
-                    3,
+                    token,
+                    pid,
                     eapol,
                     control & 0x4000 != 0,
                 )?;
@@ -8495,16 +8602,18 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             txwi.write_bytes(&txwi_bytes)?;
             ring.write_descriptor_at(0, descriptor);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            // A failed doorbell write is ambiguous: record intent first and do
-            // not reclaim this slot unless DIDX and DMA_DONE later prove it.
-            publication_may_have_happened = true;
+            // A doorbell failure is ambiguous until DIDX and DMA_DONE jointly
+            // prove that the device consumed the complete TXWI/TXP envelope.
+            outcome = MgmtTxPublicationOutcome::AmbiguousOwnership;
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
             loop {
                 let didx = self.loader.mcu.wfdma.read(0xd430c)?;
                 let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
                 if didx == 1 && descriptor_done {
-                    descriptor_consumed = true;
-                    record_sae_stage("sae_tx_ring0_consumed didx=1 descriptor_done=true");
+                    outcome = MgmtTxPublicationOutcome::Committed;
+                    record_sae_stage(
+                        "management_tx outcome=committed descriptor_consumed=true dma_done=true ownership=device",
+                    );
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -8514,58 +8623,40 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            loop {
-                self.loader.mcu.cancelled()?;
-                self.loader.mcu.handle_irq(None)?;
-                self.tx_completions
-                    .append(&mut self.loader.mcu.tx_completions);
-                let _ = drain_data_rx_queue(
-                    self.loader.mcu.wfdma,
-                    &mut self.data,
-                    &mut self.loader.mcu.descriptor_provenance,
-                    &mut self.tx_completions,
-                    Some(&mut self.loader.mcu.normal_rx_frames),
-                )?;
-                for completion in self.tx_completions.drain(..) {
-                    completion_state.observe(completion)?;
-                }
-                if let Some(result) = completion_state.finished() {
-                    break result;
-                }
-                if Instant::now() >= deadline {
-                    break Err(
-                        "SAE management TX completion timed out; frame may have transmitted".into(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            Ok(())
         })();
-        if publication_may_have_happened && !descriptor_consumed {
+
+        if outcome == MgmtTxPublicationOutcome::AmbiguousOwnership {
             self.loader.uni_terminal_poisoned = true;
             return Err(format!(
                 "REBOOT REQUIRED: management TX outcome={result:?}; ring-0 descriptor ownership is uncertain; MCU TX blocked until universal containment"
             ));
         }
-        let contained = self.reset_consumed_mgmt_tx_ring();
-        if let Err(error) = contained {
-            self.loader.uni_terminal_poisoned = true;
-            return Err(format!(
-                "REBOOT REQUIRED: management TX outcome={result:?}; ring-local reclaim failed and MCU TX is blocked until universal containment: {error}"
-            ));
+        if outcome == MgmtTxPublicationOutcome::NotPublished {
+            self.mgmt_tx_outstanding.abandon_last(token, pid);
+        }
+        if outcome != MgmtTxPublicationOutcome::NotPublished {
+            self.reset_consumed_mgmt_tx_ring().map_err(|error| {
+                self.loader.uni_terminal_poisoned = true;
+                format!(
+                    "REBOOT REQUIRED: management TX outcome={outcome:?}; ring-local reclaim failed and MCU TX is blocked until universal containment: {error}"
+                )
+            })?;
         }
         ring.write_descriptor_at(0, DmaDescriptor::reset());
-        let txwi_reset = txwi.zero_bytes(PAGE);
-        let frame_reset = frame_arena.zero_bytes(PAGE);
-        if let Err(error) = result {
-            txwi_reset
-                .map_err(|wipe| format!("REBOOT REQUIRED: {error}; TXWI reclaim failed: {wipe}"))?;
-            frame_reset.map_err(|wipe| {
-                format!("REBOOT REQUIRED: {error}; frame reclaim failed: {wipe}")
-            })?;
-            return Err(format!("REBOOT REQUIRED: SAE spike failed: {error}"));
-        }
-        txwi_reset.map_err(|error| format!("REBOOT REQUIRED: TXWI reclaim failed: {error}"))?;
-        frame_reset.map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))
+        txwi.zero_bytes(PAGE)
+            .map_err(|error| format!("REBOOT REQUIRED: TXWI reclaim failed: {error}"))?;
+        frame_arena
+            .zero_bytes(PAGE)
+            .map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))?;
+        result?;
+        debug_assert_eq!(outcome, MgmtTxPublicationOutcome::Committed);
+        // Fuchsia SoftMAC send_wlan_frame is an enqueue contract. Linux mt76
+        // keeps TX status/free asynchronous after the DMA-owned descriptor has
+        // been consumed; absence of those reports cannot turn this enqueue
+        // into an authentication failure. The unique token/PID remains live in
+        // mgmt_tx_outstanding until both correlated reports arrive.
+        Ok(())
     }
 
     fn receive_one_sae_auth(
@@ -8584,6 +8675,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 &mut self.tx_completions,
                 Some(&mut self.loader.mcu.normal_rx_frames),
             )?;
+            self.retire_mgmt_tx_completions()?;
             let frames = std::mem::take(&mut self.loader.mcu.normal_rx_frames);
             for frame in &frames {
                 if let Some(occurrence) = frame.occurrence.as_ref() {
@@ -8677,6 +8769,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
             zx::Status::IO_DATA_INTEGRITY
         })?;
+        self.retire_mgmt_tx_completions()
+            .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         let Some(frame) = self.loader.mcu.normal_rx_frames.pop_front() else {
             record_sae_stage("next_client_rx result=empty");
             return Ok(None);
@@ -8851,6 +8945,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             )
             .map_err(PhysicalPassiveError)?,
         );
+        self.retire_mgmt_tx_completions()
+            .map_err(PhysicalPassiveError)?;
         let mut routed_frames = std::mem::take(&mut self.loader.mcu.normal_rx_frames);
         while !routed_frames.is_empty() {
             let frame = routed_frames.pop_front().expect("queue is nonempty");
@@ -10942,7 +11038,7 @@ mod tests {
     fn client_management_encoder_binds_subtype_and_rejects_non_management() {
         let mut association = vec![0u8; 30];
         association[0..2].copy_from_slice(&0x0000u16.to_le_bytes());
-        let encoded = encode_client_management_tx(&association, 0x1000, 0x2000).unwrap();
+        let encoded = encode_client_management_tx(&association, 0x1000, 0x2000, 7, 11).unwrap();
         assert_eq!(
             u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap()) & 0xf,
             0
@@ -10951,9 +11047,17 @@ mod tests {
             u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()),
             0x801e
         );
+        assert_eq!(
+            u16::from_le_bytes(encoded.txwi[32..34].try_into().unwrap()),
+            0x8007
+        );
+        assert_eq!(
+            u32::from_le_bytes(encoded.txwi[20..24].try_into().unwrap()) & 0xff,
+            11
+        );
         association[0..2].copy_from_slice(&0x0008u16.to_le_bytes());
-        assert!(encode_client_management_tx(&association, 0x1000, 0x2000).is_err());
-        assert!(encode_client_management_tx(&association[..20], 0x1000, 0x2000).is_err());
+        assert!(encode_client_management_tx(&association, 0x1000, 0x2000, 0, 3).is_err());
+        assert!(encode_client_management_tx(&association[..20], 0x1000, 0x2000, 0, 3).is_err());
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -15486,7 +15590,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn management_tx_proves_descriptor_consumption_before_rx_completion() {
+    fn management_tx_commits_before_asynchronous_rx_completion() {
         let source = include_str!("vfio_read.rs");
         let transmit = source
             .split("fn transmit_one_sae_auth(")
@@ -15498,10 +15602,16 @@ mod tests {
         let publish = transmit.find("write_active_wfdma(0xd4308, 1)").unwrap();
         let didx = transmit.find("read(0xd430c)").unwrap();
         let descriptor_done = transmit.find("is_dma_done()").unwrap();
-        let drain = transmit.find("drain_data_rx_queue(").unwrap();
-        assert!(publish < didx && didx < descriptor_done && descriptor_done < drain);
+        let committed = transmit
+            .find("MgmtTxPublicationOutcome::Committed")
+            .unwrap();
+        let enqueue_success = transmit.rfind("Ok(())").unwrap();
+        assert!(publish < didx && didx < descriptor_done && descriptor_done < committed);
+        assert!(committed < enqueue_success);
+        assert!(!transmit.contains("drain_data_rx_queue("));
+        assert!(!transmit.contains("TX completion timed out"));
         let publication_intent = transmit
-            .find("publication_may_have_happened = true")
+            .find("MgmtTxPublicationOutcome::AmbiguousOwnership")
             .unwrap();
         let poison = publication_intent
             + transmit[publication_intent..]
@@ -15524,7 +15634,7 @@ mod tests {
             .split("fn receive_one_sae_auth(")
             .next()
             .unwrap();
-        assert!(transmit.contains("descriptor_consumed = true"));
+        assert!(transmit.contains("MgmtTxPublicationOutcome::Committed"));
         assert!(transmit.contains("reset_consumed_mgmt_tx_ring()"));
         assert!(!transmit.contains("global & !1"));
 
@@ -15574,7 +15684,7 @@ mod tests {
                 }),
             ],
         ] {
-            let mut state = MgmtTxCompletionState::default();
+            let mut state = MgmtTxCompletionState::new(0, 3);
             assert!(state.finished().is_none());
             state.observe(completions[0]).unwrap();
             assert!(state.finished().is_none());
@@ -15586,7 +15696,7 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn one_management_tx_rejects_wrong_identity_duplicate_and_failed_ack() {
-        let mut state = MgmtTxCompletionState::default();
+        let mut state = MgmtTxCompletionState::new(0, 3);
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
@@ -15623,5 +15733,85 @@ mod tests {
             }))
             .unwrap();
         assert!(state.finished().unwrap().is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn committed_management_frames_keep_distinct_identities_until_delayed_completion() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let first = outstanding.reserve().unwrap();
+        let second = outstanding.reserve().unwrap();
+        assert_ne!(
+            first.0, second.0,
+            "group fallback must not reuse the TX token"
+        );
+        assert_ne!(
+            first.1, second.1,
+            "group fallback must not reuse the TX PID"
+        );
+        assert_eq!(outstanding.entries.len(), 2);
+
+        for completion in [
+            MgmtTxCompletion::Status(Mt7921TxStatus {
+                wcid: 19,
+                pid: second.1,
+                acked: true,
+            }),
+            MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: None,
+                token: first.0,
+                dropped: false,
+                attempts: 1,
+            }),
+            MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: None,
+                token: second.0,
+                dropped: false,
+                attempts: 1,
+            }),
+            MgmtTxCompletion::Status(Mt7921TxStatus {
+                wcid: 19,
+                pid: first.1,
+                acked: true,
+            }),
+        ] {
+            outstanding.observe(completion).unwrap();
+        }
+        assert!(
+            outstanding.is_empty(),
+            "both delayed completion pairs must retire"
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn unpublished_or_missing_completion_never_reuses_management_identity() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let unpublished = outstanding.reserve().unwrap();
+        outstanding.abandon_last(unpublished.0, unpublished.1);
+        let committed = outstanding.reserve().unwrap();
+        assert_ne!(
+            unpublished, committed,
+            "pre-publication failure must not recycle identity"
+        );
+        let later = outstanding.reserve().unwrap();
+        assert_ne!(
+            committed, later,
+            "missing completion must block identity reuse"
+        );
+        assert_eq!(outstanding.entries.len(), 2);
+
+        let source = include_str!("vfio_read.rs");
+        let transmit = source
+            .split("fn transmit_one_sae_auth(")
+            .nth(1)
+            .unwrap()
+            .split("fn receive_one_sae_auth(")
+            .next()
+            .unwrap();
+        assert!(transmit.contains("MgmtTxPublicationOutcome::AmbiguousOwnership"));
+        assert!(transmit.contains("uni_terminal_poisoned = true"));
+        assert!(transmit.contains("MgmtTxPublicationOutcome::Committed"));
+        assert!(!transmit.contains("TX completion timed out"));
     }
 }
