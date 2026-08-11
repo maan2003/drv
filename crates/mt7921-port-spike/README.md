@@ -2516,3 +2516,38 @@ driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3, IPv4,
 the default route, and gateway connectivity recovered on `wlan10` in
 10313 ms. The watchdog disarmed without reboot, both watchdog units were
 inactive, and lab state was absent.
+
+The move-only selector-evidence integration passed 109 core tests and its
+compile-fail doc, 38 full adapter tests and three docs, 103 passive-transport
+tests, production Netstack DHCP/DNS/TCP/HTTP tests, and locked
+release/format/no-hardware gates. The SAE production path retains one selector
+scan identity and contains no synthetic DeviceOps scan. Exactly one guarded
+follow-up, `wifi-sae-e2e30`, used matching local and staged release SHA-256
+`e08d6b5f457f8046a507da6d8f30c61fce70e449f0f3a0afda9c14dfe16ec922`.
+Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260811T092145Z-0000_05_00.0.log`.
+
+Selector scan 1 retained observation generation 1 at monotonic timestamp
+1601776255 for BSSID `f2:a3:18:4f:30:76` and complete channel-36 Cbw80
+chandef (control 36, center 42, firmware bandwidth 2, center2 0). The one
+physical target transition established channel generation 1. After rate/power
+setup and SAE-resource acquisition, ClientMlme's Connect replay reported the
+same context as `current`, so it emitted no second channel switch.
+
+The pinned owner then emitted a valid group-20 H2E transaction-1/status-126
+commit with 48-byte scalar and 96-byte on-curve element. Ring-0 consumption,
+acknowledged WCID-19/PID-3 TX status, and a non-dropped token-0 TX-free after
+one attempt proved local transmission. No peer SAE response arrived within
+the bounded connect deadline, so the run ended with
+`pinned SME/MLME connect failed: Timeout`. Without a status-77 response,
+group-19 fallback was not emitted. No peer commit/confirm, BSS/WCID
+association, EAPOL, key installation, controlled port, or production Netstack
+Internet evidence followed. The report contains no secret-bearing assignment.
+No retry was made.
+
+Cleanup disabled PCI bus mastering, quiesced transport, released DMA mappings
+before reset, reset VFIO, verified the safe state, and restored the native
+driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3, IPv4,
+the default route, and gateway connectivity recovered on `wlan11` in
+4156 ms. The watchdog disarmed without reboot, both watchdog units were
+inactive, and lab state was absent.
