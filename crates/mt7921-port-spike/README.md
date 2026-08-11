@@ -2458,3 +2458,30 @@ D0, iwd, WPA3 association, IPv4, the default route, and gateway connectivity
 recovered on `wlan8` in 6202 ms. The watchdog disarmed without a reboot,
 both watchdog units were inactive, and the lab state was absent. No retry was
 made.
+
+The core-owned full-chandef correction was integrated without modifying the
+E2E27 evidence. Core, full adapter, passive transport, runtime/Netstack,
+locked release, formatting, and no-hardware gates all passed. The one
+authorized follow-up, `wifi-sae-e2e28`, used release SHA-256
+`c906d0be2f9aa6ffe906940874bae6f4f06a7f35febc6bb7bbe9c9ad6c46efd3`;
+the local and immediately verified staged artifacts matched. Report
+`/var/lib/wifi-driver-lab/reports/20260811T085125Z-0000_05_00.0.log`
+records the sole run.
+
+Firmware loading, N9 readiness, NIC capability, EFUSE, CLC configuration, and
+the channel-domain command completed. The run then failed closed before the
+passive scan at `invalid passive scan request`: the direct pre-client scan
+setup still supplied an absent optional secondary-channel field, while the
+new full-chandef adapter boundary required that field. Therefore no physical
+channel switch, channel-context ensure diagnostic, target beacon, rate/power
+setup, SAE resources or commit, status-77/group-19 fallback, BSS/WCID
+association, EAPOL, keys, controlled port, or production Netstack
+DHCP/DNS/TCP/HTTP evidence was reached. The durable report contains no
+secret-bearing assignment. No retry was made.
+
+Cleanup disabled PCI bus mastering, quiesced transport, released DMA mappings
+before reset, reset VFIO, verified the post-reset safe state, and restored the
+native driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3,
+IPv4, the default route, and gateway connectivity recovered on `wlan9` in
+6205 ms. The watchdog disarmed without reboot, both watchdog units were
+inactive, and lab state was absent.
