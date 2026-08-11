@@ -2551,3 +2551,51 @@ driver with `RESTORE end failed=0`. Native `mt7921e`, D0, iwd WPA3, IPv4,
 the default route, and gateway connectivity recovered on `wlan11` in
 4156 ms. The watchdog disarmed without reboot, both watchdog units were
 inactive, and lab state was absent.
+
+The preassociation-SAE receive routing integration retained the group-20
+status-77 fallback to group 19 and added a literal full-path regression from
+a hardware data-RX descriptor through descriptor rearm, `next_client_rx`, and
+the pinned ClientMlme/SME runtime. The regression proves that an AP
+transaction-1/status-77 frame causes a second valid group-19 commit ending in
+the Rejected Groups extension bytes `ff 03 5c 14 00`.
+
+Verification passed 110 core tests and its compile-fail doc test, the
+`userspace-vfio` test, the port-spike library test, 38 full adapter tests and
+three doc tests, 106 passive-transport tests, both production Netstack
+DHCP/DNS/TCP/HTTP tests, the focused literal regression, the root format
+check, and `git diff --check`. A fresh locked/offline release and sterile
+no-hardware gate passed. The adapter and passive manifest-scoped format
+checks still report only the pre-existing rustfmt drift in the vendored
+Fuchsia reference tree; the touched source is clean.
+
+Exactly one guarded follow-up, `wifi-sae-e2e31`, used matching local, staged,
+and active release SHA-256
+`5bda99fac706e37be7db3bdef7648220b9981758ecee90eb771e889259c94586`
+(11610752 bytes). Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260811T095018Z-0000_05_00.0.log`.
+The report contains no password, passphrase, PSK, secret, or credential
+assignment.
+
+Firmware and regulatory setup completed, the bounded selector scan retained
+the `ph1` BSS on channel 36, and the physical Cbw80 context was established at
+generation 1. ClientMlme's exact-channel replay again reported the context as
+current. The pinned owner emitted a valid group-20 H2E
+transaction-1/status-126 commit with a 48-byte scalar and 96-byte on-curve
+element. Ring-0 consumption, acknowledged WCID-19/PID-3 TX status, and a
+non-dropped token-0 TX-free after one attempt proved local transmission.
+
+The new receive telemetry then recorded 23672 bounded
+`next_client_rx result=empty` polls, but no data-RX descriptor, rearm,
+admission, filter, or delivered frame. Thus no AP authentication response was
+presented by the physical RX ring, status 77 was not observed, and the
+group-19 fallback could not run. The pinned connect timed out; no peer
+commit/confirm, BSS/WCID association, EAPOL, key installation,
+controlled-port transition, or production Netstack Internet evidence
+followed. No retry was made.
+
+Cleanup disabled PCI bus mastering, quiesced transport, released DMA mappings
+before reset, reset VFIO, verified the safe state, and restored native
+`mt7921e` with `RESTORE end failed=0`. Lab state was absent, the watchdog and
+test unit were inactive, native iwd WPA3 connectivity returned on `wlan12`,
+the DHCP default route was present, and an HTTPS Internet probe succeeded
+without a reboot.
