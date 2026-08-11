@@ -5091,13 +5091,14 @@ pub fn encode_remove_wcid_command(
     Ok(bytes)
 }
 
-pub fn encode_legacy_wme_add_wcid_command(
+fn encode_legacy_wme_wcid_command(
     sequence: u8,
     bss_index: u8,
     wcid: u8,
     aid: u16,
     peer: [u8; 6],
     rcpi: u8,
+    associated: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence) {
         return Err("WCID add omitted valid sequence".into());
@@ -5113,10 +5114,37 @@ pub fn encode_legacy_wme_add_wcid_command(
     ];
     bytes[66..68].copy_from_slice(&aid.to_le_bytes());
     bytes[68..74].copy_from_slice(&peer);
+    // mt7921_mac_sta_add publishes STATE_NONE with EXTRA_INFO_NEW before
+    // authentication. mt7921_mac_sta_event updates that same WCID to
+    // STATE_ASSOC after the association response.
+    bytes[65] = u8::from(associated);
+    bytes[74..76].copy_from_slice(&(if associated { 1u16 } else { 3u16 }).to_le_bytes());
+    bytes[112] = if associated { 2 } else { 0 };
     bytes[132..138].copy_from_slice(&peer);
-    bytes[141] = 1;
+    bytes[141] = u8::from(associated);
     bytes[144..146].copy_from_slice(&aid.to_le_bytes());
     Ok(bytes)
+}
+
+pub fn encode_preauth_peer_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    peer: [u8; 6],
+    rcpi: u8,
+) -> Result<Vec<u8>, String> {
+    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, 0, peer, rcpi, false)
+}
+
+pub fn encode_legacy_wme_add_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    aid: u16,
+    peer: [u8; 6],
+    rcpi: u8,
+) -> Result<Vec<u8>, String> {
+    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, aid, peer, rcpi, true)
 }
 
 /// Linux v7.1 `mt76_connac_mcu_uni_add_bss` station BASIC+QBSS request.
@@ -5278,7 +5306,7 @@ pub fn encode_igtk_command(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyWmeAssociation {
     pub bss_index: u8,
     pub peer_wcid: u8,
@@ -5652,6 +5680,7 @@ pub struct ClientFirmwareEffectsState {
     pub joined: Option<JoinedClientBss>,
     pub bss_programmed: bool,
     bss_binding: Option<(u8, bool)>,
+    pub preauth_peer: Option<LegacyWmeAssociation>,
     pub association: Option<LegacyWmeAssociation>,
     pub sequence: u8,
     pub ptk_installed: bool,
@@ -5678,6 +5707,7 @@ impl ClientFirmwareEffectsState {
     ) -> Result<(), String> {
         if bssid == [0; 6]
             || beacon_interval == 0
+            || self.preauth_peer.is_some()
             || self.association.is_some()
             || self.bss_programmed
             || self.firmware_uncertain
@@ -5727,6 +5757,64 @@ impl ClientFirmwareEffectsState {
         self.sequence
     }
 
+    pub fn prepare_preauth_peer(
+        &mut self,
+        peer: LegacyWmeAssociation,
+        channel: ClientChannelLease,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let joined = self
+            .joined
+            .filter(|joined| {
+                joined.bssid == peer.peer
+                    && joined.channel == channel.channel.primary
+                    && joined.channel_generation == channel.generation
+            })
+            .ok_or("preauth peer requires the current joined channel generation")?;
+        if peer.aid != 0
+            || peer.negotiated_qos
+            || peer.mfp_required
+            || self.association.is_some()
+            || self.bss_programmed
+            || self.firmware_uncertain
+        {
+            return Err("preauth peer state is not clean".into());
+        }
+        if let Some(current) = self.preauth_peer {
+            return if current == peer {
+                Ok(())
+            } else {
+                Err("preauth peer changed without teardown".into())
+            };
+        }
+        let command = encode_preauth_peer_wcid_command(
+            self.next_sequence(),
+            peer.bss_index,
+            peer.peer_wcid,
+            peer.peer,
+            peer.rcpi,
+        )?;
+        self.firmware_uncertain = true;
+        if let Err(error) = submit(3, &command) {
+            let rollback = encode_remove_wcid_command(
+                self.next_sequence(),
+                peer.bss_index,
+                peer.peer_wcid,
+                0,
+                joined.bssid,
+                false,
+            )
+            .and_then(|command| submit(3, &command));
+            self.firmware_uncertain = rollback.is_err();
+            return Err(format!(
+                "preauth WCID add failed: {error}; rollback_wcid={rollback:?}"
+            ));
+        }
+        self.preauth_peer = Some(peer);
+        self.firmware_uncertain = false;
+        Ok(())
+    }
+
     pub fn associate(
         &mut self,
         association: LegacyWmeAssociation,
@@ -5741,6 +5829,16 @@ impl ClientFirmwareEffectsState {
                     && joined.channel_generation == channel.generation
             })
             .ok_or("association requires the current joined channel generation")?;
+        let preauth = self
+            .preauth_peer
+            .filter(|preauth| {
+                preauth.bss_index == association.bss_index
+                    && preauth.peer_wcid == association.peer_wcid
+                    && preauth.peer == association.peer
+                    && preauth.rcpi == association.rcpi
+                    && preauth.aid == 0
+            })
+            .ok_or("association requires an ACKed preauth peer WCID")?;
         if self.association.is_some() || self.bss_programmed || self.firmware_uncertain {
             return Err("client firmware association state is not clean".into());
         }
@@ -5812,11 +5910,15 @@ impl ClientFirmwareEffectsState {
             if rollback_bss.is_ok() {
                 self.bss_binding = None;
             }
+            if rollback_wcid.is_ok() {
+                self.preauth_peer = None;
+            }
             self.firmware_uncertain = rollback_wcid.is_err() || rollback_bss.is_err();
             return Err(format!(
                 "WCID add failed: {error}; rollback_wcid={rollback_wcid:?}; rollback_bss={rollback_bss:?}"
             ));
         }
+        debug_assert_eq!(preauth.peer, association.peer);
         self.association = Some(association);
         self.association_generation = Some(self.mint_generation());
         Ok(())
@@ -6033,6 +6135,22 @@ impl ClientFirmwareEffectsState {
             self.association_generation = None;
             self.ptk_rx_pn = None;
             self.gtk_rx_pn = None;
+            if let Some(preauth) = self.preauth_peer {
+                encode_remove_wcid_command(
+                    self.next_sequence(),
+                    preauth.bss_index,
+                    preauth.peer_wcid,
+                    0,
+                    preauth.peer,
+                    false,
+                )
+                .and_then(|command| submit(3, &command))
+                .map_err(|error| {
+                    self.firmware_uncertain = true;
+                    format!("client firmware preauth WCID teardown failed: {error}")
+                })?;
+                self.preauth_peer = None;
+            }
             if self.bss_programmed {
                 let joined = self.joined.ok_or("programmed BSS lost its join binding")?;
                 let (bss_index, negotiated_qos) = self
@@ -6057,6 +6175,8 @@ impl ClientFirmwareEffectsState {
                 self.joined = None;
                 self.firmware_uncertain = false;
             }
+            self.joined = None;
+            self.firmware_uncertain = false;
             return Ok(());
         };
         if self.broadcast_keys_dirty {
@@ -6117,6 +6237,7 @@ impl ClientFirmwareEffectsState {
         })?;
         self.bss_programmed = false;
         self.bss_binding = None;
+        self.preauth_peer = None;
         self.association = None;
         self.joined = None;
         self.association_generation = None;
@@ -7545,6 +7666,18 @@ mod tests {
         assert!(state.accepts_joined_management(&association_response, client));
         association_response[4..10].copy_from_slice(&[1, 1, 1, 1, 1, 1]);
         assert!(!state.accepts_joined_management(&association_response, client));
+        let preauth = LegacyWmeAssociation {
+            aid: 0,
+            negotiated_qos: false,
+            ..association
+        };
+        let mut transcript = Vec::new();
+        state
+            .prepare_preauth_peer(preauth, lease, |_, command| {
+                transcript.push(command.to_vec());
+                Ok(())
+            })
+            .unwrap();
         assert!(
             state
                 .associate(
@@ -7558,7 +7691,6 @@ mod tests {
                 .is_err()
         );
 
-        let mut transcript = Vec::new();
         state
             .associate(association, lease, |_, command| {
                 transcript.push(command.to_vec());
@@ -7572,19 +7704,27 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(transcript.len(), 4);
+        assert_eq!(transcript.len(), 5);
         assert_eq!(
             transcript
                 .iter()
                 .map(|command| u16::from_le_bytes([command[34], command[35]]))
                 .collect::<Vec<_>>(),
-            [2, 3, 3, 2]
+            [3, 2, 3, 3, 2]
         );
-        let bss_add = &transcript[0];
+        let preauth_add = &transcript[0];
+        assert_eq!(preauth_add[112], 0);
+        assert_eq!(&preauth_add[68..74], &peer);
+        assert_eq!(
+            u16::from_le_bytes(preauth_add[66..68].try_into().unwrap()),
+            0
+        );
+        let bss_add = &transcript[1];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[92], 1);
-        assert_eq!(transcript[3][56], 0);
+        assert_eq!(transcript[2][112], 2);
+        assert_eq!(transcript[4][56], 0);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
     }
@@ -7614,6 +7754,17 @@ mod tests {
 
         let mut rolled_back = ClientFirmwareEffectsState::default();
         rolled_back.bind_join(peer, lease, 100).unwrap();
+        rolled_back
+            .prepare_preauth_peer(
+                LegacyWmeAssociation {
+                    aid: 0,
+                    negotiated_qos: false,
+                    ..association
+                },
+                lease,
+                |_, _| Ok(()),
+            )
+            .unwrap();
         let mut transcript = Vec::new();
         assert!(
             rolled_back
@@ -7633,6 +7784,17 @@ mod tests {
 
         let mut dirty = ClientFirmwareEffectsState::default();
         dirty.bind_join(peer, lease, 100).unwrap();
+        dirty
+            .prepare_preauth_peer(
+                LegacyWmeAssociation {
+                    aid: 0,
+                    negotiated_qos: false,
+                    ..association
+                },
+                lease,
+                |_, _| Ok(()),
+            )
+            .unwrap();
         assert!(
             dirty
                 .associate(association, lease, |_, _| Err("no ACK".into()))
@@ -7647,7 +7809,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(teardown, [(2, 0)]);
+        assert_eq!(teardown, [(3, 0), (2, 0)]);
         assert!(!dirty.bss_programmed);
         assert!(!dirty.firmware_uncertain);
         assert!(dirty.joined.is_none());

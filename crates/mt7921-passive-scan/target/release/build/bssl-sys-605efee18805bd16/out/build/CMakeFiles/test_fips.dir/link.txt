@@ -1,0 +1,1 @@
+/nix/store/xhk1jrskwjaw0pq9xxm1dy6zz952ikbk-gcc-wrapper-15.2.0/bin/c++  -ffunction-sections -fdata-sections -fPIC -m64 -w -fno-strict-aliasing -ggdb -fno-common -fvisibility=hidden -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/test_fips.dir/link.d CMakeFiles/test_fips.dir/util/fipstools/test_fips.cc.o -o test_fips  libcrypto.a

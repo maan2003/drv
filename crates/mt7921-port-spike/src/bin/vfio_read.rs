@@ -1555,16 +1555,32 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         .map_err(|error| format!("self-test E2E48 bind: {error}"))?;
     let mut activation_commands = Vec::new();
     rx_gate
+        .prepare_preauth_peer(
+            LegacyWmeAssociation {
+                aid: 0,
+                negotiated_qos: false,
+                ..association
+            },
+            rx_channel,
+            |cid, command| {
+                activation_commands.push((cid, command.to_vec()));
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("self-test preauth peer: {error}"))?;
+    rx_gate
         .associate(association, rx_channel, |cid, command| {
             activation_commands.push((cid, command.to_vec()));
             Ok(())
         })
         .map_err(|error| format!("self-test E2E48 association: {error}"))?;
-    let expected_bss = encode_client_bss_command(1, 0, peer, 36, 100, true, true)
+    let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, 7, peer, 100)
+        .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
+    let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
-    let expected_peer = encode_legacy_wme_add_wcid_command(2, 0, 7, 42, peer, 100)
+    let expected_peer = encode_legacy_wme_add_wcid_command(3, 0, 7, 42, peer, 100)
         .map_err(|error| format!("self-test association peer fixture: {error}"))?;
-    if activation_commands != [(2, expected_bss), (3, expected_peer)]
+    if activation_commands != [(3, expected_preauth), (2, expected_bss), (3, expected_peer)]
         || !rx_gate.bss_programmed
         || !rx_gate.association.is_some_and(|active| {
             active.bss_index == 0
@@ -1581,13 +1597,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass cid_order=2,3 bss_active=true peer_wcid=7 association_generation=true controlled_port_open=false eapol_ready=true"
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
         generation,
         eapol: true,
-        wcid: 1023,
+        wcid: 7,
         tid: 0,
         group: false,
         key_id: 0,
@@ -1601,7 +1617,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     };
     rx_gate
         .deliver_rx(candidate)
-        .map_err(|error| format!("self-test E2E48 pre-key EAPOL gate: {error}"))?;
+        .map_err(|error| format!("self-test immediate WCID7 EAPOL gate: {error}"))?;
+    rx_gate
+        .deliver_rx(candidate)
+        .map_err(|error| format!("self-test retried WCID7 EAPOL gate: {error}"))?;
     let mut non_eapol = candidate;
     non_eapol.eapol = false;
     if rx_gate.deliver_rx(non_eapol).is_ok() {
@@ -1613,7 +1632,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         return Err("self-test E2E48 malformed descriptor was not terminal".into());
     }
     println!(
-        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true from_ds=true rfc1042=true ether_type=0x888e eapol_m1=admitted wcid=1023 non_eapol=filtered malformed=terminal"
+        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true from_ds=true rfc1042=true ether_type=0x888e eapol_m1=immediate_and_retried_admitted wcid=7 non_eapol=filtered malformed=terminal"
     );
     let mut auth = vec![0; 32];
     auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
@@ -8711,7 +8730,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         let management = control & 0x000c == 0;
         let sae = control & 0x00fc == 0x00b0;
         let state = self.state.lock().unwrap();
-        if state.channel.authorized_channel().is_err()
+        let channel = state.channel.authorized_channel();
+        if channel.is_err()
             || bytes.get(4..10) != Some(&self.target)
             || bytes.get(10..16) != Some(&self.client)
             || (sae && bytes.get(16..22) != Some(&self.target))
@@ -8728,6 +8748,29 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 record_sae_commit_structure(bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
             }
             drop(state);
+            if sae && self.firmware.preauth_peer.is_none() {
+                self.firmware
+                    .prepare_preauth_peer(
+                        LegacyWmeAssociation {
+                            bss_index: 0,
+                            peer_wcid: 7,
+                            aid: 0,
+                            peer: self.target,
+                            rcpi: self.rcpi,
+                            negotiated_qos: false,
+                            mfp_required: false,
+                        },
+                        channel.expect("authorized channel was checked"),
+                        |cid, command| {
+                            io.submit_uni(cid, command)
+                                .map_err(|status| status.to_string())
+                        },
+                    )
+                    .map_err(|_| zx::Status::IO)?;
+                record_sae_stage(
+                    "firmware_wcid_stage stage=preauth peer_wcid=7 sta_state=none aid=0 peer_identity=true keys=false port_open=false",
+                );
+            }
             io.transmit_client(bytes, flags)?;
             if sae {
                 record_sae_stage(match bytes.get(26..28) {
@@ -8861,6 +8904,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .association_generation
             .expect("successful association publishes its generation");
         self.post_association_data_wait = Some(Instant::now());
+        record_sae_stage(&format!(
+            "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc aid={aid} peer_identity=true keys=false port_open=false"
+        ));
         record_sae_stage(&format!(
             "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid=7 wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true"
         ));
@@ -9052,6 +9098,18 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 classification.ether_type.map_or(0, u16::from),
                 classification.llc_result,
                 security.wcid,
+            ));
+            record_sae_stage(&format!(
+                "firmware_rx_lookup observed_wcid={} peer_wcid=7 lookup_match={} firmware_wcid_stage={} association_generation_match={association_generation_match}",
+                security.wcid,
+                security.wcid == 7,
+                if self.firmware.association.is_some() {
+                    "associated"
+                } else if self.firmware.preauth_peer.is_some() {
+                    "preauth"
+                } else {
+                    "absent"
+                },
             ));
             let drop = |subreason| {
                 record_sae_stage(&format!(
@@ -11420,6 +11478,25 @@ mod tests {
     }
 
     #[cfg(feature = "fuchsia-passive")]
+    fn prepare_test_preauth(
+        state: &mut ClientFirmwareEffectsState,
+        association: LegacyWmeAssociation,
+    ) {
+        state
+            .prepare_preauth_peer(
+                LegacyWmeAssociation {
+                    aid: 0,
+                    negotiated_qos: false,
+                    mfp_required: false,
+                    ..association
+                },
+                test_channel_lease(36),
+                |_, _| Ok(()),
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     fn selected_live_state(bssid: [u8; 6], channel: ClientPhysicalChannel) -> LiveClientState {
         LiveClientState {
             selection: ClientTargetBssLease::retain(ClientScanEvidence {
@@ -11632,9 +11709,10 @@ mod tests {
         assert_eq!(
             &encoded[56..76],
             &[
-                0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 3, 0
+                0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 1, 0
             ]
         );
+        assert_eq!(encoded[112], 2);
         assert_eq!(&encoded[116..124], &[13, 0, 60, 0, 7, 1, 4, 0]);
         assert_eq!(
             &encoded[128..148],
@@ -11643,6 +11721,21 @@ mod tests {
             ]
         );
         assert_eq!(&encoded[168..176], &[13, 0, 8, 0, 1, 0, 1, 0]);
+
+        let preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
+            8,
+            0,
+            7,
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            100,
+        )
+        .unwrap();
+        assert_eq!(preauth[65], 0);
+        assert_eq!(u16::from_le_bytes(preauth[66..68].try_into().unwrap()), 0);
+        assert_eq!(&preauth[68..74], &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
+        assert_eq!(&preauth[74..76], &[3, 0]);
+        assert_eq!(preauth[112], 0);
+        assert_eq!(preauth[141], 0);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -11691,6 +11784,7 @@ mod tests {
         state
             .bind_join(association.peer, test_channel_lease(36), 100)
             .unwrap();
+        prepare_test_preauth(&mut state, association);
         assert!(state.set_controlled_port(true).is_err());
         let mut association_commands = Vec::new();
         state
@@ -11764,6 +11858,7 @@ mod tests {
         state
             .bind_join(association.peer, test_channel_lease(36), 100)
             .unwrap();
+        prepare_test_preauth(&mut state, association);
         state
             .associate(association, test_channel_lease(36), |_, _| Ok(()))
             .unwrap();
@@ -11840,6 +11935,7 @@ mod tests {
         state
             .bind_join(association.peer, test_channel_lease(36), 100)
             .unwrap();
+        prepare_test_preauth(&mut state, association);
         state
             .associate(association, test_channel_lease(36), |_, _| Ok(()))
             .unwrap();
@@ -12211,10 +12307,10 @@ mod tests {
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
-        assert_eq!(io.uni.len(), 2);
+        assert_eq!(io.uni.len(), 3);
         assert!(!effects.firmware.controlled_port_open);
-        let sentinel_security = ClientRxSecurity {
-            wcid: 1023,
+        let peer_security = ClientRxSecurity {
+            wcid: 7,
             tid: 0,
             key_id: 0,
             security_mode: 0,
@@ -12233,7 +12329,16 @@ mod tests {
         io.rx.push_back(ClientRxFrame {
             bytes: inbound_eapol.clone(),
             status: rx_status.clone(),
-            security: Some(sentinel_security),
+            security: Some(peer_security),
+        });
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            inbound_eapol
+        );
+        io.rx.push_back(ClientRxFrame {
+            bytes: inbound_eapol.clone(),
+            status: rx_status.clone(),
+            security: Some(peer_security),
         });
         assert_eq!(
             effects.next_rx(&mut io).unwrap().unwrap().bytes,
@@ -12242,6 +12347,10 @@ mod tests {
 
         let mut sentinel_data = inbound_eapol.clone();
         sentinel_data[30..32].copy_from_slice(&[0x08, 0x00]);
+        let sentinel_security = ClientRxSecurity {
+            wcid: 1023,
+            ..peer_security
+        };
         io.rx.push_back(ClientRxFrame {
             bytes: sentinel_data,
             status: rx_status,
@@ -12300,7 +12409,7 @@ mod tests {
                 &mut io,
             )
             .unwrap();
-        assert_eq!(io.uni.len(), 8);
+        assert_eq!(io.uni.len(), 9);
         assert_eq!(io.tx, [sae, eapol, data]);
         assert!(effects.firmware.association.is_none());
 
