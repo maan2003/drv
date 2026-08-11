@@ -1847,66 +1847,6 @@ where
     Ok(owned)
 }
 
-pub const CONNAC2_MCU_TXD_BYTES: usize = 64;
-pub const PATCH_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 12;
-pub const PATCH_SEMAPHORE_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
-pub const PATCH_FINISH_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 4;
-pub const FIRMWARE_START_REQUEST_BYTES: usize = CONNAC2_MCU_TXD_BYTES + 8;
-pub const DL_MODE_ENCRYPT: u32 = 1 << 0;
-pub const DL_MODE_KEY_INDEX: u32 = 0b11 << 1;
-pub const DL_MODE_RESET_SECURITY_IV: u32 = 1 << 3;
-pub const DL_MODE_WORKING_PDA_CR4: u32 = 1 << 4;
-pub const DL_MODE_ENCRYPTION_MODE_SELECT: u32 = 1 << 6;
-pub const DL_MODE_NEED_RESPONSE: u32 = 1 << 31;
-
-/// Translate a Connac2 RAM region feature byte into Linux's download mode.
-/// Address override and non-download are caller-side region controls and do
-/// not contribute mode bits.
-pub const fn firmware_download_mode(feature_set: u8, working_pda_cr4: bool) -> u32 {
-    let mut mode = DL_MODE_NEED_RESPONSE | ((feature_set as u32) & DL_MODE_KEY_INDEX);
-    if feature_set & (1 << 0) != 0 {
-        mode |= DL_MODE_ENCRYPT | DL_MODE_RESET_SECURITY_IV;
-    }
-    if feature_set & (1 << 4) != 0 {
-        mode |= DL_MODE_ENCRYPTION_MODE_SELECT;
-    }
-    if working_pda_cr4 {
-        mode |= DL_MODE_WORKING_PDA_CR4;
-    }
-    mode
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PatchSecurityError {
-    UnsupportedEncryptionType(u8),
-}
-
-/// Translate a Connac2 patch section's security word into Linux's download
-/// mode. Unknown encryption types fail closed instead of merely being logged.
-pub fn patch_download_mode(security_info: u32) -> Result<u32, PatchSecurityError> {
-    let mut mode = DL_MODE_NEED_RESPONSE;
-    if security_info == u32::MAX {
-        return Ok(mode);
-    }
-    match (security_info >> 24) as u8 {
-        0 => {}
-        1 => {
-            mode |= DL_MODE_ENCRYPT
-                | ((security_info << 1) & DL_MODE_KEY_INDEX)
-                | DL_MODE_RESET_SECURITY_IV;
-        }
-        2 => {
-            mode |= DL_MODE_ENCRYPT | DL_MODE_ENCRYPTION_MODE_SELECT | DL_MODE_RESET_SECURITY_IV;
-        }
-        encryption_type => {
-            return Err(PatchSecurityError::UnsupportedEncryptionType(
-                encryption_type,
-            ));
-        }
-    }
-    Ok(mode)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadCommand {
     NicPowerControl,
