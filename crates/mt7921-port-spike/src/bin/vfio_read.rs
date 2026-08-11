@@ -10228,6 +10228,54 @@ mod tests {
     }
 
     #[cfg(feature = "fuchsia-passive")]
+    struct FallbackMechanics {
+        rx: VecDeque<ClientRxFrame>,
+        tx: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    impl SourceExactPassiveMechanics for FallbackMechanics {
+        type Error = std::io::Error;
+
+        fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+            Ok(PassivePrerequisites {
+                channel_domain_mask_zero: true,
+                mac_mmio_initialized: true,
+                data_rx_owned: true,
+            })
+        }
+
+        fn command(&mut self, _: &PassiveMcuCommand, _: &[u8], _: bool) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn next_event(&mut self, _: i64) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
+            Ok(None)
+        }
+
+        fn confirm_scan_done(&mut self, _: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn transmit_client(
+            &mut self,
+            bytes: &[u8],
+            _: fidl_softmac::WlanTxInfoFlags,
+        ) -> Result<(), zx::Status> {
+            self.tx.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+            Ok(self.rx.pop_front())
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn sae_credential_declared_length_does_not_wait_for_eof() {
         use std::os::fd::IntoRawFd;
@@ -13522,6 +13570,256 @@ mod tests {
             ]
         ));
         assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn status77_descriptor_rearm_reaches_pinned_runtime_group19_fallback() {
+        futures::executor::block_on(async {
+            let ring_mapping = TestMapping::new(PAGE);
+            let buffer_mapping = TestMapping::new(8 * 2048);
+            let page_mapping = TestMapping::new(PAGE);
+            let mut ring = ring_mapping.dma(0x0102_0000);
+            let mut buffers = buffer_mapping.dma(0x0103_0000);
+            let page = page_mapping.read_page();
+            let client = [2, 0, 0, 0, 0, 1];
+            let peer = [2, 0, 0, 0, 0, 2];
+            let channel = ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 36,
+            };
+
+            let mut rx = vec![0; 24 + 8 + 32];
+            let length = rx.len() as u32;
+            rx[0..4].copy_from_slice(&((2u32 << 27) | length).to_le_bytes());
+            rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+            rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+            rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+            {
+                let auth = &mut rx[32..];
+                auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+                auth[4..10].copy_from_slice(&client);
+                auth[10..16].copy_from_slice(&peer);
+                auth[16..22].copy_from_slice(&peer);
+                auth[24..26].copy_from_slice(&3u16.to_le_bytes());
+                auth[26..28].copy_from_slice(&1u16.to_le_bytes());
+                auth[28..30].copy_from_slice(&77u16.to_le_bytes());
+                auth[30..32].copy_from_slice(&20u16.to_le_bytes());
+            }
+            buffers.write_bytes_at(0, &rx).unwrap();
+            ring.write_descriptor_at(
+                0,
+                DmaDescriptor {
+                    buf0: buffers.iova as u32,
+                    ctrl: (1 << 31) | (1 << 30) | (length << 16),
+                    buf1: 0,
+                    info: 0,
+                },
+            );
+            let mut queue = ActiveMcuRx {
+                rx_ring: &mut ring,
+                rx_buffers: &buffers,
+                rx_tail: 0,
+                rx_head: 7,
+                rx_ring_index: 2,
+                rx_count: 8,
+                irq_bit: DATA_RX_IRQ_BIT,
+            };
+            let mut provenance = DescriptorProvenance::new();
+            let mut normal = Vec::new();
+            drain_data_rx_queue(
+                &page,
+                &mut queue,
+                &mut provenance,
+                &mut Vec::new(),
+                Some(&mut normal),
+            )
+            .unwrap();
+            assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
+            assert!(matches!(
+                provenance.effects.as_slice(),
+                [
+                    DescriptorProvenanceEffect::Mint(_),
+                    DescriptorProvenanceEffect::Rearm {
+                        route: DescriptorOccurrenceRoute::DataRx,
+                        ring: 2,
+                        slot: 7,
+                        ..
+                    }
+                ]
+            ));
+            let parsed = parse_connac2_rx_frame(&normal.pop().unwrap().bytes).unwrap();
+            let status77 = ClientRxFrame {
+                bytes: parsed.bytes,
+                status: fidl_softmac::WlanRxInfo {
+                    rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                    valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                    phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                    data_rate: 0,
+                    primary: channel,
+                    bandwidth: ChannelBandwidth::Cbw20,
+                    vht_secondary_80_channel: ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
+                    mcs: 0,
+                    rssi_dbm: parsed.rssi_dbm,
+                    snr_dbh: 0,
+                },
+                security: None,
+            };
+
+            let capability = mt7921_port_spike::NicCapability {
+                element_count: 2,
+                mac_address: Some(client),
+                phy: Some(mt7921_port_spike::NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz: true,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 3,
+                    he: true,
+                }),
+                has_6ghz: Some(false),
+                chip_capability: None,
+                unknown_elements: 0,
+            };
+            let transmitted = Arc::new(Mutex::new(Vec::new()));
+            let transport = SourceExactPassiveTransport::new(
+                FallbackMechanics {
+                    rx: VecDeque::from([status77]),
+                    tx: Arc::clone(&transmitted),
+                },
+                capability,
+            )
+            .unwrap();
+            let candidates = candidate_channels(capability);
+            let adapter =
+                Mt7921SoftmacAdapter::new(transport, capability, candidates.clone(), vec![channel])
+                    .unwrap();
+            let physical = client_physical_channel(
+                channel,
+                ChannelBandwidth::Cbw80,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+            let shared = Arc::new(Mutex::new(selected_live_state(peer, physical)));
+            let effects = LiveClientEffects {
+                state: Arc::clone(&shared),
+                target: peer,
+                client,
+                rcpi: 100,
+                firmware: ClientFirmwareEffectsState::default(),
+            };
+            let support = live_client_support(query_from_capabilities(capability, &candidates));
+            let device_info =
+                wlan_mlme::mlme_device_info_from_softmac(support.query.clone()).unwrap();
+            let security = support.security.clone();
+            let spectrum = support.spectrum_management.clone();
+            let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
+            DeviceOps::set_channel(
+                &mut device,
+                channel,
+                ChannelBandwidth::Cbw80,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .await
+            .unwrap();
+            {
+                let state = &mut shared.lock().unwrap();
+                state
+                    .mark_rate_power_ready(
+                        peer,
+                        channel,
+                        ChannelBandwidth::Cbw80,
+                        ChannelNumber {
+                            number: 0,
+                            ..channel
+                        },
+                    )
+                    .unwrap();
+                state
+                    .authorize_sae(
+                        peer,
+                        channel,
+                        ChannelBandwidth::Cbw80,
+                        ChannelNumber {
+                            number: 0,
+                            ..channel
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut runtime = PinnedClientRuntime::new(
+                device,
+                runner,
+                {
+                    let mut config = wlan_sme::client::ClientConfig::default();
+                    config.wpa3_supported = true;
+                    config
+                },
+                device_info,
+                security,
+                spectrum,
+                fuchsia_inspect::Inspector::default(),
+            )
+            .await
+            .unwrap();
+            let request = fidl_sme::ConnectRequest {
+                ssid: b"test".to_vec(),
+                bss_description: fidl_ieee80211::BssDescription {
+                    bssid: peer,
+                    bss_type: fidl_ieee80211::BssType::Infrastructure,
+                    beacon_period: 100,
+                    capability_info: 0x11,
+                    ies: vec![
+                        0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f,
+                        0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0, 244, 1,
+                        0x20,
+                    ],
+                    primary: channel,
+                    bandwidth: ChannelBandwidth::Cbw80,
+                    vht_secondary_80_channel: ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
+                    rssi_dbm: -40,
+                    snr_db: 20,
+                },
+                multiple_bss_candidates: false,
+                authentication: fidl_internal::Authentication {
+                    protocol: fidl_internal::Protocol::Wpa3Personal,
+                    credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
+                        fidl_internal::WpaCredentials::Passphrase(b"synthetic-password".to_vec()),
+                    ))),
+                },
+                deprecated_scan_type: fidl_common::ScanType::Passive,
+            };
+            assert_eq!(
+                runtime
+                    .connect(
+                        request,
+                        Instant::now() + std::time::Duration::from_millis(100),
+                    )
+                    .await,
+                Err(mt7921_softmac_adapter::client_device::PinnedConnectError::Timeout)
+            );
+            let transmitted = transmitted.lock().unwrap();
+            assert!(transmitted.len() >= 2);
+            assert_eq!(&transmitted[0][28..32], &[126, 0, 20, 0]);
+            assert_eq!(&transmitted[1][28..32], &[126, 0, 19, 0]);
+            assert_eq!(
+                &transmitted[1][transmitted[1].len() - 5..],
+                &[0xff, 0x03, 0x5c, 0x14, 0x00]
+            );
+        });
     }
 
     #[cfg(feature = "fuchsia-passive")]
