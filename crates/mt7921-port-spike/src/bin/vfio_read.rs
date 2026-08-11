@@ -1365,8 +1365,248 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
     }
 }
 
+#[cfg(feature = "fuchsia-passive")]
+struct SaeCommittedSelfTestMechanics {
+    rx: VecDeque<ClientRxFrame>,
+    status77: Option<ClientRxFrame>,
+    tx: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
+    type Error = std::io::Error;
+
+    fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
+        Ok(PassivePrerequisites {
+            channel_domain_mask_zero: true,
+            mac_mmio_initialized: true,
+            data_rx_owned: true,
+        })
+    }
+    fn command(&mut self, _: &PassiveMcuCommand, _: &[u8], _: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn next_event(&mut self, _: i64) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
+        Ok(None)
+    }
+    fn confirm_scan_done(&mut self, _: u8) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn transmit_client(
+        &mut self,
+        bytes: &[u8],
+        _: fidl_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        self.tx.lock().unwrap().push(bytes.to_vec());
+        println!("self_test_management_tx outcome=committed");
+        if bytes.get(28..32) == Some(&[126, 0, 20, 0]) {
+            if let Some(frame) = self.status77.take() {
+                self.rx.push_back(frame);
+            }
+        }
+        Ok(())
+    }
+    fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        Ok(self.rx.pop_front())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
+    let client = [2, 0, 0, 0, 0, 1];
+    let peer = [2, 0, 0, 0, 0, 2];
+    let channel = ChannelNumber {
+        band: WlanBand::FiveGhz,
+        number: 36,
+    };
+    let mut auth = vec![0; 32];
+    auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+    auth[4..10].copy_from_slice(&client);
+    auth[10..16].copy_from_slice(&peer);
+    auth[16..22].copy_from_slice(&peer);
+    auth[24..26].copy_from_slice(&3u16.to_le_bytes());
+    auth[26..28].copy_from_slice(&1u16.to_le_bytes());
+    auth[28..30].copy_from_slice(&77u16.to_le_bytes());
+    auth[30..32].copy_from_slice(&20u16.to_le_bytes());
+    let status77 = ClientRxFrame {
+        bytes: auth,
+        status: fidl_softmac::WlanRxInfo {
+            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
+            mcs: 0,
+            rssi_dbm: -40,
+            snr_dbh: 0,
+        },
+        security: None,
+    };
+    let capability = mt7921_port_spike::NicCapability {
+        element_count: 2,
+        mac_address: Some(client),
+        phy: Some(mt7921_port_spike::NicPhyCapability {
+            ht: true,
+            vht: true,
+            has_5ghz: true,
+            max_bandwidth: 2,
+            spatial_streams: 2,
+            hardware_path: 3,
+            he: true,
+        }),
+        has_6ghz: Some(false),
+        chip_capability: None,
+        unknown_elements: 0,
+    };
+    let tx = Arc::new(Mutex::new(Vec::new()));
+    let transport = SourceExactPassiveTransport::new(
+        SaeCommittedSelfTestMechanics {
+            rx: VecDeque::new(),
+            status77: Some(status77),
+            tx: Arc::clone(&tx),
+        },
+        capability,
+    )
+    .map_err(|e| format!("self-test transport: {e}"))?;
+    let candidates = candidate_channels(capability);
+    let adapter =
+        Mt7921SoftmacAdapter::new(transport, capability, candidates.clone(), vec![channel])
+            .map_err(|e| format!("self-test adapter: {e}"))?;
+    let physical = client_physical_channel(
+        channel,
+        ChannelBandwidth::Cbw80,
+        ChannelNumber {
+            number: 0,
+            ..channel
+        },
+    )
+    .map_err(|e| format!("self-test channel: {e:?}"))?;
+    let shared = Arc::new(Mutex::new(LiveClientState {
+        selection: ClientTargetBssLease::retain(ClientScanEvidence {
+            scan_id: 7,
+            observation_generation: 1,
+            observation_timestamp_nanos: 1,
+            bssid: peer,
+            channel: physical,
+        })
+        .map_err(|e| format!("self-test selection: {e:?}"))?,
+        channel: ClientChannelContext::default(),
+    }));
+    let effects = LiveClientEffects {
+        state: Arc::clone(&shared),
+        target: peer,
+        client,
+        rcpi: 100,
+        firmware: ClientFirmwareEffectsState::default(),
+    };
+    let support = live_client_support(query_from_capabilities(capability, &candidates));
+    let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
+        .map_err(|e| format!("self-test device info: {e}"))?;
+    let security = support.security.clone();
+    let spectrum = support.spectrum_management.clone();
+    let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
+    DeviceOps::set_channel(
+        &mut device,
+        channel,
+        ChannelBandwidth::Cbw80,
+        ChannelNumber {
+            number: 0,
+            ..channel
+        },
+    )
+    .await
+    .map_err(|e| format!("self-test set channel: {e}"))?;
+    {
+        let mut state = shared.lock().unwrap();
+        let secondary = ChannelNumber {
+            number: 0,
+            ..channel
+        };
+        state
+            .mark_rate_power_ready(peer, channel, ChannelBandwidth::Cbw80, secondary)
+            .map_err(|e| format!("self-test ready: {e}"))?;
+        state
+            .authorize_sae(peer, channel, ChannelBandwidth::Cbw80, secondary)
+            .map_err(|e| format!("self-test authorize: {e}"))?;
+    }
+    let mut config = wlan_sme::client::ClientConfig::default();
+    config.wpa3_supported = true;
+    let mut runtime = PinnedClientRuntime::new(
+        device,
+        runner,
+        config,
+        device_info,
+        security,
+        spectrum,
+        fuchsia_inspect::Inspector::default(),
+    )
+    .await
+    .map_err(|e| format!("self-test runtime: {e}"))?;
+    let request = fidl_sme::ConnectRequest {
+        ssid: b"test".to_vec(),
+        bss_description: fidl_ieee80211::BssDescription {
+            bssid: peer,
+            bss_type: fidl_ieee80211::BssType::Infrastructure,
+            beacon_period: 100,
+            capability_info: 0x11,
+            ies: vec![
+                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1,
+                0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0, 244, 1, 0x20,
+            ],
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw80,
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
+            rssi_dbm: -40,
+            snr_db: 20,
+        },
+        multiple_bss_candidates: false,
+        authentication: fidl_internal::Authentication {
+            protocol: fidl_internal::Protocol::Wpa3Personal,
+            credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
+                fidl_internal::WpaCredentials::Passphrase(b"synthetic-password".to_vec()),
+            ))),
+        },
+        deprecated_scan_type: fidl_common::ScanType::Passive,
+    };
+    let result = runtime
+        .connect(
+            request,
+            Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await;
+    if result != Err(mt7921_softmac_adapter::client_device::PinnedConnectError::Timeout) {
+        return Err(format!("self-test connect result: {result:?}"));
+    }
+    let tx = tx.lock().unwrap();
+    if tx.len() < 2
+        || tx[0].get(28..32) != Some(&[126, 0, 20, 0])
+        || tx[1].get(28..32) != Some(&[126, 0, 19, 0])
+    {
+        return Err("self-test did not preserve group20 commit through status77 fallback".into());
+    }
+    println!(
+        "self_test_result=pass post_request_state=authenticating timer=refreshed status77=accepted fallback_group=19"
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--self-test-sae-committed-fallback") {
+        return futures::executor::block_on(run_sae_committed_fallback_self_test());
+    }
     let operation = match operation_argument.as_deref() {
         None => Operation::ReadFixed,
         Some("--acquire-driver-ownership") => Operation::AcquireDriverOwnership,
@@ -8635,13 +8875,16 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if outcome == MgmtTxPublicationOutcome::NotPublished {
             self.mgmt_tx_outstanding.abandon_last(token, pid);
         }
-        if outcome != MgmtTxPublicationOutcome::NotPublished {
-            self.reset_consumed_mgmt_tx_ring().map_err(|error| {
-                self.loader.uni_terminal_poisoned = true;
-                format!(
-                    "REBOOT REQUIRED: management TX outcome={outcome:?}; ring-local reclaim failed and MCU TX is blocked until universal containment: {error}"
-                )
-            })?;
+        if outcome == MgmtTxPublicationOutcome::Committed {
+            result?;
+            // DIDX plus DMA_DONE transfers the enqueue contract to the device,
+            // but does not return the backing storage to the host.  Keep the
+            // descriptor, TXWI, and frame intact until the next submission's
+            // ring-local reset; TXS/TX_FREE remain correlated asynchronously.
+            record_sae_stage(
+                "management_tx outcome=committed next=reclaim_deferred ownership=device",
+            );
+            return Ok(());
         }
         ring.write_descriptor_at(0, DmaDescriptor::reset());
         txwi.zero_bytes(PAGE)
@@ -8649,14 +8892,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         frame_arena
             .zero_bytes(PAGE)
             .map_err(|error| format!("REBOOT REQUIRED: frame reclaim failed: {error}"))?;
-        result?;
-        debug_assert_eq!(outcome, MgmtTxPublicationOutcome::Committed);
-        // Fuchsia SoftMAC send_wlan_frame is an enqueue contract. Linux mt76
-        // keeps TX status/free asynchronous after the DMA-owned descriptor has
-        // been consumed; absence of those reports cannot turn this enqueue
-        // into an authentication failure. The unique token/PID remains live in
-        // mgmt_tx_outstanding until both correlated reports arrive.
-        Ok(())
+        result
     }
 
     fn receive_one_sae_auth(
@@ -15617,9 +15853,10 @@ mod tests {
             + transmit[publication_intent..]
                 .find("self.loader.uni_terminal_poisoned = true")
                 .unwrap();
-        let ring_reset = transmit.find("reset_consumed_mgmt_tx_ring()").unwrap();
+        let deferred_reclaim = transmit.find("next=reclaim_deferred").unwrap();
         assert!(publication_intent < publish);
-        assert!(publish < poison && poison < ring_reset);
+        assert!(publish < poison && poison < deferred_reclaim);
+        assert!(!transmit[deferred_reclaim..].contains("reset_consumed_mgmt_tx_ring()"));
         assert!(!transmit.contains("write_active_wfdma(0xd4208"));
     }
 
@@ -15635,7 +15872,15 @@ mod tests {
             .next()
             .unwrap();
         assert!(transmit.contains("MgmtTxPublicationOutcome::Committed"));
-        assert!(transmit.contains("reset_consumed_mgmt_tx_ring()"));
+        assert!(transmit.contains("next=reclaim_deferred"));
+        let configure = source
+            .split("fn configure_mgmt_tx_ring_for_submission(")
+            .nth(1)
+            .unwrap()
+            .split("fn transmit_one_sae_auth(")
+            .next()
+            .unwrap();
+        assert!(configure.contains("reset_consumed_mgmt_tx_ring()"));
         assert!(!transmit.contains("global & !1"));
 
         let unified = source

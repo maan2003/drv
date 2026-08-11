@@ -1,7 +1,7 @@
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
---- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 15:15:30.209053910 +0000
-+++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 15:22:17.805523141 +0000
-@@ -177,6 +177,7 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 16:02:35.843202660 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 16:02:35.838483502 +0000
+@@ -162,6 +162,7 @@
      link_up: bool,
      events: Vec<fidl_mlme::MlmeEvent>,
      order: Vec<&'static str>,
@@ -9,7 +9,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
  }
  
  struct FakeDeviceOps {
-@@ -264,6 +265,8 @@
+@@ -243,6 +244,8 @@
          tx_flags: fidl_softmac::WlanTxInfoFlags,
          _async_id: Option<fuchsia_trace::Id>,
      ) -> Result<(), zx::Status> {
@@ -18,7 +18,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
          self.effects.lock().unwrap().frames.push((buffer.to_vec(), tx_flags));
          Ok(())
      }
-@@ -608,11 +611,17 @@
+@@ -433,11 +436,17 @@
              }
          }
          let stale_sme_timer = stale_sme_timer.expect("SME SAE retry timer");
@@ -38,7 +38,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
  
          let mut peer_updates = vec![];
          peer.on_sae_frame_rx(&mut peer_updates, sae_tx).unwrap();
-@@ -705,6 +714,11 @@
+@@ -530,6 +539,11 @@
          }
          assert!(saw_eapol_conf && saw_key_conf, "MLME confirmations must return to SME");
  
@@ -50,7 +50,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
          sme.on_disconnect_command(
              fidl_sme::UserDisconnectReason::WlanSmeUnitTesting,
              Default::default(),
-@@ -736,3 +750,70 @@
+@@ -561,3 +575,70 @@
          assert!(!effects.link_up, "cancellation must leave the controlled port closed");
          });
  }
@@ -122,8 +122,8 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
 +        });
 +}
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
---- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-11 15:16:28.195907515 +0000
-+++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-11 15:16:58.389588263 +0000
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-11 16:02:35.844224918 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs	2026-08-11 16:02:35.840719513 +0000
 @@ -333,6 +333,14 @@
  }
  
@@ -140,9 +140,25 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs b/src/connecti
          &mut self.ctx.seq_mgr
      }
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
---- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 15:16:28.196365645 +0000
-+++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 15:16:43.365497224 +0000
-@@ -1297,11 +1297,38 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 16:02:35.844616148 +0000
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 16:03:23.181490944 +0000
+@@ -199,6 +199,15 @@
+     ) -> AuthProgress {
+         let state =
+             self.algorithm.handle_sme_sae_tx(sta, tx.seq_num, tx.status_code, &tx.sae_fields[..]);
++        crate::sae_disposition(format_args!(
++            "result=akm_sme_sae_tx category={}",
++            match &state {
++                Ok(akm::AkmState::AuthComplete) => "complete",
++                Ok(akm::AkmState::InProgress) => "in_progress",
++                Ok(akm::AkmState::Failed) => "failed",
++                Err(_) => "send_error",
++            }
++        ));
+         self.akm_state_update_notify_sme(sta, state).await
+     }
+ 
+@@ -1297,11 +1306,58 @@
                      AuthProgress::InProgress => state.into(),
                      AuthProgress::Failed => state.transition_to(Joined).into(),
                  },
@@ -163,8 +179,20 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
 +                        ));
 +                        return state.into();
 +                    }
-+                    match state.on_sme_sae_tx(sta, frame).await {
++                    let progress = state.on_sme_sae_tx(sta, frame).await;
++                    crate::sae_disposition(format_args!(
++                        "result=sme_sae_frame_tx progress={}",
++                        match progress {
++                            AuthProgress::Complete => "complete",
++                            AuthProgress::InProgress => "in_progress",
++                            AuthProgress::Failed => "failed",
++                        }
++                    ));
++                    match progress {
 +                        AuthProgress::Complete => {
++                            crate::sae_disposition(format_args!(
++                                "next_state=associating reason=auth_complete"
++                            ));
 +                            state.transition_to(Associating::default()).into()
 +                        }
 +                        AuthProgress::InProgress => {
@@ -178,15 +206,23 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
 +                            crate::sae_disposition(format_args!(
 +                                "transition=sme_sae_frame_tx_committed before=authenticating after=authenticating old_timer=canceled new_timer=scheduled"
 +                            ));
++                            crate::sae_disposition(format_args!(
++                                "next_state=authenticating reason=auth_in_progress"
++                            ));
 +                            state.into()
 +                        }
-+                        AuthProgress::Failed => state.transition_to(Joined).into(),
++                        AuthProgress::Failed => {
++                            crate::sae_disposition(format_args!(
++                                "next_state=joined reason=auth_failed"
++                            ));
++                            state.transition_to(Joined).into()
++                        }
 +                    }
 +                }
                  MlmeReq::Deauthenticate(_) => {
                      state.on_sme_deauthenticate(sta).await;
                      state.transition_to(Joined).into()
-@@ -1385,7 +1412,7 @@
+@@ -1385,7 +1441,7 @@
          }
      }
  
