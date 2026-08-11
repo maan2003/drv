@@ -340,11 +340,7 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter
     ) -> Result<(), zx::Status> {
         SoftmacHardware::set_channel(
             self,
-            fidl_softmac::WlanSoftmacBaseSetChannelRequest {
-                primary: Some(primary),
-                bandwidth: Some(bandwidth),
-                vht_secondary_80_channel: Some(secondary),
-            },
+            crate::set_channel_request(primary, bandwidth, Some(secondary)),
         )
         .map_err(|_| zx::Status::IO)
     }

@@ -18,8 +18,7 @@ use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use fuchsia_softmac_port::{
     BeaconHintAuthorizer, ChannelBandwidth, ChannelNumber, ConservativeRegulatoryPolicy,
     HardwareScanEvent, MlmeScanEvent, PassiveScanner, ScanRequest, ScanResultCode, ScanTypes,
-    SoftmacHardware, WlanBand, WlanSoftmacBaseSetChannelRequest,
-    WlanSoftmacBaseStartPassiveScanRequest, allowed_passive_channels,
+    SoftmacHardware, WlanBand, WlanSoftmacBaseStartPassiveScanRequest, allowed_passive_channels,
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
@@ -71,8 +70,9 @@ use mt7921_softmac_adapter::client_device::{
 use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig};
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
-    Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites, SourceExactPassiveMechanics,
-    SourceExactPassiveTransport, linux_channel_shape, query_from_capabilities,
+    LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
+    SourceExactPassiveMechanics, SourceExactPassiveTransport, query_from_capabilities,
+    set_channel_request,
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
@@ -1049,11 +1049,11 @@ fn run_contained_dma_resource_round_trip(
                         )
                         .map_err(|error| error.to_string())?;
                         adapter
-                            .set_channel(WlanSoftmacBaseSetChannelRequest {
-                                primary: Some(channel),
-                                bandwidth: Some(ChannelBandwidth::Cbw20),
-                                vht_secondary_80_channel: None,
-                            })
+                            .set_channel(set_channel_request(
+                                channel,
+                                ChannelBandwidth::Cbw20,
+                                None,
+                            ))
                             .map_err(|error| error.to_string())?;
                         record_sae_stage(
                             &format!(
@@ -3354,11 +3354,11 @@ fn run() -> Result<(), String> {
                             let mut total_observations = 0usize;
                             for channel in &channels {
                                 adapter
-                                    .set_channel(WlanSoftmacBaseSetChannelRequest {
-                                        primary: Some(*channel),
-                                        bandwidth: Some(ChannelBandwidth::Cbw20),
-                                        vht_secondary_80_channel: None,
-                                    })
+                                    .set_channel(set_channel_request(
+                                        *channel,
+                                        ChannelBandwidth::Cbw20,
+                                        None,
+                                    ))
                                     .map_err(|error| error.to_string())?;
                                 for attempt in 1..=operation.passive_scan_attempt_limit() {
                                     let response = adapter
@@ -7605,15 +7605,14 @@ fn client_physical_channel(
         WlanBand::FiveGhz => 1,
         _ => return Err(zx::Status::INVALID_ARGS),
     };
-    let (center, bandwidth, center2) =
-        linux_channel_shape(channel.number, bandwidth, secondary.number)
-            .ok_or(zx::Status::INVALID_ARGS)?;
+    let shape = LinuxChannelShape::from_fidl(channel, bandwidth, Some(secondary))
+        .ok_or(zx::Status::INVALID_ARGS)?;
     Ok(ClientPhysicalChannel {
         band,
         primary: u16::from(channel.number),
-        center: u16::from(center),
-        bandwidth,
-        center2: u16::from(center2),
+        center: u16::from(shape.center_channel),
+        bandwidth: shape.bandwidth,
+        center2: u16::from(shape.center_channel2),
     })
 }
 

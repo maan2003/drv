@@ -816,23 +816,20 @@ impl<T: Mt7921PassiveTransport> SoftmacHardware for Mt7921SoftmacAdapter<T> {
         self.ensure_live()?;
         let primary = request.primary.ok_or(AdapterError::InvalidRequest)?;
         let bandwidth = request.bandwidth.ok_or(AdapterError::InvalidRequest)?;
-        let secondary = request
-            .vht_secondary_80_channel
-            .ok_or(AdapterError::InvalidRequest)?;
         if !self.authorized.contains(&primary) {
             return Err(AdapterError::UnauthorizedChannel(primary));
         }
         let candidate = channel_to_candidate(primary, &self.candidates)
             .ok_or(AdapterError::UnauthorizedChannel(primary))?;
-        let (center_channel, bandwidth, center_channel2) =
-            linux_channel_shape(primary.number, bandwidth, secondary.number)
+        let shape =
+            LinuxChannelShape::from_fidl(primary, bandwidth, request.vht_secondary_80_channel)
                 .ok_or(AdapterError::UnsupportedChannelWidth)?;
         self.transport
             .set_channel_context(PhysicalChannelContext {
                 channel: candidate,
-                center_channel,
-                bandwidth,
-                center_channel2,
+                center_channel: shape.center_channel,
+                bandwidth: shape.bandwidth,
+                center_channel2: shape.center_channel2,
             })
             .map_err(|error| self.transport_failure(error))?;
         Ok(())
@@ -956,34 +953,76 @@ fn channel_to_candidate(
 
 /// Convert Fuchsia's channel notation to Linux v7.1.5 mt7921 MCU chandef
 /// fields (`center_ch`, `bw`, `center_ch2`).
-pub fn linux_channel_shape(
-    primary: u8,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxChannelShape {
+    pub center_channel: u8,
+    pub bandwidth: u8,
+    pub center_channel2: u8,
+}
+
+pub fn set_channel_request(
+    primary: ChannelNumber,
     bandwidth: ChannelBandwidth,
-    secondary80: u8,
-) -> Option<(u8, u8, u8)> {
-    let center80 = match primary {
-        36..=48 => 42,
-        52..=64 => 58,
-        100..=112 => 106,
-        116..=128 => 122,
-        132..=144 => 138,
-        148..=161 => 155,
-        _ => 0,
-    };
-    match bandwidth {
-        ChannelBandwidth::Cbw20 => Some((primary, 0, 0)),
-        ChannelBandwidth::Cbw40 => primary.checked_add(2).map(|center| (center, 1, 0)),
-        ChannelBandwidth::Cbw40Below => primary.checked_sub(2).map(|center| (center, 1, 0)),
-        ChannelBandwidth::Cbw80 if center80 != 0 => Some((center80, 2, 0)),
-        ChannelBandwidth::Cbw160 => match primary {
-            36..=64 => Some((50, 3, 0)),
-            100..=128 => Some((114, 3, 0)),
-            _ => None,
-        },
-        ChannelBandwidth::Cbw80P80 if center80 != 0 && secondary80 != 0 => {
-            Some((center80, 6, secondary80))
-        }
-        _ => None,
+    secondary80: Option<ChannelNumber>,
+) -> WlanSoftmacBaseSetChannelRequest {
+    WlanSoftmacBaseSetChannelRequest {
+        primary: Some(primary),
+        bandwidth: Some(bandwidth),
+        vht_secondary_80_channel: secondary80,
+    }
+}
+
+impl LinuxChannelShape {
+    pub fn from_fidl(
+        primary: ChannelNumber,
+        bandwidth: ChannelBandwidth,
+        secondary80: Option<ChannelNumber>,
+    ) -> Option<Self> {
+        let primary_number = primary.number;
+        let secondary_number = match (bandwidth, secondary80) {
+            (ChannelBandwidth::Cbw80P80, Some(secondary))
+                if secondary.band == primary.band && secondary.number != 0 =>
+            {
+                secondary.number
+            }
+            (ChannelBandwidth::Cbw80P80, _) => return None,
+            (_, None) => 0,
+            (_, Some(secondary)) if secondary.band == primary.band && secondary.number == 0 => 0,
+            _ => return None,
+        };
+        let center80 = match primary_number {
+            36..=48 => 42,
+            52..=64 => 58,
+            100..=112 => 106,
+            116..=128 => 122,
+            132..=144 => 138,
+            148..=161 => 155,
+            _ => 0,
+        };
+        let (center_channel, bandwidth, center_channel2) = match bandwidth {
+            ChannelBandwidth::Cbw20 => (primary_number, 0, 0),
+            ChannelBandwidth::Cbw40 => (primary_number.checked_add(2)?, 1, 0),
+            ChannelBandwidth::Cbw40Below => (primary_number.checked_sub(2)?, 1, 0),
+            ChannelBandwidth::Cbw80 if center80 != 0 => (center80, 2, 0),
+            ChannelBandwidth::Cbw160 => match primary_number {
+                36..=64 => (50, 3, 0),
+                100..=128 => (114, 3, 0),
+                _ => return None,
+            },
+            ChannelBandwidth::Cbw80P80
+                if center80 != 0
+                    && matches!(secondary_number, 42 | 58 | 106 | 122 | 138 | 155)
+                    && secondary_number != center80 =>
+            {
+                (center80, 6, secondary_number)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            center_channel,
+            bandwidth,
+            center_channel2,
+        })
     }
 }
 
@@ -1228,6 +1267,109 @@ mod tests {
         }
     }
 
+    fn channel5(number: u8) -> ChannelNumber {
+        ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number,
+        }
+    }
+
+    #[test]
+    fn absent_secondary80_maps_to_zero_for_contiguous_widths() {
+        for (bandwidth, expected) in [
+            (ChannelBandwidth::Cbw20, (36, 0, 0)),
+            (ChannelBandwidth::Cbw40, (38, 1, 0)),
+            (ChannelBandwidth::Cbw80, (42, 2, 0)),
+            (ChannelBandwidth::Cbw160, (50, 3, 0)),
+        ] {
+            let shape = LinuxChannelShape::from_fidl(channel5(36), bandwidth, None).unwrap();
+            assert_eq!(
+                (shape.center_channel, shape.bandwidth, shape.center_channel2),
+                expected
+            );
+        }
+        assert_eq!(
+            LinuxChannelShape::from_fidl(channel5(40), ChannelBandwidth::Cbw40Below, None),
+            Some(LinuxChannelShape {
+                center_channel: 38,
+                bandwidth: 1,
+                center_channel2: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn secondary80_is_required_only_for_valid_80_plus_80() {
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::Cbw80P80,
+                Some(channel5(106)),
+            ),
+            Some(LinuxChannelShape {
+                center_channel: 42,
+                bandwidth: 6,
+                center_channel2: 106,
+            })
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(channel5(36), ChannelBandwidth::Cbw80P80, None),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::Cbw80P80,
+                Some(channel5(0)),
+            ),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::Cbw80P80,
+                Some(channel5(42)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn contradictory_or_malformed_channel_shapes_are_rejected() {
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::Cbw80,
+                Some(channel5(106)),
+            ),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(channel5(36), ChannelBandwidth::Cbw20, Some(channel(0)),),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::Cbw80P80,
+                Some(channel(106)),
+            ),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(channel5(165), ChannelBandwidth::Cbw80, None),
+            None
+        );
+        assert_eq!(
+            LinuxChannelShape::from_fidl(
+                channel5(36),
+                ChannelBandwidth::from_primitive_allow_unknown(77),
+                None,
+            ),
+            None
+        );
+    }
+
     fn new_adapter(authorized: Vec<ChannelNumber>) -> Mt7921SoftmacAdapter<ScriptedTransport> {
         let capability = nic();
         Mt7921SoftmacAdapter::new(
@@ -1261,11 +1403,11 @@ mod tests {
         )
         .unwrap();
         adapter
-            .set_channel(WlanSoftmacBaseSetChannelRequest {
-                primary: Some(channel(1)),
-                bandwidth: Some(ChannelBandwidth::Cbw20),
-                vht_secondary_80_channel: Some(channel(0)),
-            })
+            .set_channel(set_channel_request(
+                channel(1),
+                ChannelBandwidth::Cbw20,
+                None,
+            ))
             .unwrap();
         let response = adapter
             .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
@@ -1553,11 +1695,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
-                primary: Some(channel(1)),
-                bandwidth: Some(ChannelBandwidth::Cbw20),
-                vht_secondary_80_channel: Some(channel(0)),
-            }),
+            adapter.set_channel(set_channel_request(
+                channel(1),
+                ChannelBandwidth::Cbw20,
+                Some(channel(0)),
+            )),
             Err(AdapterError::Transport(
                 SourceExactTransportError::MandatoryDependency(_)
             ))
@@ -1579,11 +1721,11 @@ mod tests {
             2
         );
         assert_eq!(
-            adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
-                primary: Some(channel(6)),
-                bandwidth: Some(ChannelBandwidth::Cbw20),
-                vht_secondary_80_channel: Some(channel(0)),
-            }),
+            adapter.set_channel(set_channel_request(
+                channel(6),
+                ChannelBandwidth::Cbw20,
+                Some(channel(0)),
+            )),
             Err(AdapterError::UnauthorizedChannel(channel(6)))
         );
         assert!(adapter.transport.calls.is_empty());
