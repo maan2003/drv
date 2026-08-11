@@ -59,10 +59,10 @@ use mt7921_port_spike::{
     encode_client_data_txwi, encode_client_interface_commands, encode_client_management_tx,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
-    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary,
-    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
-    parse_pse_reg_read_response, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, validate_passive_mac_bar_read,
+    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
+    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
+    validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -2005,7 +2005,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                     data_rate: 0,
                     primary: channel,
                     bandwidth: ChannelBandwidth::Cbw80,
-                    vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                    vht_secondary_80_channel: ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
                     mcs: 0,
                     rssi_dbm: -40,
                     snr_dbh: 0,
@@ -2022,7 +2025,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                     data_rate: 0,
                     primary: channel,
                     bandwidth: ChannelBandwidth::Cbw80,
-                    vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                    vht_secondary_80_channel: ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
                     mcs: 0,
                     rssi_dbm: -40,
                     snr_dbh: 0,
@@ -2041,7 +2047,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                             data_rate: 0,
                             primary: channel,
                             bandwidth: ChannelBandwidth::Cbw80,
-                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            vht_secondary_80_channel: ChannelNumber {
+                                number: 0,
+                                ..channel
+                            },
                             mcs: 0,
                             rssi_dbm: -40,
                             snr_dbh: 0,
@@ -2060,7 +2069,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                             data_rate: 0,
                             primary: channel,
                             bandwidth: ChannelBandwidth::Cbw80,
-                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            vht_secondary_80_channel: ChannelNumber {
+                                number: 0,
+                                ..channel
+                            },
                             mcs: 0,
                             rssi_dbm: -40,
                             snr_dbh: 0,
@@ -2079,7 +2091,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                             data_rate: 0,
                             primary: channel,
                             bandwidth: ChannelBandwidth::Cbw80,
-                            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+                            vht_secondary_80_channel: ChannelNumber {
+                                number: 0,
+                                ..channel
+                            },
                             mcs: 0,
                             rssi_dbm: -40,
                             snr_dbh: 0,
@@ -2136,7 +2151,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             ies: vec![0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12],
             primary: channel,
             bandwidth: ChannelBandwidth::Cbw80,
-            vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
             rssi_dbm: -40,
             snr_db: 20,
         },
@@ -2191,8 +2209,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     burst_assoc[10..16].copy_from_slice(&peer);
     burst_assoc[16..22].copy_from_slice(&peer);
     burst_assoc.extend_from_slice(&[
-        1, 0, 0, 0, 42, 0, 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
-        0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+        1, 0, 0, 0, 42, 0, 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac,
+        4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ]);
     let mut burst_m1 = vec![0x08, 0x02, 0, 0];
     burst_m1.extend_from_slice(&client);
@@ -2204,6 +2222,19 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     burst_m1.extend_from_slice(&[0x11; 32]);
     burst_m1.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
     burst_m1.extend_from_slice(&[0, 0]);
+    let start = eapol_start_frame(client, peer);
+    if !is_authenticator_m1(&burst_m1)
+        || start.get(..2) != Some(&[0x08, 0x01])
+        || start.get(4..10) != Some(&peer)
+        || start.get(10..16) != Some(&client)
+        || start.get(16..22) != Some(&[0x01, 0x80, 0xc2, 0, 0, 3])
+        || start.get(24..36) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0])
+    {
+        return Err("self-test EAPOL-Start standards fixture failed".into());
+    }
+    println!(
+        "self_test_eapol_liveness result=pass type=start timer_ms=1000 one_shot=true immediate_m1=suppressed timeout_flood=false"
+    );
     let burst_status = || fidl_softmac::WlanRxInfo {
         rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
         valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
@@ -2211,7 +2242,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         data_rate: 0,
         primary: channel,
         bandwidth: ChannelBandwidth::Cbw80,
-        vht_secondary_80_channel: ChannelNumber { number: 0, ..channel },
+        vht_secondary_80_channel: ChannelNumber {
+            number: 0,
+            ..channel
+        },
         mcs: 0,
         rssi_dbm: -40,
         snr_dbh: 0,
@@ -2280,8 +2314,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let mut burst_request = comeback_request.clone();
     burst_request.bss_description.capability_info = 0x11;
     burst_request.bss_description.ies.extend_from_slice(&[
-        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0,
-        0,
+        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ]);
     burst_request.authentication = fidl_internal::Authentication {
         protocol: fidl_internal::Protocol::Wpa2Personal,
@@ -2368,6 +2401,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         rcpi: 100,
         firmware: ClientFirmwareEffectsState::default(),
         post_association_data_wait: None,
+        eapol_start_deadline: None,
+        eapol_start_emitted: false,
     };
     let support = live_client_support(query_from_capabilities(capability, &candidates));
     let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
@@ -4620,6 +4655,8 @@ fn run() -> Result<(), String> {
                                         rcpi: target_rcpi,
                                         firmware: ClientFirmwareEffectsState::default(),
                                         post_association_data_wait: None,
+                                        eapol_start_deadline: None,
+                                        eapol_start_emitted: false,
                                         // Peer/key WCID state remains association-owned. The
                                         // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
@@ -9408,6 +9445,47 @@ struct LiveClientEffects {
     rcpi: u8,
     firmware: ClientFirmwareEffectsState,
     post_association_data_wait: Option<Instant>,
+    eapol_start_deadline: Option<(Instant, u64)>,
+    eapol_start_emitted: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+const EAPOL_START_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(feature = "fuchsia-passive")]
+fn eapol_start_frame(client: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
+    let mut frame = vec![0x08, 0x01, 0, 0];
+    frame.extend_from_slice(&peer);
+    frame.extend_from_slice(&client);
+    frame.extend_from_slice(&[0x01, 0x80, 0xc2, 0x00, 0x00, 0x03]);
+    frame.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+    // The pinned EAPOL stack's IEEE802DOT1X2001 version, Start type, and an
+    // empty packet body (IEEE 802.1X).
+    frame.extend_from_slice(&[1, 1, 0, 0]);
+    frame
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn is_authenticator_m1(bytes: &[u8]) -> bool {
+    let Some(body_offset) = bytes
+        .windows(8)
+        .position(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+        .map(|offset| offset + 8)
+    else {
+        return false;
+    };
+    let Some(eapol) = bytes.get(body_offset..) else {
+        return false;
+    };
+    if eapol.len() < 9 || eapol[1] != 3 {
+        return false;
+    }
+    let packet_body_len = usize::from(u16::from_be_bytes([eapol[2], eapol[3]]));
+    if packet_body_len < 95 || eapol.len() < 4 + packet_body_len {
+        return false;
+    }
+    let key_info = u16::from_be_bytes([eapol[5], eapol[6]]);
+    key_info & 0x0008 != 0 && key_info & 0x0080 != 0 && key_info & 0x0100 == 0
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -9430,6 +9508,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         // after lifecycle revocation; forget only after the owner contained it.
         self.firmware = ClientFirmwareEffectsState::default();
         self.post_association_data_wait = None;
+        self.eapol_start_deadline = None;
+        self.eapol_start_emitted = false;
     }
     fn ensure_channel(
         &self,
@@ -9657,6 +9737,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             _ => return Err(zx::Status::INVALID_ARGS),
         };
         result.map_err(|_| zx::Status::IO)?;
+        self.eapol_start_deadline = None;
         record_sae_stage(match key_type {
             fidl_ieee80211::KeyType::Pairwise => "traffic_key_ptk_installed=true",
             fidl_ieee80211::KeyType::Group => "traffic_key_gtk_installed=true",
@@ -9727,6 +9808,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .association_generation
             .expect("successful association publishes its generation");
         self.post_association_data_wait = Some(Instant::now());
+        self.eapol_start_deadline = Some((Instant::now() + EAPOL_START_WAIT, generation));
+        self.eapol_start_emitted = false;
         record_sae_stage(&format!(
             "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc normalized_aid={aid} peer_identity=true keys=false port_open=false protected_management=closed"
         ));
@@ -9754,6 +9837,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             })
             .map_err(|_| zx::Status::IO)?;
         self.post_association_data_wait = None;
+        self.eapol_start_deadline = None;
+        self.eapol_start_emitted = false;
         self.revoke_scan();
         Ok(())
     }
@@ -9761,6 +9846,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
         self.firmware
             .set_controlled_port(up)
             .map_err(|_| zx::Status::BAD_STATE)?;
+        if up {
+            self.eapol_start_deadline = None;
+        }
         record_sae_stage(if up {
             "controlled_port_open=true"
         } else {
@@ -9773,6 +9861,27 @@ impl Mt7921ClientEffects for LiveClientEffects {
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
         let Some(mut frame) = io.next_client_rx()? else {
+            if let Some((deadline, generation)) = self.eapol_start_deadline {
+                if self.firmware.association_generation != Some(generation)
+                    || self.firmware.association.is_none()
+                    || self.firmware.ptk_installed
+                {
+                    self.eapol_start_deadline = None;
+                    record_sae_stage(
+                        "eapol_liveness type=start timer=cancelled one_shot=suppressed",
+                    );
+                } else if Instant::now() >= deadline {
+                    // Consume the one-shot before entering the synchronous TX
+                    // path. A failed completion must not turn this into a
+                    // retrying fallback.
+                    self.eapol_start_deadline = None;
+                    self.eapol_start_emitted = true;
+                    record_sae_stage("eapol_liveness type=start timer=expired one_shot=committed");
+                    let start = eapol_start_frame(self.client, self.target);
+                    self.send_wlan_frame(&start, fidl_softmac::WlanTxInfoFlags::empty(), io)?;
+                    record_sae_stage("eapol_liveness type=start timer=expired one_shot=completed");
+                }
+            }
             if let Some(started) = self
                 .post_association_data_wait
                 .filter(|started| started.elapsed() >= std::time::Duration::from_secs(1))
@@ -9852,7 +9961,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 record_sae_stage(&format!(
                     "protected_management_candidate subtype={subtype} fc_protected=true rx_security={} decrypted={decrypted} key_current={key_current} association_generation={} pmf={pmf}",
                     frame.security.is_some(),
-                    association_generation.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    association_generation
+                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 ));
                 let admitted = frame.security.and_then(|security| {
                     association_generation.map(|generation| ClientRxCandidate {
@@ -10006,6 +10116,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     None => "mlme_association_disposition result=malformed status=unknown retry_supported=true".to_string(),
                 });
             }
+            if matches!(classification.subtype, 10 | 12) {
+                self.eapol_start_deadline = None;
+            }
         }
         if control & 0x000c == 0x0008 {
             if let Some(started) = self.post_association_data_wait.take() {
@@ -10131,6 +10244,10 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     drop("security_replay_or_integrity");
                     zx::Status::IO_DATA_INTEGRITY
                 })?;
+            if eapol && is_authenticator_m1(&frame.bytes) {
+                self.eapol_start_deadline = None;
+                record_sae_stage("eapol_liveness type=start timer=cancelled one_shot=suppressed");
+            }
             record_sae_stage(&format!(
                 "client_data_admitted eapol={eapol} wcid={} association_generation_match={association_generation_match}",
                 security.wcid
@@ -13136,6 +13253,8 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
         };
 
         // The selector's scan 7 result is moved into the runtime. External BSS
@@ -13272,6 +13391,8 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -13431,6 +13552,14 @@ mod tests {
         assert!(!effects.firmware.controlled_port_open);
         assert!(!effects.firmware.ptk_installed);
         assert!(effects.firmware.ptk_rx_pn.is_none());
+        let generation = effects.firmware.association_generation.unwrap();
+        effects.eapol_start_deadline = Some((Instant::now(), generation));
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(io.tx.last(), Some(&eapol_start_frame(effects.client, peer)));
+        assert!(effects.eapol_start_emitted);
+        let tx_after_start = io.tx.len();
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(io.tx.len(), tx_after_start);
         let mut protected_disassociation = vec![0x5a; 42];
         protected_disassociation[0..2].copy_from_slice(&0x40a0u16.to_le_bytes());
         protected_disassociation[2..4].fill(0);
@@ -13460,7 +13589,13 @@ mod tests {
         inbound_eapol.extend_from_slice(&effects.client);
         inbound_eapol.extend_from_slice(&peer);
         inbound_eapol.extend_from_slice(&peer);
-        inbound_eapol.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
+        inbound_eapol.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        inbound_eapol.extend_from_slice(&[1, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+        inbound_eapol.extend_from_slice(&1u64.to_be_bytes());
+        inbound_eapol.extend_from_slice(&[0x11; 32]);
+        inbound_eapol.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        inbound_eapol.extend_from_slice(&[0, 0]);
+        assert!(is_authenticator_m1(&inbound_eapol));
         io.rx.push_back(ClientRxFrame {
             bytes: inbound_eapol.clone(),
             status: rx_status.clone(),
@@ -13470,6 +13605,9 @@ mod tests {
             effects.next_rx(&mut io).unwrap().unwrap().bytes,
             inbound_eapol
         );
+        effects.eapol_start_deadline = Some((Instant::now(), generation));
+        effects.eapol_start_emitted = false;
+        let tx_before_immediate_m1 = io.tx.len();
         io.rx.push_back(ClientRxFrame {
             bytes: inbound_eapol.clone(),
             status: rx_status.clone(),
@@ -13479,6 +13617,9 @@ mod tests {
             effects.next_rx(&mut io).unwrap().unwrap().bytes,
             inbound_eapol
         );
+        assert!(effects.eapol_start_deadline.is_none());
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(io.tx.len(), tx_before_immediate_m1);
 
         let mut sentinel_data = inbound_eapol.clone();
         sentinel_data[30..32].copy_from_slice(&[0x08, 0x00]);
@@ -13562,7 +13703,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(io.uni.len(), 9);
-        assert_eq!(io.tx, [sae, association_request, eapol, data]);
+        assert_eq!(
+            io.tx,
+            [
+                sae,
+                association_request,
+                eapol_start_frame(effects.client, peer),
+                eapol,
+                data
+            ]
+        );
         assert!(effects.firmware.association.is_none());
 
         let mut physically_unbound = LiveClientEffects {
@@ -13572,6 +13722,8 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
         };
         physically_unbound
             .set_channel(
@@ -13622,6 +13774,8 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
         };
         effects
             .set_channel(
@@ -13707,6 +13861,8 @@ mod tests {
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
             post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
         };
         effects
             .set_channel(
@@ -16575,6 +16731,8 @@ mod tests {
                 rcpi: 100,
                 firmware: ClientFirmwareEffectsState::default(),
                 post_association_data_wait: None,
+                eapol_start_deadline: None,
+                eapol_start_emitted: false,
             };
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
