@@ -542,6 +542,12 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
                 status.primary.number
             );
         }
+        let eapol = bytes
+            .windows(8)
+            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        if eapol {
+            println!("client_eapol_stage=adapter_return controlled_port_independent=true");
+        }
         wlan_mlme::MlmeImpl::handle_mac_frame_rx(mlme, &bytes, status, fuchsia_trace::Id::new())
             .await;
         if let Some(auth) = safe_auth_stage(&bytes) {
@@ -552,6 +558,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
                 "client_mlme_rx stage=handle_complete algorithm={} transaction={} status={} rejected_group={:?}",
                 auth.algorithm, auth.transaction, auth.status, auth.rejected_group
             );
+        }
+        if eapol {
+            println!("client_eapol_stage=mlme_handle_complete");
         }
         Ok(true)
     }
@@ -696,6 +705,7 @@ where
             match self.requests.try_recv() {
                 Ok(request) => {
                     let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
+                    let eapol_tx = matches!(&request, wlan_sme::MlmeRequest::Eapol(_));
                     if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
                         println!(
                             "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
@@ -703,6 +713,9 @@ where
                             frame.status_code.into_primitive(),
                             safe_sae_group(frame)
                         );
+                    }
+                    if eapol_tx {
+                        println!("client_eapol_stage=sme_tx_request");
                     }
                     let name = request.name();
                     wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
@@ -720,6 +733,9 @@ where
                             "client_sae_stage=mlme_request_complete state={}",
                             self.mlme.sae_state_name()
                         );
+                    }
+                    if eapol_tx {
+                        println!("client_eapol_stage=mlme_tx_request_complete");
                     }
                     progressed = true;
                 }
@@ -748,6 +764,11 @@ where
                             frame.seq_num,
                             frame.status_code.into_primitive(),
                             safe_sae_group(frame)
+                        );
+                    }
+                    if matches!(&event, fidl_mlme::MlmeEvent::EapolInd { .. }) {
+                        println!(
+                            "client_eapol_stage=mlme_indication_forwarded_to_sme controlled_port_closed_allowed=true"
                         );
                     }
                     Station::on_mlme_event(&mut self.sme, event);

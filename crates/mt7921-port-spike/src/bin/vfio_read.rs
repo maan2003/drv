@@ -55,9 +55,9 @@ use mt7921_port_spike::{
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
     ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
-    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_data_txwi,
-    encode_client_interface_commands, encode_client_management_tx, encode_disable_keys_command,
-    encode_gtk_command, encode_igtk_command, encode_key_v2_command,
+    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
+    encode_client_data_txwi, encode_client_interface_commands, encode_client_management_tx,
+    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
@@ -1539,9 +1539,36 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     rx_gate
         .bind_join(peer, rx_channel, 100)
         .map_err(|error| format!("self-test E2E48 bind: {error}"))?;
+    let mut activation_commands = Vec::new();
     rx_gate
-        .associate(association, rx_channel, |_, _| Ok(()))
+        .associate(association, rx_channel, |cid, command| {
+            activation_commands.push((cid, command.to_vec()));
+            Ok(())
+        })
         .map_err(|error| format!("self-test E2E48 association: {error}"))?;
+    let expected_bss = encode_client_bss_command(1, 0, peer, 36, 100, true, true)
+        .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
+    let expected_peer = encode_legacy_wme_add_wcid_command(2, 0, 7, 42, peer, 100)
+        .map_err(|error| format!("self-test association peer fixture: {error}"))?;
+    if activation_commands != [(2, expected_bss), (3, expected_peer)]
+        || !rx_gate.bss_programmed
+        || !rx_gate.association.is_some_and(|active| {
+            active.bss_index == 0
+                && active.peer_wcid == 7
+                && active.aid == 42
+                && active.peer == peer
+        })
+        || rx_gate.association_generation.is_none()
+        || rx_gate.controlled_port_open
+        || rx_gate.tx_generation(true).is_err()
+    {
+        return Err(
+            "self-test association did not publish exact data-RX/EAPOL-ready activation".into(),
+        );
+    }
+    println!(
+        "self_test_association_activation result=pass cid_order=2,3 bss_active=true peer_wcid=7 association_generation=true controlled_port_open=false eapol_ready=true"
+    );
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
         generation,
@@ -1685,6 +1712,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         client,
         rcpi: 100,
         firmware: ClientFirmwareEffectsState::default(),
+        post_association_data_wait: None,
     };
     let support = live_client_support(query_from_capabilities(capability, &candidates));
     let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
@@ -3936,6 +3964,7 @@ fn run() -> Result<(), String> {
                                             .bytes(),
                                         rcpi: target_rcpi,
                                         firmware: ClientFirmwareEffectsState::default(),
+                                        post_association_data_wait: None,
                                         // Peer/key WCID state remains association-owned. The
                                         // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
@@ -6481,6 +6510,25 @@ fn passive_mac_address_allowed(address: u32) -> bool {
         })
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn passive_mac_read_address_allowed(address: u32) -> bool {
+    passive_mac_address_allowed(address)
+        || matches!(
+            address,
+            0x820e_5000 | 0x820e_5004 | 0x820f_5000 | 0x820f_5004
+        )
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
+    match address {
+        0x820e_5000 | 0x820e_5004 => Ok(0x0002_1400 + (address - 0x820e_5000) as usize),
+        0x820f_5000 | 0x820f_5004 => Ok(0x000a_1400 + (address - 0x820f_5000) as usize),
+        _ => passive_mac_bar_offset(address)
+            .map_err(|error| format!("translate passive MAC read: {error:?}")),
+    }
+}
+
 fn classify_mcu_completion(
     command: DownloadCommand,
     response: &ReceivedMcuResponse,
@@ -7816,8 +7864,7 @@ fn run_passive_prepare_steps<E>(
 #[cfg(feature = "fuchsia-passive")]
 impl PassiveMacExecutor<'_> {
     fn page(&self, address: u32) -> Result<&ReadPage, String> {
-        let offset = passive_mac_bar_offset(address)
-            .map_err(|error| format!("translate passive MAC address: {error:?}"))?;
+        let offset = passive_mac_read_bar_offset(address)?;
         let bar_page = offset & !(PAGE - 1);
         self.pages
             .iter()
@@ -8432,6 +8479,7 @@ struct LiveClientEffects {
     client: [u8; 6],
     rcpi: u8,
     firmware: ClientFirmwareEffectsState,
+    post_association_data_wait: Option<Instant>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8453,6 +8501,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         // Device reset/stop owns transport containment. Do not issue new DMA
         // after lifecycle revocation; forget only after the owner contained it.
         self.firmware = ClientFirmwareEffectsState::default();
+        self.post_association_data_wait = None;
     }
     fn ensure_channel(
         &self,
@@ -8683,7 +8732,17 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 },
             )
             .map_err(|_| zx::Status::IO)?;
-        record_sae_stage("association_firmware_configured=true");
+        let generation = self
+            .firmware
+            .association_generation
+            .expect("successful association publishes its generation");
+        self.post_association_data_wait = Some(Instant::now());
+        record_sae_stage(&format!(
+            "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid=7 wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true"
+        ));
+        record_sae_stage(
+            "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
+        );
         Ok(())
     }
     fn clear_association(
@@ -8701,6 +8760,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     .map_err(|status| status.to_string())
             })
             .map_err(|_| zx::Status::IO)?;
+        self.post_association_data_wait = None;
         self.revoke_scan();
         Ok(())
     }
@@ -8720,6 +8780,16 @@ impl Mt7921ClientEffects for LiveClientEffects {
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
         let Some(frame) = io.next_client_rx()? else {
+            if let Some(started) = self
+                .post_association_data_wait
+                .filter(|started| started.elapsed() >= std::time::Duration::from_secs(1))
+            {
+                record_sae_stage(&format!(
+                    "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
+                    started.elapsed().as_millis()
+                ));
+                self.post_association_data_wait = None;
+            }
             return Ok(None);
         };
         let control = frame
@@ -8769,6 +8839,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Ok(None);
         }
         if control & 0x000c == 0x0008 {
+            if let Some(started) = self.post_association_data_wait.take() {
+                record_sae_stage(&format!(
+                    "post_association_first_data result=observed elapsed_ms={} data_candidate=true",
+                    started.elapsed().as_millis()
+                ));
+            }
             let admitted = self.firmware.association.is_some()
                 && control & 0x0300 == 0x0200
                 && frame.bytes.get(4..10) == Some(&self.client)
@@ -9244,7 +9320,38 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
         self.loader
             .send_acknowledged_uni_command(expected_cid, encoded)
-            .map_err(|_| zx::Status::IO)
+            .map_err(|_| zx::Status::IO)?;
+        // Linux's association STA add is CID 3 with this exact five-TLV
+        // fixture. Observe, but never mutate, the source-owned RX state after
+        // its ACK so a no-data run distinguishes filtering from ring ingress.
+        if expected_cid == 3 && encoded.len() == 176 {
+            let mac = PassiveMacExecutor {
+                pages: self.mac_pages,
+            };
+            let rfcr = [
+                mac.read(0x820e_5000),
+                mac.read(0x820e_5004),
+                mac.read(0x820f_5000),
+                mac.read(0x820f_5004),
+            ];
+            let ring = [
+                self.loader.mcu.wfdma.read(0xd4208),
+                self.loader.mcu.wfdma.read(0xd4520),
+                self.loader.mcu.wfdma.read(0xd4524),
+                self.loader.mcu.wfdma.read(0xd4528),
+                self.loader.mcu.wfdma.read(0xd452c),
+            ];
+            match (rfcr, ring) {
+                (
+                    [Ok(rfcr0), Ok(rfcr1), Ok(rfcr0_band1), Ok(rfcr1_band1)],
+                    [Ok(glo), Ok(base), Ok(count), Ok(cidx), Ok(didx)],
+                ) => record_sae_stage(&format!(
+                    "association_rx_config rfcr0={rfcr0:#010x} rfcr1={rfcr1:#010x} rfcr0_band1={rfcr0_band1:#010x} rfcr1_band1={rfcr1_band1:#010x} wfdma_glo={glo:#010x} data_ring_base={base:#010x} data_ring_count={count} data_ring_cidx={cidx} data_ring_didx={didx}"
+                )),
+                _ => record_sae_stage("association_rx_config result=read_unavailable"),
+            }
+        }
+        Ok(())
     }
 
     fn transmit_client(
@@ -10005,22 +10112,29 @@ impl ReadPage {
     }
     #[cfg(feature = "fuchsia-passive")]
     fn read_passive_mac(&self, address: u32) -> Result<u32, String> {
-        if !passive_mac_address_allowed(address) {
+        if !passive_mac_read_address_allowed(address) {
             return Err(format!(
                 "passive MAC read {address:#010x} escaped exact plan"
             ));
         }
-        let offset = passive_mac_bar_offset(address)
-            .map_err(|error| format!("translate passive MAC read: {error:?}"))?;
+        let offset = passive_mac_read_bar_offset(address)?;
         if self.bar_page != offset & !(PAGE - 1) {
             return Err(format!(
                 "passive MAC read {address:#010x} used wrong fixed BAR page"
             ));
         }
         let value = self.read(offset)?;
-        validate_passive_mac_bar_read(address, value)
-            .map(|(_, value)| value)
-            .map_err(|error| format!("validate passive MAC read: {error:?}"))
+        if passive_mac_address_allowed(address) {
+            validate_passive_mac_bar_read(address, value)
+                .map(|(_, value)| value)
+                .map_err(|error| format!("validate passive MAC read: {error:?}"))
+        } else if value == u32::MAX {
+            Err(format!(
+                "passive MAC read {address:#010x} returned all ones"
+            ))
+        } else {
+            Ok(value)
+        }
     }
     #[cfg(feature = "fuchsia-passive")]
     fn write_passive_mac(&self, address: u32, value: u32) -> Result<(), String> {
@@ -11635,6 +11749,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
+            post_association_data_wait: None,
         };
 
         // The selector's scan 7 result is moved into the runtime. External BSS
@@ -11770,6 +11885,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
+            post_association_data_wait: None,
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -11932,6 +12048,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
+            post_association_data_wait: None,
         };
         physically_unbound
             .set_channel(
@@ -11981,6 +12098,7 @@ mod tests {
             client,
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
+            post_association_data_wait: None,
         };
         effects
             .set_channel(
@@ -12065,6 +12183,7 @@ mod tests {
             client,
             rcpi: 100,
             firmware: ClientFirmwareEffectsState::default(),
+            post_association_data_wait: None,
         };
         effects
             .set_channel(
@@ -14888,6 +15007,7 @@ mod tests {
                 client,
                 rcpi: 100,
                 firmware: ClientFirmwareEffectsState::default(),
+                post_association_data_wait: None,
             };
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
