@@ -1483,6 +1483,26 @@ impl Drop for SaeCommittedSelfTestMechanics {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn e2e48_translation_error_eapol_frame(client: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
+    // E2E48's exact post-association descriptor shape: GROUP1/2/3,
+    // HDR_TRANS clear, HDR_TRANS_ERROR set, and unicast-search sentinel.
+    let mut rx = vec![0; 56 + 34];
+    let length = rx.len() as u32;
+    rx[0..4].copy_from_slice(&((2u32 << 27) | length).to_le_bytes());
+    rx[4..8].copy_from_slice(&((0x07u32 << 11) | 1023).to_le_bytes());
+    rx[8..12].copy_from_slice(&0x4200_0c40u32.to_le_bytes());
+    rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+    rx[52..56].copy_from_slice(&0x7878u32.to_le_bytes());
+    let frame = &mut rx[56..];
+    frame[0..2].copy_from_slice(&0x0208u16.to_le_bytes());
+    frame[4..10].copy_from_slice(&client);
+    frame[10..16].copy_from_slice(&peer);
+    frame[16..22].copy_from_slice(&peer);
+    frame[24..34].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
+    rx
+}
+
+#[cfg(feature = "fuchsia-passive")]
 async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let client = [2, 0, 0, 0, 0, 1];
     let peer = [2, 0, 0, 0, 0, 2];
@@ -1490,6 +1510,70 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         band: WlanBand::FiveGhz,
         number: 36,
     };
+    let raw_eapol = e2e48_translation_error_eapol_frame(client, peer);
+    let parsed_eapol = parse_connac2_rx_frame(&raw_eapol)
+        .map_err(|error| format!("self-test E2E48 raw EAPOL parse: {error:?}"))?;
+    if parsed_eapol.bytes.get(24..32) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
+        return Err("self-test E2E48 raw EAPOL decapsulation failed".into());
+    }
+    let association = LegacyWmeAssociation {
+        bss_index: 0,
+        peer_wcid: 7,
+        aid: 42,
+        peer,
+        rcpi: 100,
+        negotiated_qos: true,
+        mfp_required: false,
+    };
+    let mut rx_gate = ClientFirmwareEffectsState::default();
+    let rx_channel = mt7921_port_spike::ClientChannelLease {
+        channel: ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 36,
+            bandwidth: 0,
+            center2: 0,
+        },
+        generation: 1,
+    };
+    rx_gate
+        .bind_join(peer, rx_channel, 100)
+        .map_err(|error| format!("self-test E2E48 bind: {error}"))?;
+    rx_gate
+        .associate(association, rx_channel, |_, _| Ok(()))
+        .map_err(|error| format!("self-test E2E48 association: {error}"))?;
+    let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
+    let candidate = ClientRxCandidate {
+        generation,
+        eapol: true,
+        wcid: 1023,
+        tid: 0,
+        group: false,
+        key_id: 0,
+        security_mode: 0,
+        cm: false,
+        clm: false,
+        icv_error: false,
+        mic_error: false,
+        fcs_error: false,
+        pn: [0; 6],
+    };
+    rx_gate
+        .deliver_rx(candidate)
+        .map_err(|error| format!("self-test E2E48 pre-key EAPOL gate: {error}"))?;
+    let mut non_eapol = candidate;
+    non_eapol.eapol = false;
+    if rx_gate.deliver_rx(non_eapol).is_ok() {
+        return Err("self-test E2E48 sentinel admitted non-EAPOL data".into());
+    }
+    let mut malformed = raw_eapol;
+    malformed[0..4].copy_from_slice(&((2u32 << 27) | 55).to_le_bytes());
+    if parse_connac2_rx_frame(&malformed) != Err(PassiveRxError::Truncated) {
+        return Err("self-test E2E48 malformed descriptor was not terminal".into());
+    }
+    println!(
+        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true eapol=admitted wcid=1023 non_eapol=filtered malformed=terminal"
+    );
     let mut auth = vec![0; 32];
     auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
     auth[4..10].copy_from_slice(&client);
@@ -8709,19 +8793,22 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 .bytes
                 .windows(8)
                 .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+            if security.wcid == 1023 && (!eapol || frame.bytes.get(16..22) != Some(&self.target)) {
+                record_sae_stage(
+                    "client_rx_filtered reason=unicast_search_miss_non_eapol subtype=data",
+                );
+                return Ok(None);
+            }
             let generation = self
                 .firmware
                 .tx_generation(eapol)
                 .map_err(|_| zx::Status::ACCESS_DENIED)?;
-            let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
             self.firmware
                 .deliver_rx(ClientRxCandidate {
                     generation,
                     eapol,
-                    wcid: security
-                        .wcid
-                        .try_into()
-                        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?,
+                    wcid: security.wcid,
                     tid: security.tid,
                     group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
                     key_id: security.key_id,
@@ -11411,7 +11498,9 @@ mod tests {
                 .deliver_rx(ClientRxCandidate {
                     generation: association_generation,
                     eapol: true,
-                    wcid: 7,
+                    // Hardware reports the pre-key raw EAPOL path against
+                    // the unicast-search sentinel rather than peer WCID 7.
+                    wcid: 1023,
                     tid: 7,
                     group: false,
                     key_id: 0,
@@ -11451,6 +11540,10 @@ mod tests {
         };
         state.deliver_rx(normal).unwrap();
         assert!(state.deliver_rx(normal).is_err());
+        let mut sentinel_data = normal;
+        sentinel_data.wcid = 1023;
+        sentinel_data.pn[5] = 7;
+        assert!(state.deliver_rx(sentinel_data).is_err());
         let mut wrong_crypto = normal;
         wrong_crypto.pn[5] = 7;
         wrong_crypto.cm = true;
@@ -11726,6 +11819,57 @@ mod tests {
             .unwrap();
         assert_eq!(io.uni.len(), 2);
         assert!(!effects.firmware.controlled_port_open);
+
+        let rx_status = fidl_softmac::WlanRxInfo {
+            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
+            mcs: 0,
+            rssi_dbm: -40,
+            snr_dbh: 0,
+        };
+        let sentinel_security = ClientRxSecurity {
+            wcid: 1023,
+            tid: 0,
+            key_id: 0,
+            security_mode: 0,
+            cm: false,
+            clm: false,
+            icv_error: false,
+            mic_error: false,
+            fcs_error: false,
+            pn: None,
+        };
+        let mut inbound_eapol = vec![0x08, 0x02, 0, 0];
+        inbound_eapol.extend_from_slice(&effects.client);
+        inbound_eapol.extend_from_slice(&peer);
+        inbound_eapol.extend_from_slice(&peer);
+        inbound_eapol.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 2]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: inbound_eapol.clone(),
+            status: rx_status.clone(),
+            security: Some(sentinel_security),
+        });
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            inbound_eapol
+        );
+
+        let mut sentinel_data = inbound_eapol.clone();
+        sentinel_data[30..32].copy_from_slice(&[0x08, 0x00]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: sentinel_data,
+            status: rx_status,
+            security: Some(sentinel_security),
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
 
         let mut eapol = vec![0x08, 0x01, 0, 0];
         eapol.extend_from_slice(&peer);
@@ -14484,6 +14628,25 @@ mod tests {
         frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
         frame[36..].copy_from_slice(&[0, 3, b'a', b'p', b'1']);
         rx
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn e2e48_hdr_trans_error_without_translation_preserves_raw_eapol() {
+        let client = [1, 2, 3, 4, 5, 6];
+        let peer = [6, 5, 4, 3, 2, 1];
+        let rx = e2e48_translation_error_eapol_frame(client, peer);
+        let parsed = parse_connac2_rx_frame(&rx).unwrap();
+        assert_eq!(&parsed.bytes[4..10], &client);
+        assert_eq!(&parsed.bytes[10..22], &[peer, peer].concat());
+        assert_eq!(&parsed.bytes[24..32], &[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+
+        let mut malformed = rx;
+        malformed[0..4].copy_from_slice(&((2u32 << 27) | 55).to_le_bytes());
+        assert_eq!(
+            parse_connac2_rx_frame(&malformed),
+            Err(PassiveRxError::Truncated)
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]

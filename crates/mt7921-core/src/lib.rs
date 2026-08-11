@@ -3144,10 +3144,10 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
-    // Bit 28 is BAND_IDX on Connac2, not an RX error.
-    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0
-        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
-    {
+    // Bit 28 is BAND_IDX on Connac2, not an RX error. Pinned Linux also
+    // ignores HDR_TRANS_ERROR (RXD2 bit 25): when HDR_TRANS below is clear,
+    // the payload is still the raw 802.11 frame.
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0 || rxd2 & ((1 << 23) | (1 << 24)) != 0 {
         return Err(PassiveRxError::RxError);
     }
     if rxd2 & (1 << 13) != 0 {
@@ -5013,10 +5013,9 @@ pub fn parse_mt7921_auth_rx(bytes: &[u8]) -> Result<Mt7921AuthRx, PassiveRxError
     if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
-    // Bit 28 is BAND_IDX on Connac2, not an RX error.
-    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0
-        || rxd2 & ((1 << 23) | (1 << 24) | (1 << 25)) != 0
-    {
+    // Match parse_connac2_rx_frame: HDR_TRANS_ERROR without HDR_TRANS still
+    // carries a usable raw 802.11 authentication frame.
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0 || rxd2 & ((1 << 23) | (1 << 24)) != 0 {
         return Err(PassiveRxError::RxError);
     }
     if rxd2 & (1 << 13) != 0 {
@@ -5550,7 +5549,7 @@ pub enum ClientDataGeneration {
 pub struct ClientRxCandidate {
     pub generation: ClientDataGeneration,
     pub eapol: bool,
-    pub wcid: u8,
+    pub wcid: u16,
     pub tid: u8,
     pub group: bool,
     pub key_id: u8,
@@ -5966,7 +5965,11 @@ impl ClientFirmwareEffectsState {
     }
 
     pub fn deliver_rx(&mut self, rx: ClientRxCandidate) -> Result<(), String> {
-        if self.tx_generation(rx.eapol)? != rx.generation || rx.wcid != 7 || rx.tid >= 16 {
+        let pre_key_eapol = rx.eapol && rx.wcid == 1023 && rx.security_mode == 0;
+        if self.tx_generation(rx.eapol)? != rx.generation
+            || (rx.wcid != 7 && !pre_key_eapol)
+            || rx.tid >= 16
+        {
             return Err("stale or foreign client RX".into());
         }
         if rx.security_mode == 0 && rx.eapol {
@@ -10885,6 +10888,7 @@ mod tests {
         let rxd0 = (2u32 << 27) | rx.len() as u32;
         rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
         rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        rx[8..12].copy_from_slice(&(1u32 << 25).to_le_bytes());
         rx[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
         let frame = &mut rx[32..];
         frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
@@ -10895,6 +10899,7 @@ mod tests {
         frame[26..28].copy_from_slice(&1u16.to_le_bytes());
         frame[28..30].copy_from_slice(&0u16.to_le_bytes());
         frame[30..34].copy_from_slice(&[9, 8, 7, 6]);
+        assert_eq!(parse_connac2_rx_frame(&rx).unwrap().bytes, rx[32..]);
         assert_eq!(
             parse_mt7921_auth_rx(&rx),
             Ok(Mt7921AuthRx {
