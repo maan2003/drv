@@ -5144,6 +5144,9 @@ pub fn encode_legacy_wme_add_wcid_command(
     peer: [u8; 6],
     rcpi: u8,
 ) -> Result<Vec<u8>, String> {
+    if !(1..=2007).contains(&aid) {
+        return Err("associated WCID AID escaped infrastructure range".into());
+    }
     encode_legacy_wme_wcid_command(sequence, bss_index, wcid, aid, peer, rcpi, true)
 }
 
@@ -5366,6 +5369,20 @@ pub struct ClientTargetBssLease {
 pub struct PreAssociationSaeAuth {
     pub transaction: u16,
     pub status: u16,
+}
+
+/// Normalize the raw two-byte AID field carried by a successful legacy
+/// infrastructure association response. IEEE 802.11 reserves the top two bits
+/// as ones on the wire; firmware receives only the bounded association ID.
+pub fn normalize_infrastructure_aid(raw: u16) -> Result<u16, &'static str> {
+    if raw & 0xc000 != 0xc000 {
+        return Err("association response AID omitted reserved-bit form");
+    }
+    let aid = raw & 0x3fff;
+    if !(1..=2007).contains(&aid) {
+        return Err("association response AID escaped infrastructure range");
+    }
+    Ok(aid)
 }
 
 /// Safely classify only the fixed 802.11 Authentication envelope. SAE body
@@ -7556,6 +7573,16 @@ mod tests {
         ));
         lease.invalidate();
         assert!(!lease.permits_join(bssid, channel_lease));
+    }
+
+    #[test]
+    fn infrastructure_aid_normalization_matches_linux_assoc_boundary() {
+        assert_eq!(normalize_infrastructure_aid(0xc004), Ok(4));
+        assert_eq!(normalize_infrastructure_aid(0xc7d7), Ok(2007));
+        for malformed in [0, 4, 0xc000, 0xc7d8, 0xffff] {
+            assert!(normalize_infrastructure_aid(malformed).is_err());
+        }
+        assert!(encode_legacy_wme_add_wcid_command(1, 0, 7, 0, [1, 2, 3, 4, 5, 6], 100).is_err());
     }
 
     #[test]

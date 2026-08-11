@@ -59,10 +59,10 @@ use mt7921_port_spike::{
     encode_client_data_txwi, encode_client_interface_commands, encode_client_management_tx,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
-    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
-    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    validate_passive_mac_bar_read,
+    encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary,
+    normalize_infrastructure_aid, parse_connac2_rx_frame, parse_passive_advertisement,
+    parse_passive_scan_done, parse_pse_reg_read_response, passive_mac_bar_offset,
+    passive_mac_mmio_plan, passive_mac_source_rmw_value, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -8864,10 +8864,11 @@ impl Mt7921ClientEffects for LiveClientEffects {
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
         let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
-        let aid = configuration
+        let raw_aid = configuration
             .aid
             .filter(|aid| *aid != 0)
             .ok_or(zx::Status::INVALID_ARGS)?;
+        let aid = normalize_infrastructure_aid(raw_aid).map_err(|_| zx::Status::INVALID_ARGS)?;
         if peer != self.target {
             return Err(zx::Status::ACCESS_DENIED);
         }
@@ -8905,7 +8906,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .expect("successful association publishes its generation");
         self.post_association_data_wait = Some(Instant::now());
         record_sae_stage(&format!(
-            "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc aid={aid} peer_identity=true keys=false port_open=false"
+            "firmware_wcid_stage stage=associated peer_wcid=7 sta_state=assoc raw_aid={raw_aid} normalized_aid={aid} peer_identity=true keys=false port_open=false"
         ));
         record_sae_stage(&format!(
             "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid=7 wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true"
@@ -12223,7 +12224,7 @@ mod tests {
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
-            aid: Some(42),
+            aid: Some(0xc004),
             qos: Some(true),
             ..Default::default()
         };
@@ -12284,7 +12285,7 @@ mod tests {
         association_response[4..10].copy_from_slice(&[1, 1, 1, 1, 1, 1]);
         association_response[10..16].copy_from_slice(&peer);
         association_response[16..22].copy_from_slice(&peer);
-        association_response[28..30].copy_from_slice(&42u16.to_le_bytes());
+        association_response[28..30].copy_from_slice(&0xc004u16.to_le_bytes());
         io.rx.push_back(ClientRxFrame {
             bytes: association_response.clone(),
             status: rx_status.clone(),
@@ -12304,10 +12305,35 @@ mod tests {
             association_response
         );
         assert!(effects.firmware.association.is_none());
+        for raw_aid in [0xc000, 0xc7d8, 4] {
+            assert_eq!(
+                effects.notify_association_complete(
+                    &fidl_softmac::WlanAssociationConfig {
+                        bssid: Some(peer),
+                        aid: Some(raw_aid),
+                        qos: Some(true),
+                        ..Default::default()
+                    },
+                    &mut io,
+                ),
+                Err(zx::Status::INVALID_ARGS)
+            );
+        }
+        assert!(effects.firmware.association.is_none());
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
         assert_eq!(io.uni.len(), 3);
+        assert_eq!(u16::from_le_bytes(io.uni[2][66..68].try_into().unwrap()), 4);
+        assert_eq!(
+            u16::from_le_bytes(io.uni[2][144..146].try_into().unwrap()),
+            4
+        );
+        assert_eq!(
+            u16::from_le_bytes(association_response[28..30].try_into().unwrap()),
+            0xc004
+        );
+        assert_eq!(effects.firmware.association.unwrap().aid, 4);
         assert!(!effects.firmware.controlled_port_open);
         let peer_security = ClientRxSecurity {
             wcid: 7,
