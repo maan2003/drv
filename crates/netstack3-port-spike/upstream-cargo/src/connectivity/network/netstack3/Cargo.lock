@@ -790,6 +790,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_matches",
+ "eapol",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",

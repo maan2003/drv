@@ -1117,6 +1117,7 @@ dependencies = [
  "tokio",
  "wlan-mlme",
  "wlan-sme",
+ "wlan-softmac-class-support",
  "zx",
 ]
 
@@ -2490,6 +2491,14 @@ dependencies = [
  "wlan-rsn",
  "wlan-statemachine",
  "zx",
+]
+
+[[package]]
+name = "wlan-softmac-class-support"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-softmac",
 ]
 
 [[package]]
