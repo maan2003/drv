@@ -5102,6 +5102,9 @@ fn encode_legacy_wme_wcid_command(
     rcpi: u8,
     basic_rates: u16,
     legacy_rates: u16,
+    ht_cap: Option<[u8; 26]>,
+    vht_cap: Option<[u8; 12]>,
+    bandwidth: u8,
     associated: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence) {
@@ -5129,7 +5132,91 @@ fn encode_legacy_wme_wcid_command(
     bytes[132..138].copy_from_slice(&peer);
     bytes[141] = u8::from(associated);
     bytes[144..146].copy_from_slice(&aid.to_le_bytes());
-    Ok(bytes)
+    if !associated || ht_cap.is_none() {
+        return Ok(bytes);
+    }
+    let ht = ht_cap.expect("checked");
+    if bandwidth > 3 {
+        return Err("HT/VHT station context escaped negotiated bandwidth".into());
+    }
+    let mut expanded = bytes[..76].to_vec();
+    expanded.extend_from_slice(&[9, 0, 8, 0, ht[0], ht[1], 0, 0]);
+    if let Some(vht) = vht_cap {
+        expanded.extend_from_slice(&[
+            10, 0, 16, 0, vht[0], vht[1], vht[2], vht[3], vht[4], vht[5], vht[8], vht[9],
+            0, 0, 0, 0,
+        ]);
+    }
+    let max_mpdu = vht_cap.is_some_and(|vht| vht[0] & 3 >= 1) || ht[1] & 0x08 != 0;
+    expanded.extend_from_slice(&[15, 0, 8, 0, 8, u8::from(max_mpdu), 1, 0]);
+
+    let phy_start = expanded.len();
+    expanded.extend_from_slice(&bytes[76..88]);
+    expanded[phy_start + 6] = 0x08 | 0x10 | if vht_cap.is_some() { 0x20 } else { 0 };
+    expanded[phy_start + 7] = ht[2] & 0x1f;
+    let ra_start = expanded.len();
+    expanded.extend_from_slice(&bytes[88..104]);
+    expanded[ra_start + 6..ra_start + 16].copy_from_slice(&ht[3..13]);
+    let state_start = expanded.len();
+    expanded.extend_from_slice(&bytes[104..116]);
+    let nss = if let Some(vht) = vht_cap {
+        let rx_map = u16::from_le_bytes([vht[4], vht[5]]);
+        (0..8)
+            .take_while(|index| rx_map >> (index * 2) & 3 != 3)
+            .count()
+            .max(1) as u8
+    } else {
+        ht[3..13].iter().rposition(|mask| *mask != 0).map_or(1, |i| i + 1) as u8
+    };
+    expanded[state_start + 9] = bandwidth | (nss - 1) << 4;
+
+    let wtbl_start = expanded.len();
+    expanded.extend_from_slice(&bytes[116..168]);
+    let mut nested = 4u16;
+    expanded.extend_from_slice(&[
+        2,
+        0,
+        12,
+        0,
+        1,
+        u8::from(ht[0] & 1 != 0),
+        ht[2] & 3,
+        ht[2] >> 2 & 7,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    nested += 1;
+    if let Some(vht) = vht_cap {
+        let cap = u32::from_le_bytes(vht[..4].try_into().unwrap());
+        expanded.extend_from_slice(&[
+            3,
+            0,
+            12,
+            0,
+            u8::from(cap & (1 << 4) != 0),
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        nested += 1;
+    }
+    let smps = u8::from(ht[0] >> 2 & 3 == 1);
+    expanded.extend_from_slice(&[13, 0, 8, 0, smps, 0, 0, 0]);
+    let wtbl_len = (expanded.len() - wtbl_start) as u16;
+    expanded[wtbl_start + 2..wtbl_start + 4]
+        .copy_from_slice(&wtbl_len.to_le_bytes());
+    expanded[wtbl_start + 6..wtbl_start + 8].copy_from_slice(&nested.to_le_bytes());
+    expanded[50..52].copy_from_slice(&(8u16 - u16::from(vht_cap.is_none())).to_le_bytes());
+    let total = expanded.len() as u16;
+    expanded[0..2].copy_from_slice(&total.to_le_bytes());
+    expanded[32..34].copy_from_slice(&(total - 32).to_le_bytes());
+    Ok(expanded)
 }
 
 pub fn encode_preauth_peer_wcid_command(
@@ -5139,7 +5226,9 @@ pub fn encode_preauth_peer_wcid_command(
     peer: [u8; 6],
     rcpi: u8,
 ) -> Result<Vec<u8>, String> {
-    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, 0, peer, rcpi, 1, 0x40, false)
+    encode_legacy_wme_wcid_command(
+        sequence, bss_index, wcid, 0, peer, rcpi, 1, 0x40, None, None, 0, false,
+    )
 }
 
 pub fn encode_legacy_wme_add_wcid_command(
@@ -5151,6 +5240,9 @@ pub fn encode_legacy_wme_add_wcid_command(
     rcpi: u8,
     basic_rates: u16,
     legacy_rates: u16,
+    ht_cap: Option<[u8; 26]>,
+    vht_cap: Option<[u8; 12]>,
+    bandwidth: u8,
 ) -> Result<Vec<u8>, String> {
     if !(1..=2007).contains(&aid) {
         return Err("associated WCID AID escaped infrastructure range".into());
@@ -5167,6 +5259,9 @@ pub fn encode_legacy_wme_add_wcid_command(
         rcpi,
         basic_rates,
         legacy_rates,
+        ht_cap,
+        vht_cap,
+        bandwidth,
         true,
     )
 }
@@ -5375,6 +5470,10 @@ pub struct LegacyWmeAssociation {
     pub basic_rates: u16,
     /// Connac RA_LEGACY_CCK/OFDM bitmap copied to STA_REC_RA.legacy.
     pub legacy_rates: u16,
+    pub ht_cap: Option<[u8; 26]>,
+    pub vht_cap: Option<[u8; 12]>,
+    /// Linux IEEE80211_STA_RX_BW_* encoding (20/40/80/160 = 0/1/2/3).
+    pub bandwidth: u8,
     pub negotiated_qos: bool,
     pub mfp_required: bool,
 }
@@ -6142,6 +6241,9 @@ impl ClientFirmwareEffectsState {
             association.rcpi,
             association.basic_rates,
             association.legacy_rates,
+            association.ht_cap,
+            association.vht_cap,
+            association.bandwidth,
         )?;
         if let Err(error) = submit(3, &command) {
             self.controlled_port_open = false;
@@ -7875,6 +7977,9 @@ mod tests {
                 100,
                 1,
                 0x40,
+                None,
+                None,
+                0,
             )
             .is_err()
         );
@@ -7965,6 +8070,9 @@ mod tests {
             rcpi: 100,
             basic_rates: 1,
             legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
             negotiated_qos: true,
             mfp_required: false,
         };
@@ -8085,6 +8193,9 @@ mod tests {
             rcpi: 100,
             basic_rates: 1,
             legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
             negotiated_qos: true,
             mfp_required: false,
         };
@@ -8455,12 +8566,49 @@ mod tests {
             100,
             basic,
             legacy,
+            None,
+            None,
+            0,
         )
         .unwrap();
         assert_eq!(&encoded[80..82], &[0x15, 0]);
         assert_eq!(&encoded[92..94], &[0xc0, 0x3f]);
         assert_ne!(&encoded[80..82], &[1, 0]);
         assert_ne!(&encoded[92..94], &[0x40, 0]);
+    }
+
+    #[test]
+    fn independent_linux_ht_vht_assoc_transcript_has_every_required_tlv() {
+        let mut ht = [0u8; 26];
+        ht[..3].copy_from_slice(&[0xf3, 0x09, 0x03]);
+        ht[3..5].copy_from_slice(&[0xff, 0xff]);
+        let vht = [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+        let encoded = encode_legacy_wme_add_wcid_command(
+            9,
+            0,
+            7,
+            1,
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            100,
+            0x15,
+            0x3fc0,
+            Some(ht),
+            Some(vht),
+            2,
+        )
+        .unwrap();
+        assert_eq!(encoded.len(), 232);
+        assert_eq!(u16::from_le_bytes(encoded[50..52].try_into().unwrap()), 8);
+        assert_eq!(&encoded[76..84], &[9, 0, 8, 0, 0xf3, 0x09, 0, 0]);
+        assert_eq!(&encoded[84..100], &[10, 0, 16, 0, 0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0]);
+        assert_eq!(&encoded[100..108], &[15, 0, 8, 0, 8, 1, 1, 0]);
+        assert_eq!(&encoded[108..120], &[21, 0, 12, 0, 0x15, 0, 0x38, 3, 0, 100, 0, 0]);
+        assert_eq!(&encoded[120..136], &[1, 0, 16, 0, 0xc0, 0x3f, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[136..148], &[7, 0, 12, 0, 0, 0, 0, 0, 2, 0x12, 0, 0]);
+        assert_eq!(&encoded[148..160], &[13, 0, 84, 0, 7, 1, 6, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[200..212], &[2, 0, 12, 0, 1, 1, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[212..224], &[3, 0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[224..232], &[13, 0, 8, 0, 0, 0, 0, 0]);
     }
 
     #[test]

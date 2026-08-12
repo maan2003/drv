@@ -1858,21 +1858,21 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	524	function	mt76_connac_mc
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	541	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	543	function	mt76_connac_mcu_wtbl_generic_tlv	encode_legacy_wme_add_wcid_command	exact	peer/OMAC/QoS/partial-AID plus RCA1/RCA2/RV nested WTBL fields
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	595	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	598	function	mt76_connac_mcu_sta_amsdu_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	598	function	mt76_connac_mcu_sta_amsdu_tlv	encode_legacy_wme_add_wcid_command	exact	negotiated HT/VHT station HW-AMSDU enable and maximum MPDU class
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	622	macro	HE_PHY	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	623	macro	HE_MAC	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	625	function	mt76_connac_mcu_sta_he_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	758	function	mt76_connac_mcu_sta_he_tlv_v2	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	789	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	792	function	mt76_connac_get_phy_mode_v2	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	792	function	mt76_connac_get_phy_mode_v2	encode_legacy_wme_add_wcid_command	exact	5-GHz OFDM plus negotiated HT/VHT PHY bitmap
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	846	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	848	function	mt76_connac_mcu_sta_tlv	encode_legacy_wme_add_wcid_command, linux_legacy_rate_context_reference	exact	legacy PHY basic-rate, RA supported-rate and STATE_ASSOC subset; HT/VHT/HE excluded
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	848	function	mt76_connac_mcu_sta_tlv	encode_legacy_wme_add_wcid_command, linux_legacy_rate_context_reference	exact	HT/VHT capabilities, PHY basic/type/AMPDU, RA legacy/MCS and STATE_ASSOC bandwidth/NSS subset; HE excluded by pinned API
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	948	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	950	function	mt76_connac_mcu_wtbl_smps_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	950	function	mt76_connac_mcu_wtbl_smps_tlv	encode_legacy_wme_add_wcid_command	exact	negotiated dynamic-SMPS flag
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	962	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	964	function	mt76_connac_mcu_wtbl_ht_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	964	function	mt76_connac_mcu_wtbl_ht_tlv	encode_legacy_wme_add_wcid_command	exact	nested HT/VHT enable, LDPC and AMPDU factor/density subset
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1040	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	encode_legacy_wme_add_wcid_command	exact	STA_REC and nested reset-and-set WTBL envelope for associated legacy-WME station
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	encode_legacy_wme_add_wcid_command	exact	STA_REC and nested reset-and-set WTBL envelope for associated negotiated HT/VHT station
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1095	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1097	function	mt76_connac_mcu_wtbl_ba_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1140	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
