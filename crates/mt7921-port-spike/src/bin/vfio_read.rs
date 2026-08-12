@@ -1736,6 +1736,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test association comeback IE contract failed".into());
     }
+    if validate_peer_wtbl_dw5_named_fields(0x3200_0427).is_err()
+        || validate_peer_wtbl_dw5_named_fields(0x3200_0423).is_err()
+        || validate_peer_wtbl_dw5_named_fields(0x3200_0c23).is_ok()
+    {
+        return Err("self-test WTBL DW5 named-field semantics failed".into());
+    }
+    println!(
+        "self_test_wtbl_dw5 result=pass af=7 byte206=7 sgi160=false reserved_bit2=ignored ht_vht_fields=preserved"
+    );
     if diagnostic_liveness(0x000c_ef1a).is_err() || diagnostic_liveness(u32::MAX).is_ok() {
         return Err("self-test firmware snapshot liveness semantics failed".into());
     }
@@ -7523,6 +7532,21 @@ fn diagnostic_liveness(value: u32) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn validate_peer_wtbl_dw5_named_fields(value: u32) -> Result<(), String> {
+    // Linux 6.18/7.1 mt76_connac_mcu.h names bits 5..13. Bit 2 is reserved.
+    const NAMED_MASK: u32 = 0x0000_3fe0;
+    const LINUX_NATIVE: u32 = 0x0000_0420;
+    ((value & NAMED_MASK) == LINUX_NATIVE)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "peer WTBL DW5 named fields mismatch value={value:#010x} named={:#06x} expected={LINUX_NATIVE:#06x}",
+                value & NAMED_MASK
+            )
+        })
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn passive_mac_read_address_allowed(address: u32) -> bool {
     passive_mac_address_allowed(address)
         || (0x820d_8100..0x820d_8200).contains(&address)
@@ -11906,6 +11930,32 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 frame.extend_from_slice(&[0, 0, tid, 0]);
                 frame
             };
+            let peer_dw5 = PassiveMacExecutor {
+                pages: self.mac_pages,
+            }
+            .read_firmware_snapshot_raw(0x820d_8114)
+            .map_err(|error| {
+                record_sae_stage(&format!(
+                    "e2e88_peer_dw5 result=read_error addr=0x820d8114 reason={error}"
+                ));
+                zx::Status::IO
+            })?;
+            let reserved_bit2 = (peer_dw5 >> 2) & 1;
+            validate_peer_wtbl_dw5_named_fields(peer_dw5).map_err(|error| {
+                record_sae_stage(&format!(
+                    "e2e88_peer_dw5 result=named_mismatch value={peer_dw5:#010x} reserved_bit2={reserved_bit2} reason={error}"
+                ));
+                zx::Status::IO_DATA_INTEGRITY
+            })?;
+            record_sae_stage(&format!(
+                "e2e88_peer_dw5 result=match value={peer_dw5:#010x} change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} reserved_bit2={reserved_bit2}",
+                (peer_dw5 >> 5) & 7,
+                (peer_dw5 >> 8) & 1,
+                (peer_dw5 >> 9) & 1,
+                (peer_dw5 >> 10) & 1,
+                (peer_dw5 >> 11) & 1,
+                (peer_dw5 >> 12) & 3,
+            ));
             self.e2e81_snapshot("immediately_before_BE");
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
@@ -11917,7 +11967,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e87_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "e2e88_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));
