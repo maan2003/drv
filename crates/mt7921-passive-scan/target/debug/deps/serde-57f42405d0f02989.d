@@ -1,0 +1,12 @@
+/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/deps/serde-57f42405d0f02989.d: /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/serde-75b766a8ddf1ddb8/out/private.rs
+
+/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/deps/libserde-57f42405d0f02989.rmeta: /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/serde-75b766a8ddf1ddb8/out/private.rs
+
+/home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/maan2003/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/serde-75b766a8ddf1ddb8/out/private.rs:
+
+# env-dep:OUT_DIR=/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/serde-75b766a8ddf1ddb8/out

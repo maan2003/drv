@@ -1042,6 +1042,8 @@ fn run_contained_dma_resource_round_trip(
                 client_interface: None,
                 fwdl_index: 0,
                 pending_scatter: None,
+                dmashdl,
+                dmashdl_watcher: None,
                 start: Instant::now(),
             };
             let patch = Patch::parse(patch_bytes)
@@ -2864,6 +2866,27 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test did not preserve group20 commit through status77 fallback".into());
     }
+    let mut dmashdl_watcher = DmashdlTransitionWatcher::new(DMASHDL_BYPASS | 5);
+    if dmashdl_watcher
+        .observe("unchanged_host_boundary", DMASHDL_BYPASS | 5)
+        .unwrap()
+        .is_some()
+    {
+        return Err("self-test DMASHDL watcher logged an unchanged value".into());
+    }
+    let transition = dmashdl_watcher
+        .observe("firmware_n9_ready", 5)
+        .expect_err("self-test DMASHDL watcher did not stop on firmware-side clear");
+    if transition.before != DMASHDL_BYPASS | 5
+        || transition.after != 5
+        || transition.operation != "firmware_n9_ready"
+    {
+        return Err("self-test DMASHDL watcher corrupted first transition evidence".into());
+    }
+    println!(
+        "self_test_dmashdl_transition result=pass unchanged_logged=false operation={} before={:#010x} after={:#010x} bypass_transition=1->0 stop_before_data=true",
+        transition.operation, transition.before, transition.after
+    );
     println!(
         "self_test_result=pass post_request_state=authenticating timer=refreshed status77=accepted fallback_group=19 identities=distinct missing_completion=blocked teardown=contained"
     );
@@ -2916,6 +2939,20 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
+    let dmashdl_transition_diagnostic = match env::var("DRV_DMASHDL_TRANSITION_DIAGNOSTIC") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("DRV_DMASHDL_TRANSITION_DIAGNOSTIC must equal 1".into()),
+        Err(error) => return Err(format!("read DMASHDL diagnostic mode: {error}")),
+    };
+    #[cfg(feature = "fuchsia-passive")]
+    if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
+        return Err("DMASHDL transition diagnostic requires the pinned SAE lifecycle".into());
+    }
+    #[cfg(not(feature = "fuchsia-passive"))]
+    if dmashdl_transition_diagnostic {
+        return Err("DMASHDL transition diagnostic requires fuchsia-passive".into());
+    }
     #[cfg(feature = "fuchsia-passive")]
     let contained_passive_channel = if operation == Operation::RunOneShotPassiveChannel1 {
         let number = if operation_argument.as_deref() == Some("--run-one-shot-passive-channel") {
@@ -4465,12 +4502,15 @@ fn run() -> Result<(), String> {
                 dmashdl_readback.control_after,
                 dmashdl_readback.attempts,
             ));
+            let mut dmashdl_watcher = dmashdl_transition_diagnostic
+                .then(|| DmashdlTransitionWatcher::new(dmashdl_readback.control_after));
             let reset = wfdma.read(0xd4100)?;
             if reset == u32::MAX {
                 return Err("WFDMA reset control returned all ones".into());
             }
             wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
             wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_wfdma_reset_toggle")?;
             {
                 let mut transport = VfioGlobalTxRings { page: &wfdma };
                 prepare_global_tx_rings(
@@ -4482,6 +4522,11 @@ fn run() -> Result<(), String> {
                 )
                 .map_err(|error| format!("own global TX rings: {error:?}"))?;
             }
+            observe_dmashdl_transition(
+                dmashdl,
+                &mut dmashdl_watcher,
+                "host_global_tx_ring_reconfiguration",
+            )?;
             {
                 let mut transport = VfioGlobalRxRings { page: &wfdma };
                 prepare_global_rx_rings(
@@ -4494,6 +4539,11 @@ fn run() -> Result<(), String> {
                 wfdma.write_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
+            observe_dmashdl_transition(
+                dmashdl,
+                &mut dmashdl_watcher,
+                "host_global_rx_ring_reconfiguration",
+            )?;
             capsule
                 .containment
                 .as_mut()
@@ -4505,6 +4555,7 @@ fn run() -> Result<(), String> {
                 return Err("unexpected IRQ before device source enable".into());
             }
             println!("{{\"active_mcu_event\":\"vfio_irq_installed\"}}");
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_vfio_irq_install")?;
             if wfdma.read(0xd4200)? != 0 {
                 return Err(format!(
                     "refused nonzero interrupt status before activation: {:#010x}",
@@ -4530,12 +4581,22 @@ fn run() -> Result<(), String> {
             wfdma.write_active_wfdma(0xd4690, 0x00c0_0004)?;
             wfdma.write_active_wfdma(0xd4640, 0x0340_0004)?;
             wfdma.write_active_wfdma(0xd4644, 0x0380_0004)?;
+            observe_dmashdl_transition(
+                dmashdl,
+                &mut dmashdl_watcher,
+                "host_wfdma_prefetch_configuration",
+            )?;
             capsule
                 .containment
                 .as_mut()
                 .expect("active MCU operation has containment ledger")
                 .mark_possibly_active(Hazard::BusMaster);
             set_pci_bus_master(&bdf, true)?;
+            observe_dmashdl_transition(
+                dmashdl,
+                &mut dmashdl_watcher,
+                "host_pci_bus_master_enable",
+            )?;
             let global = wfdma.read(0xd4208)?
                 | (1 << 0)
                 | (1 << 2)
@@ -4556,6 +4617,7 @@ fn run() -> Result<(), String> {
                 1 << 0
             };
             wfdma.write_active_wfdma(0xd4204, response_irq_mask)?;
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_wfdma_dma_irq_enable")?;
             capsule
                 .containment
                 .as_mut()
@@ -4575,8 +4637,11 @@ fn run() -> Result<(), String> {
             };
             acquire_top_driver_ownership(&mut top, log_top_ownership_event)
                 .map_err(|error| format!("acquire MT_TOP ownership: {error:?}"))?;
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_top_driver_ownership")?;
             pcie_mac.disable_pcie_l0s()?;
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_disable_pcie_l0s")?;
             swdef.write_swdef_normal()?;
+            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_swdef_normal")?;
             if operation == Operation::RunOneShotFirmware {
                 println!(
                     "{{\"firmware_bootstrap_event\":\"transport_ready\",\"bme\":true,\"wfdma_global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\",\"rings\":[\"fwdl_tx\",\"mcu_tx\",\"wm_rx\",\"wm2_rx\"]}}"
@@ -4633,6 +4698,8 @@ fn run() -> Result<(), String> {
                     client_interface: None,
                     fwdl_index: 0,
                     pending_scatter: None,
+                    dmashdl,
+                    dmashdl_watcher,
                     start: Instant::now(),
                 };
                 let patch = Patch::parse(patch_bytes)
@@ -7407,7 +7474,15 @@ struct VfioFirmwareLoader<'a> {
     client_interface: Option<ClientInterfaceFirmwareState>,
     fwdl_index: usize,
     pending_scatter: Option<(FirmwareImagePart, u8, usize, u32)>,
+    dmashdl: &'a ReadPage,
+    dmashdl_watcher: Option<DmashdlTransitionWatcher>,
     start: Instant,
+}
+
+impl VfioFirmwareLoader<'_> {
+    fn observe_dmashdl(&mut self, operation: impl Into<String>) -> Result<(), String> {
+        observe_dmashdl_transition(self.dmashdl, &mut self.dmashdl_watcher, operation)
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8249,6 +8324,7 @@ impl VfioFirmwareLoader<'_> {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         reclaim_uni_dma_slot(self.mcu.tx_ring, self.mcu.payload, descriptor_index)?;
+        self.observe_dmashdl(format!("client_ce_cid_{cid:#04x}"))?;
         Ok(())
     }
 
@@ -8481,6 +8557,7 @@ impl VfioFirmwareLoader<'_> {
         let result = classify_uni_ack(expected_cid, &response?);
         if result.is_ok() {
             publication.acknowledged().expect("published command");
+            self.observe_dmashdl(format!("client_uni_cid_{expected_cid}"))?;
         }
         result
     }
@@ -8552,6 +8629,7 @@ impl VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl(format!("passive_command_{command:?}"))?;
         println!(
             r#"{{"passive_scan_event":"command_completed","command":"{command:?}","sequence":{sequence}}}"#
         );
@@ -8601,6 +8679,7 @@ impl VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl("client_rate_power")?;
         Ok(())
     }
 
@@ -8640,6 +8719,7 @@ impl VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl("client_pse_query")?;
         Ok(value)
     }
 }
@@ -8764,6 +8844,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl(format!("firmware_command_{command:?}"))?;
         let milestone = match command {
             DownloadCommand::PatchFinish => Some("patch_published_and_finished"),
             DownloadCommand::FirmwareStart { .. } => Some("ram_published_firmware_start_acked"),
@@ -8833,6 +8914,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl(format!("firmware_clc_rule_{}", command.index))?;
         println!(
             "{{\"firmware_bootstrap_event\":\"clc_calibration_configured\",\"sequence\":{sequence},\"rule_index\":{},\"response\":{}}}",
             command.index,
@@ -8890,6 +8972,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.observe_dmashdl("firmware_channel_domain")?;
         println!(
             "{{\"active_mcu_event\":\"set_channel_domain_tx_complete\",\"sequence\":{sequence},\"channels\":{}}}",
             command.channels.len()
@@ -8928,6 +9011,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         self.mcu.wfdma.write_active_wfdma(0xd4408, next as u32)?;
         self.fwdl_index = next;
         self.pending_scatter = Some((part, sequence, descriptor_index, next as u32));
+        self.observe_dmashdl(format!("firmware_{part:?}_scatter_publish_{sequence}"))?;
         println!(
             r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index},"bytes":{}}}"#,
             chunk.len()
@@ -8966,6 +9050,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.fwdl_payload.zero_bytes(PAGE)?;
         self.pending_scatter = None;
+        self.observe_dmashdl(format!("firmware_{part:?}_scatter_complete_{sequence}"))?;
         println!(
             r#"{{"active_fwdl_event":"scatter_completed","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index}}}"#
         );
@@ -8974,12 +9059,19 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
 
     fn firmware_download_state(&mut self) -> Result<u8, Self::Error> {
         self.mcu.cancelled()?;
-        Ok((self.conn.read(0xe00f0)? & 0x7) as u8)
+        let state = (self.conn.read(0xe00f0)? & 0x7) as u8;
+        self.observe_dmashdl(format!("firmware_download_state_{state}"))?;
+        Ok(state)
     }
 
     fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
         self.mcu.cancelled()?;
         let ready = self.conn.read(0xe00f0)? & 3 == 3;
+        self.observe_dmashdl(if ready {
+            "firmware_n9_ready"
+        } else {
+            "firmware_n9_not_ready"
+        })?;
         if ready {
             println!("{{\"firmware_bootstrap_event\":\"n9_ready\"}}");
             std::io::stdout()
@@ -12169,6 +12261,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::INVALID_ARGS);
         }
+        if self.loader.dmashdl_watcher.is_some() {
+            self.loader
+                .observe_dmashdl("client_first_data_tx_attempt")
+                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            record_sae_stage(
+                "e2e91_data_tx_gate result=diagnostic_stop data_published=false probe_published=false",
+            );
+            return Err(zx::Status::CANCELED);
+        }
         let eapol = bytes
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
@@ -12435,6 +12536,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     }
                 }
             }
+            self.loader
+                .observe_dmashdl(format!("passive_prepare_{step:?}"))
+                .map_err(PhysicalPassiveError)?;
             println!(r#"{{"passive_prepare_step":"{step:?}"}}"#);
             Ok(())
         })?;
@@ -12897,6 +13001,79 @@ const WFDMA_GLO_CFG_EXT0: usize = 0xd42b0;
 const WFDMA_TX_DMASHDL_ENABLE: u32 = 1 << 6;
 const DMASHDL_SW_CONTROL: usize = 0xd6004;
 const DMASHDL_BYPASS: u32 = 1 << 28;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DmashdlTransition {
+    operation: String,
+    before: u32,
+    after: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DmashdlTransitionWatcher {
+    last: u32,
+}
+
+impl DmashdlTransitionWatcher {
+    const fn new(initial: u32) -> Self {
+        Self { last: initial }
+    }
+
+    fn observe(
+        &mut self,
+        operation: impl Into<String>,
+        current: u32,
+    ) -> Result<Option<DmashdlTransition>, DmashdlTransition> {
+        if current == self.last {
+            return Ok(None);
+        }
+        let transition = DmashdlTransition {
+            operation: operation.into(),
+            before: self.last,
+            after: current,
+        };
+        self.last = current;
+        if transition.before & DMASHDL_BYPASS != 0 && transition.after & DMASHDL_BYPASS == 0 {
+            Err(transition)
+        } else {
+            Ok(Some(transition))
+        }
+    }
+}
+
+fn observe_dmashdl_transition(
+    dmashdl: &ReadPage,
+    watcher: &mut Option<DmashdlTransitionWatcher>,
+    operation: impl Into<String>,
+) -> Result<(), String> {
+    let Some(watcher) = watcher.as_mut() else {
+        return Ok(());
+    };
+    let current = dmashdl.read(DMASHDL_SW_CONTROL)?;
+    if current == u32::MAX {
+        return Err("E2E91 DMASHDL transition read returned all ones".into());
+    }
+    let (transition, stopped) = match watcher.observe(operation, current) {
+        Ok(None) => return Ok(()),
+        Ok(Some(transition)) => (transition, false),
+        Err(transition) => (transition, true),
+    };
+    record_sae_stage(&format!(
+        "e2e91_dmashdl_transition operation={} before={:#010x} after={:#010x} bypass_before={} bypass_after={}",
+        transition.operation,
+        transition.before,
+        transition.after,
+        u8::from(transition.before & DMASHDL_BYPASS != 0),
+        u8::from(transition.after & DMASHDL_BYPASS != 0),
+    ));
+    if stopped {
+        return Err(format!(
+            "E2E91 stopped at first DMASHDL bypass 1->0 transition after {}",
+            transition.operation
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DmashdlInvariantReadback {

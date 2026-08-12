@@ -1,0 +1,1 @@
+/nix/store/adcz0m6qq2flmshdf0zz2xwjr5zbq1gr-gcc-wrapper-15.3.0/bin/g++  -ffunction-sections -fdata-sections -fPIC -m64 -w -fno-strict-aliasing -ggdb -fno-common -fvisibility=hidden -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/urandom_test.dir/link.d CMakeFiles/urandom_test.dir/crypto/rand/urandom_test.cc.o -o urandom_test  libtest_support_lib.a libboringssl_gtest.a libcrypto.a
