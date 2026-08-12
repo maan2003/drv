@@ -846,23 +846,23 @@ fn run_contained_dma_resource_round_trip(
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let dmashdl = active.dmashdl.as_ref().expect("mapped");
-        let dmashdl_readback =
-            ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant { wfdma, dmashdl })?;
-        record_sae_stage(&format!(
-            "dmashdl_invariant point=contained_dma_init ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
-            dmashdl_readback.ext0_before,
-            dmashdl_readback.control_before,
-            dmashdl_readback.ext0_after,
-            dmashdl_readback.control_after,
-            dmashdl_readback.attempts,
-        ));
         let reset = wfdma.read(0xd4100)?;
         if reset == u32::MAX {
             return Err("WFDMA reset control returned all ones".into());
         }
         wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
         wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
+        let dmashdl = active.dmashdl.as_ref().expect("mapped");
+        let dmashdl_readback =
+            ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant { wfdma, dmashdl })?;
+        record_sae_stage(&format!(
+            "dmashdl_invariant point=contained_dma_init_post_reset ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
+            dmashdl_readback.ext0_before,
+            dmashdl_readback.control_before,
+            dmashdl_readback.ext0_after,
+            dmashdl_readback.control_after,
+            dmashdl_readback.attempts,
+        ));
         {
             let mut transport = VfioGlobalTxRings { page: wfdma };
             prepare_global_tx_rings(
@@ -4490,12 +4490,18 @@ fn run() -> Result<(), String> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            let reset = wfdma.read(0xd4100)?;
+            if reset == u32::MAX {
+                return Err("WFDMA reset control returned all ones".into());
+            }
+            wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
+            wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
             let dmashdl_readback = ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant {
                 wfdma: &wfdma,
                 dmashdl,
             })?;
             record_sae_stage(&format!(
-                "dmashdl_invariant point=linux_dma_init ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
+                "dmashdl_invariant point=linux_dma_init_post_reset ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
                 dmashdl_readback.ext0_before,
                 dmashdl_readback.control_before,
                 dmashdl_readback.ext0_after,
@@ -4504,13 +4510,6 @@ fn run() -> Result<(), String> {
             ));
             let mut dmashdl_watcher = dmashdl_transition_diagnostic
                 .then(|| DmashdlTransitionWatcher::new(dmashdl_readback.control_after));
-            let reset = wfdma.read(0xd4100)?;
-            if reset == u32::MAX {
-                return Err("WFDMA reset control returned all ones".into());
-            }
-            wfdma.write_active_wfdma(0xd4100, reset & !0x30)?;
-            wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
-            observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_wfdma_reset_toggle")?;
             {
                 let mut transport = VfioGlobalTxRings { page: &wfdma };
                 prepare_global_tx_rings(
@@ -19438,7 +19437,7 @@ mod tests {
     }
 
     #[test]
-    fn dmashdl_invariant_retries_one_unlatched_write_and_skips_when_correct() {
+    fn dmashdl_invariant_retries_and_reasserts_after_reset() {
         struct FakeDmashdl {
             ext0: u32,
             control: u32,
@@ -19493,6 +19492,32 @@ mod tests {
         let readback = ensure_linux_dmashdl_invariant(&mut correct).unwrap();
         assert_eq!(readback.attempts, 0);
         assert_eq!((correct.ext0_writes, correct.control_writes), (0, 0));
+
+        // E2E91 observed the host WFDMA reset clear bypass. Model that exact
+        // reset effect and require the post-reset invariant publication to
+        // restore bypass before the lifecycle can continue.
+        correct.control &= !DMASHDL_BYPASS;
+        assert_eq!(correct.control & DMASHDL_BYPASS, 0);
+        let readback = ensure_linux_dmashdl_invariant(&mut correct).unwrap();
+        assert_eq!(readback.control_before & DMASHDL_BYPASS, 0);
+        assert_ne!(readback.control_after & DMASHDL_BYPASS, 0);
+        assert_eq!(correct.control_writes, 1);
+    }
+
+    #[test]
+    fn dma_init_publishes_dmashdl_invariant_after_wfdma_reset() {
+        let source = include_str!("vfio_read.rs");
+        for point in [
+            "point=contained_dma_init_post_reset",
+            "point=linux_dma_init_post_reset",
+        ] {
+            let before = source.split(point).next().unwrap();
+            let reset = before
+                .rfind("write_active_wfdma(0xd4100, reset | 0x30)")
+                .unwrap();
+            let invariant = before.rfind("ensure_linux_dmashdl_invariant").unwrap();
+            assert!(reset < invariant, "{point}");
+        }
     }
 
     #[test]
