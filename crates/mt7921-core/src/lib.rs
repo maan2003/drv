@@ -5779,6 +5779,44 @@ pub fn linux_qos_eapol_control_port_reference(
     Ok(bytes)
 }
 
+/// Independent Linux v7.1 `ieee80211_send_nullfunc` plus Connac2 TXWI
+/// transcript for an awake (PM=0) QoS-null probe on the associated VO queue.
+pub fn linux_qos_null_probe_reference(
+    mpdu: &[u8],
+    payload_iova: u64,
+    token: u16,
+    pid: u8,
+) -> Result<[u8; 64], String> {
+    if mpdu.len() != 26
+        || u16::from_le_bytes(mpdu[0..2].try_into().unwrap()) != 0x01c8
+        || mpdu[4] & 1 != 0
+        || mpdu[24] & 15 != 7
+    {
+        return Err("Linux QoS-null reference requires an awake unicast TID7 probe".into());
+    }
+    let mut bytes = [0u8; 64];
+    let words = [
+        0x0600_003a,
+        0x8072_6807,
+        0x8000_202c,
+        0x1000_7800,
+        0,
+        0x400 | u32::from(pid),
+        0x004b_0004,
+        0x002c_0000,
+    ];
+    for (index, word) in words.into_iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    if payload_iova > u64::from(u32::MAX) || token >= 8192 || !(3..127).contains(&pid) {
+        return Err("Linux QoS-null reference escaped TXWI/TXP bounds".into());
+    }
+    bytes[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    bytes[40..44].copy_from_slice(&(payload_iova as u32).to_le_bytes());
+    bytes[44..46].copy_from_slice(&0x801au16.to_le_bytes());
+    Ok(bytes)
+}
+
 pub fn encode_client_management_tx(
     frame: &[u8],
     txwi_iova: u64,
@@ -8296,6 +8334,34 @@ mod tests {
         // TXD3's SN_VALID and SEQ fields are both clear.
         assert_eq!(u16::from_le_bytes(mpdu[22..24].try_into().unwrap()), 0);
         assert_eq!(dword(3) & 0x8fff_0000, 0);
+    }
+
+    #[test]
+    fn independent_linux_awake_qos_null_probe_is_source_exact() {
+        let frame = [
+            0xc8, 0x01, 0, 0, 2, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 2, 2, 3, 4, 5, 6, 0, 0, 7, 0,
+        ];
+        let encoded = linux_qos_null_probe_reference(&frame, 0x1234_5000, 3, 6).unwrap();
+        let words = (0..8)
+            .map(|index| u32::from_le_bytes(encoded[index * 4..index * 4 + 4].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                0x0600_003a,
+                0x8072_6807,
+                0x8000_202c,
+                0x1000_7800,
+                0,
+                0x406,
+                0x004b_0004,
+                0x002c_0000,
+            ]
+        );
+        assert_eq!(
+            &encoded[32..46],
+            &[3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x34, 0x12, 0x1a, 0x80]
+        );
     }
 
     #[test]

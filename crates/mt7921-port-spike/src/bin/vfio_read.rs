@@ -64,6 +64,7 @@ use mt7921_port_spike::{
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
     passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
     validate_passive_mac_bar_read, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -1039,11 +1040,13 @@ fn run_contained_dma_resource_round_trip(
                                 irq_bit: DATA_RX_IRQ_BIT,
                             },
                             mac_pages: &active.passive_window_pages,
+                            dmashdl: active.dmashdl.as_ref().expect("mapped"),
                             scan_started: None,
                             pending_scan_done: None,
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
+                            e2e77_matrix_done: false,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -4414,11 +4417,13 @@ fn run() -> Result<(), String> {
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
                                 mac_pages: &*passive_window_pages,
+                                dmashdl,
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
+                                e2e77_matrix_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4485,11 +4490,13 @@ fn run() -> Result<(), String> {
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
                                 mac_pages: &*passive_window_pages,
+                                dmashdl,
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
+                                e2e77_matrix_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -7332,7 +7339,21 @@ fn passive_mac_read_address_allowed(address: u32) -> bool {
     passive_mac_address_allowed(address)
         || matches!(
             address,
-            0x820e_5000 | 0x820e_5004 | 0x820f_5000 | 0x820f_5004
+            0x820e_5000
+                | 0x820e_5004
+                | 0x820f_5000
+                | 0x820f_5004
+                | 0x820d_8750
+                | 0x820d_8754
+                | 0x820d_8758
+                | 0x820d_875c
+                | 0x820d_8760
+                | 0x820d_8764
+                | 0x820d_8768
+                | 0x820d_876c
+                | 0x820f_d100
+                | 0x820f_d108
+                | 0x820f_d520
         )
 }
 
@@ -7341,6 +7362,10 @@ fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
     match address {
         0x820e_5000 | 0x820e_5004 => Ok(0x0002_1400 + (address - 0x820e_5000) as usize),
         0x820f_5000 | 0x820f_5004 => Ok(0x000a_1400 + (address - 0x820f_5000) as usize),
+        0x820d_8750..=0x820d_876c => Ok(0x0003_8750 + (address - 0x820d_8750) as usize),
+        0x820f_d100 | 0x820f_d108 | 0x820f_d520 => {
+            Ok(0x000a_4800 + (address - 0x820f_d000) as usize)
+        }
         _ => passive_mac_bar_offset(address)
             .map_err(|error| format!("translate passive MAC read: {error:?}")),
     }
@@ -8927,7 +8952,18 @@ fn drain_data_rx_queue(
                         (rxd1 & 0x1e00_0000) | (rxd2 & 0x0380_0000),
                     ));
                 }
-                let completion = match mt7921_packet_type(&bytes) {
+                let packet_type = mt7921_packet_type(&bytes);
+                if packet_type == Some(6) || packet_type == Some(0) && bytes.len() == 40 {
+                    let raw = bytes
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    record_sae_stage(&format!(
+                        "tx_completion_raw packet_type={packet_type:?} len={} bytes={raw}",
+                        bytes.len()
+                    ));
+                }
+                let completion = match packet_type {
                     Some(6) => parse_mt7921_tx_free(&bytes)
                         .ok()
                         .map(MgmtTxCompletion::Free),
@@ -9095,6 +9131,7 @@ enum MgmtTxCompletion {
 struct MgmtTxCompletionState {
     token: u16,
     pid: u8,
+    expected_wcid: u16,
     free: Option<Mt7921TxFree>,
     status: Option<Mt7921TxStatus>,
 }
@@ -9102,9 +9139,14 @@ struct MgmtTxCompletionState {
 #[cfg(feature = "fuchsia-passive")]
 impl MgmtTxCompletionState {
     fn new(token: u16, pid: u8) -> Self {
+        Self::new_for_wcid(token, pid, 19)
+    }
+
+    fn new_for_wcid(token: u16, pid: u8, expected_wcid: u16) -> Self {
         Self {
             token,
             pid,
+            expected_wcid,
             free: None,
             status: None,
         }
@@ -9116,7 +9158,9 @@ impl MgmtTxCompletionState {
                 self.free = Some(value)
             }
             MgmtTxCompletion::Status(value)
-                if value.pid == self.pid && value.wcid == 19 && self.status.is_none() =>
+                if value.pid == self.pid
+                    && value.wcid == self.expected_wcid
+                    && self.status.is_none() =>
             {
                 self.status = Some(value)
             }
@@ -9155,6 +9199,10 @@ struct MgmtTxOutstanding {
 #[cfg(feature = "fuchsia-passive")]
 impl MgmtTxOutstanding {
     fn reserve(&mut self) -> Result<(u16, u8), String> {
+        self.reserve_for_wcid(19)
+    }
+
+    fn reserve_for_wcid(&mut self, expected_wcid: u16) -> Result<(u16, u8), String> {
         if self.next_token >= 8192 {
             return Err("management TX token space exhausted before teardown".into());
         }
@@ -9165,7 +9213,11 @@ impl MgmtTxOutstanding {
             .ok_or("management TX PID space exhausted before teardown")?;
         self.next_token += 1;
         self.next_pid += 1;
-        self.entries.push(MgmtTxCompletionState::new(token, pid));
+        self.entries.push(MgmtTxCompletionState::new_for_wcid(
+            token,
+            pid,
+            expected_wcid,
+        ));
         Ok((token, pid))
     }
 
@@ -9207,6 +9259,37 @@ impl MgmtTxOutstanding {
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    fn last_identity(&self) -> Option<(u16, u8)> {
+        self.entries.last().map(|entry| (entry.token, entry.pid))
+    }
+
+    fn observe_diagnostic(&mut self, completion: MgmtTxCompletion) -> Result<(), String> {
+        let entry = match completion {
+            MgmtTxCompletion::Free(value) => self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.token == value.token),
+            MgmtTxCompletion::Status(value) => self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.pid == value.pid),
+        }
+        .ok_or("uncorrelated diagnostic TX completion")?;
+        entry.observe(completion)
+    }
+
+    fn take_diagnostic_free(
+        &mut self,
+        token: u16,
+    ) -> Option<(Mt7921TxFree, Option<Mt7921TxStatus>)> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.token == token && entry.free.is_some())?;
+        let entry = self.entries.remove(index);
+        Some((entry.free.expect("selected free completion"), entry.status))
     }
 }
 
@@ -10552,11 +10635,13 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     ledger: &'c mut ContainmentLedger,
     data: ActiveMcuRx<'b>,
     mac_pages: &'b [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
+    dmashdl: &'b ReadPage,
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
     mgmt_tx_outstanding: MgmtTxOutstanding,
+    e2e77_matrix_done: bool,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -10583,6 +10668,90 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn e2e77_snapshot(&self, phase: &str) {
+        let mac = PassiveMacExecutor {
+            pages: self.mac_pages,
+        };
+        let read = |address| {
+            mac.read(address)
+                .map_or_else(|_| "unavailable".into(), |v| format!("{v:#010x}"))
+        };
+        let wtbl = (0..4)
+            .map(|ac| {
+                let address = 0x820d_8750 + ac * 8;
+                format!(
+                    "ac{ac}_tx={},ac{ac}_rx={}",
+                    read(address),
+                    read(address + 4)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let dmashdl = |offset| {
+            self.dmashdl
+                .read(offset)
+                .map_or_else(|_| "unavailable".into(), |v| format!("{v:#010x}"))
+        };
+        record_sae_stage(&format!(
+            "e2e77_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
+            read(0x820f_d108),
+            read(0x820f_d520),
+            read(0x820f_d100),
+            dmashdl(0xd6004),
+            dmashdl(0xd6060),
+            dmashdl(0xd6070),
+            self.loader.mcu.wfdma.read(0xd4308),
+            self.loader.mcu.wfdma.read(0xd430c),
+        ));
+    }
+
+    fn e2e77_wait_tx_free(
+        &mut self,
+        variant: &str,
+        token: u16,
+        pid: u8,
+    ) -> Result<Mt7921TxFree, String> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            self.loader.mcu.handle_irq(None)?;
+            let _ = drain_data_rx_queue(
+                self.loader.mcu.wfdma,
+                &mut self.data,
+                &mut self.loader.mcu.descriptor_provenance,
+                &mut self.tx_completions,
+                Some(&mut self.loader.mcu.normal_rx_frames),
+            )?;
+            self.tx_completions
+                .append(&mut self.loader.mcu.tx_completions);
+            for completion in self.tx_completions.drain(..) {
+                let _ = self.mgmt_tx_outstanding.observe_diagnostic(completion);
+            }
+            if let Some((free, status)) = self.mgmt_tx_outstanding.take_diagnostic_free(token) {
+                record_sae_stage(&format!(
+                    "e2e77_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
+                    free.dropped,
+                    free.attempts,
+                    status.is_some(),
+                    status.is_some_and(|value| value.acked),
+                ));
+                return Ok(free);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("E2E77 {variant} TX_FREE timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn e2e77_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
+        self.transmit_owned_client_frame(frame)?;
+        let (token, pid) = self
+            .mgmt_tx_outstanding
+            .last_identity()
+            .ok_or("E2E77 submission omitted identity")?;
+        self.e2e77_wait_tx_free(variant, token, pid)
+    }
+
     fn preserve_client_rx_during_control_wait(&mut self) -> Result<(), String> {
         self.loader.mcu.handle_irq(None)?;
         drain_data_rx_queue(
@@ -10760,7 +10929,16 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .zero_bytes(PAGE)
             .map_err(|error| format!("REBOOT REQUIRED: pre-submit frame wipe failed: {error}"))?;
         record_sae_stage("management_tx_pre_submit stage=buffer_wipe result=complete");
-        let (token, pid) = self.mgmt_tx_outstanding.reserve()?;
+        let frame_control = frame
+            .get(..2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .ok_or("client TX omitted frame control")?;
+        let expected_wcid = if frame_control & 0x000c == 0x0008 {
+            7
+        } else {
+            19
+        };
+        let (token, pid) = self.mgmt_tx_outstanding.reserve_for_wcid(expected_wcid)?;
         record_sae_stage("management_tx_pre_submit stage=identity result=allocated");
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut outcome = MgmtTxPublicationOutcome::NotPublished;
@@ -10792,7 +10970,14 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 } else {
                     0
                 };
-                let encoded = if eapol && qos {
+                let encoded = if control & 0x00f0 == 0x00c0 && qos {
+                    let encoded =
+                        linux_qos_null_probe_reference(frame, frame_arena.iova, token, pid)?;
+                    record_sae_stage(
+                        "e2e77_variant=A kind=qos_null awake=true dont_encrypt=true use_minrate=true queue=vo qidx=3 wcid=7 altx=false state_change=false",
+                    );
+                    encoded
+                } else if eapol && qos {
                     let encoded = linux_qos_eapol_control_port_reference(
                         frame,
                         frame_arena.iova,
@@ -11098,6 +11283,55 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .ok_or(zx::Status::INVALID_ARGS)?;
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::INVALID_ARGS);
+        }
+        let eapol = bytes
+            .windows(8)
+            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        if eapol && !self.e2e77_matrix_done {
+            // One bounded same-session discriminator. Linux constructs this
+            // exact awake QoS-null frame in ieee80211_nullfunc_get and sends
+            // it with DONT_ENCRYPT; connection polling authorizes MINRATE.
+            self.e2e77_matrix_done = true;
+            let ap: [u8; 6] = bytes
+                .get(4..10)
+                .ok_or(zx::Status::INVALID_ARGS)?
+                .try_into()
+                .unwrap();
+            let sta: [u8; 6] = bytes
+                .get(10..16)
+                .ok_or(zx::Status::INVALID_ARGS)?
+                .try_into()
+                .unwrap();
+            let mut null = vec![0xc8, 0x01, 0, 0];
+            null.extend_from_slice(&ap);
+            null.extend_from_slice(&sta);
+            null.extend_from_slice(&ap);
+            null.extend_from_slice(&[0, 0, 7, 0]);
+            self.e2e77_snapshot("before_A");
+            let a = self
+                .e2e77_submit_wait("A_qos_null", &null)
+                .map_err(|error| {
+                    record_sae_stage(&format!("e2e77_matrix result=error stage=A reason={error}"));
+                    zx::Status::IO
+                })?;
+            self.e2e77_snapshot("after_A_before_B");
+            let b = self
+                .e2e77_submit_wait("B_eapol_start", bytes)
+                .map_err(|error| {
+                    record_sae_stage(&format!("e2e77_matrix result=error stage=B reason={error}"));
+                    zx::Status::IO
+                })?;
+            self.e2e77_snapshot("after_B");
+            let classification = match (!a.dropped, !b.dropped) {
+                (true, false) => "content_or_control_port",
+                (false, false) => "general_data_wcid7_vo_path",
+                (false, true) => "qos_null_specific_unexpected",
+                (true, true) => "data_path_operational",
+            };
+            record_sae_stage(&format!(
+                "e2e77_matrix result=complete classification={classification} variant_C=omitted reason=no_source_valid_state_neutral_alternate_wcid_or_altx_route"
+            ));
+            return Ok(());
         }
         let transmit = self.transmit_owned_client_frame(bytes);
         let preserve = self.preserve_client_rx_during_control_wait();
@@ -18677,6 +18911,41 @@ mod tests {
             }))
             .unwrap();
         assert!(state.finished().unwrap().is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn data_tx_status_correlates_against_the_reserved_station_wcid() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let (token, pid) = outstanding.reserve_for_wcid(7).unwrap();
+        assert!(
+            outstanding
+                .observe_diagnostic(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid,
+                    acked: true,
+                }))
+                .is_err()
+        );
+        outstanding
+            .observe_diagnostic(MgmtTxCompletion::Status(Mt7921TxStatus {
+                wcid: 7,
+                pid,
+                acked: true,
+            }))
+            .unwrap();
+        outstanding
+            .observe_diagnostic(MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: Some(7),
+                token,
+                dropped: false,
+                attempts: 1,
+            }))
+            .unwrap();
+        let (free, status) = outstanding.take_diagnostic_free(token).unwrap();
+        assert!(!free.dropped);
+        assert_eq!(status.unwrap().wcid, 7);
+        assert!(outstanding.is_empty());
     }
 
     #[cfg(feature = "fuchsia-passive")]
