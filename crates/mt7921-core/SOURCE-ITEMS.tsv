@@ -1755,11 +1755,11 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	259	prototype	EXPORT_SYMBOL
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	261	function	mt76_connac_init_tx_queues	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	276	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	278	macro	__bitrate_mask_check	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	296	function	mt76_connac2_mac_tx_rate_val	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	296	function	mt76_connac2_mac_tx_rate_val	linux_qos_eapol_control_port_reference	exact	5-GHz lowest-basic fixed OFDM rate, fixed bandwidth, no LDPC/STBC
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	358	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	361	function	mt76_connac2_mac_write_txwi_8023	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	401	function	mt76_connac2_mac_write_txwi_80211	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	495	function	mt76_connac2_mac_write_txwi	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	401	function	mt76_connac2_mac_write_txwi_80211	linux_qos_eapol_control_port_reference	exact	QoS header/TID/type/subtype, USE_MINRATE fixed rate, normal non-injected sequence ownership
+drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	495	function	mt76_connac2_mac_write_txwi	linux_qos_eapol_control_port_reference	exact	pre-key control-port TXD/TXP transcript, normal VO qidx 3, retry/lifetime/status fields
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	613	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	615	function	mt76_connac2_mac_fill_txs	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c	738	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-

@@ -63,7 +63,7 @@ use mt7921_port_spike::{
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
     passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    validate_passive_mac_bar_read,
+    validate_passive_mac_bar_read, linux_qos_eapol_control_port_reference,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -10792,16 +10792,30 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 } else {
                     0
                 };
-                let encoded = encode_client_data_txwi(
-                    frame.len(),
-                    frame_arena.iova,
-                    token,
-                    pid,
-                    eapol,
-                    control & 0x4000 != 0,
-                    qos,
-                    tid,
-                )?;
+                let encoded = if eapol && qos {
+                    let encoded = linux_qos_eapol_control_port_reference(
+                        frame,
+                        frame_arena.iova,
+                        token,
+                        pid,
+                    )?;
+                    record_sae_stage(&format!(
+                        "linux_control_port_tx_reference port_ctrl_proto=true use_minrate=true dont_encrypt=true assign_seq=false mpdu_sequence_host_owned=true txd_sn_valid=false txd_seq=0 fcs=hardware_appended mpdu_excludes_fcs=true queue=vo qidx=3 qid=normal_altx_false fixed_rate=ofdm6 ldpc=false stbc=false lifetime=0 retry=15 mpdu_seq_ctrl={}",
+                        u16::from_le_bytes(frame[22..24].try_into().unwrap()) >> 4
+                    ));
+                    encoded
+                } else {
+                    encode_client_data_txwi(
+                        frame.len(),
+                        frame_arena.iova,
+                        token,
+                        pid,
+                        eapol,
+                        control & 0x4000 != 0,
+                        qos,
+                        tid,
+                    )?
+                };
                 let dwords = (0..8)
                     .map(|index| {
                         u32::from_le_bytes(encoded[index * 4..index * 4 + 4].try_into().unwrap())
@@ -13378,7 +13392,7 @@ mod tests {
             &eapol[32..46],
             &[7, 128, 0, 0, 0, 0, 0, 0, 0, 80, 52, 18, 120, 128]
         );
-        let start_frame = eapol_start_frame([6, 5, 4, 3, 2, 1], [1, 2, 3, 4, 5, 6], true);
+        let start_frame = eapol_start_frame([6, 5, 4, 3, 2, 1], [2, 2, 3, 4, 5, 6], true);
         let start = encode_client_data_txwi(
             start_frame.len(),
             0x1234_5000,
@@ -13390,8 +13404,30 @@ mod tests {
             7,
         )
         .unwrap();
+        let linux_reference = linux_qos_eapol_control_port_reference(
+            &start_frame,
+            0x1234_5000,
+            7,
+            9,
+        )
+        .unwrap();
+        // Independently ported Linux control-port skb/tx_info path: QoS TID 7
+        // owns seq_ctrl in the MPDU, while ASSIGN_SEQ, INJECTED and TXD3
+        // SN_VALID/SEQ remain clear.  A zero diff selects the reference path
+        // in the physical E2E76 diagnostic instead of speculating on ALTX.
+        assert_eq!(start, linux_reference);
+        assert_eq!(
+            start_frame,
+            [
+                0x88, 0x01, 0, 0, 2, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 1, 0x80, 0xc2,
+                0, 0, 3, 0, 0, 7, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0,
+                0,
+            ]
+        );
         let all_words = (0..16)
-            .map(|i| u32::from_le_bytes(start[i * 4..i * 4 + 4].try_into().unwrap()))
+            .map(|i| {
+                u32::from_le_bytes(linux_reference[i * 4..i * 4 + 4].try_into().unwrap())
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             all_words,

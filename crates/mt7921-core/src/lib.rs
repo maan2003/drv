@@ -5718,6 +5718,67 @@ pub fn encode_client_data_txwi(
     Ok(bytes)
 }
 
+/// Independent port of Linux v7.1's mac80211 control-port preparation and
+/// `mt76_connac2_mac_write_txwi` for the one pre-key QoS EAPOL shape used by
+/// the physical client.  This deliberately does not call the production
+/// encoder: it is a diagnostic reference for the exact skb/tx_info path.
+pub fn linux_qos_eapol_control_port_reference(
+    mpdu: &[u8],
+    payload_iova: u64,
+    token: u16,
+    pid: u8,
+) -> Result<[u8; 64], String> {
+    if mpdu.len() > 0x0fff
+        || mpdu.len() < 38
+        || payload_iova
+            .checked_add(mpdu.len() as u64 - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || token >= 8192
+        || !(3..127).contains(&pid)
+    {
+        return Err("Linux control-port reference escaped TXWI/TXP bounds".into());
+    }
+
+    let fc = u16::from_le_bytes(mpdu[0..2].try_into().unwrap());
+    let qos = u16::from_le_bytes(mpdu[24..26].try_into().unwrap());
+    // Normal STA To-DS QoS data, unprotected, unicast RA, TID 7, LLC EAPOL.
+    // mac80211 has already written the per-STA/per-TID seq_ctrl in bytes
+    // 22..24.  It does not set ASSIGN_SEQ for QoS data, and mt76 only emits
+    // TXD3 SN_VALID for INJECTED frames.
+    if fc != 0x0188
+        || mpdu[4] & 1 != 0
+        || qos & 15 != 7
+        || mpdu.get(26..34) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+    {
+        return Err("Linux control-port reference requires a QoS EAPOL MPDU".into());
+    }
+
+    let mut bytes = [0u8; 64];
+    let mut put = |index: usize, value: u32| {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes())
+    };
+    // skb queue mapping VO -> Connac LMAC qidx 3; normal qid is below PSD,
+    // therefore this is CT rather than ALTX.  PORT_CTRL_PROTO implies
+    // USE_MINRATE.  DONT_ENCRYPT leaves hw_key NULL before PTK installation.
+    put(0, (3 << 25) | (mpdu.len() as u32 + 32));
+    put(1, (1 << 31) | (7 << 20) | (2 << 16) | (13 << 11) | 7);
+    put(2, (1 << 31) | (1 << 13) | (2 << 4) | 8);
+    // BA disabled by the fixed-rate path, 15 remaining attempts. SN_VALID,
+    // SEQ, protection and NO_ACK are intentionally clear.
+    put(3, (1 << 28) | (15 << 11));
+    put(4, 0);
+    put(5, (1 << 10) | u32::from(pid));
+    // Lowest 5-GHz basic rate: OFDM 6 Mbps. Fixed bandwidth; no LDPC/STBC.
+    put(6, ((0x40u32 | 11) << 16) | (1 << 2));
+    put(7, (2 << 20) | (8 << 16));
+    drop(put);
+
+    bytes[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
+    bytes[40..44].copy_from_slice(&(payload_iova as u32).to_le_bytes());
+    bytes[44..46].copy_from_slice(&((mpdu.len() as u16) | 0x8000).to_le_bytes());
+    Ok(bytes)
+}
+
 pub fn encode_client_management_tx(
     frame: &[u8],
     txwi_iova: u64,
@@ -8196,6 +8257,45 @@ mod tests {
                 info: 0,
             }
         );
+    }
+
+    #[test]
+    fn independent_linux_qos_control_port_transcript_matches_e2e75() {
+        let mpdu = [
+            0x88, 0x01, 0, 0, 2, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 1, 0x80, 0xc2, 0, 0, 3,
+            0, 0, 7, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0,
+        ];
+        let reference =
+            linux_qos_eapol_control_port_reference(&mpdu, 0x1234_5000, 4, 7).unwrap();
+        let dword = |index: usize| {
+            u32::from_le_bytes(
+                reference[index * 4..index * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            (0..8).map(dword).collect::<Vec<_>>(),
+            [
+                0x0600_0046,
+                0x8072_6807,
+                0x8000_2028,
+                0x1000_7800,
+                0,
+                0x0000_0407,
+                0x004b_0004,
+                0x0028_0000,
+            ]
+        );
+        assert_eq!(&reference[32..40], &[4, 0x80, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &reference[40..48],
+            &[0, 0x50, 0x34, 0x12, 0x26, 0x80, 0, 0]
+        );
+        // Normal QoS control-port sequence is owned by mac80211 in the MPDU;
+        // TXD3's SN_VALID and SEQ fields are both clear.
+        assert_eq!(u16::from_le_bytes(mpdu[22..24].try_into().unwrap()), 0);
+        assert_eq!(dword(3) & 0x8fff_0000, 0);
     }
 
     #[test]
