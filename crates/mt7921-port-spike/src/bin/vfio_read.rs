@@ -1853,6 +1853,36 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
+    // Source-exact discriminator: ieee80211_send_nullfunc only requests the
+    // minimum rate during connection polling.  This post-association liveness
+    // probe is ordinary rate-controlled traffic; EAPOL control-port traffic
+    // independently retains USE_MINRATE and the fixed OFDM6 TXD path.
+    let mut null = [0u8; 26];
+    null[..2].copy_from_slice(&0x01c8u16.to_le_bytes());
+    null[4] = 2;
+    let normal_ra = linux_qos_null_probe_reference_for_tid(&null, 0x1234_5000, 3, 6, 0)
+        .map_err(|error| format!("self-test normal-RA QoS null: {error}"))?;
+    let eapol_frame = eapol_start_frame([6, 5, 4, 3, 2, 1], [2, 2, 3, 4, 5, 6], true);
+    let fixed_eapol = linux_qos_eapol_control_port_reference(
+        &eapol_frame,
+        0x1234_6000,
+        4,
+        7,
+    )
+    .map_err(|error| format!("self-test fixed-rate EAPOL: {error}"))?;
+    let word = |bytes: &[u8; 64], index: usize| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    };
+    if [word(&normal_ra, 2), word(&normal_ra, 3), word(&normal_ra, 6)]
+        != [0x0000_002c, 0x0000_7800, 0]
+        || [word(&fixed_eapol, 2), word(&fixed_eapol, 3), word(&fixed_eapol, 6)]
+            != [0x8000_2028, 0x1000_7800, 0x004b_0004]
+    {
+        return Err("self-test normal-RA null/fixed-rate EAPOL distinction lost".into());
+    }
+    println!(
+        "self_test_qos_null_rate_control result=pass one_probe=be_qidx1 null_use_minrate=false null_fix_rate=false null_htc=false null_ba_disable=false null_txd6=zero eapol_use_minrate=true eapol_fix_rate=true eapol_fixed_rate=ofdm6 raw_tx_free_telemetry=retained"
+    );
     for status in 1..=3u32 {
         let mut raw = [0u8; 16];
         raw[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
@@ -11105,7 +11135,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                         frame[24] & 15,
                     )?;
                     record_sae_stage(&format!(
-                        "e2e81_variant kind=qos_null tid={} ac={} qidx={} awake=true dont_encrypt=true use_minrate=true wcid=7 altx=false state_change=false",
+                        "e2e85_variant kind=qos_null tid={} ac={} qidx={} awake=true dont_encrypt=true use_minrate=false rate_control=normal wcid=7 altx=false state_change=false",
                         frame[24] & 15,
                         if frame[24] & 15 == 0 { "be" } else { "vo" },
                         if frame[24] & 15 == 0 { 1 } else { 3 },
@@ -11519,7 +11549,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e84_evidence result=complete one_probe_only=true be_dropped={} qidx_be=1 eapol_published=false vo_published=false protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "e2e85_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
                 be.dropped,
             ));
             return Ok(());

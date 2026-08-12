@@ -5985,7 +5985,8 @@ pub fn linux_qos_eapol_control_port_reference(
 }
 
 /// Independent Linux v7.1 `ieee80211_send_nullfunc` plus Connac2 TXWI
-/// transcript for an awake (PM=0) QoS-null probe on the associated VO queue.
+/// transcript for an ordinary awake (PM=0) QoS-null probe.  Unlike a
+/// connection-poll null, this path does not set `USE_MINRATE`.
 pub fn linux_qos_null_probe_reference(
     mpdu: &[u8],
     payload_iova: u64,
@@ -6014,11 +6015,11 @@ pub fn linux_qos_null_probe_reference_for_tid(
     let words = [
         if tid == 0 { 0x0200_003a } else { 0x0600_003a },
         0x8002_6807 | u32::from(tid) << 20,
-        0x8000_202c,
-        0x1000_7800,
+        0x0000_002c,
+        0x0000_7800,
         0,
         0x400 | u32::from(pid),
-        0x004b_0004,
+        0,
         0x002c_0000,
     ];
     for (index, word) in words.into_iter().enumerate() {
@@ -8646,11 +8647,11 @@ mod tests {
             [
                 0x0600_003a,
                 0x8072_6807,
-                0x8000_202c,
-                0x1000_7800,
+                0x0000_002c,
+                0x0000_7800,
                 0,
                 0x406,
-                0x004b_0004,
+                0,
                 0x002c_0000,
             ]
         );
@@ -8673,6 +8674,11 @@ mod tests {
         };
         assert_eq!((word(&be, 0), word(&be, 1)), (0x0200_003a, 0x8002_6807));
         assert_eq!((word(&vo, 0), word(&vo, 1)), (0x0600_003a, 0x8072_6807));
+        for encoded in [&be, &vo] {
+            assert_eq!(word(encoded, 2), 0x0000_002c); // no FIX_RATE/HTC
+            assert_eq!(word(encoded, 3), 0x0000_7800); // no BA_DISABLE
+            assert_eq!(word(encoded, 6), 0); // rate control, not fixed OFDM6
+        }
     }
 
     #[test]
@@ -8684,11 +8690,11 @@ mod tests {
         let be = [
             0x0200_003a,
             0x8002_6807,
-            0x8000_202c,
-            0x1000_7800,
+            0x0000_002c,
+            0x0000_7800,
             0x0000_0000,
             0x0000_0407,
-            0x004b_0004,
+            0x0000_0000,
             0x002c_0000,
         ];
         assert_eq!(field(be[0], 0xfe00_0000), 1); // Q_IDX
@@ -8705,18 +8711,18 @@ mod tests {
         assert_eq!(field(be[1], 0x0000_f800), 13); // 26-byte HDR_INFO / 2
         assert_eq!(field(be[1], 0x0000_0400), 0); // VTA
         assert_eq!(field(be[1], 0x0000_03ff), 7); // ten-bit WLAN_IDX
-        assert_eq!(field(be[2], 0x8000_0000), 1); // FIX_RATE
+        assert_eq!(field(be[2], 0x8000_0000), 0); // normal rate control
         assert_eq!(field(be[2], 0x4000_0000), 0); // FIXED_RATE
         assert_eq!(field(be[2], 0x2000_0000), 0); // POWER_OFFSET high bit
         assert_eq!(field(be[2], 0x00ff_0000), 0); // MAX_TX_TIME
         assert_eq!(field(be[2], 0x0000_c000), 0); // FRAG
-        assert_eq!(field(be[2], 0x0000_2000), 1); // HTC_VLD
+        assert_eq!(field(be[2], 0x0000_2000), 0); // HTC_VLD
         assert_eq!(field(be[2], 0x0000_0030), 2); // DATA frame TYPE
         assert_eq!(field(be[2], 0x0000_000f), 12); // QoS-null SUB_TYPE
         assert_eq!(field(be[3], 0x8000_0000), 0); // SN_VALID
         assert_eq!(field(be[3], 0x4000_0000), 0); // PN_VALID
         assert_eq!(field(be[3], 0x2000_0000), 0); // SW_POWER_MGMT
-        assert_eq!(field(be[3], 0x1000_0000), 1); // BA_DISABLE
+        assert_eq!(field(be[3], 0x1000_0000), 0); // BA_DISABLE
         assert_eq!(field(be[3], 0x0fff_0000), 0); // SEQ
         assert_eq!(field(be[3], 0x0000_f800), 15); // REM_TX_COUNT
         assert_eq!(be[4], 0); // PN_LOW
@@ -8725,8 +8731,7 @@ mod tests {
         assert_eq!(field(be[5], 0x0000_0200), 0); // TX_STATUS_MCU
         assert_eq!(field(be[5], 0x0000_0100), 0); // TX_STATUS_FMT
         assert_eq!(field(be[5], 0x0000_00ff), 7); // PID, unrelated to WCID
-        assert_eq!(field(be[6], 0x3fff_0000), 0x4b); // OFDM 6 Mbps
-        assert_eq!(field(be[6], 0x0000_0004), 1); // FIXED_BW
+        assert_eq!(be[6], 0); // hardware rate control owns rate/bandwidth
         assert_eq!(field(be[7], 0x0030_0000), 2); // DATA TYPE
         assert_eq!(field(be[7], 0x000f_0000), 12); // QoS-null SUB_TYPE
         assert_eq!(be[7] & 0xffc0_ffff, 0); // no TXD_LEN/checksum/SPE/time
