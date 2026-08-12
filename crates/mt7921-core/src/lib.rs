@@ -5332,7 +5332,10 @@ pub fn encode_client_bss_command(
     payload[28] = 1;
     payload[29] = if channel <= 14 { 0x4e } else { 0xb1 };
     payload[30..32].copy_from_slice(&19u16.to_le_bytes());
-    payload[32..34].copy_from_slice(&(if channel <= 14 { 2u16 } else { 1u16 }).to_le_bytes());
+    // mt76_connac_get_phy_mode_v2(..., link_sta=NULL) uses the local
+    // MT7921 band capabilities, not the single legacy rate selected for TX.
+    payload[32..34]
+        .copy_from_slice(&(if channel <= 14 { 0x53u16 } else { 0x78u16 }).to_le_bytes());
     payload[40..42].copy_from_slice(&15u16.to_le_bytes());
     payload[42..44].copy_from_slice(&8u16.to_le_bytes());
     payload[44] = u8::from(qos);
@@ -6051,8 +6054,9 @@ impl ClientFirmwareEffectsState {
     }
 
     pub fn qos_tx_ready(&self) -> bool {
-        self.association.is_some_and(|association| !association.negotiated_qos)
-            || self.edca_programmed.is_some()
+        self.bss_programmed
+            && (self.association.is_some_and(|association| !association.negotiated_qos)
+                || self.edca_programmed.is_some())
     }
     pub fn bind_join(
         &mut self,
@@ -8609,6 +8613,21 @@ mod tests {
         assert_eq!(&encoded[200..212], &[2, 0, 12, 0, 1, 1, 3, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[212..224], &[3, 0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[224..232], &[13, 0, 8, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn independent_linux_dev_bss_sta_assoc_transcript_is_jointly_active() {
+        let client = [2, 2, 3, 4, 5, 6];
+        let peer = [6, 5, 4, 3, 2, 1];
+        let [dev, _] = encode_client_interface_commands(client, true, 1, 2).unwrap();
+        let bss = encode_client_bss_command(3, 0, peer, 36, 100, true, true).unwrap();
+        assert_eq!(dev[56], 1);
+        assert_eq!(&bss[56..66], &[1, 0, 0, 0, 1, 0, 1, 0, 0, 0]);
+        assert_eq!(&bss[66..72], &peer);
+        assert_eq!(u16::from_le_bytes(bss[72..74].try_into().unwrap()), 19);
+        assert_eq!(u16::from_le_bytes(bss[78..80].try_into().unwrap()), 19);
+        assert_eq!(u16::from_le_bytes(bss[80..82].try_into().unwrap()), 0x78);
+        assert_eq!(bss[92], 1);
     }
 
     #[test]

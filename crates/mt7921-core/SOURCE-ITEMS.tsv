@@ -1936,7 +1936,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1488	member	band	-	unmapped
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1489	member	pad	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1490	member	rlm	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1544	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1546	function	mt76_connac_mcu_uni_add_bss	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1546	function	mt76_connac_mcu_uni_add_bss	encode_client_bss_command	exact	infrastructure-client BASIC+QBSS request including active/connection state, BMC/STA WCID19 and local band PHY bitmaps
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1556	struct	__anone60253870e08	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1557	struct	__anone60253870f08	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1558	member	bss_idx	-	unmapped	-

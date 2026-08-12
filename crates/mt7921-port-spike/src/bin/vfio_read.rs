@@ -1046,7 +1046,7 @@ fn run_contained_dma_resource_round_trip(
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                            e2e79_probe_done: false,
+                            e2e80_probe_done: false,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -4430,7 +4430,7 @@ fn run() -> Result<(), String> {
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                                e2e79_probe_done: false,
+                                e2e80_probe_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4503,7 +4503,7 @@ fn run() -> Result<(), String> {
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                                e2e79_probe_done: false,
+                                e2e80_probe_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -10082,7 +10082,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             _ => return Err(zx::Status::INVALID_ARGS),
         };
         record_sae_stage(&format!(
-            "e2e79_linux_sta_context source=association_config basic_rates={basic_rates:#06x} legacy_rates={legacy_rates:#06x} ht_present={} vht_present={} he_present=false he_reason=pinned_api_omission bandwidth={bandwidth} qidx_mapping=3_minus_mac80211_ac tid7_ac=vo qidx=3",
+            "e2e80_linux_sta_context source=association_config basic_rates={basic_rates:#06x} legacy_rates={legacy_rates:#06x} ht_present={} vht_present={} he_present=false he_reason=pinned_api_omission bandwidth={bandwidth} qidx_mapping=3_minus_mac80211_ac tid7_ac=vo qidx=3",
             ht_cap.is_some(), vht_cap.is_some(),
         ));
         record_sae_stage(&format!(
@@ -10687,7 +10687,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
     mgmt_tx_outstanding: MgmtTxOutstanding,
-    e2e79_probe_done: bool,
+    e2e80_probe_done: bool,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -10714,7 +10714,7 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
-    fn e2e79_snapshot(&self, phase: &str) {
+    fn e2e80_snapshot(&self, phase: &str) {
         let mac = PassiveMacExecutor {
             pages: self.mac_pages,
         };
@@ -10739,7 +10739,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .map_or_else(|_| "unavailable".into(), |v| format!("{v:#010x}"))
         };
         record_sae_stage(&format!(
-            "e2e79_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
+            "e2e80_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
             read(0x820f_d108),
             read(0x820f_d520),
             read(0x820f_d100),
@@ -10751,7 +10751,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         ));
     }
 
-    fn e2e79_wait_tx_free(
+    fn e2e80_wait_tx_free(
         &mut self,
         variant: &str,
         token: u16,
@@ -10774,7 +10774,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             }
             if let Some((free, status)) = self.mgmt_tx_outstanding.take_diagnostic_free(token) {
                 record_sae_stage(&format!(
-                    "e2e79_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
+                    "e2e80_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
                     free.dropped,
                     free.attempts,
                     status.is_some(),
@@ -10783,19 +10783,19 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 return Ok(free);
             }
             if Instant::now() >= deadline {
-                return Err(format!("E2E79 {variant} TX_FREE timed out"));
+                return Err(format!("E2E80 {variant} TX_FREE timed out"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
-    fn e2e79_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
+    fn e2e80_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
         self.transmit_owned_client_frame(frame)?;
         let (token, pid) = self
             .mgmt_tx_outstanding
             .last_identity()
-            .ok_or("E2E79 submission omitted identity")?;
-        self.e2e79_wait_tx_free(variant, token, pid)
+            .ok_or("E2E80 submission omitted identity")?;
+        self.e2e80_wait_tx_free(variant, token, pid)
     }
 
     fn preserve_client_rx_during_control_wait(&mut self) -> Result<(), String> {
@@ -11207,6 +11207,17 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        if expected_cid == 2 && encoded.len() == 96 {
+            record_sae_stage(&format!(
+                "e2e80_bss_transcript bytes=96 bss_idx={} active={} omac_idx={} hw_bss_idx={} band_idx={} conn_type={:#010x} conn_state={} wmm_idx={} bmc_wcid={} beacon_interval={} dtim={} phymode={:#04x} sta_idx={} nonht_basic_phy={:#06x} qos={} cipher=firmware_vif_owned",
+                encoded[48], encoded[56], encoded[57], encoded[58], encoded[59],
+                u32::from_le_bytes(encoded[60..64].try_into().unwrap()), encoded[64], encoded[65],
+                u16::from_le_bytes(encoded[72..74].try_into().unwrap()),
+                u16::from_le_bytes(encoded[74..76].try_into().unwrap()), encoded[76], encoded[77],
+                u16::from_le_bytes(encoded[78..80].try_into().unwrap()),
+                u16::from_le_bytes(encoded[80..82].try_into().unwrap()), encoded[92],
+            ));
+        }
         let sta_update_wcid = (expected_cid == 3 && encoded.len() >= 176)
             .then(|| encoded.get(49).copied())
             .flatten();
@@ -11275,7 +11286,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let rx = nested(wtbl, 1).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
             let hdr = nested(wtbl, 6).ok_or(zx::Status::IO_DATA_INTEGRITY)?;
             record_sae_stage(&format!(
-                "e2e79_sta_rec_transcript wcid={wcid} bytes={} bss_idx={} omac_idx={} conn_type={:#010x} conn_state={} qos={} aid={} tlv_ht={} tlv_vht={} tlv_amsdu={} tlv_uapsd={} tlv_he=false phy_basic_rates={:#06x} phy_type={:#04x} phy_ampdu={:#04x} ra_legacy_rates={:#06x} ra_mcs={:02x?} sta_state={} vht_opmode={:#04x} wtbl_operation={} wtbl_tlvs={} wtbl_ht={} wtbl_vht={} wtbl_smps={} generic_muar={} generic_skip_tx={} generic_qos={} rx_rca1={} rx_rca2={} rx_rv={} hdr_to_ds={} hdr_from_ds={} hdr_no_rx_trans={}",
+                "e2e80_sta_rec_transcript wcid={wcid} bytes={} bss_idx={} omac_idx={} conn_type={:#010x} conn_state={} qos={} aid={} tlv_ht={} tlv_vht={} tlv_amsdu={} tlv_uapsd={} tlv_he=false phy_basic_rates={:#06x} phy_type={:#04x} phy_ampdu={:#04x} ra_legacy_rates={:#06x} ra_mcs={:02x?} sta_state={} vht_opmode={:#04x} wtbl_operation={} wtbl_tlvs={} wtbl_ht={} wtbl_vht={} wtbl_smps={} generic_muar={} generic_skip_tx={} generic_qos={} rx_rca1={} rx_rca2={} rx_rv={} hdr_to_ds={} hdr_from_ds={} hdr_no_rx_trans={}",
                 encoded.len(),
                 encoded[48],
                 encoded[53],
@@ -11328,7 +11339,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         // Linux's association STA add is CID 3 with this exact five-TLV
         // fixture. Observe, but never mutate, the source-owned RX state after
         // its ACK so a no-data run distinguishes filtering from ring ingress.
-        if expected_cid == 3 && encoded.len() == 176 {
+        if expected_cid == 3 && encoded.len() >= 176 {
             let mac = PassiveMacExecutor {
                 pages: self.mac_pages,
             };
@@ -11397,21 +11408,21 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let eapol = bytes
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        if eapol && !self.e2e79_probe_done {
+        if eapol && !self.e2e80_probe_done {
             // One bounded source-exact EAPOL probe after the negotiated-rate
             // STA_REC context has been ACKed. E2E77 already ruled out MPDU
             // content, so no additional frame variant is authorized here.
-            self.e2e79_probe_done = true;
-            self.e2e79_snapshot("before_eapol");
+            self.e2e80_probe_done = true;
+            self.e2e80_snapshot("before_eapol");
             let result = self
-                .e2e79_submit_wait("eapol_start", bytes)
+                .e2e80_submit_wait("eapol_start", bytes)
                 .map_err(|error| {
-                    record_sae_stage(&format!("e2e79_probe result=error reason={error}"));
+                    record_sae_stage(&format!("e2e80_probe result=error reason={error}"));
                     zx::Status::IO
                 })?;
-            self.e2e79_snapshot("after_eapol");
+            self.e2e80_snapshot("after_eapol");
             record_sae_stage(&format!(
-                "e2e79_probe result=complete dropped={} attempts={} frame_variants=one firmware_context=negotiated_ht_vht_context",
+                "e2e80_probe result=complete dropped={} attempts={} frame_variants=one firmware_context=associated_bss_and_sta_context",
                 result.dropped, result.attempts,
             ));
             return Ok(());
