@@ -1,0 +1,12 @@
+prefix=/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/bssl-sys-01f9826455eeace6/out
+exec_prefix=${prefix}
+libdir=/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/bssl-sys-01f9826455eeace6/out/lib64
+includedir=/home/maan2003/src/drv/.jj/managed-workspaces/ws-eng14fn-open-markers/crates/mt7921-passive-scan/target/debug/build/bssl-sys-01f9826455eeace6/out/include
+
+Name: benchmark
+Description: Google microbenchmark framework
+Version: 1.9.5
+
+Libs: -L${libdir} -lbenchmark
+Libs.private: -lpthread -lrt
+Cflags: -I${includedir}

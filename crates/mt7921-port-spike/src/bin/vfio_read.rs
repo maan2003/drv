@@ -846,16 +846,17 @@ fn run_contained_dma_resource_round_trip(
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let global_ext = wfdma.read(0xd42b0)?;
-        if global_ext == u32::MAX {
-            return Err("WFDMA extended configuration returned all ones".into());
-        }
-        wfdma.write_active_wfdma(0xd42b0, global_ext & !(1 << 6))?;
-        active
-            .dmashdl
-            .as_ref()
-            .expect("mapped")
-            .enable_dmashdl_bypass()?;
+        let dmashdl = active.dmashdl.as_ref().expect("mapped");
+        let dmashdl_readback =
+            ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant { wfdma, dmashdl })?;
+        record_sae_stage(&format!(
+            "dmashdl_invariant point=contained_dma_init ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
+            dmashdl_readback.ext0_before,
+            dmashdl_readback.control_before,
+            dmashdl_readback.ext0_after,
+            dmashdl_readback.control_after,
+            dmashdl_readback.attempts,
+        ));
         let reset = wfdma.read(0xd4100)?;
         if reset == u32::MAX {
             return Err("WFDMA reset control returned all ones".into());
@@ -4452,12 +4453,18 @@ fn run() -> Result<(), String> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            let global_ext = wfdma.read(0xd42b0)?;
-            if global_ext == u32::MAX {
-                return Err("WFDMA extended configuration returned all ones".into());
-            }
-            wfdma.write_active_wfdma(0xd42b0, global_ext & !(1 << 6))?;
-            dmashdl.enable_dmashdl_bypass()?;
+            let dmashdl_readback = ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant {
+                wfdma: &wfdma,
+                dmashdl,
+            })?;
+            record_sae_stage(&format!(
+                "dmashdl_invariant point=linux_dma_init ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
+                dmashdl_readback.ext0_before,
+                dmashdl_readback.control_before,
+                dmashdl_readback.ext0_after,
+                dmashdl_readback.control_after,
+                dmashdl_readback.attempts,
+            ));
             let reset = wfdma.read(0xd4100)?;
             if reset == u32::MAX {
                 return Err("WFDMA reset control returned all ones".into());
@@ -12147,31 +12154,60 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 frame.extend_from_slice(&[0, 0, tid, 0]);
                 frame
             };
+            let dmashdl_ext0 = self
+                .loader
+                .mcu
+                .wfdma
+                .read(WFDMA_GLO_CFG_EXT0)
+                .map_err(|error| {
+                    record_sae_stage(&format!(
+                        "e2e90_dmashdl_gate result=read_error register=ext0 reason={error}"
+                    ));
+                    zx::Status::IO
+                })?;
+            let dmashdl_control = self.dmashdl.read(DMASHDL_SW_CONTROL).map_err(|error| {
+                record_sae_stage(&format!(
+                    "e2e90_dmashdl_gate result=read_error register=control reason={error}"
+                ));
+                zx::Status::IO
+            })?;
+            if dmashdl_ext0 & WFDMA_TX_DMASHDL_ENABLE != 0 || dmashdl_control & DMASHDL_BYPASS == 0
+            {
+                record_sae_stage(&format!(
+                    "e2e90_dmashdl_gate result=mismatch ext0={dmashdl_ext0:#010x} scheduler_bit6={} control={dmashdl_control:#010x} bypass_bit28={} probe_published=false",
+                    (dmashdl_ext0 >> 6) & 1,
+                    (dmashdl_control >> 28) & 1,
+                ));
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            record_sae_stage(&format!(
+                "e2e90_dmashdl_gate result=match ext0={dmashdl_ext0:#010x} scheduler_bit6=0 control={dmashdl_control:#010x} bypass_bit28=1"
+            ));
             let peer_dw5 = PassiveMacExecutor {
                 pages: self.mac_pages,
             }
             .read_firmware_snapshot_raw(0x820d_8114)
             .map_err(|error| {
                 record_sae_stage(&format!(
-                    "e2e89_peer_dw5 result=read_error addr=0x820d8114 reason={error}"
+                    "e2e90_peer_dw5 result=read_error addr=0x820d8114 reason={error}"
                 ));
                 zx::Status::IO
             })?;
             let reserved_bit2 = (peer_dw5 >> 2) & 1;
             validate_peer_wtbl_dw5_named_fields(peer_dw5).map_err(|error| {
                 record_sae_stage(&format!(
-                    "e2e89_peer_dw5 result=named_mismatch value={peer_dw5:#010x} reserved_bit2={reserved_bit2} reason={error}"
+                    "e2e90_peer_dw5 result=named_mismatch value={peer_dw5:#010x} reserved_bit2={reserved_bit2} reason={error}"
                 ));
                 zx::Status::IO_DATA_INTEGRITY
             })?;
             if peer_dw5 != 0x3200_0427 {
                 record_sae_stage(&format!(
-                    "e2e89_peer_dw5 result=exact_mismatch value={peer_dw5:#010x} expected=0x32000427 reserved_bit2={reserved_bit2}"
+                    "e2e90_peer_dw5 result=exact_mismatch value={peer_dw5:#010x} expected=0x32000427 reserved_bit2={reserved_bit2}"
                 ));
                 return Err(zx::Status::IO_DATA_INTEGRITY);
             }
             record_sae_stage(&format!(
-                "e2e89_peer_dw5 result=exact_match value={peer_dw5:#010x} expected=0x32000427 change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} reserved_bit2={reserved_bit2}",
+                "e2e90_peer_dw5 result=exact_match value={peer_dw5:#010x} expected=0x32000427 change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} reserved_bit2={reserved_bit2}",
                 (peer_dw5 >> 5) & 7,
                 (peer_dw5 >> 8) & 1,
                 (peer_dw5 >> 9) & 1,
@@ -12183,12 +12219,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
                 .map_err(|error| {
-                    record_sae_stage(&format!("e2e89_probe result=error stage=BE reason={error}"));
+                    record_sae_stage(&format!("e2e90_probe result=error stage=BE reason={error}"));
                     zx::Status::IO
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e89_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "e2e90_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true raw_txs_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));
@@ -12819,6 +12855,94 @@ fn install_vfio_irq(device: &Arc<File>, capability: PciIrqCapability) -> Result<
     )
 }
 
+const WFDMA_GLO_CFG_EXT0: usize = 0xd42b0;
+const WFDMA_TX_DMASHDL_ENABLE: u32 = 1 << 6;
+const DMASHDL_SW_CONTROL: usize = 0xd6004;
+const DMASHDL_BYPASS: u32 = 1 << 28;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DmashdlInvariantReadback {
+    ext0_before: u32,
+    control_before: u32,
+    ext0_after: u32,
+    control_after: u32,
+    attempts: u8,
+}
+
+trait DmashdlInvariantIo {
+    fn read_ext0(&mut self) -> Result<u32, String>;
+    fn write_ext0(&mut self, value: u32) -> Result<(), String>;
+    fn read_control(&mut self) -> Result<u32, String>;
+    fn write_control(&mut self, value: u32) -> Result<(), String>;
+}
+
+fn ensure_linux_dmashdl_invariant(
+    io: &mut impl DmashdlInvariantIo,
+) -> Result<DmashdlInvariantReadback, String> {
+    let ext0_before = io.read_ext0()?;
+    let control_before = io.read_control()?;
+    if ext0_before == u32::MAX || control_before == u32::MAX {
+        return Err("DMASHDL invariant read returned all ones".into());
+    }
+    let mut ext0_after = ext0_before;
+    let mut control_after = control_before;
+    let mut attempts = 0;
+    while ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0 || control_after & DMASHDL_BYPASS == 0 {
+        if attempts == 2 {
+            return Err(format!(
+                "DMASHDL invariant did not latch ext0={ext0_after:#010x} control={control_after:#010x}"
+            ));
+        }
+        attempts += 1;
+        if ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0 {
+            io.write_ext0(ext0_after & !WFDMA_TX_DMASHDL_ENABLE)?;
+        }
+        if control_after & DMASHDL_BYPASS == 0 {
+            io.write_control(control_after | DMASHDL_BYPASS)?;
+        }
+        // A BAR read flushes the preceding posted PCIe write. Linux performs
+        // this idempotent RMW while DMA is disabled; one retry is safe at the
+        // same lifecycle point and catches an unlatched first publication.
+        ext0_after = io.read_ext0()?;
+        control_after = io.read_control()?;
+        if ext0_after == u32::MAX || control_after == u32::MAX {
+            return Err("DMASHDL invariant readback returned all ones".into());
+        }
+    }
+    Ok(DmashdlInvariantReadback {
+        ext0_before,
+        control_before,
+        ext0_after,
+        control_after,
+        attempts,
+    })
+}
+
+struct VfioDmashdlInvariant<'a> {
+    wfdma: &'a ReadPage,
+    dmashdl: &'a ReadPage,
+}
+
+impl DmashdlInvariantIo for VfioDmashdlInvariant<'_> {
+    fn read_ext0(&mut self) -> Result<u32, String> {
+        self.wfdma.read(WFDMA_GLO_CFG_EXT0)
+    }
+
+    fn write_ext0(&mut self, value: u32) -> Result<(), String> {
+        self.wfdma.write_active_wfdma(WFDMA_GLO_CFG_EXT0, value)
+    }
+
+    fn read_control(&mut self) -> Result<u32, String> {
+        self.dmashdl.read(DMASHDL_SW_CONTROL)
+    }
+
+    fn write_control(&mut self, value: u32) -> Result<(), String> {
+        // Linux's 0x7c026004 falls in its fixed 0x7c020000 -> BAR 0xd0000
+        // map, so the exact direct BAR address is 0xd6004; no L1 remap is used.
+        self.dmashdl.write_dmashdl_control(value)
+    }
+}
+
 struct ReadPage {
     mapping: Option<userspace_vfio::RegionMapping>,
     #[cfg(test)]
@@ -13043,17 +13167,14 @@ impl ReadPage {
         }
         Ok(())
     }
-    fn enable_dmashdl_bypass(&self) -> Result<(), String> {
+    fn write_dmashdl_control(&self, value: u32) -> Result<(), String> {
         if self.bar_page != 0xd6000 {
             return Err("DMASHDL write escaped immutable allowlist".into());
         }
-        let offset = 0xd6004;
-        let raw = self.read(offset)?;
-        if raw == u32::MAX {
-            return Err("DMASHDL control returned all ones".into());
+        if value & DMASHDL_BYPASS == 0 {
+            return Err("DMASHDL bypass write did not set source-owned bit".into());
         }
-        let value = raw | (1 << 28);
-        let within = offset - self.bar_page;
+        let within = DMASHDL_SW_CONTROL - self.bar_page;
         self.write_within(within, value)?;
         Ok(())
     }
@@ -19029,6 +19150,64 @@ mod tests {
         wm2_tail = next_dma_index(wm2_tail, 8);
         assert_eq!((wm_head, wm_tail), (0, 7));
         assert_eq!((wm2_head, wm2_tail), (4, 0));
+    }
+
+    #[test]
+    fn dmashdl_invariant_retries_one_unlatched_write_and_skips_when_correct() {
+        struct FakeDmashdl {
+            ext0: u32,
+            control: u32,
+            drop_first_control_write: bool,
+            ext0_writes: usize,
+            control_writes: usize,
+        }
+        impl DmashdlInvariantIo for FakeDmashdl {
+            fn read_ext0(&mut self) -> Result<u32, String> {
+                Ok(self.ext0)
+            }
+            fn write_ext0(&mut self, value: u32) -> Result<(), String> {
+                self.ext0_writes += 1;
+                self.ext0 = value;
+                Ok(())
+            }
+            fn read_control(&mut self) -> Result<u32, String> {
+                Ok(self.control)
+            }
+            fn write_control(&mut self, value: u32) -> Result<(), String> {
+                self.control_writes += 1;
+                if self.drop_first_control_write {
+                    self.drop_first_control_write = false;
+                } else {
+                    self.control = value;
+                }
+                Ok(())
+            }
+        }
+
+        let mut lost_once = FakeDmashdl {
+            ext0: WFDMA_TX_DMASHDL_ENABLE | 3,
+            control: 5,
+            drop_first_control_write: true,
+            ext0_writes: 0,
+            control_writes: 0,
+        };
+        let readback = ensure_linux_dmashdl_invariant(&mut lost_once).unwrap();
+        assert_eq!(readback.attempts, 2);
+        assert_eq!(readback.ext0_after, 3);
+        assert_eq!(readback.control_after, DMASHDL_BYPASS | 5);
+        assert_eq!(lost_once.ext0_writes, 1);
+        assert_eq!(lost_once.control_writes, 2);
+
+        let mut correct = FakeDmashdl {
+            ext0: 3,
+            control: DMASHDL_BYPASS | 5,
+            drop_first_control_write: false,
+            ext0_writes: 0,
+            control_writes: 0,
+        };
+        let readback = ensure_linux_dmashdl_invariant(&mut correct).unwrap();
+        assert_eq!(readback.attempts, 0);
+        assert_eq!((correct.ext0_writes, correct.control_writes), (0, 0));
     }
 
     #[test]

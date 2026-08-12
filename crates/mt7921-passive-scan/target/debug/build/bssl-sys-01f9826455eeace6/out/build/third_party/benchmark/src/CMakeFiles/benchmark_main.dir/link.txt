@@ -1,0 +1,2 @@
+/nix/store/adcz0m6qq2flmshdf0zz2xwjr5zbq1gr-gcc-wrapper-15.3.0/bin/ar qc libbenchmark_main.a CMakeFiles/benchmark_main.dir/benchmark_main.cc.o
+/nix/store/adcz0m6qq2flmshdf0zz2xwjr5zbq1gr-gcc-wrapper-15.3.0/bin/ranlib libbenchmark_main.a
