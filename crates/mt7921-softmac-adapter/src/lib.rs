@@ -418,6 +418,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         let channel = context.channel;
         if !self.initialized {
             self.prepare_receive_only()?;
+            self.issue(PassiveMcuCommand::ProtectCtrl)?;
             self.issue(PassiveMcuCommand::MacEnable)?;
             self.issue(PassiveMcuCommand::SetRxPath {
                 channel,
@@ -1510,23 +1511,24 @@ mod tests {
         assert_eq!(response.scan_id, Some(1));
         let commands = &adapter.transport.mechanics.commands;
         assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(1));
-        assert_eq!(commands.len(), 8);
+        assert_eq!(commands.len(), 9);
         assert!(matches!(commands[0].0, PassiveMcuCommand::EepromBufferMode));
-        assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
-        assert!(matches!(commands[2].0, PassiveMcuCommand::SetRxPath { .. }));
-        assert!(matches!(commands[3].0, PassiveMcuCommand::AddDevice { .. }));
-        assert!(matches!(commands[4].0, PassiveMcuCommand::AddBss));
+        assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
+        assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
+        assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
+        assert!(matches!(commands[4].0, PassiveMcuCommand::AddDevice { .. }));
+        assert!(matches!(commands[5].0, PassiveMcuCommand::AddBss));
         assert!(matches!(
-            commands[5].0,
+            commands[6].0,
             PassiveMcuCommand::SetPassiveRxFilter
         ));
         assert!(matches!(
-            commands[6].0,
+            commands[7].0,
             PassiveMcuCommand::ChannelSwitch { .. }
         ));
-        assert!(matches!(commands[7].0, PassiveMcuCommand::StartScan { .. }));
-        assert!(!commands[7].2);
-        let scan_request = &commands[7].1[64..];
+        assert!(matches!(commands[8].0, PassiveMcuCommand::StartScan { .. }));
+        assert!(!commands[8].2);
+        let scan_request = &commands[8].1[64..];
         assert_eq!(scan_request[2], 0);
         assert_eq!(scan_request[4], 0);
         assert_eq!(scan_request[5], 0);

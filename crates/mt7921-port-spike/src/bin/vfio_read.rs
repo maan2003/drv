@@ -1658,6 +1658,9 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
                     token,
                     dropped: false,
                     attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }))
                 .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
             println!("self_test_management_tx completion=paired token={token} pid={pid}");
@@ -1850,6 +1853,23 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
+    for status in 1..=3u32 {
+        let mut raw = [0u8; 16];
+        raw[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        let pair = (1u32 << 31) | (7 << 14);
+        let info = (4u32 << 16) | (status << 13) | 15;
+        raw[8..12].copy_from_slice(&pair.to_le_bytes());
+        raw[12..16].copy_from_slice(&info.to_le_bytes());
+        let parsed = parse_mt7921_tx_free(&raw)
+            .map_err(|error| format!("self-test raw TX_FREE status: {error:?}"))?;
+        if parsed.status != status as u8 || parsed.attempts != 15 {
+            return Err("self-test raw TX_FREE status/count lost".into());
+        }
+        println!(
+            "self_test_tx_free_raw status2={} count={} wcid={:?} token={} pair_word={:#010x} info_word={:#010x}",
+            parsed.status, parsed.attempts, parsed.wcid, parsed.token, pair, info
+        );
+    }
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
         generation,
@@ -7378,6 +7398,10 @@ fn passive_mac_read_address_allowed(address: u32) -> bool {
                 | 0x820e_5004
                 | 0x820f_5000
                 | 0x820f_5004
+                | 0x820d_8708
+                | 0x820d_870c
+                | 0x820d_8710
+                | 0x820d_8714
                 | 0x820d_8750
                 | 0x820d_8754
                 | 0x820d_8758
@@ -7397,6 +7421,7 @@ fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
     match address {
         0x820e_5000 | 0x820e_5004 => Ok(0x0002_1400 + (address - 0x820e_5000) as usize),
         0x820f_5000 | 0x820f_5004 => Ok(0x000a_1400 + (address - 0x820f_5000) as usize),
+        0x820d_8708..=0x820d_8714 => Ok(0x0003_8708 + (address - 0x820d_8708) as usize),
         0x820d_8750..=0x820d_876c => Ok(0x0003_8750 + (address - 0x820d_8750) as usize),
         0x820f_d100 | 0x820f_d108 | 0x820f_d520 => {
             Ok(0x000a_4800 + (address - 0x820f_d000) as usize)
@@ -7574,11 +7599,15 @@ fn drain_rx_queue(
                 let packet_type = (rxd0 >> 27) & 0x1f;
                 let packet_flag = (rxd0 >> 16) & 0x0f;
                 let completion = match packet_type {
-                    6 => Some(
-                        parse_mt7921_tx_free(&response)
+                    6 => {
+                        let raw = response.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                        record_sae_stage(&format!(
+                            "tx_completion_raw route=mcu_normal packet_type=6 len={} bytes={raw}", response.len()
+                        ));
+                        Some(parse_mt7921_tx_free(&response)
                             .map(MgmtTxCompletion::Free)
-                            .map_err(|error| format!("parse TX_FREE: {error:?}")),
-                    ),
+                            .map_err(|error| format!("parse TX_FREE: {error:?}")))
+                    }
                     0 if response_len >= 40 && (rxd0 & 0xffff) as usize == response_len => Some(
                         parse_mt7921_tx_status(&response)
                             .map(MgmtTxCompletion::Status)
@@ -10781,10 +10810,16 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .map_or_else(|_| "unavailable".into(), |v| format!("{v:#010x}"))
         };
         record_sae_stage(&format!(
-            "e2e81_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
+            "e2e84_public_snapshot phase={phase} wtbl_wcid7_control_dw2={} wtbl_wcid7_control_dw3={} wtbl_wcid7_control_dw4={} wtbl_wcid7_control_dw5={} privacy=dw0_dw1_mac_masked_key_pn_unread wtbl_expected=associated_awake_skip_tx0_tx_ps0_qos1 admission_counters=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} mac_band0_rmac_ctrl={} mac_band0_tmac_ctrl={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
+            read(0x820d_8708),
+            read(0x820d_870c),
+            read(0x820d_8710),
+            read(0x820d_8714),
             read(0x820f_d108),
             read(0x820f_d520),
             read(0x820f_d100),
+            read(0x820e_5000),
+            read(0x820e_4000),
             dmashdl(0xd6004),
             dmashdl(0xd6060),
             dmashdl(0xd6070),
@@ -10816,9 +10851,12 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             }
             if let Some((free, status)) = self.mgmt_tx_outstanding.take_diagnostic_free(token) {
                 record_sae_stage(&format!(
-                    "e2e81_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
-                    free.dropped,
+                    "e2e84_tx_result variant={variant} token={token} pid={pid} tx_free_pair_word={:?} tx_free_info_word={:#010x} tx_free_status2={} tx_free_count={} tx_free_dropped={} txs_present={} txs_acked={}",
+                    free.pair_word,
+                    free.info_word,
+                    free.status,
                     free.attempts,
+                    free.dropped,
                     status.is_some(),
                     status.is_some_and(|value| value.acked),
                 ));
@@ -11472,30 +11510,17 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 frame.extend_from_slice(&[0, 0, tid, 0]);
                 frame
             };
-            self.e2e81_snapshot("before_BE");
+            self.e2e81_snapshot("immediately_before_BE");
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
                 .map_err(|error| {
                     record_sae_stage(&format!("e2e81_matrix result=error stage=BE reason={error}"));
                     zx::Status::IO
                 })?;
-            self.e2e81_snapshot("after_BE_before_VO");
-            let vo = self
-                .e2e81_submit_wait("B_tid7_vo_qidx3", &make_null(7))
-                .map_err(|error| {
-                    record_sae_stage(&format!("e2e81_matrix result=error stage=VO reason={error}"));
-                    zx::Status::IO
-                })?;
-            self.e2e81_snapshot("after_VO");
-            let classification = match (!be.dropped, !vo.dropped) {
-                (true, false) => "ac_qidx_edca_path",
-                (false, false) => "general_wcid7_data_context",
-                (true, true) => "eapol_specific",
-                (false, true) => "be_specific_unexpected",
-            };
+            self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e81_matrix result=complete classification={classification} be_dropped={} vo_dropped={} qidx_be=1 qidx_vo=3 eapol_published=false",
-                be.dropped, vo.dropped,
+                "e2e84_evidence result=complete one_probe_only=true be_dropped={} qidx_be=1 eapol_published=false vo_published=false protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                be.dropped,
             ));
             return Ok(());
         }
@@ -17121,6 +17146,9 @@ mod tests {
                     token: 0,
                     dropped: false,
                     attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }),
             ]
         );
@@ -19030,6 +19058,9 @@ mod tests {
                     token: 0,
                     dropped: false,
                     attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }),
                 MgmtTxCompletion::Status(Mt7921TxStatus {
                     wcid: 19,
@@ -19048,6 +19079,9 @@ mod tests {
                     token: 0,
                     dropped: false,
                     attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }),
             ],
         ] {
@@ -19070,7 +19104,10 @@ mod tests {
                     wcid: None,
                     token: 1,
                     dropped: false,
-                    attempts: 1
+                    attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }))
                 .is_err()
         );
@@ -19080,6 +19117,9 @@ mod tests {
                 token: 0,
                 dropped: true,
                 attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
             }))
             .unwrap();
         assert!(
@@ -19088,7 +19128,10 @@ mod tests {
                     wcid: None,
                     token: 0,
                     dropped: false,
-                    attempts: 1
+                    attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
                 }))
                 .is_err()
         );
@@ -19129,6 +19172,9 @@ mod tests {
                 token,
                 dropped: false,
                 attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
             }))
             .unwrap();
         let (free, status) = outstanding.take_diagnostic_free(token).unwrap();
@@ -19164,12 +19210,18 @@ mod tests {
                 token: first.0,
                 dropped: false,
                 attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
             }),
             MgmtTxCompletion::Free(Mt7921TxFree {
                 wcid: None,
                 token: second.0,
                 dropped: false,
                 attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
             }),
             MgmtTxCompletion::Status(Mt7921TxStatus {
                 wcid: 19,

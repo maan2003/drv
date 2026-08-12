@@ -1467,13 +1467,13 @@ drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	32	enumerator	MT_LMAC_PSMP
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	35	enum	__anonfe52b62a0203	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	36	enumerator	MT_TXS_MPDU_FMT	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	37	enumerator	MT_TXS_PPDU_FMT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	40	macro	MT_TX_FREE_MSDU_CNT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	41	macro	MT_TX_FREE_WLAN_ID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	42	macro	MT_TX_FREE_COUNT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	44	macro	MT_TX_FREE_STATUS	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	45	macro	MT_TX_FREE_MSDU_ID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	46	macro	MT_TX_FREE_PAIR	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	48	macro	MT_TX_FREE_RATE	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	40	macro	MT_TX_FREE_MSDU_CNT	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	41	macro	MT_TX_FREE_WLAN_ID	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	42	macro	MT_TX_FREE_COUNT	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	44	macro	MT_TX_FREE_STATUS	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	45	macro	MT_TX_FREE_MSDU_ID	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	46	macro	MT_TX_FREE_PAIR	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	48	macro	MT_TX_FREE_RATE	parse_mt7921_tx_free	exact	raw pair/info words, ten-bit WCID, token, status2 and count retained independently
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	50	macro	MT_TXD0_Q_IDX	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	51	macro	MT_TXD0_PKT_FMT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	52	macro	MT_TXD0_ETH_TYPE_OFFSET	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
@@ -1828,7 +1828,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	193	struct	__anone602538706
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	194	member	bss_idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	195	member	ps_state	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	210	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	212	function	mt76_connac_mcu_set_rts_thresh	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	212	function	mt76_connac_mcu_set_rts_thresh	PassiveMcuCommand::ProtectCtrl	exact	source-mandatory band0 RTS threshold 0x92b init command; closure only, no causal claim
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	214	struct	__anone60253870708	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	215	member	prot_idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	216	member	band	-	unmapped	-
@@ -3083,7 +3083,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1240	enumerator	MCU_EXT_CMD
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1241	enumerator	MCU_EXT_CMD_SET_DRR_CTRL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1242	enumerator	MCU_EXT_CMD_SET_RDD_CTRL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1243	enumerator	MCU_EXT_CMD_ATE_CTRL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1244	enumerator	MCU_EXT_CMD_PROTECT_CTRL	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1244	enumerator	MCU_EXT_CMD_PROTECT_CTRL	PassiveMcuCommand::ProtectCtrl	exact	source-mandatory band0 RTS threshold 0x92b init command; closure only, no causal claim
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1245	enumerator	MCU_EXT_CMD_DBDC_CTRL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1246	enumerator	MCU_EXT_CMD_MAC_INIT_CTRL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1247	enumerator	MCU_EXT_CMD_RX_HDR_TRANS	-	unmapped	-
@@ -3654,7 +3654,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/init.c	66	macro	IS_UNII_INVALID	-	unma
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	115	function	mt7921_regd_update	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	126	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	129	function	mt7921_regd_notifier	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/init.c	160	function	mt7921_mac_init	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/init.c	160	function	mt7921_mac_init	PassiveMcuCommand::ProtectCtrl	exact	source-mandatory band0 RTS threshold 0x92b init command; closure only, no causal claim
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	178	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	180	function	__mt7921_init_hardware	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/init.c	205	function	mt7921_init_hardware	-	unmapped	-

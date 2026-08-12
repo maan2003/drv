@@ -2616,6 +2616,7 @@ pub fn encode_channel_domain_command(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PassiveMcuCommand {
     EepromBufferMode,
+    ProtectCtrl,
     MacEnable,
     SetRxPath {
         channel: CandidateChannel,
@@ -2656,6 +2657,7 @@ impl PassiveMcuCommand {
         matches!(
             self,
             Self::EepromBufferMode
+                | Self::ProtectCtrl
                 | Self::MacEnable
                 | Self::SetRxPath { .. }
                 | Self::ChannelSwitch { .. }
@@ -2802,6 +2804,14 @@ pub fn encode_passive_mcu_command(
         PassiveMcuCommand::EepromBufferMode => {
             encode_legacy_mcu(0xed, 0x21, &[1, 0, 0, 0], sequence)
         }
+        // mt7921_mac_init -> mt76_connac_mcu_set_rts_thresh(0x92b, band 0).
+        // This closes the source init transcript; it is not claimed causal.
+        PassiveMcuCommand::ProtectCtrl => encode_legacy_mcu(
+            0xed,
+            0x3e,
+            &[1, 0, 0, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0],
+            sequence,
+        ),
         PassiveMcuCommand::MacEnable => encode_legacy_mcu(0xed, 0x46, &[1, 0, 0, 0], sequence),
         PassiveMcuCommand::SetRxPath {
             channel,
@@ -4874,6 +4884,9 @@ pub struct Mt7921TxFree {
     pub token: u16,
     pub dropped: bool,
     pub attempts: u16,
+    pub status: u8,
+    pub pair_word: Option<u32>,
+    pub info_word: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4942,8 +4955,11 @@ pub fn parse_mt7921_tx_free(bytes: &[u8]) -> Result<Mt7921TxFree, Mt7921TxComple
     Ok(Mt7921TxFree {
         wcid,
         token: ((info >> 16) & 0x7fff) as u16,
+        status: ((info >> 13) & 0x3) as u8,
         dropped: (info >> 13) & 0x3 != 0,
         attempts: (info & 0x1fff) as u16,
+        pair_word: wcid.map(|_| first),
+        info_word: info,
     })
 }
 
@@ -9136,7 +9152,10 @@ mod tests {
                 wcid: None,
                 token: 7,
                 dropped: false,
-                attempts: 1
+                attempts: 1,
+                status: 0,
+                pair_word: None,
+                info_word: (7 << 16) | 1,
             })
         );
 
@@ -9154,6 +9173,14 @@ mod tests {
         );
         txs[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
         assert_eq!(parse_mt7921_tx_status(&txs).unwrap().acked, false);
+        for status in 1..=3u32 {
+            free[8..12]
+                .copy_from_slice(&((7u32 << 16) | (status << 13) | 15).to_le_bytes());
+            let parsed = parse_mt7921_tx_free(&free).unwrap();
+            assert_eq!((parsed.status, parsed.attempts), (status as u8, 15));
+            assert_eq!(parsed.info_word, (7 << 16) | (status << 13) | 15);
+            assert!(parsed.dropped);
+        }
 
         let mut batched = [0u8; 72];
         batched[0..4].copy_from_slice(&72u32.to_le_bytes());
@@ -9177,7 +9204,10 @@ mod tests {
                 wcid: Some(19),
                 token: 7,
                 dropped: false,
-                attempts: 1
+                attempts: 1,
+                status: 0,
+                pair_word: Some((1 << 31) | (19 << 14)),
+                info_word: (7 << 16) | 1,
             })
         );
     }
