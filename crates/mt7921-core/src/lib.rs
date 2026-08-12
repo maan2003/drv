@@ -5319,6 +5319,78 @@ pub fn encode_client_post_assoc_interface_wcid_command(
     Ok(encode_uni_mcu(3, &body, sequence))
 }
 
+/// Linux `mt7921_mcu_uni_bss_bcnft`: associated station beacon timing used by
+/// the firmware beacon filter. The response is synchronously ACKed.
+pub fn encode_client_post_assoc_beacon_timing_command(
+    sequence: u8,
+    bss_index: u8,
+    beacon_interval: u16,
+    dtim_period: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || beacon_interval == 0 || dtim_period == 0 {
+        return Err("post-association beacon timing is invalid".into());
+    }
+    let mut body = vec![0u8; 12];
+    body[0] = bss_index;
+    body[4..8].copy_from_slice(&[22, 0, 8, 0]);
+    body[8..10].copy_from_slice(&beacon_interval.to_le_bytes());
+    body[10] = dtim_period;
+    Ok(encode_uni_mcu(2, &body, sequence))
+}
+
+/// Linux `mt7921_mcu_set_rxfilter(..., BIT_SET,
+/// MT_WF_RFCR_DROP_OTHER_BEACON)`. CE SET_RX_FILTER has no firmware ACK;
+/// successful publication means transport DMA ownership was consumed.
+pub fn encode_client_post_assoc_rx_filter_command(sequence: u8) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) {
+        return Err("post-association RX filter sequence is invalid".into());
+    }
+    let mut body = [0u8; 68];
+    body[4] = 2; // bitmap update mode
+    body[12..16].copy_from_slice(&(1u32 << 11).to_le_bytes());
+    body[16] = 1; // set bitmap bits
+    Ok(encode_legacy_mcu(0x0a, 0, &body, sequence))
+}
+
+/// Linux `mt76_connac_mcu_uni_set_chctx`: the post-association RLM update
+/// emitted by `mt7921_change_chanctx`. The response is synchronously ACKed.
+pub fn encode_client_post_assoc_rlm_command(
+    sequence: u8,
+    bss_index: u8,
+    channel: ClientPhysicalChannel,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bss_index != 0
+        || channel.primary == 0
+        || channel.primary > u16::from(u8::MAX)
+        || channel.center == 0
+        || channel.center > u16::from(u8::MAX)
+        || channel.center2 > u16::from(u8::MAX)
+        || channel.band > 1
+        || channel.bandwidth > 3
+    {
+        return Err("post-association RLM channel context is invalid".into());
+    }
+    let mut body = vec![0u8; 20];
+    body[0] = bss_index;
+    body[4..8].copy_from_slice(&[2, 0, 16, 0]);
+    body[8] = channel.primary as u8;
+    body[9] = channel.center as u8;
+    body[10] = channel.center2 as u8;
+    body[11] = channel.bandwidth;
+    body[12] = 2; // hweight8(local antenna mask 0x3)
+    body[13] = 3; // local RX chain mask
+    body[14] = 1; // short slot time
+    body[15] = 4; // HT 40 MHz allowed
+    body[16] = match channel.primary.cmp(&channel.center) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Greater => 3,
+        core::cmp::Ordering::Equal => 0,
+    };
+    body[17] = channel.band;
+    Ok(encode_uni_mcu(2, &body, sequence))
+}
+
 /// Linux v7.1 mac80211 band-rate indexes translated into the exact Connac2
 /// STA_REC_PHY.basic_rate and STA_REC_RA.legacy fields.
 pub fn linux_legacy_rate_context_reference(
@@ -6154,6 +6226,9 @@ pub struct ClientFirmwareEffectsState {
     pub association: Option<LegacyWmeAssociation>,
     pub edca_programmed: Option<ClientEdcaParameters>,
     pub post_assoc_interface_programmed: bool,
+    pub post_assoc_beacon_timing_programmed: bool,
+    pub post_assoc_rx_filter_published: bool,
+    pub post_assoc_rlm_programmed: bool,
     pub sequence: u8,
     pub ptk_installed: bool,
     pub ptk_dirty: bool,
@@ -6216,6 +6291,9 @@ impl ClientFirmwareEffectsState {
     pub fn qos_tx_ready(&self) -> bool {
         self.bss_programmed
             && self.post_assoc_interface_programmed
+            && self.post_assoc_beacon_timing_programmed
+            && self.post_assoc_rx_filter_published
+            && self.post_assoc_rlm_programmed
             && (self
                 .association
                 .is_some_and(|association| !association.negotiated_qos)
@@ -6224,7 +6302,10 @@ impl ClientFirmwareEffectsState {
 
     pub fn complete_post_assoc_interface(
         &mut self,
-        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        dtim_period: u8,
+        channel: ClientPhysicalChannel,
+        mut submit_uni: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self
             .association
@@ -6233,6 +6314,9 @@ impl ClientFirmwareEffectsState {
             .joined
             .ok_or("post-association interface update requires joined BSS")?;
         if self.post_assoc_interface_programmed
+            || self.post_assoc_beacon_timing_programmed
+            || self.post_assoc_rx_filter_published
+            || self.post_assoc_rlm_programmed
             || self.firmware_uncertain
             || (association.negotiated_qos && self.edca_programmed.is_none())
         {
@@ -6244,8 +6328,26 @@ impl ClientFirmwareEffectsState {
             joined.bssid,
         )?;
         self.firmware_uncertain = true;
-        submit(3, &command)?;
+        submit_uni(3, &command)?;
         self.post_assoc_interface_programmed = true;
+        let beacon = encode_client_post_assoc_beacon_timing_command(
+            self.next_sequence(),
+            association.bss_index,
+            joined.beacon_interval,
+            dtim_period,
+        )?;
+        submit_uni(2, &beacon)?;
+        self.post_assoc_beacon_timing_programmed = true;
+        let rx_filter = encode_client_post_assoc_rx_filter_command(self.next_sequence())?;
+        submit_ce_no_ack(&rx_filter)?;
+        self.post_assoc_rx_filter_published = true;
+        let rlm = encode_client_post_assoc_rlm_command(
+            self.next_sequence(),
+            association.bss_index,
+            channel,
+        )?;
+        submit_uni(2, &rlm)?;
+        self.post_assoc_rlm_programmed = true;
         self.firmware_uncertain = false;
         Ok(())
     }
@@ -6723,6 +6825,9 @@ impl ClientFirmwareEffectsState {
         self.controlled_port_open = false;
         self.edca_programmed = None;
         self.post_assoc_interface_programmed = false;
+        self.post_assoc_beacon_timing_programmed = false;
+        self.post_assoc_rx_filter_published = false;
+        self.post_assoc_rlm_programmed = false;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
             self.firmware_uncertain = true;
@@ -8086,6 +8191,39 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn post_assoc_bss_updates_match_captured_linux_commands() {
+        let channel = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 42,
+            bandwidth: 2,
+            center2: 0,
+        };
+        let beacon = encode_client_post_assoc_beacon_timing_command(6, 0, 100, 2).unwrap();
+        let rx_filter = encode_client_post_assoc_rx_filter_command(7).unwrap();
+        let rlm = encode_client_post_assoc_rlm_command(8, 0, channel).unwrap();
+
+        assert_eq!(beacon.len(), 60);
+        assert_eq!(&beacon[34..36], &[2, 0]);
+        assert_eq!(&beacon[48..], &[0, 0, 0, 0, 22, 0, 8, 0, 100, 0, 2, 0]);
+        assert_eq!(rx_filter.len(), 132);
+        assert_eq!(&rx_filter[34..44], &[0, 0x80, 0x0a, 0xa0, 1, 7, 0, 0, 0, 0]);
+        let mut expected_rx_payload = [0u8; 68];
+        expected_rx_payload[4] = 2;
+        expected_rx_payload[12..16].copy_from_slice(&0x800u32.to_le_bytes());
+        expected_rx_payload[16] = 1;
+        assert_eq!(&rx_filter[64..], &expected_rx_payload);
+        assert_eq!(rlm.len(), 68);
+        assert_eq!(&rlm[34..36], &[2, 0]);
+        assert_eq!(
+            &rlm[48..],
+            &[
+                0, 0, 0, 0, 2, 0, 16, 0, 36, 42, 0, 2, 2, 3, 1, 4, 1, 1, 0, 0
+            ]
+        );
+    }
+
+    #[test]
     fn client_channel_context_owns_identity_generation_and_authorization() {
         let channel36 = ClientPhysicalChannel {
             band: 1,
@@ -8397,13 +8535,29 @@ mod tests {
         assert_eq!(&edca_command[36..39], &[0x1d, 0xa0, 1]);
         assert_eq!(&edca_command[64..74], &[7, 0, 15, 0, 94, 0, 2, 0, 0, 0]);
         assert_eq!(&edca_command[74..84], &[3, 0, 7, 0, 47, 0, 2, 0, 0, 0]);
+        let transcript = std::cell::RefCell::new(transcript);
         state
-            .complete_post_assoc_interface(|_, command| {
-                transcript.push(command.to_vec());
-                Ok(())
-            })
+            .complete_post_assoc_interface(
+                2,
+                ClientPhysicalChannel {
+                    band: 1,
+                    primary: 36,
+                    center: 42,
+                    bandwidth: 2,
+                    center2: 0,
+                },
+                |_, command| {
+                    transcript.borrow_mut().push(command.to_vec());
+                    Ok(())
+                },
+                |command| {
+                    transcript.borrow_mut().push(command.to_vec());
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(state.qos_tx_ready());
+        let mut transcript = transcript.into_inner();
         state
             .teardown(|_, command| {
                 transcript.push(command.to_vec());
@@ -8411,13 +8565,20 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(transcript.len(), 6);
+        assert_eq!(transcript.len(), 9);
         assert_eq!(
             transcript
                 .iter()
-                .map(|command| u16::from_le_bytes([command[34], command[35]]))
+                .map(|command| {
+                    let cid = u16::from_le_bytes([command[34], command[35]]);
+                    if cid == 0x8000 {
+                        u16::from(command[36])
+                    } else {
+                        cid
+                    }
+                })
                 .collect::<Vec<_>>(),
-            [3, 2, 3, 3, 3, 2]
+            [3, 2, 3, 3, 2, 0x0a, 2, 3, 2]
         );
         let preauth_add = &transcript[0];
         assert_eq!(preauth_add[49], 1);
@@ -8446,8 +8607,8 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[5][56], 0);
-        assert_eq!(transcript[4][49], 1);
+        assert_eq!(transcript[8][56], 0);
+        assert_eq!(transcript[7][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);

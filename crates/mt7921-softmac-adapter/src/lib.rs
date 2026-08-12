@@ -187,6 +187,9 @@ pub trait Mt7921PassiveTransport {
     fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn submit_client_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
         Ok(())
     }
@@ -248,6 +251,9 @@ pub trait SourceExactPassiveMechanics {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn submit_client_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
@@ -397,6 +403,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.mechanics.submit_client_edca(encoded)
+    }
+    fn submit_client_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.mechanics.submit_client_ce_no_ack(encoded)
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.mechanics.diagnostic_association_snapshot(generation)

@@ -58,15 +58,17 @@ use mt7921_port_spike::{
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
     encode_client_data_txwi, encode_client_edca_command, encode_client_interface_commands,
-    encode_client_management_tx, encode_client_post_assoc_interface_wcid_command,
-    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
-    encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
-    encode_remove_wcid_command, linux_legacy_rate_context_reference,
-    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
-    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
-    parse_pse_reg_read_response, passive_mac_bar_offset, passive_mac_mmio_plan,
-    passive_mac_source_rmw_value, set_client_txwi_wcid, validate_passive_mac_bar_read,
+    encode_client_management_tx, encode_client_post_assoc_beacon_timing_command,
+    encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
+    encode_client_post_assoc_rx_filter_command, encode_disable_keys_command, encode_gtk_command,
+    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
+    encode_pse_reg_read_command, encode_ptk_command, encode_remove_wcid_command,
+    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
+    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
+    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
+    set_client_txwi_wcid, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -172,7 +174,26 @@ fn record_sae_stage(event: &str) {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-const WTBL_STAGE_ORDER: [&str; 8] = [
+fn client_dtim_period(ies: &[u8]) -> Result<u8, String> {
+    let mut offset = 0;
+    while offset + 2 <= ies.len() {
+        let len = usize::from(ies[offset + 1]);
+        let end = offset + 2 + len;
+        if end > ies.len() {
+            return Err("target beacon IE stream is truncated".into());
+        }
+        if ies[offset] == 5 && len >= 2 {
+            return (ies[offset + 3] != 0)
+                .then_some(ies[offset + 3])
+                .ok_or_else(|| "target beacon TIM has zero DTIM period".into());
+        }
+        offset = end;
+    }
+    Err("target beacon omitted TIM DTIM period".into())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+const WTBL_STAGE_ORDER: [&str; 11] = [
     "before_admission_clear",
     "after_admission_clear",
     "after_preauth_cid3_ack",
@@ -180,6 +201,9 @@ const WTBL_STAGE_ORDER: [&str; 8] = [
     "after_associated_cid3_ack",
     "after_edca",
     "after_interface_wcid_update",
+    "after_beacon_timing_ack",
+    "after_rx_filter_publish",
+    "after_rlm_ack",
     "immediately_pre_data",
 ];
 
@@ -1757,9 +1781,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_wtbl_dw5 result=pass command_af=7 byte206=7 named_state_fixture_sgi160=false reserved_bit2=ignored ht_vht_fields=preserved causality=not_claimed"
     );
-    if WTBL_STAGE_ORDER.len() != 8
+    if WTBL_STAGE_ORDER.len() != 11
         || WTBL_STAGE_ORDER[0] != "before_admission_clear"
-        || WTBL_STAGE_ORDER[7] != "immediately_pre_data"
+        || WTBL_STAGE_ORDER[10] != "immediately_pre_data"
         || WTBL_STAGE_ORDER
             .iter()
             .enumerate()
@@ -1770,6 +1794,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     println!(
         "self_test_wtbl_stage_order result=pass stages={}",
         WTBL_STAGE_ORDER.join(",")
+    );
+    println!(
+        "self_test_wtbl_post_assoc result=pass associated_peer_cid3=0x32000c27 first_bss_update=after_beacon_timing_ack second_bss_update=after_rx_filter_publish final_bss_update=after_rlm_ack required_predata=0x32000427 intermediate_values=runtime_observed"
     );
     if diagnostic_liveness(0x000c_ef1a).is_err() || diagnostic_liveness(u32::MAX).is_ok() {
         return Err("self-test firmware snapshot liveness semantics failed".into());
@@ -1892,12 +1919,32 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     if rx_gate.qos_tx_ready() {
         return Err("self-test data TX opened before interface WCID update".into());
     }
+    let activation_commands = std::cell::RefCell::new(activation_commands);
     rx_gate
-        .complete_post_assoc_interface(|cid, command| {
-            activation_commands.push((cid, command.to_vec()));
-            Ok(())
-        })
+        .complete_post_assoc_interface(
+            2,
+            ClientPhysicalChannel {
+                band: 1,
+                primary: 36,
+                center: 42,
+                bandwidth: 2,
+                center2: 0,
+            },
+            |cid, command| {
+                activation_commands
+                    .borrow_mut()
+                    .push((cid, command.to_vec()));
+                Ok(())
+            },
+            |command| {
+                activation_commands
+                    .borrow_mut()
+                    .push((0x0a, command.to_vec()));
+                Ok(())
+            },
+        )
         .map_err(|error| format!("self-test post-ASSOC interface WCID: {error}"))?;
+    let activation_commands = activation_commands.into_inner();
     let expected_preauth =
         mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, peer_wcid.get(), peer, 100)
             .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
@@ -1919,6 +1966,22 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     .map_err(|error| format!("self-test association peer fixture: {error}"))?;
     let expected_interface = encode_client_post_assoc_interface_wcid_command(5, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
+    let expected_beacon = encode_client_post_assoc_beacon_timing_command(6, 0, 100, 2)
+        .map_err(|error| format!("self-test association beacon fixture: {error}"))?;
+    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(7)
+        .map_err(|error| format!("self-test association RX-filter fixture: {error}"))?;
+    let expected_rlm = encode_client_post_assoc_rlm_command(
+        8,
+        0,
+        ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 42,
+            bandwidth: 2,
+            center2: 0,
+        },
+    )
+    .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == peer_wcid.get()
         && expected_peer[121] == 1
         && expected_peer[122..124] == [4, 0]
@@ -1934,6 +1997,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             (2, expected_bss),
             (3, expected_peer),
             (3, expected_interface),
+            (2, expected_beacon),
+            (0x0a, expected_rx_filter),
+            (2, expected_rlm),
         ]
         || !wtbl_structure
         || unavailable_readback != WtblPeerReadback::Unavailable
@@ -1955,7 +2021,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19,BCNFT,SET_RXFILTER,RLM cid_order=3,2,3,legacy29,3,2,legacy10,2 ack_order=interface,BCNFT,RLM no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
         peer_wcid.get()
     );
     // Source-exact discriminator: ieee80211_send_nullfunc only requests the
@@ -2700,6 +2766,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         target: peer,
         client,
         rcpi: 100,
+        dtim_period: 2,
         firmware: ClientFirmwareEffectsState::default(),
         peer_wcid: None,
         post_association_data_wait: None,
@@ -4963,6 +5030,12 @@ fn run() -> Result<(), String> {
                                             .3
                                             .bytes(),
                                         rcpi: target_rcpi,
+                                        dtim_period: client_dtim_period(
+                                            &target_bss
+                                                .as_ref()
+                                                .ok_or("target BSS was not retained")?
+                                                .ies,
+                                        )?,
                                         firmware: ClientFirmwareEffectsState::default(),
                                         peer_wcid: None,
                                         post_association_data_wait: None,
@@ -8127,11 +8200,16 @@ impl ActiveMcuIo<'_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioFirmwareLoader<'_> {
-    fn send_client_edca_bytes(&mut self, encoded: &[u8]) -> Result<(), String> {
+    fn send_client_ce_no_ack_bytes(
+        &mut self,
+        encoded: &[u8],
+        cid: u8,
+        expected_len: usize,
+    ) -> Result<(), String> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
-        if encoded.len() != 108 || encoded.get(36..39) != Some(&[0x1d, 0xa0, 1]) {
-            return Err("client EDCA escaped CE SET_EDCA_PARMS".into());
+        if encoded.len() != expected_len || encoded.get(36..39) != Some(&[cid, 0xa0, 1]) {
+            return Err("client CE no-ACK command escaped expected envelope".into());
         }
         self.sequence = self.sequence % 15 + 1;
         let sequence = self.sequence;
@@ -8158,7 +8236,7 @@ impl VfioFirmwareLoader<'_> {
             if Instant::now() >= deadline {
                 self.uni_terminal_poisoned = true;
                 return Err(format!(
-                    "EDCA command DMA consumption timed out at descriptor {descriptor_index}"
+                    "CE no-ACK command DMA consumption timed out at descriptor {descriptor_index}"
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -9980,6 +10058,7 @@ struct LiveClientEffects {
     target: [u8; 6],
     client: [u8; 6],
     rcpi: u8,
+    dtim_period: u8,
     firmware: ClientFirmwareEffectsState,
     peer_wcid: Option<ClientWcid>,
     post_association_data_wait: Option<Instant>,
@@ -10500,11 +10579,22 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 params.ac[3].acm,
             ));
         }
+        let io = std::cell::RefCell::new(io);
         self.firmware
-            .complete_post_assoc_interface(|cid, command| {
-                io.submit_uni(cid, command)
-                    .map_err(|status| status.to_string())
-            })
+            .complete_post_assoc_interface(
+                self.dtim_period,
+                channel.channel,
+                |cid, command| {
+                    io.borrow_mut()
+                        .submit_uni(cid, command)
+                        .map_err(|status| status.to_string())
+                },
+                |command| {
+                    io.borrow_mut()
+                        .submit_ce_no_ack(command)
+                        .map_err(|status| status.to_string())
+                },
+            )
             .map_err(|error| {
                 record_sae_stage(&format!(
                     "post_assoc_interface_wcid result=error wcid=19 reason={error}"
@@ -10512,8 +10602,16 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 zx::Status::IO
             })?;
         record_sae_stage(
-            "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=open",
+            "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=closed",
         );
+        record_sae_stage(&format!(
+            "post_assoc_bss_updates result=complete order=BCNFT,SET_RXFILTER,RLM beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
+            self.firmware.joined.expect("join retained").beacon_interval,
+            self.dtim_period,
+            channel.channel.primary,
+            channel.channel.center,
+            channel.channel.bandwidth,
+        ));
         let generation = self
             .firmware
             .association_generation
@@ -10532,7 +10630,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         record_sae_stage(
             "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
         );
-        if let Err(status) = io.diagnostic_association_snapshot(generation) {
+        if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
             record_sae_stage(&format!(
                 "fw_state_diagnostic result=failed generation={generation} status={status}"
             ));
@@ -11239,7 +11337,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 return Ok(free);
             }
             if Instant::now() >= deadline {
-                return Err(format!("E2E81 {variant} TX_FREE timed out"));
+                return Err(format!("E2E89 {variant} TX_FREE timed out"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -11250,12 +11348,12 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         let (token, pid) = self
             .mgmt_tx_outstanding
             .last_identity()
-            .ok_or("E2E81 submission omitted identity")?;
+            .ok_or("E2E89 submission omitted identity")?;
         let free = self.e2e81_wait_tx_free(variant, token, pid)?;
         let resident = self
             .mgmt_frame
             .as_ref()
-            .ok_or("E2E81 post-TX frame arena missing")?
+            .ok_or("E2E89 post-TX frame arena missing")?
             .read_bytes(0, frame.len())?;
         let hash = |bytes: &[u8]| {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
@@ -11264,7 +11362,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         };
         if resident != frame {
             return Err(format!(
-                "E2E81 {variant} DMA payload changed before completion"
+                "E2E89 {variant} DMA payload changed before completion"
             ));
         }
         record_sae_stage(&format!(
@@ -11724,7 +11822,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(&format!(
             "wtbl_command cid={expected_cid} bytes={} raw={}",
             encoded.len(),
-            encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            encoded
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         ));
         if expected_cid == 3
             && let Some(wcid) = encoded
@@ -11904,6 +12005,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             (2, 96, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
             (3, len, Some(1)) if len >= 200 => Some("after_associated_cid3_ack"),
             (3, 108, Some(19)) => Some("after_interface_wcid_update"),
+            (2, 60, _) if encoded.get(52..56) == Some(&[22, 0, 8, 0]) => {
+                Some("after_beacon_timing_ack")
+            }
+            (2, 68, _) if encoded.get(52..56) == Some(&[2, 0, 16, 0]) => Some("after_rlm_ack"),
             _ => None,
         };
         if let Some(stage) = stage {
@@ -11957,10 +12062,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(&format!(
             "wtbl_command cid=legacy29 bytes={} raw={}",
             encoded.len(),
-            encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            encoded
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         ));
         self.loader
-            .send_client_edca_bytes(encoded)
+            .send_client_ce_no_ack_bytes(encoded, 0x1d, 108)
             .map_err(|error| {
                 record_sae_stage(&format!(
                     "wmm_edca_program result=error completion=false reason={error}"
@@ -11970,7 +12078,37 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "wmm_edca_transport completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux",
         );
-        PassiveMacExecutor { pages: self.mac_pages }.trace_peer_wtbl_dw5("after_edca");
+        PassiveMacExecutor {
+            pages: self.mac_pages,
+        }
+        .trace_peer_wtbl_dw5("after_edca");
+        Ok(())
+    }
+
+    fn submit_client_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        record_sae_stage(&format!(
+            "wtbl_command cid=ce10 bytes={} raw={}",
+            encoded.len(),
+            encoded
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+        self.loader
+            .send_client_ce_no_ack_bytes(encoded, 0x0a, 132)
+            .map_err(|error| {
+                record_sae_stage(&format!(
+                    "post_assoc_rx_filter result=error completion=false reason={error}"
+                ));
+                zx::Status::IO
+            })?;
+        record_sae_stage(
+            "post_assoc_rx_filter result=published dma_didx_consumed=true firmware_ack=not_requested_linux",
+        );
+        PassiveMacExecutor {
+            pages: self.mac_pages,
+        }
+        .trace_peer_wtbl_dw5("after_rx_filter_publish");
         Ok(())
     }
 
@@ -11990,8 +12128,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
         if eapol {
-            PassiveMacExecutor { pages: self.mac_pages }
-                .trace_peer_wtbl_dw5("immediately_pre_data");
+            PassiveMacExecutor {
+                pages: self.mac_pages,
+            }
+            .trace_peer_wtbl_dw5("immediately_pre_data");
         }
         if eapol && !self.e2e81_probe_done {
             // Same-session source-exact AC discriminator. The EAPOL timer is
@@ -12013,19 +12153,25 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .read_firmware_snapshot_raw(0x820d_8114)
             .map_err(|error| {
                 record_sae_stage(&format!(
-                    "e2e88_peer_dw5 result=read_error addr=0x820d8114 reason={error}"
+                    "e2e89_peer_dw5 result=read_error addr=0x820d8114 reason={error}"
                 ));
                 zx::Status::IO
             })?;
             let reserved_bit2 = (peer_dw5 >> 2) & 1;
             validate_peer_wtbl_dw5_named_fields(peer_dw5).map_err(|error| {
                 record_sae_stage(&format!(
-                    "e2e88_peer_dw5 result=named_mismatch value={peer_dw5:#010x} reserved_bit2={reserved_bit2} reason={error}"
+                    "e2e89_peer_dw5 result=named_mismatch value={peer_dw5:#010x} reserved_bit2={reserved_bit2} reason={error}"
                 ));
                 zx::Status::IO_DATA_INTEGRITY
             })?;
+            if peer_dw5 != 0x3200_0427 {
+                record_sae_stage(&format!(
+                    "e2e89_peer_dw5 result=exact_mismatch value={peer_dw5:#010x} expected=0x32000427 reserved_bit2={reserved_bit2}"
+                ));
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
             record_sae_stage(&format!(
-                "e2e88_peer_dw5 result=match value={peer_dw5:#010x} change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} reserved_bit2={reserved_bit2}",
+                "e2e89_peer_dw5 result=exact_match value={peer_dw5:#010x} expected=0x32000427 change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} reserved_bit2={reserved_bit2}",
                 (peer_dw5 >> 5) & 7,
                 (peer_dw5 >> 8) & 1,
                 (peer_dw5 >> 9) & 1,
@@ -12037,14 +12183,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
                 .map_err(|error| {
-                    record_sae_stage(&format!(
-                        "e2e81_matrix result=error stage=BE reason={error}"
-                    ));
+                    record_sae_stage(&format!("e2e89_probe result=error stage=BE reason={error}"));
                     zx::Status::IO
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e88_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "e2e89_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));
@@ -13964,6 +14108,13 @@ mod tests {
             self.uni.push(bytes.to_vec());
             Ok(())
         }
+        fn submit_ce_no_ack(&mut self, bytes: &[u8]) -> Result<(), zx::Status> {
+            if bytes.get(36..39) != Some(&[0x0a, 0xa0, 1]) || bytes.len() != 132 {
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            self.uni.push(bytes.to_vec());
+            Ok(())
+        }
         fn transmit_client(
             &mut self,
             bytes: &[u8],
@@ -14583,6 +14734,7 @@ mod tests {
             target: peer,
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
+            dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             post_association_data_wait: None,
@@ -14722,6 +14874,7 @@ mod tests {
             target: peer,
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
+            dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             post_association_data_wait: None,
@@ -15091,6 +15244,7 @@ mod tests {
             target: peer,
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
+            dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             post_association_data_wait: None,
@@ -15154,6 +15308,7 @@ mod tests {
             target: peer,
             client,
             rcpi: 100,
+            dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             post_association_data_wait: None,
@@ -15242,6 +15397,7 @@ mod tests {
             target: peer,
             client,
             rcpi: 100,
+            dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             post_association_data_wait: None,
@@ -18116,6 +18272,7 @@ mod tests {
                 target: peer,
                 client,
                 rcpi: 100,
+                dtim_period: 2,
                 firmware: ClientFirmwareEffectsState::default(),
                 peer_wcid: None,
                 post_association_data_wait: None,

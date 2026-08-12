@@ -107,6 +107,7 @@ pub struct ClientRxSecurity {
 pub trait Mt7921ClientIo {
     fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status>;
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
+    fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
         Ok(())
     }
@@ -353,6 +354,9 @@ impl Mt7921ClientIo for NoClientScan {
     fn submit_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn submit_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn transmit_client(
         &mut self,
         _: &[u8],
@@ -421,6 +425,9 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     }
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.submit_client_edca(encoded))
+    }
+    fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.submit_client_ce_no_ack(encoded))
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.diagnostic_association_snapshot(generation))
