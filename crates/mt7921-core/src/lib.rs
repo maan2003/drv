@@ -8974,6 +8974,7 @@ mod tests {
                 10, 0, 16, 0, 0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0
             ]
         );
+        assert_eq!(encoded[88] & 0x40, 0); // negotiated STA_REC_VHT SGI160 clear
         assert_eq!(&encoded[100..108], &[15, 0, 8, 0, 8, 1, 1, 0]);
         assert_eq!(
             &encoded[108..120],

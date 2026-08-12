@@ -106,14 +106,12 @@ failure/success counters, and bits 31..29 `RATE_IDX`. Thus named fields agree
 except userspace alone has `SHORT_GI_160`; XOR bit 2 is unnamed/reserved by
 both source versions. The upper counters/rate index are identical and dynamic.
 
-The causal command-construction difference is WTBL_HT `af`, not an actual
-negotiated SGI-160 capability. Linux's `mt76_connac_mcu_wtbl_ht_tlv` starts
-from `sta->ht_cap.ampdu_factor`, obtains the VHT maximum A-MPDU exponent with
-`FIELD_GET(IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK, ...)`, and stores
-the maximum. Our encoder sent HT exponent 3 despite the negotiated VHT
-exponent 7. The firmware consequently produced the differing DW5 state. The
-encoder now performs the same max before emitting WTBL_HT; the independent
-raw command golden asserts `af=7` at byte 206. Remaining stable differences
+One source-semantic command difference was WTBL_HT `af`. Linux's
+`mt76_connac_mcu_wtbl_ht_tlv` maxes the HT A-MPDU exponent 3 with the VHT
+exponent 7; the encoder now does the same and the raw golden asserts byte 206
+is 7. E2E88 disproved a causal link to SGI160: DW5 changed only from
+`0x32000c23` to `0x32000c27`, making unnamed bit 2 match native while named
+SGI160 remained set. Remaining stable differences
 are retained as follow-up evidence rather than mass-fixed: many are explicit
 queue/rate/counter state, while early configuration candidates include peer
 WTBL offsets `0x1c`/`0x24`, interface WTBL `0x1c`/`0x24`, DMASHDL `0x4`/`0xdc`,
@@ -136,3 +134,27 @@ The complete three-attempt-stable offset inventory (after the AID mask) is:
 Offsets are hexadecimal. Values for the first causal dword are given above;
 the comparison tool emits exact values from root-only reports without copying
 raw device state into the repository.
+
+
+## E2E88 and SGI160 source audit
+
+E2E88 (`20260812T172113Z-0000_05_00.0.log`) read peer DW5 immediately before
+the probe gate as `0x32000c27`. Named bits were `0x0c20`, not native
+`0x0420`; reserved bit 2 was one. The gate aborted before publishing a frame,
+so there is no probe TXS or TX_FREE. Cleanup completed and the watchdog reboot
+returned the host to stock networking.
+
+The capability path contains no SGI160 mismatch to fix. This PCI function is
+MT7961 (`0x7961`), so Linux `mt7921_register_device` does not take its MT7922-
+only branch that adds `IEEE80211_VHT_CAP_SHORT_GI_160`. Linux and our local
+DeviceInfo therefore advertise VHT bytes
+`b2 71 90 33 fa ff 00 00 fa ff 00 00`: bit 5 SGI80 is one and bit 6 SGI160 is
+zero. The AP's beacon/association VHT capability is
+`b2 79 81 33 fa ff 0c 03 fa ff 0c 23`, also with SGI160 zero and a Cbw80 VHT
+operation. Fuchsia's `VhtCapabilitiesInfo::intersect` combines `sgi_cbw160`
+with logical AND, and `notify_association_complete` forwards those negotiated
+bytes unchanged. `encode_legacy_wme_add_wcid_command` copies the same first
+four bytes into `STA_REC_VHT.vht_cap`; its WTBL_VHT contains only LDPC,
+dynamic-BW, VHT-present, and TXOP-PS fields and does not synthesize SGI160.
+Thus neither DeviceInfo nor negotiation nor the encoder requests SGI160. The
+remaining physical bit-11 difference has no source-proven host fix yet.

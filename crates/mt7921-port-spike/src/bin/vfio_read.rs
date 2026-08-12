@@ -1743,7 +1743,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         return Err("self-test WTBL DW5 named-field semantics failed".into());
     }
     println!(
-        "self_test_wtbl_dw5 result=pass af=7 byte206=7 sgi160=false reserved_bit2=ignored ht_vht_fields=preserved"
+        "self_test_wtbl_dw5 result=pass command_af=7 byte206=7 named_state_fixture_sgi160=false reserved_bit2=ignored ht_vht_fields=preserved causality=not_claimed"
     );
     if diagnostic_liveness(0x000c_ef1a).is_err() || diagnostic_liveness(u32::MAX).is_ok() {
         return Err("self-test firmware snapshot liveness semantics failed".into());

@@ -1189,6 +1189,10 @@ mod tests {
             vht,
             [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
+        // MT7961 follows mt76_init_sband + mt7921_register_device's
+        // non-MT7922 branch: SGI80 is advertised, SGI160 is not.
+        assert_ne!(vht[0] & 0x20, 0);
+        assert_eq!(vht[0] & 0x40, 0);
         assert!(query.supported_phys.unwrap().contains(&WlanPhyType::He));
     }
 
