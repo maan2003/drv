@@ -7400,8 +7400,9 @@ const WM_RX_IRQ_BIT: u32 = 1 << 0;
 const DATA_RX_IRQ_BIT: u32 = 1 << 2;
 const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
-const PASSIVE_MAC_BAR_PAGES: [usize; 9] = [
-    0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0x38000, 0xa1000, 0xa3000, 0xa4000,
+const PASSIVE_MAC_BAR_PAGES: [usize; 13] = [
+    0x08000, 0x09000, 0x0c000, 0x0f000, 0x21000, 0x23000, 0x24000, 0x34000,
+    0x38000, 0x39000, 0xa1000, 0xa3000, 0xa4000,
 ];
 
 const fn firmware_bootstrap_rx_irq_mask() -> u32 {
@@ -7479,6 +7480,14 @@ fn passive_mac_address_allowed(address: u32) -> bool {
 #[cfg(feature = "fuchsia-passive")]
 fn passive_mac_read_address_allowed(address: u32) -> bool {
     passive_mac_address_allowed(address)
+        || (0x820d_8100..0x820d_8200).contains(&address)
+        || (0x820d_9300..0x820d_9400).contains(&address)
+        || (0x820d_4000..0x820d_4400).contains(&address)
+        || (0x820c_0000..0x820c_1200).contains(&address)
+        || (0x820c_8000..0x820c_8400).contains(&address)
+        || (0x820e_4000..0x820e_4400).contains(&address)
+        || (0x820e_5000..0x820e_5500).contains(&address)
+        || (0x820e_d000..0x820e_d800).contains(&address)
         || matches!(
             address,
             0x820e_5000
@@ -7505,6 +7514,20 @@ fn passive_mac_read_address_allowed(address: u32) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
+    for (physical, mapped, size) in [
+        (0x820d_0000, 0x0003_0000, 0x0001_0000),
+        (0x820c_0000, 0x0000_8000, 0x0000_4000),
+        (0x820c_8000, 0x0000_c000, 0x0000_2000),
+        (0x820e_4000, 0x0002_1000, 0x0000_0400),
+        (0x820e_5000, 0x0002_1400, 0x0000_0800),
+        (0x820e_d000, 0x0002_4800, 0x0000_0800),
+    ] {
+        if let Some(offset) = address.checked_sub(physical)
+            && offset < size
+        {
+            return Ok(mapped + offset as usize);
+        }
+    }
     match address {
         0x820e_5000 | 0x820e_5004 => Ok(0x0002_1400 + (address - 0x820e_5000) as usize),
         0x820f_5000 | 0x820f_5004 => Ok(0x000a_1400 + (address - 0x820f_5000) as usize),
@@ -10915,6 +10938,39 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn firmware_owned_snapshot(&self) {
+        let mac = PassiveMacExecutor {
+            pages: self.mac_pages,
+        };
+        record_sae_stage("fw_state_begin point=before_wcid1_probe wcid=1");
+        for (base, bytes, name) in [
+            (0x820d_8100, 0x100, "wtbl_peer1"),
+            (0x820d_9300, 0x100, "wtbl_interface19"),
+            (0x820d_4000, 0x400, "wtblon"),
+            (0x820c_0000, 0x1200, "ple"),
+            (0x820c_8000, 0x400, "pse"),
+            (0x820e_4000, 0x400, "tmac0"),
+            (0x820e_5000, 0x500, "rmac0"),
+            (0x820e_d000, 0x800, "mib0"),
+        ] {
+            for offset in (0..bytes).step_by(4) {
+                let address = base + offset;
+                let value = mac.read(address).unwrap_or(u32::MAX);
+                record_sae_stage(&format!(
+                    "fw_state region={name} offset={offset:#x} addr={address:#x} value={value:08x}"
+                ));
+            }
+        }
+        for offset in (0..0x100).step_by(4) {
+            let value = self.dmashdl.read(0xd6000 + offset).unwrap_or(u32::MAX);
+            record_sae_stage(&format!(
+                "fw_state region=dmashdl offset={offset:#x} addr={:#x} value={value:08x}",
+                0x7c02_6000 + offset
+            ));
+        }
+        record_sae_stage("fw_state_end point=before_wcid1_probe wcid=1");
+    }
+
     fn e2e81_snapshot(&self, phase: &str) {
         let mac = PassiveMacExecutor {
             pages: self.mac_pages,
@@ -11729,6 +11785,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 frame.extend_from_slice(&[0, 0, tid, 0]);
                 frame
             };
+            self.firmware_owned_snapshot();
             self.e2e81_snapshot("immediately_before_BE");
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
