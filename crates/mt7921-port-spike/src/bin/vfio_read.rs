@@ -10905,7 +10905,27 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .mgmt_tx_outstanding
             .last_identity()
             .ok_or("E2E81 submission omitted identity")?;
-        self.e2e81_wait_tx_free(variant, token, pid)
+        let free = self.e2e81_wait_tx_free(variant, token, pid)?;
+        let resident = self
+            .mgmt_frame
+            .as_ref()
+            .ok_or("E2E81 post-TX frame arena missing")?
+            .read_bytes(0, frame.len())?;
+        let hash = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+            })
+        };
+        if resident != frame {
+            return Err(format!("E2E81 {variant} DMA payload changed before completion"));
+        }
+        record_sae_stage(&format!(
+            "qos_null_dma_post_tx result=unchanged variant={variant} mpdu_len={} intended_hash=fnv1a64:{:016x} resident_hash=fnv1a64:{:016x} tx_free_observed=true",
+            frame.len(),
+            hash(frame),
+            hash(&resident),
+        ));
+        Ok(free)
     }
 
     fn preserve_client_rx_during_control_wait(&mut self) -> Result<(), String> {
@@ -11104,6 +11124,26 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .get(..2)
                 .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
                 .ok_or("client TX omitted frame control")?;
+            if control & 0x00fc == 0x00c8 {
+                let resident = frame_arena.read_bytes(0, frame.len())?;
+                let hash = |bytes: &[u8]| {
+                    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                    })
+                };
+                if resident != frame {
+                    return Err("QoS-null DMA payload differs before publication".into());
+                }
+                record_sae_stage(&format!(
+                    "qos_null_dma_pre_doorbell result=exact iova={:#010x} arena_len={} iova_page_aligned={} mpdu_len={} intended_hash=fnv1a64:{:016x} resident_hash=fnv1a64:{:016x}",
+                    frame_arena.iova,
+                    frame_arena.len,
+                    frame_arena.iova.is_multiple_of(PAGE as u64),
+                    frame.len(),
+                    hash(frame),
+                    hash(&resident),
+                ));
+            }
             let (txwi_bytes, descriptor) = if control & 0x000c == 0 {
                 let encoded =
                     encode_client_management_tx(frame, txwi.iova, frame_arena.iova, token, pid)?;
