@@ -1474,77 +1474,77 @@ drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	44	macro	MT_TX_FREE_STATUS
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	45	macro	MT_TX_FREE_MSDU_ID	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	46	macro	MT_TX_FREE_PAIR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	48	macro	MT_TX_FREE_RATE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	50	macro	MT_TXD0_Q_IDX	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	51	macro	MT_TXD0_PKT_FMT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	52	macro	MT_TXD0_ETH_TYPE_OFFSET	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	53	macro	MT_TXD0_TX_BYTES	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	55	macro	MT_TXD1_LONG_FORMAT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	56	macro	MT_TXD1_TGID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	57	macro	MT_TXD1_OWN_MAC	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	58	macro	MT_TXD1_AMSDU	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	59	macro	MT_TXD1_TID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	60	macro	MT_TXD1_HDR_PAD	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	61	macro	MT_TXD1_HDR_FORMAT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	62	macro	MT_TXD1_HDR_INFO	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	63	macro	MT_TXD1_ETH_802_3	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	64	macro	MT_TXD1_VTA	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	65	macro	MT_TXD1_WLAN_IDX	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	67	macro	MT_TXD2_FIX_RATE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	68	macro	MT_TXD2_FIXED_RATE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	69	macro	MT_TXD2_POWER_OFFSET	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	70	macro	MT_TXD2_MAX_TX_TIME	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	71	macro	MT_TXD2_FRAG	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	72	macro	MT_TXD2_HTC_VLD	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	73	macro	MT_TXD2_DURATION	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	74	macro	MT_TXD2_BIP	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	75	macro	MT_TXD2_MULTICAST	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	76	macro	MT_TXD2_RTS	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	77	macro	MT_TXD2_SOUNDING	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	78	macro	MT_TXD2_NDPA	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	79	macro	MT_TXD2_NDP	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	80	macro	MT_TXD2_FRAME_TYPE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	81	macro	MT_TXD2_SUB_TYPE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	83	macro	MT_TXD3_SN_VALID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	84	macro	MT_TXD3_PN_VALID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	85	macro	MT_TXD3_SW_POWER_MGMT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	86	macro	MT_TXD3_BA_DISABLE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	87	macro	MT_TXD3_SEQ	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	88	macro	MT_TXD3_REM_TX_COUNT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	89	macro	MT_TXD3_TX_COUNT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	90	macro	MT_TXD3_TIMING_MEASURE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	91	macro	MT_TXD3_DAS	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	92	macro	MT_TXD3_EEOSP	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	93	macro	MT_TXD3_EMRD	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	94	macro	MT_TXD3_PROTECT_FRAME	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	95	macro	MT_TXD3_NO_ACK	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	97	macro	MT_TXD4_PN_LOW	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	99	macro	MT_TXD5_PN_HIGH	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	100	macro	MT_TXD5_MD	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	101	macro	MT_TXD5_ADD_BA	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	102	macro	MT_TXD5_TX_STATUS_HOST	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	103	macro	MT_TXD5_TX_STATUS_MCU	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	104	macro	MT_TXD5_TX_STATUS_FMT	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	105	macro	MT_TXD5_PID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	107	macro	MT_TXD6_TX_IBF	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	108	macro	MT_TXD6_TX_EBF	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	109	macro	MT_TXD6_TX_RATE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	110	macro	MT_TXD6_SGI	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	111	macro	MT_TXD6_HELTF	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	112	macro	MT_TXD6_LDPC	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	113	macro	MT_TXD6_SPE_ID_IDX	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	114	macro	MT_TXD6_ANT_ID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	115	macro	MT_TXD6_DYN_BW	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	116	macro	MT_TXD6_FIXED_BW	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	117	macro	MT_TXD6_BW	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	119	macro	MT_TXD7_TXD_LEN	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	120	macro	MT_TXD7_UDP_TCP_SUM	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	121	macro	MT_TXD7_IP_SUM	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	122	macro	MT_TXD7_TYPE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	123	macro	MT_TXD7_SUB_TYPE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	125	macro	MT_TXD7_PSE_FID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	126	macro	MT_TXD7_SPE_IDX	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	127	macro	MT_TXD7_HW_AMSDU	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	128	macro	MT_TXD7_TX_TIME	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	50	macro	MT_TXD0_Q_IDX	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	51	macro	MT_TXD0_PKT_FMT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	52	macro	MT_TXD0_ETH_TYPE_OFFSET	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	53	macro	MT_TXD0_TX_BYTES	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	55	macro	MT_TXD1_LONG_FORMAT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	56	macro	MT_TXD1_TGID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	57	macro	MT_TXD1_OWN_MAC	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	58	macro	MT_TXD1_AMSDU	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	59	macro	MT_TXD1_TID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	60	macro	MT_TXD1_HDR_PAD	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	61	macro	MT_TXD1_HDR_FORMAT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	62	macro	MT_TXD1_HDR_INFO	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	63	macro	MT_TXD1_ETH_802_3	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	64	macro	MT_TXD1_VTA	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	65	macro	MT_TXD1_WLAN_IDX	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	67	macro	MT_TXD2_FIX_RATE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	68	macro	MT_TXD2_FIXED_RATE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	69	macro	MT_TXD2_POWER_OFFSET	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	70	macro	MT_TXD2_MAX_TX_TIME	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	71	macro	MT_TXD2_FRAG	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	72	macro	MT_TXD2_HTC_VLD	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	73	macro	MT_TXD2_DURATION	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	74	macro	MT_TXD2_BIP	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	75	macro	MT_TXD2_MULTICAST	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	76	macro	MT_TXD2_RTS	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	77	macro	MT_TXD2_SOUNDING	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	78	macro	MT_TXD2_NDPA	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	79	macro	MT_TXD2_NDP	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	80	macro	MT_TXD2_FRAME_TYPE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	81	macro	MT_TXD2_SUB_TYPE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	83	macro	MT_TXD3_SN_VALID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	84	macro	MT_TXD3_PN_VALID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	85	macro	MT_TXD3_SW_POWER_MGMT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	86	macro	MT_TXD3_BA_DISABLE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	87	macro	MT_TXD3_SEQ	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	88	macro	MT_TXD3_REM_TX_COUNT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	89	macro	MT_TXD3_TX_COUNT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	90	macro	MT_TXD3_TIMING_MEASURE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	91	macro	MT_TXD3_DAS	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	92	macro	MT_TXD3_EEOSP	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	93	macro	MT_TXD3_EMRD	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	94	macro	MT_TXD3_PROTECT_FRAME	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	95	macro	MT_TXD3_NO_ACK	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	97	macro	MT_TXD4_PN_LOW	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	99	macro	MT_TXD5_PN_HIGH	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	100	macro	MT_TXD5_MD	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	101	macro	MT_TXD5_ADD_BA	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	102	macro	MT_TXD5_TX_STATUS_HOST	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	103	macro	MT_TXD5_TX_STATUS_MCU	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	104	macro	MT_TXD5_TX_STATUS_FMT	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	105	macro	MT_TXD5_PID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	107	macro	MT_TXD6_TX_IBF	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	108	macro	MT_TXD6_TX_EBF	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	109	macro	MT_TXD6_TX_RATE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	110	macro	MT_TXD6_SGI	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	111	macro	MT_TXD6_HELTF	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	112	macro	MT_TXD6_LDPC	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	113	macro	MT_TXD6_SPE_ID_IDX	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	114	macro	MT_TXD6_ANT_ID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	115	macro	MT_TXD6_DYN_BW	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	116	macro	MT_TXD6_FIXED_BW	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	117	macro	MT_TXD6_BW	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	119	macro	MT_TXD7_TXD_LEN	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	120	macro	MT_TXD7_UDP_TCP_SUM	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	121	macro	MT_TXD7_IP_SUM	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	122	macro	MT_TXD7_TYPE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	123	macro	MT_TXD7_SUB_TYPE	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	125	macro	MT_TXD7_PSE_FID	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	126	macro	MT_TXD7_SPE_IDX	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	127	macro	MT_TXD7_HW_AMSDU	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
+drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	128	macro	MT_TXD7_TX_TIME	linux_qos_null_probe_reference_for_tid	exact	numeric Linux v7.1 mask audit covers all eight PCI TXD dwords, ten-bit WLAN_IDX, and separate DW5 PID versus DW7 type/subtype
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	130	macro	MT_TXD8_L_TYPE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	131	macro	MT_TXD8_L_SUB_TYPE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac2_mac.h	133	macro	MT_TX_RATE_STBC	-	unmapped	-
@@ -3665,8 +3665,8 @@ drivers/net/wireless/mediatek/mt76/mt7921/mac.c	12	macro	MT_WTBL_TXRX_CAP_RATE_O
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	13	macro	MT_WTBL_TXRX_RATE_G2_HE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	14	macro	MT_WTBL_TXRX_RATE_G2	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	16	macro	MT_WTBL_AC0_CTT_OFFSET	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mac.c	18	function	mt7921_mac_wtbl_update	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mac.c	27	function	mt7921_mac_wtbl_lmac_addr	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mac.c	18	function	mt7921_mac_wtbl_update	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
+drivers/net/wireless/mediatek/mt76/mt7921/mac.c	27	function	mt7921_mac_wtbl_lmac_addr	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	32	function	mt7921_mac_sta_poll	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	168	function	mt7921_mac_fill_rx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mac.c	446	function	mt7921_mac_add_txs	-	unmapped	-
@@ -5173,10 +5173,10 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	166	macro	MT_WTBL_ITCR_EXEC	-	u
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	167	macro	MT_WTBL_ITDR0	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	168	macro	MT_WTBL_ITDR1	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	169	macro	MT_WTBL_SPE_IDX_SEL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	171	macro	MT_WTBL_BASE	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	172	macro	MT_WTBL_LMAC_ID	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	173	macro	MT_WTBL_LMAC_DW	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	174	macro	MT_WTBL_LMAC_OFFS	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	171	macro	MT_WTBL_BASE	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	172	macro	MT_WTBL_LMAC_ID	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	173	macro	MT_WTBL_LMAC_DW	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	174	macro	MT_WTBL_LMAC_OFFS	VfioPassiveMechanics::e2e81_snapshot	exact	WCID7 maps to LMAC entry base 0x820d8700 and admission counters begin at DW20/0x820d8750
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	179	macro	MT_WF_AGG_BASE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	180	macro	MT_WF_AGG	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	182	macro	MT_AGG_AWSCR0	-	unmapped	-

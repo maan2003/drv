@@ -8581,6 +8581,92 @@ mod tests {
     }
 
     #[test]
+    fn independent_linux_connac2_txd_bitfields_cover_wide_wcid_and_txd7() {
+        // Numeric masks copied independently from Linux v7.1
+        // mt76_connac2_mac.h.  In particular WLAN_IDX is DW1[9:0]; it does
+        // not share TID/QIDX and has no continuation in DW7.
+        let field = |word: u32, mask: u32| (word & mask) >> mask.trailing_zeros();
+        let be = [
+            0x0200_003a,
+            0x8002_6807,
+            0x8000_202c,
+            0x1000_7800,
+            0x0000_0000,
+            0x0000_0407,
+            0x004b_0004,
+            0x002c_0000,
+        ];
+        assert_eq!(field(be[0], 0xfe00_0000), 1); // Q_IDX
+        assert_eq!(field(be[0], 0x0180_0000), 0); // PKT_FMT: CT
+        assert_eq!(field(be[0], 0x007f_0000), 0); // ETH_TYPE_OFFSET
+        assert_eq!(field(be[0], 0x0000_ffff), 58); // TX_BYTES
+        assert_eq!(field(be[1], 0x8000_0000), 1); // LONG_FORMAT
+        assert_eq!(field(be[1], 0x4000_0000), 0); // TGID: band 0
+        assert_eq!(field(be[1], 0x3f00_0000), 0); // OWN_MAC / OMAC 0
+        assert_eq!(field(be[1], 0x0080_0000), 0); // AMSDU
+        assert_eq!(field(be[1], 0x0070_0000), 0); // TID 0
+        assert_eq!(field(be[1], 0x000c_0000), 0); // HDR_PAD
+        assert_eq!(field(be[1], 0x0003_0000), 2); // 802.11 HDR_FORMAT
+        assert_eq!(field(be[1], 0x0000_f800), 13); // 26-byte HDR_INFO / 2
+        assert_eq!(field(be[1], 0x0000_0400), 0); // VTA
+        assert_eq!(field(be[1], 0x0000_03ff), 7); // ten-bit WLAN_IDX
+        assert_eq!(field(be[2], 0x8000_0000), 1); // FIX_RATE
+        assert_eq!(field(be[2], 0x4000_0000), 0); // FIXED_RATE
+        assert_eq!(field(be[2], 0x2000_0000), 0); // POWER_OFFSET high bit
+        assert_eq!(field(be[2], 0x00ff_0000), 0); // MAX_TX_TIME
+        assert_eq!(field(be[2], 0x0000_c000), 0); // FRAG
+        assert_eq!(field(be[2], 0x0000_2000), 1); // HTC_VLD
+        assert_eq!(field(be[2], 0x0000_0030), 2); // DATA frame TYPE
+        assert_eq!(field(be[2], 0x0000_000f), 12); // QoS-null SUB_TYPE
+        assert_eq!(field(be[3], 0x8000_0000), 0); // SN_VALID
+        assert_eq!(field(be[3], 0x4000_0000), 0); // PN_VALID
+        assert_eq!(field(be[3], 0x2000_0000), 0); // SW_POWER_MGMT
+        assert_eq!(field(be[3], 0x1000_0000), 1); // BA_DISABLE
+        assert_eq!(field(be[3], 0x0fff_0000), 0); // SEQ
+        assert_eq!(field(be[3], 0x0000_f800), 15); // REM_TX_COUNT
+        assert_eq!(be[4], 0); // PN_LOW
+        assert_eq!(field(be[5], 0xffff_0000), 0); // PN_HIGH
+        assert_eq!(field(be[5], 0x0000_0400), 1); // TX_STATUS_HOST
+        assert_eq!(field(be[5], 0x0000_0200), 0); // TX_STATUS_MCU
+        assert_eq!(field(be[5], 0x0000_0100), 0); // TX_STATUS_FMT
+        assert_eq!(field(be[5], 0x0000_00ff), 7); // PID, unrelated to WCID
+        assert_eq!(field(be[6], 0x3fff_0000), 0x4b); // OFDM 6 Mbps
+        assert_eq!(field(be[6], 0x0000_0004), 1); // FIXED_BW
+        assert_eq!(field(be[7], 0x0030_0000), 2); // DATA TYPE
+        assert_eq!(field(be[7], 0x000f_0000), 12); // QoS-null SUB_TYPE
+        assert_eq!(be[7] & 0xffc0_ffff, 0); // no TXD_LEN/checksum/SPE/time
+
+        let mgmt = [
+            0x2000_004a,
+            0x8002_6013,
+            0x8000_200b,
+            0x1000_7800,
+            0x0000_0000,
+            0x0000_0403,
+            0x004b_0004,
+            0x000b_0000,
+        ];
+        assert_eq!(field(mgmt[1], 0x0000_03ff), 19);
+        assert_eq!(field(mgmt[1], 0x0000_f800), 12);
+        assert_eq!(field(mgmt[7], 0x0030_0000), 0); // management TYPE
+        assert_eq!(field(mgmt[7], 0x000f_0000), 11); // auth SUB_TYPE
+        assert_eq!(field(mgmt[5], 0x0000_00ff), 3); // PID remains in DW5
+
+        // Linux FIELD_PREP(MT_TXD1_WLAN_IDX, wcid->idx) accepts all ten bits.
+        // Values above 255 therefore remain wholly in DW1 and cannot alter
+        // HDR_INFO, HDR_FORMAT, OMAC, TGID, or DW7.
+        for wcid in [7u32, 19, 0x1ab, 0x3ff] {
+            let dw1 = 0x8002_6800 | wcid;
+            assert_eq!(field(dw1, 0x0000_03ff), wcid);
+            assert_eq!(field(dw1, 0x0000_f800), 13);
+            assert_eq!(field(dw1, 0x0003_0000), 2);
+            assert_eq!(field(dw1, 0x3f00_0000), 0);
+            assert_eq!(field(dw1, 0x4000_0000), 0);
+        }
+        assert_eq!(0x400u32 & 0x0000_03ff, 0); // index 1024 is out of range
+    }
+
+    #[test]
     fn independent_linux_five_ghz_rate_context_exposes_legacy_fixture_divergence() {
         let rates = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
         let (basic, legacy) = linux_legacy_rate_context_reference(1, &rates).unwrap();
