@@ -158,3 +158,29 @@ four bytes into `STA_REC_VHT.vht_cap`; its WTBL_VHT contains only LDPC,
 dynamic-BW, VHT-present, and TXOP-PS fields and does not synthesize SGI160.
 Thus neither DeviceInfo nor negotiation nor the encoder requests SGI160. The
 remaining physical bit-11 difference has no source-proven host fix yet.
+
+## Stage-local WTBL trace (2026-08-12)
+
+One guarded native oracle capture and one guarded userspace capture traced peer
+WCID 1 DW5 without changing association behavior. Native report
+`20260812T175733Z-linux-oracle-0000_05_00.0.log` and userspace report
+`20260812T175915Z-0000_05_00.0.log` both observed SGI160 clear before/after the
+WCID-1 admission clear, clear after the preauthentication CID-3 ACK and
+association BSS ACK, and set immediately after the associated peer CID-3 ACK.
+It stayed set through EDCA and the interface-WCID update on both paths.
+
+The first SGI160 divergence is therefore the immediately-pre-data boundary,
+not peer creation: native changed from `0x32000c27` after interface-WCID update
+to `0x32000427` before data, while userspace remained `0x32000c27`. Between
+those native boundaries Linux emitted two BSS-info updates (raw locally
+retained): beacon-filter timing and power-save state. Userspace emitted no
+corresponding command between its interface-WCID ACK and pre-data read. This
+pair isolates the missing clear to that post-interface BSS-update interval;
+it does not prove which of those updates, or firmware settling around them,
+is causal. No SGI capability or inventory field was changed and no speculative
+fix was made.
+
+The admission-clear register trace selected WCID 1 explicitly. Its programmed
+low index was 1 on both paths, with bit 12 set for the write and busy clear in
+the observed completion; direct LMAC address `0x820d8114` was used for peer
+DW5. Interface WCID 19 was not selected by either peer clear.

@@ -171,6 +171,18 @@ fn record_sae_stage(event: &str) {
     });
 }
 
+#[cfg(feature = "fuchsia-passive")]
+const WTBL_STAGE_ORDER: [&str; 8] = [
+    "before_admission_clear",
+    "after_admission_clear",
+    "after_preauth_cid3_ack",
+    "after_association_bss_ack",
+    "after_associated_cid3_ack",
+    "after_edca",
+    "after_interface_wcid_update",
+    "immediately_pre_data",
+];
+
 #[repr(C)]
 #[derive(Default)]
 struct Bind {
@@ -1744,6 +1756,20 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     println!(
         "self_test_wtbl_dw5 result=pass command_af=7 byte206=7 named_state_fixture_sgi160=false reserved_bit2=ignored ht_vht_fields=preserved causality=not_claimed"
+    );
+    if WTBL_STAGE_ORDER.len() != 8
+        || WTBL_STAGE_ORDER[0] != "before_admission_clear"
+        || WTBL_STAGE_ORDER[7] != "immediately_pre_data"
+        || WTBL_STAGE_ORDER
+            .iter()
+            .enumerate()
+            .any(|(index, stage)| WTBL_STAGE_ORDER[..index].contains(stage))
+    {
+        return Err("self-test WTBL stage marker ordering lost canonical order".into());
+    }
+    println!(
+        "self_test_wtbl_stage_order result=pass stages={}",
+        WTBL_STAGE_ORDER.join(",")
     );
     if diagnostic_liveness(0x000c_ef1a).is_err() || diagnostic_liveness(u32::MAX).is_ok() {
         return Err("self-test firmware snapshot liveness semantics failed".into());
@@ -9034,6 +9060,18 @@ fn run_passive_prepare_steps<E>(
 
 #[cfg(feature = "fuchsia-passive")]
 impl PassiveMacExecutor<'_> {
+    fn trace_peer_wtbl_dw5(&self, stage: &str) {
+        match self.read_firmware_snapshot_raw(0x820d_8114) {
+            Ok(value) => record_sae_stage(&format!(
+                "wtbl_stage stage={stage} peer_wcid=1 interface_wcid=19 selector=direct_lmac_addr address=0x820d8114 dw5={value:#010x} sgi160={}",
+                (value >> 11) & 1
+            )),
+            Err(error) => record_sae_stage(&format!(
+                "wtbl_stage stage={stage} peer_wcid=1 result=read_unavailable reason={error}"
+            )),
+        }
+    }
+
     fn page(&self, address: u32) -> Result<&ReadPage, String> {
         let offset = passive_mac_read_bar_offset(address)?;
         let bar_page = offset & !(PAGE - 1);
@@ -9071,10 +9109,21 @@ impl PassiveMacExecutor<'_> {
     fn clear_wtbl_admission_counts(&self, wcid: u8) -> Result<(), String> {
         let address = 0x820d_4230;
         let initial = self.read(address)?;
-        self.write(address, (initial & !0x03ff) | u32::from(wcid) | (1 << 12))?;
+        let programmed = (initial & !0x03ff) | u32::from(wcid) | (1 << 12);
+        self.trace_peer_wtbl_dw5("before_admission_clear");
+        self.write(address, programmed)?;
+        let written = self.read(address)?;
+        record_sae_stage(&format!(
+            "wtbl_update_register stage=admission_clear register=0x820d4230 selector_wcid={wcid} initial={initial:#010x} programmed={programmed:#010x} immediate={written:#010x}"
+        ));
         let deadline = Instant::now() + std::time::Duration::from_micros(5000);
         loop {
-            if self.read(address)? & (1 << 31) == 0 {
+            let observed = self.read(address)?;
+            if observed & (1 << 31) == 0 {
+                record_sae_stage(&format!(
+                    "wtbl_update_register stage=admission_clear_complete selector_wcid={wcid} observed={observed:#010x}"
+                ));
+                self.trace_peer_wtbl_dw5("after_admission_clear");
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -11672,6 +11721,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
+        record_sae_stage(&format!(
+            "wtbl_command cid={expected_cid} bytes={} raw={}",
+            encoded.len(),
+            encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        ));
         if expected_cid == 3
             && let Some(wcid) = encoded
                 .get(49)
@@ -11842,6 +11896,19 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::IO);
         }
         preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        let mac = PassiveMacExecutor {
+            pages: self.mac_pages,
+        };
+        let stage = match (expected_cid, encoded.len(), encoded.get(49).copied()) {
+            (3, len, Some(1)) if len < 200 => Some("after_preauth_cid3_ack"),
+            (2, 96, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
+            (3, len, Some(1)) if len >= 200 => Some("after_associated_cid3_ack"),
+            (3, 108, Some(19)) => Some("after_interface_wcid_update"),
+            _ => None,
+        };
+        if let Some(stage) = stage {
+            mac.trace_peer_wtbl_dw5(stage);
+        }
         // Linux's association STA add is CID 3 with this exact five-TLV
         // fixture. Observe, but never mutate, the source-owned RX state after
         // its ACK so a no-data run distinguishes filtering from ring ingress.
@@ -11887,6 +11954,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        record_sae_stage(&format!(
+            "wtbl_command cid=legacy29 bytes={} raw={}",
+            encoded.len(),
+            encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        ));
         self.loader
             .send_client_edca_bytes(encoded)
             .map_err(|error| {
@@ -11898,6 +11970,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "wmm_edca_transport completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux",
         );
+        PassiveMacExecutor { pages: self.mac_pages }.trace_peer_wtbl_dw5("after_edca");
         Ok(())
     }
 
@@ -11916,6 +11989,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let eapol = bytes
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        if eapol {
+            PassiveMacExecutor { pages: self.mac_pages }
+                .trace_peer_wtbl_dw5("immediately_pre_data");
+        }
         if eapol && !self.e2e81_probe_done {
             // Same-session source-exact AC discriminator. The EAPOL timer is
             // only the post-association trigger; no EAPOL is published.
