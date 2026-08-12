@@ -1745,9 +1745,11 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test exact AP-to-STA EAPOL M1 classification failed".into());
     }
+    let mut rx_gate = ClientFirmwareEffectsState::default();
+    let peer_wcid = rx_gate.allocate_peer_wcid()?;
     let association = LegacyWmeAssociation {
         bss_index: 0,
-        peer_wcid: ClientWcid::try_from(7).unwrap(),
+        peer_wcid,
         aid: 42,
         peer,
         rcpi: 100,
@@ -1759,7 +1761,6 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         negotiated_qos: true,
         mfp_required: false,
     };
-    let mut rx_gate = ClientFirmwareEffectsState::default();
     let rx_channel = mt7921_port_spike::ClientChannelLease {
         channel: ClientPhysicalChannel {
             band: 1,
@@ -1841,16 +1842,34 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             Ok(())
         })
         .map_err(|error| format!("self-test post-ASSOC interface WCID: {error}"))?;
-    let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, 7, peer, 100)
-        .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
+    let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
+        1,
+        0,
+        peer_wcid.get(),
+        peer,
+        100,
+    )
+    .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
     let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer =
-        encode_legacy_wme_add_wcid_command(3, 0, 7, 42, peer, 100, 1, 0x40, None, None, 0)
+        encode_legacy_wme_add_wcid_command(
+            3,
+            0,
+            peer_wcid.get(),
+            42,
+            peer,
+            100,
+            1,
+            0x40,
+            None,
+            None,
+            0,
+        )
             .map_err(|error| format!("self-test association peer fixture: {error}"))?;
     let expected_interface = encode_client_post_assoc_interface_wcid_command(5, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
-    let wtbl_structure = expected_peer[120] == 7
+    let wtbl_structure = expected_peer[120] == peer_wcid.get()
         && expected_peer[121] == 1
         && expected_peer[122..124] == [4, 0]
         && expected_peer[68..74] == expected_peer[132..138]
@@ -1872,7 +1891,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         || !rx_gate.bss_programmed
         || !rx_gate.association.is_some_and(|active| {
             active.bss_index == 0
-                && active.peer_wcid.get() == 7
+                && active.peer_wcid == peer_wcid
                 && active.aid == 42
                 && active.peer == peer
         })
@@ -1886,7 +1905,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
+        peer_wcid.get()
     );
     // Source-exact discriminator: ieee80211_send_nullfunc only requests the
     // minimum rate during connection polling.  This post-association liveness
@@ -1922,13 +1942,16 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     for status in 1..=3u32 {
         let mut raw = [0u8; 16];
         raw[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
-        let pair = (1u32 << 31) | (7 << 14);
+        let pair = (1u32 << 31) | (u32::from(peer_wcid.get()) << 14);
         let info = (4u32 << 16) | (status << 13) | 15;
         raw[8..12].copy_from_slice(&pair.to_le_bytes());
         raw[12..16].copy_from_slice(&info.to_le_bytes());
         let parsed = parse_mt7921_tx_free(&raw)
             .map_err(|error| format!("self-test raw TX_FREE status: {error:?}"))?;
-        if parsed.status != status as u8 || parsed.attempts != 15 {
+        if parsed.status != status as u8
+            || parsed.attempts != 15
+            || parsed.wcid != Some(u16::from(peer_wcid.get()))
+        {
             return Err("self-test raw TX_FREE status/count lost".into());
         }
         println!(
@@ -1940,7 +1963,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let candidate = ClientRxCandidate {
         generation,
         eapol: true,
-        wcid: 7,
+        wcid: u16::from(peer_wcid.get()),
         tid: 0,
         group: false,
         key_id: 0,
@@ -1954,10 +1977,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     };
     rx_gate
         .deliver_rx(candidate)
-        .map_err(|error| format!("self-test immediate WCID7 EAPOL gate: {error}"))?;
+        .map_err(|error| format!("self-test immediate peer EAPOL gate: {error}"))?;
     rx_gate
         .deliver_rx(candidate)
-        .map_err(|error| format!("self-test retried WCID7 EAPOL gate: {error}"))?;
+        .map_err(|error| format!("self-test retried peer EAPOL gate: {error}"))?;
     let mut non_eapol = candidate;
     non_eapol.eapol = false;
     if rx_gate.deliver_rx(non_eapol).is_ok() {
@@ -1966,7 +1989,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let protected_disassociation = ClientRxCandidate {
         generation,
         eapol: false,
-        wcid: 7,
+        wcid: u16::from(peer_wcid.get()),
         tid: 0,
         group: false,
         key_id: 0,
@@ -2055,7 +2078,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         return Err("self-test E2E48 malformed descriptor was not terminal".into());
     }
     println!(
-        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true from_ds=true rfc1042=true ether_type=0x888e eapol_m1=immediate_and_retried_admitted wcid=7 non_eapol=filtered malformed=terminal"
+        "self_test_client_rx result=pass rxd2=0x42000c40 hdr_trans=false raw_80211=true from_ds=true rfc1042=true ether_type=0x888e eapol_m1=immediate_and_retried_admitted wcid={} non_eapol=filtered malformed=terminal",
+        peer_wcid.get()
     );
     let mut auth = vec![0; 32];
     auth[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
@@ -2379,10 +2403,11 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         1, 0, 0, 0, 42, 0, 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac,
         4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ]);
-    burst_assoc.extend_from_slice(&[
+    let wmm_parameters = [
         0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x80, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27,
         0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
-    ]);
+    ];
+    burst_assoc.extend_from_slice(&wmm_parameters);
     let mut burst_m1 = vec![0x08, 0x02, 0, 0];
     burst_m1.extend_from_slice(&client);
     burst_m1.extend_from_slice(&peer);
@@ -2403,11 +2428,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test EAPOL-Start standards fixture failed".into());
     }
-    let start_txwi = encode_client_data_txwi(start.len(), 0x1234_5000, 7, 9, true, false, true, 7)
+    let mut start_txwi =
+        encode_client_data_txwi(start.len(), 0x1234_5000, 7, 9, true, false, true, 7)
         .map_err(|error| format!("self-test EAPOL-Start TXWI: {error}"))?;
+    set_client_txwi_wcid(&mut start_txwi, peer_wcid);
     let linux_words = [
         0x0600_0046u32,
-        0x8072_6807,
+        0x8072_6800 | u32::from(peer_wcid.get()),
         0x8000_2028,
         0x1000_7800,
         0,
@@ -2433,7 +2460,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         return Err("self-test Linux EAPOL-Start descriptor golden diverged".into());
     }
     println!(
-        "self_test_eapol_liveness result=pass type=start timer_ms=1000 one_shot=true immediate_m1=suppressed timeout_flood=false linux_golden=exact qos=true tid=7 wcid=7 management_data=distinct missing_wcid=blocked"
+        "self_test_eapol_liveness result=pass type=start timer_ms=1000 one_shot=true immediate_m1=suppressed timeout_flood=false linux_golden=exact qos=true tid=7 wcid={} management_data=distinct missing_wcid=blocked",
+        peer_wcid.get()
     );
     let burst_status = || fidl_softmac::WlanRxInfo {
         rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
@@ -2516,6 +2544,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     burst_request.bss_description.ies.extend_from_slice(&[
         48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ]);
+    burst_request
+        .bss_description
+        .ies
+        .extend_from_slice(&wmm_parameters);
     burst_request.authentication = fidl_internal::Authentication {
         protocol: fidl_internal::Protocol::Wpa2Personal,
         credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
@@ -2545,7 +2577,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     });
     let wmm_request = burst_tx.lock().unwrap().iter().any(|(frame, _, _)| {
         frame.first() == Some(&0x00)
-            && frame.ends_with(&[0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00])
+            && frame
+                .windows(8)
+                .any(|ie| ie == [0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01])
     });
     if !matches!((wmm, cid2, cid3, m1_rx), (Some(w), Some(a), Some(b), Some(c)) if w < a && a < b && b < c)
         || !m2
@@ -11245,7 +11279,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                         frame[24] & 15,
                     )?;
                     record_sae_stage(&format!(
-                        "e2e86_variant kind=qos_null tid={} ac={} qidx={} awake=true dont_encrypt=true use_minrate=false rate_control=normal wcid={} altx=false state_change=false",
+                        "e2e87_variant kind=qos_null tid={} ac={} qidx={} awake=true dont_encrypt=true use_minrate=false rate_control=normal wcid={} altx=false state_change=false",
                         frame[24] & 15,
                         if frame[24] & 15 == 0 { "be" } else { "vo" },
                         if frame[24] & 15 == 0 { 1 } else { 3 },
@@ -11706,7 +11740,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e86_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "e2e87_evidence result=complete one_probe_only=true normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false raw_tx_free_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));
