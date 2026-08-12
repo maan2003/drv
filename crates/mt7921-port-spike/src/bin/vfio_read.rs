@@ -2126,7 +2126,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     rx_gate.association.as_mut().unwrap().mfp_required = true;
     rx_gate
-        .install_ptk(&[0x11; 16], 0, |_, _| Ok(()))
+        .install_ptk(&[0x11; 16], 0, |_, _| Ok(()), |_| Ok(()))
         .map_err(|error| format!("self-test protected management PTK: {error}"))?;
     rx_gate
         .deliver_protected_management_rx(protected_disassociation)
@@ -10381,17 +10381,27 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .ok_or(zx::Status::INVALID_ARGS)?;
         let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
         let key_type = configuration.key_type.ok_or(zx::Status::INVALID_ARGS)?;
+        let io = std::cell::RefCell::new(io);
         let result = match key_type {
             fidl_ieee80211::KeyType::Pairwise
                 if configuration.peer_addr == Some(association.peer)
                     && key_id == 0
                     && configuration.cipher_type == Some(4) =>
             {
-                self.firmware
-                    .install_ptk(key, configuration.rsc.unwrap_or(0), |cid, command| {
-                        io.submit_uni(cid, command)
+                self.firmware.install_ptk(
+                    key,
+                    configuration.rsc.unwrap_or(0),
+                    |cid, command| {
+                        io.borrow_mut()
+                            .submit_uni(cid, command)
                             .map_err(|status| status.to_string())
-                    })
+                    },
+                    |command| {
+                        io.borrow_mut()
+                            .submit_ce_no_ack(command)
+                            .map_err(|status| status.to_string())
+                    },
+                )
             }
             fidl_ieee80211::KeyType::Group
                 if configuration.peer_addr == Some([0xff; 6])
@@ -10403,7 +10413,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     key,
                     configuration.rsc.unwrap_or(0),
                     |cid, command| {
-                        io.submit_uni(cid, command)
+                        io.borrow_mut()
+                            .submit_uni(cid, command)
+                            .map_err(|status| status.to_string())
+                    },
+                    |command| {
+                        io.borrow_mut()
+                            .submit_ce_no_ack(command)
                             .map_err(|status| status.to_string())
                     },
                 )
@@ -10413,10 +10429,20 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     && (4..=5).contains(&key_id)
                     && configuration.cipher_type == Some(6) =>
             {
-                self.firmware.install_igtk(key_id, key, |cid, command| {
-                    io.submit_uni(cid, command)
-                        .map_err(|status| status.to_string())
-                })
+                self.firmware.install_igtk(
+                    key_id,
+                    key,
+                    |cid, command| {
+                        io.borrow_mut()
+                            .submit_uni(cid, command)
+                            .map_err(|status| status.to_string())
+                    },
+                    |command| {
+                        io.borrow_mut()
+                            .submit_ce_no_ack(command)
+                            .map_err(|status| status.to_string())
+                    },
+                )
             }
             _ => return Err(zx::Status::INVALID_ARGS),
         };
@@ -10556,10 +10582,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 io.submit_edca(command).map_err(|status| status.to_string())
             }) {
                 record_sae_stage(&format!("wmm_edca_program result=error reason={error}"));
-                let _ = self.firmware.teardown(|cid, command| {
-                    io.submit_uni(cid, command)
-                        .map_err(|status| status.to_string())
-                });
+                let _ = self.firmware.teardown(
+                    |cid, command| {
+                        io.submit_uni(cid, command)
+                            .map_err(|status| status.to_string())
+                    },
+                    |_| Ok(()),
+                );
                 return Err(zx::Status::IO);
             }
             record_sae_stage(&format!(
@@ -10653,11 +10682,20 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if request.peer_addr != Some(association.peer) {
             return Err(zx::Status::INVALID_ARGS);
         }
+        let io = std::cell::RefCell::new(io);
         self.firmware
-            .teardown(|cid, command| {
-                io.submit_uni(cid, command)
-                    .map_err(|status| status.to_string())
-            })
+            .teardown(
+                |cid, command| {
+                    io.borrow_mut()
+                        .submit_uni(cid, command)
+                        .map_err(|status| status.to_string())
+                },
+                |command| {
+                    io.borrow_mut()
+                        .submit_ce_no_ack(command)
+                        .map_err(|status| status.to_string())
+                },
+            )
             .map_err(|_| zx::Status::IO)?;
         self.peer_wcid = None;
         self.post_association_data_wait = None;
@@ -14511,34 +14549,53 @@ mod tests {
         assert!(state.association.is_some());
         assert!(state.set_controlled_port(true).is_err());
         state
-            .install_ptk(&[0x11; 16], 0, |_, command| {
-                assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
-                Ok(())
-            })
+            .install_ptk(
+                &[0x11; 16],
+                0,
+                |_, command| {
+                    assert_eq!(&command[48..56], &[0, 7, 1, 0, 1, 0, 0, 0]);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         state
-            .install_gtk(2, &[0x22; 16], 0, |_, command| {
-                assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
-                Ok(())
-            })
+            .install_gtk(
+                2,
+                &[0x22; 16],
+                0,
+                |_, command| {
+                    assert_eq!(&command[48..56], &[0, 19, 1, 0, 1, 14, 0, 0]);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         assert!(state.set_controlled_port(true).is_err());
         state
-            .install_igtk(4, &[0x44; 16], |_, command| {
-                assert_eq!(&command[68..84], &[0x22; 16]);
-                assert_eq!(&command[104..120], &[0x44; 16]);
-                Ok(())
-            })
+            .install_igtk(
+                4,
+                &[0x44; 16],
+                |_, command| {
+                    assert_eq!(&command[68..84], &[0x22; 16]);
+                    assert_eq!(&command[104..120], &[0x44; 16]);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         state.set_controlled_port(true).unwrap();
         assert!(state.controlled_port_open);
 
         let mut teardown = Vec::new();
         state
-            .teardown(|_, command| {
-                teardown.push((command.len(), command[49], command[58], command[60]));
-                Ok(())
-            })
+            .teardown(
+                |_, command| {
+                    teardown.push((command.len(), command[49], command[58], command[60]));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(
             teardown,
@@ -14579,16 +14636,24 @@ mod tests {
         state
             .associate(association, test_channel_lease(36), |_, _| Ok(()))
             .unwrap();
-        state.install_ptk(&[1; 16], 0, |_, _| Ok(())).unwrap();
+        state
+            .install_ptk(&[1; 16], 0, |_, _| Ok(()), |_| Ok(()))
+            .unwrap();
         assert!(
             state
-                .install_gtk(1, &[2; 16], 0, |_, _| Err("negative ACK".into()))
+                .install_gtk(
+                    1,
+                    &[2; 16],
+                    0,
+                    |_, _| Err("negative ACK".into()),
+                    |_| Ok(())
+                )
                 .is_err()
         );
         assert!(state.firmware_uncertain);
         assert!(!state.controlled_port_open);
         assert!(state.set_controlled_port(true).is_err());
-        state.teardown(|_, _| Ok(())).unwrap();
+        state.teardown(|_, _| Ok(()), |_| Ok(())).unwrap();
         assert!(!state.firmware_uncertain);
         assert!(state.association.is_none());
     }
@@ -14737,11 +14802,20 @@ mod tests {
         );
         assert!(
             state
-                .install_ptk(&[1; 16], 1 << 48, |_, _| panic!("invalid RSC submitted"))
+                .install_ptk(
+                    &[1; 16],
+                    1 << 48,
+                    |_, _| panic!("invalid RSC submitted"),
+                    |_| Ok(())
+                )
                 .is_err()
         );
-        state.install_ptk(&[1; 16], 5, |_, _| Ok(())).unwrap();
-        state.install_gtk(2, &[2; 16], 9, |_, _| Ok(())).unwrap();
+        state
+            .install_ptk(&[1; 16], 5, |_, _| Ok(()), |_| Ok(()))
+            .unwrap();
+        state
+            .install_gtk(2, &[2; 16], 9, |_, _| Ok(()), |_| Ok(()))
+            .unwrap();
         state.set_controlled_port(true).unwrap();
         let authorized = ClientDataGeneration::Authorized(state.authorized_generation.unwrap());
         let normal = ClientRxCandidate {
@@ -14775,10 +14849,10 @@ mod tests {
         assert!(state.authorized_generation.is_none());
         assert!(state.publish_tx(12, authorized).is_err());
         assert!(state.deliver_rx(normal).is_err());
-        assert!(state.teardown(|_, _| Ok(())).is_err());
+        assert!(state.teardown(|_, _| Ok(()), |_| Ok(())).is_err());
         assert!(state.association.is_some());
         state.complete_tx(11).unwrap();
-        state.teardown(|_, _| Ok(())).unwrap();
+        state.teardown(|_, _| Ok(()), |_| Ok(())).unwrap();
         assert!(state.association_generation.is_none());
     }
 

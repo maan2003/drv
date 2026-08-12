@@ -5342,13 +5342,26 @@ pub fn encode_client_post_assoc_beacon_timing_command(
 /// MT_WF_RFCR_DROP_OTHER_BEACON)`. CE SET_RX_FILTER has no firmware ACK;
 /// successful publication means transport DMA ownership was consumed.
 pub fn encode_client_post_assoc_rx_filter_command(sequence: u8) -> Result<Vec<u8>, String> {
+    encode_client_post_assoc_rx_filter_bitmap_command(sequence, 1)
+}
+
+/// Linux beacon-filter teardown uses `BIT_CLR` (bit operation 2) for the
+/// same `MT_WF_RFCR_DROP_OTHER_BEACON` bitmap before dismantling the BSS.
+pub fn encode_client_post_assoc_rx_filter_clear_command(sequence: u8) -> Result<Vec<u8>, String> {
+    encode_client_post_assoc_rx_filter_bitmap_command(sequence, 2)
+}
+
+fn encode_client_post_assoc_rx_filter_bitmap_command(
+    sequence: u8,
+    bit_operation: u8,
+) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence) {
         return Err("post-association RX filter sequence is invalid".into());
     }
     let mut body = [0u8; 68];
     body[4] = 2; // bitmap update mode
     body[12..16].copy_from_slice(&(1u32 << 11).to_le_bytes());
-    body[16] = 1; // set bitmap bits
+    body[16] = bit_operation;
     Ok(encode_legacy_mcu(0x0a, 0, &body, sequence))
 }
 
@@ -6590,6 +6603,7 @@ impl ClientFirmwareEffectsState {
         key: &[u8],
         rsc: u64,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("PTK install requires WCID ACK")?;
         if rsc >> 48 != 0 {
@@ -6607,7 +6621,7 @@ impl ClientFirmwareEffectsState {
         if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
-            let rollback = self.teardown(&mut submit);
+            let rollback = self.teardown(&mut submit, &mut submit_ce_no_ack);
             return Err(format!(
                 "PTK install failed: {error}; rollback={rollback:?}"
             ));
@@ -6623,6 +6637,7 @@ impl ClientFirmwareEffectsState {
         key: &[u8],
         rsc: u64,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
         if rsc >> 48 != 0 {
@@ -6633,7 +6648,7 @@ impl ClientFirmwareEffectsState {
         if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
-            let rollback = self.teardown(&mut submit);
+            let rollback = self.teardown(&mut submit, &mut submit_ce_no_ack);
             return Err(format!(
                 "GTK install failed: {error}; rollback={rollback:?}"
             ));
@@ -6651,6 +6666,7 @@ impl ClientFirmwareEffectsState {
         key_id: u8,
         key: &[u8],
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("IGTK install requires WCID ACK")?;
         let sequence = self.next_sequence();
@@ -6670,7 +6686,7 @@ impl ClientFirmwareEffectsState {
         if let Err(error) = submit(3, command.as_bytes()) {
             self.controlled_port_open = false;
             self.firmware_uncertain = true;
-            let rollback = self.teardown(&mut submit);
+            let rollback = self.teardown(&mut submit, &mut submit_ce_no_ack);
             return Err(format!(
                 "IGTK install failed: {error}; rollback={rollback:?}"
             ));
@@ -6821,17 +6837,25 @@ impl ClientFirmwareEffectsState {
     pub fn teardown(
         &mut self,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         self.controlled_port_open = false;
         self.edca_programmed = None;
         self.post_assoc_interface_programmed = false;
         self.post_assoc_beacon_timing_programmed = false;
-        self.post_assoc_rx_filter_published = false;
         self.post_assoc_rlm_programmed = false;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
             self.firmware_uncertain = true;
             return Err("client TX must be contained before key teardown".into());
+        }
+        if self.post_assoc_rx_filter_published {
+            let clear = encode_client_post_assoc_rx_filter_clear_command(self.next_sequence())?;
+            submit_ce_no_ack(&clear).map_err(|error| {
+                self.firmware_uncertain = true;
+                format!("client firmware RX-filter teardown failed: {error}")
+            })?;
+            self.post_assoc_rx_filter_published = false;
         }
         let Some(association) = self.association else {
             self.gtk = None;
@@ -8201,6 +8225,7 @@ mod tests {
         };
         let beacon = encode_client_post_assoc_beacon_timing_command(6, 0, 100, 2).unwrap();
         let rx_filter = encode_client_post_assoc_rx_filter_command(7).unwrap();
+        let rx_filter_clear = encode_client_post_assoc_rx_filter_clear_command(9).unwrap();
         let rlm = encode_client_post_assoc_rlm_command(8, 0, channel).unwrap();
 
         assert_eq!(beacon.len(), 60);
@@ -8213,6 +8238,8 @@ mod tests {
         expected_rx_payload[12..16].copy_from_slice(&0x800u32.to_le_bytes());
         expected_rx_payload[16] = 1;
         assert_eq!(&rx_filter[64..], &expected_rx_payload);
+        expected_rx_payload[16] = 2;
+        assert_eq!(&rx_filter_clear[64..], &expected_rx_payload);
         assert_eq!(rlm.len(), 68);
         assert_eq!(&rlm[34..36], &[2, 0]);
         assert_eq!(
@@ -8557,15 +8584,22 @@ mod tests {
             )
             .unwrap();
         assert!(state.qos_tx_ready());
-        let mut transcript = transcript.into_inner();
+        let transcript = std::cell::RefCell::new(transcript.into_inner());
         state
-            .teardown(|_, command| {
-                transcript.push(command.to_vec());
-                Ok(())
-            })
+            .teardown(
+                |_, command| {
+                    transcript.borrow_mut().push(command.to_vec());
+                    Ok(())
+                },
+                |command| {
+                    transcript.borrow_mut().push(command.to_vec());
+                    Ok(())
+                },
+            )
             .unwrap();
+        let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 9);
+        assert_eq!(transcript.len(), 10);
         assert_eq!(
             transcript
                 .iter()
@@ -8578,8 +8612,11 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>(),
-            [3, 2, 3, 3, 2, 0x0a, 2, 3, 2]
+            [3, 2, 3, 3, 2, 0x0a, 2, 0x0a, 3, 2]
         );
+        assert_eq!(transcript[5][80], 1);
+        assert_eq!(transcript[7][80], 2);
+        assert!(!state.post_assoc_rx_filter_published);
         let preauth_add = &transcript[0];
         assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
@@ -8607,8 +8644,8 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[8][56], 0);
-        assert_eq!(transcript[7][49], 1);
+        assert_eq!(transcript[9][56], 0);
+        assert_eq!(transcript[8][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);
@@ -8694,10 +8731,13 @@ mod tests {
         assert!(dirty.firmware_uncertain);
         let mut teardown = Vec::new();
         dirty
-            .teardown(|cid, command| {
-                teardown.push((cid, command[56]));
-                Ok(())
-            })
+            .teardown(
+                |cid, command| {
+                    teardown.push((cid, command[56]));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(teardown, [(3, 0), (2, 0)]);
         assert!(!dirty.bss_programmed);
