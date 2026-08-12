@@ -1872,7 +1872,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	950	function	mt76_connac_mc
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	962	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	964	function	mt76_connac_mcu_wtbl_ht_tlv	encode_legacy_wme_add_wcid_command	exact	nested HT/VHT enable, LDPC and AMPDU factor/density subset
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1040	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	encode_legacy_wme_add_wcid_command	exact	STA_REC and nested reset-and-set WTBL envelope for associated negotiated HT/VHT station
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	encode_legacy_wme_add_wcid_command, encode_client_post_assoc_interface_wcid_command	exact	STA_REC and nested reset-and-set WTBL envelope for associated negotiated HT/VHT station; null-sta offload path emits only WCID19 WTBL GENERIC/RX/HDR_TRANS
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1095	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1097	function	mt76_connac_mcu_wtbl_ba_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1140	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
@@ -3714,7 +3714,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/main.c	671	macro	MT7921_FILTER_CONTROL
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	672	macro	MT7921_FILTER_OTHER_BSS	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	673	macro	MT7921_FILTER_ENABLE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	678	macro	MT7921_FILTER	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/main.c	694	function	mt7921_bss_info_changed	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/main.c	694	function	mt7921_bss_info_changed	encode_client_post_assoc_interface_wcid_command, ClientFirmwareEffectsState::complete_post_assoc_interface	exact	post-ASSOC Linux order is peer STA_REC, EDCA, then separate reserved interface WCID19 WTBL reset-and-set before first data TX
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	745	function	mt7921_calc_vif_num	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	765	function	mt7921_regd_set_6ghz_power_type	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/main.c	807	function	mt7921_mac_sta_add	-	unmapped	-
@@ -3978,7 +3978,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1025	member	pad	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1032	struct	__anone31f438c1008	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1033	member	bss_idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1034	member	pad	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1049	function	mt7921_mcu_sta_update	encode_legacy_wme_add_wcid_command	exact	STATE_ASSOC enable/newly/RCPI/WCID selection subset
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1049	function	mt7921_mcu_sta_update	encode_legacy_wme_add_wcid_command, encode_client_post_assoc_interface_wcid_command	exact	STATE_ASSOC enable/newly/RCPI/WCID selection subset; BSS_CHANGED_ASSOC null-sta selects reserved interface WCID19
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1073	function	mt7921_mcu_set_beacon_filter	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1077	macro	MT7921_FIF_BIT_CLR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1078	macro	MT7921_FIF_BIT_SET	-	unmapped	-

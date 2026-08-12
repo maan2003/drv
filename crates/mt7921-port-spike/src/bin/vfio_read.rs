@@ -58,6 +58,7 @@ use mt7921_port_spike::{
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
     encode_client_data_txwi, encode_client_edca_command, encode_client_interface_commands, encode_client_management_tx,
+    encode_client_post_assoc_interface_wcid_command,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
     encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
@@ -1784,6 +1785,29 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             Ok(())
         })
         .map_err(|error| format!("self-test E2E48 association: {error}"))?;
+    if rx_gate.qos_tx_ready() {
+        return Err("self-test data TX opened before post-ASSOC commands".into());
+    }
+    let edca = ClientEdcaParameters {
+        ac: [
+            ClientEdcaAc { cw_min: 3, cw_max: 7, txop: 47, aifs: 2, acm: false },
+            ClientEdcaAc { cw_min: 7, cw_max: 15, txop: 94, aifs: 2, acm: false },
+            ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 3, acm: false },
+            ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 7, acm: false },
+        ],
+    };
+    rx_gate
+        .program_edca(edca, |_| Ok(()))
+        .map_err(|error| format!("self-test post-ASSOC EDCA: {error}"))?;
+    if rx_gate.qos_tx_ready() {
+        return Err("self-test data TX opened before interface WCID update".into());
+    }
+    rx_gate
+        .complete_post_assoc_interface(|cid, command| {
+            activation_commands.push((cid, command.to_vec()));
+            Ok(())
+        })
+        .map_err(|error| format!("self-test post-ASSOC interface WCID: {error}"))?;
     let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, 7, peer, 100)
         .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
     let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
@@ -1792,6 +1816,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         3, 0, 7, 42, peer, 100, 1, 0x40, None, None, 0,
     )
         .map_err(|error| format!("self-test association peer fixture: {error}"))?;
+    let expected_interface = encode_client_post_assoc_interface_wcid_command(5, 0, peer)
+        .map_err(|error| format!("self-test association interface fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == 7
         && expected_peer[121] == 1
         && expected_peer[122..124] == [4, 0]
@@ -1801,7 +1827,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let unavailable_readback =
         classify_wtbl_peer_readback(&peer, Err(WtblPeerReadback::Unavailable));
     let all_ones_readback = classify_wtbl_peer_readback(&peer, Err(WtblPeerReadback::AllOnes));
-    if activation_commands != [(3, expected_preauth), (2, expected_bss), (3, expected_peer)]
+    if activation_commands != [(3, expected_preauth), (2, expected_bss), (3, expected_peer), (3, expected_interface)]
         || !wtbl_structure
         || unavailable_readback != WtblPeerReadback::Unavailable
         || all_ones_readback != WtblPeerReadback::AllOnes
@@ -1814,6 +1840,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         })
         || rx_gate.association_generation.is_none()
         || rx_gate.controlled_port_open
+        || !rx_gate.qos_tx_ready()
         || rx_gate.tx_generation(true).is_err()
     {
         return Err(
@@ -1821,7 +1848,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,peer_associated cid_order=3,2,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 wtbl_reset_set=true nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19 cid_order=3,2,3,legacy29,3 preauth_peer_wcid=7 preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_interface=blocked data_tx_after_interface=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true"
     );
     let generation = ClientDataGeneration::Association(rx_gate.association_generation.unwrap());
     let candidate = ClientRxCandidate {
@@ -10163,6 +10190,20 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 params.ac[3].aifs, params.ac[3].cw_min, params.ac[3].cw_max, params.ac[3].txop, params.ac[3].acm,
             ));
         }
+        self.firmware
+            .complete_post_assoc_interface(|cid, command| {
+                io.submit_uni(cid, command)
+                    .map_err(|status| status.to_string())
+            })
+            .map_err(|error| {
+                record_sae_stage(&format!(
+                    "post_assoc_interface_wcid result=error wcid=19 reason={error}"
+                ));
+                zx::Status::IO
+            })?;
+        record_sae_stage(
+            "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=open",
+        );
         let generation = self
             .firmware
             .association_generation
@@ -14328,13 +14369,14 @@ mod tests {
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
-        assert_eq!(io.uni.len(), 4);
+        assert_eq!(io.uni.len(), 5);
         assert_eq!(u16::from_le_bytes(io.uni[2][66..68].try_into().unwrap()), 4);
         assert_eq!(
             u16::from_le_bytes(io.uni[2][144..146].try_into().unwrap()),
             4
         );
         assert_eq!(io.uni[3].get(36..39), Some(&[0x1d, 0xa0, 1][..]));
+        assert_eq!(&io.uni[4][48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
         assert!(effects.firmware.qos_tx_ready());
         assert_eq!(
             u16::from_le_bytes(association_response[28..30].try_into().unwrap()),

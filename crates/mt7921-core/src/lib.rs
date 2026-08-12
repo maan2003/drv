@@ -5266,6 +5266,36 @@ pub fn encode_legacy_wme_add_wcid_command(
     )
 }
 
+/// Linux v7.1's second post-association `mt7921_mcu_sta_update(dev, NULL, ...)`.
+///
+/// This is distinct from the peer WCID update: `BSS_CHANGED_ASSOC` resets and
+/// sets the reserved station-interface/BMC WCID 19 after EDCA programming.
+/// With firmware offload enabled and no `sta`, Linux emits no BASIC/RA TLV;
+/// the command consists solely of the exact GENERIC/RX/HDR_TRANS WTBL set.
+pub fn encode_client_post_assoc_interface_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    bssid: [u8; 6],
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || bssid == [0; 6] {
+        return Err("post-association interface WCID identity is invalid".into());
+    }
+    let mut body = vec![0u8; 60];
+    // sta_req_hdr: WCID19 and one outer STA_REC_WTBL TLV.
+    body[0..8].copy_from_slice(&[bss_index, 19, 1, 0, 0, 0, 0, 0]);
+    // STA_REC_WTBL plus WTBL_RESET_AND_SET, three nested TLVs.
+    body[8..20].copy_from_slice(&[13, 0, 52, 0, 19, 1, 3, 0, 0, 0, 0, 0]);
+    // WTBL_GENERIC: station-mode BSSID, reserved MUAR 0xe, no QoS/partial AID.
+    body[20..24].copy_from_slice(&[0, 0, 20, 0]);
+    body[24..30].copy_from_slice(&bssid);
+    body[30] = 0x0e;
+    // WTBL_RX: rca1/rca2/rv are all enabled for the interface WCID.
+    body[40..52].copy_from_slice(&[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]);
+    // WTBL_HDR_TRANS: To-DS, no RX translation.
+    body[52..60].copy_from_slice(&[6, 0, 8, 0, 1, 0, 1, 0]);
+    Ok(encode_uni_mcu(3, &body, sequence))
+}
+
 /// Linux v7.1 mac80211 band-rate indexes translated into the exact Connac2
 /// STA_REC_PHY.basic_rate and STA_REC_RA.legacy fields.
 pub fn linux_legacy_rate_context_reference(
@@ -6026,6 +6056,7 @@ pub struct ClientFirmwareEffectsState {
     pub preauth_peer: Option<LegacyWmeAssociation>,
     pub association: Option<LegacyWmeAssociation>,
     pub edca_programmed: Option<ClientEdcaParameters>,
+    pub post_assoc_interface_programmed: bool,
     pub sequence: u8,
     pub ptk_installed: bool,
     pub ptk_dirty: bool,
@@ -6066,8 +6097,37 @@ impl ClientFirmwareEffectsState {
 
     pub fn qos_tx_ready(&self) -> bool {
         self.bss_programmed
+            && self.post_assoc_interface_programmed
             && (self.association.is_some_and(|association| !association.negotiated_qos)
                 || self.edca_programmed.is_some())
+    }
+
+    pub fn complete_post_assoc_interface(
+        &mut self,
+        mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let association = self
+            .association
+            .ok_or("post-association interface update requires peer STA_REC ACK")?;
+        let joined = self
+            .joined
+            .ok_or("post-association interface update requires joined BSS")?;
+        if self.post_assoc_interface_programmed
+            || self.firmware_uncertain
+            || (association.negotiated_qos && self.edca_programmed.is_none())
+        {
+            return Err("post-association interface update is out of Linux order".into());
+        }
+        let command = encode_client_post_assoc_interface_wcid_command(
+            self.next_sequence(),
+            association.bss_index,
+            joined.bssid,
+        )?;
+        self.firmware_uncertain = true;
+        submit(3, &command)?;
+        self.post_assoc_interface_programmed = true;
+        self.firmware_uncertain = false;
+        Ok(())
     }
     pub fn bind_join(
         &mut self,
@@ -6538,6 +6598,7 @@ impl ClientFirmwareEffectsState {
     ) -> Result<(), String> {
         self.controlled_port_open = false;
         self.edca_programmed = None;
+        self.post_assoc_interface_programmed = false;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
             self.firmware_uncertain = true;
@@ -8160,11 +8221,21 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(state.qos_tx_ready());
+        // Linux does not make first WCID data TX reachable after only the
+        // peer STA_REC and EDCA commands: BSS_CHANGED_ASSOC follows with the
+        // separate reserved interface-WCID update.
+        assert!(!state.qos_tx_ready());
         assert_eq!(edca_command.len(), 108);
         assert_eq!(&edca_command[36..39], &[0x1d, 0xa0, 1]);
         assert_eq!(&edca_command[64..74], &[7, 0, 15, 0, 94, 0, 2, 0, 0, 0]);
         assert_eq!(&edca_command[74..84], &[3, 0, 7, 0, 47, 0, 2, 0, 0, 0]);
+        state
+            .complete_post_assoc_interface(|_, command| {
+                transcript.push(command.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert!(state.qos_tx_ready());
         state
             .teardown(|_, command| {
                 transcript.push(command.to_vec());
@@ -8172,13 +8243,13 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(transcript.len(), 5);
+        assert_eq!(transcript.len(), 6);
         assert_eq!(
             transcript
                 .iter()
                 .map(|command| u16::from_le_bytes([command[34], command[35]]))
                 .collect::<Vec<_>>(),
-            [3, 2, 3, 3, 2]
+            [3, 2, 3, 3, 3, 2]
         );
         let preauth_add = &transcript[0];
         assert_eq!(preauth_add[112], 0);
@@ -8192,7 +8263,15 @@ mod tests {
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[92], 1);
         assert_eq!(transcript[2][112], 2);
-        assert_eq!(transcript[4][56], 0);
+        let interface_assoc = &transcript[3];
+        assert_eq!(interface_assoc.len(), 108);
+        assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&interface_assoc[56..68], &[13, 0, 52, 0, 19, 1, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(&interface_assoc[72..78], &peer);
+        assert_eq!(interface_assoc[78], 0x0e);
+        assert_eq!(&interface_assoc[88..100], &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
+        assert_eq!(transcript[5][56], 0);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
     }

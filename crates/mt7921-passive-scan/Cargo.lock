@@ -636,7 +636,6 @@ name = "fuchsia-softmac-port"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "eapol",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
