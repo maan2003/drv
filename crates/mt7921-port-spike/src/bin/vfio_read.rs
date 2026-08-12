@@ -1736,9 +1736,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test association comeback IE contract failed".into());
     }
-    if diagnostic_liveness(0x000c_ef1a).is_err()
-        || diagnostic_liveness(u32::MAX).is_ok()
-    {
+    if diagnostic_liveness(0x000c_ef1a).is_err() || diagnostic_liveness(u32::MAX).is_ok() {
         return Err("self-test firmware snapshot liveness semantics failed".into());
     }
     let legitimate_raw = u32::MAX;

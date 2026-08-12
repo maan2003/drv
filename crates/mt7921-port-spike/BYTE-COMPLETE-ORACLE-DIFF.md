@@ -80,3 +80,59 @@ There is no unmasked byte, bit, command-order, MMIO, register-state, TXD/TXP,
 still ended in firmware status 1/count 15 with no TXS. Host-visible internal
 evidence is exhausted; the next useful discriminator requires external RF or
 firmware visibility. No E2E88 is justified.
+
+
+## Firmware-owned state inventory
+
+A source-instrumented Linux 6.18.40 run and the final guarded userspace run
+(`20260812T170831Z-0000_05_00.0.log`) each yielded the same 2,944 ordered
+addresses. The raw reader first validates RMAC liveness, then preserves
+`0xffffffff` inside only the fixed diagnostic ranges.
+
+WTBL peer DW2 bits 0..11 at offset `0x8` are masked as the dynamic association
+ID: `mt76_connac_mcu_wtbl_generic_tlv` sources `vif->cfg.aid`, and the three
+userspace captures tracked AP assignments 9, 8, and 5 in exactly those bits.
+After that mask, 107 dwords differed identically in all three userspace
+attempts: peer WTBL 12, interface WTBL 2, WTBLON 7, PLE 6, PSE 2, DMASHDL 2,
+TMAC0 52, RMAC0 12, and MIB0 12. This is a stability inventory, not a claim
+that queue/rate/counter/MIB values are semantic; a single native capture
+cannot distinguish those time-varying fields.
+
+The first semantic difference is peer WTBL DW5, offset `0x14`: Linux
+`0x32000427`, userspace `0x32000c23`, XOR `0x00000804`. Linux 6.18 and 7.1
+`mt76_connac_mcu.h` name DW5 bits 7..5 `CHANGE_BW_RATE`, bits 8/9/10/11
+`SHORT_GI_20/40/80/160`, bits 13..12 `BW_CAP`, bits 25..23/28..26 as MPDU
+failure/success counters, and bits 31..29 `RATE_IDX`. Thus named fields agree
+except userspace alone has `SHORT_GI_160`; XOR bit 2 is unnamed/reserved by
+both source versions. The upper counters/rate index are identical and dynamic.
+
+The causal command-construction difference is WTBL_HT `af`, not an actual
+negotiated SGI-160 capability. Linux's `mt76_connac_mcu_wtbl_ht_tlv` starts
+from `sta->ht_cap.ampdu_factor`, obtains the VHT maximum A-MPDU exponent with
+`FIELD_GET(IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK, ...)`, and stores
+the maximum. Our encoder sent HT exponent 3 despite the negotiated VHT
+exponent 7. The firmware consequently produced the differing DW5 state. The
+encoder now performs the same max before emitting WTBL_HT; the independent
+raw command golden asserts `af=7` at byte 206. Remaining stable differences
+are retained as follow-up evidence rather than mass-fixed: many are explicit
+queue/rate/counter state, while early configuration candidates include peer
+WTBL offsets `0x1c`/`0x24`, interface WTBL `0x1c`/`0x24`, DMASHDL `0x4`/`0xdc`,
+and TMAC configuration ranges.
+
+The complete three-attempt-stable offset inventory (after the AID mask) is:
+
+| Region | Stable differing offsets |
+|---|---|
+| peer WTBL | `14,1c,24,28,2c,30,34,6c,74,78,7c,88` |
+| interface WTBL | `1c,24` |
+| WTBLON | `220,224,228,22c,230,234,238` |
+| PLE | `384,404,408,40c,424,10e0` |
+| PSE | `1fc,200` |
+| DMASHDL | `4,dc` |
+| TMAC0 | `20,24,c0,c4,e4,108,140-1e0 (every dword),27c,284,374,378,384` |
+| RMAC0 | `24,4c,7c,b8,bc,180,1a4,1a8,204,208,20c,210` |
+| MIB0 | `48,74,400,574,594,5b8,5e0,630,638,64c,75c,780` |
+
+Offsets are hexadecimal. Values for the first causal dword are given above;
+the comparison tool emits exact values from root-only reports without copying
+raw device state into the repository.

@@ -5192,6 +5192,11 @@ fn encode_legacy_wme_wcid_command(
     let wtbl_start = expanded.len();
     expanded.extend_from_slice(&bytes[116..168]);
     let mut nested = 4u16;
+    // mt76_connac_mcu_wtbl_ht_tlv raises HT's A-MPDU exponent to the
+    // negotiated VHT maximum before encoding WTBL_HT.af.
+    let ampdu_factor = vht_cap
+        .map(|vht| (u32::from_le_bytes(vht[..4].try_into().unwrap()) >> 23 & 7) as u8)
+        .map_or(ht[2] & 3, |vht| (ht[2] & 3).max(vht));
     expanded.extend_from_slice(&[
         2,
         0,
@@ -5199,7 +5204,7 @@ fn encode_legacy_wme_wcid_command(
         0,
         1,
         u8::from(ht[0] & 1 != 0),
-        ht[2] & 3,
+        ampdu_factor,
         ht[2] >> 2 & 7,
         0,
         0,
@@ -8983,7 +8988,7 @@ mod tests {
             &[7, 0, 12, 0, 0, 0, 0, 0, 2, 0x12, 0, 0]
         );
         assert_eq!(&encoded[148..160], &[13, 0, 84, 0, 7, 1, 6, 0, 0, 0, 0, 0]);
-        assert_eq!(&encoded[200..212], &[2, 0, 12, 0, 1, 1, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(&encoded[200..212], &[2, 0, 12, 0, 1, 1, 7, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[212..224], &[3, 0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[224..232], &[13, 0, 8, 0, 0, 0, 0, 0]);
     }
