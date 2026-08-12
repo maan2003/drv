@@ -63,8 +63,8 @@ use mt7921_port_spike::{
     encode_remove_wcid_command, load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
     parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
     passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    validate_passive_mac_bar_read, linux_qos_eapol_control_port_reference,
-    linux_qos_null_probe_reference,
+    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -1046,7 +1046,7 @@ fn run_contained_dma_resource_round_trip(
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                            e2e77_matrix_done: false,
+                            e2e78_probe_done: false,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -1740,6 +1740,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         aid: 42,
         peer,
         rcpi: 100,
+        basic_rates: 1,
+        legacy_rates: 0x40,
         negotiated_qos: true,
         mfp_required: false,
     };
@@ -1782,7 +1784,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
     let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
-    let expected_peer = encode_legacy_wme_add_wcid_command(3, 0, 7, 42, peer, 100)
+    let expected_peer = encode_legacy_wme_add_wcid_command(3, 0, 7, 42, peer, 100, 1, 0x40)
         .map_err(|error| format!("self-test association peer fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == 7
         && expected_peer[121] == 1
@@ -4423,7 +4425,7 @@ fn run() -> Result<(), String> {
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                                e2e77_matrix_done: false,
+                                e2e78_probe_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4496,7 +4498,7 @@ fn run() -> Result<(), String> {
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
-                                e2e77_matrix_done: false,
+                                e2e78_probe_done: false,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -9874,6 +9876,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                             aid: 0,
                             peer: self.target,
                             rcpi: self.rcpi,
+                            basic_rates: 1,
+                            legacy_rates: 0x40,
                             negotiated_qos: false,
                             mfp_required: false,
                         },
@@ -10044,6 +10048,20 @@ impl Mt7921ClientEffects for LiveClientEffects {
             );
             return Err(zx::Status::INVALID_ARGS);
         }
+        let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+        let band = match primary.band {
+            fidl_ieee80211::WlanBand::TwoGhz => 0,
+            fidl_ieee80211::WlanBand::FiveGhz => 1,
+            _ => return Err(zx::Status::NOT_SUPPORTED),
+        };
+        let (basic_rates, legacy_rates) = linux_legacy_rate_context_reference(
+            band,
+            configuration.rates.as_deref().ok_or(zx::Status::INVALID_ARGS)?,
+        )
+        .map_err(|_| zx::Status::INVALID_ARGS)?;
+        record_sae_stage(&format!(
+            "e2e78_linux_sta_context rate_source=association_config basic_rates={basic_rates:#06x} legacy_rates={legacy_rates:#06x} qidx_mapping=3_minus_mac80211_ac tid7_ac=vo qidx=3"
+        ));
         record_sae_stage(&format!(
             "association_config_validation result=pass bssid_match=true normalized_aid={aid} keys=false port_open=false protected_management=closed"
         ));
@@ -10062,6 +10080,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     aid,
                     peer,
                     rcpi: self.rcpi,
+                    basic_rates,
+                    legacy_rates,
                     negotiated_qos,
                     // This FIDL association seam does not carry RSN MFP
                     // negotiation. IGTK installation remains supported but
@@ -10641,7 +10661,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
     mgmt_tx_outstanding: MgmtTxOutstanding,
-    e2e77_matrix_done: bool,
+    e2e78_probe_done: bool,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -10668,7 +10688,7 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
-    fn e2e77_snapshot(&self, phase: &str) {
+    fn e2e78_snapshot(&self, phase: &str) {
         let mac = PassiveMacExecutor {
             pages: self.mac_pages,
         };
@@ -10693,7 +10713,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .map_or_else(|_| "unavailable".into(), |v| format!("{v:#010x}"))
         };
         record_sae_stage(&format!(
-            "e2e77_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
+            "e2e78_public_snapshot phase={phase} wtbl_wcid7_airtime=[{wtbl}] mib_bss_tx_retry={} mib_bss_ack_fail={} mib_bss_raw={} dmashdl_control={} dmashdl_qmap0={} dmashdl_sched0={} ple=unavailable_no_fixed_source_map pse=unavailable_no_fixed_source_map wfdma_ring0_cidx={:?} wfdma_ring0_didx={:?}",
             read(0x820f_d108),
             read(0x820f_d520),
             read(0x820f_d100),
@@ -10705,7 +10725,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         ));
     }
 
-    fn e2e77_wait_tx_free(
+    fn e2e78_wait_tx_free(
         &mut self,
         variant: &str,
         token: u16,
@@ -10728,7 +10748,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             }
             if let Some((free, status)) = self.mgmt_tx_outstanding.take_diagnostic_free(token) {
                 record_sae_stage(&format!(
-                    "e2e77_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
+                    "e2e78_tx_result variant={variant} token={token} pid={pid} tx_free_dropped={} attempts={} txs_present={} txs_acked={}",
                     free.dropped,
                     free.attempts,
                     status.is_some(),
@@ -10737,19 +10757,19 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 return Ok(free);
             }
             if Instant::now() >= deadline {
-                return Err(format!("E2E77 {variant} TX_FREE timed out"));
+                return Err(format!("E2E78 {variant} TX_FREE timed out"));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
-    fn e2e77_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
+    fn e2e78_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
         self.transmit_owned_client_frame(frame)?;
         let (token, pid) = self
             .mgmt_tx_outstanding
             .last_identity()
-            .ok_or("E2E77 submission omitted identity")?;
-        self.e2e77_wait_tx_free(variant, token, pid)
+            .ok_or("E2E78 submission omitted identity")?;
+        self.e2e78_wait_tx_free(variant, token, pid)
     }
 
     fn preserve_client_rx_during_control_wait(&mut self) -> Result<(), String> {
@@ -11181,6 +11201,30 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::IO_DATA_INTEGRITY);
         }
         if let Some(wcid) = sta_update_wcid {
+            record_sae_stage(&format!(
+                "e2e78_sta_rec_transcript wcid={wcid} bss_idx={} omac_idx={} conn_type={:#010x} conn_state={} qos={} aid={} phy_basic_rates={:#06x} phy_type={:#04x} ra_legacy_rates={:#06x} sta_state={} wtbl_operation={} wtbl_tlvs={} generic_muar={} generic_skip_tx={} generic_qos={} rx_rca1={} rx_rca2={} rx_rv={} hdr_to_ds={} hdr_from_ds={} hdr_no_rx_trans={}",
+                encoded[48],
+                encoded[53],
+                u32::from_le_bytes(encoded[60..64].try_into().unwrap()),
+                encoded[64],
+                encoded[65],
+                u16::from_le_bytes(encoded[66..68].try_into().unwrap()),
+                u16::from_le_bytes(encoded[80..82].try_into().unwrap()),
+                encoded[82],
+                u16::from_le_bytes(encoded[92..94].try_into().unwrap()),
+                encoded[112],
+                encoded[121],
+                u16::from_le_bytes(encoded[122..124].try_into().unwrap()),
+                encoded[138],
+                encoded[139],
+                encoded[141],
+                encoded[153],
+                encoded[154],
+                encoded[155],
+                encoded[164],
+                encoded[165],
+                encoded[166],
+            ));
             if let Err(error) = (PassiveMacExecutor {
                 pages: self.mac_pages,
             })
@@ -11287,49 +11331,22 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let eapol = bytes
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        if eapol && !self.e2e77_matrix_done {
-            // One bounded same-session discriminator. Linux constructs this
-            // exact awake QoS-null frame in ieee80211_nullfunc_get and sends
-            // it with DONT_ENCRYPT; connection polling authorizes MINRATE.
-            self.e2e77_matrix_done = true;
-            let ap: [u8; 6] = bytes
-                .get(4..10)
-                .ok_or(zx::Status::INVALID_ARGS)?
-                .try_into()
-                .unwrap();
-            let sta: [u8; 6] = bytes
-                .get(10..16)
-                .ok_or(zx::Status::INVALID_ARGS)?
-                .try_into()
-                .unwrap();
-            let mut null = vec![0xc8, 0x01, 0, 0];
-            null.extend_from_slice(&ap);
-            null.extend_from_slice(&sta);
-            null.extend_from_slice(&ap);
-            null.extend_from_slice(&[0, 0, 7, 0]);
-            self.e2e77_snapshot("before_A");
-            let a = self
-                .e2e77_submit_wait("A_qos_null", &null)
+        if eapol && !self.e2e78_probe_done {
+            // One bounded source-exact EAPOL probe after the negotiated-rate
+            // STA_REC context has been ACKed. E2E77 already ruled out MPDU
+            // content, so no additional frame variant is authorized here.
+            self.e2e78_probe_done = true;
+            self.e2e78_snapshot("before_eapol");
+            let result = self
+                .e2e78_submit_wait("eapol_start", bytes)
                 .map_err(|error| {
-                    record_sae_stage(&format!("e2e77_matrix result=error stage=A reason={error}"));
+                    record_sae_stage(&format!("e2e78_probe result=error reason={error}"));
                     zx::Status::IO
                 })?;
-            self.e2e77_snapshot("after_A_before_B");
-            let b = self
-                .e2e77_submit_wait("B_eapol_start", bytes)
-                .map_err(|error| {
-                    record_sae_stage(&format!("e2e77_matrix result=error stage=B reason={error}"));
-                    zx::Status::IO
-                })?;
-            self.e2e77_snapshot("after_B");
-            let classification = match (!a.dropped, !b.dropped) {
-                (true, false) => "content_or_control_port",
-                (false, false) => "general_data_wcid7_vo_path",
-                (false, true) => "qos_null_specific_unexpected",
-                (true, true) => "data_path_operational",
-            };
+            self.e2e78_snapshot("after_eapol");
             record_sae_stage(&format!(
-                "e2e77_matrix result=complete classification={classification} variant_C=omitted reason=no_source_valid_state_neutral_alternate_wcid_or_altx_route"
+                "e2e78_probe result=complete dropped={} attempts={} frame_variants=one firmware_context=negotiated_legacy_rates",
+                result.dropped, result.attempts,
             ));
             return Ok(());
         }
@@ -13405,6 +13422,8 @@ mod tests {
             42,
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             100,
+            0x15,
+            0x3fc0,
         )
         .unwrap();
         assert_eq!(encoded.len(), 176);
@@ -13416,6 +13435,8 @@ mod tests {
                 0, 0, 20, 0, 2, 0, 1, 0, 2, 1, 42, 0, 16, 32, 48, 64, 80, 96, 1, 0
             ]
         );
+        assert_eq!(&encoded[80..82], &0x15u16.to_le_bytes());
+        assert_eq!(&encoded[92..94], &0x3fc0u16.to_le_bytes());
         assert_eq!(encoded[112], 2);
         assert_eq!(&encoded[116..124], &[13, 0, 60, 0, 7, 1, 4, 0]);
         assert_eq!(
@@ -13481,6 +13502,8 @@ mod tests {
             aid: 42,
             peer: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
             negotiated_qos: true,
             mfp_required: true,
         };
@@ -13555,6 +13578,8 @@ mod tests {
             aid: 42,
             peer: [1, 2, 3, 4, 5, 6],
             rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
             negotiated_qos: true,
             mfp_required: false,
         };
@@ -13709,6 +13734,8 @@ mod tests {
             aid: 42,
             peer: [1, 2, 3, 4, 5, 6],
             rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
             negotiated_qos: true,
             mfp_required: false,
         };

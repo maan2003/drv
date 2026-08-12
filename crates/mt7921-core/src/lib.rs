@@ -5100,6 +5100,8 @@ fn encode_legacy_wme_wcid_command(
     aid: u16,
     peer: [u8; 6],
     rcpi: u8,
+    basic_rates: u16,
+    legacy_rates: u16,
     associated: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence) {
@@ -5121,6 +5123,8 @@ fn encode_legacy_wme_wcid_command(
     // STATE_ASSOC after the association response.
     bytes[65] = u8::from(associated);
     bytes[74..76].copy_from_slice(&(if associated { 1u16 } else { 3u16 }).to_le_bytes());
+    bytes[80..82].copy_from_slice(&basic_rates.to_le_bytes());
+    bytes[92..94].copy_from_slice(&legacy_rates.to_le_bytes());
     bytes[112] = if associated { 2 } else { 0 };
     bytes[132..138].copy_from_slice(&peer);
     bytes[141] = u8::from(associated);
@@ -5135,7 +5139,7 @@ pub fn encode_preauth_peer_wcid_command(
     peer: [u8; 6],
     rcpi: u8,
 ) -> Result<Vec<u8>, String> {
-    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, 0, peer, rcpi, false)
+    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, 0, peer, rcpi, 1, 0x40, false)
 }
 
 pub fn encode_legacy_wme_add_wcid_command(
@@ -5145,11 +5149,60 @@ pub fn encode_legacy_wme_add_wcid_command(
     aid: u16,
     peer: [u8; 6],
     rcpi: u8,
+    basic_rates: u16,
+    legacy_rates: u16,
 ) -> Result<Vec<u8>, String> {
     if !(1..=2007).contains(&aid) {
         return Err("associated WCID AID escaped infrastructure range".into());
     }
-    encode_legacy_wme_wcid_command(sequence, bss_index, wcid, aid, peer, rcpi, true)
+    if basic_rates == 0 || legacy_rates == 0 {
+        return Err("associated WCID omitted negotiated legacy rates".into());
+    }
+    encode_legacy_wme_wcid_command(
+        sequence,
+        bss_index,
+        wcid,
+        aid,
+        peer,
+        rcpi,
+        basic_rates,
+        legacy_rates,
+        true,
+    )
+}
+
+/// Linux v7.1 mac80211 band-rate indexes translated into the exact Connac2
+/// STA_REC_PHY.basic_rate and STA_REC_RA.legacy fields.
+pub fn linux_legacy_rate_context_reference(
+    band: u8,
+    encoded_rates: &[u8],
+) -> Result<(u16, u16), String> {
+    let rate_values: &[u8] = match band {
+        0 => &[2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108],
+        1 => &[12, 18, 24, 36, 48, 72, 96, 108],
+        _ => return Err("legacy rate context used an unsupported band".into()),
+    };
+    let mut supported = 0u16;
+    let mut basic = 0u16;
+    for encoded in encoded_rates {
+        let position = rate_values
+            .iter()
+            .position(|rate| *rate == encoded & 0x7f)
+            .ok_or("association advertised a rate outside the Linux band table")?;
+        supported |= 1 << position;
+        if encoded & 0x80 != 0 {
+            basic |= 1 << position;
+        }
+    }
+    if basic == 0 || supported == 0 {
+        return Err("association omitted negotiated basic/supported rates".into());
+    }
+    let legacy = if band == 0 {
+        supported & 0x0f | (supported >> 4) << 6
+    } else {
+        supported << 6
+    };
+    Ok((basic, legacy))
 }
 
 /// Linux v7.1 `mt76_connac_mcu_uni_add_bss` station BASIC+QBSS request.
@@ -5318,6 +5371,10 @@ pub struct LegacyWmeAssociation {
     pub aid: u16,
     pub peer: [u8; 6],
     pub rcpi: u8,
+    /// mac80211 band-rate bitmap copied to STA_REC_PHY.basic_rate.
+    pub basic_rates: u16,
+    /// Connac RA_LEGACY_CCK/OFDM bitmap copied to STA_REC_RA.legacy.
+    pub legacy_rates: u16,
     pub negotiated_qos: bool,
     pub mfp_required: bool,
 }
@@ -6083,6 +6140,8 @@ impl ClientFirmwareEffectsState {
             association.aid,
             association.peer,
             association.rcpi,
+            association.basic_rates,
+            association.legacy_rates,
         )?;
         if let Err(error) = submit(3, &command) {
             self.controlled_port_open = false;
@@ -7806,7 +7865,19 @@ mod tests {
         for malformed in [0, 4, 0xc000, 0xc7d8, 0xffff] {
             assert!(normalize_infrastructure_aid(malformed).is_err());
         }
-        assert!(encode_legacy_wme_add_wcid_command(1, 0, 7, 0, [1, 2, 3, 4, 5, 6], 100).is_err());
+        assert!(
+            encode_legacy_wme_add_wcid_command(
+                1,
+                0,
+                7,
+                0,
+                [1, 2, 3, 4, 5, 6],
+                100,
+                1,
+                0x40,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7892,6 +7963,8 @@ mod tests {
             aid: 42,
             peer,
             rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
             negotiated_qos: true,
             mfp_required: false,
         };
@@ -8010,6 +8083,8 @@ mod tests {
             aid: 42,
             peer,
             rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
             negotiated_qos: true,
             mfp_required: false,
         };
@@ -8362,6 +8437,30 @@ mod tests {
             &encoded[32..46],
             &[3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x34, 0x12, 0x1a, 0x80]
         );
+    }
+
+    #[test]
+    fn independent_linux_five_ghz_rate_context_exposes_legacy_fixture_divergence() {
+        let rates = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
+        let (basic, legacy) = linux_legacy_rate_context_reference(1, &rates).unwrap();
+        assert_eq!(basic, 0x15);
+        assert_eq!(legacy, 0x3fc0);
+
+        let encoded = encode_legacy_wme_add_wcid_command(
+            9,
+            0,
+            7,
+            42,
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            100,
+            basic,
+            legacy,
+        )
+        .unwrap();
+        assert_eq!(&encoded[80..82], &[0x15, 0]);
+        assert_eq!(&encoded[92..94], &[0xc0, 0x3f]);
+        assert_ne!(&encoded[80..82], &[1, 0]);
+        assert_ne!(&encoded[92..94], &[0x40, 0]);
     }
 
     #[test]

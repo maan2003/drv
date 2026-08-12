@@ -1410,7 +1410,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac.h	264	function	is_mt7611	-	unmapp
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	269	function	is_connac_v1	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	274	function	is_mt76_fw_txp	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	290	function	mt76_connac_chan_bw	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac.h	310	function	mt76_connac_lmac_mapping	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac.h	310	function	mt76_connac_lmac_mapping	linux_qos_null_probe_reference, linux_qos_eapol_control_port_reference	exact	mac80211 VO index 0 reverses to LMAC qidx 3
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	317	function	mt76_connac_txwi_to_txp	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	329	function	mt76_connac_spe_idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac.h	340	function	mt76_connac_irq_enable	-	unmapped	-
@@ -1846,7 +1846,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	302	function	mt76_connac_mc
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	327	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	329	function	mt76_connac_mcu_bss_omac_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	369	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	371	function	mt76_connac_mcu_sta_basic_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	371	function	mt76_connac_mcu_sta_basic_tlv	encode_legacy_wme_add_wcid_command	exact	infrastructure-AP connection type, port-secure firmware state, QoS, AID, peer and version-only associated update
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	433	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	435	function	mt76_connac_mcu_sta_uapsd	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	465	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
@@ -1856,7 +1856,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	497	function	mt76_connac_mc
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	522	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	524	function	mt76_connac_mcu_wtbl_update_hdr_trans	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	541	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	543	function	mt76_connac_mcu_wtbl_generic_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	543	function	mt76_connac_mcu_wtbl_generic_tlv	encode_legacy_wme_add_wcid_command	exact	peer/OMAC/QoS/partial-AID plus RCA1/RCA2/RV nested WTBL fields
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	595	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	598	function	mt76_connac_mcu_sta_amsdu_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	622	macro	HE_PHY	-	unmapped	-
@@ -1866,13 +1866,13 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	758	function	mt76_connac_mc
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	789	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	792	function	mt76_connac_get_phy_mode_v2	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	846	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	848	function	mt76_connac_mcu_sta_tlv	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	848	function	mt76_connac_mcu_sta_tlv	encode_legacy_wme_add_wcid_command, linux_legacy_rate_context_reference	exact	legacy PHY basic-rate, RA supported-rate and STATE_ASSOC subset; HT/VHT/HE excluded
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	948	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	950	function	mt76_connac_mcu_wtbl_smps_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	962	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	964	function	mt76_connac_mcu_wtbl_ht_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1040	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1042	function	mt76_connac_mcu_sta_cmd	encode_legacy_wme_add_wcid_command	exact	STA_REC and nested reset-and-set WTBL envelope for associated legacy-WME station
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1095	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1097	function	mt76_connac_mcu_wtbl_ba_tlv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c	1140	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
@@ -3978,7 +3978,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1025	member	pad	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1032	struct	__anone31f438c1008	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1033	member	bss_idx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1034	member	pad	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1049	function	mt7921_mcu_sta_update	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1049	function	mt7921_mcu_sta_update	encode_legacy_wme_add_wcid_command	exact	STATE_ASSOC enable/newly/RCPI/WCID selection subset
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1073	function	mt7921_mcu_set_beacon_filter	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1077	macro	MT7921_FIF_BIT_CLR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	1078	macro	MT7921_FIF_BIT_SET	-	unmapped	-
