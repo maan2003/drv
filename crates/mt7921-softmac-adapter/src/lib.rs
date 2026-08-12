@@ -187,6 +187,9 @@ pub trait Mt7921PassiveTransport {
     fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
+    }
     fn transmit_client(
         &mut self,
         _: &[u8],
@@ -246,6 +249,9 @@ pub trait SourceExactPassiveMechanics {
     }
     fn submit_client_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
     }
     fn transmit_client(
         &mut self,
@@ -391,6 +397,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.mechanics.submit_client_edca(encoded)
+    }
+    fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
+        self.mechanics.diagnostic_association_snapshot(generation)
     }
 
     fn transmit_client(

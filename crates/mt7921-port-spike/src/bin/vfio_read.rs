@@ -1050,6 +1050,7 @@ fn run_contained_dma_resource_round_trip(
                             tx_completions: Vec::new(),
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                             e2e81_probe_done: false,
+                            fw_snapshot_generation: None,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -1386,6 +1387,8 @@ struct SaeCommittedSelfTestMechanics {
     ring_cidx: u32,
     ring_didx: u32,
     descriptor_done: bool,
+    snapshot_order: Option<Arc<Mutex<Vec<&'static str>>>>,
+    snapshot_generation: Option<u64>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -1472,6 +1475,7 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
         }
         io.submit_uni(3, &[])?;
         self.order.lock().unwrap().push("cid3");
+        io.diagnostic_association_snapshot(1)?;
         Ok(())
     }
     fn clear_association(
@@ -1573,6 +1577,16 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         println!(
             "self_test_wmm_edca completion=true dma_consumed=true firmware_ack=not_requested_linux ac_vo=aifs2,cwmin3,cwmax7,txop47 ac_vi=aifs2,cwmin7,cwmax15,txop94 ac_be=aifs3,cwmin15,cwmax1023,txop0 ac_bk=aifs7,cwmin15,cwmax1023,txop0 tid7_ac=vo qidx3_programmed=true data_ring=0"
         );
+        Ok(())
+    }
+    fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
+        if self.snapshot_generation.replace(generation).is_some() {
+            return Err(zx::Status::ALREADY_EXISTS);
+        }
+        if let Some(order) = &self.snapshot_order {
+            order.lock().unwrap().push("snapshot");
+        }
+        println!("self_test_fw_state_snapshot generation={generation} marker=complete");
         Ok(())
     }
     fn transmit_client(
@@ -1722,6 +1736,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     {
         return Err("self-test association comeback IE contract failed".into());
     }
+    if diagnostic_liveness(0x000c_ef1a).is_err()
+        || diagnostic_liveness(u32::MAX).is_ok()
+    {
+        return Err("self-test firmware snapshot liveness semantics failed".into());
+    }
+    let legitimate_raw = u32::MAX;
+    println!(
+        "self_test_fw_state_raw result=pass all_ones_value={legitimate_raw:08x} failed_liveness=separate"
+    );
     println!(
         "self_test_association_comeback result=pass ie_id_lengths=56:5 valid_tu=20 valid_ms=20 malformed=failure no_ie=failure"
     );
@@ -1842,31 +1865,25 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             Ok(())
         })
         .map_err(|error| format!("self-test post-ASSOC interface WCID: {error}"))?;
-    let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
-        1,
-        0,
-        peer_wcid.get(),
-        peer,
-        100,
-    )
-    .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
+    let expected_preauth =
+        mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, peer_wcid.get(), peer, 100)
+            .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
     let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
-    let expected_peer =
-        encode_legacy_wme_add_wcid_command(
-            3,
-            0,
-            peer_wcid.get(),
-            42,
-            peer,
-            100,
-            1,
-            0x40,
-            None,
-            None,
-            0,
-        )
-            .map_err(|error| format!("self-test association peer fixture: {error}"))?;
+    let expected_peer = encode_legacy_wme_add_wcid_command(
+        3,
+        0,
+        peer_wcid.get(),
+        42,
+        peer,
+        100,
+        1,
+        0x40,
+        None,
+        None,
+        0,
+    )
+    .map_err(|error| format!("self-test association peer fixture: {error}"))?;
     let expected_interface = encode_client_post_assoc_interface_wcid_command(5, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == peer_wcid.get()
@@ -2123,6 +2140,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         ring_cidx: 0,
         ring_didx: 0,
         descriptor_done: false,
+        snapshot_order: None,
+        snapshot_generation: None,
     };
     let mut synthetic_group20 = vec![0; 32];
     synthetic_group20[28..32].copy_from_slice(&[126, 0, 20, 0]);
@@ -2300,6 +2319,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             ring_cidx: 0,
             ring_didx: 0,
             descriptor_done: false,
+            snapshot_order: None,
+            snapshot_generation: None,
         },
         capability,
     )
@@ -2430,7 +2451,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     let mut start_txwi =
         encode_client_data_txwi(start.len(), 0x1234_5000, 7, 9, true, false, true, 7)
-        .map_err(|error| format!("self-test EAPOL-Start TXWI: {error}"))?;
+            .map_err(|error| format!("self-test EAPOL-Start TXWI: {error}"))?;
     set_client_txwi_wcid(&mut start_txwi, peer_wcid);
     let linux_words = [
         0x0600_0046u32,
@@ -2506,6 +2527,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             ring_cidx: 0,
             ring_didx: 0,
             descriptor_done: false,
+            snapshot_order: Some(Arc::clone(&burst_order)),
+            snapshot_generation: None,
         },
         capability,
     )
@@ -2564,6 +2587,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let wmm = order.iter().position(|stage| *stage == "wmm");
     let cid2 = order.iter().position(|stage| *stage == "cid2");
     let cid3 = order.iter().position(|stage| *stage == "cid3");
+    let snapshot = order.iter().position(|stage| *stage == "snapshot");
     let m1_rx = order
         .iter()
         .enumerate()
@@ -2581,7 +2605,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
                 .windows(8)
                 .any(|ie| ie == [0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01])
     });
-    if !matches!((wmm, cid2, cid3, m1_rx), (Some(w), Some(a), Some(b), Some(c)) if w < a && a < b && b < c)
+    if !matches!((wmm, cid2, cid3, snapshot, m1_rx), (Some(w), Some(a), Some(b), Some(s), Some(c)) if w < a && a < b && b < s && s < c)
         || !m2
         || !wmm_request
     {
@@ -2591,7 +2615,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     drop(order);
     println!(
-        "self_test_association_control_priority result=pass m1_arrival=during_cid2_wait persistent_fifo=true cid_order=2,3 before_m1=true m2=true wmm_request=true negotiated_qos=true ac_params_installed=true"
+        "self_test_association_control_priority result=pass m1_arrival=during_cid2_wait persistent_fifo=true cid_order=2,3 snapshot_after_final_ack=true snapshot_before_m1_dequeue=true before_m1=true m2=true wmm_request=true negotiated_qos=true ac_params_installed=true"
     );
     let tx = Arc::new(Mutex::new(Vec::new()));
     let transport = SourceExactPassiveTransport::new(
@@ -2608,6 +2632,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             ring_cidx: 0,
             ring_didx: 0,
             descriptor_done: false,
+            snapshot_order: None,
+            snapshot_generation: None,
         },
         capability,
     )
@@ -4564,6 +4590,7 @@ fn run() -> Result<(), String> {
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
+                                fw_snapshot_generation: None,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4638,6 +4665,7 @@ fn run() -> Result<(), String> {
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
+                                fw_snapshot_generation: None,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -7401,8 +7429,8 @@ const DATA_RX_IRQ_BIT: u32 = 1 << 2;
 const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
 const PASSIVE_MAC_BAR_PAGES: [usize; 13] = [
-    0x08000, 0x09000, 0x0c000, 0x0f000, 0x21000, 0x23000, 0x24000, 0x34000,
-    0x38000, 0x39000, 0xa1000, 0xa3000, 0xa4000,
+    0x08000, 0x09000, 0x0c000, 0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0x38000, 0x39000,
+    0xa1000, 0xa3000, 0xa4000,
 ];
 
 const fn firmware_bootstrap_rx_irq_mask() -> u32 {
@@ -7475,6 +7503,25 @@ fn passive_mac_address_allowed(address: u32) -> bool {
                 address: expected, ..
             } => *expected == address,
         })
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn firmware_snapshot_address_allowed(address: u32) -> bool {
+    (0x820d_8100..0x820d_8200).contains(&address)
+        || (0x820d_9300..0x820d_9400).contains(&address)
+        || (0x820d_4000..0x820d_4400).contains(&address)
+        || (0x820c_0000..0x820c_1200).contains(&address)
+        || (0x820c_8000..0x820c_8400).contains(&address)
+        || (0x820e_4000..0x820e_4400).contains(&address)
+        || (0x820e_5000..0x820e_5500).contains(&address)
+        || (0x820e_d000..0x820e_d800).contains(&address)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn diagnostic_liveness(value: u32) -> Result<(), String> {
+    (value != u32::MAX)
+        .then_some(())
+        .ok_or_else(|| "known-good BAR liveness read returned all ones".into())
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8979,6 +9026,22 @@ impl PassiveMacExecutor<'_> {
         self.page(address)?.read_passive_mac(address)
     }
 
+    fn read_firmware_snapshot_raw(&self, address: u32) -> Result<u32, String> {
+        if !firmware_snapshot_address_allowed(address) {
+            return Err(format!(
+                "firmware snapshot read {address:#010x} escaped exact allowlist"
+            ));
+        }
+        let offset = passive_mac_read_bar_offset(address)?;
+        let page = self.page(address)?;
+        if page.bar_page != offset & !(PAGE - 1) {
+            return Err(format!(
+                "firmware snapshot read {address:#010x} used wrong fixed BAR page"
+            ));
+        }
+        page.read(offset)
+    }
+
     fn write(&self, address: u32, value: u32) -> Result<(), String> {
         self.page(address)?.write_passive_mac(address, value)
     }
@@ -10398,6 +10461,11 @@ impl Mt7921ClientEffects for LiveClientEffects {
         record_sae_stage(
             "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
         );
+        if let Err(status) = io.diagnostic_association_snapshot(generation) {
+            record_sae_stage(&format!(
+                "fw_state_diagnostic result=failed generation={generation} status={status}"
+            ));
+        }
         Ok(())
     }
     fn clear_association(
@@ -10912,6 +10980,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     tx_completions: Vec<MgmtTxCompletion>,
     mgmt_tx_outstanding: MgmtTxOutstanding,
     e2e81_probe_done: bool,
+    fw_snapshot_generation: Option<u64>,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -10938,37 +11007,87 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
-    fn firmware_owned_snapshot(&self) {
+    fn firmware_owned_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
+        if self.fw_snapshot_generation == Some(generation) {
+            return Ok(());
+        }
+        self.fw_snapshot_generation = Some(generation);
         let mac = PassiveMacExecutor {
             pages: self.mac_pages,
         };
-        record_sae_stage("fw_state_begin point=before_wcid1_probe wcid=1");
+        let liveness = mac.read(0x820e_5000).map_err(|error| {
+            record_sae_stage(&format!(
+                "fw_state_error stage=liveness addr=0x820e5000 reason={error}"
+            ));
+            zx::Status::IO
+        })?;
+        diagnostic_liveness(liveness).map_err(|error| {
+            record_sae_stage(&format!(
+                "fw_state_error stage=liveness addr=0x820e5000 reason={error}"
+            ));
+            zx::Status::IO
+        })?;
+        record_sae_stage(&format!(
+            "fw_state_begin point=post_assoc_before_first_eapol generation={generation} wcid=1"
+        ));
         for (base, bytes, name) in [
             (0x820d_8100, 0x100, "wtbl_peer1"),
             (0x820d_9300, 0x100, "wtbl_interface19"),
             (0x820d_4000, 0x400, "wtblon"),
             (0x820c_0000, 0x1200, "ple"),
             (0x820c_8000, 0x400, "pse"),
-            (0x820e_4000, 0x400, "tmac0"),
-            (0x820e_5000, 0x500, "rmac0"),
-            (0x820e_d000, 0x800, "mib0"),
         ] {
             for offset in (0..bytes).step_by(4) {
                 let address = base + offset;
-                let value = mac.read(address).unwrap_or(u32::MAX);
+                let value = mac.read_firmware_snapshot_raw(address).map_err(|error| {
+                    record_sae_stage(&format!(
+                        "fw_state_error region={name} offset={offset:#x} addr={address:#x} reason={error}"
+                    ));
+                    zx::Status::IO
+                })?;
                 record_sae_stage(&format!(
                     "fw_state region={name} offset={offset:#x} addr={address:#x} value={value:08x}"
                 ));
             }
         }
         for offset in (0..0x100).step_by(4) {
-            let value = self.dmashdl.read(0xd6000 + offset).unwrap_or(u32::MAX);
+            let value = self
+                .dmashdl
+                .read_firmware_snapshot_dmashdl_raw(0xd6000 + offset)
+                .map_err(|error| {
+                record_sae_stage(&format!(
+                    "fw_state_error region=dmashdl offset={offset:#x} addr={:#x} reason={error}",
+                    0x7c02_6000 + offset
+                ));
+                zx::Status::IO
+            })?;
             record_sae_stage(&format!(
                 "fw_state region=dmashdl offset={offset:#x} addr={:#x} value={value:08x}",
                 0x7c02_6000 + offset
             ));
         }
-        record_sae_stage("fw_state_end point=before_wcid1_probe wcid=1");
+        for (base, bytes, name) in [
+            (0x820e_4000, 0x400, "tmac0"),
+            (0x820e_5000, 0x500, "rmac0"),
+            (0x820e_d000, 0x800, "mib0"),
+        ] {
+            for offset in (0..bytes).step_by(4) {
+                let address = base + offset;
+                let value = mac.read_firmware_snapshot_raw(address).map_err(|error| {
+                    record_sae_stage(&format!(
+                        "fw_state_error region={name} offset={offset:#x} addr={address:#x} reason={error}"
+                    ));
+                    zx::Status::IO
+                })?;
+                record_sae_stage(&format!(
+                    "fw_state region={name} offset={offset:#x} addr={address:#x} value={value:08x}"
+                ));
+            }
+        }
+        record_sae_stage(&format!(
+            "fw_state_end point=post_assoc_before_first_eapol generation={generation} wcid=1 count=2944"
+        ));
+        Ok(())
     }
 
     fn e2e81_snapshot(&self, phase: &str) {
@@ -11526,6 +11645,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
 impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
+    fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
+        self.firmware_owned_snapshot(generation)
+    }
+
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
         if expected_cid == 3
             && let Some(wcid) = encoded
@@ -11785,7 +11908,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 frame.extend_from_slice(&[0, 0, tid, 0]);
                 frame
             };
-            self.firmware_owned_snapshot();
             self.e2e81_snapshot("immediately_before_BE");
             let be = self
                 .e2e81_submit_wait("A_tid0_be_qidx1", &make_null(0))
@@ -12495,6 +12617,13 @@ impl ReadPage {
             #[cfg(not(test))]
             unreachable!()
         }
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    fn read_firmware_snapshot_dmashdl_raw(&self, offset: usize) -> Result<u32, String> {
+        if self.bar_page != 0xd6000 || !(0xd6000..0xd6100).contains(&offset) || offset % 4 != 0 {
+            return Err("firmware snapshot DMASHDL read escaped exact allowlist".into());
+        }
+        self.read(offset)
     }
     fn write_clear_own(&self) -> Result<(), String> {
         let offset = ReadRegister::ConnOnLowPowerControl.bar_offset();

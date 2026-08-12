@@ -107,6 +107,9 @@ pub struct ClientRxSecurity {
 pub trait Mt7921ClientIo {
     fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status>;
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
+    fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
+    }
     fn transmit_client(
         &mut self,
         bytes: &[u8],
@@ -419,6 +422,9 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.submit_client_edca(encoded))
     }
+    fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.diagnostic_association_snapshot(generation))
+    }
     fn transmit_client(
         &mut self,
         bytes: &[u8],
@@ -672,8 +678,9 @@ where
                 },
             ),
         );
-        let mlme_timers =
-            Box::pin(wlan_mlme::common::timer::make_async_timed_event_stream(mlme_timer_stream));
+        let mlme_timers = Box::pin(wlan_mlme::common::timer::make_async_timed_event_stream(
+            mlme_timer_stream,
+        ));
         let timer_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -782,8 +789,7 @@ where
     async fn pump_once(&mut self) -> Result<bool, PinnedConnectError> {
         const CONTROL_BUDGET: usize = 64;
 
-        let (mut progressed, mut control_quiescent) =
-            self.drain_control(CONTROL_BUDGET).await?;
+        let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
 
         if let Some(action) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
@@ -1401,8 +1407,8 @@ mod tests {
         let mut request = open_connect_request();
         request.bss_description.capability_info = 0x11;
         request.bss_description.ies = vec![
-            0, 4, b't', b'e', b's', b't', 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1,
-            0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+            0, 4, b't', b'e', b's', b't', 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+            0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
         ];
         request.authentication = fidl_fuchsia_wlan_internal::Authentication {
             protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa2Personal,
@@ -1424,15 +1430,19 @@ mod tests {
         bytes.extend_from_slice(&[0x11; 32]);
         bytes.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
         bytes.extend_from_slice(&[0, 0]);
-        ClientRxFrame { bytes, status: rx_status(-30), security: None }
+        ClientRxFrame {
+            bytes,
+            status: rx_status(-30),
+            security: None,
+        }
     }
 
     fn wpa2_association_response() -> ClientRxFrame {
         open_response(
             0x01,
             &[
-                1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
-                0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+                1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f,
+                0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
             ],
         )
     }
@@ -2326,9 +2336,13 @@ mod tests {
                         primary_channels: Some(vec![channel(36)]),
                         ..Default::default()
                     }]);
-                let (device, runner) =
-                    Mt7921ClientDevice::new(effects, passive, device_support);
-                runner.backend.lock().unwrap().authorization.authorize_scan();
+                let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
+                runner
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .authorization
+                    .authorize_scan();
                 let support_info = support();
                 PinnedClientRuntime::new(
                     device,
@@ -2380,17 +2394,24 @@ mod tests {
                 .nth(2)
                 .unwrap()
                 .0;
-            assert!(association < third_rx, "M1 dequeued before association activation");
+            assert!(
+                association < third_rx,
+                "M1 dequeued before association activation"
+            );
             assert!(backend.effects.frames.iter().any(|frame| {
-                frame.get(..2).is_some_and(|fc| {
-                    u16::from_le_bytes([fc[0], fc[1]]) & 0x000c == 0x0008
-                }) && frame.windows(8).any(|window| {
-                    window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]
-                })
+                frame
+                    .get(..2)
+                    .is_some_and(|fc| u16::from_le_bytes([fc[0], fc[1]]) & 0x000c == 0x0008)
+                    && frame
+                        .windows(8)
+                        .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
             }));
             drop(backend);
 
-            let mut effects = FakeEffects { fail_on: Some("association"), ..Default::default() };
+            let mut effects = FakeEffects {
+                fail_on: Some("association"),
+                ..Default::default()
+            };
             effects.rx.extend([
                 open_response(0x0b, &[0, 0, 2, 0, 0, 0]),
                 wpa2_association_response(),
@@ -2403,12 +2424,20 @@ mod tests {
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
                 .await;
-            assert!(failure.is_err(), "association activation failure must be terminal");
+            assert!(
+                failure.is_err(),
+                "association activation failure must be terminal"
+            );
             let backend = failed.runner.backend.lock().unwrap();
             assert_eq!(backend.effects.rx_dequeued, 2);
-            assert_eq!(backend.effects.rx.len(), 1, "queued M1 carrier was consumed");
+            assert_eq!(
+                backend.effects.rx.len(),
+                1,
+                "queued M1 carrier was consumed"
+            );
             assert!(!backend.effects.frames.iter().any(|frame| {
-                frame.windows(8)
+                frame
+                    .windows(8)
                     .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
             }));
         });
@@ -2418,7 +2447,9 @@ mod tests {
     fn pinned_runtime_drives_comeback_timer_and_disconnect_cancels_it() {
         futures::executor::block_on(async {
             let mut effects = FakeEffects::default();
-            effects.rx.push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
+            effects
+                .rx
+                .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
             effects.rx.push_back(open_response(
                 0x01,
                 &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
@@ -2442,7 +2473,12 @@ mod tests {
                 ..Default::default()
             }]);
             let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-            runner.backend.lock().unwrap().authorization.authorize_scan();
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             let backend = Arc::clone(&runner.backend);
             let support_info = support();
             let mut runtime = PinnedClientRuntime::new(
@@ -2469,7 +2505,10 @@ mod tests {
                             return;
                         }
                     }
-                    assert!(std::time::Instant::now() < deadline, "association retry not emitted");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "association retry not emitted"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             });
@@ -2497,7 +2536,9 @@ mod tests {
             drop(backend);
 
             let mut effects = FakeEffects::default();
-            effects.rx.push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
+            effects
+                .rx
+                .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
             effects.rx.push_back(open_response(
                 0x01,
                 &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
@@ -2520,7 +2561,12 @@ mod tests {
                 ..Default::default()
             }]);
             let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-            runner.backend.lock().unwrap().authorization.authorize_scan();
+            runner
+                .backend
+                .lock()
+                .unwrap()
+                .authorization
+                .authorize_scan();
             let support_info = support();
             let mut canceled = PinnedClientRuntime::new(
                 device,
@@ -2540,7 +2586,10 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(canceled.runner.backend.lock().unwrap().effects.frames.len(), 2);
+            assert_eq!(
+                canceled.runner.backend.lock().unwrap().effects.frames.len(),
+                2
+            );
             canceled.sme.on_disconnect_command(
                 fidl_sme::UserDisconnectReason::WlanSmeUnitTesting,
                 Default::default(),
