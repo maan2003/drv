@@ -2702,3 +2702,29 @@ route, and gateway connectivity recovered on `wlan14` in 6197 ms, and an
 HTTPS probe succeeded. Lab state was absent, watchdog and test units were
 inactive, the boot ID was unchanged, and the corrected Nix closure remained
 active.
+
+The captured Linux post-association tail was then reproduced as the exact
+ordered sequence BCNFT (CID 2, acknowledged), SET_RXFILTER (CE CID 0x0a,
+DMA-consumption completion with no firmware ACK), and RLM (CID 2,
+acknowledged). The data gate remains closed through the interface-WCID and
+first two BSS updates, opening only after the RLM ACK. Exact command goldens,
+the full 123-test core suite and doctests, locked/offline release build,
+self-test trace, and sterile no-hardware CLI gate passed.
+
+Exactly one guarded E2E89 run used matching local, staged, and active release
+SHA-256 `f5334223b93432b07d4ad814c8be0931e3906f191a4deadcdab77a6ffeddc3f2`.
+Its durable report is
+`/var/lib/wifi-driver-lab/reports/20260812T182053Z-0000_05_00.0.log`.
+The associated peer CID3 ACK, interface-WCID update, BCNFT ACK, and
+SET_RXFILTER publication all retained peer WTBL DW5 `0x32000c27`; the RLM ACK
+changed it to `0x32000427`, which remained exact immediately before data.
+
+The exact pre-data and named-field gates therefore admitted one TID-0,
+BE/QIDX1, normal-rate-control QoS Null publication. Its DMA payload remained
+unchanged, and TX-free reported it dropped after 15 firmware attempts. No
+EAPOL, VO variant, or second probe was published by E2E89. The subsequent
+connect path failed closed, and cleanup reported a BSS-disable response-status
+mismatch before reset containment. `RESTORE end failed=0`; native `mt7921e`,
+iwd, and the boot ID recovered unchanged. The lab was idle and not
+quarantined, and the reboot watchdog was disarmed without a reboot. No retry
+was made.
