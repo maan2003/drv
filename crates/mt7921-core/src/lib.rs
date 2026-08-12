@@ -5159,8 +5159,8 @@ fn encode_legacy_wme_wcid_command(
     expanded.extend_from_slice(&[9, 0, 8, 0, ht[0], ht[1], 0, 0]);
     if let Some(vht) = vht_cap {
         expanded.extend_from_slice(&[
-            10, 0, 16, 0, vht[0], vht[1], vht[2], vht[3], vht[4], vht[5], vht[8], vht[9],
-            0, 0, 0, 0,
+            10, 0, 16, 0, vht[0], vht[1], vht[2], vht[3], vht[4], vht[5], vht[8], vht[9], 0, 0, 0,
+            0,
         ]);
     }
     let max_mpdu = vht_cap.is_some_and(|vht| vht[0] & 3 >= 1) || ht[1] & 0x08 != 0;
@@ -5182,7 +5182,10 @@ fn encode_legacy_wme_wcid_command(
             .count()
             .max(1) as u8
     } else {
-        ht[3..13].iter().rposition(|mask| *mask != 0).map_or(1, |i| i + 1) as u8
+        ht[3..13]
+            .iter()
+            .rposition(|mask| *mask != 0)
+            .map_or(1, |i| i + 1) as u8
     };
     expanded[state_start + 9] = bandwidth | (nss - 1) << 4;
 
@@ -5225,8 +5228,7 @@ fn encode_legacy_wme_wcid_command(
     let smps = u8::from(ht[0] >> 2 & 3 == 1);
     expanded.extend_from_slice(&[13, 0, 8, 0, smps, 0, 0, 0]);
     let wtbl_len = (expanded.len() - wtbl_start) as u16;
-    expanded[wtbl_start + 2..wtbl_start + 4]
-        .copy_from_slice(&wtbl_len.to_le_bytes());
+    expanded[wtbl_start + 2..wtbl_start + 4].copy_from_slice(&wtbl_len.to_le_bytes());
     expanded[wtbl_start + 6..wtbl_start + 8].copy_from_slice(&nested.to_le_bytes());
     expanded[50..52].copy_from_slice(&(8u16 - u16::from(vht_cap.is_none())).to_le_bytes());
     let total = expanded.len() as u16;
@@ -5380,8 +5382,7 @@ pub fn encode_client_bss_command(
     payload[30..32].copy_from_slice(&19u16.to_le_bytes());
     // mt76_connac_get_phy_mode_v2(..., link_sta=NULL) uses the local
     // MT7921 band capabilities, not the single legacy rate selected for TX.
-    payload[32..34]
-        .copy_from_slice(&(if channel <= 14 { 0x53u16 } else { 0x78u16 }).to_le_bytes());
+    payload[32..34].copy_from_slice(&(if channel <= 14 { 0x53u16 } else { 0x78u16 }).to_le_bytes());
     payload[40..42].copy_from_slice(&15u16.to_le_bytes());
     payload[42..44].copy_from_slice(&8u16.to_le_bytes());
     payload[44] = u8::from(qos);
@@ -5474,6 +5475,74 @@ pub fn encode_ptk_command(
     encode_key_v2_command(sequence, bss_index, peer_wcid, 0, 0, key, None)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientWcid(u8);
+
+impl ClientWcid {
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for ClientWcid {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        (1..19)
+            .contains(&value)
+            .then_some(Self(value))
+            .ok_or("peer WCID is reserved or out of range".into())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ClientWcidAllocator {
+    occupied: [bool; 20],
+}
+
+impl Default for ClientWcidAllocator {
+    fn default() -> Self {
+        let mut occupied = [false; 20];
+        // WCID 0 belongs to the first interface and 19 is the reserved
+        // interface/BMC entry in the MT7921 client topology.
+        occupied[0] = true;
+        occupied[19] = true;
+        Self { occupied }
+    }
+}
+
+impl ClientWcidAllocator {
+    pub fn reserve_peer(&mut self, wcid: ClientWcid) -> Result<(), String> {
+        let index = usize::from(wcid.get());
+        if self.occupied[index] {
+            return Err("peer WCID is already occupied".into());
+        }
+        self.occupied[index] = true;
+        Ok(())
+    }
+
+    pub fn allocate_peer(&mut self) -> Result<ClientWcid, String> {
+        let index = (1..19)
+            .find(|&index| !self.occupied[index])
+            .ok_or("no free peer WCID")?;
+        self.occupied[index] = true;
+        Ok(ClientWcid(index as u8))
+    }
+
+    pub fn release_peer(&mut self, wcid: ClientWcid) -> Result<(), String> {
+        let index = usize::from(wcid.0);
+        if !(1..19).contains(&index) || !self.occupied[index] {
+            return Err("peer WCID release is stale or reserved".into());
+        }
+        self.occupied[index] = false;
+        Ok(())
+    }
+
+    pub fn owns(&self, wcid: ClientWcid) -> bool {
+        self.occupied[usize::from(wcid.0)]
+    }
+}
+
 pub fn encode_gtk_command(
     sequence: u8,
     bss_index: u8,
@@ -5511,7 +5580,7 @@ pub fn encode_igtk_command(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyWmeAssociation {
     pub bss_index: u8,
-    pub peer_wcid: u8,
+    pub peer_wcid: ClientWcid,
     pub aid: u16,
     pub peer: [u8; 6],
     pub rcpi: u8,
@@ -5923,6 +5992,12 @@ pub fn encode_client_data_txwi(
     Ok(bytes)
 }
 
+pub fn set_client_txwi_wcid(txwi: &mut [u8; 64], wcid: ClientWcid) {
+    let mut txd1 = u32::from_le_bytes(txwi[4..8].try_into().unwrap());
+    txd1 = (txd1 & !0x3ff) | u32::from(wcid.get());
+    txwi[4..8].copy_from_slice(&txd1.to_le_bytes());
+}
+
 /// Independent port of Linux v7.1's mac80211 control-port preparation and
 /// `mt76_connac2_mac_write_txwi` for the one pre-key QoS EAPOL shape used by
 /// the physical client.  This deliberately does not call the production
@@ -6088,23 +6163,44 @@ pub struct ClientFirmwareEffectsState {
     pub outstanding_tx: Vec<(u16, ClientDataGeneration)>,
     pub ptk_rx_pn: Option<[u64; 16]>,
     pub gtk_rx_pn: Option<(u8, [u64; 16])>,
+    pub wcid_allocator: ClientWcidAllocator,
+    allocated_peer_wcid: Option<ClientWcid>,
 }
 
 impl ClientFirmwareEffectsState {
+    pub fn allocate_peer_wcid(&mut self) -> Result<ClientWcid, String> {
+        if self.allocated_peer_wcid.is_some()
+            || self.preauth_peer.is_some()
+            || self.association.is_some()
+        {
+            return Err("peer WCID already allocated".into());
+        }
+        let wcid = self.wcid_allocator.allocate_peer()?;
+        self.allocated_peer_wcid = Some(wcid);
+        Ok(wcid)
+    }
+
+    fn release_allocated_peer(&mut self, wcid: ClientWcid) -> Result<(), String> {
+        if self.allocated_peer_wcid == Some(wcid) {
+            self.wcid_allocator.release_peer(wcid)?;
+            self.allocated_peer_wcid = None;
+        }
+        Ok(())
+    }
     pub fn program_edca(
         &mut self,
         params: ClientEdcaParameters,
         mut submit: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
-        let association = self.association.ok_or("EDCA requires an ACKed association")?;
-        if !association.negotiated_qos || self.edca_programmed.is_some() || self.firmware_uncertain {
+        let association = self
+            .association
+            .ok_or("EDCA requires an ACKed association")?;
+        if !association.negotiated_qos || self.edca_programmed.is_some() || self.firmware_uncertain
+        {
             return Err("EDCA state is not clean negotiated QoS".into());
         }
-        let command = encode_client_edca_command(
-            self.next_sequence(),
-            association.bss_index,
-            params,
-        )?;
+        let command =
+            encode_client_edca_command(self.next_sequence(), association.bss_index, params)?;
         self.firmware_uncertain = true;
         submit(&command)?;
         self.edca_programmed = Some(params);
@@ -6115,7 +6211,9 @@ impl ClientFirmwareEffectsState {
     pub fn qos_tx_ready(&self) -> bool {
         self.bss_programmed
             && self.post_assoc_interface_programmed
-            && (self.association.is_some_and(|association| !association.negotiated_qos)
+            && (self
+                .association
+                .is_some_and(|association| !association.negotiated_qos)
                 || self.edca_programmed.is_some())
     }
 
@@ -6237,7 +6335,7 @@ impl ClientFirmwareEffectsState {
         let command = encode_preauth_peer_wcid_command(
             self.next_sequence(),
             peer.bss_index,
-            peer.peer_wcid,
+            peer.peer_wcid.get(),
             peer.peer,
             peer.rcpi,
         )?;
@@ -6246,13 +6344,16 @@ impl ClientFirmwareEffectsState {
             let rollback = encode_remove_wcid_command(
                 self.next_sequence(),
                 peer.bss_index,
-                peer.peer_wcid,
+                peer.peer_wcid.get(),
                 0,
                 joined.bssid,
                 false,
             )
             .and_then(|command| submit(3, &command));
             self.firmware_uncertain = rollback.is_err();
+            if rollback.is_ok() {
+                self.release_allocated_peer(peer.peer_wcid)?;
+            }
             return Err(format!(
                 "preauth WCID add failed: {error}; rollback_wcid={rollback:?}"
             ));
@@ -6327,7 +6428,7 @@ impl ClientFirmwareEffectsState {
         let command = encode_legacy_wme_add_wcid_command(
             self.next_sequence(),
             association.bss_index,
-            association.peer_wcid,
+            association.peer_wcid.get(),
             association.aid,
             association.peer,
             association.rcpi,
@@ -6342,7 +6443,7 @@ impl ClientFirmwareEffectsState {
             let rollback_wcid = encode_remove_wcid_command(
                 self.next_sequence(),
                 association.bss_index,
-                association.peer_wcid,
+                association.peer_wcid.get(),
                 association.aid,
                 association.peer,
                 association.negotiated_qos,
@@ -6364,6 +6465,7 @@ impl ClientFirmwareEffectsState {
             }
             if rollback_wcid.is_ok() {
                 self.preauth_peer = None;
+                self.release_allocated_peer(association.peer_wcid)?;
             }
             self.firmware_uncertain = rollback_wcid.is_err() || rollback_bss.is_err();
             return Err(format!(
@@ -6389,7 +6491,7 @@ impl ClientFirmwareEffectsState {
         let command = encode_ptk_command(
             self.next_sequence(),
             association.bss_index,
-            association.peer_wcid,
+            association.peer_wcid.get(),
             key,
         )?;
         // A timeout can hide a successful firmware install. Record the
@@ -6534,7 +6636,10 @@ impl ClientFirmwareEffectsState {
     pub fn deliver_rx(&mut self, rx: ClientRxCandidate) -> Result<(), String> {
         let pre_key_eapol = rx.eapol && rx.wcid == 1023 && rx.security_mode == 0;
         if self.tx_generation(rx.eapol)? != rx.generation
-            || (rx.wcid != 7 && !pre_key_eapol)
+            || (self
+                .association
+                .is_none_or(|association| rx.wcid != u16::from(association.peer_wcid.get()))
+                && !pre_key_eapol)
             || rx.tid >= 16
         {
             return Err("stale or foreign client RX".into());
@@ -6568,10 +6673,7 @@ impl ClientFirmwareEffectsState {
         Ok(())
     }
 
-    pub fn deliver_protected_management_rx(
-        &mut self,
-        rx: ClientRxCandidate,
-    ) -> Result<(), String> {
+    pub fn deliver_protected_management_rx(&mut self, rx: ClientRxCandidate) -> Result<(), String> {
         let association = self
             .association
             .ok_or("protected management RX lacks association")?;
@@ -6585,7 +6687,7 @@ impl ClientFirmwareEffectsState {
             || self.firmware_uncertain
             || rx.eapol
             || rx.group
-            || rx.wcid != u16::from(association.peer_wcid)
+            || rx.wcid != u16::from(association.peer_wcid.get())
             || rx.tid >= 16
             || rx.key_id != 0
         {
@@ -6634,7 +6736,7 @@ impl ClientFirmwareEffectsState {
                 encode_remove_wcid_command(
                     self.next_sequence(),
                     preauth.bss_index,
-                    preauth.peer_wcid,
+                    preauth.peer_wcid.get(),
                     0,
                     preauth.peer,
                     false,
@@ -6645,6 +6747,7 @@ impl ClientFirmwareEffectsState {
                     format!("client firmware preauth WCID teardown failed: {error}")
                 })?;
                 self.preauth_peer = None;
+                self.release_allocated_peer(preauth.peer_wcid)?;
             }
             if self.bss_programmed {
                 let joined = self.joined.ok_or("programmed BSS lost its join binding")?;
@@ -6690,7 +6793,7 @@ impl ClientFirmwareEffectsState {
             encode_disable_keys_command(
                 self.next_sequence(),
                 association.bss_index,
-                association.peer_wcid,
+                association.peer_wcid.get(),
                 0,
             )
             .and_then(|command| submit(3, command.as_bytes()))
@@ -6705,7 +6808,7 @@ impl ClientFirmwareEffectsState {
         encode_remove_wcid_command(
             self.next_sequence(),
             association.bss_index,
-            association.peer_wcid,
+            association.peer_wcid.get(),
             association.aid,
             association.peer,
             association.negotiated_qos,
@@ -6734,6 +6837,7 @@ impl ClientFirmwareEffectsState {
         self.bss_binding = None;
         self.preauth_peer = None;
         self.association = None;
+        self.release_allocated_peer(association.peer_wcid)?;
         self.joined = None;
         self.association_generation = None;
         self.firmware_uncertain = false;
@@ -8079,6 +8183,21 @@ mod tests {
     }
 
     #[test]
+    fn client_wcid_allocator_is_first_free_and_rejects_collisions() {
+        let mut allocator = ClientWcidAllocator::default();
+        let one = ClientWcid::try_from(1).unwrap();
+        let three = ClientWcid::try_from(3).unwrap();
+        allocator.reserve_peer(one).unwrap();
+        allocator.reserve_peer(three).unwrap();
+        assert!(allocator.reserve_peer(one).is_err());
+        assert_eq!(allocator.allocate_peer().unwrap().get(), 2);
+        allocator.release_peer(one).unwrap();
+        assert_eq!(allocator.allocate_peer().unwrap(), one);
+        assert!(ClientWcid::try_from(0).is_err());
+        assert!(ClientWcid::try_from(19).is_err());
+    }
+
+    #[test]
     fn preassociation_sae_classifier_is_narrow_and_bounded() {
         let client = [1, 2, 3, 4, 5, 6];
         let peer = [6, 5, 4, 3, 2, 1];
@@ -8155,9 +8274,9 @@ mod tests {
     #[test]
     fn client_join_association_and_teardown_match_linux_v71_bss_wcid_order() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
-        let association = LegacyWmeAssociation {
+        let mut association = LegacyWmeAssociation {
             bss_index: 0,
-            peer_wcid: 7,
+            peer_wcid: ClientWcid(7),
             aid: 42,
             peer,
             rcpi: 100,
@@ -8170,6 +8289,9 @@ mod tests {
             mfp_required: false,
         };
         let mut state = ClientFirmwareEffectsState::default();
+        association.peer_wcid = state.allocate_peer_wcid().unwrap();
+        assert_eq!(association.peer_wcid.get(), 1);
+        assert!(state.allocate_peer_wcid().is_err());
         let mut channels = ClientChannelContext::default();
         let physical = ClientPhysicalChannel {
             band: 1,
@@ -8225,10 +8347,34 @@ mod tests {
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
-                ClientEdcaAc { cw_min: 3, cw_max: 7, txop: 47, aifs: 2, acm: false },
-                ClientEdcaAc { cw_min: 7, cw_max: 15, txop: 94, aifs: 2, acm: false },
-                ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 3, acm: false },
-                ClientEdcaAc { cw_min: 15, cw_max: 1023, txop: 0, aifs: 7, acm: false },
+                ClientEdcaAc {
+                    cw_min: 3,
+                    cw_max: 7,
+                    txop: 47,
+                    aifs: 2,
+                    acm: false,
+                },
+                ClientEdcaAc {
+                    cw_min: 7,
+                    cw_max: 15,
+                    txop: 94,
+                    aifs: 2,
+                    acm: false,
+                },
+                ClientEdcaAc {
+                    cw_min: 15,
+                    cw_max: 1023,
+                    txop: 0,
+                    aifs: 3,
+                    acm: false,
+                },
+                ClientEdcaAc {
+                    cw_min: 15,
+                    cw_max: 1023,
+                    txop: 0,
+                    aifs: 7,
+                    acm: false,
+                },
             ],
         };
         let mut edca_command = Vec::new();
@@ -8269,6 +8415,7 @@ mod tests {
             [3, 2, 3, 3, 3, 2]
         );
         let preauth_add = &transcript[0];
+        assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
         assert_eq!(&preauth_add[68..74], &peer);
         assert_eq!(
@@ -8283,14 +8430,22 @@ mod tests {
         let interface_assoc = &transcript[3];
         assert_eq!(interface_assoc.len(), 108);
         assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
-        assert_eq!(&interface_assoc[56..68], &[13, 0, 52, 0, 19, 1, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &interface_assoc[56..68],
+            &[13, 0, 52, 0, 19, 1, 3, 0, 0, 0, 0, 0]
+        );
         assert_eq!(&interface_assoc[72..78], &peer);
         assert_eq!(interface_assoc[78], 0x0e);
-        assert_eq!(&interface_assoc[88..100], &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            &interface_assoc[88..100],
+            &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
+        );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
         assert_eq!(transcript[5][56], 0);
+        assert_eq!(transcript[4][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
+        assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);
     }
 
     #[test]
@@ -8298,7 +8453,7 @@ mod tests {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let association = LegacyWmeAssociation {
             bss_index: 0,
-            peer_wcid: 7,
+            peer_wcid: ClientWcid(7),
             aid: 42,
             peer,
             rcpi: 100,
@@ -8597,17 +8752,12 @@ mod tests {
     #[test]
     fn independent_linux_qos_control_port_transcript_matches_e2e75() {
         let mpdu = [
-            0x88, 0x01, 0, 0, 2, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 1, 0x80, 0xc2, 0, 0, 3,
-            0, 0, 7, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0,
+            0x88, 0x01, 0, 0, 2, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 1, 0x80, 0xc2, 0, 0, 3, 0, 0, 7,
+            0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e, 1, 1, 0, 0,
         ];
-        let reference =
-            linux_qos_eapol_control_port_reference(&mpdu, 0x1234_5000, 4, 7).unwrap();
+        let reference = linux_qos_eapol_control_port_reference(&mpdu, 0x1234_5000, 4, 7).unwrap();
         let dword = |index: usize| {
-            u32::from_le_bytes(
-                reference[index * 4..index * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            )
+            u32::from_le_bytes(reference[index * 4..index * 4 + 4].try_into().unwrap())
         };
         assert_eq!(
             (0..8).map(dword).collect::<Vec<_>>(),
@@ -8623,10 +8773,7 @@ mod tests {
             ]
         );
         assert_eq!(&reference[32..40], &[4, 0x80, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(
-            &reference[40..48],
-            &[0, 0x50, 0x34, 0x12, 0x26, 0x80, 0, 0]
-        );
+        assert_eq!(&reference[40..48], &[0, 0x50, 0x34, 0x12, 0x26, 0x80, 0, 0]);
         // Normal QoS control-port sequence is owned by mac80211 in the MPDU;
         // TXD3's SN_VALID and SEQ fields are both clear.
         assert_eq!(u16::from_le_bytes(mpdu[22..24].try_into().unwrap()), 0);
@@ -8816,11 +8963,25 @@ mod tests {
         assert_eq!(encoded.len(), 232);
         assert_eq!(u16::from_le_bytes(encoded[50..52].try_into().unwrap()), 8);
         assert_eq!(&encoded[76..84], &[9, 0, 8, 0, 0xf3, 0x09, 0, 0]);
-        assert_eq!(&encoded[84..100], &[10, 0, 16, 0, 0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0]);
+        assert_eq!(
+            &encoded[84..100],
+            &[
+                10, 0, 16, 0, 0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0
+            ]
+        );
         assert_eq!(&encoded[100..108], &[15, 0, 8, 0, 8, 1, 1, 0]);
-        assert_eq!(&encoded[108..120], &[21, 0, 12, 0, 0x15, 0, 0x38, 3, 0, 100, 0, 0]);
-        assert_eq!(&encoded[120..136], &[1, 0, 16, 0, 0xc0, 0x3f, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&encoded[136..148], &[7, 0, 12, 0, 0, 0, 0, 0, 2, 0x12, 0, 0]);
+        assert_eq!(
+            &encoded[108..120],
+            &[21, 0, 12, 0, 0x15, 0, 0x38, 3, 0, 100, 0, 0]
+        );
+        assert_eq!(
+            &encoded[120..136],
+            &[1, 0, 16, 0, 0xc0, 0x3f, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            &encoded[136..148],
+            &[7, 0, 12, 0, 0, 0, 0, 0, 2, 0x12, 0, 0]
+        );
         assert_eq!(&encoded[148..160], &[13, 0, 84, 0, 7, 1, 6, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[200..212], &[2, 0, 12, 0, 1, 1, 3, 0, 0, 0, 0, 0]);
         assert_eq!(&encoded[212..224], &[3, 0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0]);
@@ -9179,8 +9340,7 @@ mod tests {
         txs[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes());
         assert_eq!(parse_mt7921_tx_status(&txs).unwrap().acked, false);
         for status in 1..=3u32 {
-            free[8..12]
-                .copy_from_slice(&((7u32 << 16) | (status << 13) | 15).to_le_bytes());
+            free[8..12].copy_from_slice(&((7u32 << 16) | (status << 13) | 15).to_le_bytes());
             let parsed = parse_mt7921_tx_free(&free).unwrap();
             assert_eq!((parsed.status, parsed.attempts), (status as u8, 15));
             assert_eq!(parsed.info_word, (7 << 16) | (status << 13) | 15);
