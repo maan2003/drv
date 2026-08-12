@@ -1090,6 +1090,7 @@ fn run_contained_dma_resource_round_trip(
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                             e2e81_probe_done: false,
                             fw_snapshot_generation: None,
+                            stable_mac_watcher: None,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -2945,13 +2946,30 @@ fn run() -> Result<(), String> {
         Ok(_) => return Err("DRV_DMASHDL_TRANSITION_DIAGNOSTIC must equal 1".into()),
         Err(error) => return Err(format!("read DMASHDL diagnostic mode: {error}")),
     };
+    let stable_mac_transition_diagnostic = match env::var("DRV_STABLE_MAC_TRANSITION_DIAGNOSTIC") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("DRV_STABLE_MAC_TRANSITION_DIAGNOSTIC must equal 1".into()),
+        Err(error) => return Err(format!("read stable-MAC diagnostic mode: {error}")),
+    };
     #[cfg(feature = "fuchsia-passive")]
     if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
         return Err("DMASHDL transition diagnostic requires the pinned SAE lifecycle".into());
     }
+    #[cfg(feature = "fuchsia-passive")]
+    if stable_mac_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
+        return Err("stable-MAC transition diagnostic requires the pinned SAE lifecycle".into());
+    }
+    if dmashdl_transition_diagnostic && stable_mac_transition_diagnostic {
+        return Err("DMASHDL and stable-MAC diagnostics are mutually exclusive".into());
+    }
     #[cfg(not(feature = "fuchsia-passive"))]
     if dmashdl_transition_diagnostic {
         return Err("DMASHDL transition diagnostic requires fuchsia-passive".into());
+    }
+    #[cfg(not(feature = "fuchsia-passive"))]
+    if stable_mac_transition_diagnostic {
+        return Err("stable-MAC transition diagnostic requires fuchsia-passive".into());
     }
     #[cfg(feature = "fuchsia-passive")]
     let contained_passive_channel = if operation == Operation::RunOneShotPassiveChannel1 {
@@ -4739,7 +4757,7 @@ fn run() -> Result<(), String> {
                                     RunPhase::DmaAndResponseIrqEnabled,
                                     RunPhase::FirmwareReady,
                                 )?;
-                            let mechanics = VfioPassiveMechanics {
+                            let mut mechanics = VfioPassiveMechanics {
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -4764,10 +4782,14 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
+                                stable_mac_watcher: stable_mac_transition_diagnostic.then(Vec::new),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
                             };
+                            mechanics
+                                .observe_stable_mac("diagnostic_seed")
+                                .map_err(|status| format!("seed stable-MAC watcher: {status}"))?;
                             let mut transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
@@ -4814,7 +4836,7 @@ fn run() -> Result<(), String> {
                                     RunPhase::DmaAndResponseIrqEnabled,
                                     RunPhase::FirmwareReady,
                                 )?;
-                            let mechanics = VfioPassiveMechanics {
+                            let mut mechanics = VfioPassiveMechanics {
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -4839,10 +4861,14 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
+                                stable_mac_watcher: stable_mac_transition_diagnostic.then(Vec::new),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
                             };
+                            mechanics
+                                .observe_stable_mac("diagnostic_seed")
+                                .map_err(|status| format!("seed stable-MAC watcher: {status}"))?;
                             let transport =
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
@@ -11301,6 +11327,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mgmt_tx_outstanding: MgmtTxOutstanding,
     e2e81_probe_done: bool,
     fw_snapshot_generation: Option<u64>,
+    stable_mac_watcher: Option<Vec<(u32, u32)>>,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -11327,6 +11354,54 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
+    fn observe_stable_mac(&mut self, preceded_by: &str) -> Result<bool, zx::Status> {
+        let Some(before) = self.stable_mac_watcher.as_mut() else {
+            return Ok(false);
+        };
+        let mut rows = vec![(0x820e_40c0, 0), (0x820e_40c4, 0)];
+        rows.extend(
+            (0x140..=0x1e0)
+                .step_by(4)
+                .map(|offset| (0x820e_4000 + offset, 0)),
+        );
+        rows.extend(
+            [
+                0x024, 0x04c, 0x07c, 0x0b8, 0x0bc, 0x180, 0x1a4, 0x1a8, 0x204, 0x208, 0x20c, 0x210,
+            ]
+            .into_iter()
+            .map(|offset| (0x820e_5000 + offset, 0)),
+        );
+        let mac = PassiveMacExecutor {
+            pages: self.mac_pages,
+        };
+        for (address, value) in &mut rows {
+            *value = mac
+                .read_firmware_snapshot_raw(*address)
+                .map_err(|_| zx::Status::IO)?;
+        }
+        if before.is_empty() {
+            *before = rows;
+            record_sae_stage("stable_mac_watcher seeded=true rows=55 raw_values=omitted");
+            return Ok(false);
+        }
+        for ((address, old), (_, value)) in before.iter().zip(&rows) {
+            if old != value {
+                let (region, offset) = if *address < 0x820e_5000 {
+                    ("tmac0", address - 0x820e_4000)
+                } else {
+                    ("rmac0", address - 0x820e_5000)
+                };
+                record_sae_stage(&format!(
+                    "stable_mac_transition region={region} offset={offset:#x} changed_mask={:08x} preceded_by={preceded_by} raw_values=omitted",
+                    old ^ value
+                ));
+                return Ok(true);
+            }
+        }
+        *before = rows;
+        Ok(false)
+    }
+
     fn firmware_owned_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         if self.fw_snapshot_generation == Some(generation) {
             return Ok(());
@@ -12148,6 +12223,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::IO);
         }
         preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        if self.observe_stable_mac(&format!("uni_cid_{expected_cid}"))? {
+            record_sae_stage(
+                "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
+            );
+            return Err(zx::Status::CANCELED);
+        }
         let mac = PassiveMacExecutor {
             pages: self.mac_pages,
         };
@@ -12229,6 +12310,17 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "wmm_edca_transport completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux",
         );
+        if self.stable_mac_watcher.is_some() {
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if self.observe_stable_mac("set_edca_parms")? {
+                    record_sae_stage(
+                        "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
+                    );
+                    return Err(zx::Status::CANCELED);
+                }
+            }
+        }
         PassiveMacExecutor {
             pages: self.mac_pages,
         }
@@ -12256,6 +12348,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "post_assoc_rx_filter result=published dma_didx_consumed=true firmware_ack=not_requested_linux",
         );
+        if self.observe_stable_mac("ce_set_rx_path")? {
+            record_sae_stage(
+                "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
+            );
+            return Err(zx::Status::CANCELED);
+        }
         PassiveMacExecutor {
             pages: self.mac_pages,
         }
