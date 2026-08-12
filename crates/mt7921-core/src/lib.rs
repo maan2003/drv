@@ -5946,17 +5946,28 @@ pub fn linux_qos_null_probe_reference(
     token: u16,
     pid: u8,
 ) -> Result<[u8; 64], String> {
+    linux_qos_null_probe_reference_for_tid(mpdu, payload_iova, token, pid, 7)
+}
+
+pub fn linux_qos_null_probe_reference_for_tid(
+    mpdu: &[u8],
+    payload_iova: u64,
+    token: u16,
+    pid: u8,
+    tid: u8,
+) -> Result<[u8; 64], String> {
     if mpdu.len() != 26
         || u16::from_le_bytes(mpdu[0..2].try_into().unwrap()) != 0x01c8
         || mpdu[4] & 1 != 0
-        || mpdu[24] & 15 != 7
+        || mpdu[24] & 15 != tid
+        || !matches!(tid, 0 | 7)
     {
-        return Err("Linux QoS-null reference requires an awake unicast TID7 probe".into());
+        return Err("Linux QoS-null reference requires an awake unicast TID0/TID7 probe".into());
     }
     let mut bytes = [0u8; 64];
     let words = [
-        0x0600_003a,
-        0x8072_6807,
+        if tid == 0 { 0x0200_003a } else { 0x0600_003a },
+        0x8002_6807 | u32::from(tid) << 20,
         0x8000_202c,
         0x1000_7800,
         0,
@@ -8552,6 +8563,21 @@ mod tests {
             &encoded[32..46],
             &[3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x34, 0x12, 0x1a, 0x80]
         );
+    }
+
+    #[test]
+    fn independent_linux_qos_null_be_and_vo_queue_goldens_are_exact() {
+        let mut frame = [0u8; 26];
+        frame[..2].copy_from_slice(&0x01c8u16.to_le_bytes());
+        frame[4] = 2;
+        let be = linux_qos_null_probe_reference_for_tid(&frame, 0x1234_5000, 3, 6, 0).unwrap();
+        frame[24] = 7;
+        let vo = linux_qos_null_probe_reference_for_tid(&frame, 0x1234_5000, 4, 7, 7).unwrap();
+        let word = |bytes: &[u8; 64], index: usize| {
+            u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!((word(&be, 0), word(&be, 1)), (0x0200_003a, 0x8002_6807));
+        assert_eq!((word(&vo, 0), word(&vo, 1)), (0x0600_003a, 0x8072_6807));
     }
 
     #[test]
