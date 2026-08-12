@@ -60,15 +60,15 @@ use mt7921_port_spike::{
     encode_client_data_txwi, encode_client_edca_command, encode_client_interface_commands,
     encode_client_management_tx, encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
-    encode_client_post_assoc_rx_filter_command, encode_disable_keys_command, encode_gtk_command,
-    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
-    encode_pse_reg_read_command, encode_ptk_command, encode_remove_wcid_command,
-    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
-    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
-    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, parse_pse_reg_read_response,
-    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    set_client_txwi_wcid, validate_passive_mac_bar_read,
+    encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
+    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
+    encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
+    encode_remove_wcid_command, linux_legacy_rate_context_reference,
+    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
+    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
+    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
+    parse_pse_reg_read_response, passive_mac_bar_offset, passive_mac_mmio_plan,
+    passive_mac_source_rmw_value, set_client_txwi_wcid, validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -8328,6 +8328,15 @@ impl VfioFirmwareLoader<'_> {
         Ok(())
     }
 
+    fn clear_client_rx_filter(&mut self) -> Result<(), String> {
+        let clear = encode_client_post_assoc_rx_filter_clear_command(1)?;
+        self.send_client_ce_no_ack_bytes(&clear, 0x0a, 132)?;
+        record_sae_stage(
+            "post_assoc_rx_filter_clear result=published dma_didx_consumed=true firmware_ack=not_requested_linux cleanup=universal",
+        );
+        Ok(())
+    }
+
     fn ensure_mcu_tx_allowed(&self) -> Result<(), String> {
         if self.uni_terminal_poisoned {
             Err("MCU TX transport is terminally poisoned; containment required".into())
@@ -9096,6 +9105,12 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         // connect succeeded, failed, reset, or stopped. Disable firmware's BSS
         // before DEV while command/RX transport is still live; ambiguity is
         // retained as a cleanup error and contained by the mandatory reset.
+        #[cfg(feature = "fuchsia-passive")]
+        if self.client_interface.is_some()
+            && let Err(error) = self.clear_client_rx_filter()
+        {
+            errors.push(format!("client RX-filter teardown: {error}"));
+        }
         #[cfg(feature = "fuchsia-passive")]
         if let Err(error) = self.disable_client_interface() {
             errors.push(format!("client interface teardown: {error}"));
@@ -16767,6 +16782,25 @@ mod tests {
         for forbidden in ["OpenOptions", "File::", "sync_all", "SAE_STAGE_PATH"] {
             assert!(!recorder.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn universal_cleanup_clears_rx_filter_before_client_contexts_and_dma() {
+        let source = include_str!("vfio_read.rs");
+        let cleanup = source
+            .split("fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState)")
+            .nth(1)
+            .unwrap()
+            .split("impl std::fmt::Display for PhysicalPassiveError")
+            .next()
+            .unwrap();
+        let clear = cleanup.find("self.clear_client_rx_filter()").unwrap();
+        let interface = cleanup.find("self.disable_client_interface()").unwrap();
+        let dma = cleanup
+            .find("write_active_wfdma(0xd4208, disabled)")
+            .unwrap();
+        assert!(clear < interface && interface < dma);
+        assert!(cleanup[..clear].contains("self.client_interface.is_some()"));
     }
 
     #[test]
