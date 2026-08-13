@@ -11481,28 +11481,26 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             record_sae_stage("stable_mac_watcher seeded=true rows=55 raw_values=omitted");
             return Ok(false);
         }
-        let changed = watcher
-            .before
-            .iter()
-            .zip(&rows)
-            .find_map(|((address, old), (_, value))| {
-                (old != value).then_some((*address, old ^ value))
-            });
-        watcher.before = rows;
-        if let Some((address, changed_mask)) = changed {
-            let (region, offset) = if address < 0x820e_5000 {
-                ("tmac0", address - 0x820e_4000)
+        let mut changed = false;
+        for ((address, old), (_, value)) in watcher.before.iter().zip(&rows) {
+            if old == value {
+                continue;
+            }
+            changed = true;
+            let changed_mask = old ^ value;
+            let (region, offset) = if *address < 0x820e_5000 {
+                ("tmac0", *address - 0x820e_4000)
             } else {
-                ("rmac0", address - 0x820e_5000)
+                ("rmac0", *address - 0x820e_5000)
             };
             record_sae_stage(&format!(
                 "stable_mac_transition region={region} offset={offset:#x} changed_mask={changed_mask:08x} preceded_by={preceded_by} raw_values=omitted",
             ));
             watcher.transitioned = true;
             watcher.tmac_transitioned |= region == "tmac0";
-            return Ok(true);
         }
-        Ok(false)
+        watcher.before = rows;
+        Ok(changed)
     }
 
     fn firmware_owned_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
@@ -12469,7 +12467,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "post_assoc_rx_filter result=published dma_didx_consumed=true firmware_ack=not_requested_linux",
         );
-        if self.observe_stable_mac("ce_set_rx_path")?
+        if self.observe_stable_mac("ce_set_rx_filter")?
             && self
                 .stable_mac_watcher
                 .as_ref()
@@ -12832,6 +12830,23 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         self.loader
             .send_passive_command(command, encoded, wait_response)
             .map_err(PhysicalPassiveError)?;
+        if self
+            .observe_stable_mac(&format!("passive_{command:?}"))
+            .map_err(|status| {
+                PhysicalPassiveError(format!("observe passive command TMAC boundary: {status}"))
+            })?
+            && self
+                .stable_mac_watcher
+                .as_ref()
+                .is_some_and(|watcher| watcher.stop_on_transition)
+        {
+            record_sae_stage(
+                "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
+            );
+            return Err(PhysicalPassiveError(
+                "stable MAC transition diagnostic completed".into(),
+            ));
+        }
         if matches!(command, PassiveMcuCommand::StartScan { .. }) {
             self.scan_started = Some(Instant::now());
         }

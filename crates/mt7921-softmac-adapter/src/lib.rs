@@ -439,7 +439,15 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             self.issue(PassiveMcuCommand::ProtectCtrl)?;
             self.issue(PassiveMcuCommand::MacEnable)?;
             self.issue(PassiveMcuCommand::SetRxPath {
-                channel,
+                // Linux starts the PHY with mac80211's initial 2.4 GHz
+                // channel definition, then applies the requested channel
+                // through CHANNEL_SWITCH.  Do not fold the first requested
+                // scan/association channel into this one-time RX-path setup.
+                channel: CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 1,
+                    frequency_mhz: 2412,
+                },
                 antenna_mask: self.antenna_mask,
             })?;
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
@@ -1538,6 +1546,17 @@ mod tests {
         assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
         assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
         assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
+        assert!(matches!(
+            commands[3].0,
+            PassiveMcuCommand::SetRxPath {
+                channel: CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 1,
+                    frequency_mhz: 2412,
+                },
+                antenna_mask: 3,
+            }
+        ));
         assert!(matches!(commands[4].0, PassiveMcuCommand::AddDevice { .. }));
         assert!(matches!(commands[5].0, PassiveMcuCommand::AddBss));
         assert!(matches!(

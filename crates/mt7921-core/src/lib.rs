@@ -12043,6 +12043,16 @@ mod tests {
         let eeprom = encode_passive_mcu_command(&PassiveMcuCommand::EepromBufferMode, 1).unwrap();
         assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 1, 1, 0, 0x21, 0, 1]);
         assert_eq!(&eeprom[64..], &[1, 0, 0, 0]);
+        let rx_path = encode_passive_mcu_command(
+            &PassiveMcuCommand::SetRxPath {
+                channel,
+                antenna_mask: 3,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(&rx_path[36..44], &[0xed, 0xa0, 1, 2, 0, 0x4e, 0, 1]);
+        assert_eq!(&rx_path[64..75], &[1, 1, 0, 2, 3, 0, 0, 0, 0, 0, 0]);
         let switch = encode_passive_mcu_command(
             &PassiveMcuCommand::ChannelSwitch {
                 channel,
@@ -12051,10 +12061,10 @@ mod tests {
                 center_channel2: 0,
                 antenna_mask: 3,
             },
-            2,
+            3,
         )
         .unwrap();
-        assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 2, 0, 8, 0, 1]);
+        assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 3, 0, 8, 0, 1]);
         assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
         let channel36 = CandidateChannel {
             band: PhysicalBand::Ghz5,
