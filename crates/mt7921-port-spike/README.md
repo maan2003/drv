@@ -2731,6 +2731,24 @@ was made.
 
 ### Prepared normal full-firmware one-frame validation
 
+An offline-only reserved-layout package refresh from source commit
+`42a6bf89ecbb77f7635eac2c92027076893976f5` produced package
+`/nix/store/86hysa95ifkyy2mvz1hjlwjvpz4h7kwr-mt7921-full-firmware-validation-0.1.0`
+and manifest
+`/nix/store/vn4884kbzslcgal45xzpdhr6sjx4ly6a-mt7921-full-firmware-validation-manifest`.
+The manifest SHA-256 is
+`134e68c7b4323c1aff695fb8c42cd13d9b3b66e54622389dac954ea7fa853ac2`;
+it records launcher SHA-256
+`2b8fa42829391e4f6f6d0c5a5ada91730efe350e7a79cec825df7c82819e95ac`,
+allowlisted ELF SHA-256
+`10bcc31232b99bde01efcf07772b8db9f3ebe9286513948f477f46ea812152f2`,
+and sorted closure SHA-256
+`8dbf376e64a9bd83eade1fe7cffdff55fca37e1068f3d53c84c8395ab4b1213b`.
+The package install check and its contiguous rate-power delivery self-test
+passed without opening hardware. This refresh changes only source-exact SKU
+serialization: the project safety cap still applies to named rate fields,
+while 5-GHz CCK and the eight VHT reserved entries remain `127`.
+
 The semaphore-order fix is packaged for a single normal-operation validation
 without authorizing a radio run. Commit `b16d2489852f60de8edb121d484d4fdc4057d28a`
 produced package
