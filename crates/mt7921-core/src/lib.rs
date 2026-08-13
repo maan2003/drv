@@ -4257,6 +4257,77 @@ pub const MT7921_MGMT_TXWI_BYTES: usize = 64;
 pub const MT7921_SKU_RATE_COUNT: usize = 161;
 pub const MT7921_PSE_BASE: u32 = 0x820c_8000;
 
+const RATE_POWER_CHANNELS_2GHZ: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const RATE_POWER_CHANNELS_5GHZ: &[u16] = &[
+    36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110, 112,
+    114, 116, 118, 120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151, 153, 155,
+    157, 159, 161, 165, 169, 173, 177,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegulatoryRatePowerChannel {
+    pub band: PhysicalBand,
+    pub channel: u16,
+    pub frequency_mhz: u16,
+    pub present: bool,
+    pub disabled: bool,
+    /// None is only valid for a missing or disabled channel.
+    pub max_reg_power_dbm: Option<i8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SarFrequencyRange {
+    pub start_mhz: u16,
+    pub end_mhz: u16,
+    pub max_power_half_dbm: i8,
+}
+
+/// One immutable input generation for an entire SET_RATE_TX_POWER transaction.
+/// Empty `sar_ranges` means that the platform supplied no additional SAR
+/// limit; it never means a zero-power limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegulatoryRatePowerSnapshot {
+    generation: u64,
+    alpha2: [u8; 2],
+    channels: Vec<RegulatoryRatePowerChannel>,
+    sar_ranges: Vec<SarFrequencyRange>,
+    external_cap_half_dbm: Option<i8>,
+}
+
+impl RegulatoryRatePowerSnapshot {
+    pub fn new(
+        generation: u64,
+        alpha2: [u8; 2],
+        channels: Vec<RegulatoryRatePowerChannel>,
+        sar_ranges: Vec<SarFrequencyRange>,
+        external_cap_half_dbm: Option<i8>,
+    ) -> Self {
+        Self {
+            generation,
+            alpha2,
+            channels,
+            sar_ranges,
+            external_cap_half_dbm,
+        }
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub const fn alpha2(&self) -> [u8; 2] {
+        self.alpha2
+    }
+    pub fn channels(&self) -> &[RegulatoryRatePowerChannel] {
+        &self.channels
+    }
+    pub fn sar_ranges(&self) -> &[SarFrequencyRange] {
+        &self.sar_ranges
+    }
+    pub const fn external_cap_half_dbm(&self) -> Option<i8> {
+        self.external_cap_half_dbm
+    }
+}
+
 pub fn encode_pse_reg_read_command(sequence: u8) -> Result<Vec<u8>, RateTxPowerError> {
     if sequence == 0 || sequence > 15 {
         return Err(RateTxPowerError::InvalidSequence);
@@ -4323,6 +4394,11 @@ pub enum RateTxPowerError {
     InvalidSequence,
     Unsupported6Ghz,
     InvalidPseResponse,
+    StaleSnapshot,
+    IncompleteSnapshot,
+    DuplicateChannel,
+    InvalidChannelFrequency,
+    InvalidSarRange,
 }
 
 pub trait RateTxPowerTransport {
@@ -4394,14 +4470,72 @@ impl RateTxPowerAuthorizer {
         Ok(authorization)
     }
 
+    pub fn submit_snapshot<T: RateTxPowerTransport>(
+        &mut self,
+        transport: &mut T,
+        capability: NicCapability,
+        snapshot: &RegulatoryRatePowerSnapshot,
+        first_sequence: u8,
+    ) -> Result<RateTxPowerAuthorization, RateTxPowerInstallError<T::Error>> {
+        // A replacement attempt revokes prior authority before validation or
+        // page one. Any partial transport failure therefore leaves no permit.
+        self.authorization = None;
+        if snapshot.alpha2 != self.alpha2 {
+            return Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::NonWorldDomain,
+            ));
+        }
+        let commands = encode_regulatory_rate_tx_power_commands(
+            capability,
+            snapshot,
+            self.generation,
+            first_sequence,
+        )
+        .map_err(RateTxPowerInstallError::Encode)?;
+        // No transport call occurs until the complete immutable generation has
+        // encoded successfully. Pages then remain contiguous by construction.
+        for (index, command) in commands.iter().enumerate() {
+            transport.send_and_wait_consumed(command).map_err(|error| {
+                RateTxPowerInstallError::Transport {
+                    command: index as u8,
+                    error,
+                }
+            })?;
+        }
+        let owner_id = *self
+            .owner_id
+            .get_or_insert_with(next_rate_power_authorizer_id);
+        let authorization = RateTxPowerAuthorization {
+            owner_id,
+            generation: self.generation,
+            alpha2: self.alpha2,
+            // Generic snapshots are channel-specific. This legacy private
+            // field is not authority; retain the initialized Linux ceiling.
+            target_half_dbm: 127,
+        };
+        self.authorization = Some(RateTxPowerAuthorization {
+            owner_id: authorization.owner_id,
+            generation: authorization.generation,
+            alpha2: authorization.alpha2,
+            target_half_dbm: authorization.target_half_dbm,
+        });
+        Ok(authorization)
+    }
+
     pub fn set_regulatory_domain(&mut self, alpha2: [u8; 2]) {
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("rate-power generation exhausted");
         self.alpha2 = alpha2;
         self.authorization = None;
     }
 
     pub fn reset(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("rate-power generation exhausted");
         self.authorization = None;
     }
 
@@ -4452,6 +4586,196 @@ fn submit_conservative_rate_tx_power<T: RateTxPowerTransport>(
                     .expect("encoder required safety cap"),
             ),
     })
+}
+
+fn expected_rate_power_channels(
+    capability: NicCapability,
+) -> Result<Vec<(PhysicalBand, u16)>, RateTxPowerError> {
+    let phy = capability
+        .phy
+        .ok_or(RateTxPowerError::MissingBandCapabilities)?;
+    if capability.has_6ghz != Some(false) {
+        return Err(RateTxPowerError::Unsupported6Ghz);
+    }
+    let mut channels = RATE_POWER_CHANNELS_2GHZ
+        .iter()
+        .copied()
+        .map(|channel| (PhysicalBand::Ghz2, channel))
+        .collect::<Vec<_>>();
+    if phy.has_5ghz {
+        channels.extend(
+            RATE_POWER_CHANNELS_5GHZ
+                .iter()
+                .copied()
+                .map(|channel| (PhysicalBand::Ghz5, channel)),
+        );
+    }
+    Ok(channels)
+}
+
+/// Complete firmware-emitted channel skeleton. Adapter/regulatory owners fill
+/// presence, disabled state, and power without duplicating the MT7921 table.
+pub fn regulatory_rate_power_channel_skeleton(
+    capability: NicCapability,
+) -> Result<Vec<RegulatoryRatePowerChannel>, RateTxPowerError> {
+    expected_rate_power_channels(capability)?
+        .into_iter()
+        .map(|(band, channel)| {
+            Ok(RegulatoryRatePowerChannel {
+                band,
+                channel,
+                frequency_mhz: rate_power_frequency(band, channel)
+                    .ok_or(RateTxPowerError::InvalidChannelFrequency)?,
+                present: false,
+                disabled: false,
+                max_reg_power_dbm: None,
+            })
+        })
+        .collect()
+}
+
+fn rate_power_frequency(band: PhysicalBand, channel: u16) -> Option<u16> {
+    match band {
+        PhysicalBand::Ghz2 if channel == 14 => Some(2484),
+        PhysicalBand::Ghz2 => 2407u16.checked_add(channel.checked_mul(5)?),
+        PhysicalBand::Ghz5 => 5000u16.checked_add(channel.checked_mul(5)?),
+        PhysicalBand::Ghz6 => None,
+    }
+}
+
+fn validate_rate_power_snapshot(
+    capability: NicCapability,
+    snapshot: &RegulatoryRatePowerSnapshot,
+    expected_generation: u64,
+) -> Result<Vec<(PhysicalBand, u16)>, RateTxPowerError> {
+    if snapshot.generation != expected_generation {
+        return Err(RateTxPowerError::StaleSnapshot);
+    }
+    if snapshot.alpha2 != *b"00" {
+        return Err(RateTxPowerError::NonWorldDomain);
+    }
+    let expected = expected_rate_power_channels(capability)?;
+    if snapshot.channels.len() != expected.len() {
+        return Err(RateTxPowerError::IncompleteSnapshot);
+    }
+    for &(band, channel) in &expected {
+        let mut matching = snapshot
+            .channels
+            .iter()
+            .filter(|input| input.band == band && input.channel == channel);
+        let input = matching
+            .next()
+            .ok_or(RateTxPowerError::IncompleteSnapshot)?;
+        if matching.next().is_some() {
+            return Err(RateTxPowerError::DuplicateChannel);
+        }
+        if rate_power_frequency(band, channel) != Some(input.frequency_mhz) {
+            return Err(RateTxPowerError::InvalidChannelFrequency);
+        }
+        if input.present
+            && !input.disabled
+            && !input
+                .max_reg_power_dbm
+                .is_some_and(|power| (0..=63).contains(&power))
+        {
+            return Err(RateTxPowerError::InvalidRegulatoryLimit);
+        }
+    }
+    let mut previous_start = None;
+    for range in &snapshot.sar_ranges {
+        if range.start_mhz >= range.end_mhz
+            || previous_start.is_some_and(|start| range.start_mhz < start)
+        {
+            return Err(RateTxPowerError::InvalidSarRange);
+        }
+        previous_start = Some(range.start_mhz);
+    }
+    Ok(expected)
+}
+
+fn snapshot_channel_target(
+    input: &RegulatoryRatePowerChannel,
+    snapshot: &RegulatoryRatePowerSnapshot,
+) -> i8 {
+    if !input.present || input.disabled {
+        return 127;
+    }
+    let mut target = input
+        .max_reg_power_dbm
+        .expect("validated present channel has regulatory power")
+        * 2;
+    if let Some(range) = snapshot
+        .sar_ranges
+        .iter()
+        .find(|range| range.start_mhz <= input.frequency_mhz && input.frequency_mhz < range.end_mhz)
+    {
+        target = target.min(range.max_power_half_dbm);
+    }
+    if let Some(cap) = snapshot.external_cap_half_dbm {
+        target = target.min(cap);
+    }
+    target
+}
+
+/// Encode Linux's no-device-tree-override rate-power construction from one
+/// complete, generation-bound regulatory/SAR snapshot. The whole command set
+/// is encoded before publication so later source changes cannot split an
+/// eight-page transaction across generations.
+pub fn encode_regulatory_rate_tx_power_commands(
+    capability: NicCapability,
+    snapshot: &RegulatoryRatePowerSnapshot,
+    expected_generation: u64,
+    first_sequence: u8,
+) -> Result<Vec<Vec<u8>>, RateTxPowerError> {
+    let expected = validate_rate_power_snapshot(capability, snapshot, expected_generation)?;
+    let command_count = expected.len().div_ceil(8);
+    if first_sequence == 0 || usize::from(first_sequence) + command_count - 1 > 15 {
+        return Err(RateTxPowerError::InvalidSequence);
+    }
+    let mut commands = Vec::with_capacity(command_count);
+    let mut offset = 0;
+    while offset < expected.len() {
+        let band = expected[offset].0;
+        let band_end = expected[offset..]
+            .iter()
+            .position(|(candidate, _)| *candidate != band)
+            .map_or(expected.len(), |length| offset + length);
+        for batch in expected[offset..band_end].chunks(8) {
+            let request_length = 44 + batch.len() * (1 + MT7921_SKU_RATE_COUNT);
+            let total = CONNAC2_MCU_TXD_BYTES + request_length;
+            let mut bytes = vec![0u8; total];
+            bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+            bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+            bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+            bytes[34..36].copy_from_slice(&0x8000u16.to_le_bytes());
+            bytes[36..40].copy_from_slice(&[0x5d, 0xa0, 1, first_sequence + commands.len() as u8]);
+            let request = &mut bytes[CONNAC2_MCU_TXD_BYTES..];
+            request[4] = batch.len() as u8;
+            let band_id = match band {
+                PhysicalBand::Ghz2 => 1,
+                PhysicalBand::Ghz5 => 2,
+                PhysicalBand::Ghz6 => unreachable!(),
+            };
+            request[5] = band_id;
+            request[6] = u8::from(band_end == expected.len() && batch.last() == expected.last());
+            request[8..10].copy_from_slice(&snapshot.alpha2);
+            for (index, &(entry_band, channel)) in batch.iter().enumerate() {
+                let input = snapshot
+                    .channels
+                    .iter()
+                    .find(|input| input.band == entry_band && input.channel == channel)
+                    .expect("validated complete snapshot");
+                let target = snapshot_channel_target(input, snapshot);
+                let entry_offset = 44 + index * (1 + MT7921_SKU_RATE_COUNT);
+                request[entry_offset] = channel as u8;
+                request[entry_offset + 1..entry_offset + 1 + MT7921_SKU_RATE_COUNT]
+                    .copy_from_slice(&mt7921_uniform_rate_power_sku(band_id, target));
+            }
+            commands.push(bytes);
+        }
+        offset = band_end;
+    }
+    Ok(commands)
 }
 
 /// Encode pinned Connac2 `MCU_CE_CMD(SET_RATE_TX_POWER)` batches. This narrow
@@ -8886,27 +9210,34 @@ mod tests {
             chip_capability: None,
             unknown_elements: 0,
         };
-        let limits = ConservativePowerLimits {
-            alpha2: *b"00",
-            max_reg_power_dbm: 20,
-            sar_limit_half_dbm: Some(40),
-            external_safety_cap_half_dbm: Some(40),
-        };
-        let mut native = encode_conservative_rate_tx_power_commands(capability, limits, 4).unwrap();
         // These runtime-oracle table entries had no registered channel, so
         // Linux retained its initial 127 ceiling for all 161 entries.
         const ABSENT_5GHZ: &[u8] = &[
             38, 42, 46, 50, 54, 58, 62, 102, 106, 110, 114, 118, 122, 126, 134, 138, 142, 151, 155,
             159, 169, 173, 177,
         ];
-        let mut records = 0;
-        for command in &mut native {
-            let request = &mut command[CONNAC2_MCU_TXD_BYTES..];
-            let band = request[5];
-            for entry in request[44..].chunks_exact_mut(1 + MT7921_SKU_RATE_COUNT) {
-                if band == 2 && ABSENT_5GHZ.contains(&entry[0]) {
-                    entry[1..].copy_from_slice(&absent_channel);
+        let channels = expected_rate_power_channels(capability)
+            .unwrap()
+            .into_iter()
+            .map(|(band, channel)| {
+                let present = band == PhysicalBand::Ghz2 || !ABSENT_5GHZ.contains(&(channel as u8));
+                RegulatoryRatePowerChannel {
+                    band,
+                    channel,
+                    frequency_mhz: rate_power_frequency(band, channel).unwrap(),
+                    present,
+                    disabled: false,
+                    max_reg_power_dbm: present.then_some(20),
                 }
+            })
+            .collect();
+        let snapshot = RegulatoryRatePowerSnapshot::new(0, *b"00", channels, Vec::new(), None);
+        let native = encode_regulatory_rate_tx_power_commands(capability, &snapshot, 0, 4).unwrap();
+        let mut records = 0;
+        for command in &native {
+            let request = &command[CONNAC2_MCU_TXD_BYTES..];
+            let band = request[5];
+            for entry in request[44..].chunks_exact(1 + MT7921_SKU_RATE_COUNT) {
                 let expected = if band == 1 {
                     &two_ghz
                 } else if ABSENT_5GHZ.contains(&entry[0]) {
@@ -8951,8 +9282,10 @@ mod tests {
         let userspace = encode_conservative_rate_tx_power_commands(
             capability,
             ConservativePowerLimits {
+                alpha2: *b"00",
+                max_reg_power_dbm: 20,
+                sar_limit_half_dbm: Some(40),
                 external_safety_cap_half_dbm: Some(0),
-                ..limits
             },
             1,
         )
@@ -8964,6 +9297,155 @@ mod tests {
             userspace_header[39] = 0;
             assert_eq!(native_header, userspace_header);
         }
+    }
+
+    #[test]
+    fn regulatory_rate_power_snapshot_applies_linux_limits_and_fails_closed() {
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 15,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let channels = expected_rate_power_channels(capability)
+            .unwrap()
+            .into_iter()
+            .map(|(band, channel)| RegulatoryRatePowerChannel {
+                band,
+                channel,
+                frequency_mhz: rate_power_frequency(band, channel).unwrap(),
+                present: true,
+                disabled: false,
+                max_reg_power_dbm: Some(18),
+            })
+            .collect::<Vec<_>>();
+        let mut snapshot = RegulatoryRatePowerSnapshot::new(
+            7,
+            *b"00",
+            channels,
+            vec![
+                SarFrequencyRange {
+                    start_mhz: 2400,
+                    end_mhz: 2500,
+                    max_power_half_dbm: 30,
+                },
+                // Deliberate overlap: Linux uses the first ordered match.
+                SarFrequencyRange {
+                    start_mhz: 2450,
+                    end_mhz: 5900,
+                    max_power_half_dbm: 24,
+                },
+            ],
+            Some(28),
+        );
+        let commands =
+            encode_regulatory_rate_tx_power_commands(capability, &snapshot, 7, 1).unwrap();
+        struct CountTransport(usize);
+        impl RateTxPowerTransport for CountTransport {
+            type Error = ();
+            fn send_and_wait_consumed(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+                self.0 += 1;
+                Ok(())
+            }
+        }
+        let mut stale_transport = CountTransport(0);
+        assert_eq!(
+            RateTxPowerAuthorizer::new().submit_snapshot(
+                &mut stale_transport,
+                capability,
+                &snapshot,
+                1,
+            ),
+            Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::StaleSnapshot
+            ))
+        );
+        assert_eq!(stale_transport.0, 0);
+        let records = commands
+            .iter()
+            .flat_map(|command| {
+                let request = &command[CONNAC2_MCU_TXD_BYTES..];
+                request[44..]
+                    .chunks_exact(1 + MT7921_SKU_RATE_COUNT)
+                    .map(move |entry| (request[5], entry))
+            })
+            .collect::<Vec<_>>();
+        let channel_1 = records
+            .iter()
+            .find(|(band, entry)| *band == 1 && entry[0] == 1)
+            .unwrap()
+            .1;
+        assert_eq!(&channel_1[1..], &mt7921_uniform_rate_power_sku(1, 28));
+        let channel_11 = records
+            .iter()
+            .find(|(band, entry)| *band == 1 && entry[0] == 11)
+            .unwrap()
+            .1;
+        assert_eq!(&channel_11[1..], &mt7921_uniform_rate_power_sku(1, 28));
+        let channel_36 = records
+            .iter()
+            .find(|(band, entry)| *band == 2 && entry[0] == 36)
+            .unwrap()
+            .1;
+        // Only the second range matches at 5180 MHz.
+        assert_eq!(&channel_36[1..], &mt7921_uniform_rate_power_sku(2, 24));
+        assert_eq!(&channel_36[1..5], &[127, 127, 127, 127]);
+        for nss in 0..4 {
+            assert_eq!(
+                &channel_36[1 + 39 + nss * 12..1 + 41 + nss * 12],
+                &[127, 127]
+            );
+        }
+
+        snapshot.sar_ranges = vec![SarFrequencyRange {
+            start_mhz: 6000,
+            end_mhz: 6100,
+            max_power_half_dbm: 2,
+        }];
+        snapshot.external_cap_half_dbm = None;
+        let no_sar = encode_regulatory_rate_tx_power_commands(capability, &snapshot, 7, 1).unwrap();
+        let request = &no_sar[0][CONNAC2_MCU_TXD_BYTES..];
+        assert_eq!(
+            &request[45..45 + MT7921_SKU_RATE_COUNT],
+            &mt7921_uniform_rate_power_sku(1, 36)
+        );
+
+        snapshot.channels[0].present = false;
+        snapshot.channels[0].max_reg_power_dbm = None;
+        snapshot.channels[1].disabled = true;
+        snapshot.channels[1].max_reg_power_dbm = None;
+        let unavailable =
+            encode_regulatory_rate_tx_power_commands(capability, &snapshot, 7, 1).unwrap();
+        let request = &unavailable[0][CONNAC2_MCU_TXD_BYTES..];
+        assert_eq!(
+            &request[45..45 + MT7921_SKU_RATE_COUNT],
+            &[127; MT7921_SKU_RATE_COUNT]
+        );
+        let second = 44 + 1 + MT7921_SKU_RATE_COUNT;
+        assert_eq!(
+            &request[second + 1..second + 1 + MT7921_SKU_RATE_COUNT],
+            &[127; MT7921_SKU_RATE_COUNT]
+        );
+
+        assert_eq!(
+            encode_regulatory_rate_tx_power_commands(capability, &snapshot, 8, 1),
+            Err(RateTxPowerError::StaleSnapshot)
+        );
+        snapshot.channels.pop();
+        assert_eq!(
+            encode_regulatory_rate_tx_power_commands(capability, &snapshot, 7, 1),
+            Err(RateTxPowerError::IncompleteSnapshot)
+        );
     }
 
     #[test]

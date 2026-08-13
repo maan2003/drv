@@ -29,23 +29,23 @@ use mt7921_port_spike::{
     CONNAC2_MCU_TXD_BYTES, ClientChannelContext, ClientDataGeneration, ClientEdcaAc,
     ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
-    ClientWcid, ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation,
-    PassiveMcuCommand, PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport,
-    candidate_channels, classify_preassociation_sae_auth, connac2_group1_pn,
-    encode_client_bss_command, encode_client_data_txwi, encode_client_early_edca_command,
-    encode_client_edca_command, encode_client_interface_commands, encode_client_management_tx,
+    ClientWcid, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
+    RateTxPowerAuthorizer, RateTxPowerTransport, RegulatoryRatePowerSnapshot, candidate_channels,
+    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
+    encode_client_data_txwi, encode_client_early_edca_command, encode_client_edca_command,
+    encode_client_interface_commands, encode_client_management_tx,
     encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
     encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
-    encode_passive_mcu_command, encode_ptk_command, encode_remove_wcid_command,
-    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
-    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
-    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, set_client_txwi_wcid,
-    validate_passive_mac_bar_read,
+    encode_passive_mcu_command, encode_ptk_command, encode_regulatory_rate_tx_power_commands,
+    encode_remove_wcid_command, linux_legacy_rate_context_reference,
+    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
+    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
+    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
+    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
+    regulatory_rate_power_channel_skeleton, set_client_txwi_wcid, validate_passive_mac_bar_read,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -84,7 +84,7 @@ use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig
 use mt7921_softmac_adapter::{
     LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
     SourceExactPassiveMechanics, SourceExactPassiveTransport, query_from_capabilities,
-    set_channel_request,
+    regulatory_rate_power_snapshot_from_fuchsia, set_channel_request,
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
@@ -3143,15 +3143,21 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
         "{}",
         r#"{"rate_power_self_test":"command","ordinal":0,"name":"SET_RX_PATH"}"#
     );
+    println!(
+        "{}",
+        r#"{"rate_power_self_test":"input","generation":0,"alpha2":"00","channels":62,"present_enabled":39,"missing":23,"disabled":0,"sar":"absent","external_cap":"absent","per_rate_override":"absent"}"#
+    );
     let mut commands = realistic_rate_power_audit_commands(15)?;
     for (index, encoded) in commands.iter_mut().enumerate() {
         let ordinal = index as u8 + 1;
         audit.page_consumed_and_reclaimed(&encoded)?;
         println!(
-            r#"{{"rate_power_self_test":"command","ordinal":{ordinal},"cid":"0x4005d","sequence":{},"total_length":{},"raw_length":{},"wait_response":false,"dma_didx_consumed":true,"descriptor_reclaimed":true,"last_msg":{}}}"#,
+            r#"{{"rate_power_self_test":"command","ordinal":{ordinal},"cid":"0x4005d","sequence":{},"total_length":{},"raw_length":{},"total_sha256":"{}","raw_sha256":"{}","wait_response":false,"dma_didx_consumed":true,"descriptor_reclaimed":true,"last_msg":{}}}"#,
             encoded[39],
             encoded.len(),
             encoded.len() - CONNAC2_MCU_TXD_BYTES,
+            sha256_hex(encoded),
+            sha256_hex(&encoded[CONNAC2_MCU_TXD_BYTES..]),
             encoded[CONNAC2_MCU_TXD_BYTES + 6]
         );
     }
@@ -3190,17 +3196,20 @@ fn realistic_rate_power_audit_commands(
         chip_capability: None,
         unknown_elements: 0,
     };
-    let mut commands = encode_conservative_rate_tx_power_commands(
-        capability,
-        ConservativePowerLimits {
-            alpha2: *b"00",
-            max_reg_power_dbm: 20,
-            sar_limit_half_dbm: Some(40),
-            external_safety_cap_half_dbm: Some(0),
-        },
-        1,
-    )
-    .map_err(|error| format!("encode realistic rate-power audit fixture: {error:?}"))?;
+    const PRESENT_5GHZ: &[u16] = &[
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165,
+    ];
+    let mut channels = regulatory_rate_power_channel_skeleton(capability)
+        .map_err(|error| format!("build rate-power channel skeleton: {error:?}"))?;
+    for channel in &mut channels {
+        channel.present = matches!(channel.band, mt7921_port_spike::PhysicalBand::Ghz2)
+            || PRESENT_5GHZ.contains(&channel.channel);
+        channel.max_reg_power_dbm = channel.present.then_some(20);
+    }
+    let snapshot = RegulatoryRatePowerSnapshot::new(0, *b"00", channels, Vec::new(), None);
+    let mut commands = encode_regulatory_rate_tx_power_commands(capability, &snapshot, 0, 1)
+        .map_err(|error| format!("encode realistic rate-power audit fixture: {error:?}"))?;
     let mut sequence = first_physical_sequence;
     for command in &mut commands {
         if !(1..=15).contains(&sequence) {
@@ -5399,6 +5408,17 @@ fn run() -> Result<(), String> {
                                 // This observation deliberately precedes set_channel/start_scan:
                                 // publish the exact bounded pages and then the command that would
                                 // naturally follow them, without adding a timing fence.
+                                let snapshot = regulatory_rate_power_snapshot_from_fuchsia(
+                                    0,
+                                    *b"00",
+                                    report.nic_capability,
+                                    &candidates,
+                                    &channels,
+                                    &[],
+                                    Vec::new(),
+                                    Some(0),
+                                )
+                                .map_err(|error| format!("freeze rate-power input: {error:?}"))?;
                                 let transport = adapter.into_transport();
                                 let mechanics = transport.into_mechanics();
                                 let mut power_transport = VfioRateTxPower {
@@ -5406,15 +5426,10 @@ fn run() -> Result<(), String> {
                                 };
                                 let mut power_authorizer = RateTxPowerAuthorizer::new();
                                 let authorization = power_authorizer
-                                    .submit(
+                                    .submit_snapshot(
                                         &mut power_transport,
                                         report.nic_capability,
-                                        ConservativePowerLimits {
-                                            alpha2: *b"00",
-                                            max_reg_power_dbm: 20,
-                                            sar_limit_half_dbm: Some(40),
-                                            external_safety_cap_half_dbm: Some(0),
-                                        },
+                                        &snapshot,
                                         1,
                                     )
                                     .map_err(|error| {
@@ -5845,21 +5860,23 @@ fn run() -> Result<(), String> {
                                 let mut power_transport = VfioRateTxPower {
                                     loader: &mut *mechanics.loader,
                                 };
+                                let snapshot = regulatory_rate_power_snapshot_from_fuchsia(
+                                    0,
+                                    *b"00",
+                                    report.nic_capability,
+                                    &candidates,
+                                    &channels,
+                                    &[],
+                                    Vec::new(),
+                                    Some(0),
+                                )
+                                .map_err(|error| format!("freeze rate-power input: {error:?}"))?;
                                 let mut power_authorizer = RateTxPowerAuthorizer::new();
                                 let authorization = power_authorizer
-                                    .submit(
+                                    .submit_snapshot(
                                         &mut power_transport,
                                         report.nic_capability,
-                                        ConservativePowerLimits {
-                                            alpha2: *b"00",
-                                            max_reg_power_dbm: 20,
-                                            // Read-only ACPI evidence for this exact host has MTDS/MTGS
-                                            // but no MTCL, so pinned initialization rejects the tables
-                                            // and applies no narrower ACPI SAR range.
-                                            sar_limit_half_dbm: Some(40),
-                                            // Keep this setup-only boundary at 0 dBm for every rate.
-                                            external_safety_cap_half_dbm: Some(0),
-                                        },
+                                        &snapshot,
                                         1,
                                     )
                                     .map_err(|error| {
@@ -9660,22 +9677,24 @@ fn program_live_rate_power(
     mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
     capability: mt7921_port_spike::NicCapability,
 ) -> Result<(), String> {
+    // The pinned Fuchsia SoftMAC query supplies channel identity but no
+    // max-regulatory-power value. Preserve that absence so publication fails
+    // closed rather than substituting a captured host value.
+    let candidates = candidate_channels(capability);
+    let mut channels = regulatory_rate_power_channel_skeleton(capability)
+        .map_err(|error| format!("build rate-power channel skeleton: {error:?}"))?;
+    for channel in &mut channels {
+        channel.present = candidates
+            .iter()
+            .any(|candidate| candidate.band == channel.band && candidate.number == channel.channel);
+    }
+    let snapshot = RegulatoryRatePowerSnapshot::new(0, *b"00", channels, Vec::new(), Some(0));
     let mut transport = VfioRateTxPower {
         loader: &mut *mechanics.loader,
     };
     let mut authorizer = RateTxPowerAuthorizer::new();
     let authorization = authorizer
-        .submit(
-            &mut transport,
-            capability,
-            ConservativePowerLimits {
-                alpha2: *b"00",
-                max_reg_power_dbm: 20,
-                sar_limit_half_dbm: Some(40),
-                external_safety_cap_half_dbm: Some(0),
-            },
-            1,
-        )
+        .submit_snapshot(&mut transport, capability, &snapshot, 1)
         .map_err(|error| format!("submit rate-power setup: {error:?}"))?;
     mechanics.loader.rate_power_delivery.finish()?;
     mechanics

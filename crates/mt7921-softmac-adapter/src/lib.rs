@@ -19,8 +19,10 @@ use fuchsia_softmac_port::{
 };
 use mt7921_port_spike::{
     CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
-    PassiveMcuCommandError, PassiveScanDone, PhysicalBand,
+    PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
+    RegulatoryRatePowerSnapshot, SarFrequencyRange,
     candidate_channels as capability_channels, encode_passive_mcu_command,
+    regulatory_rate_power_channel_skeleton,
 };
 use std::collections::VecDeque;
 use std::error::Error;
@@ -1074,6 +1076,54 @@ fn to_fuchsia_channel(channel: CandidateChannel) -> Option<ChannelNumber> {
     Some(ChannelNumber { band, number })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FuchsiaRegulatoryPower {
+    pub channel: ChannelNumber,
+    pub max_reg_power_dbm: i8,
+}
+
+/// Freeze the Fuchsia-reported channel universe and current authorization into
+/// the core's complete MT7921 table. A present, enabled channel without a
+/// matching power entry remains explicitly incomplete and will be rejected by
+/// the core before any page is sent. The pinned Fuchsia API currently exposes
+/// channel identity but not this power value.
+pub fn regulatory_rate_power_snapshot_from_fuchsia(
+    generation: u64,
+    alpha2: [u8; 2],
+    capability: NicCapability,
+    candidates: &[CandidateChannel],
+    authorized: &[ChannelNumber],
+    powers: &[FuchsiaRegulatoryPower],
+    sar_ranges: Vec<SarFrequencyRange>,
+    external_cap_half_dbm: Option<i8>,
+) -> Result<RegulatoryRatePowerSnapshot, RateTxPowerError> {
+    let mut channels = regulatory_rate_power_channel_skeleton(capability)?;
+    for input in &mut channels {
+        let candidate = candidates.iter().copied().find(|candidate| {
+            candidate.band == input.band && candidate.number == input.channel
+        });
+        let Some(candidate) = candidate else { continue };
+        if candidate.frequency_mhz != input.frequency_mhz {
+            return Err(RateTxPowerError::InvalidChannelFrequency);
+        }
+        input.present = true;
+        let fuchsia_channel = to_fuchsia_channel(candidate)
+            .ok_or(RateTxPowerError::IncompleteSnapshot)?;
+        input.disabled = !authorized.contains(&fuchsia_channel);
+        input.max_reg_power_dbm = powers
+            .iter()
+            .find(|power| power.channel == fuchsia_channel)
+            .map(|power| power.max_reg_power_dbm);
+    }
+    Ok(RegulatoryRatePowerSnapshot::new(
+        generation,
+        alpha2,
+        channels,
+        sar_ranges,
+        external_cap_half_dbm,
+    ))
+}
+
 pub fn query_from_capabilities(
     nic: NicCapability,
     candidates: &[CandidateChannel],
@@ -2070,5 +2120,56 @@ mod tests {
             Err(AdapterError::Transport(ScriptError("start")))
         );
         assert_eq!(adapter.next_scan_event(), Err(AdapterError::Poisoned));
+    }
+
+    #[test]
+    fn fuchsia_regulatory_snapshot_preserves_missing_power_as_incomplete() {
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: Some([2, 0, 0, 0, 0, 1]),
+            phy: Some(mt7921_port_spike::NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: false,
+                max_bandwidth: 1,
+                spatial_streams: 2,
+                hardware_path: 1,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let candidates = capability_channels(capability);
+        let authorized = vec![ChannelNumber { band: WlanBand::TwoGhz, number: 1 }];
+        let incomplete = regulatory_rate_power_snapshot_from_fuchsia(
+            3, *b"00", capability, &candidates, &authorized, &[], Vec::new(), None,
+        )
+        .unwrap();
+        assert_eq!(
+            mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
+                capability, &incomplete, 3, 1,
+            ),
+            Err(RateTxPowerError::InvalidRegulatoryLimit)
+        );
+
+        let complete = regulatory_rate_power_snapshot_from_fuchsia(
+            3,
+            *b"00",
+            capability,
+            &candidates,
+            &authorized,
+            &[FuchsiaRegulatoryPower { channel: authorized[0], max_reg_power_dbm: 17 }],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let commands = mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
+            capability, &complete, 3, 1,
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(complete.channels().iter().filter(|channel| channel.present).count(), 14);
+        assert_eq!(complete.channels().iter().filter(|channel| channel.disabled).count(), 13);
     }
 }
