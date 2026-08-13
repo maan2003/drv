@@ -471,7 +471,8 @@
                 --subst-var-by recovery_samples 45 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
-                --subst-var-by var_root /var
+                --subst-var-by var_root /var \
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id
               chmod 0755 "$out/bin/mt7921-rate-power-evidence-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-supervisor"
               grep -F '${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence' \
@@ -513,8 +514,100 @@
                 CHANNEL_SET=false
                 AUTHENTICATION=false
                 FRAME_TX=false
+                PRIVILEGE_CONTRACT=FIXED_ROOT_ENTRY_SUDO_-n
                 EOF
               '';
+
+          mt7921-rate-power-evidence-root-entry = pkgs.runCommand
+            "mt7921-rate-power-evidence-root-entry"
+            { nativeBuildInputs = [ pkgs.coreutils ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-rate-power-evidence-root.sh} \
+                "$out/bin/mt7921-rate-power-evidence-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by supervisor ${mt7921-rate-power-evidence-supervisor}/bin/mt7921-rate-power-evidence-supervisor \
+                --subst-var-by launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
+                --subst-var-by manifest ${mt7921-rate-power-evidence-manifest} \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut
+              chmod 0755 "$out/bin/mt7921-rate-power-evidence-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-root"
+            '';
+
+          mt7921-rate-power-evidence-privilege-test = pkgs.runCommand
+            "mt7921-rate-power-evidence-privilege-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+            ''
+              mkdir -p work/bin work/var/lib/wifi-driver-lab
+              launcher=${pkgs.coreutils}/bin/true
+              cat > work/bin/id-unprivileged <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo 1000
+              EOF
+              cat > work/bin/id-root <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo 0
+              EOF
+              cat > work/bin/hardware-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo hardware-called >> "$PWD/transcript"
+              exit 1
+              EOF
+              chmod 0755 work/bin/*
+              make_supervisor() {
+                local id=$1 output=$2
+                substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} "$output" \
+                  --subst-var-by runtime_path ${pkgs.coreutils}/bin \
+                  --subst-var-by wifi_driver_lab "$PWD/work/bin/hardware-stub" \
+                  --subst-var-by wifi_lab_watchdog "$PWD/work/bin/hardware-stub" \
+                  --subst-var-by validation_launcher "$launcher" \
+                  --subst-var-by recovery_samples 1 \
+                  --subst-var-by sys_root "$PWD/work/sys" \
+                  --subst-var-by run_root "$PWD/work/run" \
+                  --subst-var-by var_root "$PWD/work/var" \
+                  --subst-var-by id_command "$id"
+                chmod 0755 "$output"
+              }
+              make_supervisor "$PWD/work/bin/id-unprivileged" work/supervisor-unprivileged
+              if ${pkgs.bash}/bin/bash work/supervisor-unprivileged 0000:05:00.0 -- "$launcher" 2>error; then exit 1; fi
+              grep -F 'requires noninteractive root elevation before any state change' error
+              test ! -e transcript
+              test -z "$(find work/var/lib/wifi-driver-lab -type f -print -quit)"
+
+              make_supervisor "$PWD/work/bin/id-root" work/supervisor-root
+              ${pkgs.bash}/bin/bash work/supervisor-root --plan 0000:05:00.0 -- "$launcher" > plan
+              grep -F 'mode=inert hardware_handoff=false uid=0 privilege_contract=sudo_-n' plan
+              grep -F 'durable_report_writable=true' plan
+              test ! -e transcript
+
+              : > work/manifest
+              cat > work/bin/sudo-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf '%s\n' "$@" > "$PWD/sudo.argv"
+              exit 0
+              EOF
+              chmod 0755 work/bin/sudo-stub
+              substitute ${./nix/mt7921-rate-power-evidence-root.sh} work/root-entry \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo "$PWD/work/bin/sudo-stub" \
+                --subst-var-by supervisor "$PWD/work/supervisor-root" \
+                --subst-var-by launcher "$launcher" \
+                --subst-var-by manifest "$PWD/work/manifest" \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut
+              chmod 0755 work/root-entry
+              work/root-entry
+              printf '%s\n' -n "$PWD/work/supervisor-root" 0000:05:00.0 -- "$launcher" > expected
+              cmp expected sudo.argv
+              work/root-entry --plan
+              printf '%s\n' -n "$PWD/work/supervisor-root" --plan 0000:05:00.0 -- "$launcher" > expected
+              cmp expected sudo.argv
+              if work/root-entry arbitrary 2>error; then exit 1; fi
+              grep -F 'accepts no arguments except --plan' error
+              printf passed > "$out"
+            '';
 
           mt7921-full-firmware-validation-manifest =
             let

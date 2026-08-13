@@ -9,6 +9,7 @@ recovery_samples=@recovery_samples@
 sys_root=@sys_root@
 run_root=@run_root@
 var_root=@var_root@
+id_command=@id_command@
 umask 077
 
 plan=false
@@ -29,13 +30,24 @@ shift
   exit 2
 }
 [[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}[.][[:xdigit:]]$ ]] || exit 2
+root=$var_root/lib/wifi-driver-lab
+
+[[ $($id_command -u) == 0 ]] || {
+  echo "fixed validation supervisor requires noninteractive root elevation before any state change" >&2
+  exit 77
+}
 
 if $plan; then
   [[ $validation_launcher == /nix/store/* && -x $validation_launcher ]] || {
     echo "fixed validation launcher is missing or outside the Nix store" >&2
     exit 2
   }
-  printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+  [[ -d $root && -w $root ]] || {
+    echo "durable report directory is not writable by root" >&2
+    exit 77
+  }
+  printf 'PLAN mode=inert hardware_handoff=false uid=0 privilege_contract=sudo_-n durable_report_dir=%s durable_report_writable=true supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+    "$root" \
     "$(readlink -f "$0")" "$(sha256sum "$(readlink -f "$0")" | cut -d ' ' -f1)" \
     "$wifi_driver_lab" "$(sha256sum "$wifi_driver_lab" | cut -d ' ' -f1)" \
     "$wifi_lab_watchdog" "$(sha256sum "$wifi_lab_watchdog" | cut -d ' ' -f1)" \
@@ -51,7 +63,6 @@ normalize_iw_frequency() {
   printf '%s\n' "${frequency%.0}"
 }
 
-root=$var_root/lib/wifi-driver-lab
 stamp=$(date --utc +%Y%m%dT%H%M%SZ)
 timeline=$root/selector-write-recovery-$stamp.log
 messages=$root/selector-write-recovery-$stamp.messages.log
