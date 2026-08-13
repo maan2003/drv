@@ -1040,6 +1040,7 @@ fn run_contained_dma_resource_round_trip(
                 conn: &conn,
                 pcie_mac,
                 patch_table_page: active.patch_table_page.as_ref(),
+                normal_patch_table_capture: false,
                 bdf,
                 fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
                 fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
@@ -3103,6 +3104,33 @@ fn run_patch_table_gate_self_test() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    if operation_argument.as_deref() == Some("--full-firmware-preflight") {
+        if env::args().len() != 2 {
+            return Err("full-firmware preflight accepts no additional arguments".into());
+        }
+        let operation = Operation::RunOneShotSaeAuth;
+        if operation == Operation::RunOneShotPatchTableGate
+            || !operation.is_active_mcu()
+            || !operation.loads_firmware()
+            || operation.uses_contained_transport_gate()
+        {
+            return Err("full-firmware dispatch lost its normal-operation contract".into());
+        }
+        let patch = decompress_patch()?;
+        let ram = decompress_ram()?;
+        Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+        Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+        let watchdog = verify_external_watchdog_armed()?;
+        let watchdog_deadline = watchdog.deadline;
+        let containment = ContainmentLedger::acquire(Some(watchdog))?;
+        if containment.phase != RunPhase::Acquiring || containment.hardware_may_be_active() {
+            return Err("full-firmware inert containment acquisition is invalid".into());
+        }
+        println!(
+            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-sae-auth\",\"patch_table_gate\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}"
+        );
+        return Ok(());
+    }
     if operation_argument.as_deref() == Some("--self-test-patch-table-gate") {
         if env::args().len() != 2 {
             return Err("patch-table gate self-test accepts no additional arguments".into());
@@ -4979,7 +5007,19 @@ fn run() -> Result<(), String> {
                     mcu,
                     conn: &conn,
                     pcie_mac,
-                    patch_table_page,
+                    patch_table_page: {
+                        #[cfg(feature = "fuchsia-passive")]
+                        if e2e94_probe && operation == Operation::RunOneShotSaeAuth {
+                            passive_window_pages[4].as_ref()
+                        } else {
+                            patch_table_page
+                        }
+                        #[cfg(not(feature = "fuchsia-passive"))]
+                        patch_table_page
+                    },
+                    normal_patch_table_capture: cfg!(feature = "fuchsia-passive")
+                        && e2e94_probe
+                        && operation == Operation::RunOneShotSaeAuth,
                     bdf: &bdf,
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
@@ -7801,6 +7841,7 @@ struct VfioFirmwareLoader<'a> {
     conn: &'a ReadPage,
     pcie_mac: &'a ReadPage,
     patch_table_page: Option<&'a ReadPage>,
+    normal_patch_table_capture: bool,
     bdf: &'a str,
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
@@ -7964,6 +8005,30 @@ impl VfioFirmwareLoader<'_> {
         encoded: &[u8],
     ) -> Result<(), String> {
         self.patch_gate.record_command(command, sequence, encoded)
+    }
+
+    fn capture_patch_table_snapshot(&self, point: &str) -> Result<(), String> {
+        if !self.normal_patch_table_capture {
+            return Ok(());
+        }
+        let page = self
+            .patch_table_page
+            .ok_or("normal firmware validation omitted TMAC BAR page")?;
+        let mut populated = 0usize;
+        let mut rows = Vec::with_capacity(41);
+        for offset in (0x140usize..=0x1e0).step_by(4) {
+            let value = page.read(0x21000 + offset)?;
+            populated += usize::from(value != 0 && value != u32::MAX);
+            rows.push(format!("\"{offset:#05x}\":\"{value:#010x}\""));
+        }
+        println!(
+            "{{\"full_firmware_patch_table\":\"{point}\",\"row_count\":{},\"populated_count\":{populated},\"rows\":{{{}}}}}",
+            rows.len(),
+            rows.join(",")
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush full-firmware patch-table snapshot: {error}"))
     }
 }
 
@@ -9336,6 +9401,9 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             }
             FirmwareCommandCompletion::NoResponse
         };
+        if command == DownloadCommand::PatchSemaphoreRelease {
+            self.capture_patch_table_snapshot("post_release_before_ram")?;
+        }
         self.record_patch_gate_command(command, sequence, encoded)?;
         self.mcu
             .tx_ring
@@ -10299,11 +10367,13 @@ impl MgmtTxOutstanding {
     fn take_diagnostic_free(
         &mut self,
         token: u16,
+        require_status: bool,
     ) -> Option<(Mt7921TxFree, Option<Mt7921TxStatus>)> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.token == token && entry.free.is_some())?;
+        let index = self.entries.iter().position(|entry| {
+            entry.token == token
+                && entry.free.is_some()
+                && (!require_status || entry.status.is_some())
+        })?;
         let entry = self.entries.remove(index);
         Some((entry.free.expect("selected free completion"), entry.status))
     }
@@ -11831,6 +11901,13 @@ struct StableMacWatcher {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+struct DiagnosticTxResult {
+    free: Mt7921TxFree,
+    txs_present: bool,
+    txs_acked: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl Drop for VfioPassiveMechanics<'_, '_, '_> {
     fn drop(&mut self) {
         if !self.mgmt_tx_outstanding.is_empty() {
@@ -12034,7 +12111,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         variant: &str,
         token: u16,
         pid: u8,
-    ) -> Result<Mt7921TxFree, String> {
+    ) -> Result<DiagnosticTxResult, String> {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
             self.loader.mcu.handle_irq(None)?;
@@ -12050,7 +12127,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             for completion in self.tx_completions.drain(..) {
                 let _ = self.mgmt_tx_outstanding.observe_diagnostic(completion);
             }
-            if let Some((free, status)) = self.mgmt_tx_outstanding.take_diagnostic_free(token) {
+            if let Some((free, status)) = self
+                .mgmt_tx_outstanding
+                .take_diagnostic_free(token, self.e2e94_probe)
+            {
                 record_sae_stage(&format!(
                     "e2e84_tx_result variant={variant} token={token} pid={pid} tx_free_pair_word={:?} tx_free_info_word={:#010x} tx_free_status2={} tx_free_count={} tx_free_dropped={} txs_present={} txs_acked={}",
                     free.pair_word,
@@ -12061,7 +12141,11 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     status.is_some(),
                     status.is_some_and(|value| value.acked),
                 ));
-                return Ok(free);
+                return Ok(DiagnosticTxResult {
+                    free,
+                    txs_present: status.is_some(),
+                    txs_acked: status.is_some_and(|value| value.acked),
+                });
             }
             if Instant::now() >= deadline {
                 return Err(format!("E2E89 {variant} TX_FREE timed out"));
@@ -12070,7 +12154,11 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         }
     }
 
-    fn e2e81_submit_wait(&mut self, variant: &str, frame: &[u8]) -> Result<Mt7921TxFree, String> {
+    fn e2e81_submit_wait(
+        &mut self,
+        variant: &str,
+        frame: &[u8],
+    ) -> Result<DiagnosticTxResult, String> {
         self.transmit_owned_client_frame(frame)?;
         let (token, pid) = self
             .mgmt_tx_outstanding
@@ -12910,6 +12998,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .windows(8)
             .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
         if eapol {
+            self.loader
+                .capture_patch_table_snapshot("immediately_predata")
+                .map_err(|_| zx::Status::IO)?;
             PassiveMacExecutor {
                 pages: self.mac_pages,
             }
@@ -13026,8 +13117,23 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     "e2e90"
                 },
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
-                be.dropped,
+                be.free.dropped,
             ));
+            if self.e2e94_probe {
+                let passed = !be.free.dropped && be.txs_present && be.txs_acked;
+                record_sae_stage(&format!(
+                    "e2e94_tx_success_gate result={} tx_free_success={} txs_present={} txs_acked={} stop_after_one=true eapol_published=false vo_published=false retry_published=false",
+                    if passed { "passed" } else { "failed" },
+                    !be.free.dropped,
+                    be.txs_present,
+                    be.txs_acked,
+                ));
+                return Err(if passed {
+                    zx::Status::STOP
+                } else {
+                    zx::Status::IO
+                });
+            }
             return Ok(());
         }
         let transmit = self.transmit_owned_client_frame(bytes);
@@ -17748,6 +17854,59 @@ mod tests {
         assert!(!block.contains("/dev/vfio"));
     }
 
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn full_firmware_preflight_is_inert_and_cannot_select_patch_gate() {
+        let source = include_str!("vfio_read.rs");
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let preflight = run.find("--full-firmware-preflight").unwrap();
+        let operation_dispatch = run.find("let operation = match").unwrap();
+        let device_environment = run.find("DRV_PCI_BDF").unwrap();
+        assert!(preflight < operation_dispatch && operation_dispatch < device_environment);
+        let block = &run[preflight..operation_dispatch];
+        assert!(block.contains("Operation::RunOneShotSaeAuth"));
+        assert!(block.contains("operation == Operation::RunOneShotPatchTableGate"));
+        assert!(block.contains("ram_firmware_required\\\":true"));
+        assert!(block.contains("device_opened\\\":false"));
+        assert!(block.contains("vfio_opened\\\":false"));
+        assert!(!block.contains("OpenOptions"));
+        assert!(!block.contains("/dev/vfio"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn e2e94_normal_dispatch_downloads_ram_and_stops_after_one_be_result() {
+        assert!(Operation::RunOneShotSaeAuth != Operation::RunOneShotPatchTableGate);
+        let source = include_str!("vfio_read.rs");
+        let consolidated = source
+            .split("if operation.is_active_mcu() {")
+            .find(|segment| segment.contains("Operation::RunOneShotSaeAuth"))
+            .unwrap();
+        assert!(consolidated.contains("load_mt7921_firmware_with_passive_boundary"));
+        assert!(source.contains("ram_published_firmware_start_acked"));
+        assert!(source.contains("post_release_before_ram"));
+        assert!(source.contains("immediately_predata"));
+
+        let transmit = source
+            .split("self.e2e81_snapshot(\"immediately_before_BE\")")
+            .nth(1)
+            .unwrap()
+            .split("let transmit = self.transmit_owned_client_frame(bytes)")
+            .next()
+            .unwrap();
+        assert!(transmit.contains("A_tid0_be_qidx1"));
+        assert!(transmit.contains("e2e94_tx_success_gate"));
+        assert!(transmit.contains("txs_present"));
+        assert!(transmit.contains("txs_acked"));
+        assert!(transmit.contains("stop_after_one=true"));
+        assert!(transmit.contains("eapol_published=false"));
+        assert!(transmit.contains("vo_published=false"));
+        assert!(transmit.contains("retry_published=false"));
+    }
+
     #[test]
     fn sae_records_the_shared_host_preflight_and_vfio_boundaries() {
         assert!(Operation::RunOneShotSaeAuth.records_active_transport_stages());
@@ -21058,10 +21217,39 @@ mod tests {
                 info_word: 0,
             }))
             .unwrap();
-        let (free, status) = outstanding.take_diagnostic_free(token).unwrap();
+        let (free, status) = outstanding.take_diagnostic_free(token, false).unwrap();
         assert!(!free.dropped);
         assert_eq!(status.unwrap().wcid, 7);
         assert!(outstanding.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn production_probe_retains_tx_free_until_txs_arrives() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let (token, pid) = outstanding.reserve_for_wcid(7).unwrap();
+        outstanding
+            .observe_diagnostic(MgmtTxCompletion::Free(Mt7921TxFree {
+                wcid: Some(7),
+                token,
+                dropped: false,
+                attempts: 1,
+                status: 0,
+                pair_word: None,
+                info_word: 0,
+            }))
+            .unwrap();
+        assert!(outstanding.take_diagnostic_free(token, true).is_none());
+        outstanding
+            .observe_diagnostic(MgmtTxCompletion::Status(Mt7921TxStatus {
+                wcid: 7,
+                pid,
+                acked: true,
+            }))
+            .unwrap();
+        let (free, status) = outstanding.take_diagnostic_free(token, true).unwrap();
+        assert!(!free.dropped);
+        assert!(status.unwrap().acked);
     }
 
     #[cfg(feature = "fuchsia-passive")]

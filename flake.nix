@@ -115,6 +115,58 @@
             meta.mainProgram = "mt7921-passive-scan";
           };
 
+          mt7921-full-firmware-validation = pkgs.stdenv.mkDerivation {
+            pname = "mt7921-full-firmware-validation";
+            version = "0.1.0";
+            src =
+              let fullFirmwareBinary = builtins.getEnv "MT7921_FULL_FIRMWARE_BINARY";
+              in
+              if fullFirmwareBinary == "" then
+                throw "set MT7921_FULL_FIRMWARE_BINARY to the exact locally verified release executable and evaluate with --impure"
+              else
+                builtins.path {
+                  path = fullFirmwareBinary;
+                  name = "mt7921-full-firmware-validation-unpatched";
+                };
+            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.binutils ];
+            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+            dontUnpack = true;
+            installPhase = ''
+              runHook preInstall
+              install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
+              mkdir -p "$out/bin"
+              ln -s ../libexec/mt7921-full-firmware-validation "$out/bin/mt7921-full-firmware-validation-driver"
+              cat >"$out/bin/mt7921-full-firmware-validation" <<EOF
+              #!${pkgs.runtimeShell}
+              set -eu
+              case "$#:''${1-}" in
+                0:) exec "$out/libexec/mt7921-full-firmware-validation" --run-one-shot-sae-auth ;;
+                1:--full-firmware-preflight) exec "$out/libexec/mt7921-full-firmware-validation" --full-firmware-preflight ;;
+                *) echo 'fixed full-firmware validation accepts no arguments except --full-firmware-preflight' >&2; exit 64 ;;
+              esac
+              EOF
+              chmod 0755 "$out/bin/mt7921-full-firmware-validation"
+              runHook postInstall
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              driver=$out/libexec/mt7921-full-firmware-validation
+              strings "$driver" | grep -F '"full_firmware_preflight":"passed"'
+              strings "$driver" | grep -F 'ram_published_firmware_start_acked'
+              strings "$driver" | grep -F 'post_release_before_ram'
+              strings "$driver" | grep -F 'immediately_predata'
+              strings "$driver" | grep -F 'e2e94_tx_success_gate result='
+              strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false retry_published=false'
+              if "$out/bin/mt7921-full-firmware-validation" --run-one-shot-patch-table-gate 2>/dev/null; then
+                echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
+                exit 1
+              fi
+              runHook postInstallCheck
+            '';
+            meta.mainProgram = "mt7921-full-firmware-validation";
+          };
+
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";
             version = "0.1.0";
