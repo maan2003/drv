@@ -150,7 +150,7 @@
          let parsed_assoc_resp = ParsedAssociateResp::parse(&assoc_resp_frame);
          let ap_capabilities = ApCapabilities(StaCapabilities {
              capability_info: parsed_assoc_resp.capabilities,
-@@ -403,7 +455,7 @@
+@@ -415,7 +467,7 @@
          let status_check_timeout =
              schedule_association_status_timeout(sta.sta.beacon_period(), &mut sta.ctx.timer);
  
@@ -159,7 +159,7 @@
              aid,
              assoc_resp_ies: assoc_resp_body.to_vec(),
              controlled_port_open,
-@@ -414,7 +466,7 @@
+@@ -426,7 +478,7 @@
              status_check_timeout,
              signal_strength_average: SignalStrengthAverage::new(),
              block_ack_state: StateMachine::new(BlockAckState::from(State::new(Closed))),
@@ -168,7 +168,7 @@
      }
  
      /// Processes an inbound disassociation frame.
-@@ -458,6 +510,57 @@
+@@ -470,6 +522,57 @@
      }
  }
  
@@ -226,7 +226,7 @@
  /// Extract HT Operation and VHT Operation IEs from the association response frame.
  /// If either IE is of an incorrect length, it will be ignored.
  fn extract_ht_vht_op<B: SplitByteSlice>(
-@@ -1134,7 +1237,10 @@
+@@ -1146,7 +1249,10 @@
              States::Associating(mut state) => match mgmt_body {
                  mac::MgmtBody::AssociationResp(assoc_resp_frame) => {
                      match state.on_assoc_resp_frame(sta, assoc_resp_frame).await {
@@ -238,7 +238,7 @@
                          Err(()) => state.transition_to(Joined).into(),
                      }
                  }
-@@ -1229,6 +1335,48 @@
+@@ -1241,6 +1347,48 @@
          event: TimedEvent,
      ) -> States {
          match event {
@@ -287,7 +287,7 @@
              TimedEvent::Connecting => {
                  sta.sta.connect_timeout.take();
                  sta.send_connect_conf_failure(fidl_ieee80211::StatusCode::RejectedSequenceTimeout);
-@@ -1607,6 +1755,7 @@
+@@ -1619,6 +1767,7 @@
                  device: self.fake_device.clone(),
                  timer: self.timer.take().unwrap(),
                  seq_mgr: SequenceManager::new(),
@@ -295,7 +295,7 @@
              }
          }
      }
-@@ -1876,7 +2025,8 @@
+@@ -1888,7 +2037,8 @@
                  },
              )
              .await
@@ -305,7 +305,7 @@
          assert_eq!(aid, 42);
          assert_eq!(true, controlled_port_open);
  
-@@ -1930,7 +2080,8 @@
+@@ -1942,7 +2092,8 @@
                  },
              )
              .await
@@ -440,7 +440,7 @@
  fn observed_receive_uses_exact_constructed_scan_result_and_ordinary_sink_is_unchanged() {
      futures::executor::block_on(async {
          fn scan_request() -> fidl_mlme::ScanRequest {
-@@ -690,9 +776,59 @@
+@@ -697,9 +783,59 @@
              &[0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
          );
  
@@ -502,7 +502,7 @@
          Station::on_mlme_event(&mut sme, connect_conf);
  
          let msg1 = peer_updates.into_iter().find_map(|update| match update {
-@@ -700,7 +836,7 @@
+@@ -707,7 +843,7 @@
              _ => None,
          }).expect("authenticator EAPOL message 1");
          peer.on_eapol_conf(&mut vec![], fidl_mlme::EapolResultCode::Success).unwrap();

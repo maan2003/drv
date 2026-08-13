@@ -359,7 +359,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
      minstrel: Option<MinstrelWrapper>,
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
-@@ -363,9 +363,8 @@
+@@ -354,9 +354,8 @@
          let assoc_cfg = fidl_softmac::WlanAssociationConfig {
              bssid: Some(sta.sta.bssid().to_array()),
              aid: Some(aid),
@@ -403,7 +403,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
          };
          for (id, body) in assoc_resp_frame.ies() {
              match id {
-@@ -546,7 +548,13 @@
+@@ -544,7 +546,13 @@
                          parsed.vht_cap = Some(*vht_cap);
                      }
                  },
@@ -454,7 +454,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
  
          let assoc_cfg = fidl_softmac::WlanAssociationConfig {
              bssid: Some(sta.sta.bssid().to_array()),
-@@ -361,7 +373,7 @@
+@@ -360,7 +372,7 @@
              bandwidth: sta.channel_state.get_bandwidth(),
              vht_secondary_80_channel: sta.channel_state.get_vht_secondary_80_channel(),
              qos: Some(qos),

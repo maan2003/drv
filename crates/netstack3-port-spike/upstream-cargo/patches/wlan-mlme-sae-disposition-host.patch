@@ -1,7 +1,7 @@
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 12:41:54.309534703 +0000
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs	2026-08-11 12:43:06.479263525 +0000
-@@ -576,7 +576,8 @@
+@@ -579,7 +579,8 @@
          status_code: fidl_ieee80211::StatusCode,
          sae_fields: Vec<u8>,
      ) {
@@ -11,7 +11,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs b/src/connec
              .device
              .send_mlme_event(fidl_mlme::MlmeEvent::OnSaeFrameRx {
                  frame: fidl_mlme::SaeFrame {
-@@ -585,8 +586,14 @@
+@@ -588,8 +589,14 @@
                      status_code,
                      sae_fields,
                  },
@@ -72,7 +72,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs b/src/connecti
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 12:41:54.305312682 +0000
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs	2026-08-11 12:43:06.478263519 +0000
-@@ -1014,21 +1014,32 @@
+@@ -1025,21 +1025,32 @@
          let mac_frame = match mac::MacFrame::parse(bytes, body_aligned) {
              Some(mac_frame) => mac_frame,
              None => {
@@ -106,7 +106,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
              debug!("Dropping MAC frame with prohibited frame class.");
              wtrace::async_end_wlansoftmac_rx(async_id, "frame with prohibited frame class");
              return self;
-@@ -1076,9 +1087,26 @@
+@@ -1087,9 +1098,26 @@
          // Parse management frame. Drop corrupted ones.
          let (mgmt_hdr, mgmt_body) = match mgmt_frame.try_into_mgmt_body() {
              (mgmt_hdr, Some(mgmt_body)) => (mgmt_hdr, mgmt_body),
@@ -134,7 +134,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
          match self {
              States::Authenticating(mut state) => match mgmt_body {
                  mac::MgmtBody::Authentication(auth_frame) => match state
-@@ -1356,6 +1384,16 @@
+@@ -1367,6 +1395,16 @@
              States::Associated(_) => class <= mac::FrameClass::Class3,
          }
      }

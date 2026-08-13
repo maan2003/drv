@@ -418,6 +418,10 @@ impl OpenClientMlme {
                 frame.extend_from_slice(rsnxe);
             }
         }
+        // Match Linux's association-request WMM information element. Keep it
+        // after the SAE-H2E RSNXE so the selected-BSS security evidence is not
+        // hidden behind a host-only vendor suffix.
+        frame.extend_from_slice(&[0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00]);
         Ok(frame)
     }
 
@@ -938,6 +942,7 @@ mod tests {
             if protected {
                 expected.push((244, 1));
             }
+            expected.push((221, 7));
             assert_eq!(ies, expected);
             let ht = assoc.ies().find(|(id, _)| *id == Id::HT_CAPABILITIES).unwrap().1;
             assert_eq!(&ht[..3], &[0x73, 0x09, 3]);
@@ -980,8 +985,14 @@ mod tests {
                 .any(|(id, body)| { id == Id::RSNE && body == &WPA3_SAE_RSNE[2..] })
         );
         assert_eq!(
-            assoc.ies().collect::<Vec<_>>().last(),
-            Some(&(Id::RSNXE, &[0x20][..]))
+            assoc.ies().collect::<Vec<_>>().as_slice(),
+            &[
+                (Id::SSID, &[b't', b'e', b's', b't'][..]),
+                (Id::SUPPORTED_RATES, &[0x02, 0x04][..]),
+                (Id::RSNE, &WPA3_SAE_RSNE[2..]),
+                (Id::RSNXE, &[0x20][..]),
+                (Id::VENDOR_SPECIFIC, &[0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00][..]),
+            ]
         );
 
         client

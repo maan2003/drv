@@ -497,7 +497,14 @@ fn sme_connect_drives_production_sae_tx_and_both_timer_seams() {
             ies.push((association_request[offset], len));
             offset += 2 + len;
         }
-        assert_eq!(ies, [(0, 4), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1)]);
+        assert_eq!(
+            ies,
+            [(0, 4), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)]
+        );
+        assert_eq!(
+            &association_request[association_request.len() - 9..],
+            &[221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0],
+        );
         let ht = association_request.windows(2).position(|bytes| bytes == [45, 26]).unwrap();
         assert_eq!(&association_request[ht + 2..ht + 5], &[0x73, 0x09, 3]);
         let vht = association_request.windows(2).position(|bytes| bytes == [191, 12]).unwrap();

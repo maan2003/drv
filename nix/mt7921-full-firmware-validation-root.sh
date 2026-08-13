@@ -11,10 +11,25 @@ case "$#:${1-}" in
 esac
 
 @sha256sum@ @manifest@ >/dev/null
-grep -Fx 'FLAVOR=full-firmware-production' @manifest@ >/dev/null
-grep -Fx 'ACTIVE_CAPABLE=true' @manifest@ >/dev/null
-grep -Fx 'FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof' @manifest@ >/dev/null
-test "$(@launcher@ --artifact-identity)" = "$(cat @artifact_identity@)"
+@grep@ -Fx 'FLAVOR=full-firmware-production' @manifest@ >/dev/null
+@grep@ -Fx 'ACTIVE_CAPABLE=true' @manifest@ >/dev/null
+@grep@ -Fx 'FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof' @manifest@ >/dev/null
+test "$(@launcher@ --artifact-identity)" = "$(@cat@ @artifact_identity@)"
+assert_identity_field() {
+  value=$(@sed@ -n "s/^$1=//p" @manifest@)
+  test -n "$value"
+  @grep@ -F "\"$2\":\"$value\"" @artifact_identity@ >/dev/null
+}
+assert_identity_field SOURCE_IDENTITY_SHA256 source_identity_sha256
+assert_identity_field FUCHSIA_BASE_REVISION fuchsia_base_revision
+assert_identity_field FUCHSIA_ORDERED_PATCH_SET_SHA256 fuchsia_ordered_patch_set_sha256
+assert_identity_field FUCHSIA_ORDERED_PATCH_LIST fuchsia_ordered_patch_list
+assert_identity_field MATERIALIZED_SOURCE_TREE_SHA256 materialized_source_tree_sha256
+assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha256
+fixture=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
+fixture_sha=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)
+test -s "$fixture"
+test "$(@sha256sum@ "$fixture" | @cut@ -d ' ' -f1)" = "$fixture_sha"
 printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=%s supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=%s\n' \
   @manifest@ "$(@sha256sum@ @manifest@ | @cut@ -d ' ' -f1)" \
   @supervisor@ @launcher@ "${operation:---active}"

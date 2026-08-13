@@ -3,8 +3,11 @@
 Pinned Fuchsia revision: `1e1219e3fac944c9a906aea9646939746b6062b3`.
 
 The fetch script downloads every path below directly from the pinned revision.
-The Cargo overlay supplies build metadata only. Unless a patch is named, source
-files are byte-for-byte upstream.
+Except for the explicitly project-owned host fixture described below, the Cargo
+overlay supplies build metadata only. Unless a patch is named, production source
+files are byte-for-byte upstream. The project-owned `host_fixture.rs` and
+`wlan-mlme-host-fixture.patch` export deterministic, effect-only self-test
+plumbing; they do not replace or implement the production `ClientMlme`.
 
 | Native package / responsibility | Pinned Fuchsia production source | Host modification | License |
 |---|---|---|---|

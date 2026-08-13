@@ -1,6 +1,6 @@
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
-@@ -1136,6 +1136,37 @@
+@@ -1148,6 +1148,37 @@
              }
          };
  
@@ -38,7 +38,7 @@
          let frame_class = mac::FrameClass::from(&mac_frame);
          if !sta.sta.should_handle_frame(&mac_frame) {
              crate::sae_disposition(format_args!(
-@@ -1253,6 +1284,11 @@
+@@ -1265,6 +1296,11 @@
                  // This case is highly unlikely and only added to improve interoperability with
                  // buggy Access Points.
                  mac::MgmtBody::Disassociation { disassoc_hdr, .. } => {

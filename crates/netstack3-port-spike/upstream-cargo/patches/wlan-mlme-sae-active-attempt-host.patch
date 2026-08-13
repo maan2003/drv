@@ -1,7 +1,7 @@
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
 --- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 16:02:35.843202660 +0000
 +++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-11 16:02:35.838483502 +0000
-@@ -177,6 +177,7 @@
+@@ -182,6 +182,7 @@
      link_up: bool,
      events: Vec<fidl_mlme::MlmeEvent>,
      order: Vec<&'static str>,
@@ -9,7 +9,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
  }
  
  struct FakeDeviceOps {
-@@ -264,6 +265,8 @@
+@@ -271,6 +272,8 @@
          tx_flags: fidl_softmac::WlanTxInfoFlags,
          _async_id: Option<fuchsia_trace::Id>,
      ) -> Result<(), zx::Status> {
@@ -18,7 +18,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
          self.effects.lock().unwrap().frames.push((buffer.to_vec(), tx_flags));
          Ok(())
      }
-@@ -608,11 +611,17 @@
+@@ -615,11 +618,17 @@
              }
          }
          let stale_sme_timer = stale_sme_timer.expect("SME SAE retry timer");
@@ -38,7 +38,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
  
          let mut peer_updates = vec![];
          peer.on_sae_frame_rx(&mut peer_updates, sae_tx).unwrap();
-@@ -705,6 +714,11 @@
+@@ -747,6 +756,11 @@
          }
          assert!(saw_eapol_conf && saw_key_conf, "MLME confirmations must return to SME");
  
@@ -50,7 +50,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
          sme.on_disconnect_command(
              fidl_sme::UserDisconnectReason::WlanSmeUnitTesting,
              Default::default(),
-@@ -736,3 +750,70 @@
+@@ -778,3 +792,70 @@
          assert!(!effects.link_up, "cancellation must leave the controlled port closed");
          });
  }
@@ -158,7 +158,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
          self.akm_state_update_notify_sme(sta, state).await
      }
  
-@@ -1297,11 +1306,58 @@
+@@ -1308,11 +1317,58 @@
                      AuthProgress::InProgress => state.into(),
                      AuthProgress::Failed => state.transition_to(Joined).into(),
                  },
@@ -222,7 +222,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs b/src/connec
                  MlmeReq::Deauthenticate(_) => {
                      state.on_sme_deauthenticate(sta).await;
                      state.transition_to(Joined).into()
-@@ -1385,7 +1441,7 @@
+@@ -1396,7 +1452,7 @@
          }
      }
  

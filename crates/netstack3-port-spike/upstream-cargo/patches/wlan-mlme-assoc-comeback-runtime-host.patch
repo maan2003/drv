@@ -18,7 +18,7 @@
                      self.association_attempts
                  ));
                  return Ok(None);
-@@ -1339,6 +1341,9 @@
+@@ -1351,6 +1353,9 @@
                  States::Associating(mut state)
                      if state.comeback_generation == Some(generation) =>
                  {
@@ -28,7 +28,7 @@
                      state.comeback_timeout.take();
                      state.comeback_generation = None;
                      if state.association_attempts >= 3 {
-@@ -1363,7 +1368,7 @@
+@@ -1375,7 +1380,7 @@
                              sta.ctx.timer.schedule_after(duration, TimedEvent::Connecting);
                          sta.sta.connect_timeout.replace(timeout);
                          crate::sae_disposition(format_args!(
@@ -37,7 +37,7 @@
                              state.association_attempts
                          ));
                          state.into()
-@@ -1371,7 +1376,7 @@
+@@ -1383,7 +1388,7 @@
                  }
                  States::Associating(state) => {
                      crate::sae_disposition(format_args!(

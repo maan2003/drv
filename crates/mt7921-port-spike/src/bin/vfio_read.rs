@@ -3635,9 +3635,96 @@ fn run() -> Result<(), String> {
         } else {
             ("unclassified", "none", false)
         };
+        if cfg!(feature = "full-firmware-production") {
+            println!(
+                r#"{{"artifact_identity":"mt7921-validation-v2","flavor":"{flavor}","enabled_operation":"{operation}","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
+                option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
+                option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
+                option_env!("MT7921_FUCHSIA_ORDERED_PATCH_LIST").unwrap_or("unidentified"),
+                option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified"),
+                option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified"),
+            );
+        } else {
+            println!(
+                r#"{{"artifact_identity":"mt7921-validation-v1","flavor":"{flavor}","enabled_operation":"{operation}","source_commit":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified"),
+            );
+        }
+        return Ok(());
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--self-test-sae-h2e-association-request") {
+        if env::args().len() != 2 {
+            return Err("SAE-H2E association-request self-test accepts no additional arguments".into());
+        }
+        let base = option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified");
+        let patch_set = option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256")
+            .unwrap_or("unidentified");
+        let source_identity = option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified");
+        let materialized_tree = option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified");
+        let generated_source = option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified");
+        if base.len() != 40
+            || patch_set.len() != 64
+            || source_identity.len() != 64
+            || materialized_tree.len() != 64
+            || generated_source.len() != 64
+        {
+            return Err("SAE-H2E association self-test lacks derivation-owned source identity".into());
+        }
+        let (frame, without_h2e) = wlan_mlme::host_fixture::sae_h2e_association_request_fixture()
+            .map_err(|error| format!("SAE-H2E association fixture: {error}"))?;
+        let parse_ies = |bytes: &[u8]| -> Result<Vec<(u8, Vec<u8>)>, String> {
+            if bytes.len() < 28 {
+                return Err("association request is truncated".into());
+            }
+            let mut offset = 28;
+            let mut ies = Vec::new();
+            while offset < bytes.len() {
+                let len = usize::from(*bytes.get(offset + 1).ok_or("truncated IE header")?);
+                let body = bytes
+                    .get(offset + 2..offset + 2 + len)
+                    .ok_or("truncated IE body")?;
+                ies.push((bytes[offset], body.to_vec()));
+                offset += 2 + len;
+            }
+            Ok(ies)
+        };
+        if u16::from_le_bytes(frame[26..28].try_into().unwrap()) != 5 {
+            return Err("production ClientMlme listen interval drifted".into());
+        }
+        let ies = parse_ies(&frame)?;
+        let id_lengths = ies.iter().map(|(id, body)| (*id, body.len())).collect::<Vec<_>>();
+        if id_lengths != [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)] {
+            return Err(format!("production ClientMlme association IE ordering drifted: {id_lengths:?}"));
+        }
+        let expected_rsne = [1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
+            0x0f, 0xac, 8, 0xcc, 0];
+        let expected_ht = [0x73, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let expected_vht = [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+        let expected_wmm = [0, 0x50, 0xf2, 2, 0, 1, 0];
+        if ies[2].1 != expected_rsne || ies[3].1 != expected_ht || ies[4].1 != expected_vht
+            || ies[5].1 != [0x20] || ies[6].1 != expected_wmm
+        {
+            return Err("production ClientMlme RSN/HT/VHT/RSNXE/WMM bytes drifted".into());
+        }
+        let without_h2e_ies = parse_ies(&without_h2e)?;
+        if without_h2e_ies.iter().any(|(id, _)| *id == 244)
+            || without_h2e_ies.last() != Some(&(221, expected_wmm.to_vec()))
+        {
+            return Err("selected BSS without H2E incorrectly emitted RSNXE".into());
+        }
+        let digest = Sha256::digest(&frame);
+        let sha256 = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let frame_hex = frame.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let without_h2e_sha256 = Sha256::digest(&without_h2e)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         println!(
-            r#"{{"artifact_identity":"mt7921-validation-v1","flavor":"{flavor}","enabled_operation":"{operation}","source_commit":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
-            option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified")
+            r#"{{"sae_h2e_association_request_self_test":"passed","constructor":"wlan_mlme::client::ClientMlme","listen_interval":5,"ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","rsne_body_hex":"0100000fac040100000fac040100000fac08cc00","ht_body_hex":"730903ffff000000000000000000000100000000000000000000","vht_body_hex":"b2719033faff0000faff0000","rsnxe":"244:1:20","wmm_body_hex":"0050f202000100","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","stale_listen_interval0":false,"stale_vendor_only":false,"frame_len":{},"frame_sha256":"{sha256}","frame_hex":"{frame_hex}","without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
+            frame.len(),
         );
         return Ok(());
     }
@@ -3761,8 +3848,8 @@ fn run() -> Result<(), String> {
             return Err("full-firmware inert containment acquisition is invalid".into());
         }
         println!(
-            "{{\"full_firmware_preflight\":\"passed\",\"artifact_flavor\":\"full-firmware-production\",\"enabled_operation\":\"run-one-shot-sae-auth\",\"active_capable\":true,\"source_commit\":\"{}\",\"fd_contract\":\"credential-fd3+snapshot-fd4+immediate-eof\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"credential_eof\":true,\"credential_policy_binding\":\"{credential_policy_binding}\",\"snapshot_eof\":true,\"target\":\"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a\",\"regulatory_domain\":\"00\",\"regulatory_generation\":0,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
-            option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified"),
+            "{{\"full_firmware_preflight\":\"passed\",\"artifact_flavor\":\"full-firmware-production\",\"enabled_operation\":\"run-one-shot-sae-auth\",\"active_capable\":true,\"source_identity_sha256\":\"{}\",\"fd_contract\":\"credential-fd3+snapshot-fd4+immediate-eof\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"credential_eof\":true,\"credential_policy_binding\":\"{credential_policy_binding}\",\"snapshot_eof\":true,\"target\":\"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a\",\"regulatory_domain\":\"00\",\"regulatory_generation\":0,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
             snapshot
                 .source_sha256()
                 .iter()

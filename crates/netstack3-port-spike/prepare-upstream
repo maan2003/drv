@@ -64,6 +64,7 @@ host_patches=(
   "$patch_dir/wlan-mlme-assoc-comeback-host.patch"
   "$patch_dir/wlan-mlme-assoc-comeback-runtime-host.patch"
   "$patch_dir/wlan-mlme-disconnect-fixed-telemetry-host.patch"
+  "$patch_dir/wlan-mlme-host-fixture.patch"
 )
 patch_set=$(cat "${host_patches[@]}" | sha256sum | cut -d' ' -f1)
 patch_stamp="$refroot/.drv-host-patch-set"

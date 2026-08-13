@@ -1,7 +1,7 @@
 diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
 --- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-10 00:12:45.124556969 +0000
 +++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs	2026-08-10 01:13:27.884594201 +0000
-@@ -132,6 +132,21 @@
+@@ -137,6 +137,21 @@
      bytes
  }
 
@@ -23,7 +23,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
  fn peer_assoc_success() -> Vec<u8> {
      let mut bytes = vec![0x10, 0, 0, 0];
      bytes.extend_from_slice(&CLIENT);
-@@ -208,7 +223,13 @@
+@@ -215,7 +230,13 @@
      async fn discovery_support(
          &mut self,
      ) -> Result<fidl_softmac::DiscoverySupport, zx::Status> {
@@ -38,7 +38,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
      }
 
      async fn mac_sublayer_support(
-@@ -271,7 +292,7 @@
+@@ -278,7 +299,7 @@
          &mut self,
          _request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
      ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
@@ -47,7 +47,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs b/src/
      }
 
      async fn start_active_scan(
-@@ -367,6 +388,160 @@
+@@ -374,6 +395,160 @@
  }
 
  #[test]

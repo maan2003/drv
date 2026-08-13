@@ -56,8 +56,56 @@
               zstd -dc ${pkgs.wireless-regdb}/lib/firmware/regulatory.db.zst > "$out"
             fi
           '';
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
         in
         rec {
+          mt7921-fuchsia-source = mt7921FuchsiaSource;
+          mt7921-fuchsia-source-negative-tests = pkgs.runCommand
+            "mt7921-fuchsia-source-negative-tests"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.findutils pkgs.gnutar pkgs.gnugrep pkgs.patch ]; }
+            ''
+              set -euo pipefail
+              verify=${./nix/verify-mt7921-fuchsia-source.sh}
+              source=${mt7921FuchsiaSource}/reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}
+              cp ${mt7921FuchsiaSource}/reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}/.drv-host-patches expected
+              base=${mt7921FuchsiaSource.fuchsiaBaseRevision}
+              set_hash=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
+              closure=$(cat "$source/.drv-source-closure")
+
+              bash "$verify" "$source" "$base" expected "$set_hash" "$closure" derivation-owned
+              cp -R "$source" stale
+              chmod -R u+w stale
+              printf '%s\n' a5386e3039ac3d04ee9fe387e317272f3c8d0aa72661e57f9c2c6c02f19c33db \
+                > stale/.drv-host-patch-set
+              ! bash "$verify" stale "$base" expected "$set_hash" "$closure" derivation-owned
+
+              cp expected missing
+              sed -i '/wlan-mlme-host.patch/d' missing
+              ! bash "$verify" "$source" "$base" missing "$set_hash" "$closure" derivation-owned
+              cp expected reordered
+              sed -i '12,13{h;12d;13G}' reordered
+              ! bash "$verify" "$source" "$base" reordered "$set_hash" "$closure" derivation-owned
+
+              # The same bytes are rejected when labeled as an ignored
+              # working-tree reference; acceptance requires derivation ownership.
+              ! bash "$verify" "$source" "$base" expected "$set_hash" "$closure" ignored-reference
+
+              mkdir -p offset/a
+              printf 'inserted\nheader\nalpha\nbeta\ntail\n' > offset/a/file
+              cat > offset.patch <<'EOF'
+              --- a/a/file
+              +++ b/a/file
+              @@ -3,4 +3,4 @@
+               header
+              -alpha
+              +changed
+               beta
+               tail
+              EOF
+              ! bash ${./nix/apply-exact-patch.sh} offset offset.patch offset.log
+              grep -Fi offset offset.log
+              touch "$out"
+            '';
           audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
 
           netstack3-provider-daemon = pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix { };
@@ -234,40 +282,44 @@
             meta.mainProgram = "mt7921-rate-power-evidence";
           };
 
-          mt7921-full-firmware-validation = pkgs.stdenv.mkDerivation {
+          mt7921-full-firmware-validation =
+            assert
+              let spoof = builtins.getEnv "MT7921_FULL_FIRMWARE_SOURCE_COMMIT";
+              in spoof == "" || throw "MT7921_FULL_FIRMWARE_SOURCE_COMMIT is rejected: production identity is derived from immutable source hashes";
+            pkgs.rustPlatform.buildRustPackage {
             pname = "mt7921-full-firmware-validation";
             version = "0.1.0";
-            src =
-              let
-                fullFirmwareBinary = builtins.getEnv "MT7921_FULL_FIRMWARE_BINARY";
-              in
-              if fullFirmwareBinary == "" then
-                throw "set MT7921_FULL_FIRMWARE_BINARY to the exact locally verified release executable and evaluate with --impure"
-              else
-                builtins.path {
-                  path = fullFirmwareBinary;
-                  name = "mt7921-full-firmware-validation-unpatched";
-                };
-            sourceCommit =
-              let value = builtins.getEnv "MT7921_FULL_FIRMWARE_SOURCE_COMMIT";
-              in
-              if builtins.match "[0-9a-f]{40}" value == null then
-                throw "set MT7921_FULL_FIRMWARE_SOURCE_COMMIT to the 40-hex source commit embedded in the production executable"
-              else
-                value;
-            nativeBuildInputs = [
-              pkgs.autoPatchelfHook
-              pkgs.binutils
+            src = mt7921FuchsiaSource;
+            cargoRoot = "crates/mt7921-passive-scan";
+            buildAndTestSubdir = "crates/mt7921-passive-scan";
+            cargoLock.lockFile = ./crates/mt7921-passive-scan/Cargo.lock;
+            cargoBuildFlags = [
+              "--no-default-features"
+              "--features"
+              "fuchsia-passive,full-firmware-production"
             ];
-            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-            dontUnpack = true;
+            nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config pkgs.perl ];
+            MT7921_FUCHSIA_BASE_REVISION = mt7921FuchsiaSource.fuchsiaBaseRevision;
+            MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256 = mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256;
+            MT7921_FUCHSIA_ORDERED_PATCH_LIST = mt7921FuchsiaSource.fuchsiaOrderedPatchList;
+            preBuild = ''
+              ref=reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}
+              export MT7921_MATERIALIZED_SOURCE_TREE_SHA256=$(cat "$ref/.drv-materialized-source-tree-sha256")
+              export MT7921_GENERATED_CRATE_SOURCE_SHA256=$(cat "$ref/.drv-generated-crate-source-sha256")
+              export MT7921_SOURCE_IDENTITY_SHA256=$(cat "$ref/.drv-source-identity-sha256")
+              test "''${#MT7921_MATERIALIZED_SOURCE_TREE_SHA256}" -eq 64
+              test "''${#MT7921_GENERATED_CRATE_SOURCE_SHA256}" -eq 64
+              test "''${#MT7921_SOURCE_IDENTITY_SHA256}" -eq 64
+            '';
+            doCheck = false;
             installPhase = ''
               runHook preInstall
-              install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
+              driver=$(find target -path '*/release/mt7921-passive-scan' -type f -print -quit)
+              test -n "$driver"
+              install -Dm0755 "$driver" "$out/libexec/mt7921-full-firmware-validation"
               mkdir -p "$out/share/mt7921-full-firmware-validation"
-              cat > "$out/share/mt7921-full-firmware-validation/artifact-identity.json" <<EOF
-              {"artifact_identity":"mt7921-validation-v1","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_commit":"$sourceCommit","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
-              EOF
+              "$out/libexec/mt7921-full-firmware-validation" --artifact-identity \
+                > "$out/share/mt7921-full-firmware-validation/artifact-identity.json"
               cat > "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" <<'EOF'
               Passphrase=packaged-integration-only
               EOF
@@ -303,9 +355,13 @@
               cmp actual-identity.json "$evidence_dir/artifact-identity.json"
               "$driver" --self-test-rate-power-delivery > "$evidence_dir/rate-power-self-test.jsonl"
               "$driver" --self-test-production-validation > "$evidence_dir/production-self-test.jsonl"
+              "$driver" --self-test-sae-h2e-association-request > "$evidence_dir/sae-h2e-association-request-self-test.json"
               cat > "$evidence_dir/ARTIFACTS" <<EOF
               RATE_POWER_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/rate-power-self-test.jsonl" | cut -d ' ' -f1)
               PRODUCTION_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/production-self-test.jsonl" | cut -d ' ' -f1)
+              SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/sae-h2e-association-request-self-test.json" | cut -d ' ' -f1)
+              FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
+              FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
               REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               REGULATORY_GENERATION=0
               EOF
@@ -317,6 +373,10 @@
               test "$("$driver" --artifact-identity)" = "$(cat $out/share/mt7921-full-firmware-validation/artifact-identity.json)"
               grep -F '"flavor":"full-firmware-production"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"active_capable":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"fuchsia_ordered_patch_list":"${mt7921FuchsiaSource.fuchsiaOrderedPatchList}"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               strings "$driver" | grep -F '"full_firmware_preflight":"passed"'
               strings "$driver" | grep -F 'ram_published_firmware_start_acked'
               strings "$driver" | grep -F 'post_release_before_ram'
@@ -345,6 +405,22 @@
                 | grep -F '"txs_acked":true' \
                 | grep -F '"second_frame":false' \
                 | grep -F '"tmac_population_invariant":false'
+              association_output="$("$driver" --self-test-sae-h2e-association-request)"
+              printf '%s\n' "$association_output" \
+                | grep -F '"sae_h2e_association_request_self_test":"passed"' \
+                | grep -F '"constructor":"wlan_mlme::client::ClientMlme"' \
+                | grep -F '"listen_interval":5' \
+                | grep -F '"ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7"' \
+                | grep -F '"rsne_body_hex":"0100000fac040100000fac040100000fac08cc00"' \
+                | grep -F '"ht_body_hex":"730903ffff000000000000000000000100000000000000000000"' \
+                | grep -F '"vht_body_hex":"b2719033faff0000faff0000"' \
+                | grep -F '"wmm_body_hex":"0050f202000100"' \
+                | grep -F '"rsnxe_source":"selected_bss"' \
+                | grep -F '"selected_bss_without_h2e":"rsnxe_absent_wmm_present"' \
+                | grep -F '"stale_listen_interval0":false' \
+                | grep -F '"stale_vendor_only":false' \
+                | grep -F '"fuchsia_base_revision":"${mt7921FuchsiaSource.fuchsiaBaseRevision}"' \
+                | grep -F '"fuchsia_ordered_patch_set_sha256":"${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}"'
               integration_output="$(MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation")"
               printf '%s\n' "$integration_output" \
                 | grep -F '"packaged_zero_arg_integration":"passed"' \
@@ -651,7 +727,10 @@
                 --subst-var-by manifest ${mt7921-rate-power-evidence-manifest} \
                 --subst-var-by artifact_identity ${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                --subst-var-by cut ${pkgs.coreutils}/bin/cut
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
               chmod 0755 "$out/bin/mt7921-rate-power-evidence-root"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-root"
             '';
@@ -773,7 +852,15 @@
                 driver=${package}/bin/mt7921-full-firmware-validation-driver
                 supervisor=${supervisor}/bin/mt7921-full-firmware-validation-supervisor
                 identity=${package}/share/mt7921-full-firmware-validation/artifact-identity.json
+                fixture=${package}/share/mt7921-full-firmware-validation/sae-h2e-association-request-self-test.json
                 closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
+                test -s "$fixture"
+                source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                test "''${#source_identity}" -eq 64
+                test "''${#materialized_tree}" -eq 64
+                test "''${#generated_source}" -eq 64
                 cat > "$out" <<EOF
                 PACKAGE=${package}
                 LAUNCHER=$launcher
@@ -782,6 +869,14 @@
                 ELF_SHA256=$(sha256sum "$driver" | cut -d ' ' -f1)
                 ARTIFACT_IDENTITY=$identity
                 ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
+                SOURCE_IDENTITY_SHA256=$source_identity
+                FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
+                FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
+                FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
+                MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
+                GENERATED_CRATE_SOURCE_SHA256=$generated_source
+                SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=$fixture
+                SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)
                 FLAVOR=full-firmware-production
                 ACTIVE_CAPABLE=true
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
@@ -813,12 +908,16 @@
                 SECOND_FRAME=false
                 RETRY=false
                 EOF
+                grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$out"
+                grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$out"
+                grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$out"
+                grep -Fx "SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)" "$out"
               '';
 
           mt7921-full-firmware-validation-root-entry = pkgs.runCommand
             "mt7921-full-firmware-validation-root-entry"
             {
-              nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+              nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
               meta.mainProgram = "mt7921-full-firmware-validation-root";
             }
             ''
@@ -832,14 +931,18 @@
                 --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                --subst-var-by cut ${pkgs.coreutils}/bin/cut
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-root"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-full-firmware-validation-root"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-root"
             '';
 
           mt7921-validation-flavor-cross-wire-test = pkgs.runCommand
             "mt7921-validation-flavor-cross-wire-test"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; }
             ''
               cat > sudo-stub <<'EOF'
               #!${pkgs.runtimeShell}
@@ -847,23 +950,51 @@
               exit 1
               EOF
               chmod +x sudo-stub
+              cat > supervisor-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo called > "$PWD/supervisor-called"
+              exit 1
+              EOF
+              chmod +x supervisor-stub
               make_root() {
                 template=$1 output=$2 launcher=$3 manifest=$4 identity=$5
                 substitute "$template" "$output" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
                   --subst-var-by sudo "$PWD/sudo-stub" \
-                  --subst-var-by supervisor ${pkgs.coreutils}/bin/false \
+                  --subst-var-by supervisor "$PWD/supervisor-stub" \
                   --subst-var-by launcher "$launcher" \
                   --subst-var-by manifest "$manifest" \
                   --subst-var-by artifact_identity "$identity" \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                  --subst-var-by cut ${pkgs.coreutils}/bin/cut
+                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
+                ! grep -Eq '@[a-z_]+@' "$output"
                 chmod +x "$output"
               }
+              cat > evidence-identity.json <<'EOF'
+              {"artifact_identity":"mt7921-validation-v1","flavor":"rate-power-evidence-only","enabled_operation":"run-one-shot-power-setup","source_commit":"0000000000000000000000000000000000000000","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":false}
+              EOF
+              cat > evidence-launcher <<'EOF'
+              #!${pkgs.runtimeShell}
+              if [ "$#:''${1-}" = 1:--artifact-identity ]; then
+                cat "$PWD/evidence-identity.json"
+                exit 0
+              fi
+              echo called > "$PWD/evidence-operation-called"
+              exit 64
+              EOF
+              chmod +x evidence-launcher
+              cat > evidence-manifest <<'EOF'
+              FLAVOR=rate-power-evidence-only
+              ACTIVE_CAPABLE=false
+              FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
+              EOF
               production_launcher=${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation
-              evidence_launcher=${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence
+              evidence_launcher=$PWD/evidence-launcher
               production_identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
-              evidence_identity=${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json
+              evidence_identity=$PWD/evidence-identity.json
               test "$("$production_launcher" --artifact-identity)" = "$(cat "$production_identity")"
               test "$("$evidence_launcher" --artifact-identity)" = "$(cat "$evidence_identity")"
               test "$(cat "$production_identity")" != "$(cat "$evidence_identity")"
@@ -871,19 +1002,22 @@
               make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-elf \
                 "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$production_identity"
               make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-manifest \
-                "$production_launcher" ${mt7921-rate-power-evidence-manifest} "$production_identity"
+                "$production_launcher" "$PWD/evidence-manifest" "$production_identity"
               make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-elf \
-                "$production_launcher" ${mt7921-rate-power-evidence-manifest} "$evidence_identity"
+                "$production_launcher" "$PWD/evidence-manifest" "$evidence_identity"
               make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-manifest \
                 "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$evidence_identity"
+              : > "$out"
               for root in prod-wrong-elf prod-wrong-manifest evidence-wrong-elf evidence-wrong-manifest; do
                 if ./$root --plan; then
                   echo "cross-wired root unexpectedly passed: $root" >&2
                   exit 1
                 fi
+                printf 'CROSS_WIRE_REJECT root=%s before_sudo=true before_supervisor=true before_device=true\n' "$root" >> "$out"
               done
               test ! -e sudo-called
-              touch "$out"
+              test ! -e supervisor-called
+              test ! -e evidence-operation-called
             '';
 
           mt7921-full-firmware-inert-proof =
@@ -913,15 +1047,15 @@
                     def valid_path: test("^/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[^/[:space:]\\t]+$");
                     def valid_hash: test("^sha256:[0123456789abcdfghijklmnpqrsvwxyz]{52}$");
                     .closure | sort_by(.path) as $rows
-                    | if (($rows | length) == 75
-                        and ($rows | map(.path) | unique | length) == 75
+                    | if (($rows | length) == 76
+                        and ($rows | map(.path) | unique | length) == 76
                         and all($rows[]; (.path | valid_path) and (.narHash | valid_hash)))
-                      then $rows else error("invalid 75-path registered closure metadata") end
+                      then $rows else error("invalid \($rows | length)-path registered closure metadata") end
                     | .[] | [.path, .narHash] | @tsv
                   ' "$NIX_ATTRS_JSON_FILE" >"$out/closure.tsv"
                   cut -f1 "$out/closure.tsv" >"$out/closure.paths"
-                  test "$(wc -l < "$out/closure.tsv")" -eq 75
-                  test "$(awk -F '\t' 'NF == 2 && $1 != "" && $2 != "" { count++ } END { print count+0 }' "$out/closure.tsv")" -eq 75
+                  test "$(wc -l < "$out/closure.tsv")" -eq 76
+                  test "$(awk -F '\t' 'NF == 2 && $1 != "" && $2 != "" { count++ } END { print count+0 }' "$out/closure.tsv")" -eq 76
                 '';
               closureRootsFile = pkgs.writeText "mt7921-full-firmware-inert-proof-roots" (
                 pkgs.lib.concatMapStringsSep "\n" toString closureRoots + "\n"
@@ -955,8 +1089,11 @@
                 "$out/libexec/mt7921-closure-manifest-validate" \
                   "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" \
                   "$out/share/mt7921-full-firmware-inert-proof/closure.paths"
-                test "$(wc -l < "$out/share/mt7921-full-firmware-inert-proof/closure.tsv")" -eq 75
+                test "$(wc -l < "$out/share/mt7921-full-firmware-inert-proof/closure.tsv")" -eq 76
                 closure_manifest_sha256="$(${pkgs.coreutils}/bin/sha256sum "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" | cut -d' ' -f1)"
+                source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' \
+                  ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json)
+                test "''${#source_identity}" -eq 64
                 substitute ${./nix/mt7921-full-firmware-inert-proof.sh} \
                   "$out/bin/mt7921-full-firmware-inert-proof" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
@@ -968,7 +1105,7 @@
                   --subst-var-by closure_roots "$out/share/mt7921-full-firmware-inert-proof/closure.roots" \
                   --subst-var-by closure_manifest_sha256 "$closure_manifest_sha256" \
                   --subst-var-by manifest_verifier "$out/libexec/mt7921-closure-manifest-verify" \
-                  --subst-var-by commit aefc95ec3adea38d7ffbac4475cfbcb2848a9f38 \
+                  --subst-var-by source_identity "$source_identity" \
                   --subst-var-by id ${pkgs.coreutils}/bin/id \
                   --subst-var-by date ${pkgs.coreutils}/bin/date \
                   --subst-var-by install ${pkgs.coreutils}/bin/install \
@@ -1074,6 +1211,13 @@
                 runner_sha256=$(sha256sum "$runner" | cut -d ' ' -f1)
                 runner_registered_hash=$(cat ${runnerRegisteredHash})
                 manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
+                identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
+                source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                test "''${#source_identity}" -eq 64
+                test "''${#materialized_tree}" -eq 64
+                test "''${#generated_source}" -eq 64
                 substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} \
                   "$out/bin/mt7921-full-firmware-inert-proof-root" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
@@ -1085,6 +1229,12 @@
                   --subst-var-by manifest "$manifest" \
                   --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                   --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                  --subst-var-by source_identity "$source_identity" \
+                  --subst-var-by fuchsia_base_revision ${mt7921FuchsiaSource.fuchsiaBaseRevision} \
+                  --subst-var-by fuchsia_patch_set ${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256} \
+                  --subst-var-by fuchsia_patch_list ${mt7921FuchsiaSource.fuchsiaOrderedPatchList} \
+                  --subst-var-by materialized_tree "$materialized_tree" \
+                  --subst-var-by generated_source "$generated_source" \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                   --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                   --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
@@ -1101,7 +1251,12 @@
                 RUNNER_REGISTERED_HASH=$runner_registered_hash
                 FLAVOR=full-firmware-production
                 OPERATION=run-one-shot-sae-auth
-                SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7
+                SOURCE_IDENTITY_SHA256=$source_identity
+                FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
+                FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
+                FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
+                MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
+                GENERATED_CRATE_SOURCE_SHA256=$generated_source
                 ACTIVE_CAPABLE=true
                 EOF
                 runHook postInstall
@@ -1119,7 +1274,12 @@
                 grep -Fx "RUNNER_REGISTERED_HASH=$(cat ${runnerRegisteredHash})" "$manifest"
                 grep -Fx 'FLAVOR=full-firmware-production' "$manifest"
                 grep -Fx 'OPERATION=run-one-shot-sae-auth' "$manifest"
-                grep -Fx 'SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7' "$manifest"
+                grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$manifest"
+                grep -Fx 'FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}' "$manifest"
+                grep -Fx 'FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}' "$manifest"
+                grep -Fx 'FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}' "$manifest"
+                grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$manifest"
+                grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$manifest"
                 grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
                 grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
                 grep -Fx '  exec /run/wrappers/bin/sudo -n "$runner" --plan' "$entry"
@@ -1166,7 +1326,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v1","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_commit":"34acd735fdd1c232c456dfecf387875f9cb13af7","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
+              {"artifact_identity":"mt7921-validation-v2","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1188,6 +1348,12 @@
                   --subst-var-by manifest "$manifest" \
                   --subst-var-by launcher "$PWD/work/launcher" \
                   --subst-var-by artifact_identity "$PWD/work/identity" \
+                  --subst-var-by source_identity 1111111111111111111111111111111111111111111111111111111111111111 \
+                  --subst-var-by fuchsia_base_revision 1e1219e3fac944c9a906aea9646939746b6062b3 \
+                  --subst-var-by fuchsia_patch_set 2222222222222222222222222222222222222222222222222222222222222222 \
+                  --subst-var-by fuchsia_patch_list fixture.patch:3333 \
+                  --subst-var-by materialized_tree 4444444444444444444444444444444444444444444444444444444444444444 \
+                  --subst-var-by generated_source 5555555555555555555555555555555555555555555555555555555555555555 \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                   --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                   --subst-var-by nix_store "$PWD/work/nix-store-stub" \
@@ -1204,7 +1370,12 @@
               RUNNER_REGISTERED_HASH=sha256:registered-proof-stub
               FLAVOR=full-firmware-production
               OPERATION=run-one-shot-sae-auth
-              SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7
+              SOURCE_IDENTITY_SHA256=1111111111111111111111111111111111111111111111111111111111111111
+              FUCHSIA_BASE_REVISION=1e1219e3fac944c9a906aea9646939746b6062b3
+              FUCHSIA_ORDERED_PATCH_SET_SHA256=2222222222222222222222222222222222222222222222222222222222222222
+              FUCHSIA_ORDERED_PATCH_LIST=fixture.patch:3333
+              MATERIALIZED_SOURCE_TREE_SHA256=4444444444444444444444444444444444444444444444444444444444444444
+              GENERATED_CRATE_SOURCE_SHA256=5555555555555555555555555555555555555555555555555555555555555555
               ACTIVE_CAPABLE=true
               EOF
               }

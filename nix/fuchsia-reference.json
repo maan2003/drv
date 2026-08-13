@@ -121,5 +121,308 @@
     }
   ],
   "boringsslCommit": "156c7b75ae9b8c3b3f847acf264f17594c3859fb",
-  "pigweedCommit": "c14c119c51a82f6e044f81b7dad0a322091d4121"
+  "pigweedCommit": "c14c119c51a82f6e044f81b7dad0a322091d4121",
+  "archives": [
+    {
+      "path": "src/connectivity/bluetooth",
+      "sha256": "734388ee4e566f0f32f58f06dc25ffb1f96775ad2a7e67138ad1141787a1ee29",
+      "hash": "sha256-5Rxic2L/KiV9LCOJPsv+yW9NyLWp7UYS50hYNq/ecAw="
+    },
+    {
+      "path": "src/connectivity/network/netstack3",
+      "sha256": "916d82a887ca073e10415514fddc93df340fd9b87e786710809308afcb8c39fc",
+      "hash": "sha256-htzxY54MBdauPS5fDPthvUb2gH2vBMRzGJNM5tUqc6U="
+    },
+    {
+      "path": "src/connectivity/network/dhcpv4/client/core",
+      "sha256": "962bb9223dd18f05cae0d5d249e2d2843238b5b3c09373292cf98c6f88402784",
+      "hash": "sha256-U6pagwbUDRhnxbg9hOWQ6dsYcJ5rRd23UNap21MsdPk="
+    },
+    {
+      "path": "src/connectivity/network/dhcpv4/protocol",
+      "sha256": "bdbafbd47ef6be429b5c681057d79795b16bab530d8024b7b2e602745562bdf3",
+      "hash": "sha256-ZpNTdmd/MCihf+uZyaOgCha59GRMogyEma+8qwt1Em8="
+    },
+    {
+      "path": "src/connectivity/network/dns",
+      "sha256": "9e6c9f90a761a103f6464c6f9a1df7966546fc39b8e12d9bc46ca2274d2c09d4",
+      "hash": "sha256-tnQwqtl6A+4Zv7m80Rjw6JYmtxSHir3aSNKM2DnUUiM="
+    },
+    {
+      "path": "src/connectivity/policy/netcfg",
+      "sha256": "f3c681517a71c66047f5f5bc57a21749de0be4dda8c087093c4ac213b570b4cc",
+      "hash": "sha256-+5hh3Vlj/CKT/ODPhC9hNE5W7xePQsNtBDc2MadUPF0="
+    },
+    {
+      "path": "src/connectivity/wlan",
+      "sha256": "d6ed9959b0c1985c60da278ab2648101a95e6360e0cfb4bc5321dc064dcdaf68",
+      "hash": "sha256-GvWMWHyDLzhHSmR2BH9jwLUbkkNnWCPfE+VTodIPBRY="
+    },
+    {
+      "path": "src/lib/mundane",
+      "sha256": "88e588dcd60c7d7850610f8e7a17f05a9abe0fa37debef05fef6d1567fdac0af",
+      "hash": "sha256-0KK1KYXigfV9IKPMpVw0OL05599jhVGnbMVXhDdexsA="
+    },
+    {
+      "path": "src/lib/fuchsia-sync",
+      "sha256": "f7ef20a203229f4a5a1e719d70a4e687d97a43ac0b9aef4d0e28f3f633152471",
+      "hash": "sha256-DpOviztStdZoLwHi//UfZelR/Wgeqvw5+Y/H0USDu3Q="
+    },
+    {
+      "path": "src/lib/fuchsia-async",
+      "sha256": "47322450c6007fb30c53c79085c2c71fcd9e85df528a8401fd63314b5024977a",
+      "hash": "sha256-0sIqg4qw2QjWkEqVZz/LyCBd9ThH5WBUw+6E9ppfsks="
+    },
+    {
+      "path": "src/lib/trace/rust",
+      "sha256": "1dc5fec04e4fd0aaedb24bfef5811e07eea6ede2faa1665ab3d3aa84747970c4",
+      "hash": "sha256-u3QWmWkoxH2edT2jwBdLCJvhxQcI9Lbks5MpbfBnR6s="
+    },
+    {
+      "path": "src/lib/fidl/rust/fidl",
+      "sha256": "47d7e4b17b602a873b40d5670fb70f7895ef70e01785651e9e638c1fcf63ff14",
+      "hash": "sha256-WWRHP/OS9KzELSD2QRR5j2yZBrYQ4xKrM4MZLayR20s="
+    },
+    {
+      "path": "sdk/rust/zx-types",
+      "sha256": "21707baf097075b272393f733b4b611f345c3274b8d3d55d7d4f44f391ccc4b6",
+      "hash": "sha256-HbFtXS4Z95THmwGqsvQ/Di8X+aed/xIG74f/lUpnj2k="
+    },
+    {
+      "path": "sdk/rust/zx-status",
+      "sha256": "48fcb6bf7167bce24181b248f0bb08af49d87ab00a2cef2498c0da23804065f8",
+      "hash": "sha256-MeF8m2+AG+wThXTQ26JKMzF91UIE/WtsaY/YxDLlaO0="
+    },
+    {
+      "path": "sdk/rust/zx",
+      "sha256": "d692aa03e67c7a5deaea16d6a6cf10bcab931b8b996189987224040ab54d53c0",
+      "hash": "sha256-qFmgjUpF31Gm99TPsA04HJENtzko3ONj6eExyXUygfE="
+    },
+    {
+      "path": "sdk/lib/driver/runtime/rust",
+      "sha256": "83259aa4e921a7937bda1b6087d2473e042e4504b90d7098afee7db79fc01157",
+      "hash": "sha256-9+HYFOA64B2iY+7qpHYMB2clMQAB0a2JFo8igZJo/x0="
+    },
+    {
+      "path": "src/connectivity/lib/net-types",
+      "sha256": "11cb5c07554c696dcac6a658c742420931bfa338547c7edace59ea353e080575",
+      "hash": "sha256-EQTeAONfc5QlCPRUT92FLu84YDeSEVp6bFgjSeYOLEw="
+    },
+    {
+      "path": "src/connectivity/lib/net-declare",
+      "sha256": "dbcf8094a996aa1057da0fb7c22b2765c6f1c924415dd17443cf581429a1cad6",
+      "hash": "sha256-vVPk6QpwR4JtC25+G73tC5AW8YRYow5XRtWMKIBKhWQ="
+    },
+    {
+      "path": "src/connectivity/lib/internet-checksum",
+      "sha256": "1f967073eaba96982055bed2aa5740bd298465c0f46a52ae9164c7d924e7e9d5",
+      "hash": "sha256-GjTO4hcFZ8hMqcsazbSbXvUhP5MdjxKrxIyI+yL/b/o="
+    },
+    {
+      "path": "src/connectivity/lib/packet-formats",
+      "sha256": "33028cff3a736bbffd5c89a18eb44dd603577bd74f2d99aeff7679b7f6145f89",
+      "hash": "sha256-OtILq0JFzH6dCIO4sT8skr20f0iJ7PbSiqmCZMr6zYs="
+    },
+    {
+      "path": "src/connectivity/network/lib/diagnostics-traits",
+      "sha256": "4fbbfd4ab7e271476736cb70560f4149c2016788dc9f1f79dc0d9c19a944d8fb",
+      "hash": "sha256-9mbiupRAs8i7i3GL+QyfaiVXu4KSAeG7sHaWN7KBnmE="
+    },
+    {
+      "path": "src/connectivity/network/lib/explicit",
+      "sha256": "597a2a685c4d0b95d007f7f0cba9403bef24c1040f0e9bbb6d759a628772ba99",
+      "hash": "sha256-fNjLAmnaLb8yRErlkXpgxRG1k9m6PY+oHJBx3VRyvkQ="
+    },
+    {
+      "path": "src/media/audio/drivers/testing",
+      "sha256": "acae3065a7e188efa98b6e6d026b83cc6ce7db36107eb2035d74f24ef412a6c8",
+      "hash": "sha256-10aDWgqpMVM4sVmA6hkGWjX6GMZTR9i90aJUAw+3HQY="
+    },
+    {
+      "path": "src/media/audio/drivers/virtual-audio",
+      "sha256": "d5422858fe401eab1547a02e0d76e00ceaf4570087038fa28f2e35e91ab8eebc",
+      "hash": "sha256-gF/VBrMmd1kIOhdgqlgIVIYZlfTnWaVoCtgUKG8inn0="
+    },
+    {
+      "path": "src/media/audio/lib/clock",
+      "sha256": "eb761618e8bb62a590aaa2aede1ccaf95dda3b8fd78a6fdf548481a0a3638ac7",
+      "hash": "sha256-eSys8icFDHfb9jUzPwlmr63ouatruvekMX/5eqZbpY4="
+    },
+    {
+      "path": "src/media/audio/lib/processing",
+      "sha256": "5b26687d7efe0eabec8514d0abfc21193098f069fdc5bd5991d71d795ff5150e",
+      "hash": "sha256-SSscKX/wB9yu/4JD44uaFgZnOC8qWNYjQEAXMujVYIk="
+    },
+    {
+      "path": "src/media/audio/lib/timeline",
+      "sha256": "cbbb31a8ae5c49578f252208bcebe5f67556f986880d77189827ae340689a2f1",
+      "hash": "sha256-RMk5GJbuLmbDvbLB5bBVJTxnBOe5JSPEK2RjdPYm9sg="
+    },
+    {
+      "path": "src/media/audio/services/device_registry",
+      "sha256": "697ff5492fac586bb2146e8130f8f4dc5f305241acdaa4407d4aa2a384a588d1",
+      "hash": "sha256-uzJekdC/OX9rDitR1mbddy9sW/6kjVwezGb0PMwiQ+4="
+    },
+    {
+      "path": "src/media/audio/services/mixer",
+      "sha256": "02a9254d1b588cd7fd73c5ebdab88b785be779fa1add81afde8394b5559fc78f",
+      "hash": "sha256-1DOc3k9R1iXUNUenjgUltIy0zLFBH/knBYpBizQn/so="
+    },
+    {
+      "path": "src/lib/network/packet",
+      "sha256": "05a9b096a25692366542c54c57bc6fe5c8621e52c73e6720761d422456f9e118",
+      "hash": "sha256-fNU9frD6T1rKEsYS9Gunxja7wyILJJG2QbMjaJ9/1uQ="
+    },
+    {
+      "path": "src/lib/replace-with",
+      "sha256": "6104ae560567cfcbef719ecf97b6d4b1351c1e87a86288ada2a937f6b4381877",
+      "hash": "sha256-bqELi+WX1YFlCTIf+hYBHuVephWWtKLg74GCGt3OQUU="
+    },
+    {
+      "path": "third_party/rust_crates/forks/trust-dns-proto-0.22.0",
+      "sha256": "e2c5074dc330969f6381c3e7ab8f8bcd7b457d8c2bb465000ea174bd8076c7cb",
+      "hash": "sha256-OS+ZXO2jaJRbqeT7H0WTCz5UhcOLi8KUWjO4C+9ZS5M="
+    },
+    {
+      "path": "third_party/rust_crates/forks/trust-dns-resolver-0.22.0",
+      "sha256": "4b874a312f32c868244ac485fdd8ab06801fc41a06befe0679bfb7f03dd7b9db",
+      "hash": "sha256-gIWaBQ0DZoJNUsdiae4m8vanUcZxi9qEK63ve6PUmjk="
+    },
+    {
+      "path": "third_party/boringssl/rust",
+      "sha256": "6e96db3c1426215ad977277bd787eb415bf7187d39f41843d463e691c6bf441e",
+      "hash": "sha256-DHMA2AR/XnU+cmMQGhI8oOxQ35svn9JoTWDANn8MwlA="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.audio",
+      "sha256": "4aaee379e47a730da6e1b7f3f16c4b17f5b0ade6d7a024d6ef9ff1bb2545f8e5",
+      "hash": "sha256-hyDOHIvJUSMu7PAgq7/5TaTOdhKbrMZiBss0MxC2lf0="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.audio.effects",
+      "sha256": "546a717101e64e838053db704a667e1fa76770d930775cb1d667a4dc9036fa20",
+      "hash": "sha256-9vaxjnjotj4DobrRMML52H5bu+VTqSr8bglW5ofZY8Q="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth",
+      "sha256": "5a6296a7fc4daed22552ae5b928c2295f17343d44092a5063fbd3f627093c02a",
+      "hash": "sha256-3D2FderPsFdJI9F7S5gPRmua1qqqyjIrI4IZTj+02t0="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.a2dp",
+      "sha256": "a051a45d0cb9a57899d7dddff2313272610b4217eb753ab929ccf40465b0ef08",
+      "hash": "sha256-PlHtcsvdBUCCZXrZfz+yZkeP+GX+31LPcVxNZx/ZFqY="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.bredr",
+      "sha256": "e62d44095e99d1313ea417fe67a81c885be142ead67fd8a4aa3ed43f506a11ee",
+      "hash": "sha256-P0iYa75whRJrMEB94nErLodnEGQZoYO029HQ1XV69Kc="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.fastpair",
+      "sha256": "b45a89bb5d8ce07bb9694070485ea04cb9766342da429f6d2586fd32b2975084",
+      "hash": "sha256-ijNbAfgsrLlhMUMnTkwH/NfBxbzgTYBawjxSfXvvn2g="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.gatt",
+      "sha256": "6b3234b8125b5be0847b99c6e6cbe35c16e370daeacca5d6c82e38dd1eee8bca",
+      "hash": "sha256-3KOiODL+rjcuLvPfsTpRpQdEVeWRQUcyKLzOO9+AJZo="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.gatt2",
+      "sha256": "31071d574893eaa4f3832f2d768413a84f83e8c7002632838991911dcbcb082d",
+      "hash": "sha256-WR8bZsgeA6JImupfP7IoMdzzwBJ05xQcEv9mcu9+xLY="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.hfp",
+      "sha256": "224f041ea3416b5d3449515369784377a74c31e44eaec29042135e0d6f65bb12",
+      "hash": "sha256-eIRhjo0OF+0VwPhNQU8+5kreLo41SLGrNXNUap74OjI="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.host",
+      "sha256": "40c90424282b93c848b686730bdf9a7412c2435c11412d30d9f6f477fc2be3b8",
+      "hash": "sha256-kLjqpZYefNfbl5Z7+aIueB+0j3g6a2ttFv9tmdbsdiE="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.le",
+      "sha256": "48e22b1e480faeaf591ca86ec761d3d803bd3b7875479036d116c7af9355032f",
+      "hash": "sha256-eAk5D5hbCvWiK7s59hBA1kLHA7TZQhVA8jKj9w0ex3Q="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.sys",
+      "sha256": "ebc844231403d8f103c320cb1b972957329145c18f3bf4b54864b7a5eba31922",
+      "hash": "sha256-jJjwJR+Uf5Y0zFLSzScDcBRM9wBryvJkpi5B11XtOs4="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.bluetooth.test",
+      "sha256": "29bde2ce756b5f450e9756d77f074139b222daf80d67ff4a3dd681245584efc3",
+      "hash": "sha256-pAqeU79T5//pPCp6WQNtdqDwIWEKO081wRCnS+RjBJU="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.hardware.audio",
+      "sha256": "a7ded09a7b9e67f4d121a9d114e1d2a6415848ba96a72059605baa24c07d0d0b",
+      "hash": "sha256-EK1sCqf5wKP07Q7TeCxDtz4I6lBG9yInQWzGCZnv+TE="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.hardware.audio.signalprocessing",
+      "sha256": "8cdf31d43c4de4b64f7045fff91cf4a991c479a1d69e7693ef66d965fa98e89a",
+      "hash": "sha256-gQYZWXXA62NATjAf3NNbkSUVVlge/rQ49IP883utGHM="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.hardware.bluetooth",
+      "sha256": "35e61e1a9c251f2322161854d73e1dd37348fdc9f7c1d7e1475bf514e60ae851",
+      "hash": "sha256-UyORqbtfXeQgsakMa4z4i+w5935jbNY5KUBeYI/W8XU="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.common",
+      "sha256": "818ce44a39f7fe1b0ddb16384041a4f3c864a96aecab0effa770f20047b5e314",
+      "hash": "sha256-Kd7A/wzdMM3aTlwXQnu0vAQTKELbd//I/L40dP5iZd8="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.driver",
+      "sha256": "7783887da6bc7993c6f7680981331a84f838d4670a6f51cf35991984922418e6",
+      "hash": "sha256-OvPI0ytQs/dicjxsMyq5agq+ZqM82CDDQaHj91R/7O4="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.ieee80211",
+      "sha256": "f252363f062a59bf77f8a5e9ff54621a341b602a90dd344493285d13c6dc3f3f",
+      "hash": "sha256-GGyCmPPufPzixJc0eS7nKDZh97vZSjyjm6c9c80j0EU="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.internal",
+      "sha256": "68917849bcff14b179c285d71295127b4e3ea51843a0bfce7eda8bd7eb400dc0",
+      "hash": "sha256-ilZNaz4xIabQkRErjZFVtldXbehh3TnAC6HwfXwBaZE="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.minstrel",
+      "sha256": "def42800beb7412345b96573f44da6a0796d08d9bd65cdbfc1eb605f8fb83e9e",
+      "hash": "sha256-C3s2If7XNDC8pK5OXhQpGNAcvlFs8HSpmB6SIxP6xAY="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.mlme",
+      "sha256": "f70b6ce6f1fe3c5b3c274a910f3fb0856ba85bed4d37581e737002a0b69ea77e",
+      "hash": "sha256-Xx8iLJH8PNaKWGeDK2MlTxxW8MFDUXlLBvecZsM8wdE="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.sme",
+      "sha256": "98978d3c25b47f2de3fc3ae88b7019d819b4a66a0a0020291208fdd8cacc8a92",
+      "hash": "sha256-xhiLEmthVmpFKYbwYQfpwI7pcWyWVXG7M5idi/N0uu4="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.softmac",
+      "sha256": "0e8f3bfc1988ae137e03b939451247c466ef20c56b6f66ce100bffaaabafe1c2",
+      "hash": "sha256-f3diu9m0jGR8nvJYp1kGeyfqADJNTELYkvc3MkQipTc="
+    },
+    {
+      "path": "sdk/fidl/fuchsia.wlan.stats",
+      "sha256": "5c99c1856333540f25ba1105238fe00588e0a27a4ba28c40a3bfd98f02c1870a",
+      "hash": "sha256-J3VN0ObWmpZwyz6xLChjFfxoKuMc0sHjkA0qi+HDhpM="
+    }
+  ],
+  "boringsslArchive": {
+    "path": "third_party/boringssl/src",
+    "commit": "156c7b75ae9b8c3b3f847acf264f17594c3859fb",
+    "sha256": "254dfbca383677f5cd92388dc101aaac8e660cbe10776d5246f0838236eebd19",
+    "hash": "sha256-/Ma4Z2j6KS3+Gk9XYG+FltBW/HlzHxxFDbq8U+8B2jU="
+  }
 }

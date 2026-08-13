@@ -151,15 +151,15 @@ finish() {
   if [ "$status" -eq 0 ]; then echo "$out"; fi
   exit "$status"
 }
-out=$(@mktemp@ -d /var/lib/wifi-driver-lab/@commit@-inert-proof-$(@date@ -u +%Y%m%dT%H%M%SZ)-XXXXXX)
+out=$(@mktemp@ -d /var/lib/wifi-driver-lab/@source_identity@-inert-proof-$(@date@ -u +%Y%m%dT%H%M%SZ)-XXXXXX)
 trap finish EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cp "$expected_hashes" "$out/closure.expected.tsv"
 cp "$closure_roots" "$out/closure.roots"
-printf 'SCHEMA=%s\nCOMMIT=%s\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
-  "$schema" @commit@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
+printf 'SCHEMA=%s\nSOURCE_IDENTITY_SHA256=%s\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
+  "$schema" @source_identity@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
 
 cat >"$out/COMMANDS" <<EOF
 SCHEMA=$schema

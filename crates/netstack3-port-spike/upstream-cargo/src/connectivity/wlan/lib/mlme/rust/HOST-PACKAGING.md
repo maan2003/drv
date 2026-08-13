@@ -1,10 +1,11 @@
 # Pinned `wlan-mlme` host packaging inventory
 
 This directory contains host build metadata and an external integration
-harness. The adjacent `src/**` tree is materialized unchanged from Fuchsia commit
-`1e1219e3fac944c9a906aea9646939746b6062b3` by `prepare-upstream`. The manifest
-transcribes the pin's `BUILD.gn` client production dependencies and is a member
-of the shared pinned-source workspace.
+harness. Except for the project-owned effect-only `host_fixture.rs` described
+below, the adjacent `src/**` tree is materialized from Fuchsia commit
+`1e1219e3fac944c9a906aea9646939746b6062b3` and changed only by the named
+patches. The manifest transcribes the pin's `BUILD.gn` client production
+dependencies and is a member of the shared pinned-source workspace.
 
 ## Reviewable host selection
 
@@ -73,3 +74,9 @@ from a previously materialized reference is not accepted for this gate.
 with zero fuzz/offset or proves by an exact reverse dry-run that it is already
 applied. A content hash stamps the complete patch set, so a changed patch
 requires a fresh reference root instead of reusing contaminated material.
+# Project-owned installed-artifact fixture
+
+`src/host_fixture.rs` is project-owned, effect-only self-test plumbing compiled
+beside the pinned MLME. `wlan-mlme-host-fixture.patch` only exports that module.
+The fixture drives the real `client::ClientMlme`; it is not an extracted or
+replacement MLME implementation.
