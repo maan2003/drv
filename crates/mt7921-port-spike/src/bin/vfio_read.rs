@@ -3447,22 +3447,7 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
 fn realistic_rate_power_audit_commands(
     first_physical_sequence: u8,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let capability = mt7921_port_spike::NicCapability {
-        element_count: 0,
-        mac_address: None,
-        phy: Some(mt7921_port_spike::NicPhyCapability {
-            ht: true,
-            vht: true,
-            has_5ghz: true,
-            max_bandwidth: 2,
-            spatial_streams: 2,
-            hardware_path: 15,
-            he: true,
-        }),
-        has_6ghz: Some(false),
-        chip_capability: None,
-        unknown_elements: 0,
-    };
+    let capability = fixed_mt7921_rate_power_capability();
     const PRESENT_5GHZ: &[u16] = &[
         36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
         149, 153, 157, 161, 165,
@@ -3486,6 +3471,41 @@ fn realistic_rate_power_audit_commands(
         sequence = sequence % 15 + 1;
     }
     Ok(commands)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_native_rate_power_snapshot(
+    frozen: &FrozenRatePowerSnapshot,
+) -> Result<Vec<RatePowerByteEvidence>, String> {
+    if frozen.snapshot.source_sha256() != frozen.expected_source_sha256 {
+        return Err("rate-power snapshot source identity changed after decode".into());
+    }
+    let narrowed = narrow_regulatory_rate_power_snapshot(
+        &frozen.snapshot,
+        fixed_mt7921_rate_power_capability(),
+    )
+    .map_err(|error| format!("intersect authoritative rate-power input: {error:?}"))?;
+    let commands = encode_regulatory_rate_tx_power_commands(
+        fixed_mt7921_rate_power_capability(),
+        &narrowed,
+        0,
+        1,
+    )
+    .map_err(|error| format!("encode authoritative rate-power input: {error:?}"))?;
+    validate_native_rate_power_pages(&commands)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_native_rate_power_capability(
+    actual: mt7921_port_spike::NicCapability,
+) -> Result<(), String> {
+    let expected = fixed_mt7921_rate_power_capability();
+    if actual.phy != expected.phy || actual.has_6ghz != expected.has_6ghz {
+        return Err(format!(
+            "NIC capability cannot reproduce prevalidated native rate-power pages: {actual:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn run() -> Result<(), String> {
@@ -3517,12 +3537,6 @@ fn run() -> Result<(), String> {
         let ram = decompress_ram()?;
         Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
         Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
-        let watchdog = verify_external_watchdog_armed()?;
-        let watchdog_deadline = watchdog.deadline;
-        let containment = ContainmentLedger::acquire(Some(watchdog))?;
-        if containment.phase != RunPhase::Acquiring || containment.hardware_may_be_active() {
-            return Err("full-firmware inert containment acquisition is invalid".into());
-        }
         let frozen = read_rate_power_snapshot()?;
         let snapshot = &frozen.snapshot;
         let enabled = snapshot
@@ -3549,15 +3563,43 @@ fn run() -> Result<(), String> {
         {
             return Err("inert preflight regulatory snapshot identity is invalid".into());
         }
+        let page_evidence = validate_native_rate_power_snapshot(&frozen)?;
+        let actual_raw_sha256 = page_evidence
+            .iter()
+            .map(|page| page.raw_sha256.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let actual_normalized_envelope_sha256 = page_evidence
+            .iter()
+            .map(|page| page.normalized_envelope_sha256.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let actual_channel_sha256 = page_evidence
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                format!(
+                    r#"{{"page":{},"channels":[{}]}}"#,
+                    index + 1,
+                    rate_power_channels_json(&page.channels)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let watchdog = verify_external_watchdog_armed()?;
+        let watchdog_deadline = watchdog.deadline;
+        let containment = ContainmentLedger::acquire(Some(watchdog))?;
+        if containment.phase != RunPhase::Acquiring || containment.hardware_may_be_active() {
+            return Err("full-firmware inert containment acquisition is invalid".into());
+        }
         println!(
-            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{}\",\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"snapshot_eof\":true,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
             snapshot
                 .source_sha256()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
             frozen.wire_sha256,
-            NATIVE_RATE_POWER_RAW_SHA256.join(","),
         );
         return Ok(());
     }
@@ -3852,9 +3894,17 @@ fn run() -> Result<(), String> {
     .then(read_rate_power_snapshot)
     .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
-    let mut sae_credential = (operation == Operation::RunOneShotSaeAuth)
-        .then(read_sae_credential)
+    let _rate_power_evidence = rate_power_snapshot
+        .as_ref()
+        .map(validate_native_rate_power_snapshot)
         .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    let mut sae_credential = matches!(
+        operation,
+        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+    )
+    .then(read_sae_credential)
+    .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
     if operation == Operation::RunOneShotSaeAuth {
         record_sae_stage("credential_read");
@@ -5730,6 +5780,7 @@ fn run() -> Result<(), String> {
                                 let frozen = rate_power_snapshot
                                     .as_ref()
                                     .ok_or("regulatory snapshot was not frozen before VFIO")?;
+                                validate_native_rate_power_capability(report.nic_capability)?;
                                 let snapshot = narrow_regulatory_rate_power_snapshot(
                                     &frozen.snapshot,
                                     report.nic_capability,
@@ -6193,6 +6244,7 @@ fn run() -> Result<(), String> {
                                 let frozen = rate_power_snapshot
                                     .as_ref()
                                     .ok_or("regulatory snapshot was not frozen before VFIO")?;
+                                validate_native_rate_power_capability(report.nic_capability)?;
                                 let snapshot = narrow_regulatory_rate_power_snapshot(
                                     &frozen.snapshot,
                                     report.nic_capability,
@@ -8460,6 +8512,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct RatePowerByteEvidence {
     total_sha256: String,
     raw_sha256: String,
+    normalized_envelope_sha256: String,
     channels: Vec<(u8, String)>,
 }
 
@@ -8490,11 +8543,87 @@ fn rate_power_byte_evidence(encoded: &[u8]) -> Result<RatePowerByteEvidence, Str
         let offset = 44 + index * 162;
         channels.push((raw[offset], sha256_hex(&raw[offset + 1..offset + 162])));
     }
+    // The command sequence is allocated immediately before publication.  The
+    // normalized envelope is the complete TXD + raw request with only that
+    // dynamic byte (offset 39) replaced by zero.
+    let mut normalized = encoded.to_vec();
+    *normalized
+        .get_mut(39)
+        .ok_or("rate-power evidence omitted sequence byte")? = 0;
     Ok(RatePowerByteEvidence {
         total_sha256: sha256_hex(encoded),
         raw_sha256: sha256_hex(raw),
+        normalized_envelope_sha256: sha256_hex(&normalized),
         channels,
     })
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_native_rate_power_page(
+    encoded: &[u8],
+    ordinal: usize,
+) -> Result<RatePowerByteEvidence, String> {
+    if !(1..=8).contains(&ordinal) {
+        return Err("native rate-power page ordinal is invalid".into());
+    }
+    let expected_raw_length = if ordinal == 2 { 1016 } else { 1340 };
+    let expected_total_length = CONNAC2_MCU_TXD_BYTES + expected_raw_length;
+    let raw = encoded
+        .get(CONNAC2_MCU_TXD_BYTES..)
+        .ok_or("native rate-power page omitted raw request")?;
+    let txd_length = encoded.get(..4).map(|bytes| {
+        u32::from_le_bytes(bytes.try_into().expect("fixed TXD length")) as usize & 0xfff
+    });
+    let legacy_length = encoded
+        .get(32..34)
+        .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed legacy length")) as usize);
+    let expected_channel_count = if ordinal == 2 { 6 } else { 8 };
+    let expected_band = if ordinal <= 2 { 1 } else { 2 };
+    if encoded.len() != expected_total_length
+        || raw.len() != expected_raw_length
+        || txd_length != Some(expected_total_length)
+        || legacy_length != Some(expected_total_length - 32)
+        || encoded.get(36..39) != Some(&[0x5d, 0xa0, 1])
+        || !encoded
+            .get(39)
+            .is_some_and(|sequence| (1..=15).contains(sequence))
+        || raw.get(4) != Some(&(expected_channel_count as u8))
+        || raw.get(5) != Some(&(expected_band as u8))
+        || raw.get(6) != Some(&u8::from(ordinal == 8))
+    {
+        return Err(format!(
+            "native rate-power page {ordinal} has an invalid envelope"
+        ));
+    }
+    let evidence = rate_power_byte_evidence(encoded)?;
+    let expected_raw = NATIVE_RATE_POWER_RAW_SHA256[ordinal - 1];
+    let expected_envelope = NATIVE_RATE_POWER_NORMALIZED_ENVELOPE_SHA256[ordinal - 1];
+    if evidence.raw_sha256 != expected_raw
+        || evidence.normalized_envelope_sha256 != expected_envelope
+    {
+        return Err(format!(
+            "native rate-power page {ordinal} differs from captured bytes: raw={} expected_raw={expected_raw} normalized_envelope={} expected_normalized_envelope={expected_envelope}",
+            evidence.raw_sha256, evidence.normalized_envelope_sha256
+        ));
+    }
+    Ok(evidence)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_native_rate_power_pages(
+    commands: &[Vec<u8>],
+) -> Result<Vec<RatePowerByteEvidence>, String> {
+    if commands.len() != 8 {
+        return Err(format!(
+            "native rate-power generation contains {} pages instead of 8",
+            commands.len()
+        ));
+    }
+    commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| validate_native_rate_power_page(command, index + 1))
+        .collect()
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8527,58 +8656,23 @@ impl RatePowerDeliveryAudit {
             return Err("SET_RATE_TX_POWER page escaped the RX_PATH transaction".into());
         }
         let ordinal = self.pages + 1;
-        let expected_raw_length = if ordinal == 2 { 1016 } else { 1340 };
-        let expected_total_length = CONNAC2_MCU_TXD_BYTES + expected_raw_length;
-        let raw = encoded.get(CONNAC2_MCU_TXD_BYTES..);
-        let raw_length = raw.map(<[u8]>::len);
-        let txd_length = encoded.get(..4).map(|bytes| {
-            u32::from_le_bytes(bytes.try_into().expect("fixed TXD length field")) as usize & 0xfff
-        });
-        let legacy_length = encoded
-            .get(32..34)
-            .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed legacy length field")));
         let sequence = encoded.get(39).copied();
         let expected_sequence = self.previous_sequence.map(|previous| previous % 15 + 1);
-        let channel_count = raw.and_then(|request| request.get(4)).copied();
-        let band = raw.and_then(|request| request.get(5)).copied();
-        let last_msg = raw.and_then(|request| request.get(6)).copied();
-        let expected_channel_count = if ordinal == 2 { 6 } else { 8 };
-        let expected_band = if ordinal <= 2 { 1 } else { 2 };
-        if encoded.len() != expected_total_length
-            || raw_length != Some(expected_raw_length)
-            || txd_length != Some(expected_total_length)
-            || legacy_length != Some((expected_total_length - 32) as u16)
-            || encoded.get(36..39) != Some(&[0x5d, 0xa0, 1])
-            || !matches!(sequence, Some(1..=15))
-            || expected_sequence.is_some_and(|expected| sequence != Some(expected))
-            || channel_count != Some(expected_channel_count)
-            || band != Some(expected_band)
-            || last_msg != Some(u8::from(ordinal == 8))
-        {
+        if expected_sequence.is_some_and(|expected| sequence != Some(expected)) {
             return Err(format!(
-                "SET_RATE_TX_POWER page {ordinal} diverged: total_length={} expected_total_length={expected_total_length} raw_length={raw_length:?} expected_raw_length={expected_raw_length} txd_length={txd_length:?} legacy_length={legacy_length:?} sequence={sequence:?} expected_sequence={expected_sequence:?} channel_count={channel_count:?} band={band:?} last_msg={last_msg:?}",
-                encoded.len(),
+                "SET_RATE_TX_POWER page {ordinal} sequence {sequence:?} does not follow {expected_sequence:?}"
             ));
         }
-        let actual_raw_sha256 = sha256_hex(raw.expect("validated raw request"));
-        let mut normalized = encoded.to_vec();
-        normalized[39] = 0;
-        let actual_normalized_envelope_sha256 = sha256_hex(&normalized);
-        let expected_raw_sha256 = NATIVE_RATE_POWER_RAW_SHA256[usize::from(ordinal - 1)];
-        let expected_normalized_envelope_sha256 =
-            NATIVE_RATE_POWER_NORMALIZED_ENVELOPE_SHA256[usize::from(ordinal - 1)];
-        if actual_raw_sha256 != expected_raw_sha256
-            || actual_normalized_envelope_sha256 != expected_normalized_envelope_sha256
-        {
-            return Err(format!(
-                "SET_RATE_TX_POWER page {ordinal} differs from captured native bytes: raw={actual_raw_sha256} expected_raw={expected_raw_sha256} normalized_envelope={actual_normalized_envelope_sha256} expected_normalized_envelope={expected_normalized_envelope_sha256}"
-            ));
-        }
+        let evidence = validate_native_rate_power_page(encoded, usize::from(ordinal))?;
+        let expected_raw_length = if ordinal == 2 { 1016 } else { 1340 };
+        let expected_total_length = CONNAC2_MCU_TXD_BYTES + expected_raw_length;
         self.pages = ordinal;
         self.previous_sequence = sequence;
         record_sae_stage(&format!(
-            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={actual_raw_sha256} normalized_envelope_sha256={actual_normalized_envelope_sha256} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={} normalized_envelope_sha256={} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
             sequence.expect("validated sequence"),
+            evidence.raw_sha256,
+            evidence.normalized_envelope_sha256,
             expected_total_length - 32,
             u8::from(ordinal == 8)
         ));
@@ -9951,6 +10045,9 @@ impl VfioFirmwareLoader<'_> {
         let sequence = self.sequence;
         let mut encoded = encoded.to_vec();
         encoded[39] = sequence;
+        // This is the final sequence-adjusted byte vector.  Reject it before
+        // any producer index or descriptor can make it visible to firmware.
+        validate_native_rate_power_page(&encoded, usize::from(self.rate_power_delivery.pages) + 1)?;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         let before_ns = self.start.elapsed().as_nanos();
@@ -10027,7 +10124,7 @@ impl VfioFirmwareLoader<'_> {
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
         self.rate_power_delivery
-            .page_consumed_and_reclaimed(&encoded)?;
+            .page_consumed_and_reclaimed(&published)?;
         self.capture_patch_table_snapshot(&format!(
             "after_rate_power_page_{}",
             self.rate_power_delivery.pages
@@ -16176,6 +16273,127 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn native_rate_power_generation_is_validated_before_any_publication() {
+        let commands = realistic_rate_power_audit_commands(1).unwrap();
+        let evidence = validate_native_rate_power_pages(&commands).unwrap();
+        assert_eq!(evidence.len(), 8);
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|page| page.raw_sha256.as_str())
+                .collect::<Vec<_>>(),
+            NATIVE_RATE_POWER_RAW_SHA256
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|page| page.normalized_envelope_sha256.as_str())
+                .collect::<Vec<_>>(),
+            NATIVE_RATE_POWER_NORMALIZED_ENVELOPE_SHA256
+        );
+
+        for page in 0..8 {
+            let mut mutated = commands.clone();
+            mutated[page][CONNAC2_MCU_TXD_BYTES + 45] ^= 1;
+            assert!(validate_native_rate_power_pages(&mutated).is_err());
+        }
+
+        let mut header_mutation = commands;
+        header_mutation[7][34] ^= 1;
+        assert!(validate_native_rate_power_pages(&header_mutation).is_err());
+
+        let source = include_str!("vfio_read.rs");
+        let rate_sender = source
+            .split("fn send_rate_power_bytes")
+            .nth(1)
+            .unwrap()
+            .split("struct VfioRateTxPower")
+            .next()
+            .unwrap();
+        let sequence = rate_sender.find("encoded[39] = sequence").unwrap();
+        let golden = rate_sender
+            .find("validate_native_rate_power_page(&encoded")
+            .unwrap();
+        let publication = rate_sender.find("publish_mcu_bytes(").unwrap();
+        assert!(sequence < golden && golden < publication);
+        let client_sender = source
+            .split("fn send_client_ce_no_ack_bytes")
+            .nth(1)
+            .unwrap()
+            .split("fn send_passive_command")
+            .next()
+            .unwrap();
+        assert!(!client_sender.contains("validate_native_rate_power_page"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn supplied_snapshot_power_mutation_cannot_reach_transport() {
+        let database = include_bytes!("../../../mt7921-core/tests/fixtures/regulatory.db");
+        let source: [u8; 32] = Sha256::digest(database).into();
+        let snapshot = regulatory_rate_power_snapshot_from_regdb_v20(
+            database,
+            0,
+            *b"00",
+            fixed_mt7921_rate_power_capability(),
+            source,
+        )
+        .unwrap();
+        let mut wire = encode_rate_power_snapshot_wire(&snapshot);
+        // First channel's power byte. Preserve the wire digest so this tests
+        // the native page golden rather than transport corruption detection.
+        wire[55] -= 1;
+        let payload_len = wire.len() - 32;
+        let digest = Sha256::digest(&wire[..payload_len]);
+        wire[payload_len..].copy_from_slice(&digest);
+        let decoded = decode_rate_power_snapshot_wire(&wire, source).unwrap();
+        let frozen = FrozenRatePowerSnapshot {
+            snapshot: decoded,
+            expected_source_sha256: source,
+            wire_sha256: sha256_hex(&wire),
+        };
+        let device_calls = 0usize;
+        assert!(validate_native_rate_power_snapshot(&frozen).is_err());
+        assert_eq!(device_calls, 0);
+
+        let resign = |wire: &mut Vec<u8>| {
+            let payload_len = wire.len() - 32;
+            let digest = Sha256::digest(&wire[..payload_len]);
+            wire[payload_len..].copy_from_slice(&digest);
+        };
+        let valid_wire = encode_rate_power_snapshot_wire(&snapshot);
+        let mut stale = valid_wire.clone();
+        stale[5] = 1;
+        resign(&mut stale);
+        let stale = FrozenRatePowerSnapshot {
+            snapshot: decode_rate_power_snapshot_wire(&stale, source).unwrap(),
+            expected_source_sha256: source,
+            wire_sha256: String::new(),
+        };
+        assert!(validate_native_rate_power_snapshot(&stale).is_err());
+
+        let mut domain = valid_wire.clone();
+        domain[13..15].copy_from_slice(b"US");
+        resign(&mut domain);
+        let domain = FrozenRatePowerSnapshot {
+            snapshot: decode_rate_power_snapshot_wire(&domain, source).unwrap(),
+            expected_source_sha256: source,
+            wire_sha256: String::new(),
+        };
+        assert!(validate_native_rate_power_snapshot(&domain).is_err());
+        assert!(decode_rate_power_snapshot_wire(&valid_wire, [0; 32]).is_err());
+
+        let mut trailing = valid_wire.clone();
+        let digest = trailing.split_off(trailing.len() - 32);
+        trailing.push(0);
+        trailing.extend_from_slice(&digest);
+        resign(&mut trailing);
+        assert!(decode_rate_power_snapshot_wire(&trailing, source).is_err());
+        assert_eq!(device_calls, 0);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn live_support_satisfies_pinned_device_info_contract() {
         let capability = mt7921_port_spike::NicCapability {
             element_count: 1,
@@ -18744,8 +18962,11 @@ mod tests {
         let device_environment = run.find("DRV_PCI_BDF").unwrap();
         assert!(preflight < operation_dispatch && operation_dispatch < device_environment);
         let block = &run[preflight..operation_dispatch];
-        assert!(block.contains("Operation::RunOneShotSaeAuth"));
+        assert!(block.contains("Operation::RunOneShotPowerSetup"));
         assert!(block.contains("operation == Operation::RunOneShotPatchTableGate"));
+        assert!(block.contains("validate_native_rate_power_snapshot(&frozen)"));
+        assert!(block.contains("actual_normalized_envelope_sha256"));
+        assert!(block.contains("snapshot_eof\\\":true"));
         assert!(block.contains("ram_firmware_required\\\":true"));
         assert!(block.contains("device_opened\\\":false"));
         assert!(block.contains("vfio_opened\\\":false"));
@@ -18834,6 +19055,25 @@ mod tests {
                 && device_info < region_info
                 && region_info < contained
         );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn credential_and_native_snapshot_are_bound_before_device_access() {
+        let source = include_str!("vfio_read.rs");
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let snapshot = run.find("let rate_power_snapshot").unwrap();
+        let golden = run.find("let _rate_power_evidence").unwrap();
+        let credential = run.find("let mut sae_credential").unwrap();
+        let bdf = run.find("let bdf = env::var(\"DRV_PCI_BDF\")").unwrap();
+        let device = run.find("OpenOptions::new()").unwrap();
+        assert!(snapshot < golden && golden < credential && credential < bdf && bdf < device);
+        let credential_block = &run[credential..bdf];
+        assert!(credential_block.contains("Operation::RunOneShotPowerSetup"));
+        assert!(credential_block.contains("Operation::RunOneShotSaeAuth"));
     }
 
     #[test]
@@ -19000,14 +19240,10 @@ mod tests {
             let error = rate_power_audit_after_rx_path()
                 .page_consumed_and_reclaimed(&command)
                 .unwrap_err();
-            assert!(error.contains("raw_length="), "{error}");
-            assert!(error.contains("expected_raw_length=1340"), "{error}");
+            assert!(error.contains("invalid envelope"), "{error}");
         }
 
-        for (offset, width, field) in [
-            (0usize, 4usize, "txd_length="),
-            (32usize, 2usize, "legacy_length="),
-        ] {
+        for (offset, width) in [(0usize, 4usize), (32usize, 2usize)] {
             for delta in [-1i32, 1] {
                 let mut command = valid.clone();
                 if width == 4 {
@@ -19027,7 +19263,7 @@ mod tests {
                 let error = rate_power_audit_after_rx_path()
                     .page_consumed_and_reclaimed(&command)
                     .unwrap_err();
-                assert!(error.contains(field), "{error}");
+                assert!(error.contains("invalid envelope"), "{error}");
             }
         }
     }
@@ -19043,19 +19279,19 @@ mod tests {
         let error = audit
             .page_consumed_and_reclaimed(&sequence_gap)
             .unwrap_err();
-        assert!(error.contains("sequence=Some(2) expected_sequence=Some(1)"));
+        assert!(error.contains("sequence Some(2) does not follow Some(1)"));
 
-        for (offset, value, field) in [
-            (CONNAC2_MCU_TXD_BYTES + 4, 7, "channel_count=Some(7)"),
-            (CONNAC2_MCU_TXD_BYTES + 5, 2, "band=Some(2)"),
-            (CONNAC2_MCU_TXD_BYTES + 6, 1, "last_msg=Some(1)"),
+        for (offset, value) in [
+            (CONNAC2_MCU_TXD_BYTES + 4, 7),
+            (CONNAC2_MCU_TXD_BYTES + 5, 2),
+            (CONNAC2_MCU_TXD_BYTES + 6, 1),
         ] {
             let mut malformed = commands[0].clone();
             malformed[offset] = value;
             let error = rate_power_audit_after_rx_path()
                 .page_consumed_and_reclaimed(&malformed)
                 .unwrap_err();
-            assert!(error.contains(field), "{error}");
+            assert!(error.contains("invalid envelope"), "{error}");
         }
     }
 
