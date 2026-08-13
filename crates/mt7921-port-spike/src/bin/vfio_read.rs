@@ -24,6 +24,28 @@ use fuchsia_softmac_port::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use ieee80211::MacAddrBytes as _;
+#[cfg(feature = "fuchsia-passive")]
+use mt7921_port_spike::{
+    CONNAC2_MCU_TXD_BYTES, ClientChannelContext, ClientDataGeneration, ClientEdcaAc,
+    ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
+    ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
+    ClientWcid, ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation,
+    PassiveMcuCommand, PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport,
+    candidate_channels, classify_preassociation_sae_auth, connac2_group1_pn,
+    encode_client_bss_command, encode_client_data_txwi, encode_client_early_edca_command,
+    encode_client_edca_command, encode_client_interface_commands, encode_client_management_tx,
+    encode_client_post_assoc_beacon_timing_command,
+    encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
+    encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
+    encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
+    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
+    encode_ptk_command, encode_remove_wcid_command, linux_legacy_rate_context_reference,
+    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
+    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
+    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
+    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
+    set_client_txwi_wcid, validate_passive_mac_bar_read,
+};
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
@@ -49,28 +71,6 @@ use mt7921_port_spike::{
     prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
     read_dynamic_identity_status, reset_wfsys, round_trip_driver_ownership, select_vfio_irq,
     stage_disabled_firmware_chunk,
-};
-#[cfg(feature = "fuchsia-passive")]
-use mt7921_port_spike::{
-    ClientChannelContext, ClientDataGeneration, ClientEdcaAc, ClientEdcaParameters,
-    ClientFirmwareEffectsState, ClientPhysicalChannel, ClientPhysicalChannelEnsure,
-    ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease, ClientWcid,
-    ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
-    PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
-    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
-    encode_client_data_txwi, encode_client_early_edca_command, encode_client_edca_command,
-    encode_client_interface_commands, encode_client_management_tx,
-    encode_client_post_assoc_beacon_timing_command,
-    encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
-    encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
-    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
-    encode_legacy_wme_add_wcid_command, encode_ptk_command, encode_remove_wcid_command,
-    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
-    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
-    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, set_client_txwi_wcid,
-    validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -3114,6 +3114,13 @@ fn run_patch_table_gate_self_test() -> Result<(), String> {
 #[cfg(feature = "fuchsia-passive")]
 fn run_rate_power_delivery_self_test() -> Result<(), String> {
     let mut audit = RatePowerDeliveryAudit::default();
+    for command in [
+        PassiveMcuCommand::EepromBufferMode,
+        PassiveMcuCommand::ProtectCtrl,
+        PassiveMcuCommand::MacEnable,
+    ] {
+        audit.before_passive_command(&command)?;
+    }
     let rx_path = PassiveMcuCommand::SetRxPath {
         channel: mt7921_port_spike::CandidateChannel {
             band: mt7921_port_spike::PhysicalBand::Ghz2,
@@ -3133,14 +3140,16 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
         "{}",
         r#"{"rate_power_self_test":"command","ordinal":0,"name":"SET_RX_PATH"}"#
     );
-    for ordinal in 1..=8u8 {
-        let mut encoded = vec![0; if ordinal == 2 { 1016 } else { 1340 }];
-        encoded[36..39].copy_from_slice(&[0x5d, 0xa0, 1]);
-        encoded[46] = u8::from(ordinal == 8);
+    let mut commands = realistic_rate_power_audit_commands(15)?;
+    for (index, encoded) in commands.iter_mut().enumerate() {
+        let ordinal = index as u8 + 1;
         audit.page_consumed_and_reclaimed(&encoded)?;
         println!(
-            r#"{{"rate_power_self_test":"command","ordinal":{ordinal},"cid":"0x4005d","wait_response":false,"dma_didx_consumed":true,"descriptor_reclaimed":true,"last_msg":{}}}"#,
-            encoded[46]
+            r#"{{"rate_power_self_test":"command","ordinal":{ordinal},"cid":"0x4005d","sequence":{},"total_length":{},"raw_length":{},"wait_response":false,"dma_didx_consumed":true,"descriptor_reclaimed":true,"last_msg":{}}}"#,
+            encoded[39],
+            encoded.len(),
+            encoded.len() - CONNAC2_MCU_TXD_BYTES,
+            encoded[CONNAC2_MCU_TXD_BYTES + 6]
         );
     }
     audit.finish()?;
@@ -3153,9 +3162,51 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
     );
     println!(
         "{}",
-        r#"{"rate_power_self_test":"passed","order":"RX_PATH,8xSET_RATE_TX_POWER,ADD_DEVICE","reg_read_between_pages":0,"pages":8,"last_msg_page":8,"safe_reclaims":8}"#
+        r#"{"rate_power_self_test":"passed","audit":"hardware_post_dma_consumption_reclaim","order":"RX_PATH,8xSET_RATE_TX_POWER,ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7","total_lengths":"1404,1080,1404,1404,1404,1404,1404,1404","raw_lengths":"1340,1016,1340,1340,1340,1340,1340,1340","reg_read_between_pages":0,"pages":8,"last_msg_page":8,"safe_reclaims":8}"#
     );
     Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn realistic_rate_power_audit_commands(
+    first_physical_sequence: u8,
+) -> Result<Vec<Vec<u8>>, String> {
+    let capability = mt7921_port_spike::NicCapability {
+        element_count: 0,
+        mac_address: None,
+        phy: Some(mt7921_port_spike::NicPhyCapability {
+            ht: true,
+            vht: true,
+            has_5ghz: true,
+            max_bandwidth: 2,
+            spatial_streams: 2,
+            hardware_path: 15,
+            he: true,
+        }),
+        has_6ghz: Some(false),
+        chip_capability: None,
+        unknown_elements: 0,
+    };
+    let mut commands = encode_conservative_rate_tx_power_commands(
+        capability,
+        ConservativePowerLimits {
+            alpha2: *b"00",
+            max_reg_power_dbm: 20,
+            sar_limit_half_dbm: Some(40),
+            external_safety_cap_half_dbm: Some(0),
+        },
+        1,
+    )
+    .map_err(|error| format!("encode realistic rate-power audit fixture: {error:?}"))?;
+    let mut sequence = first_physical_sequence;
+    for command in &mut commands {
+        if !(1..=15).contains(&sequence) {
+            return Err("realistic rate-power audit fixture has invalid first sequence".into());
+        }
+        command[39] = sequence;
+        sequence = sequence % 15 + 1;
+    }
+    Ok(commands)
 }
 
 fn run() -> Result<(), String> {
@@ -7928,6 +7979,7 @@ struct RatePowerDeliveryAudit {
     after_rx_path: bool,
     pages: u8,
     complete: bool,
+    previous_sequence: Option<u8>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -7951,20 +8003,45 @@ impl RatePowerDeliveryAudit {
             return Err("SET_RATE_TX_POWER page escaped the RX_PATH transaction".into());
         }
         let ordinal = self.pages + 1;
-        let expected_len = if ordinal == 2 { 1016 } else { 1340 };
-        let last_msg = encoded.get(46).copied();
-        if encoded.len() != expected_len
+        let expected_raw_length = if ordinal == 2 { 1016 } else { 1340 };
+        let expected_total_length = CONNAC2_MCU_TXD_BYTES + expected_raw_length;
+        let raw = encoded.get(CONNAC2_MCU_TXD_BYTES..);
+        let raw_length = raw.map(<[u8]>::len);
+        let txd_length = encoded.get(..4).map(|bytes| {
+            u32::from_le_bytes(bytes.try_into().expect("fixed TXD length field")) as usize & 0xfff
+        });
+        let legacy_length = encoded
+            .get(32..34)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed legacy length field")));
+        let sequence = encoded.get(39).copied();
+        let expected_sequence = self.previous_sequence.map(|previous| previous % 15 + 1);
+        let channel_count = raw.and_then(|request| request.get(4)).copied();
+        let band = raw.and_then(|request| request.get(5)).copied();
+        let last_msg = raw.and_then(|request| request.get(6)).copied();
+        let expected_channel_count = if ordinal == 2 { 6 } else { 8 };
+        let expected_band = if ordinal <= 2 { 1 } else { 2 };
+        if encoded.len() != expected_total_length
+            || raw_length != Some(expected_raw_length)
+            || txd_length != Some(expected_total_length)
+            || legacy_length != Some((expected_total_length - 32) as u16)
             || encoded.get(36..39) != Some(&[0x5d, 0xa0, 1])
+            || !matches!(sequence, Some(1..=15))
+            || expected_sequence.is_some_and(|expected| sequence != Some(expected))
+            || channel_count != Some(expected_channel_count)
+            || band != Some(expected_band)
             || last_msg != Some(u8::from(ordinal == 8))
         {
             return Err(format!(
-                "SET_RATE_TX_POWER page {ordinal} diverged: len={} last_msg={last_msg:?}",
-                encoded.len()
+                "SET_RATE_TX_POWER page {ordinal} diverged: total_length={} expected_total_length={expected_total_length} raw_length={raw_length:?} expected_raw_length={expected_raw_length} txd_length={txd_length:?} legacy_length={legacy_length:?} sequence={sequence:?} expected_sequence={expected_sequence:?} channel_count={channel_count:?} band={band:?} last_msg={last_msg:?}",
+                encoded.len(),
             ));
         }
         self.pages = ordinal;
+        self.previous_sequence = sequence;
         record_sae_stage(&format!(
-            "rate_power_delivery page={ordinal} cid=0x4005d wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            sequence.expect("validated sequence"),
+            expected_total_length - 32,
             u8::from(ordinal == 8)
         ));
         Ok(())
@@ -17796,9 +17873,7 @@ mod tests {
             assert!(recovered.contains(proof), "{proof}");
         }
         let failure = recovered.find("experiment_rc != 0").unwrap();
-        let disarm = recovered
-            .find("\"$wifi_lab_watchdog\" disarm")
-            .unwrap();
+        let disarm = recovered.find("\"$wifi_lab_watchdog\" disarm").unwrap();
         let complete = recovered.find("COMPLETE realtime=").unwrap();
         assert!(disarm < failure && failure < complete);
         assert!(recovered.contains("reason=experiment_rc_$experiment_rc"));
@@ -18221,6 +18296,137 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(sae.matches("program_live_rate_power(").count(), 0);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn rate_power_audit_after_rx_path() -> RatePowerDeliveryAudit {
+        let mut audit = RatePowerDeliveryAudit::default();
+        for command in [
+            PassiveMcuCommand::EepromBufferMode,
+            PassiveMcuCommand::ProtectCtrl,
+            PassiveMcuCommand::MacEnable,
+            PassiveMcuCommand::SetRxPath {
+                channel: mt7921_port_spike::CandidateChannel {
+                    band: mt7921_port_spike::PhysicalBand::Ghz2,
+                    number: 1,
+                    frequency_mhz: 2412,
+                },
+                antenna_mask: 3,
+            },
+        ] {
+            audit.before_passive_command(&command).unwrap();
+        }
+        audit
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn rewrite_rate_power_envelope_lengths(command: &mut [u8]) {
+        let total = command.len();
+        let txd0 = u32::from_le_bytes(command[..4].try_into().unwrap());
+        command[..4]
+            .copy_from_slice(&((txd0 & !0xfff) | u32::try_from(total).unwrap()).to_le_bytes());
+        command[32..34].copy_from_slice(&u16::try_from(total - 32).unwrap().to_le_bytes());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_post_reclaim_audit_accepts_real_loader_lengths_and_wrapped_sequences() {
+        let mut audit = rate_power_audit_after_rx_path();
+        let commands = realistic_rate_power_audit_commands(15).unwrap();
+        assert_eq!(
+            commands.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1404, 1080, 1404, 1404, 1404, 1404, 1404, 1404]
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command[39])
+                .collect::<Vec<_>>(),
+            [15, 1, 2, 3, 4, 5, 6, 7]
+        );
+        for command in &commands {
+            audit.page_consumed_and_reclaimed(command).unwrap();
+        }
+        audit.finish().unwrap();
+        audit
+            .before_passive_command(&PassiveMcuCommand::AddDevice {
+                mac: [2, 0, 0, 0, 0, 1],
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_post_reclaim_audit_rejects_payload_and_envelope_off_by_one() {
+        let valid = realistic_rate_power_audit_commands(15).unwrap().remove(0);
+        for delta in [-1isize, 1] {
+            let mut command = valid.clone();
+            if delta < 0 {
+                command.pop();
+            } else {
+                command.push(0);
+            }
+            rewrite_rate_power_envelope_lengths(&mut command);
+            let error = rate_power_audit_after_rx_path()
+                .page_consumed_and_reclaimed(&command)
+                .unwrap_err();
+            assert!(error.contains("raw_length="), "{error}");
+            assert!(error.contains("expected_raw_length=1340"), "{error}");
+        }
+
+        for (offset, width, field) in [
+            (0usize, 4usize, "txd_length="),
+            (32usize, 2usize, "legacy_length="),
+        ] {
+            for delta in [-1i32, 1] {
+                let mut command = valid.clone();
+                if width == 4 {
+                    let word =
+                        u32::from_le_bytes(command[offset..offset + width].try_into().unwrap());
+                    let length = (word & 0xfff) as i32 + delta;
+                    command[offset..offset + width].copy_from_slice(
+                        &((word & !0xfff) | u32::try_from(length).unwrap()).to_le_bytes(),
+                    );
+                } else {
+                    let length = i32::from(u16::from_le_bytes(
+                        command[offset..offset + width].try_into().unwrap(),
+                    )) + delta;
+                    command[offset..offset + width]
+                        .copy_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+                }
+                let error = rate_power_audit_after_rx_path()
+                    .page_consumed_and_reclaimed(&command)
+                    .unwrap_err();
+                assert!(error.contains(field), "{error}");
+            }
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_post_reclaim_audit_rejects_noncontiguous_physical_sequence_and_page_fields() {
+        let commands = realistic_rate_power_audit_commands(15).unwrap();
+        let mut audit = rate_power_audit_after_rx_path();
+        audit.page_consumed_and_reclaimed(&commands[0]).unwrap();
+        let mut sequence_gap = commands[1].clone();
+        sequence_gap[39] = 2;
+        let error = audit
+            .page_consumed_and_reclaimed(&sequence_gap)
+            .unwrap_err();
+        assert!(error.contains("sequence=Some(2) expected_sequence=Some(1)"));
+
+        for (offset, value, field) in [
+            (CONNAC2_MCU_TXD_BYTES + 4, 7, "channel_count=Some(7)"),
+            (CONNAC2_MCU_TXD_BYTES + 5, 2, "band=Some(2)"),
+            (CONNAC2_MCU_TXD_BYTES + 6, 1, "last_msg=Some(1)"),
+        ] {
+            let mut malformed = commands[0].clone();
+            malformed[offset] = value;
+            let error = rate_power_audit_after_rx_path()
+                .page_consumed_and_reclaimed(&malformed)
+                .unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
     }
 
     #[test]

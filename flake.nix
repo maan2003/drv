@@ -160,7 +160,14 @@
               strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false'
               rate_output="$("$driver" --self-test-rate-power-delivery)"
               test "$(printf '%s\n' "$rate_output" | grep -c '"rate_power_self_test":"command"')" -eq 10
-              printf '%s\n' "$rate_output" | grep -F '"rate_power_self_test":"passed"' | grep -F '"reg_read_between_pages":0' | grep -F '"safe_reclaims":8'
+              printf '%s\n' "$rate_output" \
+                | grep -F '"rate_power_self_test":"passed"' \
+                | grep -F '"audit":"hardware_post_dma_consumption_reclaim"' \
+                | grep -F '"total_lengths":"1404,1080,1404,1404,1404,1404,1404,1404"' \
+                | grep -F '"raw_lengths":"1340,1016,1340,1340,1340,1340,1340,1340"' \
+                | grep -F '"sequences":"15,1,2,3,4,5,6,7"' \
+                | grep -F '"reg_read_between_pages":0' \
+                | grep -F '"safe_reclaims":8'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
               grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
