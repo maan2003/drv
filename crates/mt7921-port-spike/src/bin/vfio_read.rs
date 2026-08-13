@@ -2809,6 +2809,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         post_association_data_wait: None,
         eapol_start_deadline: None,
         eapol_start_emitted: false,
+        suppress_eapol_liveness: false,
     };
     let support = live_client_support(query_from_capabilities(capability, &candidates));
     let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
@@ -5489,6 +5490,7 @@ fn run() -> Result<(), String> {
                                         post_association_data_wait: None,
                                         eapol_start_deadline: None,
                                         eapol_start_emitted: false,
+                                        suppress_eapol_liveness: e2e94_probe,
                                         // Peer/key WCID state remains association-owned. The
                                         // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
@@ -10759,6 +10761,7 @@ struct LiveClientEffects {
     post_association_data_wait: Option<Instant>,
     eapol_start_deadline: Option<(Instant, u64)>,
     eapol_start_emitted: bool,
+    suppress_eapol_liveness: bool,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -11341,8 +11344,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .association_generation
             .expect("successful association publishes its generation");
         self.post_association_data_wait = Some(Instant::now());
-        self.eapol_start_deadline = Some((Instant::now() + EAPOL_START_WAIT, generation));
+        self.eapol_start_deadline = (!self.suppress_eapol_liveness)
+            .then(|| (Instant::now() + EAPOL_START_WAIT, generation));
         self.eapol_start_emitted = false;
+        if self.suppress_eapol_liveness {
+            record_sae_stage("eapol_liveness type=start timer=disabled one_shot=validation_mode");
+        }
         record_sae_stage(&format!(
             "firmware_wcid_stage stage=associated peer_wcid={} sta_state=assoc normalized_aid={aid} peer_identity=true keys=false port_open=false protected_management=closed",
             peer_wcid.get()
@@ -11411,7 +11418,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
         let Some(mut frame) = io.next_client_rx()? else {
-            if let Some((deadline, generation)) = self.eapol_start_deadline {
+            if self.suppress_eapol_liveness {
+                if self.eapol_start_deadline.take().is_some() {
+                    record_sae_stage(
+                        "eapol_liveness type=start timer=cancelled one_shot=validation_mode",
+                    );
+                }
+            } else if let Some((deadline, generation)) = self.eapol_start_deadline {
                 if self.firmware.association_generation != Some(generation)
                     || self.firmware.association.is_none()
                     || self.firmware.ptk_installed
@@ -15903,6 +15916,7 @@ mod tests {
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
+            suppress_eapol_liveness: false,
         };
 
         // The selector's scan 7 result is moved into the runtime. External BSS
@@ -16029,6 +16043,30 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn validation_mode_cancels_expired_eapol_liveness_without_tx() {
+        let mut io = TestClientIo::default();
+        let mut effects = LiveClientEffects {
+            state: Arc::new(Mutex::new(LiveClientState::default())),
+            target: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            client: [6, 5, 4, 3, 2, 1],
+            rcpi: 100,
+            dtim_period: 2,
+            firmware: ClientFirmwareEffectsState::default(),
+            peer_wcid: None,
+            post_association_data_wait: None,
+            eapol_start_deadline: Some((Instant::now(), 1)),
+            eapol_start_emitted: false,
+            suppress_eapol_liveness: true,
+        };
+
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(effects.eapol_start_deadline.is_none());
+        assert!(!effects.eapol_start_emitted);
+        assert!(io.tx.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn live_client_effects_close_sae_eapol_keys_port_data_and_teardown_in_order() {
         let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
         let mut io = TestClientIo::default();
@@ -16043,6 +16081,7 @@ mod tests {
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
+            suppress_eapol_liveness: false,
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -16413,6 +16452,7 @@ mod tests {
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
+            suppress_eapol_liveness: false,
         };
         physically_unbound
             .set_channel(
@@ -16477,6 +16517,7 @@ mod tests {
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
+            suppress_eapol_liveness: false,
         };
         effects
             .set_channel(
@@ -16566,6 +16607,7 @@ mod tests {
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
+            suppress_eapol_liveness: false,
         };
         effects
             .set_channel(
@@ -17889,6 +17931,8 @@ mod tests {
         assert!(source.contains("ram_published_firmware_start_acked"));
         assert!(source.contains("post_release_before_ram"));
         assert!(source.contains("immediately_predata"));
+        assert!(source.contains("suppress_eapol_liveness: e2e94_probe"));
+        assert!(source.contains("timer=disabled one_shot=validation_mode"));
 
         let transmit = source
             .split("self.e2e81_snapshot(\"immediately_before_BE\")")
@@ -19564,6 +19608,7 @@ mod tests {
                 post_association_data_wait: None,
                 eapol_start_deadline: None,
                 eapol_start_emitted: false,
+                suppress_eapol_liveness: false,
             };
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
