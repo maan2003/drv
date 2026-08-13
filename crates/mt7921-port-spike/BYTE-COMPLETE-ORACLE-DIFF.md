@@ -20,7 +20,10 @@ report was mode 0600 and removed after reconstruction.
 
 [`lab/byte-complete-oracle-diff.py`](lab/byte-complete-oracle-diff.py) compares
 masked byte manifests directly and reports the first differing byte and bit;
-it performs no TLV or field normalization.
+it performs no TLV or field normalization. Manifests must also contain both
+complete ordered command sequences, so a selected payload subset cannot hide
+a missing or extra command. `--command-sequence LINUX USERSPACE` compares
+`mcu_source` records directly.
 
 ## Full payload results
 
@@ -47,10 +50,11 @@ first-difference result is `none`:
 | rate/power batch 6 | 1341 | `b2f853bd7b3f6580d259d63b0ad34d97a7343337ee8fa880a13bf487d00fcea0` |
 | rate/power batch 7 | 1341 | `9b0d9cc77968fb5306e3008622c35a3a7d7fe43e6e22c8cd9a2780278bb013ea` |
 
-The report order also agrees byte-command-for-byte-command: DEV_INFO, initial
+The selected payload subset has the same relative order: DEV_INFO, initial
 BSS_INFO, channel/rate/power readiness, preauth peer, associated BSS, associated
-peer, EDCA, then interface WCID. No extra Linux pre-key command is absent from
-the userspace readiness path.
+peer, EDCA, then interface WCID. The original record-only manifest did not
+encode the full command streams, so it could not support the stronger claim
+that no native pre-key command was absent.
 
 ## MMIO and post-association state
 
@@ -75,11 +79,14 @@ EtherType `0x888e`, fixed OFDM6, qidx 3, hardware sequence/FCS ownership.
 
 ## Conclusion
 
-There is no unmasked byte, bit, command-order, MMIO, register-state, TXD/TXP,
-802.11-header, or LLC divergence available to fix. E2E87's peer-WCID-1 probe
-still ended in firmware status 1/count 15 with no TXS. Host-visible internal
-evidence is exhausted; the next useful discriminator requires external RF or
-firmware visibility. No E2E88 is justified.
+There is no unmasked byte or bit divergence in the selected payloads and
+TXD/TXP records. A later full command-sequence audit found that userspace
+omits native CE RSSI monitor `0x400a1` and UNI ROC-abort `0x20027` records.
+Source audit classifies them as optional CQM policy and cleanup of Linux's
+managed JOIN-ROC transaction respectively, not as proven TX-table setup.
+The comparison tool now reports these omissions instead of allowing a
+record-only manifest to hide them. E2E87's peer-WCID-1 probe still ended in
+firmware status 1/count 15 with no TXS.
 
 
 ## Firmware-owned state inventory

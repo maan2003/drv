@@ -2,6 +2,7 @@
 """Compare privacy-masked byte transcripts without decoding their schemas."""
 
 import argparse
+import difflib
 import hashlib
 import json
 import re
@@ -17,22 +18,58 @@ def first_difference(left: bytes, right: bytes) -> str:
     return "none"
 
 
-
 FW_STATE = re.compile(r"fw_state region=(\S+) offset=(0x[0-9a-f]+) addr=(0x[0-9a-f]+) value=([0-9a-f]{8})")
+MCU_SOURCE = re.compile(
+    r"mcu_source cmd=(0x[0-9a-f]+) payload_len=([0-9]+) wait=([01])"
+)
+
+
+def command_sequence(path):
+    records = []
+    with open(path, encoding="utf-8") as source:
+        for line in source:
+            match = MCU_SOURCE.search(line)
+            if match:
+                command, payload_len, wait = match.groups()
+                records.append((int(command, 16), int(payload_len), int(wait)))
+    return records
+
+
+def command_label(record):
+    command, payload_len, wait = record
+    return f"cmd={command:#x},payload_len={payload_len},wait={wait}"
+
+
+def command_sequence_differences(left, right):
+    differences = []
+    matcher = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
+    for operation, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        linux = ",".join(command_label(record) for record in left[left_start:left_end]) or "-"
+        userspace = ",".join(command_label(record) for record in right[right_start:right_end]) or "-"
+        differences.append(
+            f"{operation} linux[{left_start}:{left_end}]={linux} "
+            f"userspace[{right_start}:{right_end}]={userspace}"
+        )
+    return differences
+
 
 def firmware_state(path, userspace):
     records, started = [], not userspace
-    for line in open(path, encoding="utf-8"):
-        if userspace and "fw_state_begin " in line:
-            if started:
-                break
-            started = True
-            continue
-        match = FW_STATE.search(line) if started else None
-        if match:
-            region, offset, address, value = match.groups()
-            records.append((region, int(offset, 16), int(address, 16), int(value, 16)))
+    with open(path, encoding="utf-8") as source:
+        for line in source:
+            if userspace and "fw_state_begin " in line:
+                if started:
+                    break
+                started = True
+                continue
+            match = FW_STATE.search(line) if started else None
+            if match:
+                region, offset, address, value = match.groups()
+                records.append((region, int(offset, 16), int(address, 16), int(value, 16)))
     return records
+
 
 def firmware_state_difference(linux_path, userspace_path):
     left = firmware_state(linux_path, False)
@@ -49,19 +86,53 @@ def firmware_state_difference(linux_path, userspace_path):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("manifest", nargs="?", help="JSON object of name -> {linux, userspace} masked hex")
+    parser.add_argument(
+        "manifest",
+        nargs="?",
+        help="JSON object containing commands and records; see --help",
+    )
     parser.add_argument("--firmware-state", nargs=2, metavar=("LINUX", "USERSPACE"))
+    parser.add_argument("--command-sequence", nargs=2, metavar=("LINUX", "USERSPACE"))
     args = parser.parse_args()
     if args.firmware_state:
         difference = firmware_state_difference(*args.firmware_state)
         print(f"firmware_state first_difference={difference}")
         raise SystemExit(difference != "none")
+    if args.command_sequence:
+        left = command_sequence(args.command_sequence[0])
+        right = command_sequence(args.command_sequence[1])
+        differences = command_sequence_differences(left, right)
+        print(f"command_sequence count={len(left)}/{len(right)}")
+        for difference in differences:
+            print(f"command_sequence difference={difference}")
+        raise SystemExit(bool(differences))
     if not args.manifest:
-        parser.error("manifest or --firmware-state is required")
+        parser.error("manifest, --firmware-state, or --command-sequence is required")
     with open(args.manifest, encoding="utf-8") as source:
-        records = json.load(source)
+        manifest = json.load(source)
+    if set(manifest) != {"commands", "records"}:
+        parser.error(
+            "manifest must contain exactly 'commands' and 'records'; "
+            "the legacy record-only format could hide missing commands"
+        )
+    commands = manifest["commands"]
+    if set(commands) != {"linux", "userspace"}:
+        parser.error("manifest commands must contain exactly 'linux' and 'userspace'")
+    left_commands = [
+        (int(record["cmd"], 0), int(record["payload_len"]), int(record["wait"]))
+        for record in commands["linux"]
+    ]
+    right_commands = [
+        (int(record["cmd"], 0), int(record["payload_len"]), int(record["wait"]))
+        for record in commands["userspace"]
+    ]
+    command_differences = command_sequence_differences(left_commands, right_commands)
 
-    failed = False
+    failed = bool(command_differences)
+    print(f"command_sequence count={len(left_commands)}/{len(right_commands)}")
+    for difference in command_differences:
+        print(f"command_sequence difference={difference}")
+    records = manifest["records"]
     for name, record in records.items():
         left = bytes.fromhex(record["linux"])
         right = bytes.fromhex(record["userspace"])
