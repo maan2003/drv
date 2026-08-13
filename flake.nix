@@ -1043,6 +1043,195 @@
                 grep -F 'trap_safe=true' plan
               '';
 
+          mt7921-full-firmware-inert-proof-root-entry =
+            let
+              runnerRegisteredHash = pkgs.runCommand "mt7921-full-firmware-inert-proof-registered-hash"
+                {
+                  __structuredAttrs = true;
+                  exportReferencesGraph.runner = [ mt7921-full-firmware-inert-proof ];
+                  nativeBuildInputs = [ pkgs.jq ];
+                }
+                ''
+                  out="''${outputs[out]}"
+                  ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-inert-proof}' \
+                    '.runner[] | select(.path == $path) | .narHash' \
+                    "$NIX_ATTRS_JSON_FILE" > "$out"
+                  test "$(wc -l < "$out")" -eq 1
+                  grep -Eq '^sha256:[0123456789abcdfghijklmnpqrsvwxyz]{52}$' "$out"
+                '';
+            in
+            pkgs.stdenv.mkDerivation {
+              pname = "mt7921-full-firmware-inert-proof-root-entry";
+              version = "0.1.0";
+              dontUnpack = true;
+              nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.nix ];
+              doInstallCheck = true;
+              meta.mainProgram = "mt7921-full-firmware-inert-proof-root";
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin" "$out/share/mt7921-full-firmware-inert-proof-root"
+                runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof
+                runner_sha256=$(sha256sum "$runner" | cut -d ' ' -f1)
+                runner_registered_hash=$(cat ${runnerRegisteredHash})
+                manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
+                substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} \
+                  "$out/bin/mt7921-full-firmware-inert-proof-root" \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by sudo /run/wrappers/bin/sudo \
+                  --subst-var-by runner "$runner" \
+                  --subst-var-by runner_package ${mt7921-full-firmware-inert-proof} \
+                  --subst-var-by runner_sha256 "$runner_sha256" \
+                  --subst-var-by runner_registered_hash "$runner_registered_hash" \
+                  --subst-var-by manifest "$manifest" \
+                  --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
+                  --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                  --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
+                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
+                chmod 0755 "$out/bin/mt7921-full-firmware-inert-proof-root"
+                entry_sha256=$(sha256sum "$out/bin/mt7921-full-firmware-inert-proof-root" | cut -d ' ' -f1)
+                cat > "$manifest" <<EOF
+                ENTRYPOINT=$out/bin/mt7921-full-firmware-inert-proof-root
+                ENTRYPOINT_SHA256=$entry_sha256
+                RUNNER=$runner
+                RUNNER_SHA256=$runner_sha256
+                RUNNER_REGISTERED_HASH=$runner_registered_hash
+                FLAVOR=full-firmware-production
+                OPERATION=run-one-shot-sae-auth
+                SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7
+                ACTIVE_CAPABLE=true
+                EOF
+                runHook postInstall
+              '';
+              installCheckPhase = ''
+                entry=$out/bin/mt7921-full-firmware-inert-proof-root
+                manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
+                test "$(stat -c %a "$entry")" = 755
+                test "$(head -n1 "$entry")" = '#!${pkgs.runtimeShell}'
+                ${pkgs.bash}/bin/bash -n "$entry"
+                test "$(sha256sum "$entry" | cut -d ' ' -f1)" = "$(sed -n 's/^ENTRYPOINT_SHA256=//p' "$manifest")"
+                grep -Fx "ENTRYPOINT=$entry" "$manifest"
+                grep -Fx "RUNNER=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof" "$manifest"
+                grep -Fx "RUNNER_SHA256=$(sha256sum ${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof | cut -d ' ' -f1)" "$manifest"
+                grep -Fx "RUNNER_REGISTERED_HASH=$(cat ${runnerRegisteredHash})" "$manifest"
+                grep -Fx 'FLAVOR=full-firmware-production' "$manifest"
+                grep -Fx 'OPERATION=run-one-shot-sae-auth' "$manifest"
+                grep -Fx 'SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7' "$manifest"
+                grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
+                grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
+                grep -Fx '  exec /run/wrappers/bin/sudo -n "$runner" --plan' "$entry"
+                grep -Fx 'exec /run/wrappers/bin/sudo -n "$runner"' "$entry"
+              '';
+            };
+
+          mt7921-full-firmware-inert-proof-root-entry-test = pkgs.runCommand
+            "mt7921-full-firmware-inert-proof-root-entry-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; }
+            ''
+              mkdir -p work
+              cat > work/id-root <<'EOF'
+              #!${pkgs.runtimeShell}
+              test "$1" = -u
+              echo 0
+              EOF
+              cat > work/proof-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              test "$("$PWD/work/id-root" -u)" = 0
+              case "$#:''${1-}" in 0:|1:--plan) ;; *) exit 64;; esac
+              printf 'ROOT_UID=0 ARGC=%s ARG1=%s\n' "$#" "''${1-}" >> "$PWD/proof-transcript"
+              EOF
+              chmod 0755 work/id-root work/proof-stub
+              proof=$PWD/work/proof-stub
+              cat > work/sudo-stub <<EOF
+              #!${pkgs.runtimeShell}
+              set -eu
+              printf 'SUDO_ARGV' >> "\$PWD/sudo-transcript"
+              printf ' <%s>' "\$@" >> "\$PWD/sudo-transcript"
+              printf '\n' >> "\$PWD/sudo-transcript"
+              test "\$1" = -n
+              test "\$2" = "$proof"
+              shift 2
+              exec "$proof" "\$@"
+              EOF
+              chmod 0755 work/sudo-stub
+              cat > work/nix-store-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              test "$1" = -q
+              test "$2" = --hash
+              test "$3" = "$PWD/work/proof-stub"
+              echo sha256:registered-proof-stub
+              EOF
+              cat > work/identity <<'EOF'
+              {"artifact_identity":"mt7921-validation-v1","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_commit":"34acd735fdd1c232c456dfecf387875f9cb13af7","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
+              EOF
+              cat > work/launcher <<'EOF'
+              #!${pkgs.runtimeShell}
+              test "$1" = --artifact-identity
+              ${pkgs.coreutils}/bin/cat "$PWD/work/identity"
+              EOF
+              chmod 0755 work/nix-store-stub work/launcher
+              make_entry() {
+                output=$1 sudo=$2
+                runner_sha=$(sha256sum "$proof" | cut -d ' ' -f1)
+                manifest=$PWD/work/$output.manifest
+                substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} work/$output \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by sudo "$sudo" \
+                  --subst-var-by runner "$proof" \
+                  --subst-var-by runner_package "$proof" \
+                  --subst-var-by runner_sha256 "$runner_sha" \
+                  --subst-var-by runner_registered_hash sha256:registered-proof-stub \
+                  --subst-var-by manifest "$manifest" \
+                  --subst-var-by launcher "$PWD/work/launcher" \
+                  --subst-var-by artifact_identity "$PWD/work/identity" \
+                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                  --subst-var-by nix_store "$PWD/work/nix-store-stub" \
+                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
+                chmod 0755 work/$output
+                entry_sha=$(sha256sum work/$output | cut -d ' ' -f1)
+                cat > "$manifest" <<EOF
+              ENTRYPOINT=$PWD/work/$output
+              ENTRYPOINT_SHA256=$entry_sha
+              RUNNER=$proof
+              RUNNER_SHA256=$runner_sha
+              RUNNER_REGISTERED_HASH=sha256:registered-proof-stub
+              FLAVOR=full-firmware-production
+              OPERATION=run-one-shot-sae-auth
+              SOURCE_COMMIT=34acd735fdd1c232c456dfecf387875f9cb13af7
+              ACTIVE_CAPABLE=true
+              EOF
+              }
+              make_entry entry "$PWD/work/sudo-stub"
+              env -i PWD="$PWD" work/entry
+              env -i PWD="$PWD" work/entry --plan
+              grep -Fx "SUDO_ARGV <-n> <$proof>" sudo-transcript
+              grep -Fx "SUDO_ARGV <-n> <$proof> <--plan>" sudo-transcript
+              grep -Fx 'ROOT_UID=0 ARGC=0 ARG1=' proof-transcript
+              grep -Fx 'ROOT_UID=0 ARGC=1 ARG1=--plan' proof-transcript
+              cp sudo-transcript before
+              if work/entry --alternate-runner; then exit 1; fi
+              cmp before sudo-transcript
+              cp work/proof-stub work/proof-stub.saved
+              echo tampered >> work/proof-stub
+              if work/entry --plan; then exit 1; fi
+              cmp before sudo-transcript
+              mv work/proof-stub.saved work/proof-stub
+              sed -i 's/FLAVOR=full-firmware-production/FLAVOR=rate-power-evidence-only/' work/entry.manifest
+              if work/entry --plan; then exit 1; fi
+              cmp before sudo-transcript
+              make_entry no-sudo "$PWD/work/missing-sudo"
+              if work/no-sudo --plan; then exit 1; fi
+              cmp before sudo-transcript
+              touch "$out"
+            '';
+
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";
             version = "0.1.0";
