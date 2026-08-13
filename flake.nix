@@ -105,6 +105,11 @@
               runHook preInstallCheck
               strings $out/bin/mt7921-passive-scan | grep -F 'external reboot watchdog is not armed'
               strings $out/bin/mt7921-passive-scan | grep -F '"watchdog_verified":true'
+              gate_output="$($out/bin/mt7921-passive-scan --self-test-patch-table-gate)"
+              test "$(printf '%s\n' "$gate_output" | grep -c '"patch_gate_transcript":"command"')" -eq 4
+              test "$(printf '%s\n' "$gate_output" | grep -c '"patch_gate_transcript":"scatter"')" -eq 23
+              printf '%s\n' "$gate_output" | grep -F '"patch_gate_result":"passed"' | grep -F '"row_count":41' | grep -F '"before_ram_cmd_0x01":true'
+              printf '%s\n' "$gate_output" | grep -F '"patch_gate_self_test":"passed","mmio_reads":41,"ram_operations":0,"cleanup_state":"Ready"'
               runHook postInstallCheck
             '';
             meta.mainProgram = "mt7921-passive-scan";

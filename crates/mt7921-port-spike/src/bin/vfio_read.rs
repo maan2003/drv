@@ -1039,14 +1039,12 @@ fn run_contained_dma_resource_round_trip(
                 mcu,
                 conn: &conn,
                 pcie_mac,
-                patch_table_page: None,
+                patch_table_page: active.patch_table_page.as_ref(),
                 bdf,
                 fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
                 fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
                 sequence: 0,
-                patch_gate_stage: 0,
-                patch_gate_scatters: 0,
-                patch_table_gate: false,
+                patch_gate: PatchTableGate::new(operation == Operation::RunOneShotPatchTableGate),
                 command_index: 0,
                 uni_terminal_poisoned: false,
                 #[cfg(feature = "fuchsia-passive")]
@@ -1062,7 +1060,9 @@ fn run_contained_dma_resource_round_trip(
             let firmware = Firmware::parse(ram_bytes)
                 .map_err(|error| format!("parse RAM for contained loader: {error:?}"))?;
             #[cfg(feature = "fuchsia-passive")]
-            let report = if operation == Operation::RunOneShotPassiveChannel1 {
+            let report = if operation == Operation::RunOneShotPatchTableGate {
+                load_mt7921_patch_bootstrap(&mut loader, patch, firmware)
+            } else if operation == Operation::RunOneShotPassiveChannel1 {
                 load_mt7921_firmware_with_passive_boundary(
                     &mut loader,
                     patch,
@@ -2926,8 +2926,189 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     Ok(())
 }
 
+struct MockPatchGateTransport {
+    gate: PatchTableGate,
+    sequence: u8,
+    mmio_reads: usize,
+    ram_operations: usize,
+    cleanup_state: Option<FirmwareLoaderState>,
+}
+
+impl MockPatchGateTransport {
+    fn new() -> Self {
+        Self {
+            gate: PatchTableGate::new(true),
+            sequence: 0,
+            mmio_reads: 0,
+            ram_operations: 0,
+            cleanup_state: None,
+        }
+    }
+}
+
+impl FirmwareLoaderTransport for MockPatchGateTransport {
+    type Error = String;
+
+    fn next_sequence(&mut self) -> u8 {
+        self.sequence = (self.sequence + 1) & 0x0f;
+        if self.sequence == 0 {
+            self.sequence = 1;
+        }
+        self.sequence
+    }
+
+    fn acpi_configuration(&self) -> u8 {
+        0
+    }
+
+    fn command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<FirmwareCommandCompletion, Self::Error> {
+        if matches!(
+            command,
+            DownloadCommand::TargetAddressLength { .. } | DownloadCommand::FirmwareStart { .. }
+        ) {
+            self.ram_operations += 1;
+        }
+        self.gate.record_command(command, sequence, encoded)?;
+        Ok(match command {
+            DownloadCommand::PatchSemaphoreGet => {
+                FirmwareCommandCompletion::PatchSemaphore(2u8.into())
+            }
+            DownloadCommand::PatchSemaphoreRelease => {
+                FirmwareCommandCompletion::PatchSemaphore(3u8.into())
+            }
+            DownloadCommand::PatchFinish => FirmwareCommandCompletion::PatchFinish(0),
+            DownloadCommand::PatchStart { .. } => FirmwareCommandCompletion::Ack,
+            _ => return Err(format!("self-test observed forbidden command {command:?}")),
+        })
+    }
+
+    fn set_clc(
+        &mut self,
+        _command: &ClcSetCommand,
+        _sequence: u8,
+        _encoded: &[u8],
+    ) -> Result<Option<ClcSetResponse>, Self::Error> {
+        Err("self-test reached CLC after patch release".into())
+    }
+
+    fn set_channel_domain(
+        &mut self,
+        _command: &ChannelDomainCommand,
+        _sequence: u8,
+        _encoded: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err("self-test reached channel domain after patch release".into())
+    }
+
+    fn publish_scatter(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        chunk: &[u8],
+    ) -> Result<(), Self::Error> {
+        if part == FirmwareImagePart::Ram {
+            self.ram_operations += 1;
+        }
+        self.gate.record_scatter(part, sequence, chunk.len())
+    }
+
+    fn wait_scatter_completion(
+        &mut self,
+        _part: FirmwareImagePart,
+        _sequence: u8,
+        _deadline_ms: u64,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn firmware_download_state(&mut self) -> Result<u8, Self::Error> {
+        Ok(1)
+    }
+
+    fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error> {
+        Err("self-test reached N9 after patch release".into())
+    }
+
+    fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
+        let mut reads = 0usize;
+        self.gate.release_boundary(self.sequence, |offset| {
+            reads += 1;
+            Ok(0x7921_0000 | offset as u32)
+        })?;
+        self.mmio_reads += reads;
+        Ok(())
+    }
+
+    fn now_ms(&self) -> u64 {
+        0
+    }
+
+    fn sleep_ms(&mut self, _duration_ms: u64) {}
+
+    fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
+        self.cleanup_state = Some(state);
+        Ok(())
+    }
+}
+
+fn run_patch_table_gate_self_test() -> Result<(), String> {
+    const PATCH_PAYLOAD_BYTES: usize = 22 * MT7921_FWDL_CHUNK_BYTES + 1;
+    let mut patch_bytes = vec![0; 96 + 64 + PATCH_PAYLOAD_BYTES];
+    patch_bytes[0..16].copy_from_slice(b"20260101-120000\0");
+    patch_bytes[16..20].copy_from_slice(b"ALPS");
+    patch_bytes[20..24].copy_from_slice(&0x8a10_8a10u32.to_be_bytes());
+    patch_bytes[44..48].copy_from_slice(&1u32.to_be_bytes());
+    patch_bytes[96..100].copy_from_slice(&0x0004_0002u32.to_be_bytes());
+    patch_bytes[100..104].copy_from_slice(&160u32.to_be_bytes());
+    patch_bytes[108..112].copy_from_slice(&0x0090_0000u32.to_be_bytes());
+    patch_bytes[112..116].copy_from_slice(&(PATCH_PAYLOAD_BYTES as u32).to_be_bytes());
+    patch_bytes[160..].fill(0x5a);
+    let mut ram_bytes = vec![0; 36];
+    ram_bytes[0] = 0x79;
+    ram_bytes[1] = 2;
+    ram_bytes[7..17].copy_from_slice(b"FW-TEST-01");
+    ram_bytes[17..32].copy_from_slice(b"20260101-120000");
+    let patch =
+        Patch::parse(&patch_bytes).map_err(|error| format!("parse self-test patch: {error:?}"))?;
+    let firmware =
+        Firmware::parse(&ram_bytes).map_err(|error| format!("parse self-test RAM: {error:?}"))?;
+    let mut transport = MockPatchGateTransport::new();
+    let report = load_mt7921_patch_bootstrap(&mut transport, patch, firmware)
+        .map_err(|error| format!("patch-table gate self-test loader: {error:?}"))?;
+    if transport.mmio_reads != 41
+        || transport.ram_operations != 0
+        || transport.cleanup_state != Some(FirmwareLoaderState::Ready)
+        || report.patch_sections == 0
+        || report.ram_regions != 0
+    {
+        return Err(format!(
+            "patch-table gate self-test invariant failed: mmio_reads={} ram_operations={} cleanup={:?} patch_sections={} ram_regions={}",
+            transport.mmio_reads,
+            transport.ram_operations,
+            transport.cleanup_state,
+            report.patch_sections,
+            report.ram_regions,
+        ));
+    }
+    println!(
+        "{{\"patch_gate_self_test\":\"passed\",\"mmio_reads\":41,\"ram_operations\":0,\"cleanup_state\":\"Ready\"}}"
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    if operation_argument.as_deref() == Some("--self-test-patch-table-gate") {
+        if env::args().len() != 2 {
+            return Err("patch-table gate self-test accepts no additional arguments".into());
+        }
+        return run_patch_table_gate_self_test();
+    }
     if operation_argument.as_deref() == Some("--patch-table-gate-preflight") {
         if env::args().len() != 2 {
             return Err("patch-table gate preflight accepts no additional arguments".into());
@@ -4803,9 +4984,9 @@ fn run() -> Result<(), String> {
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
                     sequence: 0,
-                    patch_gate_stage: 0,
-                    patch_gate_scatters: 0,
-                    patch_table_gate: operation == Operation::RunOneShotPatchTableGate,
+                    patch_gate: PatchTableGate::new(
+                        operation == Operation::RunOneShotPatchTableGate,
+                    ),
                     command_index: 0,
                     uni_terminal_poisoned: false,
                     #[cfg(feature = "fuchsia-passive")]
@@ -7624,9 +7805,7 @@ struct VfioFirmwareLoader<'a> {
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
     sequence: u8,
-    patch_gate_stage: u8,
-    patch_gate_scatters: u8,
-    patch_table_gate: bool,
+    patch_gate: PatchTableGate,
     command_index: usize,
     uni_terminal_poisoned: bool,
     #[cfg(feature = "fuchsia-passive")]
@@ -7638,26 +7817,34 @@ struct VfioFirmwareLoader<'a> {
     start: Instant,
 }
 
-impl VfioFirmwareLoader<'_> {
-    fn observe_dmashdl(&mut self, operation: impl Into<String>) -> Result<(), String> {
-        observe_dmashdl_transition(self.dmashdl, &mut self.dmashdl_watcher, operation)
+struct PatchTableGate {
+    enabled: bool,
+    stage: u8,
+    scatters: u8,
+}
+
+impl PatchTableGate {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            stage: 0,
+            scatters: 0,
+        }
     }
 
-    fn record_patch_gate_command(
+    fn record_command(
         &mut self,
         command: DownloadCommand,
         sequence: u8,
         encoded: &[u8],
     ) -> Result<(), String> {
-        if !self.patch_table_gate {
+        if !self.enabled {
             return Ok(());
         }
         let (expected_stage, next_stage, name) = match command {
             DownloadCommand::PatchSemaphoreGet => (0, 1, "PATCH_SEM_GET"),
             DownloadCommand::PatchStart { .. } => (1, 2, "PATCH_START"),
-            DownloadCommand::PatchFinish if self.patch_gate_scatters == 23 => {
-                (2, 3, "PATCH_FINISH")
-            }
+            DownloadCommand::PatchFinish if self.scatters == 23 => (2, 3, "PATCH_FINISH"),
             DownloadCommand::PatchSemaphoreRelease => (3, 4, "PATCH_SEM_RELEASE"),
             _ => return Err(format!("patch-table gate rejected command {command:?}")),
         };
@@ -7668,10 +7855,10 @@ impl VfioFirmwareLoader<'_> {
             DownloadCommand::PatchSemaphoreRelease => 12,
             _ => unreachable!(),
         };
-        if self.patch_gate_stage != expected_stage || sequence != expected_sequence {
+        if self.stage != expected_stage || sequence != expected_sequence {
             return Err(format!(
                 "patch-table transcript mismatch: stage={} command={command:?} sequence={sequence} expected_stage={expected_stage} expected_sequence={expected_sequence}",
-                self.patch_gate_stage
+                self.stage
             ));
         }
         if matches!(
@@ -7691,13 +7878,92 @@ impl VfioFirmwareLoader<'_> {
                 ));
             }
         }
-        self.patch_gate_stage = next_stage;
+        self.stage = next_stage;
         println!(
             "{{\"patch_gate_transcript\":\"command\",\"name\":\"{name}\",\"sequence\":{sequence}}}"
         );
         std::io::stdout()
             .flush()
             .map_err(|error| format!("flush patch-gate command transcript: {error}"))
+    }
+
+    fn record_scatter(
+        &mut self,
+        part: FirmwareImagePart,
+        sequence: u8,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let expected_sequence = ((2 + self.scatters) % 15) + 1;
+        if self.stage != 2
+            || part != FirmwareImagePart::Patch
+            || self.scatters >= 23
+            || sequence != expected_sequence
+        {
+            return Err(format!(
+                "patch-table scatter mismatch: stage={} part={part:?} count={} sequence={sequence} expected_sequence={expected_sequence}",
+                self.stage, self.scatters
+            ));
+        }
+        self.scatters += 1;
+        println!(
+            "{{\"patch_gate_transcript\":\"scatter\",\"ordinal\":{},\"sequence\":{sequence},\"bytes\":{bytes}}}",
+            self.scatters,
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush patch-gate scatter transcript: {error}"))
+    }
+
+    fn release_boundary(
+        &self,
+        sequence: u8,
+        mut read: impl FnMut(usize) -> Result<u32, String>,
+    ) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.stage != 4 || self.scatters != 23 || sequence != 12 {
+            return Err(format!(
+                "patch-table boundary transcript incomplete: stage={} scatters={} sequence={sequence}",
+                self.stage, self.scatters
+            ));
+        }
+        let mut rows = Vec::with_capacity(41);
+        for offset in (0x140usize..=0x1e0).step_by(4) {
+            let value = read(0x21000 + offset)?;
+            if value == 0 || value == u32::MAX {
+                return Err(format!(
+                    "TMAC patch table row {offset:#05x} was not populated: {value:#010x}"
+                ));
+            }
+            rows.push(format!("\"{offset:#05x}\":\"{value:#010x}\""));
+        }
+        println!(
+            "{{\"patch_gate_result\":\"passed\",\"after\":\"PATCH_SEM_RELEASE_seq12\",\"before_ram_cmd_0x01\":true,\"row_count\":{},\"all_populated\":true,\"rows\":{{{}}}}}",
+            rows.len(),
+            rows.join(",")
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush patch-table result: {error}"))
+    }
+}
+
+impl VfioFirmwareLoader<'_> {
+    fn observe_dmashdl(&mut self, operation: impl Into<String>) -> Result<(), String> {
+        observe_dmashdl_transition(self.dmashdl, &mut self.dmashdl_watcher, operation)
+    }
+
+    fn record_patch_gate_command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<(), String> {
+        self.patch_gate.record_command(command, sequence, encoded)
     }
 }
 
@@ -9224,16 +9490,16 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         if chunk.is_empty() || chunk.len() > MT7921_FWDL_CHUNK_BYTES {
             return Err(format!("invalid firmware scatter length {}", chunk.len()));
         }
-        if self.patch_table_gate {
-            let expected_sequence = ((2 + self.patch_gate_scatters) % 15) + 1;
-            if self.patch_gate_stage != 2
+        if self.patch_gate.enabled {
+            let expected_sequence = ((2 + self.patch_gate.scatters) % 15) + 1;
+            if self.patch_gate.stage != 2
                 || part != FirmwareImagePart::Patch
-                || self.patch_gate_scatters >= 23
+                || self.patch_gate.scatters >= 23
                 || sequence != expected_sequence
             {
                 return Err(format!(
                     "patch-table scatter mismatch: stage={} part={part:?} count={} sequence={sequence} expected_sequence={expected_sequence}",
-                    self.patch_gate_stage, self.patch_gate_scatters
+                    self.patch_gate.stage, self.patch_gate.scatters
                 ));
             }
         }
@@ -9260,17 +9526,8 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index},"bytes":{}}}"#,
             chunk.len()
         );
-        if self.patch_table_gate {
-            self.patch_gate_scatters += 1;
-            println!(
-                "{{\"patch_gate_transcript\":\"scatter\",\"ordinal\":{},\"sequence\":{sequence},\"bytes\":{}}}",
-                self.patch_gate_scatters,
-                chunk.len()
-            );
-            std::io::stdout()
-                .flush()
-                .map_err(|error| format!("flush patch-gate scatter transcript: {error}"))?;
-        }
+        self.patch_gate
+            .record_scatter(part, sequence, chunk.len())?;
         Ok(())
     }
 
@@ -9337,36 +9594,11 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
     }
 
     fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
-        if !self.patch_table_gate {
-            return Ok(());
-        }
-        if self.patch_gate_stage != 4 || self.patch_gate_scatters != 23 || self.sequence != 12 {
-            return Err(format!(
-                "patch-table boundary transcript incomplete: stage={} scatters={} sequence={}",
-                self.patch_gate_stage, self.patch_gate_scatters, self.sequence
-            ));
-        }
-        let page = self
-            .patch_table_page
-            .ok_or("patch-table gate omitted TMAC BAR page")?;
-        let mut rows = Vec::with_capacity(41);
-        for offset in (0x140usize..=0x1e0).step_by(4) {
-            let value = page.read(0x21000 + offset)?;
-            if value == 0 || value == u32::MAX {
-                return Err(format!(
-                    "TMAC patch table row {offset:#05x} was not populated: {value:#010x}"
-                ));
-            }
-            rows.push(format!("\"{offset:#05x}\":\"{value:#010x}\""));
-        }
-        println!(
-            "{{\"patch_gate_result\":\"passed\",\"after\":\"PATCH_SEM_RELEASE_seq12\",\"before_ram_cmd_0x01\":true,\"row_count\":{},\"all_populated\":true,\"rows\":{{{}}}}}",
-            rows.len(),
-            rows.join(",")
-        );
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("flush patch-table result: {error}"))
+        let page = self.patch_table_page;
+        self.patch_gate.release_boundary(self.sequence, |offset| {
+            page.ok_or_else(|| "patch-table gate omitted TMAC BAR page".to_string())?
+                .read(offset)
+        })
     }
 
     fn now_ms(&self) -> u64 {
@@ -17109,6 +17341,34 @@ mod tests {
         let artifacts = run.find("vfio_firmware_artifacts_ready").unwrap();
         let attach = run.find("VFIO_DEVICE_BIND_IOMMUFD").unwrap();
         assert!(process < artifacts && artifacts < attach);
+    }
+
+    #[test]
+    fn patch_table_gate_is_propagated_through_contained_transport() {
+        assert!(Operation::RunOneShotPatchTableGate.uses_contained_transport_gate());
+        let source = include_str!("vfio_read.rs");
+        let boundary = source
+            .split("fn run_contained_dma_resource_round_trip")
+            .nth(1)
+            .unwrap()
+            .split("pub fn main")
+            .next()
+            .unwrap();
+        assert!(boundary.contains("patch_table_page: active.patch_table_page.as_ref()"));
+        assert!(
+            boundary
+                .contains("PatchTableGate::new(operation == Operation::RunOneShotPatchTableGate)")
+        );
+        let gate_dispatch = boundary
+            .find("operation == Operation::RunOneShotPatchTableGate")
+            .unwrap();
+        let patch_only = boundary
+            .find("load_mt7921_patch_bootstrap(&mut loader, patch, firmware)")
+            .unwrap();
+        let full_loader = boundary
+            .find("load_mt7921_firmware(&mut loader, patch, firmware)")
+            .unwrap();
+        assert!(gate_dispatch < patch_only && patch_only < full_loader);
     }
 
     #[test]
