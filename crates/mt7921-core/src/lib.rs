@@ -3578,9 +3578,8 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
         special_unii_mask: 0,
     };
 
-    let power = DownloadCommand::NicPowerControl;
-    let completion = loader_command(transport, power)?;
-    expect_loader_completion(power, completion, FirmwareCommandCompletion::NoResponse)?;
+    // This is a host-only safety observation. Pinned PCI Linux sends no
+    // NIC_POWER_CTRL here: PATCH_SEM_CONTROL(GET) is the first MCU command.
     let download_deadline = transport.now_ms().saturating_add(DOWNLOAD_READY_TIMEOUT_MS);
     loop {
         let firmware_state = transport.firmware_download_state().map_err(|source| {
@@ -11310,8 +11309,11 @@ mod tests {
         assert_eq!(&semaphore[34..36], &0x8000u16.to_le_bytes());
         assert_eq!(&semaphore[36..40], &[0x10, 0xa0, 3, 1]);
         assert_eq!(&semaphore[64..68], &1u32.to_le_bytes());
-        let release = encode_download_command(DownloadCommand::PatchSemaphoreRelease, 2).unwrap();
-        assert_eq!(&release[36..40], &[0x10, 0xa0, 3, 2]);
+        // E2E98 observes Linux's post-PATCH_FINISH release at sequence 12.
+        let release = encode_download_command(DownloadCommand::PatchSemaphoreRelease, 12).unwrap();
+        assert_eq!(&release[0..8], &[0x44, 0, 0, 0x41, 0, 0, 1, 0x80]);
+        assert_eq!(&release[32..40], &[36, 0, 0, 0x80, 0x10, 0xa0, 3, 12]);
+        assert_eq!(&release[40..64], &[0; 24]);
         assert_eq!(&release[64..68], &0u32.to_le_bytes());
         let power = encode_download_command(DownloadCommand::NicPowerControl, 3).unwrap();
         assert_eq!(&power[36..40], &[0x04, 0xa0, 3, 3]);
@@ -12777,65 +12779,64 @@ mod tests {
         assert_eq!(
             transport.trace,
             [
-                LoaderTrace::Command(DownloadCommand::NicPowerControl, 1),
                 LoaderTrace::DownloadState,
                 LoaderTrace::Sleep(10),
                 LoaderTrace::DownloadState,
-                LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 2),
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 1),
                 LoaderTrace::Command(
                     DownloadCommand::PatchStart {
                         address: 0x0090_0000,
                         length: 4097,
                         mode: DL_MODE_NEED_RESPONSE,
                     },
-                    3,
+                    2,
                 ),
-                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 4, 4096),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 3, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 3, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 4, 1),
                 LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 4, 3010),
-                LoaderTrace::PublishScatter(FirmwareImagePart::Patch, 5, 1),
-                LoaderTrace::ScatterCompletion(FirmwareImagePart::Patch, 5, 3010),
-                LoaderTrace::Command(DownloadCommand::PatchFinish, 6),
-                LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, 7),
+                LoaderTrace::Command(DownloadCommand::PatchFinish, 5),
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, 6),
                 LoaderTrace::Command(
                     DownloadCommand::TargetAddressLength {
                         address: 0x0091_5000,
                         length: 4097,
                         mode: DL_MODE_NEED_RESPONSE,
                     },
-                    8,
+                    7,
                 ),
-                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 9, 4096),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 8, 4096),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 8, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 9, 1),
                 LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 9, 3010),
-                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 10, 1),
-                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 10, 3010),
                 LoaderTrace::Command(
                     DownloadCommand::TargetAddressLength {
                         address: 0x0201_5c00,
                         length: 3,
                         mode: DL_MODE_NEED_RESPONSE,
                     },
-                    11,
+                    10,
                 ),
-                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 12, 3),
-                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 12, 3010),
+                LoaderTrace::PublishScatter(FirmwareImagePart::Ram, 11, 3),
+                LoaderTrace::ScatterCompletion(FirmwareImagePart::Ram, 11, 3010),
                 LoaderTrace::Command(
                     DownloadCommand::FirmwareStart {
                         address: 0x0091_5000,
                         option: 1,
                     },
-                    13,
+                    12,
                 ),
                 LoaderTrace::N9Ready,
                 LoaderTrace::Sleep(10),
                 LoaderTrace::N9Ready,
-                LoaderTrace::Command(DownloadCommand::GetNicCapability, 14),
+                LoaderTrace::Command(DownloadCommand::GetNicCapability, 13),
                 LoaderTrace::Command(
                     DownloadCommand::ReadEepromBlock {
                         address: MT7921_EEPROM_HW_TYPE_BLOCK,
                     },
-                    15,
+                    14,
                 ),
-                LoaderTrace::SetClc(0, 1),
+                LoaderTrace::SetClc(0, 15),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
@@ -12888,7 +12889,7 @@ mod tests {
         assert!(matches!(
             &transport.trace[transport.trace.len() - 2..],
             [
-                LoaderTrace::SetChannelDomain(39, 2),
+                LoaderTrace::SetChannelDomain(39, 1),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
             ]
         ));
@@ -13096,7 +13097,7 @@ mod tests {
         let (patch_bytes, ram_bytes) = loader_images();
         let mut wrong = FakeFirmwareLoader {
             completion_override: Some((
-                DownloadCommand::NicPowerControl,
+                DownloadCommand::PatchSemaphoreGet,
                 FirmwareCommandCompletion::Ack,
             )),
             ..Default::default()
@@ -13109,16 +13110,16 @@ mod tests {
             ),
             Err(FirmwareLoaderError::Failed(
                 FirmwareLoaderFailure::UnexpectedCommandCompletion {
-                    command: DownloadCommand::NicPowerControl,
+                    command: DownloadCommand::PatchSemaphoreGet,
                     completion: FirmwareCommandCompletion::Ack,
                 }
             ))
         ));
 
         let mut wrong_and_cleanup = FakeFirmwareLoader {
-            fail_at: Some(2),
+            fail_at: Some(4),
             completion_override: Some((
-                DownloadCommand::NicPowerControl,
+                DownloadCommand::PatchSemaphoreGet,
                 FirmwareCommandCompletion::Ack,
             )),
             ..Default::default()
@@ -13163,13 +13164,10 @@ mod tests {
             Firmware::parse(&ram_bytes).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            wrapped.trace[0],
-            LoaderTrace::Command(DownloadCommand::NicPowerControl, 15)
-        );
+        assert_eq!(wrapped.trace[0], LoaderTrace::DownloadState);
         assert!(wrapped.trace.iter().any(|event| matches!(
             event,
-            LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 1)
+            LoaderTrace::Command(DownloadCommand::PatchSemaphoreGet, 15)
         )));
         assert!(!wrapped.trace.iter().any(|event| matches!(
             event,
