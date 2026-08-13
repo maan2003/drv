@@ -1,14 +1,49 @@
-#!/run/current-system/sw/bin/bash
+#!/usr/bin/env bash
 set -u
 
-export PATH=/run/current-system/sw/bin
+export PATH=@runtime_path@
+wifi_driver_lab=@wifi_driver_lab@
+wifi_lab_watchdog=@wifi_lab_watchdog@
+validation_launcher=@validation_launcher@
+recovery_samples=@recovery_samples@
+sys_root=@sys_root@
+run_root=@run_root@
+var_root=@var_root@
 umask 077
 
+plan=false
+if [[ ${1-} == --plan ]]; then
+  plan=true
+  shift
+fi
 bdf=${1:?PCI BDF is required}
 shift
 [[ ${1-} == -- ]] || exit 2
 shift
-(($# > 0)) || exit 2
+(($# == 1)) || {
+  echo "fixed validation supervisor requires its sole packaged launcher with no launcher arguments" >&2
+  exit 2
+}
+[[ $1 == "$validation_launcher" ]] || {
+  echo "fixed validation supervisor refuses arbitrary launchers" >&2
+  exit 2
+}
+[[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}[.][[:xdigit:]]$ ]] || exit 2
+
+if $plan; then
+  [[ $validation_launcher == /nix/store/* && -x $validation_launcher ]] || {
+    echo "fixed validation launcher is missing or outside the Nix store" >&2
+    exit 2
+  }
+  printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+    "$(readlink -f "$0")" "$(sha256sum "$(readlink -f "$0")" | cut -d ' ' -f1)" \
+    "$wifi_driver_lab" "$(sha256sum "$wifi_driver_lab" | cut -d ' ' -f1)" \
+    "$wifi_lab_watchdog" "$(sha256sum "$wifi_lab_watchdog" | cut -d ' ' -f1)" \
+    "$bdf" "$validation_launcher" "$(sha256sum "$validation_launcher" | cut -d ' ' -f1)"
+  printf ' %q' "$validation_launcher"
+  printf '\n'
+  exit 0
+fi
 
 normalize_iw_frequency() {
   local frequency=$1
@@ -16,7 +51,7 @@ normalize_iw_frequency() {
   printf '%s\n' "${frequency%.0}"
 }
 
-root=/var/lib/wifi-driver-lab
+root=$var_root/lib/wifi-driver-lab
 stamp=$(date --utc +%Y%m%dT%H%M%SZ)
 timeline=$root/selector-write-recovery-$stamp.log
 messages=$root/selector-write-recovery-$stamp.messages.log
@@ -36,11 +71,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-device_path=$(readlink -f "/sys/bus/pci/devices/$bdf")
+device_path=$(readlink -f "$sys_root/bus/pci/devices/$bdf")
 connected_bssid=
 connected_frequency=
 connected_client_mac=
-for net in /sys/class/net/*; do
+for net in "$sys_root"/class/net/*; do
   [[ -e $net/device && $(readlink -f "$net/device") == "$device_path" ]] || continue
   link=$(timeout 2 iw dev "$(basename "$net")" link 2>/dev/null) || continue
   bssid=$(awk '/^Connected to / { print $3; exit }' <<< "$link")
@@ -82,14 +117,22 @@ case $connected_frequency in
 esac
 export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \
   DRV_SAE_CLIENT_MAC=$connected_client_mac
-token=$(wifi-lab-watchdog arm) || exit 1
+token=$("$wifi_lab_watchdog" arm) || exit 1
 printf 'START realtime=%s bdf=%s\n' "$start" "$bdf" >> "$timeline"
 printf 'TARGET bssid=%s channel=%s frequency=%s client_mac=%s\n' \
   "$connected_bssid" "$connected_channel" "$connected_frequency" \
   "$connected_client_mac" >> "$timeline"
 sync -f "$timeline"
 
-wifi-driver-lab "$bdf" 300 -- "$@"
+"$wifi_driver_lab" "$bdf" 300 -- "$@" &
+experiment_pid=$!
+while kill -0 "$experiment_pid" 2>/dev/null; do
+  if ! "$wifi_lab_watchdog" heartbeat "$token"; then
+    echo "watchdog heartbeat failed; recovery remains reboot-owned" >&2
+  fi
+  sleep 5
+done
+wait "$experiment_pid"
 experiment_rc=$?
 restore_ns=$(date +%s%N)
 printf 'RESTORE_RETURN realtime=%s rc=%s\n' "$(date --iso-8601=ns)" "$experiment_rc" >> "$timeline"
@@ -103,20 +146,20 @@ default_route=false
 connectivity=false
 association_failure=false
 connectivity_ms=-1
-for sample in $(seq 0 54); do
+for sample in $(seq 0 "$((recovery_samples - 1))"); do
   now=$(date --iso-8601=ns)
   driver=none
-  [[ -L /sys/bus/pci/devices/$bdf/driver ]] && \
-    driver=$(basename "$(readlink -f "/sys/bus/pci/devices/$bdf/driver")")
-  power=$(cat "/sys/bus/pci/devices/$bdf/power_state" 2>/dev/null || printf unknown)
-  runtime=$(cat "/sys/bus/pci/devices/$bdf/power/runtime_status" 2>/dev/null || printf unknown)
+  [[ -L $sys_root/bus/pci/devices/$bdf/driver ]] && \
+    driver=$(basename "$(readlink -f "$sys_root/bus/pci/devices/$bdf/driver")")
+  power=$(cat "$sys_root/bus/pci/devices/$bdf/power_state" 2>/dev/null || printf unknown)
+  runtime=$(cat "$sys_root/bus/pci/devices/$bdf/power/runtime_status" 2>/dev/null || printf unknown)
   iwd_active=$(systemctl is-active iwd.service 2>/dev/null || true)
   iwd_sub=$(systemctl show iwd.service --property=SubState --value 2>/dev/null || true)
   printf 'SAMPLE n=%s realtime=%s driver=%s power=%s runtime=%s iwd=%s/%s\n' \
     "$sample" "$now" "$driver" "$power" "$runtime" "$iwd_active" "$iwd_sub" >> "$timeline"
 
   if ! $wiphy_ready; then
-    for phy in /sys/class/ieee80211/*; do
+    for phy in "$sys_root"/class/ieee80211/*; do
       [[ -e $phy ]] || continue
       if [[ $(readlink -f "$phy/device") == "$device_path" ]]; then
         wiphy_ready=true
@@ -129,7 +172,7 @@ for sample in $(seq 0 54); do
 
   associated_if=""
   ipv4_if=""
-  for net in /sys/class/net/wlan*; do
+  for net in "$sys_root"/class/net/wlan*; do
     [[ -e $net ]] || continue
     name=$(basename "$net")
     operstate=$(cat "$net/operstate" 2>/dev/null || printf unknown)
@@ -186,8 +229,8 @@ for sample in $(seq 0 54); do
   fi
 
   shopt -s nullglob
-  states=(/run/wifi-driver-lab/*.state)
-  safety=(/run/wifi-driver-lab/*.state.safety)
+  states=("$run_root"/wifi-driver-lab/*.state)
+  safety=("$run_root"/wifi-driver-lab/*.state.safety)
   unsafe=false
   for file in "${safety[@]}"; do
     [[ $(<"$file") == SAFE ]] || unsafe=true
@@ -195,7 +238,7 @@ for sample in $(seq 0 54); do
   if ((${#states[@]} == 0)) && ! $unsafe \
     && [[ $driver == mt7921e && $power == D0 && $iwd_active == active ]] \
     && $association && $dhcp && $default_route && $connectivity; then
-    wifi-lab-watchdog disarm "$token"
+    "$wifi_lab_watchdog" disarm "$token"
     outcome=passed
     reason=none
     if ((experiment_rc != 0)); then
@@ -211,6 +254,7 @@ for sample in $(seq 0 54); do
     printf 'COMPLETE realtime=%s watchdog=disarmed outcome=%s reason=%s restore_elapsed_ms=%s\n' \
       "$(date --iso-8601=ns)" "$outcome" "$reason" "$connectivity_ms" >> "$timeline"
     sync -f "$timeline"
+    ((experiment_rc != 0)) && exit "$experiment_rc"
     [[ $outcome == passed ]]
     exit $?
   fi
@@ -221,4 +265,5 @@ printf 'INCOMPLETE realtime=%s wiphy_ready=%s usable_interface_ready=%s associat
   "$(date --iso-8601=ns)" "$wiphy_ready" "$interface_ready" "$association" "$dhcp" \
   "$default_route" "$connectivity" "$association_failure" >> "$timeline"
 sync -f "$timeline"
-exit "$experiment_rc"
+((experiment_rc != 0)) && exit "$experiment_rc"
+exit 75

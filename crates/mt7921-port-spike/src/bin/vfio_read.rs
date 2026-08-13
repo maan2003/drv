@@ -17796,7 +17796,9 @@ mod tests {
             assert!(recovered.contains(proof), "{proof}");
         }
         let failure = recovered.find("experiment_rc != 0").unwrap();
-        let disarm = recovered.find("wifi-lab-watchdog disarm").unwrap();
+        let disarm = recovered
+            .find("\"$wifi_lab_watchdog\" disarm")
+            .unwrap();
         let complete = recovered.find("COMPLETE realtime=").unwrap();
         assert!(disarm < failure && failure < complete);
         assert!(recovered.contains("reason=experiment_rc_$experiment_rc"));
@@ -17813,7 +17815,9 @@ mod tests {
         let export = supervisor
             .find("export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel")
             .unwrap();
-        let handoff = supervisor.find("wifi-driver-lab \"$bdf\" 300").unwrap();
+        let handoff = supervisor
+            .find("\"$wifi_driver_lab\" \"$bdf\" 300")
+            .unwrap();
         assert!(derive < iw && iw < address && address < export && export < handoff);
         assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));
         assert!(supervisor.contains("target Wi-Fi interface is not connected"));
