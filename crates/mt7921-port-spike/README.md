@@ -2749,6 +2749,25 @@ passed without opening hardware. This refresh changes only source-exact SKU
 serialization: the project safety cap still applies to named rate fields,
 while 5-GHz CCK and the eight VHT reserved entries remain `127`.
 
+The generic regulatory-snapshot refresh from commit `18a6001e04fc236c12839b6ae33ff7cd32bd6f7b`
+produced package
+`/nix/store/7n9n5x9v2ysj5w52hgl476fpnjmagfvg-mt7921-full-firmware-validation-0.1.0`
+and manifest
+`/nix/store/gm9q7b3nscbd6gi289wzccg1c7qjzpjv-mt7921-full-firmware-validation-manifest`.
+The manifest SHA-256 is
+`ef17ae38b2f5ed2a04d7aa61d181ddb5f29f04e10f96866325b2002e6360c956`;
+it records launcher SHA-256
+`2082cbed30d13bcb04d2daa41e0cf53006e960aaaa6dd0081f5fbb24bda25f11`,
+ELF SHA-256
+`5228e812dd855e140f873a7e62e9b64322db0e4235d08a57b9b9eb74669b5443`,
+and sorted closure SHA-256
+`9a6b8144515ebbdd4a7398ddf7b8f327f997fd73da47e29e91c66acbbbd93daf`.
+Its offline libexec delivery self-test reconstructed the native no-override
+pages from decoded generic inputs, emitted per-page raw/envelope hashes, and
+retained the contiguous eight-page/reclaim contract. Physical publication is
+now fail-closed because the pinned Fuchsia query does not expose authoritative
+per-channel maximum regulatory power.
+
 The semaphore-order fix is packaged for a single normal-operation validation
 without authorizing a radio run. Commit `b16d2489852f60de8edb121d484d4fdc4057d28a`
 produced package
