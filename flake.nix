@@ -240,6 +240,7 @@
               runHook preInstall
               install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
               regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+              test "$regulatory_source_sha256" = 2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b
               mkdir -p "$out/bin"
               ln -s ../libexec/mt7921-full-firmware-validation "$out/bin/mt7921-full-firmware-validation-driver"
               substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} \
@@ -253,10 +254,24 @@
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                 --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by stat ${pkgs.coreutils}/bin/stat \
                 --subst-var-by rm ${pkgs.coreutils}/bin/rm \
                 --subst-var-by env ${pkgs.coreutils}/bin/env
               chmod 0755 "$out/bin/mt7921-full-firmware-validation"
               runHook postInstall
+            '';
+            postFixup = ''
+              evidence_dir=$out/share/mt7921-full-firmware-validation
+              mkdir -p "$evidence_dir"
+              driver=$out/libexec/mt7921-full-firmware-validation
+              "$driver" --self-test-rate-power-delivery > "$evidence_dir/rate-power-self-test.jsonl"
+              "$driver" --self-test-production-validation > "$evidence_dir/production-self-test.jsonl"
+              cat > "$evidence_dir/ARTIFACTS" <<EOF
+              RATE_POWER_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/rate-power-self-test.jsonl" | cut -d ' ' -f1)
+              PRODUCTION_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/production-self-test.jsonl" | cut -d ' ' -f1)
+              REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+              REGULATORY_GENERATION=0
+              EOF
             '';
             doInstallCheck = true;
             installCheckPhase = ''
@@ -270,6 +285,8 @@
               strings "$driver" | grep -F 'immediately_predata'
               strings "$driver" | grep -F 'e2e94_tx_success_gate result='
               strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false'
+              strings "$driver" | grep -F 'production_policy_validation result=pass'
+              strings "$driver" | grep -F 'tmac_population_invariant=false'
               rate_output="$("$driver" --self-test-rate-power-delivery)"
               test "$(printf '%s\n' "$rate_output" | grep -c '"rate_power_self_test":"command"')" -eq 10
               printf '%s\n' "$rate_output" \
@@ -280,6 +297,14 @@
                 | grep -F '"sequences":"15,1,2,3,4,5,6,7"' \
                 | grep -F '"reg_read_between_pages":0' \
                 | grep -F '"safe_reclaims":8'
+              production_output="$("$driver" --self-test-production-validation)"
+              printf '%s\n' "$production_output" \
+                | grep -F '"production_validation_self_test":"passed"' \
+                | grep -F '"tx_free_status":0' \
+                | grep -F '"tx_free_count":1' \
+                | grep -F '"txs_acked":true' \
+                | grep -F '"second_frame":false' \
+                | grep -F '"tmac_population_invariant":false'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
               grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
@@ -320,9 +345,11 @@
                 printf ' <%s>' "$@" >> "$transcript"
                 printf '\n' >> "$transcript"
                 ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
-                credential=$(${pkgs.coreutils}/bin/cat <&3)
                 regulatory_snapshot=$(${pkgs.coreutils}/bin/cat <&4)
-                printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
+                if [ "''${1-}" = --run-one-shot-sae-auth ] || [ "''${1-}" = --full-firmware-preflight ]; then
+                  credential=$(${pkgs.coreutils}/bin/cat <&3)
+                  printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
+                fi
                 printf 'REGULATORY_SNAPSHOT=%s\n' "$regulatory_snapshot" >> "$transcript"
                 EOF
                 chmod 0755 work/bin/validation-stub
@@ -346,6 +373,7 @@
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
                   --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                   --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                  --subst-var-by stat ${pkgs.coreutils}/bin/stat \
                   --subst-var-by rm ${pkgs.coreutils}/bin/rm \
                   --subst-var-by env ${pkgs.coreutils}/bin/env
                 chmod 0755 work/launcher
@@ -369,6 +397,15 @@
                 grep -Fx 'REGULATORY_SNAPSHOT=snapshot-ok' transcript
                 ! grep -q 'PATCH_TABLE' transcript
                 ! grep -q 'EAPOL' transcript
+                rm transcript
+                work/launcher --full-firmware-preflight
+                grep -Fx 'ARGV <--full-firmware-preflight>' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
+                grep -Fx 'REGULATORY_SNAPSHOT=snapshot-ok' transcript
+                grep -Fx 'CREDENTIAL_LEN=8' transcript
                 cp transcript "$out"
               '';
 
@@ -435,6 +472,13 @@
                 grep -Fx 'SNAPSHOT=snapshot-ok' transcript
                 grep -Fx 'FD4_EOF=true' transcript
                 ! grep -q FD4_WRITABLE transcript
+
+                work/launcher --evidence-preflight
+                grep -Fx 'ARGV <--full-firmware-preflight>' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
+                grep -Fx 'CREDENTIAL=eight-by' transcript
+                grep -Fx 'SNAPSHOT=snapshot-ok' transcript
 
                 cat > work/bin/fail-stub <<'EOF'
                 #!${pkgs.runtimeShell}
@@ -609,16 +653,40 @@
               printf passed > "$out"
             '';
 
+          mt7921-full-firmware-validation-supervisor = pkgs.runCommand
+            "mt7921-full-firmware-validation-supervisor"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+                "$out/bin/mt7921-full-firmware-validation-supervisor" \
+                --subst-var-by runtime_path /run/current-system/sw/bin \
+                --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
+                --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
+                --subst-var-by validation_launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
+                --subst-var-by recovery_samples 45 \
+                --subst-var-by sys_root /sys \
+                --subst-var-by run_root /run \
+                --subst-var-by var_root /var \
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+              chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -F 'connected Wi-Fi target drifted from fixed ph1 validation policy' \
+                "$out/bin/mt7921-full-firmware-validation-supervisor"
+            '';
+
           mt7921-full-firmware-validation-manifest =
             let
               package = mt7921-full-firmware-validation;
-              closure = pkgs.closureInfo { rootPaths = [ package ]; };
+              supervisor = mt7921-full-firmware-validation-supervisor;
+              closure = pkgs.closureInfo { rootPaths = [ package supervisor ]; };
             in
             pkgs.runCommand "mt7921-full-firmware-validation-manifest"
               { nativeBuildInputs = [ pkgs.coreutils ]; }
               ''
                 launcher=${package}/bin/mt7921-full-firmware-validation
                 driver=${package}/bin/mt7921-full-firmware-validation-driver
+                supervisor=${supervisor}/bin/mt7921-full-firmware-validation-supervisor
                 closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
                 cat > "$out" <<EOF
                 PACKAGE=${package}
@@ -626,6 +694,11 @@
                 LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
                 ELF=$driver
                 ELF_SHA256=$(sha256sum "$driver" | cut -d ' ' -f1)
+                SUPERVISOR=$supervisor
+                SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
+                REGULATORY_DB=${regulatoryDb}
+                REGULATORY_DB_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+                REGULATORY_GENERATION=0
                 CLOSURE_SHA256=$closure_sha
                 PCI_BDF=0000:05:00.0
                 TIMEOUT_SECONDS=300
@@ -637,9 +710,9 @@
                 TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
                 FRAME=qos_null_tid0_be_qidx1
                 SUCCESS=tx_free_status_0_count_1_and_correlated_txs_ack
-                PATCH_TABLE_SNAPSHOTS=before_rx_path_after_each_of_8_pages_and_after_final
-                PATCH_TABLE_REQUIRED_BEFORE_ADD_DEVICE=41_of_41
-                RATE_POWER_ORDER=rx_path_then_8_contiguous_0x4005d_then_add_device
+                TMAC_DIAGNOSTIC_ONLY=true
+                TMAC_POPULATION_INVARIANT=false
+                RATE_POWER_ORDER=eeprom_prepare_protect_mac_enable_rx_path_then_8_contiguous_0x4005d_then_acked_add_device
                 RATE_POWER_REG_READ_BETWEEN_PAGES=0
                 RATE_POWER_LAST_MSG_PAGE=8
                 PATCH_TABLE_GATE=false
@@ -650,6 +723,27 @@
                 RETRY=false
                 EOF
               '';
+
+          mt7921-full-firmware-validation-root-entry = pkgs.runCommand
+            "mt7921-full-firmware-validation-root-entry"
+            {
+              nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+              meta.mainProgram = "mt7921-full-firmware-validation-root";
+            }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-rate-power-evidence-root.sh} \
+                "$out/bin/mt7921-full-firmware-validation-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by supervisor ${mt7921-full-firmware-validation-supervisor}/bin/mt7921-full-firmware-validation-supervisor \
+                --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
+                --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut
+              chmod 0755 "$out/bin/mt7921-full-firmware-validation-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-root"
+            '';
 
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";

@@ -1113,6 +1113,7 @@ fn run_contained_dma_resource_round_trip(
                             associated_edca_programmed: false,
                             e2e93_probe: false,
                             e2e94_probe: false,
+                            authoritative_rate_power: None,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -1646,12 +1647,37 @@ fn read_sae_credential_exact(
     // SAFETY: the root launcher transfers this inherited descriptor exactly
     // once to this one-shot process; taking ownership also closes it promptly.
     let mut file = unsafe { File::from_raw_fd(raw_fd) };
-    if file.read_exact(&mut credential).is_err() {
+    read_sae_credential_bytes_exact(&mut file, &mut credential)?;
+    Ok(SaeCredential(credential))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn read_sae_credential_bytes_exact<R: Read>(
+    reader: &mut R,
+    credential: &mut [u8],
+) -> Result<(), String> {
+    let wipe = |credential: &mut [u8]| {
         credential.fill(0);
         std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        return Err("read exact SAE credential bytes failed".into());
+    };
+    if let Err(error) = reader.read_exact(credential) {
+        wipe(credential);
+        return Err(format!("read exact SAE credential bytes: {error}"));
     }
-    Ok(SaeCredential(credential))
+    let mut extra = [0];
+    match reader.read(&mut extra) {
+        Ok(0) => Ok(()),
+        Ok(_) => {
+            extra.fill(0);
+            wipe(credential);
+            Err("SAE credential exceeds declared length".into())
+        }
+        Err(error) => {
+            extra.fill(0);
+            wipe(credential);
+            Err(format!("check SAE credential EOF: {error}"))
+        }
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -3075,6 +3101,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         })
         .map_err(|e| format!("self-test selection: {e:?}"))?,
         channel: ClientChannelContext::default(),
+        production_policy: None,
+        validation_complete: false,
     }));
     let effects = LiveClientEffects {
         state: Arc::clone(&shared),
@@ -3448,6 +3476,77 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn run_production_validation_self_test() -> Result<(), String> {
+    let mut audit = RatePowerDeliveryAudit::default();
+    for command in [
+        PassiveMcuCommand::EepromBufferMode,
+        PassiveMcuCommand::ProtectCtrl,
+        PassiveMcuCommand::MacEnable,
+    ] {
+        audit.before_passive_command(&command)?;
+    }
+    let rx_path = PassiveMcuCommand::SetRxPath {
+        channel: mt7921_port_spike::CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz2,
+            number: 1,
+            frequency_mhz: 2412,
+        },
+        antenna_mask: 3,
+    };
+    audit.before_passive_command(&rx_path)?;
+    audit.passive_command_completed(&rx_path)?;
+    for page in realistic_rate_power_audit_commands(4)? {
+        audit.page_consumed_and_reclaimed(&page)?;
+    }
+    audit.finish()?;
+    let add_device = PassiveMcuCommand::AddDevice {
+        mac: [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+    };
+    audit.before_passive_command(&add_device)?;
+    audit.passive_command_completed(&add_device)?;
+
+    let source =
+        parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
+    let policy = ProductionValidationPolicy::bind(
+        b"ph1",
+        [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+        36,
+        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        0,
+        source,
+    )?;
+    policy.validate_association(
+        [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+        36,
+        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+    )?;
+    let mut published = false;
+    admit_one_validation_probe(&mut published, true).map_err(|status| status.to_string())?;
+    let completion = DiagnosticTxResult {
+        free: Mt7921TxFree {
+            wcid: Some(7),
+            token: 1,
+            dropped: false,
+            attempts: 1,
+            status: 0,
+            pair_word: None,
+            info_word: 0,
+        },
+        txs_present: true,
+        txs_acked: true,
+    };
+    if !validation_probe_completed(&completion)
+        || admit_one_validation_probe(&mut published, true).is_ok()
+    {
+        return Err("production one-frame completion gate self-test failed".into());
+    }
+    println!(
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","frame":"qos_null_tid0_be","tx_free_status":0,"tx_free_count":1,"txs_present":true,"txs_acked":true,"eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+    );
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn realistic_rate_power_audit_commands(
     first_physical_sequence: u8,
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -3489,9 +3588,20 @@ fn validate_native_rate_power_snapshot(
         fixed_mt7921_rate_power_capability(),
     )
     .map_err(|error| format!("intersect authoritative rate-power input: {error:?}"))?;
+    validate_native_rate_power_snapshot_parts(&narrowed, frozen.expected_source_sha256)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_native_rate_power_snapshot_parts(
+    snapshot: &RegulatoryRatePowerSnapshot,
+    expected_source_sha256: [u8; 32],
+) -> Result<Vec<RatePowerByteEvidence>, String> {
+    if snapshot.generation() != 0 || snapshot.source_sha256() != expected_source_sha256 {
+        return Err("rate-power generation or source identity is stale".into());
+    }
     let commands = encode_regulatory_rate_tx_power_commands(
         fixed_mt7921_rate_power_capability(),
-        &narrowed,
+        snapshot,
         0,
         1,
     )
@@ -3525,6 +3635,13 @@ fn run() -> Result<(), String> {
         }
         return run_rate_power_delivery_self_test();
     }
+    #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--self-test-production-validation") {
+        if env::args().len() != 2 {
+            return Err("production validation self-test accepts no additional arguments".into());
+        }
+        return run_production_validation_self_test();
+    }
     if operation_argument.as_deref() == Some("--full-firmware-preflight") {
         if env::args().len() != 2 {
             return Err("full-firmware preflight accepts no additional arguments".into());
@@ -3541,8 +3658,11 @@ fn run() -> Result<(), String> {
         let ram = decompress_ram()?;
         Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
         Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+        let credential = read_sae_credential()?;
         let frozen = read_rate_power_snapshot()?;
         let snapshot = &frozen.snapshot;
+        let production_source =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
         let enabled = snapshot
             .channels()
             .iter()
@@ -3561,12 +3681,36 @@ fn run() -> Result<(), String> {
         if snapshot.generation() != 0
             || snapshot.alpha2() != *b"00"
             || snapshot.source_sha256() != frozen.expected_source_sha256
+            || frozen.expected_source_sha256 != production_source
             || !snapshot.sar_ranges().is_empty()
             || snapshot.external_cap_half_dbm().is_some()
             || (enabled, disabled, absent) != (39, 3, 20)
         {
             return Err("inert preflight regulatory snapshot identity is invalid".into());
         }
+        let binding = ValidatedCredentialPolicyBinding::bind(
+            &credential,
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            &frozen,
+        )?;
+        let consumed_binding = binding.consume(
+            &credential,
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            &frozen,
+        )?;
+        let credential_policy_binding = consumed_binding.marker();
+        let policy = consumed_binding.into_policy();
+        policy.validate_association(
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        )?;
         let page_evidence = validate_native_rate_power_snapshot(&frozen)?;
         let actual_raw_sha256 = page_evidence
             .iter()
@@ -3597,7 +3741,7 @@ fn run() -> Result<(), String> {
             return Err("full-firmware inert containment acquisition is invalid".into());
         }
         println!(
-            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"snapshot_eof\":true,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"credential_eof\":true,\"credential_policy_binding\":\"{credential_policy_binding}\",\"snapshot_eof\":true,\"target\":\"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a\",\"regulatory_domain\":\"00\",\"regulatory_generation\":0,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
             snapshot
                 .source_sha256()
                 .iter()
@@ -3689,11 +3833,7 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-power-setup") => Operation::RunOneShotPowerSetup,
         #[cfg(feature = "fuchsia-passive")]
-        Some("--run-one-shot-sae-auth") => {
-            return Err(
-                "SAE validation is disabled pending native rate-power payload comparison".into(),
-            );
-        }
+        Some("--run-one-shot-sae-auth") => Operation::RunOneShotSaeAuth,
         #[cfg(not(feature = "fuchsia-passive"))]
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
@@ -3710,7 +3850,7 @@ fn run() -> Result<(), String> {
         Ok(_) => return Err("DRV_STABLE_MAC_TRANSITION_DIAGNOSTIC must equal 1".into()),
         Err(error) => return Err(format!("read stable-MAC diagnostic mode: {error}")),
     };
-    let e2e93_probe = match (
+    let edca_probe_mode = match (
         env::var("DRV_E2E93_EDCA_PROBE"),
         env::var("DRV_E2E94_EDCA_PROBE"),
     ) {
@@ -3729,6 +3869,11 @@ fn run() -> Result<(), String> {
         }
     };
     let e2e94_probe = env::var("DRV_E2E94_EDCA_PROBE").is_ok();
+    let e2e93_probe = edca_probe_mode && !e2e94_probe;
+    #[cfg(feature = "fuchsia-passive")]
+    if operation == Operation::RunOneShotSaeAuth && !e2e94_probe {
+        return Err("SAE validation requires the fixed one-frame E2E94 completion mode".into());
+    }
     #[cfg(feature = "fuchsia-passive")]
     if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
         return Err("DMASHDL transition diagnostic requires the pinned SAE lifecycle".into());
@@ -3903,12 +4048,56 @@ fn run() -> Result<(), String> {
         .map(validate_native_rate_power_snapshot)
         .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
+    if e2e94_probe {
+        let expected =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
+        let frozen = rate_power_snapshot
+            .as_ref()
+            .ok_or("production validation requires a frozen regulatory snapshot")?;
+        if frozen.snapshot.generation() != 0 || frozen.expected_source_sha256 != expected {
+            return Err("production regulatory generation or source hash drifted".into());
+        }
+    }
+    #[cfg(feature = "fuchsia-passive")]
     let mut sae_credential = matches!(
         operation,
         Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
     )
     .then(read_sae_credential)
     .transpose()?;
+    #[cfg(feature = "fuchsia-passive")]
+    let mut production_policy = if operation == Operation::RunOneShotSaeAuth {
+        let target = power_target
+            .as_ref()
+            .ok_or("production validation requires a fixed target")?;
+        let frozen = rate_power_snapshot
+            .as_ref()
+            .ok_or("production validation requires a frozen regulatory snapshot")?;
+        let credential = sae_credential
+            .as_ref()
+            .ok_or("production validation requires an SAE credential")?;
+        Some(
+            ValidatedCredentialPolicyBinding::bind(
+                credential,
+                &target.1,
+                target.0,
+                target.2,
+                target.3.bytes(),
+                frozen,
+            )?
+            .consume(
+                credential,
+                &target.1,
+                target.0,
+                target.2,
+                target.3.bytes(),
+                frozen,
+            )?
+            .into_policy(),
+        )
+    } else {
+        None
+    };
     #[cfg(feature = "fuchsia-passive")]
     if operation == Operation::RunOneShotSaeAuth {
         record_sae_stage("credential_read");
@@ -5584,6 +5773,7 @@ fn run() -> Result<(), String> {
                                     RunPhase::DmaAndResponseIrqEnabled,
                                     RunPhase::FirmwareReady,
                                 )?;
+                            validate_production_prefix_sequence(e2e94_probe, loader.sequence)?;
                             let mut mechanics = VfioPassiveMechanics {
                                 loader,
                                 ledger: capsule
@@ -5620,6 +5810,11 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                authoritative_rate_power: rate_power_snapshot.as_ref().map(
+                                    |frozen| {
+                                        (frozen.snapshot.clone(), frozen.expected_source_sha256)
+                                    },
+                                ),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -5673,6 +5868,7 @@ fn run() -> Result<(), String> {
                                     RunPhase::DmaAndResponseIrqEnabled,
                                     RunPhase::FirmwareReady,
                                 )?;
+                            validate_production_prefix_sequence(e2e94_probe, loader.sequence)?;
                             let mut mechanics = VfioPassiveMechanics {
                                 loader,
                                 ledger: capsule
@@ -5709,6 +5905,11 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                authoritative_rate_power: rate_power_snapshot.as_ref().map(
+                                    |frozen| {
+                                        (frozen.snapshot.clone(), frozen.expected_source_sha256)
+                                    },
+                                ),
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -5999,8 +6200,12 @@ fn run() -> Result<(), String> {
                                     let selection = target_selection
                                         .take()
                                         .ok_or("target selection evidence was not retained")?;
+                                    let production_policy = production_policy.take().ok_or(
+                                        "production credential-policy binding unavailable",
+                                    )?;
                                     let shared = Arc::new(Mutex::new(LiveClientState {
                                         selection,
+                                        production_policy: Some(production_policy),
                                         ..Default::default()
                                     }));
                                     let target_rcpi = target_bss
@@ -6153,6 +6358,15 @@ fn run() -> Result<(), String> {
                                         .map_err(|error| {
                                             format!("pinned SME/MLME connect failed: {error:?}")
                                         })?;
+                                    if e2e94_probe {
+                                        if !shared.lock().unwrap().validation_complete {
+                                            return Err("production validation connected without the required physical TX completion".into());
+                                        }
+                                        record_sae_stage(
+                                            "production_validation_complete association=true one_be_tid0_qos_null=true physical_completion=true stopped=true",
+                                        );
+                                        return Ok(());
+                                    }
                                     record_sae_stage(
                                         "pinned_sme_connected association=true key_install=true controlled_port=true",
                                     );
@@ -10190,18 +10404,35 @@ fn program_live_rate_power(
     mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
     capability: mt7921_port_spike::NicCapability,
 ) -> Result<(), String> {
-    // The pinned Fuchsia SoftMAC query supplies channel identity but no
-    // max-regulatory-power value. Preserve that absence so publication fails
-    // closed rather than substituting a captured host value.
-    let candidates = candidate_channels(capability);
-    let mut channels = regulatory_rate_power_channel_skeleton(capability)
-        .map_err(|error| format!("build rate-power channel skeleton: {error:?}"))?;
-    for channel in &mut channels {
-        channel.present = candidates
-            .iter()
-            .any(|candidate| candidate.band == channel.band && candidate.number == channel.channel);
-    }
-    let snapshot = RegulatoryRatePowerSnapshot::new(0, *b"00", channels, Vec::new(), Some(0));
+    let (snapshot, expected_source_sha256) = if let Some((frozen, expected)) =
+        mechanics.authoritative_rate_power.as_ref()
+    {
+        if frozen.generation() != 0 || frozen.source_sha256() != *expected {
+            return Err("authoritative rate-power generation or source identity drifted".into());
+        }
+        validate_native_rate_power_capability(capability)?;
+        (
+            narrow_regulatory_rate_power_snapshot(frozen, capability)
+                .map_err(|error| format!("intersect authoritative rate-power input: {error:?}"))?,
+            *expected,
+        )
+    } else {
+        // Non-production passive callers still have no authoritative maximum
+        // regulatory power. Preserve that absence and fail closed rather than
+        // substituting a captured host value.
+        let candidates = candidate_channels(capability);
+        let mut channels = regulatory_rate_power_channel_skeleton(capability)
+            .map_err(|error| format!("build rate-power channel skeleton: {error:?}"))?;
+        for channel in &mut channels {
+            channel.present = candidates.iter().any(|candidate| {
+                candidate.band == channel.band && candidate.number == channel.channel
+            });
+        }
+        let snapshot = RegulatoryRatePowerSnapshot::new(0, *b"00", channels, Vec::new(), Some(0));
+        let source = snapshot.source_sha256();
+        (snapshot, source)
+    };
+    validate_native_rate_power_snapshot_parts(&snapshot, expected_source_sha256)?;
     let mut transport = VfioRateTxPower {
         loader: &mut *mechanics.loader,
     };
@@ -10211,7 +10442,7 @@ fn program_live_rate_power(
             &mut transport,
             capability,
             &snapshot,
-            snapshot.source_sha256(),
+            expected_source_sha256,
             1,
         )
         .map_err(|error| format!("submit rate-power setup: {error:?}"))?;
@@ -10230,7 +10461,7 @@ fn issue_rate_power_evidence_command(
     mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
     command: PassiveMcuCommand,
 ) -> Result<(), String> {
-    let sequence = FirmwareLoaderTransport::next_sequence(mechanics.loader);
+    let sequence = mechanics.loader.sequence % 15 + 1;
     let encoded = encode_passive_mcu_command(&command, sequence)
         .map_err(|error| format!("encode rate-power lifecycle command: {error:?}"))?;
     let wait_response = command.expects_response();
@@ -11466,10 +11697,170 @@ fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionValidationPolicy {
+    bssid: [u8; 6],
+    channel: u8,
+    client: [u8; 6],
+    regulatory_generation: u64,
+    regulatory_source_sha256: [u8; 32],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ProductionValidationPolicy {
+    fn bind(
+        ssid: &[u8],
+        bssid: [u8; 6],
+        channel: u8,
+        client: [u8; 6],
+        regulatory_generation: u64,
+        regulatory_source_sha256: [u8; 32],
+    ) -> Result<Self, String> {
+        let authoritative_source =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
+        if ssid != b"ph1"
+            || bssid != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
+            || channel != 36
+            || client != [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]
+            || regulatory_generation != 0
+            || regulatory_source_sha256 != authoritative_source
+        {
+            return Err("fixed production target or regulatory generation drifted".into());
+        }
+        Ok(Self {
+            bssid,
+            channel,
+            client,
+            regulatory_generation,
+            regulatory_source_sha256,
+        })
+    }
+
+    fn validate_association(
+        &self,
+        bssid: [u8; 6],
+        channel: u8,
+        client: [u8; 6],
+    ) -> Result<(), String> {
+        let authoritative_source =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
+        (self.bssid == bssid
+            && self.channel == channel
+            && self.client == client
+            && self.regulatory_generation == 0
+            && self.regulatory_source_sha256 == authoritative_source)
+            .then_some(())
+            .ok_or_else(|| "production association policy lease drifted".into())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Debug)]
+struct ValidatedCredentialPolicyBinding {
+    credential_identity: [u8; 32],
+    ssid: Vec<u8>,
+    bssid: [u8; 6],
+    channel: u8,
+    client: [u8; 6],
+    regulatory_domain: [u8; 2],
+    regulatory_generation: u64,
+    regulatory_source_sha256: [u8; 32],
+    policy: ProductionValidationPolicy,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct ConsumedCredentialPolicyBinding(ProductionValidationPolicy);
+
+#[cfg(feature = "fuchsia-passive")]
+impl ConsumedCredentialPolicyBinding {
+    fn marker(&self) -> &'static str {
+        "validated-and-consumed-before-device-open"
+    }
+
+    fn into_policy(self) -> ProductionValidationPolicy {
+        self.0
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ValidatedCredentialPolicyBinding {
+    fn bind(
+        credential: &SaeCredential,
+        ssid: &[u8],
+        bssid: [u8; 6],
+        channel: u8,
+        client: [u8; 6],
+        snapshot: &FrozenRatePowerSnapshot,
+    ) -> Result<Self, String> {
+        let policy = ProductionValidationPolicy::bind(
+            ssid,
+            bssid,
+            channel,
+            client,
+            snapshot.snapshot.generation(),
+            snapshot.expected_source_sha256,
+        )?;
+        if snapshot.snapshot.alpha2() != *b"00"
+            || snapshot.snapshot.source_sha256() != snapshot.expected_source_sha256
+        {
+            return Err("credential-policy regulatory domain or source drifted".into());
+        }
+        let mut identity = Sha256::new();
+        identity.update(b"mt7921-credential-policy-binding-v1\0");
+        identity.update(&credential.0);
+        identity.update(ssid);
+        identity.update(bssid);
+        identity.update([channel]);
+        identity.update(client);
+        identity.update(snapshot.snapshot.alpha2());
+        identity.update(snapshot.snapshot.generation().to_le_bytes());
+        identity.update(snapshot.expected_source_sha256);
+        Ok(Self {
+            credential_identity: identity.finalize().into(),
+            ssid: ssid.to_vec(),
+            bssid,
+            channel,
+            client,
+            regulatory_domain: snapshot.snapshot.alpha2(),
+            regulatory_generation: snapshot.snapshot.generation(),
+            regulatory_source_sha256: snapshot.expected_source_sha256,
+            policy,
+        })
+    }
+
+    fn consume(
+        self,
+        credential: &SaeCredential,
+        ssid: &[u8],
+        bssid: [u8; 6],
+        channel: u8,
+        client: [u8; 6],
+        snapshot: &FrozenRatePowerSnapshot,
+    ) -> Result<ConsumedCredentialPolicyBinding, String> {
+        let rebound = Self::bind(credential, ssid, bssid, channel, client, snapshot)?;
+        if self.credential_identity != rebound.credential_identity
+            || self.ssid != rebound.ssid
+            || self.bssid != rebound.bssid
+            || self.channel != rebound.channel
+            || self.client != rebound.client
+            || self.regulatory_domain != rebound.regulatory_domain
+            || self.regulatory_generation != rebound.regulatory_generation
+            || self.regulatory_source_sha256 != rebound.regulatory_source_sha256
+            || self.policy != rebound.policy
+        {
+            return Err("credential-policy binding changed before consumption".into());
+        }
+        Ok(ConsumedCredentialPolicyBinding(self.policy))
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct LiveClientState {
     selection: ClientTargetBssLease,
     channel: ClientChannelContext,
+    production_policy: Option<ProductionValidationPolicy>,
+    validation_complete: bool,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -11719,6 +12110,14 @@ fn classify_client_data_frame(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn is_anchored_eapol_data(bytes: &[u8]) -> bool {
+    let classification = classify_client_data_frame(bytes, [0; 6], [0; 6]);
+    classification.frame_type == 2
+        && classification.snap_present
+        && classification.ether_type == Some(0x888e)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
@@ -11780,6 +12179,10 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 impl Mt7921ClientEffects for LiveClientEffects {
+    fn validation_complete(&self) -> bool {
+        self.state.lock().unwrap().validation_complete
+    }
+
     fn prepare_runtime_handoff(
         &mut self,
     ) -> mt7921_softmac_adapter::client_device::ClientRuntimeScanState {
@@ -11878,6 +12281,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
         flags: fidl_softmac::WlanTxInfoFlags,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        if self.state.lock().unwrap().validation_complete {
+            return Err(zx::Status::ALREADY_EXISTS);
+        }
         let control = bytes
             .get(..2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -11975,9 +12381,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Ok(());
         }
         drop(state);
-        let eapol = bytes
-            .windows(8)
-            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        let eapol = is_anchored_eapol_data(bytes);
         self.firmware
             .tx_generation(eapol)
             .map_err(|_| zx::Status::ACCESS_DENIED)?;
@@ -12022,7 +12426,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        io.transmit_client(bytes, flags)
+        match io.transmit_client(bytes, flags) {
+            Err(zx::Status::STOP) if self.suppress_eapol_liveness => {
+                self.state.lock().unwrap().validation_complete = true;
+                Ok(())
+            }
+            result => result,
+        }
     }
     fn install_key(
         &mut self,
@@ -12148,6 +12558,24 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Err(zx::Status::INVALID_ARGS);
         }
         let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+        if self.suppress_eapol_liveness {
+            self.state
+                .lock()
+                .unwrap()
+                .production_policy
+                .as_ref()
+                .ok_or(zx::Status::BAD_STATE)?
+                .validate_association(peer, primary.number, self.client)
+                .map_err(|error| {
+                    record_sae_stage(&format!(
+                        "production_policy_validation result=denied reason={error}"
+                    ));
+                    zx::Status::ACCESS_DENIED
+                })?;
+            record_sae_stage(
+                "production_policy_validation result=pass ssid=ph1 bssid=true channel=36 client=true regulatory_generation=0 regulatory_source=true",
+            );
+        }
         let band = match primary.band {
             fidl_ieee80211::WlanBand::TwoGhz => 0,
             fidl_ieee80211::WlanBand::FiveGhz => 1,
@@ -12869,6 +13297,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     associated_edca_programmed: bool,
     e2e93_probe: bool,
     e2e94_probe: bool,
+    authoritative_rate_power: Option<(RegulatoryRatePowerSnapshot, [u8; 32])>,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -12887,6 +13316,51 @@ struct DiagnosticTxResult {
     free: Mt7921TxFree,
     txs_present: bool,
     txs_acked: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn admit_one_validation_probe(
+    already_published: &mut bool,
+    eapol_trigger: bool,
+) -> Result<(), zx::Status> {
+    if !eapol_trigger {
+        return Err(zx::Status::ACCESS_DENIED);
+    }
+    if std::mem::replace(already_published, true) {
+        return Err(zx::Status::ALREADY_EXISTS);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn e2e94_validation_trigger(
+    control: u16,
+    eapol: bool,
+    already_published: &mut bool,
+) -> Result<bool, zx::Status> {
+    if control & 0x000c == 0 {
+        return matches!(control & 0x00fc, 0x00b0 | 0x0000)
+            .then_some(false)
+            .ok_or(zx::Status::ACCESS_DENIED);
+    }
+    admit_one_validation_probe(already_published, eapol)?;
+    Ok(true)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_production_prefix_sequence(enabled: bool, sequence: u8) -> Result<(), String> {
+    (!enabled || sequence == 14)
+        .then_some(())
+        .ok_or_else(|| format!("production firmware prefix sequence drifted from 14 to {sequence}"))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validation_probe_completed(result: &DiagnosticTxResult) -> bool {
+    result.free.status == 0
+        && result.free.attempts == 1
+        && !result.free.dropped
+        && result.txs_present
+        && result.txs_acked
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -13611,6 +14085,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
 impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
+    fn current_mcu_sequence(&self) -> Option<u8> {
+        Some(self.loader.sequence)
+    }
+
     fn install_rate_tx_power(
         &mut self,
         capability: mt7921_port_spike::NicCapability,
@@ -13983,9 +14461,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             );
             return Err(zx::Status::CANCELED);
         }
-        let eapol = bytes
-            .windows(8)
-            .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        let eapol = is_anchored_eapol_data(bytes);
+        let control = u16::from_le_bytes([bytes[0], bytes[1]]);
         if eapol {
             self.loader
                 .capture_patch_table_snapshot("immediately_predata")
@@ -13995,11 +14472,16 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             }
             .trace_peer_wtbl_dw5("immediately_pre_data");
         }
-        if eapol && !self.e2e81_probe_done {
+        let validation_trigger = if self.e2e94_probe {
+            e2e94_validation_trigger(control, eapol, &mut self.e2e81_probe_done)?
+        } else {
+            eapol && !self.e2e81_probe_done
+        };
+        if validation_trigger {
             // Same-session source-exact AC discriminator. The EAPOL timer is
             // only the post-association trigger; no EAPOL is published.
             self.e2e81_probe_done = true;
-            if self.e2e93_probe {
+            if self.e2e93_probe || self.e2e94_probe {
                 let probe = if self.e2e94_probe { "e2e94" } else { "e2e93" };
                 let early_bss = self.loader.client_interface.is_some();
                 let associated = self.associated_edca_programmed;
@@ -14007,14 +14489,14 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     .stable_mac_watcher
                     .as_ref()
                     .is_some_and(|watcher| watcher.tmac_transitioned);
-                if !(early_bss && associated && tmac_transition) {
+                if !(early_bss && associated) {
                     record_sae_stage(&format!(
-                        "{probe}_edca_gate result=mismatch early_bss={early_bss} associated={associated} stable_tmac_transition={tmac_transition} probe_published=false"
+                        "{probe}_edca_gate result=mismatch early_bss={early_bss} associated={associated} tmac_transition_diagnostic={tmac_transition} probe_published=false"
                     ));
                     return Err(zx::Status::IO_DATA_INTEGRITY);
                 }
                 record_sae_stage(&format!(
-                    "{probe}_edca_gate result=match early_bss=true associated=true stable_tmac_transition=true raw_values=omitted"
+                    "{probe}_edca_gate result=match early_bss=true associated=true tmac_transition_diagnostic={tmac_transition} tmac_population_invariant=false raw_values=omitted"
                 ));
             }
             let ap: [u8; 6] = bytes[4..10].try_into().unwrap();
@@ -14109,11 +14591,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 be.free.dropped,
             ));
             if self.e2e94_probe {
-                let passed = be.free.status == 0
-                    && be.free.attempts == 1
-                    && !be.free.dropped
-                    && be.txs_present
-                    && be.txs_acked;
+                let passed = validation_probe_completed(&be);
                 record_sae_stage(&format!(
                     "e2e94_tx_success_gate result={} tx_free_status={} tx_free_count={} tx_free_success={} txs_present={} txs_acked={} stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false",
                     if passed { "passed" } else { "failed" },
@@ -14321,6 +14799,18 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
+        let sequence = encoded
+            .get(39)
+            .copied()
+            .filter(|sequence| (1..=15).contains(sequence))
+            .ok_or_else(|| PhysicalPassiveError("passive command omitted valid sequence".into()))?;
+        let expected = self.loader.sequence % 15 + 1;
+        if sequence != expected {
+            return Err(PhysicalPassiveError(format!(
+                "passive command sequence {sequence} did not follow live loader sequence {}",
+                self.loader.sequence
+            )));
+        }
         if matches!(command, PassiveMcuCommand::SetRxPath { .. }) {
             self.loader
                 .capture_patch_table_snapshot("immediately_before_rx_path")
@@ -14337,6 +14827,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 .transition(RunPhase::PassiveReady, RunPhase::Scanning)
                 .map_err(PhysicalPassiveError)?;
         }
+        self.loader.sequence = sequence;
         self.loader
             .send_passive_command(command, encoded, wait_response)
             .map_err(PhysicalPassiveError)?;
@@ -16190,6 +16681,8 @@ mod tests {
             })
             .unwrap(),
             channel: ClientChannelContext::default(),
+            production_policy: None,
+            validation_complete: false,
         }
     }
 
@@ -16334,17 +16827,62 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn sae_credential_declared_length_does_not_wait_for_eof() {
-        use std::os::fd::IntoRawFd;
-        use std::os::unix::net::UnixStream;
+    fn sae_credential_wire_requires_exact_payload_and_eof() {
+        assert!(
+            read_sae_credential_exact(-1, 7)
+                .err()
+                .unwrap()
+                .contains("length is invalid")
+        );
+        let mut exact = std::io::Cursor::new(b"eight-by".to_vec());
+        let mut credential = vec![0; 8];
+        read_sae_credential_bytes_exact(&mut exact, &mut credential).unwrap();
+        assert_eq!(credential, b"eight-by");
 
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        writer.write_all(b"eight-byte-secret").unwrap();
-        let credential = read_sae_credential_exact(reader.into_raw_fd(), 8).unwrap();
-        assert_eq!(credential.0, b"eight-by");
-        // The peer deliberately remains open: returning proves there was no
-        // read-to-EOF dependency. Remaining bytes are discarded on close.
-        drop(writer);
+        let mut trailing = std::io::Cursor::new(b"eight-byX".to_vec());
+        credential.fill(0xaa);
+        assert!(
+            read_sae_credential_bytes_exact(&mut trailing, &mut credential)
+                .unwrap_err()
+                .contains("exceeds declared length")
+        );
+        assert_eq!(credential, [0; 8]);
+
+        let mut truncated = std::io::Cursor::new(b"short".to_vec());
+        credential.fill(0xaa);
+        assert!(
+            read_sae_credential_bytes_exact(&mut truncated, &mut credential)
+                .unwrap_err()
+                .contains("read exact")
+        );
+        assert_eq!(credential, [0; 8]);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn sae_credential_eof_read_error_zeroizes_payload() {
+        struct EofErrorReader {
+            payload: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for EofErrorReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.payload.position() < self.payload.get_ref().len() as u64 {
+                    self.payload.read(output)
+                } else {
+                    Err(std::io::Error::other("injected EOF read failure"))
+                }
+            }
+        }
+        let mut reader = EofErrorReader {
+            payload: std::io::Cursor::new(b"eight-by".to_vec()),
+        };
+        let mut credential = vec![0xaa; 8];
+        assert!(
+            read_sae_credential_bytes_exact(&mut reader, &mut credential)
+                .unwrap_err()
+                .contains("injected EOF read failure")
+        );
+        assert_eq!(credential, [0; 8]);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -16485,6 +17023,58 @@ mod tests {
             wire[payload_len..].copy_from_slice(&digest);
         };
         let valid_wire = encode_rate_power_snapshot_wire(&snapshot);
+        let valid_frozen = FrozenRatePowerSnapshot {
+            snapshot: snapshot.clone(),
+            expected_source_sha256: source,
+            wire_sha256: sha256_hex(&valid_wire),
+        };
+        let credential = SaeCredential(b"eight-by".to_vec());
+        let binding = ValidatedCredentialPolicyBinding::bind(
+            &credential,
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            &valid_frozen,
+        )
+        .unwrap();
+        let consumed = binding
+            .consume(
+                &credential,
+                b"ph1",
+                [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                36,
+                [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+                &valid_frozen,
+            )
+            .unwrap();
+        assert_eq!(
+            consumed.marker(),
+            "validated-and-consumed-before-device-open"
+        );
+        let _policy = consumed.into_policy();
+        let binding = ValidatedCredentialPolicyBinding::bind(
+            &credential,
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            &valid_frozen,
+        )
+        .unwrap();
+        let wrong_credential = SaeCredential(b"other-one".to_vec());
+        assert!(
+            binding
+                .consume(
+                    &wrong_credential,
+                    b"ph1",
+                    [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                    36,
+                    [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+                    &valid_frozen,
+                )
+                .is_err()
+        );
         let mut stale = valid_wire.clone();
         stale[5] = 1;
         resign(&mut stale);
@@ -19088,6 +19678,11 @@ mod tests {
         assert!(block.contains("Operation::RunOneShotPowerSetup"));
         assert!(block.contains("operation == Operation::RunOneShotPatchTableGate"));
         assert!(block.contains("validate_native_rate_power_snapshot(&frozen)"));
+        assert!(block.contains("let credential = read_sae_credential()?"));
+        assert!(block.contains("credential_eof\\\":true"));
+        assert!(block.contains("credential_policy_binding\\\":\\\"{credential_policy_binding}"));
+        assert!(block.contains("ValidatedCredentialPolicyBinding::bind"));
+        assert!(block.contains("binding.consume"));
         assert!(block.contains("actual_normalized_envelope_sha256"));
         assert!(block.contains("snapshot_eof\\\":true"));
         assert!(block.contains("ram_firmware_required\\\":true"));
@@ -19128,6 +19723,26 @@ mod tests {
         assert!(transmit.contains("eapol_published=false"));
         assert!(transmit.contains("vo_published=false"));
         assert!(transmit.contains("retry_published=false"));
+        assert!(source.contains("tmac_population_invariant=false"));
+        assert!(source.contains("admit_one_validation_probe"));
+        assert!(transmit.contains("validation_probe_completed"));
+        assert!(source.contains("Err(zx::Status::STOP) if self.suppress_eapol_liveness"));
+        assert!(source.contains("validation_complete = true"));
+        let successful_stop = source
+            .find("production_validation_complete association=true")
+            .unwrap();
+        let netstack = source
+            .find("let mut proof = BoundedNetstackProof::new")
+            .unwrap();
+        assert!(successful_stop < netstack);
+
+        let adapter = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mt7921-softmac-adapter/src/client_device.rs"
+        ));
+        let connect = adapter.split("async fn connect_inner").nth(1).unwrap();
+        assert!(connect.contains("self.runner.validation_complete()"));
+        assert!(connect.contains("return Ok(())"));
     }
 
     #[test]
@@ -19428,7 +20043,8 @@ mod tests {
             .split("fn run_rate_power_evidence_operation(")
             .next()
             .unwrap();
-        assert!(lifecycle_sender.contains("FirmwareLoaderTransport::next_sequence"));
+        assert!(lifecycle_sender.contains("mechanics.loader.sequence % 15 + 1"));
+        assert!(!lifecycle_sender.contains("FirmwareLoaderTransport::next_sequence"));
         let dispatch = source
             .split("if operation == Operation::RunOneShotPowerSetup")
             .nth(1)
@@ -19436,7 +20052,12 @@ mod tests {
             .split("if operation == Operation::RunOneShotPassiveSmeFull")
             .next()
             .unwrap();
-        assert_eq!(dispatch.matches("run_rate_power_evidence_operation(").count(), 1);
+        assert_eq!(
+            dispatch
+                .matches("run_rate_power_evidence_operation(")
+                .count(),
+            1
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -19453,11 +20074,189 @@ mod tests {
             "EEPROM, PROTECT, MAC_ENABLE, and RX_PATH consume the production prefix"
         );
         assert_eq!(
-            [next(), next(), next(), next(), next(), next(), next(), next()],
+            [
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next()
+            ],
             [4, 5, 6, 7, 8, 9, 10, 11],
             "the fixed production pages follow the completed prefix"
         );
         assert_eq!(next(), 12, "ADD_DEVICE naturally follows page 8");
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn production_validation_mock_crosses_full_prefix_association_and_one_tx_completion() {
+        let mut audit = rate_power_audit_after_rx_path();
+        for command in realistic_rate_power_audit_commands(4).unwrap() {
+            audit.page_consumed_and_reclaimed(&command).unwrap();
+        }
+        audit.finish().unwrap();
+        let add_device = PassiveMcuCommand::AddDevice {
+            mac: [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        };
+        audit.before_passive_command(&add_device).unwrap();
+        audit.passive_command_completed(&add_device).unwrap();
+
+        let source =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")
+                .unwrap();
+        let policy = ProductionValidationPolicy::bind(
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            0,
+            source,
+        )
+        .unwrap();
+        policy
+            .validate_association(
+                [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                36,
+                [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            )
+            .unwrap();
+
+        let mut published = false;
+        assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
+        assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
+        assert!(!e2e94_validation_trigger(0x0000, false, &mut published).unwrap());
+        assert!(e2e94_validation_trigger(0x0188, true, &mut published).unwrap());
+        assert!(e2e94_validation_trigger(0x0188, true, &mut published).is_err());
+        assert!(validation_probe_completed(&DiagnosticTxResult {
+            free: Mt7921TxFree {
+                wcid: Some(7),
+                token: 1,
+                dropped: false,
+                attempts: 1,
+                status: 0,
+                pair_word: None,
+                info_word: 0,
+            },
+            txs_present: true,
+            txs_acked: true,
+        }));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn production_validation_rejects_non_eapol_second_publication_and_failed_completion() {
+        validate_production_prefix_sequence(true, 14).unwrap();
+        assert!(validate_production_prefix_sequence(true, 13).is_err());
+        let mut anchored = vec![0x88, 0x01];
+        anchored.resize(26, 0);
+        anchored.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        assert!(is_anchored_eapol_data(&anchored));
+        let mut embedded = vec![0x88, 0x01];
+        embedded.resize(26, 0);
+        embedded.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+        embedded.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        assert!(!is_anchored_eapol_data(&embedded));
+
+        let mut published = false;
+        assert_eq!(
+            e2e94_validation_trigger(0x00c0, false, &mut published),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        assert_eq!(
+            e2e94_validation_trigger(0x0188, false, &mut published),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        assert_eq!(
+            admit_one_validation_probe(&mut published, false),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        admit_one_validation_probe(&mut published, true).unwrap();
+        assert_eq!(
+            admit_one_validation_probe(&mut published, true),
+            Err(zx::Status::ALREADY_EXISTS)
+        );
+        for result in [
+            DiagnosticTxResult {
+                free: Mt7921TxFree {
+                    wcid: Some(7),
+                    token: 1,
+                    dropped: false,
+                    attempts: 1,
+                    status: 1,
+                    pair_word: None,
+                    info_word: 0,
+                },
+                txs_present: true,
+                txs_acked: true,
+            },
+            DiagnosticTxResult {
+                free: Mt7921TxFree {
+                    wcid: Some(7),
+                    token: 1,
+                    dropped: false,
+                    attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
+                },
+                txs_present: false,
+                txs_acked: false,
+            },
+        ] {
+            assert!(!validation_probe_completed(&result));
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn production_validation_rejects_target_drift_and_stale_regulatory_generation() {
+        let source =
+            parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")
+                .unwrap();
+        assert!(
+            ProductionValidationPolicy::bind(
+                b"other",
+                [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                36,
+                [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+                0,
+                source,
+            )
+            .is_err()
+        );
+        assert!(
+            ProductionValidationPolicy::bind(
+                b"ph1",
+                [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                36,
+                [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+                1,
+                source,
+            )
+            .is_err()
+        );
+        let mut policy = ProductionValidationPolicy::bind(
+            b"ph1",
+            [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+            36,
+            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            0,
+            source,
+        )
+        .unwrap();
+        policy.regulatory_generation = 1;
+        assert!(
+            policy
+                .validate_association(
+                    [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                    36,
+                    [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+                )
+                .is_err()
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]

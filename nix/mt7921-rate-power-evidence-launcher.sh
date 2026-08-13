@@ -25,6 +25,25 @@ prepare_snapshot() {
   trap - EXIT
 }
 
+prepare_credential() {
+  umask 077
+  credential=$(@sed@ -n 's/^Passphrase=\(.*\)$/\1/p' "$credential_file")
+  credential_len=${#credential}
+  if [ "$credential_len" -lt 8 ] || [ "$credential_len" -gt 63 ]; then
+    echo "fixed credential length is invalid" >&2
+    exit 65
+  fi
+  credential_file_exact=$(@mktemp@)
+  trap '@rm@ -f "$credential_file_exact"' EXIT
+  printf '%s' "$credential" > "$credential_file_exact"
+  unset credential
+  test "$(@stat@ -c %a "$credential_file_exact")" = 600
+  exec 3< "$credential_file_exact"
+  @rm@ -f "$credential_file_exact"
+  test ! -e "$credential_file_exact"
+  trap - EXIT
+}
+
 case "$#:${1-}" in
   0:)
     : "${DRV_PCI_BDF:?missing canonical PCI target}"
@@ -32,16 +51,7 @@ case "$#:${1-}" in
     : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
     : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
     prepare_snapshot
-    credential=$(@sed@ -n 's/^Passphrase=\(.*\)$/\1/p' "$credential_file")
-    credential_len=${#credential}
-    if [ "$credential_len" -lt 8 ] || [ "$credential_len" -gt 63 ]; then
-      echo "fixed credential length is invalid" >&2
-      exit 65
-    fi
-    exec 3<<EOF_CREDENTIAL
-$credential
-EOF_CREDENTIAL
-    unset credential
+    prepare_credential
     exec @env@ -i \
       DRV_PCI_BDF="$DRV_PCI_BDF" \
       DRV_IOMMU_GROUP="$DRV_IOMMU_GROUP" \
@@ -60,7 +70,10 @@ EOF_CREDENTIAL
     ;;
   1:--evidence-preflight)
     prepare_snapshot
+    prepare_credential
     exec @env@ -i \
+      DRV_SAE_CREDENTIAL_FD=3 \
+      DRV_SAE_CREDENTIAL_LEN="$credential_len" \
       DRV_REGULATORY_SNAPSHOT_FD=4 \
       DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
       DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \

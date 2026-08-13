@@ -237,6 +237,12 @@ pub enum PassiveMechanicsEvent {
 pub trait SourceExactPassiveMechanics {
     type Error: Error + 'static;
 
+    /// Current Linux-style MCU message sequence when mechanics joins an
+    /// already-bootstrapped command domain. `None` starts a fresh domain.
+    fn current_mcu_sequence(&self) -> Option<u8> {
+        None
+    }
+
     fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error>;
     fn command(
         &mut self,
@@ -333,12 +339,16 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         if capability.phy.map(|phy| phy.spatial_streams) != Some(2) {
             return Err(SourceExactTransportError::UnsupportedSpatialStreams);
         }
+        let mcu_sequence = mechanics.current_mcu_sequence().unwrap_or(0);
+        if mcu_sequence > 15 {
+            return Err(SourceExactTransportError::InvalidSequence);
+        }
         Ok(Self {
             mechanics,
             capability,
             mac,
             antenna_mask: 3,
-            mcu_sequence: 0,
+            mcu_sequence,
             scan_sequence: 0,
             selected: None,
             receive_prepared: false,
@@ -460,6 +470,12 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             self.mechanics
                 .install_rate_tx_power(self.capability)
                 .map_err(SourceExactTransportError::Mechanics)?;
+            if let Some(sequence) = self.mechanics.current_mcu_sequence() {
+                if !(1..=15).contains(&sequence) {
+                    return Err(SourceExactTransportError::InvalidSequence);
+                }
+                self.mcu_sequence = sequence;
+            }
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
             self.issue(PassiveMcuCommand::AddBss)?;
             self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
@@ -1355,10 +1371,16 @@ mod tests {
         rate_power_after_commands: Option<usize>,
         events: VecDeque<PassiveMechanicsEvent>,
         confirmed_scan_sequences: Vec<u8>,
+        mcu_sequence: Option<u8>,
+        rate_power_sequences: Vec<u8>,
     }
 
     impl SourceExactPassiveMechanics for ScriptedMechanics {
         type Error = ScriptError;
+
+        fn current_mcu_sequence(&self) -> Option<u8> {
+            self.mcu_sequence
+        }
 
         fn prepare_passive_receive(&mut self) -> Result<PassivePrerequisites, Self::Error> {
             self.prepare_after_commands = Some(self.commands.len());
@@ -1377,11 +1399,21 @@ mod tests {
         ) -> Result<(), Self::Error> {
             self.commands
                 .push((command.clone(), encoded.to_vec(), wait_response));
+            if self.mcu_sequence.is_some() {
+                self.mcu_sequence = encoded.get(39).copied();
+            }
             Ok(())
         }
 
         fn install_rate_tx_power(&mut self, _: NicCapability) -> Result<(), Self::Error> {
             self.rate_power_after_commands = Some(self.commands.len());
+            if let Some(mut sequence) = self.mcu_sequence {
+                for _ in 0..8 {
+                    sequence = sequence % 15 + 1;
+                    self.rate_power_sequences.push(sequence);
+                }
+                self.mcu_sequence = Some(sequence);
+            }
             Ok(())
         }
 
@@ -1573,6 +1605,27 @@ mod tests {
             max_channel_time: Some(20),
             min_home_time: Some(0),
         }
+    }
+
+    #[test]
+    fn live_prefix_and_rate_pages_share_one_wrapping_mcu_sequence_domain() {
+        let capability = nic();
+        let mechanics = ScriptedMechanics {
+            mcu_sequence: Some(14),
+            ..Default::default()
+        };
+        let mut transport = SourceExactPassiveTransport::new(mechanics, capability).unwrap();
+        transport
+            .set_channel(capability_channels(capability)[0])
+            .unwrap();
+        let mechanics = transport.into_mechanics();
+        let command_sequences = mechanics
+            .commands
+            .iter()
+            .map(|(_, encoded, _)| encoded[39])
+            .collect::<Vec<_>>();
+        assert_eq!(&command_sequences[..5], &[15, 1, 2, 3, 12]);
+        assert_eq!(mechanics.rate_power_sequences, [4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]

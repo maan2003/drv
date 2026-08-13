@@ -234,8 +234,16 @@ impl Mt7921AssociationState {
 /// Firmware/DMA effects retained by the offline client boundary.
 ///
 /// Errors are already-mapped Zircon statuses. The adapter forwards them
-/// unchanged and never retries or interprets them.
+/// unchanged and never retries them; production effects may consume their
+/// private bounded-validation completion sentinel before this boundary.
 pub trait Mt7921ClientEffects {
+    /// Reports that a bounded validation transmission completed successfully.
+    /// Production effects leave this false unless their physical completion
+    /// gate has consumed the single allowed validation frame.
+    fn validation_complete(&self) -> bool {
+        false
+    }
+
     /// Immediately poison scan-derived authority in every shared TX handle.
     fn revoke_scan(&mut self);
 
@@ -460,6 +468,10 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 }
 
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
+    pub fn validation_complete(&self) -> bool {
+        self.backend.lock().unwrap().effects.validation_complete()
+    }
+
     /// Borrow the already-connected pinned MLME as the only associated data
     /// plane. The returned pump cannot outlive either the MLME or this runner.
     pub fn associated_data_pump<'a>(
@@ -741,6 +753,9 @@ where
                                 detail: error.to_string(),
                             })
                         })?;
+                    if self.runner.validation_complete() {
+                        return Ok((true, true));
+                    }
                     if sae_frame_tx {
                         println!(
                             "client_sae_stage=mlme_request_complete state={}",
@@ -797,6 +812,9 @@ where
         const CONTROL_BUDGET: usize = 64;
 
         let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
+        if self.runner.validation_complete() {
+            return Ok(progressed);
+        }
 
         if let Some(action) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
@@ -823,6 +841,9 @@ where
             let (control_progressed, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
             progressed |= control_progressed;
             control_quiescent = quiescent;
+            if self.runner.validation_complete() {
+                return Ok(progressed);
+            }
         }
         if !control_quiescent {
             println!(
@@ -839,6 +860,9 @@ where
         {
             progressed = true;
             let (_, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
+            if self.runner.validation_complete() {
+                return Ok(progressed);
+            }
             if !quiescent {
                 println!(
                     "client_runtime_control stage=post_rx_budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
@@ -873,6 +897,9 @@ where
                 return Err(PinnedConnectError::Timeout);
             }
             let progressed = self.pump_once().await?;
+            if self.runner.validation_complete() {
+                return Ok(());
+            }
             loop {
                 match transaction.try_recv() {
                     Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {

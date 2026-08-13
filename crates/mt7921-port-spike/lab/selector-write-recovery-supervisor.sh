@@ -126,6 +126,12 @@ case $connected_frequency in
     exit 1
     ;;
 esac
+if [[ $connected_bssid != 72:a6:c7:7d:56:93 \
+   || $connected_channel != 36 \
+   || $connected_client_mac != 8a:fd:2a:8b:70:5a ]]; then
+  echo "connected Wi-Fi target drifted from fixed ph1 validation policy" >&2
+  exit 1
+fi
 export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \
   DRV_SAE_CLIENT_MAC=$connected_client_mac
 token=$("$wifi_lab_watchdog" arm) || exit 1
