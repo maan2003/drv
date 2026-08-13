@@ -79,6 +79,39 @@
             ];
           };
 
+          mt7921-patch-table-gate = pkgs.stdenv.mkDerivation {
+            pname = "mt7921-patch-table-gate";
+            version = "0.1.0";
+            src =
+              let gateBinary = builtins.getEnv "MT7921_GATE_BINARY";
+              in
+              if gateBinary == "" then
+                throw "set MT7921_GATE_BINARY to the exact locally verified release executable and evaluate with --impure"
+              else
+                builtins.path {
+                  path = gateBinary;
+                  name = "mt7921-patch-table-gate-unpatched";
+                };
+            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+            dontUnpack = true;
+            installPhase = ''
+              runHook preInstall
+              install -Dm0755 "$src" "$out/bin/mt7921-passive-scan"
+              runHook postInstall
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              output=$($out/bin/mt7921-passive-scan --patch-table-gate-preflight)
+              grep -F '"patch_gate_preflight":"passed"' <<< "$output"
+              grep -F '"device_opened":false' <<< "$output"
+              grep -F '"vfio_opened":false' <<< "$output"
+              runHook postInstallCheck
+            '';
+            meta.mainProgram = "mt7921-passive-scan";
+          };
+
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";
             version = "0.1.0";

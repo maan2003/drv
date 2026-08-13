@@ -2928,6 +2928,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    if operation_argument.as_deref() == Some("--patch-table-gate-preflight") {
+        if env::args().len() != 2 {
+            return Err("patch-table gate preflight accepts no additional arguments".into());
+        }
+        println!(
+            "{{\"patch_gate_preflight\":\"passed\",\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}"
+        );
+        return Ok(());
+    }
     #[cfg(feature = "fuchsia-passive")]
     if operation_argument.as_deref() == Some("--self-test-sae-committed-fallback") {
         return futures::executor::block_on(run_sae_committed_fallback_self_test());
@@ -17437,6 +17446,25 @@ mod tests {
         ] {
             assert!(consolidated.contains(required), "{required}");
         }
+    }
+
+    #[test]
+    fn patch_table_preflight_returns_before_device_environment_or_vfio() {
+        let source = include_str!("vfio_read.rs");
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let preflight = run.find("--patch-table-gate-preflight").unwrap();
+        let operation_dispatch = run.find("let operation = match").unwrap();
+        let device_environment = run.find("DRV_PCI_BDF").unwrap();
+        assert!(preflight < operation_dispatch);
+        assert!(operation_dispatch < device_environment);
+        let block = &run[preflight..operation_dispatch];
+        assert!(block.contains("device_opened\\\":false"));
+        assert!(block.contains("vfio_opened\\\":false"));
+        assert!(!block.contains("OpenOptions"));
+        assert!(!block.contains("/dev/vfio"));
     }
 
     #[test]
