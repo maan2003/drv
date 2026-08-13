@@ -747,14 +747,44 @@
 
           mt7921-full-firmware-inert-proof =
             let
-              closure = pkgs.closureInfo {
-                rootPaths = [
-                  mt7921-full-firmware-validation
-                  mt7921-full-firmware-validation-supervisor
-                  mt7921-full-firmware-validation-manifest
-                  mt7921-full-firmware-validation-root-entry
-                ];
-              };
+              closureRoots = [
+                mt7921-full-firmware-validation
+                mt7921-full-firmware-validation-supervisor
+                mt7921-full-firmware-validation-manifest
+                mt7921-full-firmware-validation-root-entry
+                pkgs.runtimeShell
+                pkgs.coreutils
+                pkgs.diffutils
+                pkgs.gnused
+                pkgs.nettools
+                pkgs.nix
+              ];
+              closure = pkgs.runCommand "mt7921-full-firmware-inert-proof-closure-metadata"
+                {
+                  __structuredAttrs = true;
+                  exportReferencesGraph.closure = closureRoots;
+                  nativeBuildInputs = [ pkgs.jq ];
+                }
+                ''
+                  out="''${outputs[out]}"
+                  mkdir -p "$out"
+                  ${pkgs.jq}/bin/jq -er '
+                    def valid_path: test("^/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[^/[:space:]\\t]+$");
+                    def valid_hash: test("^sha256:[0123456789abcdfghijklmnpqrsvwxyz]{52}$");
+                    .closure | sort_by(.path) as $rows
+                    | if (($rows | length) == 75
+                        and ($rows | map(.path) | unique | length) == 75
+                        and all($rows[]; (.path | valid_path) and (.narHash | valid_hash)))
+                      then $rows else error("invalid 75-path registered closure metadata") end
+                    | .[] | [.path, .narHash] | @tsv
+                  ' "$NIX_ATTRS_JSON_FILE" >"$out/closure.tsv"
+                  cut -f1 "$out/closure.tsv" >"$out/closure.paths"
+                  test "$(wc -l < "$out/closure.tsv")" -eq 75
+                  test "$(awk -F '\t' 'NF == 2 && $1 != "" && $2 != "" { count++ } END { print count+0 }' "$out/closure.tsv")" -eq 75
+                '';
+              closureRootsFile = pkgs.writeText "mt7921-full-firmware-inert-proof-roots" (
+                pkgs.lib.concatMapStringsSep "\n" toString closureRoots + "\n"
+              );
             in
             pkgs.runCommand "mt7921-full-firmware-inert-proof"
               {
@@ -762,12 +792,30 @@
                 meta.mainProgram = "mt7921-full-firmware-inert-proof";
               }
               ''
-                mkdir -p "$out/bin" "$out/share/mt7921-full-firmware-inert-proof"
-                sort -u ${closure}/store-paths > "$out/share/mt7921-full-firmware-inert-proof/closure.paths"
-                while read -r path; do
-                  printf '%s\t%s\n' "$path" "$(${pkgs.nix}/bin/nix-store -q --hash "$path")"
-                done < "$out/share/mt7921-full-firmware-inert-proof/closure.paths" \
-                  > "$out/share/mt7921-full-firmware-inert-proof/closure.tsv"
+                mkdir -p "$out/bin" "$out/libexec" "$out/share/mt7921-full-firmware-inert-proof"
+                cp ${closure}/closure.paths ${closure}/closure.tsv "$out/share/mt7921-full-firmware-inert-proof/"
+                cp ${closureRootsFile} "$out/share/mt7921-full-firmware-inert-proof/closure.roots"
+                substitute ${./nix/mt7921-closure-manifest-generate.sh} manifest-generate \
+                  --subst-var-by shell ${pkgs.runtimeShell}
+                chmod 0755 manifest-generate
+                substitute ${./nix/mt7921-closure-manifest-validate.sh} \
+                  "$out/libexec/mt7921-closure-manifest-validate" \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                  --subst-var-by sort ${pkgs.coreutils}/bin/sort
+                chmod 0755 "$out/libexec/mt7921-closure-manifest-validate"
+                substitute ${./nix/mt7921-closure-manifest-verify.sh} \
+                  "$out/libexec/mt7921-closure-manifest-verify" \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by validator "$out/libexec/mt7921-closure-manifest-validate" \
+                  --subst-var-by sort ${pkgs.coreutils}/bin/sort \
+                  --subst-var-by cmp ${pkgs.diffutils}/bin/cmp
+                chmod 0755 "$out/libexec/mt7921-closure-manifest-verify"
+                "$out/libexec/mt7921-closure-manifest-validate" \
+                  "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" \
+                  "$out/share/mt7921-full-firmware-inert-proof/closure.paths"
+                test "$(wc -l < "$out/share/mt7921-full-firmware-inert-proof/closure.tsv")" -eq 75
+                closure_manifest_sha256="$(${pkgs.coreutils}/bin/sha256sum "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" | cut -d' ' -f1)"
                 substitute ${./nix/mt7921-full-firmware-inert-proof.sh} \
                   "$out/bin/mt7921-full-firmware-inert-proof" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
@@ -775,8 +823,10 @@
                   --subst-var-by supervisor ${mt7921-full-firmware-validation-supervisor} \
                   --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
                   --subst-var-by root_entry ${mt7921-full-firmware-validation-root-entry} \
-                  --subst-var-by expected_paths "$out/share/mt7921-full-firmware-inert-proof/closure.paths" \
                   --subst-var-by expected_hashes "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" \
+                  --subst-var-by closure_roots "$out/share/mt7921-full-firmware-inert-proof/closure.roots" \
+                  --subst-var-by closure_manifest_sha256 "$closure_manifest_sha256" \
+                  --subst-var-by manifest_verifier "$out/libexec/mt7921-closure-manifest-verify" \
                   --subst-var-by commit aefc95ec3adea38d7ffbac4475cfbcb2848a9f38 \
                   --subst-var-by id ${pkgs.coreutils}/bin/id \
                   --subst-var-by date ${pkgs.coreutils}/bin/date \
@@ -785,9 +835,67 @@
                   --subst-var-by hostname ${pkgs.nettools}/bin/hostname \
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
                   --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
-                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum
+                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                  --subst-var-by diff ${pkgs.diffutils}/bin/diff
                 chmod 0755 "$out/bin/mt7921-full-firmware-inert-proof"
                 ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-inert-proof"
+                ${pkgs.bash}/bin/bash -n "$out/libexec/mt7921-closure-manifest-validate"
+                ${pkgs.bash}/bin/bash -n "$out/libexec/mt7921-closure-manifest-verify"
+
+                # Hermetic regression coverage for the blank-column failure and
+                # every structural/hash-set rejection made by the target runner.
+                cp "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" valid.tsv
+                cp "$out/share/mt7921-full-firmware-inert-proof/closure.paths" valid.paths
+                "$out/libexec/mt7921-closure-manifest-validate" valid.tsv valid.paths
+                printf '#!%s\nexit 1\n' ${pkgs.runtimeShell} > hash-fails
+                printf '#!%s\nexit 0\n' ${pkgs.runtimeShell} > hash-empty
+                chmod +x hash-fails hash-empty
+                if ./manifest-generate generated.tsv valid.paths -- ./hash-fails; then exit 1; fi
+                if ./manifest-generate generated.tsv valid.paths -- ./hash-empty; then exit 1; fi
+                sed '1s/\t.*$/\t/' valid.tsv > blank.tsv
+                sed '1s/sha256:.*/sha256:not-a-hash/' valid.tsv > malformed.tsv
+                sed '1s/$/\textra/' valid.tsv > three-field.tsv
+                head -c -1 valid.tsv > unterminated.tsv
+                { cat valid.tsv; head -1 valid.tsv; } > duplicate.tsv
+                tail -n +2 valid.tsv > missing.tsv
+                { cat valid.tsv; printf '/nix/store/00000000000000000000000000000000-extra\tsha256:0000000000000000000000000000000000000000000000000000\n'; } > extra.tsv
+                ${pkgs.gawk}/bin/awk -F '\t' 'BEGIN { OFS="\t" } NR == 1 { c=substr($2,8,1); r=(c=="0"?"1":"0"); $2=substr($2,1,7) r substr($2,9) } { print }' \
+                  valid.tsv > wrong.tsv
+                cat > store-stub <<EOF
+                #!${pkgs.runtimeShell}
+                set -euo pipefail
+                mode=\$(basename "\$0")
+                case "\$1" in
+                  -qR) cat "$PWD/stub.actual" ;;
+                  --verify-path) test "\$mode" != store-verify-fails ;;
+                  -q)
+                    test "\$2" = --hash
+                    case "\$mode" in
+                      store-fails) exit 1 ;;
+                      store-empty) exit 0 ;;
+                    esac
+                    ${pkgs.gawk}/bin/awk -F '\t' -v path="\$3" '\$1 == path { print \$2; found=1 } END { exit !found }' "$PWD/valid.tsv"
+                    ;;
+                  *) exit 64 ;;
+                esac
+                EOF
+                chmod +x store-stub
+                for mode in store-fails store-empty store-verify-fails; do ln -s store-stub "$mode"; done
+                cp valid.paths stub.actual
+                mkdir verify-output
+                verify="$out/libexec/mt7921-closure-manifest-verify"
+                "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-stub"
+                for bad in blank malformed three-field unterminated duplicate missing extra wrong; do
+                  if "$verify" "$bad.tsv" "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-stub"; then exit 1; fi
+                done
+                if "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-fails"; then exit 1; fi
+                if "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-empty"; then exit 1; fi
+                if "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-verify-fails"; then exit 1; fi
+                tail -n +2 valid.paths > stub.actual
+                if "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-stub"; then exit 1; fi
+                { cat valid.paths; echo /nix/store/00000000000000000000000000000000-extra; } > stub.actual
+                if "$verify" valid.tsv "$out/share/mt7921-full-firmware-inert-proof/closure.roots" verify-output "$PWD/store-stub"; then exit 1; fi
                 "$out/bin/mt7921-full-firmware-inert-proof" --plan > plan
                 grep -F 'hardware_handoff=false active_validation=false' plan
                 grep -F 'canonical_fd3_fd4=true' plan

@@ -9,8 +9,10 @@ manifest=@manifest@
 root_entry=@root_entry@
 launcher="$package/bin/mt7921-full-firmware-validation"
 driver="$package/libexec/mt7921-full-firmware-validation"
-expected_paths=@expected_paths@
 expected_hashes=@expected_hashes@
+closure_roots=@closure_roots@
+closure_manifest_sha256=@closure_manifest_sha256@
+manifest_verifier=@manifest_verifier@
 runtime=/run/current-system/sw/bin
 
 if [ "${1-}" = --plan ] && [ "$#" -eq 1 ]; then
@@ -34,29 +36,130 @@ if [ "$(@id@ -u)" -ne 0 ]; then
   exit 77
 fi
 
+umask 077
 @install@ -d -m700 /var/lib/wifi-driver-lab
-out=$(@mktemp@ -d /var/lib/wifi-driver-lab/@commit@-inert-proof-$(@date@ -u +%Y%m%dT%H%M%SZ)-XXXXXX)
-cp "$expected_paths" "$out/closure.expected.paths"
-cp "$expected_hashes" "$out/closure.expected.tsv"
-printf 'SCHEMA=%s\nCOMMIT=%s\nTOOL=%s\n' "$schema" @commit@ "$0" >"$out/IDENTITY"
-
 snapshot() {
+  target=$1
+  tmp="$target.tmp"
+  raw=${target%.normalized}.raw
+  raw_tmp="$raw.tmp"
+  rm -f "$tmp" "$raw_tmp"
+  if ! host=$(@hostname@) ||
+     ! boot_id=$(cat /proc/sys/kernel/random/boot_id) ||
+     ! driver_link=$(readlink /sys/bus/pci/devices/$bdf/driver) ||
+     ! pci_driver=$(basename "$driver_link") ||
+     ! pci_power=$(cat /sys/bus/pci/devices/$bdf/power_state) ||
+     ! pci_runtime=$(cat /sys/bus/pci/devices/$bdf/power/runtime_status); then
+    rm -f "$tmp" "$raw_tmp"
+    return 1
+  fi
+  capture_status=0
   {
     echo "SCHEMA=$schema"
-    echo "HOST=$(@hostname@)"
-    echo "BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)"
-    echo "PCI_DRIVER=$(basename "$(readlink /sys/bus/pci/devices/$bdf/driver)")"
-    echo "PCI_POWER=$(cat /sys/bus/pci/devices/$bdf/power_state)"
-    echo "PCI_RUNTIME=$(cat /sys/bus/pci/devices/$bdf/power/runtime_status)"
-    "$runtime/systemctl" show -p ActiveState -p SubState -p UnitFileState NetworkManager
-    "$runtime/ip" -o link show
-    "$runtime/ip" -o -4 address show
-    "$runtime/ip" -4 route show table all
-    "$runtime/iw" dev
-    for net in $(ls /sys/class/net); do "$runtime/iw" dev "$net" link 2>/dev/null || true; done
-    printf WATCHDOG_STATUS=; "$runtime/wifi-lab-watchdog" status
-  } | @sed@ -E '/^[[:space:]]*(RX:|TX:|signal:|rx bitrate:|tx bitrate:)/d; s/qlen [0-9]+//g; s/valid_lft [^ ]+/valid_lft DYNAMIC/g; s/preferred_lft [^ ]+/preferred_lft DYNAMIC/g' >"$1"
+    echo "HOST=$host"
+    echo "BOOT_ID=$boot_id"
+    echo "PCI_DRIVER=$pci_driver"
+    echo "PCI_POWER=$pci_power"
+    echo "PCI_RUNTIME=$pci_runtime"
+    "$runtime/systemctl" show -p ActiveState -p SubState -p UnitFileState NetworkManager || capture_status=1
+    "$runtime/ip" -o link show || capture_status=1
+    "$runtime/ip" -o -4 address show || capture_status=1
+    "$runtime/ip" -4 route show table all || capture_status=1
+    "$runtime/iw" dev || capture_status=1
+    if interfaces=$(ls /sys/class/net); then
+      for net in $interfaces; do "$runtime/iw" dev "$net" link 2>/dev/null || true; done
+    else
+      capture_status=1
+    fi
+    printf WATCHDOG_STATUS=
+    "$runtime/wifi-lab-watchdog" status || capture_status=1
+  } >"$raw_tmp"
+  if [ "$capture_status" -ne 0 ] ||
+     ! @sed@ -E '/^[[:space:]]*(RX:|TX:|signal:|rx bitrate:|tx bitrate:)/d; s/qlen [0-9]+//g; s/valid_lft [^ ]+/valid_lft DYNAMIC/g; s/preferred_lft [^ ]+/preferred_lft DYNAMIC/g' "$raw_tmp" >"$tmp" ||
+     ! mv "$raw_tmp" "$raw" ||
+     ! mv "$tmp" "$target"; then
+    rm -f "$tmp" "$raw_tmp"
+    return 1
+  fi
 }
+
+phase=initialization
+token=
+finish() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ -n "$token" ]; then
+    "$runtime/wifi-lab-watchdog" disarm "$token" >"$out/watchdog-disarm.txt" 2>&1
+    if [ "$?" -ne 0 ]; then status=1; fi
+    token=
+  fi
+  watchdog_status=$($runtime/wifi-lab-watchdog status 2>&1)
+  printf '%s\n' "$watchdog_status" >"$out/watchdog-final-status.txt"
+  timer_status=$("$runtime/systemctl" is-active wifi-lab-watchdog.timer 2>&1)
+  printf '%s\n' "$timer_status" >"$out/watchdog-timer-status.txt"
+  if [ "$watchdog_status" != disarmed ]; then status=1; fi
+  if [ "$timer_status" != inactive ]; then status=1; fi
+  if [ -f "$out/state.before.normalized" ] && [ ! -f "$out/state.after.normalized" ]; then
+    if ! snapshot "$out/state.after.normalized"; then
+      rm -f "$out/state.after.normalized"
+      echo unavailable >"$out/state-after-status.txt"
+      status=1
+    fi
+  fi
+  if [ -f "$out/state.before.normalized" ] && [ -f "$out/state.after.normalized" ]; then
+    if cmp "$out/state.before.normalized" "$out/state.after.normalized"; then
+      echo passed >"$out/state-equality.txt"
+      : >"$out/state-diff.txt"
+    else
+      @diff@ -u "$out/state.before.normalized" "$out/state.after.normalized" >"$out/state-diff.txt"
+      echo failed >"$out/state-equality.txt"
+      status=1
+    fi
+  else
+    echo unavailable >"$out/state-equality.txt"
+  fi
+  result=failed
+  if [ "$status" -eq 0 ]; then result=passed; fi
+  write_summary() {
+    printf 'SCHEMA=%s\nRESULT=%s\nEXIT_STATUS=%s\nPHASE=%s\n' \
+      "$schema" "$result" "$status" "$phase" >"$out/SUMMARY"
+  }
+  if ! write_summary; then
+    status=1
+    result=failed
+    write_summary || true
+  fi
+  if find "$out" -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | \
+    xargs -0 @sha256sum@ >"$out/SHA256SUMS.tmp" &&
+    mv "$out/SHA256SUMS.tmp" "$out/SHA256SUMS"; then
+    :
+  else
+    status=1
+    result=failed
+    write_summary
+    rm -f "$out/SHA256SUMS.tmp"
+    if find "$out" -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | \
+      xargs -0 @sha256sum@ >"$out/SHA256SUMS.tmp" &&
+      mv "$out/SHA256SUMS.tmp" "$out/SHA256SUMS"; then
+      :
+    else
+      rm -f "$out/SHA256SUMS.tmp"
+      echo failed >"$out/SHA256SUMS.failure"
+    fi
+  fi
+  if [ "$status" -eq 0 ]; then echo "$out"; fi
+  exit "$status"
+}
+out=$(@mktemp@ -d /var/lib/wifi-driver-lab/@commit@-inert-proof-$(@date@ -u +%Y%m%dT%H%M%SZ)-XXXXXX)
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cp "$expected_hashes" "$out/closure.expected.tsv"
+cp "$closure_roots" "$out/closure.roots"
+printf 'SCHEMA=%s\nCOMMIT=%s\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
+  "$schema" @commit@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
 
 cat >"$out/COMMANDS" <<EOF
 SCHEMA=$schema
@@ -71,15 +174,12 @@ COMPARE=cmp_before_after;diff_on_failure
 DURABILITY=sha256sum_all_output_files_except_SHA256SUMS
 EOF
 
+phase=before-snapshot
 snapshot "$out/state.before.normalized"
-@nix_store@ -qR "$package" "$supervisor" "$manifest" "$root_entry" | sort -u >"$out/closure.actual.paths"
-cmp "$out/closure.expected.paths" "$out/closure.actual.paths"
-while IFS=$'\t' read -r path hash; do
-  @nix_store@ --verify-path "$path"
-  actual=$(@nix_store@ -q --hash "$path")
-  test "$actual" = "$hash"
-  printf '%s\t%s\n' "$path" "$actual"
-done <"$out/closure.expected.tsv" >"$out/closure.verified.tsv"
+phase=closure-manifest
+test "$(@sha256sum@ "$out/closure.expected.tsv" | @cut@ -d' ' -f1)" = "$closure_manifest_sha256"
+"$manifest_verifier" "$out/closure.expected.tsv" "$out/closure.roots" "$out" @nix_store@
+phase=self-tests
 @sha256sum@ "$launcher" "$driver" "$supervisor/bin/mt7921-full-firmware-validation-supervisor" "$manifest" "$root_entry/bin/mt7921-full-firmware-validation-root" "$0" >"$out/artifact-hashes.txt"
 env -i "$driver" --self-test-rate-power-delivery >"$out/selftest-rate.jsonl"
 env -i "$driver" --self-test-production-validation >"$out/selftest-production.jsonl"
@@ -88,40 +188,23 @@ grep -F '"production_validation_self_test":"passed"' "$out/selftest-production.j
 "$root_entry/bin/mt7921-full-firmware-validation-root" --plan >"$out/root-plan.txt"
 grep -F hardware_handoff=false "$out/root-plan.txt" >/dev/null
 
-token=
-cleanup() {
-  status=$?
-  trap - EXIT
-  if [ -n "$token" ]; then
-    "$runtime/wifi-lab-watchdog" disarm "$token" >"$out/watchdog-disarm.txt" 2>&1 || status=1
-  fi
-  if [ "$($runtime/wifi-lab-watchdog status 2>&1)" != disarmed ]; then
-    echo 'watchdog remained armed after inert proof cleanup' >>"$out/watchdog-disarm.txt"
-    status=1
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+phase=watchdog-arm
 token=$("$runtime/wifi-lab-watchdog" arm)
 echo armed_for=inert_full_firmware_preflight >"$out/watchdog-arm.txt"
+phase=canonical-preflight
 env -i "$launcher" --full-firmware-preflight >"$out/full-firmware-preflight.jsonl" 2>"$out/full-firmware-preflight.stderr"
+phase=watchdog-disarm
 "$runtime/wifi-lab-watchdog" disarm "$token" >"$out/watchdog-disarm.txt"
 token=
-trap - EXIT
-trap - HUP INT TERM
+phase=preflight-assertions
 for marker in '"full_firmware_preflight":"passed"' '"credential_eof":true' '"credential_policy_binding":"validated-and-consumed-before-device-open"' '"snapshot_eof":true' '"regulatory_domain":"00"' '"regulatory_generation":0' '"device_opened":false' '"vfio_opened":false' '"lab_state_created":false'; do
   grep -F "$marker" "$out/full-firmware-preflight.jsonl" >/dev/null
 done
 test "$($runtime/wifi-lab-watchdog status)" = disarmed
+phase=after-snapshot
 snapshot "$out/state.after.normalized"
-if ! cmp "$out/state.before.normalized" "$out/state.after.normalized" >"$out/state-diff.txt" 2>&1; then
-  diff -u "$out/state.before.normalized" "$out/state.after.normalized" >"$out/state-diff.txt" || true
-  exit 1
-fi
+phase=state-compare
+cmp "$out/state.before.normalized" "$out/state.after.normalized"
 echo passed >"$out/state-equality.txt"
-find "$out" -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 @sha256sum@ >"$out/SHA256SUMS"
-chmod -R go-rwx "$out"
-echo "$out"
+: >"$out/state-diff.txt"
+phase=complete
