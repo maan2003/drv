@@ -8892,6 +8892,34 @@ mod tests {
                 .all(|command| command[CONNAC2_MCU_TXD_BYTES + 6] == 0)
         );
 
+        // Independently generated from Linux 6.18.40
+        // mt76_connac_mcu_rate_txpower_band() for the pinned world-domain,
+        // zero-limit case. Compare the complete request, including reserved
+        // bytes, rather than restating individual encoder fields here.
+        let linux_requests: [&[u8]; 8] = [
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-0.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-1.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-2.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-3.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-4.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-5.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-6.bin"),
+            include_bytes!("../tests/fixtures/rate-tx-power-world-zero-7.bin"),
+        ];
+        let zero_commands = encode_conservative_rate_tx_power_commands(
+            capability,
+            ConservativePowerLimits {
+                sar_limit_half_dbm: Some(40),
+                external_safety_cap_half_dbm: Some(0),
+                ..limits
+            },
+            1,
+        )
+        .unwrap();
+        for (command, linux_request) in zero_commands.iter().zip(linux_requests) {
+            assert_eq!(&command[CONNAC2_MCU_TXD_BYTES..], linux_request);
+        }
+
         assert_eq!(
             encode_conservative_rate_tx_power_commands(
                 capability,
