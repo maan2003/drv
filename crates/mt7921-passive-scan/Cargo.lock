@@ -1091,6 +1091,7 @@ dependencies = [
  "mt7921-port-spike",
  "mt7921-softmac-adapter",
  "num-bigint",
+ "sha2",
  "userspace-vfio",
  "wlan-common",
  "wlan-mlme",

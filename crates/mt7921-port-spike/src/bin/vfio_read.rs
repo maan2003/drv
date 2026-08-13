@@ -39,12 +39,13 @@ use mt7921_port_spike::{
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
     encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
-    encode_ptk_command, encode_remove_wcid_command, linux_legacy_rate_context_reference,
-    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
-    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
-    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    set_client_txwi_wcid, validate_passive_mac_bar_read,
+    encode_passive_mcu_command, encode_ptk_command, encode_remove_wcid_command,
+    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
+    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
+    passive_mac_mmio_plan, passive_mac_source_rmw_value, set_client_txwi_wcid,
+    validate_passive_mac_bar_read,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -87,6 +88,8 @@ use mt7921_softmac_adapter::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
+#[cfg(feature = "fuchsia-passive")]
+use sha2::{Digest as _, Sha256};
 #[cfg(feature = "fuchsia-passive")]
 use std::collections::VecDeque;
 use std::{
@@ -3294,7 +3297,9 @@ fn run() -> Result<(), String> {
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
-        Some("--run-one-shot-patch-table-gate") => Operation::RunOneShotPatchTableGate,
+        Some("--run-one-shot-patch-table-gate") => {
+            return Err("TMAC patch-table validation is disabled; snapshots are diagnostic only".into());
+        }
         Some("--run-one-shot-channel-domain") => Operation::RunOneShotChannelDomain,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
@@ -3317,7 +3322,11 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-power-setup") => Operation::RunOneShotPowerSetup,
         #[cfg(feature = "fuchsia-passive")]
-        Some("--run-one-shot-sae-auth") => Operation::RunOneShotSaeAuth,
+        Some("--run-one-shot-sae-auth") => {
+            return Err(
+                "SAE validation is disabled pending native rate-power payload comparison".into(),
+            );
+        }
         #[cfg(not(feature = "fuchsia-passive"))]
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
@@ -5386,6 +5395,62 @@ fn run() -> Result<(), String> {
                                 channels.clone(),
                             )
                             .map_err(|error| error.to_string())?;
+                            if operation == Operation::RunOneShotPowerSetup {
+                                // This observation deliberately precedes set_channel/start_scan:
+                                // publish the exact bounded pages and then the command that would
+                                // naturally follow them, without adding a timing fence.
+                                let transport = adapter.into_transport();
+                                let mechanics = transport.into_mechanics();
+                                let mut power_transport = VfioRateTxPower {
+                                    loader: &mut *mechanics.loader,
+                                };
+                                let mut power_authorizer = RateTxPowerAuthorizer::new();
+                                let authorization = power_authorizer
+                                    .submit(
+                                        &mut power_transport,
+                                        report.nic_capability,
+                                        ConservativePowerLimits {
+                                            alpha2: *b"00",
+                                            max_reg_power_dbm: 20,
+                                            sar_limit_half_dbm: Some(40),
+                                            external_safety_cap_half_dbm: Some(0),
+                                        },
+                                        1,
+                                    )
+                                    .map_err(|error| {
+                                        format!("submit rate-power evidence: {error:?}")
+                                    })?;
+                                if !power_authorizer.permits(&authorization) {
+                                    return Err("rate-power authorization is not live".into());
+                                }
+                                let add_device = PassiveMcuCommand::AddDevice {
+                                    mac: power_target.as_ref().expect("power target").3.bytes(),
+                                };
+                                mechanics
+                                    .loader
+                                    .rate_power_delivery
+                                    .before_passive_command(&add_device)?;
+                                let next_sequence =
+                                    FirmwareLoaderTransport::next_sequence(mechanics.loader);
+                                let encoded_add_device =
+                                    encode_passive_mcu_command(&add_device, next_sequence)
+                                        .map_err(|error| {
+                                            format!(
+                                                "encode naturally following AddDevice: {error:?}"
+                                            )
+                                        })?;
+                                mechanics.loader.send_passive_command(
+                                    &add_device,
+                                    &encoded_add_device,
+                                    true,
+                                )?;
+                                println!(
+                                    "{}",
+                                    r#"{"rate_power_evidence_stop":"passed","after_pages":8,"next_normal_command":"ADD_DEVICE","next_normal_command_acknowledged":true,"tmac_diagnostic_non_invariant":true,"channel_set":false,"scan_started":false,"association_started":false,"frame_tx_started":false}"#
+                                );
+                                power_authorizer.reset();
+                                return Ok(());
+                            }
                             if operation == Operation::RunOneShotPassiveSmeFull {
                                 let mut scanner = PassiveScanner::default();
                                 scanner
@@ -5555,10 +5620,7 @@ fn run() -> Result<(), String> {
                                     channels.len()
                                 ));
                             }
-                            if matches!(
-                                operation,
-                                Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
-                            ) {
+                            if operation == Operation::RunOneShotSaeAuth {
                                 let beacon_authorization = beacon_authorization
                                     .as_ref()
                                     .ok_or("target beacon did not authorize current channel")?;
@@ -5806,13 +5868,34 @@ fn run() -> Result<(), String> {
                                 if !power_authorizer.permits(&authorization) {
                                     return Err("rate-power authorization is not live".into());
                                 }
+                                let add_device = PassiveMcuCommand::AddDevice {
+                                    mac: power_target.as_ref().expect("power target").3.bytes(),
+                                };
+                                mechanics
+                                    .loader
+                                    .rate_power_delivery
+                                    .before_passive_command(&add_device)?;
+                                let next_sequence =
+                                    FirmwareLoaderTransport::next_sequence(mechanics.loader);
+                                let encoded_add_device =
+                                    encode_passive_mcu_command(&add_device, next_sequence)
+                                        .map_err(|error| {
+                                            format!(
+                                                "encode naturally following AddDevice: {error:?}"
+                                            )
+                                        })?;
+                                mechanics.loader.send_passive_command(
+                                    &add_device,
+                                    &encoded_add_device,
+                                    true,
+                                )?;
                                 mechanics.ledger.transition(
                                     RunPhase::BeaconAuthorized,
                                     RunPhase::PowerConfiguredNoFrame,
                                 )?;
                                 println!(
                                     "{}",
-                                    r#"{"power_setup_event":"no_frame_gate_passed","beacon_authorized":true,"rate_power_consumed":true,"management_frame_publish_reachable":false}"#
+                                    r#"{"rate_power_evidence_stop":"passed","after_pages":8,"next_normal_command":"ADD_DEVICE","next_normal_command_acknowledged":true,"tmac_diagnostic_non_invariant":true,"rf_started":false,"association_started":false,"management_frame_publish_reachable":false}"#
                                 );
                                 power_authorizer.reset();
                                 return Ok(());
@@ -7983,6 +8066,65 @@ struct RatePowerDeliveryAudit {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Debug, Eq, PartialEq)]
+struct RatePowerByteEvidence {
+    total_sha256: String,
+    raw_sha256: String,
+    channels: Vec<(u8, String)>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn rate_power_byte_evidence(encoded: &[u8]) -> Result<RatePowerByteEvidence, String> {
+    let raw = encoded
+        .get(CONNAC2_MCU_TXD_BYTES..)
+        .ok_or("rate-power evidence omitted raw request")?;
+    let count = usize::from(
+        *raw.get(4)
+            .ok_or("rate-power evidence omitted channel count")?,
+    );
+    let expected = 44usize
+        .checked_add(
+            count
+                .checked_mul(162)
+                .ok_or("rate-power evidence size overflow")?,
+        )
+        .ok_or("rate-power evidence size overflow")?;
+    if raw.len() != expected {
+        return Err(format!(
+            "rate-power evidence raw length {} disagrees with {count} channels",
+            raw.len()
+        ));
+    }
+    let mut channels = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = 44 + index * 162;
+        channels.push((raw[offset], sha256_hex(&raw[offset + 1..offset + 162])));
+    }
+    Ok(RatePowerByteEvidence {
+        total_sha256: sha256_hex(encoded),
+        raw_sha256: sha256_hex(raw),
+        channels,
+    })
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn rate_power_channels_json(channels: &[(u8, String)]) -> String {
+    channels
+        .iter()
+        .map(|(channel, sha256)| format!(r#"{{"channel":{channel},"sku_sha256":"{sha256}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl RatePowerDeliveryAudit {
     fn before_passive_command(&mut self, command: &PassiveMcuCommand) -> Result<(), String> {
         match command {
@@ -8223,7 +8365,7 @@ impl VfioFirmwareLoader<'_> {
             rows.push(format!("\"{offset:#05x}\":\"{value:#010x}\""));
         }
         println!(
-            "{{\"full_firmware_patch_table\":\"{point}\",\"row_count\":{},\"populated_count\":{populated},\"rows\":{{{}}}}}",
+            "{{\"full_firmware_tmac_diagnostic\":\"{point}\",\"non_invariant\":true,\"row_count\":{},\"populated_count\":{populated},\"rows\":{{{}}}}}",
             rows.len(),
             rows.join(",")
         );
@@ -8231,15 +8373,6 @@ impl VfioFirmwareLoader<'_> {
             .flush()
             .map_err(|error| format!("flush full-firmware patch-table snapshot: {error}"))?;
         Ok(populated)
-    }
-
-    fn require_complete_patch_table(&self, point: &str) -> Result<(), String> {
-        if self.normal_patch_table_capture && self.capture_patch_table_snapshot(point)? != 41 {
-            return Err(format!(
-                "full-firmware validation blocked before AddDevice: {point} is not 41/41"
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -9424,6 +9557,9 @@ impl VfioFirmwareLoader<'_> {
         encoded[39] = sequence;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+        let before_ns = self.start.elapsed().as_nanos();
+        let cidx_before = self.mcu.wfdma.read(0xd4418)?;
+        let didx_before = self.mcu.wfdma.read(0xd441c)?;
         publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
@@ -9432,6 +9568,16 @@ impl VfioFirmwareLoader<'_> {
             sequence,
             descriptor_index,
         )?;
+        let published_ns = self.start.elapsed().as_nanos();
+        let cidx_published = self.mcu.wfdma.read(0xd4418)?;
+        let didx_published = self.mcu.wfdma.read(0xd441c)?;
+        let payload_offset = descriptor_index * MCU_COMMAND_SLOT_BYTES;
+        let published = self.mcu.payload.read_bytes(payload_offset, encoded.len())?;
+        if published != encoded {
+            return Err("rate-power DMA bytes differ from the encoded publication".into());
+        }
+        let evidence = rate_power_byte_evidence(&published)?;
+        let descriptor = self.mcu.tx_ring.read_descriptor_at(descriptor_index);
         self.command_index = next;
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         loop {
@@ -9447,6 +9593,39 @@ impl VfioFirmwareLoader<'_> {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        let consumed_ns = self.start.elapsed().as_nanos();
+        let cidx_consumed = self.mcu.wfdma.read(0xd4418)?;
+        let didx_consumed = self.mcu.wfdma.read(0xd441c)?;
+        let raw = &published[CONNAC2_MCU_TXD_BYTES..];
+        let txd0 = u32::from_le_bytes(published[0..4].try_into().expect("fixed TXD0"));
+        let txd1 = u32::from_le_bytes(published[4..8].try_into().expect("fixed TXD1"));
+        let legacy_length =
+            u16::from_le_bytes(published[32..34].try_into().expect("fixed legacy length"));
+        let pq_id = u16::from_le_bytes(published[34..36].try_into().expect("fixed PQ id"));
+        println!(
+            r#"{{"rate_power_publication":{{"monotonic_before_ns":{before_ns},"monotonic_published_ns":{published_ns},"monotonic_consumed_ns":{consumed_ns},"total_length":{},"total_sha256":"{}","raw_length":{},"raw_sha256":"{}","alpha2":"{}{}","n_chan":{},"band":{},"last_msg":{},"channels":[{}],"txd0":"{txd0:#010x}","txd1":"{txd1:#010x}","legacy_length":{legacy_length},"pq_id":"{pq_id:#06x}","cid":{},"pkt_type":{},"set_query":{},"sequence":{},"ext_cid":{},"s2d":{},"ext_cid_ack":{},"queue":17,"wait_response":false,"descriptor":{{"buf0":"{:#010x}","ctrl":"{:#010x}","buf1":"{:#010x}","info":"{:#010x}"}},"cidx_before":{cidx_before},"didx_before":{didx_before},"cidx_published":{cidx_published},"didx_published":{didx_published},"cidx_consumed":{cidx_consumed},"didx_consumed":{didx_consumed}}}}}"#,
+            published.len(),
+            evidence.total_sha256,
+            raw.len(),
+            evidence.raw_sha256,
+            raw[8] as char,
+            raw[9] as char,
+            raw[4],
+            raw[5],
+            raw[6],
+            rate_power_channels_json(&evidence.channels),
+            published[36],
+            published[37],
+            published[38],
+            published[39],
+            published[41],
+            published[42],
+            published[43],
+            descriptor.buf0,
+            descriptor.ctrl,
+            descriptor.buf1,
+            descriptor.info,
+        );
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
@@ -9501,7 +9680,7 @@ fn program_live_rate_power(
     mechanics.loader.rate_power_delivery.finish()?;
     mechanics
         .loader
-        .require_complete_patch_table("after_rate_power_final")?;
+        .capture_patch_table_snapshot("after_rate_power_final")?;
     authorizer
         .permits(&authorization)
         .then_some(())
@@ -18427,6 +18606,64 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains(field), "{error}");
         }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_evidence_hashes_every_actual_page_body_and_envelope_mutation() {
+        for (page, command) in realistic_rate_power_audit_commands(15)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            let baseline = rate_power_byte_evidence(&command).unwrap();
+            let count = usize::from(command[CONNAC2_MCU_TXD_BYTES + 4]);
+            assert_eq!(baseline.channels.len(), count, "page {}", page + 1);
+            for channel in 0..count {
+                let mut mutated = command.clone();
+                mutated[CONNAC2_MCU_TXD_BYTES + 44 + channel * 162 + 1] ^= 1;
+                let evidence = rate_power_byte_evidence(&mutated).unwrap();
+                assert_ne!(evidence.total_sha256, baseline.total_sha256);
+                assert_ne!(evidence.raw_sha256, baseline.raw_sha256);
+                for index in 0..count {
+                    assert_eq!(
+                        evidence.channels[index].1 != baseline.channels[index].1,
+                        index == channel,
+                        "page {} channel {}",
+                        page + 1,
+                        index
+                    );
+                }
+            }
+            for offset in 0..CONNAC2_MCU_TXD_BYTES {
+                let mut mutated = command.clone();
+                mutated[offset] ^= 1;
+                let evidence = rate_power_byte_evidence(&mutated).unwrap();
+                assert_ne!(evidence.total_sha256, baseline.total_sha256);
+                assert_eq!(evidence.raw_sha256, baseline.raw_sha256);
+                assert_eq!(evidence.channels, baseline.channels);
+            }
+        }
+    }
+
+    #[test]
+    fn rate_power_evidence_is_derived_from_dma_readback_and_tmac_is_diagnostic_only() {
+        let source = include_str!("vfio_read.rs");
+        let sender = source
+            .split("fn send_rate_power_bytes(")
+            .nth(1)
+            .unwrap()
+            .split("struct VfioRateTxPower")
+            .next()
+            .unwrap();
+        let publish = sender.find("publish_mcu_bytes(").unwrap();
+        let readback = sender.find("payload.read_bytes(").unwrap();
+        let equality = sender.find("published != encoded").unwrap();
+        let evidence = sender.find("rate_power_byte_evidence(&published)").unwrap();
+        assert!(publish < readback && readback < equality && equality < evidence);
+        assert!(source.contains("\\\"non_invariant\\\":true"));
+        assert!(!sender.contains("41/41"));
+        assert!(source.contains("TMAC patch-table validation is disabled"));
     }
 
     #[test]

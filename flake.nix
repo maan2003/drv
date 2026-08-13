@@ -12,8 +12,7 @@
       ];
     in
     {
-      nixosModules.netstack3-kernel-provider =
-        import ./crates/netstack3-port-spike/kernel-provider/module.nix;
+      nixosModules.netstack3-kernel-provider = import ./crates/netstack3-port-spike/kernel-provider/module.nix;
 
       checks.x86_64-linux.vfio-edu =
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
@@ -25,13 +24,11 @@
           { };
 
       checks.x86_64-linux.audio-pipewire-daemon =
-        nixpkgs.legacyPackages.x86_64-linux.callPackage
-          ./crates/audio-pipewire-spike/package.nix
+        nixpkgs.legacyPackages.x86_64-linux.callPackage ./crates/audio-pipewire-spike/package.nix
           { };
 
       checks.x86_64-linux.netstack3-provider-daemon =
-        nixpkgs.legacyPackages.x86_64-linux.callPackage
-          ./crates/netstack3-port-spike/provider-package.nix
+        nixpkgs.legacyPackages.x86_64-linux.callPackage ./crates/netstack3-port-spike/provider-package.nix
           { };
 
       checks.x86_64-linux.netstack3-provider-service =
@@ -52,12 +49,9 @@
           physicalWasmSource = builtins.getEnv "SAPPHIRE_PHYSICAL_WASM_SOURCE";
         in
         rec {
-          audio-pipewire-daemon =
-            pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
+          audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
 
-          netstack3-provider-daemon =
-            pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix
-              { };
+          netstack3-provider-daemon = pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix { };
 
           hardware-backends = pkgs.rustPlatform.buildRustPackage {
             pname = "drv-hardware-backends";
@@ -83,7 +77,8 @@
             pname = "mt7921-patch-table-gate";
             version = "0.1.0";
             src =
-              let gateBinary = builtins.getEnv "MT7921_GATE_BINARY";
+              let
+                gateBinary = builtins.getEnv "MT7921_GATE_BINARY";
               in
               if gateBinary == "" then
                 throw "set MT7921_GATE_BINARY to the exact locally verified release executable and evaluate with --impure"
@@ -92,7 +87,10 @@
                   path = gateBinary;
                   name = "mt7921-patch-table-gate-unpatched";
                 };
-            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.binutils ];
+            nativeBuildInputs = [
+              pkgs.autoPatchelfHook
+              pkgs.binutils
+            ];
             buildInputs = [ pkgs.stdenv.cc.cc.lib ];
             dontUnpack = true;
             installPhase = ''
@@ -115,11 +113,49 @@
             meta.mainProgram = "mt7921-passive-scan";
           };
 
+          mt7921-rate-power-evidence = pkgs.stdenv.mkDerivation {
+            pname = "mt7921-rate-power-evidence";
+            version = "0.1.0";
+            src =
+              let
+                evidenceBinary = builtins.getEnv "MT7921_RATE_POWER_EVIDENCE_BINARY";
+              in
+              if evidenceBinary == "" then
+                throw "set MT7921_RATE_POWER_EVIDENCE_BINARY to the exact locally verified release executable and evaluate with --impure"
+              else
+                builtins.path {
+                  path = evidenceBinary;
+                  name = "mt7921-rate-power-evidence-unpatched";
+                };
+            nativeBuildInputs = [
+              pkgs.autoPatchelfHook
+              pkgs.binutils
+            ];
+            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+            dontUnpack = true;
+            installPhase = ''
+              install -Dm0755 "$src" "$out/bin/mt7921-passive-scan"
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              strings $out/bin/mt7921-passive-scan | grep -F 'rate_power_publication'
+              strings $out/bin/mt7921-passive-scan | grep -F 'rate_power_evidence_stop'
+              strings $out/bin/mt7921-passive-scan | grep -F 'TMAC patch-table validation is disabled'
+              strings $out/bin/mt7921-passive-scan | grep -F 'SAE validation is disabled'
+              if $out/bin/mt7921-passive-scan --run-one-shot-patch-table-gate 2>error; then exit 1; fi
+              grep -F 'TMAC patch-table validation is disabled' error
+              if $out/bin/mt7921-passive-scan --run-one-shot-sae-auth 2>error; then exit 1; fi
+              grep -F 'SAE validation is disabled' error
+            '';
+            meta.mainProgram = "mt7921-passive-scan";
+          };
+
           mt7921-full-firmware-validation = pkgs.stdenv.mkDerivation {
             pname = "mt7921-full-firmware-validation";
             version = "0.1.0";
             src =
-              let fullFirmwareBinary = builtins.getEnv "MT7921_FULL_FIRMWARE_BINARY";
+              let
+                fullFirmwareBinary = builtins.getEnv "MT7921_FULL_FIRMWARE_BINARY";
               in
               if fullFirmwareBinary == "" then
                 throw "set MT7921_FULL_FIRMWARE_BINARY to the exact locally verified release executable and evaluate with --impure"
@@ -128,7 +164,10 @@
                   path = fullFirmwareBinary;
                   name = "mt7921-full-firmware-validation-unpatched";
                 };
-            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.binutils ];
+            nativeBuildInputs = [
+              pkgs.autoPatchelfHook
+              pkgs.binutils
+            ];
             buildInputs = [ pkgs.stdenv.cc.cc.lib ];
             dontUnpack = true;
             installPhase = ''
@@ -186,49 +225,54 @@
             meta.mainProgram = "mt7921-full-firmware-validation";
           };
 
-          mt7921-full-firmware-validation-launcher-test = pkgs.runCommand
-            "mt7921-full-firmware-validation-launcher-test"
-            { nativeBuildInputs = [ pkgs.coreutils pkgs.gnused ]; }
-            ''
-              mkdir -p work/bin work/var
-              cat > work/bin/validation-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              set -eu
-              transcript=$PWD/transcript
-              printf 'ARGV' > "$transcript"
-              printf ' <%s>' "$@" >> "$transcript"
-              printf '\n' >> "$transcript"
-              ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
-              credential=$(${pkgs.coreutils}/bin/cat <&3)
-              printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
-              EOF
-              chmod 0755 work/bin/validation-stub
-              printf 'Passphrase=eight-by\n' > work/var/ph1.psk
-              substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
-                --subst-var-by shell ${pkgs.runtimeShell} \
-                --subst-var-by driver "$PWD/work/bin/validation-stub" \
-                --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
-                --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                --subst-var-by env ${pkgs.coreutils}/bin/env
-              chmod 0755 work/launcher
-              env -i \
-                DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
-                DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
-                DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
-                work/launcher
-              grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
-              grep -Fx 'DRV_E2E94_EDCA_PROBE=1' transcript
-              grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
-              grep -Fx 'DRV_SAE_CHANNEL=36' transcript
-              grep -Fx 'DRV_SAE_SSID=ph1' transcript
-              grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
-              grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
-              grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
-              grep -Fx 'CREDENTIAL_LEN=8' transcript
-              ! grep -q 'PATCH_TABLE' transcript
-              ! grep -q 'EAPOL' transcript
-              cp transcript "$out"
-            '';
+          mt7921-full-firmware-validation-launcher-test =
+            pkgs.runCommand "mt7921-full-firmware-validation-launcher-test"
+              {
+                nativeBuildInputs = [
+                  pkgs.coreutils
+                  pkgs.gnused
+                ];
+              }
+              ''
+                mkdir -p work/bin work/var
+                cat > work/bin/validation-stub <<'EOF'
+                #!${pkgs.runtimeShell}
+                set -eu
+                transcript=$PWD/transcript
+                printf 'ARGV' > "$transcript"
+                printf ' <%s>' "$@" >> "$transcript"
+                printf '\n' >> "$transcript"
+                ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
+                credential=$(${pkgs.coreutils}/bin/cat <&3)
+                printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
+                EOF
+                chmod 0755 work/bin/validation-stub
+                printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+                substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by driver "$PWD/work/bin/validation-stub" \
+                  --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by env ${pkgs.coreutils}/bin/env
+                chmod 0755 work/launcher
+                env -i \
+                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                  work/launcher
+                grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
+                grep -Fx 'DRV_E2E94_EDCA_PROBE=1' transcript
+                grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
+                grep -Fx 'DRV_SAE_CHANNEL=36' transcript
+                grep -Fx 'DRV_SAE_SSID=ph1' transcript
+                grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
+                grep -Fx 'CREDENTIAL_LEN=8' transcript
+                ! grep -q 'PATCH_TABLE' transcript
+                ! grep -q 'EAPOL' transcript
+                cp transcript "$out"
+              '';
 
           mt7921-full-firmware-validation-manifest =
             let
@@ -337,26 +381,25 @@
               ''
           );
 
-          sapphire-physical-discovery-wasm =
-            pkgs.runCommand "sapphire-physical-discovery.wasm" { } (
-              if physicalWasmSource == "" then
-                ''
-                  echo "set SAPPHIRE_PHYSICAL_WASM_SOURCE and evaluate with --impure" >&2
-                  exit 1
-                ''
-              else
-                let
-                  source = builtins.path {
-                    path = physicalWasmSource;
-                    name = "sapphire-physical-discovery.wasm.source";
-                  };
-                in
-                ''
-                  test "$(${pkgs.coreutils}/bin/sha256sum ${source} | ${pkgs.coreutils}/bin/cut -d ' ' -f 1)" = \
-                    e8aa718f071332e6b71649857b2e41651dc002d12ae1acbab08482102762358c
-                  cp ${source} "$out"
-                ''
-            );
+          sapphire-physical-discovery-wasm = pkgs.runCommand "sapphire-physical-discovery.wasm" { } (
+            if physicalWasmSource == "" then
+              ''
+                echo "set SAPPHIRE_PHYSICAL_WASM_SOURCE and evaluate with --impure" >&2
+                exit 1
+              ''
+            else
+              let
+                source = builtins.path {
+                  path = physicalWasmSource;
+                  name = "sapphire-physical-discovery.wasm.source";
+                };
+              in
+              ''
+                test "$(${pkgs.coreutils}/bin/sha256sum ${source} | ${pkgs.coreutils}/bin/cut -d ' ' -f 1)" = \
+                  e8aa718f071332e6b71649857b2e41651dc002d12ae1acbab08482102762358c
+                cp ${source} "$out"
+              ''
+          );
 
           sapphire-discovery = pkgs.writeShellApplication {
             name = "bluetooth-sapphire-discover";
