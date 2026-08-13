@@ -10,7 +10,8 @@ resolver = "3"
 
 [features]
 fuchsia-passive = []
-default = ["fuchsia-passive"]
+rate-power-evidence-only = []
+default = ["fuchsia-passive", "rate-power-evidence-only"]
 
 [dependencies]
 driver-runtime = { path = "../driver-runtime" }

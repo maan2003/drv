@@ -1557,6 +1557,7 @@ fn generate_rate_power_snapshot() -> Result<(), String> {
 struct FrozenRatePowerSnapshot {
     snapshot: RegulatoryRatePowerSnapshot,
     expected_source_sha256: [u8; 32],
+    wire_sha256: String,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -1595,6 +1596,7 @@ fn read_rate_power_snapshot() -> Result<FrozenRatePowerSnapshot, String> {
     Ok(FrozenRatePowerSnapshot {
         snapshot: decode_rate_power_snapshot_wire(&bytes, expected)?,
         expected_source_sha256: expected,
+        wire_sha256: sha256_hex(&bytes),
     })
 }
 
@@ -3503,7 +3505,7 @@ fn run() -> Result<(), String> {
         if env::args().len() != 2 {
             return Err("full-firmware preflight accepts no additional arguments".into());
         }
-        let operation = Operation::RunOneShotSaeAuth;
+        let operation = Operation::RunOneShotPowerSetup;
         if operation == Operation::RunOneShotPatchTableGate
             || !operation.is_active_mcu()
             || !operation.loads_firmware()
@@ -3521,10 +3523,51 @@ fn run() -> Result<(), String> {
         if containment.phase != RunPhase::Acquiring || containment.hardware_may_be_active() {
             return Err("full-firmware inert containment acquisition is invalid".into());
         }
+        let frozen = read_rate_power_snapshot()?;
+        let snapshot = &frozen.snapshot;
+        let enabled = snapshot
+            .channels()
+            .iter()
+            .filter(|channel| channel.present && !channel.disabled)
+            .count();
+        let disabled = snapshot
+            .channels()
+            .iter()
+            .filter(|channel| channel.present && channel.disabled)
+            .count();
+        let absent = snapshot
+            .channels()
+            .iter()
+            .filter(|channel| !channel.present)
+            .count();
+        if snapshot.generation() != 0
+            || snapshot.alpha2() != *b"00"
+            || snapshot.source_sha256() != frozen.expected_source_sha256
+            || !snapshot.sar_ranges().is_empty()
+            || snapshot.external_cap_half_dbm().is_some()
+            || (enabled, disabled, absent) != (39, 3, 20)
+        {
+            return Err("inert preflight regulatory snapshot identity is invalid".into());
+        }
         println!(
-            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-sae-auth\",\"patch_table_gate\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}"
+            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{}\",\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            snapshot
+                .source_sha256()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            frozen.wire_sha256,
+            NATIVE_RATE_POWER_RAW_SHA256.join(","),
         );
         return Ok(());
+    }
+    if cfg!(feature = "rate-power-evidence-only")
+        && operation_argument.as_deref() != Some("--run-one-shot-power-setup")
+    {
+        return Err(
+            "evidence-only build permits only pinned-regdb rate-power delivery; scan, channel, authentication, and frame TX are unreachable"
+                .into(),
+        );
     }
     if operation_argument.as_deref() == Some("--self-test-patch-table-gate") {
         if env::args().len() != 2 {
@@ -8381,6 +8424,30 @@ struct RatePowerDeliveryAudit {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+const NATIVE_RATE_POWER_RAW_SHA256: [&str; 8] = [
+    "a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95",
+    "1c365518ffebb7a2b12b924bcfbe41436b4f2d52a83b07682d6f16c79eb39db0",
+    "1cbc40088bc367d75b2119806d3a8114ed3c4ce92a9572f262faace837343d36",
+    "f03e59182fd1e605df82de38305d445a015c9fc44c12da7802132514fed3e4d5",
+    "231e8db12ba160bdc12af55ef61c2da091387951c029008cc68b6b8d8a71d208",
+    "d8761b04f27de826280c55aac39a96e4d3bc0bb4d83330d910a4fd3ca70b90b2",
+    "e018434f160c1b67dc86477c602a87627b5553c5304359912347a04cbb3aad44",
+    "f1e5d489bb579d4d080eb8c2569e752c0b0dd87ccbdf02a112705536791d89df",
+];
+
+#[cfg(feature = "fuchsia-passive")]
+const NATIVE_RATE_POWER_NORMALIZED_ENVELOPE_SHA256: [&str; 8] = [
+    "72ea1befa9b1ff66bd677d92bde13d3d5e89409abc5afdd2e9272d65a5ddb7c7",
+    "20357281549ddaa5598b30fbbde185dedfd345ebfcef147741c41fccb3a5622e",
+    "b003e1b0460ec05444eda58cb6ba87ce2753e84b0bfd81c2102cbb62f15db735",
+    "3162681f7c44963e53b0739c59426677326490c1e70d6736ec6e317ca4e7a389",
+    "9d394dfd9b0e45eca67741a1aaca4631280b5e238ed82c0858e2942155c3ae85",
+    "28828e4df8b780205d7784a88c2e51883a379d8b3cc71cac5ff7bff2d0396bbf",
+    "0a33bb15880033bc175c79962ef1c1021da3067be28a3bbf29a7d3ae40414596",
+    "997ae34108569cb25783d44bac88e3631920188a7ec1c278bda69686c19db873",
+];
+
+#[cfg(feature = "fuchsia-passive")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -8493,10 +8560,24 @@ impl RatePowerDeliveryAudit {
                 encoded.len(),
             ));
         }
+        let actual_raw_sha256 = sha256_hex(raw.expect("validated raw request"));
+        let mut normalized = encoded.to_vec();
+        normalized[39] = 0;
+        let actual_normalized_envelope_sha256 = sha256_hex(&normalized);
+        let expected_raw_sha256 = NATIVE_RATE_POWER_RAW_SHA256[usize::from(ordinal - 1)];
+        let expected_normalized_envelope_sha256 =
+            NATIVE_RATE_POWER_NORMALIZED_ENVELOPE_SHA256[usize::from(ordinal - 1)];
+        if actual_raw_sha256 != expected_raw_sha256
+            || actual_normalized_envelope_sha256 != expected_normalized_envelope_sha256
+        {
+            return Err(format!(
+                "SET_RATE_TX_POWER page {ordinal} differs from captured native bytes: raw={actual_raw_sha256} expected_raw={expected_raw_sha256} normalized_envelope={actual_normalized_envelope_sha256} expected_normalized_envelope={expected_normalized_envelope_sha256}"
+            ));
+        }
         self.pages = ordinal;
         self.previous_sequence = sequence;
         record_sae_stage(&format!(
-            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={actual_raw_sha256} normalized_envelope_sha256={actual_normalized_envelope_sha256} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
             sequence.expect("validated sequence"),
             expected_total_length - 32,
             u8::from(ordinal == 8)

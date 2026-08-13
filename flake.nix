@@ -143,20 +143,77 @@
             buildInputs = [ pkgs.stdenv.cc.cc.lib ];
             dontUnpack = true;
             installPhase = ''
-              install -Dm0755 "$src" "$out/bin/mt7921-passive-scan"
+              install -Dm0755 "$src" "$out/libexec/mt7921-rate-power-evidence"
+              mkdir -p "$out/bin"
+              regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+              substitute ${./nix/mt7921-rate-power-evidence-launcher.sh} \
+                "$out/bin/mt7921-rate-power-evidence" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by driver "$out/libexec/mt7921-rate-power-evidence" \
+                --subst-var-by snapshot_generator "$out/libexec/mt7921-rate-power-evidence" \
+                --subst-var-by regulatory_db ${regulatoryDb} \
+                --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
+                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by stat ${pkgs.coreutils}/bin/stat \
+                --subst-var-by rm ${pkgs.coreutils}/bin/rm \
+                --subst-var-by env ${pkgs.coreutils}/bin/env
+              chmod 0755 "$out/bin/mt7921-rate-power-evidence"
+            '';
+            postFixup = ''
+              evidence_dir=$out/share/mt7921-rate-power-evidence
+              mkdir -p "$evidence_dir"
+              driver=$out/libexec/mt7921-rate-power-evidence
+              "$driver" --self-test-rate-power-delivery > "$evidence_dir/offline-self-test.jsonl"
+              "$driver" --generate-regulatory-snapshot-v20 ${regulatoryDb} 00 \
+                2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b \
+                > "$evidence_dir/regulatory.snapshot"
+              cat > "$evidence_dir/ARTIFACTS" <<EOF
+              OFFLINE_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/offline-self-test.jsonl" | cut -d ' ' -f1)
+              REGULATORY_SNAPSHOT_SHA256=$(sha256sum "$evidence_dir/regulatory.snapshot" | cut -d ' ' -f1)
+              REGULATORY_SNAPSHOT_BYTES=$(wc -c < "$evidence_dir/regulatory.snapshot")
+              REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+              COUNTRY=00
+              GENERATION=0
+              EOF
             '';
             doInstallCheck = true;
             installCheckPhase = ''
-              strings $out/bin/mt7921-passive-scan | grep -F 'rate_power_publication'
-              strings $out/bin/mt7921-passive-scan | grep -F 'rate_power_evidence_stop'
-              strings $out/bin/mt7921-passive-scan | grep -F 'TMAC patch-table validation is disabled'
-              strings $out/bin/mt7921-passive-scan | grep -F 'SAE validation is disabled'
-              if $out/bin/mt7921-passive-scan --run-one-shot-patch-table-gate 2>error; then exit 1; fi
-              grep -F 'TMAC patch-table validation is disabled' error
-              if $out/bin/mt7921-passive-scan --run-one-shot-sae-auth 2>error; then exit 1; fi
-              grep -F 'SAE validation is disabled' error
+              driver=$out/libexec/mt7921-rate-power-evidence
+              strings "$driver" | grep -F 'rate_power_publication'
+              strings "$driver" | grep -F 'rate_power_evidence_stop'
+              strings "$driver" | grep -F 'native_golden_match=true'
+              strings "$driver" | grep -F 'evidence-only build permits only pinned-regdb rate-power delivery'
+              output=$("$driver" --self-test-rate-power-delivery)
+              test "$(printf '%s\n' "$output" | grep -c '"rate_power_self_test":"command"')" -eq 10
+              printf '%s\n' "$output" | grep -F '"rate_power_self_test":"passed"'
+              for hash in \
+                a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95 \
+                1c365518ffebb7a2b12b924bcfbe41436b4f2d52a83b07682d6f16c79eb39db0 \
+                1cbc40088bc367d75b2119806d3a8114ed3c4ce92a9572f262faace837343d36 \
+                f03e59182fd1e605df82de38305d445a015c9fc44c12da7802132514fed3e4d5 \
+                231e8db12ba160bdc12af55ef61c2da091387951c029008cc68b6b8d8a71d208 \
+                d8761b04f27de826280c55aac39a96e4d3bc0bb4d83330d910a4fd3ca70b90b2 \
+                e018434f160c1b67dc86477c602a87627b5553c5304359912347a04cbb3aad44 \
+                f1e5d489bb579d4d080eb8c2569e752c0b0dd87ccbdf02a112705536791d89df
+              do
+                printf '%s\n' "$output" | grep -F "$hash"
+              done
+              "$driver" --generate-regulatory-snapshot-v20 ${regulatoryDb} 00 \
+                2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b > snapshot
+              test "$(wc -c < snapshot)" -eq 580
+              test "$(wc -c < $out/share/mt7921-rate-power-evidence/regulatory.snapshot)" -eq 580
+              cmp snapshot $out/share/mt7921-rate-power-evidence/regulatory.snapshot
+              grep -F '"rate_power_self_test":"passed"' \
+                $out/share/mt7921-rate-power-evidence/offline-self-test.jsonl
+              if "$driver" --run-one-shot-sae-auth 2>error; then exit 1; fi
+              grep -F 'evidence-only build' error
+              if "$out/bin/mt7921-rate-power-evidence" --run-one-shot-sae-auth 2>error; then exit 1; fi
+              grep -F 'accepts no arguments' error
             '';
-            meta.mainProgram = "mt7921-passive-scan";
+            meta.mainProgram = "mt7921-rate-power-evidence";
           };
 
           mt7921-full-firmware-validation = pkgs.stdenv.mkDerivation {
@@ -313,6 +370,150 @@
                 ! grep -q 'PATCH_TABLE' transcript
                 ! grep -q 'EAPOL' transcript
                 cp transcript "$out"
+              '';
+
+          mt7921-rate-power-evidence-launcher-test =
+            pkgs.runCommand "mt7921-rate-power-evidence-launcher-test"
+              {
+                nativeBuildInputs = [ pkgs.coreutils pkgs.gnused ];
+              }
+              ''
+                mkdir -p work/bin work/var
+                cat > work/bin/evidence-stub <<'EOF'
+                #!${pkgs.runtimeShell}
+                set -eu
+                test -f "$PWD/generation.complete"
+                transcript=$PWD/transcript
+                printf 'ARGV <%s>\n' "$1" > "$transcript"
+                ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
+                credential=$(${pkgs.coreutils}/bin/cat <&3)
+                snapshot=$(${pkgs.coreutils}/bin/cat <&4)
+                if printf x >&4 2>/dev/null; then
+                  echo FD4_WRITABLE >> "$transcript"
+                  exit 1
+                fi
+                printf 'CREDENTIAL=%s\nSNAPSHOT=%s\nFD4_EOF=true\n' \
+                  "$credential" "$snapshot" >> "$transcript"
+                EOF
+                chmod 0755 work/bin/evidence-stub
+                cat > work/bin/snapshot-stub <<'EOF'
+                #!${pkgs.runtimeShell}
+                set -eu
+                test "$1" = --generate-regulatory-snapshot-v20
+                test "$3" = 00
+                test "$4" = 0000000000000000000000000000000000000000000000000000000000000000
+                : > "$PWD/generation.complete"
+                printf snapshot-ok
+                EOF
+                chmod 0755 work/bin/snapshot-stub
+                : > work/var/regulatory.db
+                printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+                substitute ${./nix/mt7921-rate-power-evidence-launcher.sh} work/launcher \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by driver "$PWD/work/bin/evidence-stub" \
+                  --subst-var-by snapshot_generator "$PWD/work/bin/snapshot-stub" \
+                  --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
+                  --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+                  --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                  --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                  --subst-var-by stat ${pkgs.coreutils}/bin/stat \
+                  --subst-var-by rm ${pkgs.coreutils}/bin/rm \
+                  --subst-var-by env ${pkgs.coreutils}/bin/env
+                chmod 0755 work/launcher
+                env -i \
+                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                  work/launcher
+                grep -Fx 'ARGV <--run-one-shot-power-setup>' transcript
+                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
+                grep -Fx 'CREDENTIAL=eight-by' transcript
+                grep -Fx 'SNAPSHOT=snapshot-ok' transcript
+                grep -Fx 'FD4_EOF=true' transcript
+                ! grep -q FD4_WRITABLE transcript
+
+                cat > work/bin/fail-stub <<'EOF'
+                #!${pkgs.runtimeShell}
+                exit 1
+                EOF
+                chmod 0755 work/bin/fail-stub
+                ${pkgs.gnused}/bin/sed \
+                  "s|snapshot_generator=$PWD/work/bin/snapshot-stub|snapshot_generator=$PWD/work/bin/fail-stub|" \
+                  work/launcher > work/fail-launcher
+                chmod 0755 work/fail-launcher
+                rm -f transcript
+                if env -i \
+                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                  work/fail-launcher; then
+                  exit 1
+                fi
+                test ! -e transcript
+                printf passed > "$out"
+              '';
+
+          mt7921-rate-power-evidence-supervisor = pkgs.runCommand
+            "mt7921-rate-power-evidence-supervisor"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+                "$out/bin/mt7921-rate-power-evidence-supervisor" \
+                --subst-var-by runtime_path /run/current-system/sw/bin \
+                --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
+                --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
+                --subst-var-by validation_launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
+                --subst-var-by recovery_samples 45 \
+                --subst-var-by sys_root /sys \
+                --subst-var-by run_root /run \
+                --subst-var-by var_root /var
+              chmod 0755 "$out/bin/mt7921-rate-power-evidence-supervisor"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-supervisor"
+              grep -F '${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence' \
+                "$out/bin/mt7921-rate-power-evidence-supervisor"
+            '';
+
+          mt7921-rate-power-evidence-manifest =
+            let
+              package = mt7921-rate-power-evidence;
+              supervisor = mt7921-rate-power-evidence-supervisor;
+              closure = pkgs.closureInfo { rootPaths = [ package supervisor ]; };
+            in
+            pkgs.runCommand "mt7921-rate-power-evidence-manifest"
+              { nativeBuildInputs = [ pkgs.coreutils ]; }
+              ''
+                launcher=${package}/bin/mt7921-rate-power-evidence
+                elf=${package}/libexec/mt7921-rate-power-evidence
+                supervisor=${supervisor}/bin/mt7921-rate-power-evidence-supervisor
+                cat > "$out" <<EOF
+                PACKAGE=${package}
+                LAUNCHER=$launcher
+                LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
+                ELF=$elf
+                ELF_SHA256=$(sha256sum "$elf" | cut -d ' ' -f1)
+                SUPERVISOR=$supervisor
+                SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
+                REGULATORY_DB=${regulatoryDb}
+                REGULATORY_DB_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
+                CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
+                PCI_BDF=0000:05:00.0
+                TIMEOUT_SECONDS=300
+                OPERATION=--run-one-shot-power-setup
+                ORDER=PATCH_RAM_RX_PATH_8x0x4005d_ACKED_ADD_DEVICE_STOP
+                NATIVE_RAW_SHA256=a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95,1c365518ffebb7a2b12b924bcfbe41436b4f2d52a83b07682d6f16c79eb39db0,1cbc40088bc367d75b2119806d3a8114ed3c4ce92a9572f262faace837343d36,f03e59182fd1e605df82de38305d445a015c9fc44c12da7802132514fed3e4d5,231e8db12ba160bdc12af55ef61c2da091387951c029008cc68b6b8d8a71d208,d8761b04f27de826280c55aac39a96e4d3bc0bb4d83330d910a4fd3ca70b90b2,e018434f160c1b67dc86477c602a87627b5553c5304359912347a04cbb3aad44,f1e5d489bb579d4d080eb8c2569e752c0b0dd87ccbdf02a112705536791d89df
+                NORMALIZED_ENVELOPE_SHA256=72ea1befa9b1ff66bd677d92bde13d3d5e89409abc5afdd2e9272d65a5ddb7c7,20357281549ddaa5598b30fbbde185dedfd345ebfcef147741c41fccb3a5622e,b003e1b0460ec05444eda58cb6ba87ce2753e84b0bfd81c2102cbb62f15db735,3162681f7c44963e53b0739c59426677326490c1e70d6736ec6e317ca4e7a389,9d394dfd9b0e45eca67741a1aaca4631280b5e238ed82c0858e2942155c3ae85,28828e4df8b780205d7784a88c2e51883a379d8b3cc71cac5ff7bff2d0396bbf,0a33bb15880033bc175c79962ef1c1021da3067be28a3bbf29a7d3ae40414596,997ae34108569cb25783d44bac88e3631920188a7ec1c278bda69686c19db873
+                INERT_ARTIFACTS=${package}/share/mt7921-rate-power-evidence
+                TMAC_POPULATION_INVARIANT=false
+                SCAN=false
+                CHANNEL_SET=false
+                AUTHENTICATION=false
+                FRAME_TX=false
+                EOF
               '';
 
           mt7921-full-firmware-validation-manifest =

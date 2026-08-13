@@ -1,2 +1,0 @@
-/nix/store/adcz0m6qq2flmshdf0zz2xwjr5zbq1gr-gcc-wrapper-15.3.0/bin/ar qc libboringssl_gtest.a "CMakeFiles/boringssl_gtest.dir/third_party/googletest/googlemock/src/gmock-all.cc.o" "CMakeFiles/boringssl_gtest.dir/third_party/googletest/googletest/src/gtest-all.cc.o"
-/nix/store/adcz0m6qq2flmshdf0zz2xwjr5zbq1gr-gcc-wrapper-15.3.0/bin/ranlib libboringssl_gtest.a

@@ -1,2 +1,0 @@
-cargo::rustc-check-cfg=cfg(no_lock_order)
-cargo::rustc-cfg=no_lock_order
