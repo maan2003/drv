@@ -4289,6 +4289,7 @@ pub struct SarFrequencyRange {
 pub struct RegulatoryRatePowerSnapshot {
     generation: u64,
     alpha2: [u8; 2],
+    source_sha256: [u8; 32],
     channels: Vec<RegulatoryRatePowerChannel>,
     sar_ranges: Vec<SarFrequencyRange>,
     external_cap_half_dbm: Option<i8>,
@@ -4305,6 +4306,7 @@ impl RegulatoryRatePowerSnapshot {
         Self {
             generation,
             alpha2,
+            source_sha256: [0; 32],
             channels,
             sar_ranges,
             external_cap_half_dbm,
@@ -4316,6 +4318,13 @@ impl RegulatoryRatePowerSnapshot {
     }
     pub const fn alpha2(&self) -> [u8; 2] {
         self.alpha2
+    }
+    pub const fn source_sha256(&self) -> [u8; 32] {
+        self.source_sha256
+    }
+    pub fn bind_source_sha256(mut self, source_sha256: [u8; 32]) -> Self {
+        self.source_sha256 = source_sha256;
+        self
     }
     pub fn channels(&self) -> &[RegulatoryRatePowerChannel] {
         &self.channels
@@ -4399,6 +4408,9 @@ pub enum RateTxPowerError {
     DuplicateChannel,
     InvalidChannelFrequency,
     InvalidSarRange,
+    InvalidRegulatoryDatabase,
+    UnknownRegulatoryDomain,
+    SourceHashMismatch,
 }
 
 pub trait RateTxPowerTransport {
@@ -4417,6 +4429,7 @@ pub struct RateTxPowerAuthorization {
     owner_id: NonZeroU64,
     generation: u64,
     alpha2: [u8; 2],
+    source_sha256: [u8; 32],
     target_half_dbm: i8,
 }
 
@@ -4459,12 +4472,14 @@ impl RateTxPowerAuthorizer {
             owner_id,
             generation: self.generation,
             alpha2: self.alpha2,
+            source_sha256: [0; 32],
             target_half_dbm: submission.target_half_dbm,
         };
         self.authorization = Some(RateTxPowerAuthorization {
             owner_id: authorization.owner_id,
             generation: authorization.generation,
             alpha2: authorization.alpha2,
+            source_sha256: authorization.source_sha256,
             target_half_dbm: authorization.target_half_dbm,
         });
         Ok(authorization)
@@ -4475,6 +4490,7 @@ impl RateTxPowerAuthorizer {
         transport: &mut T,
         capability: NicCapability,
         snapshot: &RegulatoryRatePowerSnapshot,
+        expected_source_sha256: [u8; 32],
         first_sequence: u8,
     ) -> Result<RateTxPowerAuthorization, RateTxPowerInstallError<T::Error>> {
         // A replacement attempt revokes prior authority before validation or
@@ -4483,6 +4499,11 @@ impl RateTxPowerAuthorizer {
         if snapshot.alpha2 != self.alpha2 {
             return Err(RateTxPowerInstallError::Encode(
                 RateTxPowerError::NonWorldDomain,
+            ));
+        }
+        if expected_source_sha256 != snapshot.source_sha256 {
+            return Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::SourceHashMismatch,
             ));
         }
         let commands = encode_regulatory_rate_tx_power_commands(
@@ -4509,6 +4530,7 @@ impl RateTxPowerAuthorizer {
             owner_id,
             generation: self.generation,
             alpha2: self.alpha2,
+            source_sha256: snapshot.source_sha256,
             // Generic snapshots are channel-specific. This legacy private
             // field is not authority; retain the initialized Linux ceiling.
             target_half_dbm: 127,
@@ -4517,6 +4539,7 @@ impl RateTxPowerAuthorizer {
             owner_id: authorization.owner_id,
             generation: authorization.generation,
             alpha2: authorization.alpha2,
+            source_sha256: authorization.source_sha256,
             target_half_dbm: authorization.target_half_dbm,
         });
         Ok(authorization)
@@ -4634,6 +4657,202 @@ pub fn regulatory_rate_power_channel_skeleton(
         .collect()
 }
 
+/// Decode the pinned world's wireless-regdb payload format (version 20) into
+/// one complete, immutable MT7921 transaction input. Channel capability is
+/// only an intersection here; every power ceiling comes from regdb.
+pub fn regulatory_rate_power_snapshot_from_regdb_v20(
+    database: &[u8],
+    generation: u64,
+    alpha2: [u8; 2],
+    capability: NicCapability,
+    source_sha256: [u8; 32],
+) -> Result<RegulatoryRatePowerSnapshot, RateTxPowerError> {
+    fn be32(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+    fn word_offset(pointer: u16, len: usize) -> Option<usize> {
+        let offset = usize::from(pointer).checked_mul(4)?;
+        (offset < len).then_some(offset)
+    }
+
+    if database.len() < 12
+        || database.get(..4) != Some(b"RGDB")
+        || be32(database, 4) != Some(20)
+        || !alpha2
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+    }
+    if alpha2 != *b"00" {
+        return Err(RateTxPowerError::UnknownRegulatoryDomain);
+    }
+
+    let mut collection = None;
+    let mut countries = Vec::<[u8; 2]>::new();
+    let mut terminated = false;
+    for offset in (8..database.len()).step_by(4) {
+        let record = database
+            .get(offset..offset + 4)
+            .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+        let country: [u8; 2] = record[..2].try_into().expect("fixed field");
+        let pointer = u16::from_be_bytes(record[2..4].try_into().expect("fixed field"));
+        if pointer == 0 {
+            if country != [0; 2] {
+                return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+            }
+            terminated = true;
+            break;
+        }
+        if !country
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        if countries.contains(&country) || word_offset(pointer, database.len()).is_none() {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        countries.push(country);
+        if country == alpha2 {
+            collection = word_offset(pointer, database.len());
+        }
+    }
+    if !terminated {
+        return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+    }
+    let collection = collection.ok_or(RateTxPowerError::UnknownRegulatoryDomain)?;
+    let header = database
+        .get(collection..collection + 4)
+        .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+    // db2bin v20 uses a three-byte collection header, rounded to a word:
+    // encoded header length, rule count, DFS region, zero padding.
+    if header[0] < 3 || header[1] == 0 || header[1] > 64 {
+        return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+    }
+    let rule_count = usize::from(header[1]);
+    let collection_header_len = usize::from(header[0]);
+    database
+        .get(collection..collection + collection_header_len)
+        .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+    let pointer_offset = collection + collection_header_len.next_multiple_of(2);
+    let pointer_bytes = database
+        .get(pointer_offset..pointer_offset + rule_count * 2)
+        .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+    let mut rules = Vec::with_capacity(rule_count);
+    let mut pointers = Vec::with_capacity(rule_count);
+    for encoded in pointer_bytes.chunks_exact(2) {
+        let pointer = u16::from_be_bytes(encoded.try_into().expect("two-byte chunk"));
+        if pointers.contains(&pointer) {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        pointers.push(pointer);
+        let offset = word_offset(pointer, database.len())
+            .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+        let rule_len = usize::from(
+            *database
+                .get(offset)
+                .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?,
+        );
+        // This pinned database uses the base v20 rule. Fail closed rather
+        // than silently ignore an optional WMM extension.
+        if rule_len != 16 {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        let rule = database
+            .get(offset..offset + rule_len)
+            .ok_or(RateTxPowerError::InvalidRegulatoryDatabase)?;
+        let max_eirp_mbm = u16::from_be_bytes(rule[2..4].try_into().expect("fixed field"));
+        let start_khz = u32::from_be_bytes(rule[4..8].try_into().expect("fixed field"));
+        let end_khz = u32::from_be_bytes(rule[8..12].try_into().expect("fixed field"));
+        let max_bandwidth_khz = u32::from_be_bytes(rule[12..16].try_into().expect("fixed field"));
+        if start_khz >= end_khz || max_bandwidth_khz == 0 || max_bandwidth_khz > end_khz - start_khz
+        {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        rules.push((start_khz, end_khz, max_bandwidth_khz, max_eirp_mbm));
+    }
+
+    let candidates = candidate_channels(capability);
+    let mut channels = regulatory_rate_power_channel_skeleton(capability)?;
+    for channel in &mut channels {
+        if !candidates.iter().any(|candidate| {
+            candidate.band == channel.band
+                && candidate.number == channel.channel
+                && candidate.frequency_mhz == channel.frequency_mhz
+        }) {
+            continue;
+        }
+        let center_khz = u32::from(channel.frequency_mhz) * 1_000;
+        let lower_khz = center_khz.saturating_sub(10_000);
+        let upper_khz = center_khz.saturating_add(10_000);
+        let power_mbm = rules
+            .iter()
+            .filter(|(start, end, bandwidth, _)| {
+                *start <= lower_khz && upper_khz <= *end && *bandwidth >= 20_000
+            })
+            .map(|(_, _, _, power)| *power)
+            .next();
+        channel.present = true;
+        if let Some(power_mbm) = power_mbm {
+            let power_dbm = i8::try_from(power_mbm / 100)
+                .map_err(|_| RateTxPowerError::InvalidRegulatoryLimit)?;
+            if !(0..=63).contains(&power_dbm) {
+                return Err(RateTxPowerError::InvalidRegulatoryLimit);
+            }
+            channel.present = true;
+            channel.max_reg_power_dbm = Some(power_dbm);
+        } else {
+            channel.disabled = true;
+        }
+    }
+    Ok(
+        RegulatoryRatePowerSnapshot::new(generation, alpha2, channels, Vec::new(), None)
+            .bind_source_sha256(source_sha256),
+    )
+}
+
+/// Intersect an immutable regulatory policy snapshot with the NIC capability
+/// reported by this boot. Regulatory power is copied, never synthesized.
+pub fn narrow_regulatory_rate_power_snapshot(
+    source: &RegulatoryRatePowerSnapshot,
+    capability: NicCapability,
+) -> Result<RegulatoryRatePowerSnapshot, RateTxPowerError> {
+    let candidates = candidate_channels(capability);
+    let mut channels = regulatory_rate_power_channel_skeleton(capability)?;
+    for channel in &mut channels {
+        if !candidates.iter().any(|candidate| {
+            candidate.band == channel.band
+                && candidate.number == channel.channel
+                && candidate.frequency_mhz == channel.frequency_mhz
+        }) {
+            continue;
+        }
+        let mut matching = source.channels.iter().filter(|input| {
+            input.band == channel.band
+                && input.channel == channel.channel
+                && input.frequency_mhz == channel.frequency_mhz
+        });
+        let input = matching
+            .next()
+            .ok_or(RateTxPowerError::IncompleteSnapshot)?;
+        if matching.next().is_some() {
+            return Err(RateTxPowerError::DuplicateChannel);
+        }
+        *channel = *input;
+    }
+    Ok(RegulatoryRatePowerSnapshot::new(
+        source.generation,
+        source.alpha2,
+        channels,
+        source.sar_ranges.clone(),
+        source.external_cap_half_dbm,
+    )
+    .bind_source_sha256(source.source_sha256))
+}
+
 fn rate_power_frequency(band: PhysicalBand, channel: u16) -> Option<u16> {
     match band {
         PhysicalBand::Ghz2 if channel == 14 => Some(2484),
@@ -4672,23 +4891,22 @@ fn validate_rate_power_snapshot(
         if rate_power_frequency(band, channel) != Some(input.frequency_mhz) {
             return Err(RateTxPowerError::InvalidChannelFrequency);
         }
-        if input.present
-            && !input.disabled
-            && !input
-                .max_reg_power_dbm
-                .is_some_and(|power| (0..=63).contains(&power))
-        {
+        let state_is_valid = match (input.present, input.disabled, input.max_reg_power_dbm) {
+            (false, false, None) | (true, true, None) => true,
+            (true, false, Some(power)) => (0..=63).contains(&power),
+            _ => false,
+        };
+        if !state_is_valid {
             return Err(RateTxPowerError::InvalidRegulatoryLimit);
         }
     }
-    let mut previous_start = None;
+    let mut previous_end = None;
     for range in &snapshot.sar_ranges {
-        if range.start_mhz >= range.end_mhz
-            || previous_start.is_some_and(|start| range.start_mhz < start)
+        if range.start_mhz >= range.end_mhz || previous_end.is_some_and(|end| range.start_mhz < end)
         {
             return Err(RateTxPowerError::InvalidSarRange);
         }
-        previous_start = Some(range.start_mhz);
+        previous_end = Some(range.end_mhz);
     }
     Ok(expected)
 }
@@ -9300,6 +9518,145 @@ mod tests {
     }
 
     #[test]
+    fn pinned_wireless_regdb_world_snapshot_is_complete_and_source_bound() {
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 15,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let database = include_bytes!("../tests/fixtures/regulatory.db");
+        let source = [0x2f; 32];
+        let snapshot =
+            regulatory_rate_power_snapshot_from_regdb_v20(database, 0, *b"00", capability, source)
+                .unwrap();
+        let channel = |band, number| {
+            snapshot
+                .channels()
+                .iter()
+                .find(|channel| channel.band == band && channel.channel == number)
+                .unwrap()
+        };
+        assert_eq!(channel(PhysicalBand::Ghz2, 1).max_reg_power_dbm, Some(20));
+        assert_eq!(channel(PhysicalBand::Ghz5, 36).max_reg_power_dbm, Some(20));
+        assert!(!channel(PhysicalBand::Ghz5, 38).present);
+        assert!(channel(PhysicalBand::Ghz5, 169).present);
+        assert!(channel(PhysicalBand::Ghz5, 169).disabled);
+        assert_eq!(snapshot.source_sha256(), source);
+        assert_eq!(
+            snapshot
+                .channels()
+                .iter()
+                .filter(|channel| channel.present && !channel.disabled)
+                .count(),
+            39
+        );
+        assert_eq!(
+            snapshot
+                .channels()
+                .iter()
+                .filter(|channel| channel.present && channel.disabled)
+                .count(),
+            3
+        );
+        assert_eq!(
+            snapshot
+                .channels()
+                .iter()
+                .filter(|channel| !channel.present)
+                .count(),
+            20
+        );
+
+        let commands =
+            encode_regulatory_rate_tx_power_commands(capability, &snapshot, 0, 1).unwrap();
+        let channel_1 = &commands[0][CONNAC2_MCU_TXD_BYTES + 44..][..162];
+        assert_eq!(&channel_1[1..], &mt7921_uniform_rate_power_sku(1, 40));
+        struct NoTransport;
+        impl RateTxPowerTransport for NoTransport {
+            type Error = ();
+            fn send_and_wait_consumed(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+                panic!("source mismatch must fail before transport")
+            }
+        }
+        assert_eq!(
+            RateTxPowerAuthorizer::new().submit_snapshot(
+                &mut NoTransport,
+                capability,
+                &snapshot,
+                [0; 32],
+                1,
+            ),
+            Err(RateTxPowerInstallError::Encode(
+                RateTxPowerError::SourceHashMismatch
+            ))
+        );
+        struct AcceptTransport;
+        impl RateTxPowerTransport for AcceptTransport {
+            type Error = ();
+            fn send_and_wait_consumed(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        let mut authorizer = RateTxPowerAuthorizer::new();
+        let old = authorizer
+            .submit_snapshot(&mut AcceptTransport, capability, &snapshot, source, 1)
+            .unwrap();
+        let replacement_source = [0x30; 32];
+        let replacement = snapshot.clone().bind_source_sha256(replacement_source);
+        let current = authorizer
+            .submit_snapshot(
+                &mut AcceptTransport,
+                capability,
+                &replacement,
+                replacement_source,
+                1,
+            )
+            .unwrap();
+        assert!(!authorizer.permits(&old));
+        assert!(authorizer.permits(&current));
+        let two_ghz_capability = NicCapability {
+            phy: Some(NicPhyCapability {
+                has_5ghz: false,
+                hardware_path: 1,
+                ..capability.phy.unwrap()
+            }),
+            ..capability
+        };
+        let narrowed =
+            narrow_regulatory_rate_power_snapshot(&snapshot, two_ghz_capability).unwrap();
+        assert_eq!(narrowed.channels().len(), 14);
+        assert!(
+            narrowed
+                .channels()
+                .iter()
+                .all(|channel| channel.band == PhysicalBand::Ghz2)
+        );
+        let mut malformed = database.to_vec();
+        malformed[7] = 19;
+        assert_eq!(
+            regulatory_rate_power_snapshot_from_regdb_v20(
+                &malformed, 0, *b"00", capability, source,
+            ),
+            Err(RateTxPowerError::InvalidRegulatoryDatabase)
+        );
+        assert_eq!(
+            regulatory_rate_power_snapshot_from_regdb_v20(database, 0, *b"ZZ", capability, source,),
+            Err(RateTxPowerError::UnknownRegulatoryDomain)
+        );
+    }
+
+    #[test]
     fn regulatory_rate_power_snapshot_applies_linux_limits_and_fails_closed() {
         let capability = NicCapability {
             element_count: 0,
@@ -9339,9 +9696,8 @@ mod tests {
                     end_mhz: 2500,
                     max_power_half_dbm: 30,
                 },
-                // Deliberate overlap: Linux uses the first ordered match.
                 SarFrequencyRange {
-                    start_mhz: 2450,
+                    start_mhz: 2500,
                     end_mhz: 5900,
                     max_power_half_dbm: 24,
                 },
@@ -9364,6 +9720,7 @@ mod tests {
                 &mut stale_transport,
                 capability,
                 &snapshot,
+                snapshot.source_sha256(),
                 1,
             ),
             Err(RateTxPowerInstallError::Encode(

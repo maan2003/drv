@@ -47,6 +47,15 @@
           pkgs = nixpkgs.legacyPackages.${system};
           gapWasmSource = builtins.getEnv "SAPPHIRE_GAP_WASM_SOURCE";
           physicalWasmSource = builtins.getEnv "SAPPHIRE_PHYSICAL_WASM_SOURCE";
+          regulatoryDb = pkgs.runCommand "wireless-regdb-v20-uncompressed" {
+            nativeBuildInputs = [ pkgs.zstd ];
+          } ''
+            if test -f ${pkgs.wireless-regdb}/lib/firmware/regulatory.db; then
+              cp ${pkgs.wireless-regdb}/lib/firmware/regulatory.db "$out"
+            else
+              zstd -dc ${pkgs.wireless-regdb}/lib/firmware/regulatory.db.zst > "$out"
+            fi
+          '';
         in
         rec {
           audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
@@ -173,14 +182,21 @@
             installPhase = ''
               runHook preInstall
               install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
+              regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               mkdir -p "$out/bin"
               ln -s ../libexec/mt7921-full-firmware-validation "$out/bin/mt7921-full-firmware-validation-driver"
               substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} \
                 "$out/bin/mt7921-full-firmware-validation" \
                 --subst-var-by shell ${pkgs.runtimeShell} \
                 --subst-var-by driver "$out/libexec/mt7921-full-firmware-validation" \
+                --subst-var-by snapshot_generator "$out/libexec/mt7921-full-firmware-validation" \
+                --subst-var-by regulatory_db ${regulatoryDb} \
+                --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
                 --subst-var-by credential_file /var/lib/iwd/ph1.psk \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by rm ${pkgs.coreutils}/bin/rm \
                 --subst-var-by env ${pkgs.coreutils}/bin/env
               chmod 0755 "$out/bin/mt7921-full-firmware-validation"
               runHook postInstall
@@ -214,8 +230,12 @@
               grep -F 'DRV_SAE_CHANNEL=36' "$launcher"
               grep -F 'DRV_SAE_SSID=ph1' "$launcher"
               grep -F 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$launcher"
+              grep -F 'DRV_REGULATORY_SNAPSHOT_FD=4' "$launcher"
+              grep -F 'DRV_REGULATORY_SNAPSHOT_LEN=' "$launcher"
+              grep -F 'DRV_REGULATORY_SOURCE_SHA256=' "$launcher"
+              grep -F -- '--generate-regulatory-snapshot-v20' "$launcher"
               grep -F -- '--run-one-shot-sae-auth' "$launcher"
-              test "$(grep -Fc 'exec ' "$launcher")" -eq 3
+              test "$(grep -Fc 'exec ' "$launcher")" -eq 4
               if "$out/bin/mt7921-full-firmware-validation" --run-one-shot-patch-table-gate 2>/dev/null; then
                 echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
                 exit 1
@@ -244,15 +264,32 @@
                 printf '\n' >> "$transcript"
                 ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
                 credential=$(${pkgs.coreutils}/bin/cat <&3)
+                regulatory_snapshot=$(${pkgs.coreutils}/bin/cat <&4)
                 printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
+                printf 'REGULATORY_SNAPSHOT=%s\n' "$regulatory_snapshot" >> "$transcript"
                 EOF
                 chmod 0755 work/bin/validation-stub
+                cat > work/bin/snapshot-stub <<'EOF'
+                #!${pkgs.runtimeShell}
+                set -eu
+                test "$1" = --generate-regulatory-snapshot-v20
+                test "$3" = 00
+                printf snapshot-ok
+                EOF
+                chmod 0755 work/bin/snapshot-stub
+                : > work/var/regulatory.db
                 printf 'Passphrase=eight-by\n' > work/var/ph1.psk
                 substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
                   --subst-var-by shell ${pkgs.runtimeShell} \
                   --subst-var-by driver "$PWD/work/bin/validation-stub" \
+                  --subst-var-by snapshot_generator "$PWD/work/bin/snapshot-stub" \
+                  --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
+                  --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
                   --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                  --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                  --subst-var-by rm ${pkgs.coreutils}/bin/rm \
                   --subst-var-by env ${pkgs.coreutils}/bin/env
                 chmod 0755 work/launcher
                 env -i \
@@ -268,7 +305,11 @@
                 grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
                 grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
                 grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
+                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
+                grep -Fx 'DRV_REGULATORY_SOURCE_SHA256=0000000000000000000000000000000000000000000000000000000000000000' transcript
                 grep -Fx 'CREDENTIAL_LEN=8' transcript
+                grep -Fx 'REGULATORY_SNAPSHOT=snapshot-ok' transcript
                 ! grep -q 'PATCH_TABLE' transcript
                 ! grep -q 'EAPOL' transcript
                 cp transcript "$out"

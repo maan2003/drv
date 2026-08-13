@@ -43,9 +43,11 @@ use mt7921_port_spike::{
     encode_remove_wcid_command, linux_legacy_rate_context_reference,
     linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
     linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
-    passive_mac_bar_offset, passive_mac_mmio_plan, passive_mac_source_rmw_value,
-    regulatory_rate_power_channel_skeleton, set_client_txwi_wcid, validate_passive_mac_bar_read,
+    narrow_regulatory_rate_power_snapshot, parse_connac2_rx_frame, parse_passive_advertisement,
+    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
+    passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
+    regulatory_rate_power_snapshot_from_regdb_v20, set_client_txwi_wcid,
+    validate_passive_mac_bar_read,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -84,7 +86,7 @@ use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig
 use mt7921_softmac_adapter::{
     LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
     SourceExactPassiveMechanics, SourceExactPassiveTransport, query_from_capabilities,
-    regulatory_rate_power_snapshot_from_fuchsia, set_channel_request,
+    set_channel_request,
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
@@ -1331,6 +1333,269 @@ pub fn main() {
         eprintln!("mt7921-vfio-read: {message}");
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn fixed_mt7921_rate_power_capability() -> mt7921_port_spike::NicCapability {
+    mt7921_port_spike::NicCapability {
+        element_count: 0,
+        mac_address: None,
+        phy: Some(mt7921_port_spike::NicPhyCapability {
+            ht: true,
+            vht: true,
+            has_5ghz: true,
+            max_bandwidth: 2,
+            spatial_streams: 2,
+            hardware_path: 15,
+            he: true,
+        }),
+        has_6ghz: Some(false),
+        chip_capability: None,
+        unknown_elements: 0,
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn parse_sha256_hex(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("regulatory source SHA-256 length is invalid".into());
+    }
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "regulatory source SHA-256 is invalid")?;
+    }
+    Ok(digest)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn encode_rate_power_snapshot_wire(snapshot: &RegulatoryRatePowerSnapshot) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(640);
+    bytes.extend_from_slice(b"MTRP\x01");
+    bytes.extend_from_slice(&snapshot.generation().to_le_bytes());
+    bytes.extend_from_slice(&snapshot.alpha2());
+    bytes.extend_from_slice(&snapshot.source_sha256());
+    bytes.extend_from_slice(&(snapshot.channels().len() as u16).to_le_bytes());
+    for channel in snapshot.channels() {
+        bytes.push(match channel.band {
+            mt7921_port_spike::PhysicalBand::Ghz2 => 2,
+            mt7921_port_spike::PhysicalBand::Ghz5 => 5,
+            mt7921_port_spike::PhysicalBand::Ghz6 => 6,
+        });
+        bytes.extend_from_slice(&channel.channel.to_le_bytes());
+        bytes.extend_from_slice(&channel.frequency_mhz.to_le_bytes());
+        bytes.push(if !channel.present {
+            0
+        } else if channel.disabled {
+            2
+        } else {
+            1
+        });
+        bytes.push(channel.max_reg_power_dbm.unwrap_or(-1) as u8);
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&(snapshot.sar_ranges().len() as u16).to_le_bytes());
+    for range in snapshot.sar_ranges() {
+        bytes.extend_from_slice(&range.start_mhz.to_le_bytes());
+        bytes.extend_from_slice(&range.end_mhz.to_le_bytes());
+        bytes.push(range.max_power_half_dbm as u8);
+    }
+    match snapshot.external_cap_half_dbm() {
+        None => bytes.push(0),
+        Some(cap) => {
+            bytes.push(1);
+            bytes.push(cap as u8);
+        }
+    }
+    let digest = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    bytes
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn decode_rate_power_snapshot_wire(
+    bytes: &[u8],
+    expected_source_sha256: [u8; 32],
+) -> Result<RegulatoryRatePowerSnapshot, String> {
+    const PREFIX: usize = 5 + 8 + 2 + 32 + 2;
+    if bytes.len() < PREFIX + 32 || bytes.get(..5) != Some(b"MTRP\x01") {
+        return Err("regulatory snapshot header is invalid".into());
+    }
+    let payload_len = bytes.len() - 32;
+    if Sha256::digest(&bytes[..payload_len]).as_slice() != &bytes[payload_len..] {
+        return Err("regulatory snapshot payload hash mismatch".into());
+    }
+    let generation = u64::from_le_bytes(bytes[5..13].try_into().expect("fixed field"));
+    let alpha2: [u8; 2] = bytes[13..15].try_into().expect("fixed field");
+    let source_sha256: [u8; 32] = bytes[15..47].try_into().expect("fixed field");
+    if source_sha256 != expected_source_sha256 {
+        return Err("regulatory snapshot source hash mismatch".into());
+    }
+    let count = usize::from(u16::from_le_bytes(
+        bytes[47..49].try_into().expect("fixed field"),
+    ));
+    let mut offset = 49usize;
+    let channel_bytes = count
+        .checked_mul(8)
+        .and_then(|length| offset.checked_add(length))
+        .ok_or("regulatory snapshot channel length overflow")?;
+    if channel_bytes > payload_len {
+        return Err("regulatory snapshot channels are truncated".into());
+    }
+    let mut channels = Vec::with_capacity(count);
+    for encoded in bytes[offset..channel_bytes].chunks_exact(8) {
+        let band = match encoded[0] {
+            2 => mt7921_port_spike::PhysicalBand::Ghz2,
+            5 => mt7921_port_spike::PhysicalBand::Ghz5,
+            6 => mt7921_port_spike::PhysicalBand::Ghz6,
+            _ => return Err("regulatory snapshot has unknown band".into()),
+        };
+        let channel = u16::from_le_bytes(encoded[1..3].try_into().expect("fixed field"));
+        if channels
+            .iter()
+            .any(|existing: &mt7921_port_spike::RegulatoryRatePowerChannel| {
+                existing.band == band && existing.channel == channel
+            })
+        {
+            return Err("regulatory snapshot has a duplicate channel".into());
+        }
+        let (present, disabled) = match encoded[5] {
+            0 => (false, false),
+            1 => (true, false),
+            2 => (true, true),
+            _ => return Err("regulatory snapshot channel state is invalid".into()),
+        };
+        if encoded[7] != 0 {
+            return Err("regulatory snapshot reserved byte is nonzero".into());
+        }
+        let power = encoded[6] as i8;
+        if (!present || disabled) != (power == -1) {
+            return Err("regulatory snapshot channel power is inconsistent".into());
+        }
+        channels.push(mt7921_port_spike::RegulatoryRatePowerChannel {
+            band,
+            channel,
+            frequency_mhz: u16::from_le_bytes(encoded[3..5].try_into().expect("fixed field")),
+            present,
+            disabled,
+            max_reg_power_dbm: (power != -1).then_some(power),
+        });
+    }
+    offset = channel_bytes;
+    let sar_count = usize::from(u16::from_le_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .ok_or("regulatory snapshot SAR header is truncated")?
+            .try_into()
+            .expect("fixed field"),
+    ));
+    if sar_count != 0 {
+        return Err("regulatory snapshot supplied unsupported ACPI SAR data".into());
+    }
+    offset += 2;
+    let mut sar_ranges = Vec::with_capacity(sar_count);
+    for _ in 0..sar_count {
+        let encoded = bytes
+            .get(offset..offset + 5)
+            .ok_or("regulatory snapshot SAR range is truncated")?;
+        sar_ranges.push(mt7921_port_spike::SarFrequencyRange {
+            start_mhz: u16::from_le_bytes(encoded[..2].try_into().expect("fixed field")),
+            end_mhz: u16::from_le_bytes(encoded[2..4].try_into().expect("fixed field")),
+            max_power_half_dbm: encoded[4] as i8,
+        });
+        offset += 5;
+    }
+    let cap_tag = *bytes
+        .get(offset)
+        .ok_or("regulatory snapshot cap is missing")?;
+    offset += 1;
+    let external_cap = match cap_tag {
+        0 => None,
+        1 => return Err("regulatory snapshot supplied unsupported external cap".into()),
+        _ => return Err("regulatory snapshot cap tag is invalid".into()),
+    };
+    if offset != payload_len {
+        return Err("regulatory snapshot has trailing payload data".into());
+    }
+    Ok(
+        RegulatoryRatePowerSnapshot::new(generation, alpha2, channels, sar_ranges, external_cap)
+            .bind_source_sha256(source_sha256),
+    )
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn generate_rate_power_snapshot() -> Result<(), String> {
+    let arguments = env::args().collect::<Vec<_>>();
+    if arguments.len() != 5 {
+        return Err("snapshot generator requires DATABASE ALPHA2 EXPECTED_SHA256".into());
+    }
+    let alpha = arguments[3].as_bytes();
+    let alpha2: [u8; 2] = alpha
+        .try_into()
+        .map_err(|_| "snapshot generator alpha2 is invalid")?;
+    let expected = parse_sha256_hex(&arguments[4])?;
+    let database = std::fs::read(&arguments[2])
+        .map_err(|error| format!("read immutable regulatory database: {error}"))?;
+    let actual: [u8; 32] = Sha256::digest(&database).into();
+    if actual != expected {
+        return Err("immutable regulatory database hash mismatch".into());
+    }
+    let snapshot = regulatory_rate_power_snapshot_from_regdb_v20(
+        &database,
+        0,
+        alpha2,
+        fixed_mt7921_rate_power_capability(),
+        actual,
+    )
+    .map_err(|error| format!("parse wireless-regdb v20: {error:?}"))?;
+    std::io::stdout()
+        .write_all(&encode_rate_power_snapshot_wire(&snapshot))
+        .map_err(|error| format!("write regulatory snapshot: {error}"))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct FrozenRatePowerSnapshot {
+    snapshot: RegulatoryRatePowerSnapshot,
+    expected_source_sha256: [u8; 32],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn read_rate_power_snapshot() -> Result<FrozenRatePowerSnapshot, String> {
+    let raw_fd = env::var("DRV_REGULATORY_SNAPSHOT_FD")
+        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_FD is required")?
+        .parse::<RawFd>()
+        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_FD is invalid")?;
+    if raw_fd <= 2 {
+        return Err("DRV_REGULATORY_SNAPSHOT_FD is invalid".into());
+    }
+    let expected = parse_sha256_hex(
+        &env::var("DRV_REGULATORY_SOURCE_SHA256")
+            .map_err(|_| "DRV_REGULATORY_SOURCE_SHA256 is required")?,
+    )?;
+    let length = env::var("DRV_REGULATORY_SNAPSHOT_LEN")
+        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_LEN is required")?
+        .parse::<usize>()
+        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_LEN is invalid")?;
+    if length == 0 || length > 4096 {
+        return Err("DRV_REGULATORY_SNAPSHOT_LEN is out of bounds".into());
+    }
+    let mut bytes = vec![0; length];
+    // SAFETY: the root launcher transfers this pipe exactly once.
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read exact regulatory snapshot: {error}"))?;
+    let mut extra = [0];
+    if file
+        .read(&mut extra)
+        .map_err(|error| format!("check regulatory snapshot EOF: {error}"))?
+        != 0
+    {
+        return Err("regulatory snapshot exceeds declared length".into());
+    }
+    Ok(FrozenRatePowerSnapshot {
+        snapshot: decode_rate_power_snapshot_wire(&bytes, expected)?,
+        expected_source_sha256: expected,
+    })
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -3224,6 +3489,10 @@ fn realistic_rate_power_audit_commands(
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
     #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--generate-regulatory-snapshot-v20") {
+        return generate_rate_power_snapshot();
+    }
+    #[cfg(feature = "fuchsia-passive")]
     if operation_argument.as_deref() == Some("--self-test-rate-power-delivery") {
         if env::args().len() != 2 {
             return Err("rate-power delivery self-test accepts no additional arguments".into());
@@ -3532,6 +3801,13 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    #[cfg(feature = "fuchsia-passive")]
+    let rate_power_snapshot = matches!(
+        operation,
+        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+    )
+    .then(read_rate_power_snapshot)
+    .transpose()?;
     #[cfg(feature = "fuchsia-passive")]
     let mut sae_credential = (operation == Operation::RunOneShotSaeAuth)
         .then(read_sae_credential)
@@ -5408,17 +5684,27 @@ fn run() -> Result<(), String> {
                                 // This observation deliberately precedes set_channel/start_scan:
                                 // publish the exact bounded pages and then the command that would
                                 // naturally follow them, without adding a timing fence.
-                                let snapshot = regulatory_rate_power_snapshot_from_fuchsia(
-                                    0,
-                                    *b"00",
+                                let frozen = rate_power_snapshot
+                                    .as_ref()
+                                    .ok_or("regulatory snapshot was not frozen before VFIO")?;
+                                let snapshot = narrow_regulatory_rate_power_snapshot(
+                                    &frozen.snapshot,
                                     report.nic_capability,
-                                    &candidates,
-                                    &channels,
-                                    &[],
-                                    Vec::new(),
-                                    Some(0),
                                 )
-                                .map_err(|error| format!("freeze rate-power input: {error:?}"))?;
+                                .map_err(|error| {
+                                    format!("intersect rate-power input: {error:?}")
+                                })?;
+                                let target_channel = power_target.as_ref().expect("power target").2;
+                                if !snapshot.channels().iter().any(|input| {
+                                    input.channel == u16::from(target_channel)
+                                        && input.present
+                                        && !input.disabled
+                                }) {
+                                    return Err(
+                                        "target channel is not enabled by regulatory snapshot"
+                                            .into(),
+                                    );
+                                }
                                 let transport = adapter.into_transport();
                                 let mechanics = transport.into_mechanics();
                                 let mut power_transport = VfioRateTxPower {
@@ -5430,6 +5716,7 @@ fn run() -> Result<(), String> {
                                         &mut power_transport,
                                         report.nic_capability,
                                         &snapshot,
+                                        frozen.expected_source_sha256,
                                         1,
                                     )
                                     .map_err(|error| {
@@ -5860,23 +6147,34 @@ fn run() -> Result<(), String> {
                                 let mut power_transport = VfioRateTxPower {
                                     loader: &mut *mechanics.loader,
                                 };
-                                let snapshot = regulatory_rate_power_snapshot_from_fuchsia(
-                                    0,
-                                    *b"00",
+                                let frozen = rate_power_snapshot
+                                    .as_ref()
+                                    .ok_or("regulatory snapshot was not frozen before VFIO")?;
+                                let snapshot = narrow_regulatory_rate_power_snapshot(
+                                    &frozen.snapshot,
                                     report.nic_capability,
-                                    &candidates,
-                                    &channels,
-                                    &[],
-                                    Vec::new(),
-                                    Some(0),
                                 )
-                                .map_err(|error| format!("freeze rate-power input: {error:?}"))?;
+                                .map_err(|error| {
+                                    format!("intersect rate-power input: {error:?}")
+                                })?;
+                                let target_channel = power_target.as_ref().expect("power target").2;
+                                if !snapshot.channels().iter().any(|input| {
+                                    input.channel == u16::from(target_channel)
+                                        && input.present
+                                        && !input.disabled
+                                }) {
+                                    return Err(
+                                        "target channel is not enabled by regulatory snapshot"
+                                            .into(),
+                                    );
+                                }
                                 let mut power_authorizer = RateTxPowerAuthorizer::new();
                                 let authorization = power_authorizer
                                     .submit_snapshot(
                                         &mut power_transport,
                                         report.nic_capability,
                                         &snapshot,
+                                        frozen.expected_source_sha256,
                                         1,
                                     )
                                     .map_err(|error| {
@@ -9694,7 +9992,13 @@ fn program_live_rate_power(
     };
     let mut authorizer = RateTxPowerAuthorizer::new();
     let authorization = authorizer
-        .submit_snapshot(&mut transport, capability, &snapshot, 1)
+        .submit_snapshot(
+            &mut transport,
+            capability,
+            &snapshot,
+            snapshot.source_sha256(),
+            1,
+        )
         .map_err(|error| format!("submit rate-power setup: {error:?}"))?;
     mechanics.loader.rate_power_delivery.finish()?;
     mechanics
@@ -15740,6 +16044,53 @@ mod tests {
         // The peer deliberately remains open: returning proves there was no
         // read-to-EOF dependency. Remaining bytes are discarded on close.
         drop(writer);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn regulatory_snapshot_wire_is_golden_bounded_and_fail_closed() {
+        let database = include_bytes!("../../../mt7921-core/tests/fixtures/regulatory.db");
+        let source: [u8; 32] = Sha256::digest(database).into();
+        assert_eq!(
+            sha256_hex(database),
+            "2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b"
+        );
+        let snapshot = regulatory_rate_power_snapshot_from_regdb_v20(
+            database,
+            0,
+            *b"00",
+            fixed_mt7921_rate_power_capability(),
+            source,
+        )
+        .unwrap();
+        let wire = encode_rate_power_snapshot_wire(&snapshot);
+        let decoded = decode_rate_power_snapshot_wire(&wire, source).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert!(
+            decode_rate_power_snapshot_wire(&wire, [0; 32])
+                .unwrap_err()
+                .contains("source hash mismatch")
+        );
+
+        let mut malformed = wire.clone();
+        let first = malformed[49..57].to_vec();
+        malformed[57..65].copy_from_slice(&first);
+        let payload_len = malformed.len() - 32;
+        let digest = Sha256::digest(&malformed[..payload_len]);
+        malformed[payload_len..].copy_from_slice(&digest);
+        assert!(
+            decode_rate_power_snapshot_wire(&malformed, source)
+                .unwrap_err()
+                .contains("duplicate channel")
+        );
+
+        let mut corrupt = wire;
+        corrupt[60] ^= 1;
+        assert!(
+            decode_rate_power_snapshot_wire(&corrupt, source)
+                .unwrap_err()
+                .contains("payload hash mismatch")
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
