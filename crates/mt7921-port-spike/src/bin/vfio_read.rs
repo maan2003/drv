@@ -1094,6 +1094,7 @@ fn run_contained_dma_resource_round_trip(
                             stable_mac_watcher: None,
                             associated_edca_programmed: false,
                             e2e93_probe: false,
+                            e2e94_probe: false,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -2973,12 +2974,25 @@ fn run() -> Result<(), String> {
         Ok(_) => return Err("DRV_STABLE_MAC_TRANSITION_DIAGNOSTIC must equal 1".into()),
         Err(error) => return Err(format!("read stable-MAC diagnostic mode: {error}")),
     };
-    let e2e93_probe = match env::var("DRV_E2E93_EDCA_PROBE") {
-        Err(env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        Ok(_) => return Err("DRV_E2E93_EDCA_PROBE must equal 1".into()),
-        Err(error) => return Err(format!("read E2E93 probe mode: {error}")),
+    let e2e93_probe = match (
+        env::var("DRV_E2E93_EDCA_PROBE"),
+        env::var("DRV_E2E94_EDCA_PROBE"),
+    ) {
+        (Err(env::VarError::NotPresent), Ok(value)) if value == "1" => true,
+        (Err(env::VarError::NotPresent), Ok(_)) => {
+            return Err("DRV_E2E94_EDCA_PROBE must equal 1".into());
+        }
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => false,
+        (Ok(value), Err(env::VarError::NotPresent)) if value == "1" => true,
+        (Ok(_), Err(env::VarError::NotPresent)) => {
+            return Err("DRV_E2E93_EDCA_PROBE must equal 1".into());
+        }
+        (Ok(_), Ok(_)) => return Err("E2E93 and E2E94 modes are mutually exclusive".into()),
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(format!("read EDCA probe mode: {error}"));
+        }
     };
+    let e2e94_probe = env::var("DRV_E2E94_EDCA_PROBE").is_ok();
     #[cfg(feature = "fuchsia-passive")]
     if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
         return Err("DMASHDL transition diagnostic requires the pinned SAE lifecycle".into());
@@ -4830,6 +4844,7 @@ fn run() -> Result<(), String> {
                                     }),
                                 associated_edca_programmed: false,
                                 e2e93_probe,
+                                e2e94_probe,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4918,6 +4933,7 @@ fn run() -> Result<(), String> {
                                     }),
                                 associated_edca_programmed: false,
                                 e2e93_probe,
+                                e2e94_probe,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -5043,6 +5059,16 @@ fn run() -> Result<(), String> {
                             let mut target_bss = None;
                             let mut target_selection = None;
                             let mut total_observations = 0usize;
+                            let scan_attempt_limit = if e2e94_probe {
+                                3
+                            } else {
+                                operation.passive_scan_attempt_limit()
+                            };
+                            let scan_max_channel_time = if e2e94_probe {
+                                500_000_000
+                            } else {
+                                120_000_000
+                            };
                             for channel in &channels {
                                 adapter
                                     .set_channel(set_channel_request(
@@ -5051,13 +5077,13 @@ fn run() -> Result<(), String> {
                                         None,
                                     ))
                                     .map_err(|error| error.to_string())?;
-                                for attempt in 1..=operation.passive_scan_attempt_limit() {
+                                for attempt in 1..=scan_attempt_limit {
                                     let response = adapter
                                         .start_passive_scan(
                                             WlanSoftmacBaseStartPassiveScanRequest {
                                                 channels: Some(vec![*channel]),
                                                 min_channel_time: Some(50_000_000),
-                                                max_channel_time: Some(120_000_000),
+                                                max_channel_time: Some(scan_max_channel_time),
                                                 min_home_time: Some(0),
                                             },
                                         )
@@ -5127,10 +5153,9 @@ fn run() -> Result<(), String> {
                                         r#"{{"passive_scan_event":"channel_gate_passed","scan_id":{scan_id},"channel":{},"attempt":{attempt},"observations":{observations}}}"#,
                                         channel.number
                                     );
-                                    if !operation.should_continue_passive_scans(
-                                        attempt,
-                                        beacon_authorization.is_some(),
-                                    ) {
+                                    if beacon_authorization.is_some()
+                                        || attempt == scan_attempt_limit
+                                    {
                                         break;
                                     }
                                 }
@@ -11391,6 +11416,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     stable_mac_watcher: Option<StableMacWatcher>,
     associated_edca_programmed: bool,
     e2e93_probe: bool,
+    e2e94_probe: bool,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
@@ -12496,6 +12522,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             // only the post-association trigger; no EAPOL is published.
             self.e2e81_probe_done = true;
             if self.e2e93_probe {
+                let probe = if self.e2e94_probe { "e2e94" } else { "e2e93" };
                 let early_bss = self.loader.client_interface.is_some();
                 let associated = self.associated_edca_programmed;
                 let tmac_transition = self
@@ -12504,13 +12531,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     .is_some_and(|watcher| watcher.tmac_transitioned);
                 if !(early_bss && associated && tmac_transition) {
                     record_sae_stage(&format!(
-                        "e2e93_edca_gate result=mismatch early_bss={early_bss} associated={associated} stable_tmac_transition={tmac_transition} probe_published=false"
+                        "{probe}_edca_gate result=mismatch early_bss={early_bss} associated={associated} stable_tmac_transition={tmac_transition} probe_published=false"
                     ));
                     return Err(zx::Status::IO_DATA_INTEGRITY);
                 }
-                record_sae_stage(
-                    "e2e93_edca_gate result=match early_bss=true associated=true stable_tmac_transition=true raw_values=omitted",
-                );
+                record_sae_stage(&format!(
+                    "{probe}_edca_gate result=match early_bss=true associated=true stable_tmac_transition=true raw_values=omitted"
+                ));
             }
             let ap: [u8; 6] = bytes[4..10].try_into().unwrap();
             let sta: [u8; 6] = bytes[10..16].try_into().unwrap();
@@ -12593,7 +12620,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
                 "{}_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true raw_txs_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
-                if self.e2e93_probe { "e2e93" } else { "e2e90" },
+                if self.e2e94_probe {
+                    "e2e94"
+                } else if self.e2e93_probe {
+                    "e2e93"
+                } else {
+                    "e2e90"
+                },
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));
