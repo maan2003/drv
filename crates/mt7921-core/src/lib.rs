@@ -3302,6 +3302,7 @@ pub enum FirmwareLoaderOperation {
     WaitScatterCompletion(FirmwareImagePart),
     PollDownloadReady,
     PollN9Ready,
+    PatchReleaseBoundary,
     SetClc,
     SetChannelDomain,
     PassiveBoundary,
@@ -3379,6 +3380,9 @@ pub trait FirmwareLoaderTransport {
     ) -> Result<(), Self::Error>;
     fn firmware_download_state(&mut self) -> Result<u8, Self::Error>;
     fn firmware_n9_ready(&mut self) -> Result<bool, Self::Error>;
+    fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn now_ms(&self) -> u64;
     fn sleep_ms(&mut self, duration_ms: u64);
     /// Quiesce DMA/IRQ activity and revoke all loader resources. `state` is
@@ -3550,6 +3554,7 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
     state: &mut FirmwareLoaderState,
     configure_channel_domain: bool,
+    stop_after_patch: bool,
     stop_after_capability: bool,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
     let mut report = FirmwareLoaderReport {
@@ -3678,6 +3683,21 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
         }
     }
     *state = FirmwareLoaderState::PatchComplete;
+    if stop_after_patch {
+        if report.patch != PatchDisposition::Downloaded {
+            return Err(FirmwareLoaderFailure::UnexpectedPatchSemaphore(
+                PatchSemaphoreStatus::AlreadyDownloaded,
+            ));
+        }
+        transport
+            .patch_release_boundary()
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::PatchReleaseBoundary,
+                source,
+            })?;
+        *state = FirmwareLoaderState::Ready;
+        return Ok(report);
+    }
 
     let mut override_address = 0;
     *state = FirmwareLoaderState::RamDownloading;
@@ -3812,7 +3832,7 @@ pub fn load_mt7921_firmware<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, false);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, false, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -3824,7 +3844,7 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -3842,15 +3862,14 @@ where
     F: FnOnce(&mut T, &FirmwareLoaderReport) -> Result<(), T::Error>,
 {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false).and_then(
-        |report| {
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, true, false, false)
+        .and_then(|report| {
             passive(transport, &report).map_err(|source| FirmwareLoaderFailure::Transport {
                 operation: FirmwareLoaderOperation::PassiveBoundary,
                 source,
             })?;
             Ok(report)
-        },
-    );
+        });
     finish_firmware_loader(transport, state, result)
 }
 
@@ -3864,7 +3883,19 @@ pub fn load_mt7921_firmware_bootstrap<T: FirmwareLoaderTransport>(
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, true);
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, false, true);
+    finish_firmware_loader(transport, state, result)
+}
+
+/// Download only the patch, release its semaphore, execute one caller-owned
+/// post-release observation, and contain before the first RAM command.
+pub fn load_mt7921_patch_bootstrap<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    let result = run_firmware_loader(transport, patch, firmware, &mut state, false, true, false);
     finish_firmware_loader(transport, state, result)
 }
 
@@ -12479,6 +12510,7 @@ mod tests {
         SetClc(u8, u8),
         SetChannelDomain(usize, u8),
         PassiveHook,
+        PatchReleaseBoundary,
     }
 
     struct FakeFirmwareLoader {
@@ -12689,6 +12721,11 @@ mod tests {
             Ok(self.next_n9_state())
         }
 
+        fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
+            self.trace.push(LoaderTrace::PatchReleaseBoundary);
+            self.step()
+        }
+
         fn now_ms(&self) -> u64 {
             self.now_ms
         }
@@ -12870,6 +12907,33 @@ mod tests {
             transport.trace.last(),
             Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
         ));
+    }
+
+    #[test]
+    fn patch_bootstrap_observes_after_release_and_before_ram() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut transport = FakeFirmwareLoader::default();
+        let report = load_mt7921_patch_bootstrap(
+            &mut transport,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.patch, PatchDisposition::Downloaded);
+        assert_eq!(report.patch_sections, 1);
+        assert_eq!(report.ram_regions, 0);
+        assert!(matches!(
+            &transport.trace[transport.trace.len() - 3..],
+            [
+                LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, 6),
+                LoaderTrace::PatchReleaseBoundary,
+                LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
+            ]
+        ));
+        assert!(!transport.trace.iter().any(|event| matches!(
+            event,
+            LoaderTrace::Command(DownloadCommand::TargetAddressLength { .. }, _)
+        )));
     }
 
     #[test]

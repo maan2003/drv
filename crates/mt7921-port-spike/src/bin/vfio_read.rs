@@ -42,12 +42,13 @@ use mt7921_port_spike::{
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
     encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
     load_mt7921_firmware, load_mt7921_firmware_bootstrap,
-    load_mt7921_firmware_through_channel_domain, mask_ack_disabled_fwdl_interrupt,
-    mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx, mt7921_packet_type,
-    parse_clc_set_response, parse_download_response, parse_eeprom_block, parse_mt7921_tx_free,
-    parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings, prepare_global_tx_rings,
-    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
-    round_trip_driver_ownership, select_vfio_irq, stage_disabled_firmware_chunk,
+    load_mt7921_firmware_through_channel_domain, load_mt7921_patch_bootstrap,
+    mask_ack_disabled_fwdl_interrupt, mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx,
+    mt7921_packet_type, parse_clc_set_response, parse_download_response, parse_eeprom_block,
+    parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings,
+    prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
+    read_dynamic_identity_status, reset_wfsys, round_trip_driver_ownership, select_vfio_irq,
+    stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
@@ -397,6 +398,7 @@ impl AcquisitionLedger {
 struct ActiveVfioResources {
     selector_page: Option<ReadPage>,
     dynamic_window: Option<ReadPage>,
+    patch_table_page: Option<ReadPage>,
     #[cfg(feature = "fuchsia-passive")]
     passive_window_pages: [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
     swdef: Option<ReadPage>,
@@ -527,6 +529,7 @@ impl ActiveVfioCapsule {
                     });
                 }
             }
+            release_bar(&mut active.patch_table_page, &mut failures);
             for slot in [
                 &mut active.dmashdl,
                 &mut active.swdef,
@@ -662,6 +665,9 @@ fn acquire_active_vfio_resources(
     }
     map_bar!(selector_page, 0xfe000);
     map_bar!(dynamic_window, MT_HIF_REMAP_WINDOW_BAR_OFFSET);
+    if operation == Operation::RunOneShotPatchTableGate {
+        map_bar!(patch_table_page, 0x21000);
+    }
     #[cfg(feature = "fuchsia-passive")]
     if operation.is_passive() {
         for (slot, bar_page) in resources
@@ -1033,10 +1039,14 @@ fn run_contained_dma_resource_round_trip(
                 mcu,
                 conn: &conn,
                 pcie_mac,
+                patch_table_page: None,
                 bdf,
                 fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
                 fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
                 sequence: 0,
+                patch_gate_stage: 0,
+                patch_gate_scatters: 0,
+                patch_table_gate: false,
                 command_index: 0,
                 uni_terminal_poisoned: false,
                 #[cfg(feature = "fuchsia-passive")]
@@ -2935,6 +2945,7 @@ fn run() -> Result<(), String> {
         Some("--prepare-owned-global-tx-rings") => Operation::PrepareOwnedGlobalTxRings,
         Some("--query-patch-semaphore") => Operation::QueryPatchSemaphore,
         Some("--run-one-shot-fwdl") => Operation::RunOneShotFirmware,
+        Some("--run-one-shot-patch-table-gate") => Operation::RunOneShotPatchTableGate,
         Some("--run-one-shot-channel-domain") => Operation::RunOneShotChannelDomain,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-passive-prepare") => Operation::RunOneShotPassivePrepare,
@@ -3081,7 +3092,9 @@ fn run() -> Result<(), String> {
     }
     let contained_firmware_images = if matches!(
         operation,
-        Operation::RunOneShotFirmware | Operation::RunOneShotPassiveChannel1
+        Operation::RunOneShotFirmware
+            | Operation::RunOneShotPatchTableGate
+            | Operation::RunOneShotPassiveChannel1
     ) {
         let patch = decompress_patch()?;
         let ram = decompress_ram()?;
@@ -4452,6 +4465,7 @@ fn run() -> Result<(), String> {
         let ActiveVfioResources {
             selector_page,
             dynamic_window,
+            patch_table_page,
             #[cfg(feature = "fuchsia-passive")]
             passive_window_pages,
             swdef,
@@ -4480,6 +4494,7 @@ fn run() -> Result<(), String> {
         } = resources;
         let selector_page = selector_page.as_ref().expect("acquired");
         let dynamic_window = dynamic_window.as_ref().expect("acquired");
+        let patch_table_page = patch_table_page.as_ref();
         #[cfg(feature = "fuchsia-passive")]
         let passive_window_pages = passive_window_pages;
         let swdef = swdef.as_ref().expect("acquired");
@@ -4757,10 +4772,14 @@ fn run() -> Result<(), String> {
                     mcu,
                     conn: &conn,
                     pcie_mac,
+                    patch_table_page,
                     bdf: &bdf,
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
                     sequence: 0,
+                    patch_gate_stage: 0,
+                    patch_gate_scatters: 0,
+                    patch_table_gate: operation == Operation::RunOneShotPatchTableGate,
                     command_index: 0,
                     uni_terminal_poisoned: false,
                     #[cfg(feature = "fuchsia-passive")]
@@ -4793,7 +4812,9 @@ fn run() -> Result<(), String> {
                         .map_err(|error| format!("flush firmware bootstrap begin: {error}"))?;
                 }
                 #[cfg(feature = "fuchsia-passive")]
-                let result = if operation == Operation::RunOneShotFirmware {
+                let result = if operation == Operation::RunOneShotPatchTableGate {
+                    load_mt7921_patch_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotFirmware {
                     load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
                 } else if operation == Operation::RunOneShotPassivePrepare {
                     load_mt7921_firmware_with_passive_boundary(
@@ -5449,7 +5470,9 @@ fn run() -> Result<(), String> {
                     load_mt7921_firmware(&mut loader, patch, firmware)
                 };
                 #[cfg(not(feature = "fuchsia-passive"))]
-                let result = if operation == Operation::RunOneShotFirmware {
+                let result = if operation == Operation::RunOneShotPatchTableGate {
+                    load_mt7921_patch_bootstrap(&mut loader, patch, firmware)
+                } else if operation == Operation::RunOneShotFirmware {
                     load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
                 } else if operation == Operation::RunOneShotChannelDomain {
                     load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
@@ -7570,10 +7593,14 @@ struct VfioFirmwareLoader<'a> {
     mcu: ActiveMcuIo<'a>,
     conn: &'a ReadPage,
     pcie_mac: &'a ReadPage,
+    patch_table_page: Option<&'a ReadPage>,
     bdf: &'a str,
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
     sequence: u8,
+    patch_gate_stage: u8,
+    patch_gate_scatters: u8,
+    patch_table_gate: bool,
     command_index: usize,
     uni_terminal_poisoned: bool,
     #[cfg(feature = "fuchsia-passive")]
@@ -7588,6 +7615,63 @@ struct VfioFirmwareLoader<'a> {
 impl VfioFirmwareLoader<'_> {
     fn observe_dmashdl(&mut self, operation: impl Into<String>) -> Result<(), String> {
         observe_dmashdl_transition(self.dmashdl, &mut self.dmashdl_watcher, operation)
+    }
+
+    fn record_patch_gate_command(
+        &mut self,
+        command: DownloadCommand,
+        sequence: u8,
+        encoded: &[u8],
+    ) -> Result<(), String> {
+        if !self.patch_table_gate {
+            return Ok(());
+        }
+        let (expected_stage, next_stage, name) = match command {
+            DownloadCommand::PatchSemaphoreGet => (0, 1, "PATCH_SEM_GET"),
+            DownloadCommand::PatchStart { .. } => (1, 2, "PATCH_START"),
+            DownloadCommand::PatchFinish if self.patch_gate_scatters == 23 => {
+                (2, 3, "PATCH_FINISH")
+            }
+            DownloadCommand::PatchSemaphoreRelease => (3, 4, "PATCH_SEM_RELEASE"),
+            _ => return Err(format!("patch-table gate rejected command {command:?}")),
+        };
+        let expected_sequence = match command {
+            DownloadCommand::PatchSemaphoreGet => 1,
+            DownloadCommand::PatchStart { .. } => 2,
+            DownloadCommand::PatchFinish => 11,
+            DownloadCommand::PatchSemaphoreRelease => 12,
+            _ => unreachable!(),
+        };
+        if self.patch_gate_stage != expected_stage || sequence != expected_sequence {
+            return Err(format!(
+                "patch-table transcript mismatch: stage={} command={command:?} sequence={sequence} expected_stage={expected_stage} expected_sequence={expected_sequence}",
+                self.patch_gate_stage
+            ));
+        }
+        if matches!(
+            command,
+            DownloadCommand::PatchSemaphoreGet | DownloadCommand::PatchSemaphoreRelease
+        ) {
+            let op = u32::from(command == DownloadCommand::PatchSemaphoreGet);
+            if encoded.len() != 68
+                || encoded[0..8] != [0x44, 0, 0, 0x41, 0, 0, 1, 0x80]
+                || encoded[8..32] != [0; 24]
+                || encoded[32..40] != [36, 0, 0, 0x80, 0x10, 0xa0, 3, expected_sequence]
+                || encoded[40..64] != [0; 24]
+                || encoded[64..68] != op.to_le_bytes()
+            {
+                return Err(format!(
+                    "{name} envelope diverged from native 68-byte request"
+                ));
+            }
+        }
+        self.patch_gate_stage = next_stage;
+        println!(
+            "{{\"patch_gate_transcript\":\"command\",\"name\":\"{name}\",\"sequence\":{sequence}}}"
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush patch-gate command transcript: {error}"))
     }
 }
 
@@ -8960,6 +9044,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             }
             FirmwareCommandCompletion::NoResponse
         };
+        self.record_patch_gate_command(command, sequence, encoded)?;
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
@@ -9113,6 +9198,19 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         if chunk.is_empty() || chunk.len() > MT7921_FWDL_CHUNK_BYTES {
             return Err(format!("invalid firmware scatter length {}", chunk.len()));
         }
+        if self.patch_table_gate {
+            let expected_sequence = ((2 + self.patch_gate_scatters) % 15) + 1;
+            if self.patch_gate_stage != 2
+                || part != FirmwareImagePart::Patch
+                || self.patch_gate_scatters >= 23
+                || sequence != expected_sequence
+            {
+                return Err(format!(
+                    "patch-table scatter mismatch: stage={} part={part:?} count={} sequence={sequence} expected_sequence={expected_sequence}",
+                    self.patch_gate_stage, self.patch_gate_scatters
+                ));
+            }
+        }
         self.fwdl_payload.write_bytes(chunk)?;
         let descriptor_index = self.fwdl_index;
         let next = next_dma_index(descriptor_index, 128);
@@ -9136,6 +9234,17 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor_index},"bytes":{}}}"#,
             chunk.len()
         );
+        if self.patch_table_gate {
+            self.patch_gate_scatters += 1;
+            println!(
+                "{{\"patch_gate_transcript\":\"scatter\",\"ordinal\":{},\"sequence\":{sequence},\"bytes\":{}}}",
+                self.patch_gate_scatters,
+                chunk.len()
+            );
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush patch-gate scatter transcript: {error}"))?;
+        }
         Ok(())
     }
 
@@ -9199,6 +9308,39 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
                 .map_err(|error| format!("flush N9-ready milestone: {error}"))?;
         }
         Ok(ready)
+    }
+
+    fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
+        if !self.patch_table_gate {
+            return Ok(());
+        }
+        if self.patch_gate_stage != 4 || self.patch_gate_scatters != 23 || self.sequence != 12 {
+            return Err(format!(
+                "patch-table boundary transcript incomplete: stage={} scatters={} sequence={}",
+                self.patch_gate_stage, self.patch_gate_scatters, self.sequence
+            ));
+        }
+        let page = self
+            .patch_table_page
+            .ok_or("patch-table gate omitted TMAC BAR page")?;
+        let mut rows = Vec::with_capacity(41);
+        for offset in (0x140usize..=0x1e0).step_by(4) {
+            let value = page.read(0x21000 + offset)?;
+            if value == 0 || value == u32::MAX {
+                return Err(format!(
+                    "TMAC patch table row {offset:#05x} was not populated: {value:#010x}"
+                ));
+            }
+            rows.push(format!("\"{offset:#05x}\":\"{value:#010x}\""));
+        }
+        println!(
+            "{{\"patch_gate_result\":\"passed\",\"after\":\"PATCH_SEM_RELEASE_seq12\",\"before_ram_cmd_0x01\":true,\"row_count\":{},\"all_populated\":true,\"rows\":{{{}}}}}",
+            rows.len(),
+            rows.join(",")
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush patch-table result: {error}"))
     }
 
     fn now_ms(&self) -> u64 {
@@ -13995,6 +14137,7 @@ enum Operation {
     PrepareOwnedGlobalTxRings,
     QueryPatchSemaphore,
     RunOneShotFirmware,
+    RunOneShotPatchTableGate,
     RunOneShotChannelDomain,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotPassivePrepare,
@@ -14022,7 +14165,9 @@ impl Operation {
     fn uses_contained_transport_gate(self) -> bool {
         matches!(
             self,
-            Self::RunOneShotFirmware | Self::RunOneShotPassiveChannel1
+            Self::RunOneShotFirmware
+                | Self::RunOneShotPatchTableGate
+                | Self::RunOneShotPassiveChannel1
         )
     }
 
@@ -14080,7 +14225,9 @@ impl Operation {
     fn loads_firmware(self) -> bool {
         matches!(
             self,
-            Self::RunOneShotFirmware | Self::RunOneShotChannelDomain
+            Self::RunOneShotFirmware
+                | Self::RunOneShotPatchTableGate
+                | Self::RunOneShotChannelDomain
         ) || self.is_passive()
     }
 
@@ -14100,6 +14247,7 @@ impl Operation {
                 | Self::PrepareOwnedGlobalTxRings
                 | Self::QueryPatchSemaphore
                 | Self::RunOneShotFirmware
+                | Self::RunOneShotPatchTableGate
                 | Self::RunOneShotChannelDomain
         ) || self.is_passive()
     }
@@ -14110,6 +14258,7 @@ impl Operation {
             Self::AcquireDriverOwnership
                 | Self::QueryPatchSemaphore
                 | Self::RunOneShotFirmware
+                | Self::RunOneShotPatchTableGate
                 | Self::RunOneShotChannelDomain
         ) || self.is_passive()
     }
