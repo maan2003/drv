@@ -136,15 +136,13 @@
               install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
               mkdir -p "$out/bin"
               ln -s ../libexec/mt7921-full-firmware-validation "$out/bin/mt7921-full-firmware-validation-driver"
-              cat >"$out/bin/mt7921-full-firmware-validation" <<EOF
-              #!${pkgs.runtimeShell}
-              set -eu
-              case "$#:''${1-}" in
-                0:) exec "$out/libexec/mt7921-full-firmware-validation" --run-one-shot-sae-auth ;;
-                1:--full-firmware-preflight) exec "$out/libexec/mt7921-full-firmware-validation" --full-firmware-preflight ;;
-                *) echo 'fixed full-firmware validation accepts no arguments except --full-firmware-preflight' >&2; exit 64 ;;
-              esac
-              EOF
+              substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} \
+                "$out/bin/mt7921-full-firmware-validation" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by driver "$out/libexec/mt7921-full-firmware-validation" \
+                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by env ${pkgs.coreutils}/bin/env
               chmod 0755 "$out/bin/mt7921-full-firmware-validation"
               runHook postInstall
             '';
@@ -158,6 +156,15 @@
               strings "$driver" | grep -F 'immediately_predata'
               strings "$driver" | grep -F 'e2e94_tx_success_gate result='
               strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false retry_published=false'
+              launcher=$out/bin/mt7921-full-firmware-validation
+              grep -F 'case "$#:''${1-}" in' "$launcher"
+              grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
+              grep -F 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' "$launcher"
+              grep -F 'DRV_SAE_CHANNEL=36' "$launcher"
+              grep -F 'DRV_SAE_SSID=ph1' "$launcher"
+              grep -F 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$launcher"
+              grep -F -- '--run-one-shot-sae-auth' "$launcher"
+              test "$(grep -Fc 'exec ' "$launcher")" -eq 3
               if "$out/bin/mt7921-full-firmware-validation" --run-one-shot-patch-table-gate 2>/dev/null; then
                 echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
                 exit 1
@@ -166,6 +173,86 @@
             '';
             meta.mainProgram = "mt7921-full-firmware-validation";
           };
+
+          mt7921-full-firmware-validation-launcher-test = pkgs.runCommand
+            "mt7921-full-firmware-validation-launcher-test"
+            { nativeBuildInputs = [ pkgs.coreutils pkgs.gnused ]; }
+            ''
+              mkdir -p work/bin work/var
+              cat > work/bin/validation-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              transcript=$PWD/transcript
+              printf 'ARGV' > "$transcript"
+              printf ' <%s>' "$@" >> "$transcript"
+              printf '\n' >> "$transcript"
+              ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
+              credential=$(${pkgs.coreutils}/bin/cat <&3)
+              printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
+              EOF
+              chmod 0755 work/bin/validation-stub
+              printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+              substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by driver "$PWD/work/bin/validation-stub" \
+                --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by env ${pkgs.coreutils}/bin/env
+              chmod 0755 work/launcher
+              env -i \
+                DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                work/launcher
+              grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
+              grep -Fx 'DRV_E2E94_EDCA_PROBE=1' transcript
+              grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
+              grep -Fx 'DRV_SAE_CHANNEL=36' transcript
+              grep -Fx 'DRV_SAE_SSID=ph1' transcript
+              grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
+              grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
+              grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
+              grep -Fx 'CREDENTIAL_LEN=8' transcript
+              ! grep -q 'PATCH_TABLE' transcript
+              ! grep -q 'EAPOL' transcript
+              cp transcript "$out"
+            '';
+
+          mt7921-full-firmware-validation-manifest =
+            let
+              package = mt7921-full-firmware-validation;
+              closure = pkgs.closureInfo { rootPaths = [ package ]; };
+            in
+            pkgs.runCommand "mt7921-full-firmware-validation-manifest"
+              { nativeBuildInputs = [ pkgs.coreutils ]; }
+              ''
+                launcher=${package}/bin/mt7921-full-firmware-validation
+                driver=${package}/bin/mt7921-full-firmware-validation-driver
+                closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
+                cat > "$out" <<EOF
+                PACKAGE=${package}
+                LAUNCHER=$launcher
+                LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
+                ELF=$driver
+                ELF_SHA256=$(sha256sum "$driver" | cut -d ' ' -f1)
+                CLOSURE_SHA256=$closure_sha
+                PCI_BDF=0000:05:00.0
+                TIMEOUT_SECONDS=300
+                OPERATION=--run-one-shot-sae-auth
+                MODE=DRV_E2E94_EDCA_PROBE=1
+                TARGET_SSID=ph1
+                TARGET_BSSID=72:a6:c7:7d:56:93
+                TARGET_CHANNEL=36
+                TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
+                FRAME=qos_null_tid0_be_qidx1
+                SUCCESS=tx_free_status_0_count_1_and_correlated_txs_ack
+                PATCH_TABLE_GATE=false
+                STOP_AFTER_ONE=true
+                EAPOL_START=false
+                VO_PROBE=false
+                RETRY=false
+                EOF
+              '';
 
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";
