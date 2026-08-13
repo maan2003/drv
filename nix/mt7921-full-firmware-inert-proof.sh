@@ -197,7 +197,7 @@ phase=watchdog-disarm
 "$runtime/wifi-lab-watchdog" disarm "$token" >"$out/watchdog-disarm.txt"
 token=
 phase=preflight-assertions
-for marker in '"full_firmware_preflight":"passed"' '"credential_eof":true' '"credential_policy_binding":"validated-and-consumed-before-device-open"' '"snapshot_eof":true' '"regulatory_domain":"00"' '"regulatory_generation":0' '"device_opened":false' '"vfio_opened":false' '"lab_state_created":false'; do
+for marker in '"full_firmware_preflight":"passed"' '"artifact_flavor":"full-firmware-production"' '"enabled_operation":"run-one-shot-sae-auth"' '"active_capable":true' '"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof"' '"credential_eof":true' '"credential_policy_binding":"validated-and-consumed-before-device-open"' '"snapshot_eof":true' '"regulatory_domain":"00"' '"regulatory_generation":0' '"device_opened":false' '"vfio_opened":false' '"lab_state_created":false'; do
   grep -F "$marker" "$out/full-firmware-preflight.jsonl" >/dev/null
 done
 test "$($runtime/wifi-lab-watchdog status)" = disarmed

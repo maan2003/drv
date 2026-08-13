@@ -136,6 +136,13 @@
                   path = evidenceBinary;
                   name = "mt7921-rate-power-evidence-unpatched";
                 };
+            sourceCommit =
+              let value = builtins.getEnv "MT7921_RATE_POWER_EVIDENCE_SOURCE_COMMIT";
+              in
+              if builtins.match "[0-9a-f]{40}" value == null then
+                throw "set MT7921_RATE_POWER_EVIDENCE_SOURCE_COMMIT to the 40-hex source commit embedded in the evidence executable"
+              else
+                value;
             nativeBuildInputs = [
               pkgs.autoPatchelfHook
               pkgs.binutils
@@ -144,6 +151,10 @@
             dontUnpack = true;
             installPhase = ''
               install -Dm0755 "$src" "$out/libexec/mt7921-rate-power-evidence"
+              mkdir -p "$out/share/mt7921-rate-power-evidence"
+              cat > "$out/share/mt7921-rate-power-evidence/artifact-identity.json" <<EOF
+              {"artifact_identity":"mt7921-validation-v1","flavor":"rate-power-evidence-only","enabled_operation":"run-one-shot-power-setup","source_commit":"$sourceCommit","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":false}
+              EOF
               mkdir -p "$out/bin"
               regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               substitute ${./nix/mt7921-rate-power-evidence-launcher.sh} \
@@ -154,6 +165,8 @@
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
                 --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by artifact_identity "$out/share/mt7921-rate-power-evidence/artifact-identity.json" \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                 --subst-var-by wc ${pkgs.coreutils}/bin/wc \
@@ -166,6 +179,8 @@
               evidence_dir=$out/share/mt7921-rate-power-evidence
               mkdir -p "$evidence_dir"
               driver=$out/libexec/mt7921-rate-power-evidence
+              "$driver" --artifact-identity > actual-identity.json
+              cmp actual-identity.json "$evidence_dir/artifact-identity.json"
               "$driver" --self-test-rate-power-delivery > "$evidence_dir/offline-self-test.jsonl"
               "$driver" --generate-regulatory-snapshot-v20 ${regulatoryDb} 00 \
                 2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b \
@@ -182,6 +197,9 @@
             doInstallCheck = true;
             installCheckPhase = ''
               driver=$out/libexec/mt7921-rate-power-evidence
+              test "$("$driver" --artifact-identity)" = "$(cat $out/share/mt7921-rate-power-evidence/artifact-identity.json)"
+              grep -F '"flavor":"rate-power-evidence-only"' $out/share/mt7921-rate-power-evidence/artifact-identity.json
+              grep -F '"active_capable":false' $out/share/mt7921-rate-power-evidence/artifact-identity.json
               strings "$driver" | grep -F 'rate_power_publication'
               strings "$driver" | grep -F 'rate_power_evidence_stop'
               strings "$driver" | grep -F 'native_golden_match=true'
@@ -230,6 +248,13 @@
                   path = fullFirmwareBinary;
                   name = "mt7921-full-firmware-validation-unpatched";
                 };
+            sourceCommit =
+              let value = builtins.getEnv "MT7921_FULL_FIRMWARE_SOURCE_COMMIT";
+              in
+              if builtins.match "[0-9a-f]{40}" value == null then
+                throw "set MT7921_FULL_FIRMWARE_SOURCE_COMMIT to the 40-hex source commit embedded in the production executable"
+              else
+                value;
             nativeBuildInputs = [
               pkgs.autoPatchelfHook
               pkgs.binutils
@@ -239,6 +264,13 @@
             installPhase = ''
               runHook preInstall
               install -Dm0755 "$src" "$out/libexec/mt7921-full-firmware-validation"
+              mkdir -p "$out/share/mt7921-full-firmware-validation"
+              cat > "$out/share/mt7921-full-firmware-validation/artifact-identity.json" <<EOF
+              {"artifact_identity":"mt7921-validation-v1","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_commit":"$sourceCommit","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
+              EOF
+              cat > "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" <<'EOF'
+              Passphrase=packaged-integration-only
+              EOF
               regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               test "$regulatory_source_sha256" = 2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b
               mkdir -p "$out/bin"
@@ -251,6 +283,9 @@
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
                 --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by mock_credential_file "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" \
+                --subst-var-by artifact_identity "$out/share/mt7921-full-firmware-validation/artifact-identity.json" \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                 --subst-var-by wc ${pkgs.coreutils}/bin/wc \
@@ -264,6 +299,8 @@
               evidence_dir=$out/share/mt7921-full-firmware-validation
               mkdir -p "$evidence_dir"
               driver=$out/libexec/mt7921-full-firmware-validation
+              "$driver" --artifact-identity > actual-identity.json
+              cmp actual-identity.json "$evidence_dir/artifact-identity.json"
               "$driver" --self-test-rate-power-delivery > "$evidence_dir/rate-power-self-test.jsonl"
               "$driver" --self-test-production-validation > "$evidence_dir/production-self-test.jsonl"
               cat > "$evidence_dir/ARTIFACTS" <<EOF
@@ -277,6 +314,9 @@
             installCheckPhase = ''
               runHook preInstallCheck
               driver=$out/libexec/mt7921-full-firmware-validation
+              test "$("$driver" --artifact-identity)" = "$(cat $out/share/mt7921-full-firmware-validation/artifact-identity.json)"
+              grep -F '"flavor":"full-firmware-production"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"active_capable":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               strings "$driver" | grep -F '"full_firmware_preflight":"passed"'
               strings "$driver" | grep -F 'ram_published_firmware_start_acked'
               strings "$driver" | grep -F 'post_release_before_ram'
@@ -305,6 +345,18 @@
                 | grep -F '"txs_acked":true' \
                 | grep -F '"second_frame":false' \
                 | grep -F '"tmac_population_invariant":false'
+              integration_output="$(MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation")"
+              printf '%s\n' "$integration_output" \
+                | grep -F '"packaged_zero_arg_integration":"passed"' \
+                | grep -F '"dispatch":"normal-full-firmware-sae"' \
+                | grep -F '"fd3_eof":true' \
+                | grep -F '"fd4_eof":true' \
+                | grep -F '"typed_binding_consumed":true' \
+                | grep -F '"rate_power_pages":8' \
+                | grep -F '"add_device_acked":true' \
+                | grep -F '"frame":"qos_null_tid0_be"' \
+                | grep -F '"device_opened":false' \
+                | grep -F '"vfio_opened":false'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
               grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
@@ -317,7 +369,7 @@
               grep -F 'DRV_REGULATORY_SOURCE_SHA256=' "$launcher"
               grep -F -- '--generate-regulatory-snapshot-v20' "$launcher"
               grep -F -- '--run-one-shot-sae-auth' "$launcher"
-              test "$(grep -Fc 'exec ' "$launcher")" -eq 4
+              test "$(grep -Fc 'exec ' "$launcher")" -eq 5
               if "$out/bin/mt7921-full-firmware-validation" --run-one-shot-patch-table-gate 2>/dev/null; then
                 echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
                 exit 1
@@ -340,6 +392,10 @@
                 cat > work/bin/validation-stub <<'EOF'
                 #!${pkgs.runtimeShell}
                 set -eu
+                if [ "''${1-}" = --artifact-identity ]; then
+                  ${pkgs.coreutils}/bin/cat "$PWD/work/var/artifact-identity.json"
+                  exit 0
+                fi
                 transcript=$PWD/transcript
                 printf 'ARGV' > "$transcript"
                 printf ' <%s>' "$@" >> "$transcript"
@@ -363,6 +419,8 @@
                 chmod 0755 work/bin/snapshot-stub
                 : > work/var/regulatory.db
                 printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+                cp work/var/ph1.psk work/var/mock-ph1.psk
+                printf '%s\n' '{"artifact_identity":"mt7921-validation-v1","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}' > work/var/artifact-identity.json
                 substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
                   --subst-var-by shell ${pkgs.runtimeShell} \
                   --subst-var-by driver "$PWD/work/bin/validation-stub" \
@@ -370,6 +428,9 @@
                   --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
                   --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
                   --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                  --subst-var-by mock_credential_file "$PWD/work/var/mock-ph1.psk" \
+                  --subst-var-by artifact_identity "$PWD/work/var/artifact-identity.json" \
+                  --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
                   --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                   --subst-var-by wc ${pkgs.coreutils}/bin/wc \
@@ -419,6 +480,10 @@
                 cat > work/bin/evidence-stub <<'EOF'
                 #!${pkgs.runtimeShell}
                 set -eu
+                if [ "''${1-}" = --artifact-identity ]; then
+                  ${pkgs.coreutils}/bin/cat "$PWD/work/var/artifact-identity.json"
+                  exit 0
+                fi
                 test -f "$PWD/generation.complete"
                 transcript=$PWD/transcript
                 printf 'ARGV <%s>\n' "$1" > "$transcript"
@@ -445,6 +510,7 @@
                 chmod 0755 work/bin/snapshot-stub
                 : > work/var/regulatory.db
                 printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+                printf '%s\n' '{"artifact_identity":"mt7921-validation-v1","flavor":"rate-power-evidence-only","enabled_operation":"run-one-shot-power-setup","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":false}' > work/var/artifact-identity.json
                 substitute ${./nix/mt7921-rate-power-evidence-launcher.sh} work/launcher \
                   --subst-var-by shell ${pkgs.runtimeShell} \
                   --subst-var-by driver "$PWD/work/bin/evidence-stub" \
@@ -452,6 +518,8 @@
                   --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
                   --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
                   --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                  --subst-var-by artifact_identity "$PWD/work/var/artifact-identity.json" \
+                  --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
                   --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                   --subst-var-by wc ${pkgs.coreutils}/bin/wc \
@@ -512,6 +580,7 @@
                 --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
                 --subst-var-by validation_launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
+                --subst-var-by artifact_identity ${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json \
                 --subst-var-by recovery_samples 45 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
@@ -535,12 +604,18 @@
                 launcher=${package}/bin/mt7921-rate-power-evidence
                 elf=${package}/libexec/mt7921-rate-power-evidence
                 supervisor=${supervisor}/bin/mt7921-rate-power-evidence-supervisor
+                identity=${package}/share/mt7921-rate-power-evidence/artifact-identity.json
                 cat > "$out" <<EOF
                 PACKAGE=${package}
                 LAUNCHER=$launcher
                 LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
                 ELF=$elf
                 ELF_SHA256=$(sha256sum "$elf" | cut -d ' ' -f1)
+                ARTIFACT_IDENTITY=$identity
+                ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
+                FLAVOR=rate-power-evidence-only
+                ACTIVE_CAPABLE=false
+                FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
                 SUPERVISOR=$supervisor
                 SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
                 REGULATORY_DB=${regulatoryDb}
@@ -567,13 +642,14 @@
             { nativeBuildInputs = [ pkgs.coreutils ]; }
             ''
               mkdir -p "$out/bin"
-              substitute ${./nix/mt7921-rate-power-evidence-root.sh} \
+              substitute ${./nix/mt7921-rate-power-evidence-semantic-root.sh} \
                 "$out/bin/mt7921-rate-power-evidence-root" \
                 --subst-var-by shell ${pkgs.runtimeShell} \
                 --subst-var-by sudo /run/wrappers/bin/sudo \
                 --subst-var-by supervisor ${mt7921-rate-power-evidence-supervisor}/bin/mt7921-rate-power-evidence-supervisor \
                 --subst-var-by launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
                 --subst-var-by manifest ${mt7921-rate-power-evidence-manifest} \
+                --subst-var-by artifact_identity ${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                 --subst-var-by cut ${pkgs.coreutils}/bin/cut
               chmod 0755 "$out/bin/mt7921-rate-power-evidence-root"
@@ -585,7 +661,14 @@
             { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
             ''
               mkdir -p work/bin work/var/lib/wifi-driver-lab
-              launcher=${pkgs.coreutils}/bin/true
+              cat > work/bin/launcher-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              if [ "''${1-}" = --artifact-identity ]; then cat "$PWD/work/artifact-identity.json"; exit 0; fi
+              exit 0
+              EOF
+              echo '{"artifact_identity":"test"}' > work/artifact-identity.json
+              chmod 0755 work/bin/launcher-stub
+              launcher=$PWD/work/bin/launcher-stub
               cat > work/bin/id-unprivileged <<'EOF'
               #!${pkgs.runtimeShell}
               echo 1000
@@ -607,6 +690,7 @@
                   --subst-var-by wifi_driver_lab "$PWD/work/bin/hardware-stub" \
                   --subst-var-by wifi_lab_watchdog "$PWD/work/bin/hardware-stub" \
                   --subst-var-by validation_launcher "$launcher" \
+                  --subst-var-by artifact_identity "$PWD/work/artifact-identity.json" \
                   --subst-var-by recovery_samples 1 \
                   --subst-var-by sys_root "$PWD/work/sys" \
                   --subst-var-by run_root "$PWD/work/run" \
@@ -664,6 +748,7 @@
                 --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
                 --subst-var-by validation_launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
+                --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 --subst-var-by recovery_samples 45 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
@@ -687,6 +772,7 @@
                 launcher=${package}/bin/mt7921-full-firmware-validation
                 driver=${package}/bin/mt7921-full-firmware-validation-driver
                 supervisor=${supervisor}/bin/mt7921-full-firmware-validation-supervisor
+                identity=${package}/share/mt7921-full-firmware-validation/artifact-identity.json
                 closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
                 cat > "$out" <<EOF
                 PACKAGE=${package}
@@ -694,6 +780,11 @@
                 LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
                 ELF=$driver
                 ELF_SHA256=$(sha256sum "$driver" | cut -d ' ' -f1)
+                ARTIFACT_IDENTITY=$identity
+                ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
+                FLAVOR=full-firmware-production
+                ACTIVE_CAPABLE=true
+                FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
                 SUPERVISOR=$supervisor
                 SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
                 REGULATORY_DB=${regulatoryDb}
@@ -732,17 +823,67 @@
             }
             ''
               mkdir -p "$out/bin"
-              substitute ${./nix/mt7921-rate-power-evidence-root.sh} \
+              substitute ${./nix/mt7921-full-firmware-validation-root.sh} \
                 "$out/bin/mt7921-full-firmware-validation-root" \
                 --subst-var-by shell ${pkgs.runtimeShell} \
                 --subst-var-by sudo /run/wrappers/bin/sudo \
                 --subst-var-by supervisor ${mt7921-full-firmware-validation-supervisor}/bin/mt7921-full-firmware-validation-supervisor \
                 --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
+                --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                 --subst-var-by cut ${pkgs.coreutils}/bin/cut
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-root"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-root"
+            '';
+
+          mt7921-validation-flavor-cross-wire-test = pkgs.runCommand
+            "mt7921-validation-flavor-cross-wire-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+            ''
+              cat > sudo-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo called > "$PWD/sudo-called"
+              exit 1
+              EOF
+              chmod +x sudo-stub
+              make_root() {
+                template=$1 output=$2 launcher=$3 manifest=$4 identity=$5
+                substitute "$template" "$output" \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by sudo "$PWD/sudo-stub" \
+                  --subst-var-by supervisor ${pkgs.coreutils}/bin/false \
+                  --subst-var-by launcher "$launcher" \
+                  --subst-var-by manifest "$manifest" \
+                  --subst-var-by artifact_identity "$identity" \
+                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                  --subst-var-by cut ${pkgs.coreutils}/bin/cut
+                chmod +x "$output"
+              }
+              production_launcher=${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation
+              evidence_launcher=${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence
+              production_identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
+              evidence_identity=${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json
+              test "$("$production_launcher" --artifact-identity)" = "$(cat "$production_identity")"
+              test "$("$evidence_launcher" --artifact-identity)" = "$(cat "$evidence_identity")"
+              test "$(cat "$production_identity")" != "$(cat "$evidence_identity")"
+
+              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-elf \
+                "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$production_identity"
+              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-manifest \
+                "$production_launcher" ${mt7921-rate-power-evidence-manifest} "$production_identity"
+              make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-elf \
+                "$production_launcher" ${mt7921-rate-power-evidence-manifest} "$evidence_identity"
+              make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-manifest \
+                "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$evidence_identity"
+              for root in prod-wrong-elf prod-wrong-manifest evidence-wrong-elf evidence-wrong-manifest; do
+                if ./$root --plan; then
+                  echo "cross-wired root unexpectedly passed: $root" >&2
+                  exit 1
+                fi
+              done
+              test ! -e sudo-called
+              touch "$out"
             '';
 
           mt7921-full-firmware-inert-proof =

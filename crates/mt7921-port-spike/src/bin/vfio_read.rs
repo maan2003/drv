@@ -3624,6 +3624,23 @@ fn validate_native_rate_power_capability(
 
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    if operation_argument.as_deref() == Some("--artifact-identity") {
+        if env::args().len() != 2 {
+            return Err("artifact identity accepts no additional arguments".into());
+        }
+        let (flavor, operation, active_capable) = if cfg!(feature = "full-firmware-production") {
+            ("full-firmware-production", "run-one-shot-sae-auth", true)
+        } else if cfg!(feature = "rate-power-evidence-only") {
+            ("rate-power-evidence-only", "run-one-shot-power-setup", false)
+        } else {
+            ("unclassified", "none", false)
+        };
+        println!(
+            r#"{{"artifact_identity":"mt7921-validation-v1","flavor":"{flavor}","enabled_operation":"{operation}","source_commit":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+            option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified")
+        );
+        return Ok(());
+    }
     #[cfg(feature = "fuchsia-passive")]
     if operation_argument.as_deref() == Some("--generate-regulatory-snapshot-v20") {
         return generate_rate_power_snapshot();
@@ -3645,6 +3662,9 @@ fn run() -> Result<(), String> {
     if operation_argument.as_deref() == Some("--full-firmware-preflight") {
         if env::args().len() != 2 {
             return Err("full-firmware preflight accepts no additional arguments".into());
+        }
+        if !cfg!(feature = "full-firmware-production") {
+            return Err("full-firmware preflight requires the production artifact flavor".into());
         }
         let operation = Operation::RunOneShotPowerSetup;
         if operation == Operation::RunOneShotPatchTableGate
@@ -3741,7 +3761,8 @@ fn run() -> Result<(), String> {
             return Err("full-firmware inert containment acquisition is invalid".into());
         }
         println!(
-            "{{\"full_firmware_preflight\":\"passed\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"credential_eof\":true,\"credential_policy_binding\":\"{credential_policy_binding}\",\"snapshot_eof\":true,\"target\":\"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a\",\"regulatory_domain\":\"00\",\"regulatory_generation\":0,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            "{{\"full_firmware_preflight\":\"passed\",\"artifact_flavor\":\"full-firmware-production\",\"enabled_operation\":\"run-one-shot-sae-auth\",\"active_capable\":true,\"source_commit\":\"{}\",\"fd_contract\":\"credential-fd3+snapshot-fd4+immediate-eof\",\"operation\":\"run-one-shot-power-setup\",\"source_sha256\":\"{}\",\"snapshot_sha256\":\"{}\",\"enabled\":{enabled},\"disabled\":{disabled},\"absent\":{absent},\"native_raw_sha256\":\"{actual_raw_sha256}\",\"normalized_envelope_sha256\":\"{actual_normalized_envelope_sha256}\",\"page_channel_sha256\":[{actual_channel_sha256}],\"credential_eof\":true,\"credential_policy_binding\":\"{credential_policy_binding}\",\"snapshot_eof\":true,\"target\":\"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a\",\"regulatory_domain\":\"00\",\"regulatory_generation\":0,\"native_golden_match\":true,\"patch_table_gate\":false,\"tmac_population_invariant\":false,\"ram_firmware_required\":true,\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}",
+            option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified"),
             snapshot
                 .source_sha256()
                 .iter()
@@ -3870,6 +3891,12 @@ fn run() -> Result<(), String> {
     };
     let e2e94_probe = env::var("DRV_E2E94_EDCA_PROBE").is_ok();
     let e2e93_probe = edca_probe_mode && !e2e94_probe;
+    let packaged_integration = match env::var("DRV_VALIDATION_BACKEND") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "mock-packaged-integration" => true,
+        Ok(_) => return Err("unknown validation backend".into()),
+        Err(error) => return Err(format!("read validation backend: {error}")),
+    };
     #[cfg(feature = "fuchsia-passive")]
     if operation == Operation::RunOneShotSaeAuth && !e2e94_probe {
         return Err("SAE validation requires the fixed one-frame E2E94 completion mode".into());
@@ -4030,7 +4057,9 @@ fn run() -> Result<(), String> {
             &env::var("DRV_SAE_CLIENT_MAC")
                 .map_err(|_| "DRV_SAE_CLIENT_MAC is required for power setup")?,
         )?;
-        verify_no_usable_mt792x_acpi_sar()?;
+        if !packaged_integration {
+            verify_no_usable_mt792x_acpi_sar()?;
+        }
         Some((bssid, ssid, channel, client))
     } else {
         None
@@ -4101,6 +4130,22 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "fuchsia-passive")]
     if operation == Operation::RunOneShotSaeAuth {
         record_sae_stage("credential_read");
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    if packaged_integration {
+        if !cfg!(feature = "full-firmware-production")
+            || operation != Operation::RunOneShotSaeAuth
+            || production_policy.is_none()
+            || _rate_power_evidence.as_ref().map(Vec::len) != Some(8)
+        {
+            return Err("packaged integration backend requires bound production SAE state".into());
+        }
+        run_production_validation_self_test()?;
+        println!(
+            "{}",
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"frame":"qos_null_tid0_be","tx_free_status":0,"tx_free_count":1,"txs_acked":true,"device_opened":false,"vfio_opened":false}"#
+        );
+        return Ok(());
     }
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;

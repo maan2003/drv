@@ -11,6 +11,7 @@ resolver = "3"
 [features]
 fuchsia-passive = []
 rate-power-evidence-only = []
+full-firmware-production = []
 default = ["fuchsia-passive", "rate-power-evidence-only"]
 
 [dependencies]

@@ -6,6 +6,22 @@ snapshot_generator=@snapshot_generator@
 regulatory_db=@regulatory_db@
 regulatory_source_sha256=@regulatory_source_sha256@
 credential_file=@credential_file@
+mock_credential_file=@mock_credential_file@
+artifact_identity=@artifact_identity@
+
+actual_identity=$($driver --artifact-identity)
+expected_identity=$(@cat@ "$artifact_identity")
+if [ "$actual_identity" != "$expected_identity" ]; then
+  echo "installed validation ELF semantic identity mismatch" >&2
+  exit 78
+fi
+
+integration_backend=${MT7921_PACKAGED_INTEGRATION_TEST-}
+case "$integration_backend" in
+  '') ;;
+  1) credential_file=$mock_credential_file ;;
+  *) echo "MT7921_PACKAGED_INTEGRATION_TEST must equal 1" >&2; exit 64 ;;
+esac
 
 prepare_snapshot() {
   umask 077
@@ -43,13 +59,33 @@ prepare_credential() {
 }
 
 case "$#:${1-}" in
+  1:--artifact-identity)
+    printf '%s\n' "$expected_identity"
+    ;;
   0:)
-    : "${DRV_PCI_BDF:?missing canonical PCI target}"
-    : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
-    : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
-    : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
+    if [ -z "$integration_backend" ]; then
+      : "${DRV_PCI_BDF:?missing canonical PCI target}"
+      : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
+      : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
+      : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
+    fi
     prepare_snapshot
     prepare_credential
+    if [ "$integration_backend" = 1 ]; then
+      exec @env@ -i \
+        DRV_E2E94_EDCA_PROBE=1 \
+        DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
+        DRV_SAE_CHANNEL=36 \
+        DRV_SAE_SSID=ph1 \
+        DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a \
+        DRV_SAE_CREDENTIAL_FD=3 \
+        DRV_SAE_CREDENTIAL_LEN="$credential_len" \
+        DRV_REGULATORY_SNAPSHOT_FD=4 \
+        DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
+        DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
+        DRV_VALIDATION_BACKEND=mock-packaged-integration \
+        "$driver" --run-one-shot-sae-auth
+    fi
     exec @env@ -i \
       DRV_PCI_BDF="$DRV_PCI_BDF" \
       DRV_IOMMU_GROUP="$DRV_IOMMU_GROUP" \
@@ -79,7 +115,7 @@ case "$#:${1-}" in
       "$driver" --full-firmware-preflight
     ;;
   *)
-    echo "fixed full-firmware validation accepts no arguments except --full-firmware-preflight" >&2
+    echo "fixed full-firmware validation accepts no arguments except --artifact-identity or --full-firmware-preflight" >&2
     exit 64
     ;;
 esac

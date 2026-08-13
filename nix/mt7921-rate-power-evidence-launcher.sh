@@ -6,6 +6,12 @@ snapshot_generator=@snapshot_generator@
 regulatory_db=@regulatory_db@
 regulatory_source_sha256=@regulatory_source_sha256@
 credential_file=@credential_file@
+artifact_identity=@artifact_identity@
+
+if [ "$("$driver" --artifact-identity)" != "$(@cat@ "$artifact_identity")" ]; then
+  echo "installed evidence ELF semantic identity mismatch" >&2
+  exit 78
+fi
 
 prepare_snapshot() {
   umask 077
@@ -45,6 +51,9 @@ prepare_credential() {
 }
 
 case "$#:${1-}" in
+  1:--artifact-identity)
+    @cat@ "$artifact_identity"
+    ;;
   0:)
     : "${DRV_PCI_BDF:?missing canonical PCI target}"
     : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
@@ -80,7 +89,7 @@ case "$#:${1-}" in
       "$driver" --full-firmware-preflight
     ;;
   *)
-    echo "fixed rate-power evidence launcher accepts no arguments except --evidence-preflight" >&2
+    echo "fixed rate-power evidence launcher accepts no arguments except --artifact-identity or --evidence-preflight" >&2
     exit 64
     ;;
 esac

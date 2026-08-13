@@ -5,6 +5,7 @@ export PATH=@runtime_path@
 wifi_driver_lab=@wifi_driver_lab@
 wifi_lab_watchdog=@wifi_lab_watchdog@
 validation_launcher=@validation_launcher@
+artifact_identity=@artifact_identity@
 recovery_samples=@recovery_samples@
 sys_root=@sys_root@
 run_root=@run_root@
@@ -28,6 +29,10 @@ shift
 [[ $1 == "$validation_launcher" ]] || {
   echo "fixed validation supervisor refuses arbitrary launchers" >&2
   exit 2
+}
+[[ $($validation_launcher --artifact-identity) == "$(cat "$artifact_identity")" ]] || {
+  echo "fixed validation supervisor rejects launcher semantic identity" >&2
+  exit 78
 }
 [[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}[.][[:xdigit:]]$ ]] || exit 2
 root=$var_root/lib/wifi-driver-lab
