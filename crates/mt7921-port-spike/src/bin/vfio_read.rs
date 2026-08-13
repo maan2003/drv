@@ -3400,6 +3400,7 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
         antenna_mask: 3,
     };
     audit.before_passive_command(&rx_path)?;
+    audit.passive_command_completed(&rx_path)?;
     if audit
         .before_passive_command(&PassiveMcuCommand::ProtectCtrl)
         .is_ok()
@@ -3430,6 +3431,9 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
     }
     audit.finish()?;
     audit.before_passive_command(&PassiveMcuCommand::AddDevice {
+        mac: [2, 0, 0, 0, 0, 1],
+    })?;
+    audit.passive_command_completed(&PassiveMcuCommand::AddDevice {
         mac: [2, 0, 0, 0, 0, 1],
     })?;
     println!(
@@ -5800,51 +5804,14 @@ fn run() -> Result<(), String> {
                                     );
                                 }
                                 let transport = adapter.into_transport();
-                                let mechanics = transport.into_mechanics();
-                                let mut power_transport = VfioRateTxPower {
-                                    loader: &mut *mechanics.loader,
-                                };
-                                let mut power_authorizer = RateTxPowerAuthorizer::new();
-                                let authorization = power_authorizer
-                                    .submit_snapshot(
-                                        &mut power_transport,
-                                        report.nic_capability,
-                                        &snapshot,
-                                        frozen.expected_source_sha256,
-                                        1,
-                                    )
-                                    .map_err(|error| {
-                                        format!("submit rate-power evidence: {error:?}")
-                                    })?;
-                                if !power_authorizer.permits(&authorization) {
-                                    return Err("rate-power authorization is not live".into());
-                                }
-                                let add_device = PassiveMcuCommand::AddDevice {
-                                    mac: power_target.as_ref().expect("power target").3.bytes(),
-                                };
-                                mechanics
-                                    .loader
-                                    .rate_power_delivery
-                                    .before_passive_command(&add_device)?;
-                                let next_sequence =
-                                    FirmwareLoaderTransport::next_sequence(mechanics.loader);
-                                let encoded_add_device =
-                                    encode_passive_mcu_command(&add_device, next_sequence)
-                                        .map_err(|error| {
-                                            format!(
-                                                "encode naturally following AddDevice: {error:?}"
-                                            )
-                                        })?;
-                                mechanics.loader.send_passive_command(
-                                    &add_device,
-                                    &encoded_add_device,
-                                    true,
+                                let mut mechanics = transport.into_mechanics();
+                                run_rate_power_evidence_operation(
+                                    &mut mechanics,
+                                    report.nic_capability,
+                                    &snapshot,
+                                    frozen.expected_source_sha256,
+                                    power_target.as_ref().expect("power target").3.bytes(),
                                 )?;
-                                println!(
-                                    "{}",
-                                    r#"{"rate_power_evidence_stop":"passed","after_pages":8,"next_normal_command":"ADD_DEVICE","next_normal_command_acknowledged":true,"tmac_diagnostic_non_invariant":true,"channel_set":false,"scan_started":false,"association_started":false,"frame_tx_started":false}"#
-                                );
-                                power_authorizer.reset();
                                 return Ok(());
                             }
                             if operation == Operation::RunOneShotPassiveSmeFull {
@@ -8469,10 +8436,22 @@ struct VfioFirmwareLoader<'a> {
 #[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct RatePowerDeliveryAudit {
-    after_rx_path: bool,
-    pages: u8,
-    complete: bool,
-    previous_sequence: Option<u8>,
+    phase: RatePowerDeliveryPhase,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+enum RatePowerDeliveryPhase {
+    #[default]
+    BeforeRxPath,
+    RxPathInFlight,
+    PageBatch {
+        pages: u8,
+        previous_sequence: Option<u8>,
+    },
+    BatchComplete,
+    AddDeviceInFlight,
+    Complete,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -8638,26 +8617,69 @@ fn rate_power_channels_json(channels: &[(u8, String)]) -> String {
 #[cfg(feature = "fuchsia-passive")]
 impl RatePowerDeliveryAudit {
     fn before_passive_command(&mut self, command: &PassiveMcuCommand) -> Result<(), String> {
-        match command {
-            PassiveMcuCommand::SetRxPath { .. } if !self.after_rx_path => {
-                self.after_rx_path = true;
+        match (&self.phase, command) {
+            (RatePowerDeliveryPhase::BeforeRxPath, PassiveMcuCommand::SetRxPath { .. }) => {
+                self.phase = RatePowerDeliveryPhase::RxPathInFlight;
                 Ok(())
             }
-            PassiveMcuCommand::AddDevice { .. } if self.complete => Ok(()),
-            _ if self.after_rx_path && !self.complete => Err(format!(
-                "MCU command {command:?} interleaved in the SET_RATE_TX_POWER transaction"
+            (RatePowerDeliveryPhase::BatchComplete, PassiveMcuCommand::AddDevice { .. }) => {
+                self.phase = RatePowerDeliveryPhase::AddDeviceInFlight;
+                Ok(())
+            }
+            (RatePowerDeliveryPhase::BeforeRxPath, _) => Ok(()),
+            (RatePowerDeliveryPhase::RxPathInFlight, _) => {
+                Err("MCU command started before RX_PATH command completion".into())
+            }
+            (RatePowerDeliveryPhase::PageBatch { .. }, _) => Err(format!(
+                "MCU command {command:?} interleaved in the contiguous SET_RATE_TX_POWER batch"
             )),
-            _ => Ok(()),
+            (RatePowerDeliveryPhase::BatchComplete, _) => Err(format!(
+                "MCU command {command:?} replaced the naturally following ADD_DEVICE"
+            )),
+            (RatePowerDeliveryPhase::AddDeviceInFlight, _) => {
+                Err("MCU command started before ADD_DEVICE command completion".into())
+            }
+            (
+                RatePowerDeliveryPhase::Complete,
+                PassiveMcuCommand::SetRxPath { .. } | PassiveMcuCommand::AddDevice { .. },
+            ) => Err("rate-power lifecycle command reentered after completion".into()),
+            (RatePowerDeliveryPhase::Complete, _) => Ok(()),
+        }
+    }
+
+    fn passive_command_completed(&mut self, command: &PassiveMcuCommand) -> Result<(), String> {
+        match (&self.phase, command) {
+            (RatePowerDeliveryPhase::RxPathInFlight, PassiveMcuCommand::SetRxPath { .. }) => {
+                self.phase = RatePowerDeliveryPhase::PageBatch {
+                    pages: 0,
+                    previous_sequence: None,
+                };
+                Ok(())
+            }
+            (RatePowerDeliveryPhase::AddDeviceInFlight, PassiveMcuCommand::AddDevice { .. }) => {
+                self.phase = RatePowerDeliveryPhase::Complete;
+                Ok(())
+            }
+            _ => Err(format!(
+                "completed MCU command {command:?} is not owned by the rate-power operation"
+            )),
         }
     }
 
     fn page_consumed_and_reclaimed(&mut self, encoded: &[u8]) -> Result<(), String> {
-        if !self.after_rx_path || self.complete || self.pages >= 8 {
-            return Err("SET_RATE_TX_POWER page escaped the RX_PATH transaction".into());
+        let RatePowerDeliveryPhase::PageBatch {
+            pages,
+            previous_sequence,
+        } = &mut self.phase
+        else {
+            return Err("SET_RATE_TX_POWER page escaped the contiguous post-RX_PATH batch".into());
+        };
+        if *pages >= 8 {
+            return Err("SET_RATE_TX_POWER page exceeded the contiguous eight-page batch".into());
         }
-        let ordinal = self.pages + 1;
+        let ordinal = *pages + 1;
         let sequence = encoded.get(39).copied();
-        let expected_sequence = self.previous_sequence.map(|previous| previous % 15 + 1);
+        let expected_sequence = previous_sequence.map(|previous| previous % 15 + 1);
         if expected_sequence.is_some_and(|expected| sequence != Some(expected)) {
             return Err(format!(
                 "SET_RATE_TX_POWER page {ordinal} sequence {sequence:?} does not follow {expected_sequence:?}"
@@ -8666,8 +8688,8 @@ impl RatePowerDeliveryAudit {
         let evidence = validate_native_rate_power_page(encoded, usize::from(ordinal))?;
         let expected_raw_length = if ordinal == 2 { 1016 } else { 1340 };
         let expected_total_length = CONNAC2_MCU_TXD_BYTES + expected_raw_length;
-        self.pages = ordinal;
-        self.previous_sequence = sequence;
+        *pages = ordinal;
+        *previous_sequence = sequence;
         record_sae_stage(&format!(
             "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={} normalized_envelope_sha256={} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
             sequence.expect("validated sequence"),
@@ -8680,14 +8702,26 @@ impl RatePowerDeliveryAudit {
     }
 
     fn finish(&mut self) -> Result<(), String> {
-        if !self.after_rx_path || self.pages != 8 {
-            return Err(format!(
-                "incomplete SET_RATE_TX_POWER transaction after_rx_path={} pages={}",
-                self.after_rx_path, self.pages
-            ));
+        match self.phase {
+            RatePowerDeliveryPhase::PageBatch { pages: 8, .. } => {
+                self.phase = RatePowerDeliveryPhase::BatchComplete;
+                Ok(())
+            }
+            RatePowerDeliveryPhase::PageBatch { pages, .. } => Err(format!(
+                "incomplete contiguous SET_RATE_TX_POWER batch pages={pages}"
+            )),
+            _ => Err("rate-power batch finished outside the post-RX_PATH boundary".into()),
         }
-        self.complete = true;
-        Ok(())
+    }
+
+    fn pages(&self) -> u8 {
+        match self.phase {
+            RatePowerDeliveryPhase::PageBatch { pages, .. } => pages,
+            RatePowerDeliveryPhase::BatchComplete
+            | RatePowerDeliveryPhase::AddDeviceInFlight
+            | RatePowerDeliveryPhase::Complete => 8,
+            RatePowerDeliveryPhase::BeforeRxPath | RatePowerDeliveryPhase::RxPathInFlight => 0,
+        }
     }
 }
 
@@ -10047,7 +10081,10 @@ impl VfioFirmwareLoader<'_> {
         encoded[39] = sequence;
         // This is the final sequence-adjusted byte vector.  Reject it before
         // any producer index or descriptor can make it visible to firmware.
-        validate_native_rate_power_page(&encoded, usize::from(self.rate_power_delivery.pages) + 1)?;
+        validate_native_rate_power_page(
+            &encoded,
+            usize::from(self.rate_power_delivery.pages()) + 1,
+        )?;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         let before_ns = self.start.elapsed().as_nanos();
@@ -10127,7 +10164,7 @@ impl VfioFirmwareLoader<'_> {
             .page_consumed_and_reclaimed(&published)?;
         self.capture_patch_table_snapshot(&format!(
             "after_rate_power_page_{}",
-            self.rate_power_delivery.pages
+            self.rate_power_delivery.pages()
         ))?;
         self.observe_dmashdl("client_rate_power")?;
         Ok(())
@@ -10186,6 +10223,83 @@ fn program_live_rate_power(
         .permits(&authorization)
         .then_some(())
         .ok_or_else(|| "rate-power authorization is not live".into())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn issue_rate_power_evidence_command(
+    mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
+    command: PassiveMcuCommand,
+) -> Result<(), String> {
+    let sequence = FirmwareLoaderTransport::next_sequence(mechanics.loader);
+    let encoded = encode_passive_mcu_command(&command, sequence)
+        .map_err(|error| format!("encode rate-power lifecycle command: {error:?}"))?;
+    let wait_response = command.expects_response();
+    mechanics
+        .command(&command, &encoded, wait_response)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn run_rate_power_evidence_operation(
+    mechanics: &mut VfioPassiveMechanics<'_, '_, '_>,
+    capability: mt7921_port_spike::NicCapability,
+    snapshot: &RegulatoryRatePowerSnapshot,
+    source_sha256: [u8; 32],
+    mac: [u8; 6],
+) -> Result<(), String> {
+    // Linux owns this as one ordered initialization operation, not as one MCU
+    // command transaction. Every command below still publishes, completes,
+    // and reclaims its own descriptor before the next boundary is entered.
+    // Pinned Linux allocates every MCU command from one dev->mcu.msg_seq.
+    // With the observed post-bootstrap sequence 14, these four restored
+    // prefix commands consume 15,1,2,3 and the first rate page is sequence 4.
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::EepromBufferMode)?;
+    let prerequisites = mechanics
+        .prepare_passive_receive()
+        .map_err(|error| error.to_string())?;
+    if prerequisites
+        != (PassivePrerequisites {
+            channel_domain_mask_zero: true,
+            mac_mmio_initialized: true,
+            data_rx_owned: true,
+        })
+    {
+        return Err(format!(
+            "rate-power receive preparation mismatch: {prerequisites:?}"
+        ));
+    }
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::ProtectCtrl)?;
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::MacEnable)?;
+    issue_rate_power_evidence_command(
+        mechanics,
+        PassiveMcuCommand::SetRxPath {
+            channel: mt7921_port_spike::CandidateChannel {
+                band: mt7921_port_spike::PhysicalBand::Ghz2,
+                number: 1,
+                frequency_mhz: 2412,
+            },
+            antenna_mask: 3,
+        },
+    )?;
+
+    let mut power_transport = VfioRateTxPower {
+        loader: &mut *mechanics.loader,
+    };
+    let mut power_authorizer = RateTxPowerAuthorizer::new();
+    let authorization = power_authorizer
+        .submit_snapshot(&mut power_transport, capability, snapshot, source_sha256, 1)
+        .map_err(|error| format!("submit rate-power evidence: {error:?}"))?;
+    mechanics.loader.rate_power_delivery.finish()?;
+    if !power_authorizer.permits(&authorization) {
+        return Err("rate-power authorization is not live".into());
+    }
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::AddDevice { mac })?;
+    println!(
+        "{}",
+        r#"{"rate_power_evidence_stop":"passed","after_pages":8,"next_normal_command":"ADD_DEVICE","next_normal_command_acknowledged":true,"tmac_diagnostic_non_invariant":true,"channel_set":false,"scan_started":false,"association_started":false,"frame_tx_started":false}"#
+    );
+    power_authorizer.reset();
+    Ok(())
 }
 
 impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
@@ -14226,6 +14340,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         self.loader
             .send_passive_command(command, encoded, wait_response)
             .map_err(PhysicalPassiveError)?;
+        if matches!(
+            command,
+            PassiveMcuCommand::SetRxPath { .. } | PassiveMcuCommand::AddDevice { .. }
+        ) {
+            self.loader
+                .rate_power_delivery
+                .passive_command_completed(command)
+                .map_err(PhysicalPassiveError)?;
+        }
         if self
             .observe_stable_mac(&format!("passive_{command:?}"))
             .map_err(|status| {
@@ -16312,7 +16435,7 @@ mod tests {
             .unwrap();
         let sequence = rate_sender.find("encoded[39] = sequence").unwrap();
         let golden = rate_sender
-            .find("validate_native_rate_power_page(&encoded")
+            .find("validate_native_rate_power_page(")
             .unwrap();
         let publication = rate_sender.find("publish_mcu_bytes(").unwrap();
         assert!(sequence < golden && golden < publication);
@@ -19185,6 +19308,9 @@ mod tests {
             },
         ] {
             audit.before_passive_command(&command).unwrap();
+            if matches!(command, PassiveMcuCommand::SetRxPath { .. }) {
+                audit.passive_command_completed(&command).unwrap();
+            }
         }
         audit
     }
@@ -19223,6 +19349,165 @@ mod tests {
                 mac: [2, 0, 0, 0, 0, 1],
             })
             .unwrap();
+        audit
+            .passive_command_completed(&PassiveMcuCommand::AddDevice {
+                mac: [2, 0, 0, 0, 0, 1],
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_production_prefix_completion_opens_batch_and_preserves_failed_report_page1() {
+        let mut audit = RatePowerDeliveryAudit::default();
+        for command in [
+            PassiveMcuCommand::EepromBufferMode,
+            PassiveMcuCommand::ProtectCtrl,
+            PassiveMcuCommand::MacEnable,
+        ] {
+            audit.before_passive_command(&command).unwrap();
+        }
+        let rx_path = PassiveMcuCommand::SetRxPath {
+            channel: mt7921_port_spike::CandidateChannel {
+                band: mt7921_port_spike::PhysicalBand::Ghz2,
+                number: 1,
+                frequency_mhz: 2412,
+            },
+            antenna_mask: 3,
+        };
+        audit.before_passive_command(&rx_path).unwrap();
+        assert!(
+            audit
+                .page_consumed_and_reclaimed(&realistic_rate_power_audit_commands(15).unwrap()[0])
+                .unwrap_err()
+                .contains("post-RX_PATH")
+        );
+        audit.passive_command_completed(&rx_path).unwrap();
+
+        let commands = realistic_rate_power_audit_commands(15).unwrap();
+        let report_page1_dma = commands[0].clone();
+        let page1 = rate_power_byte_evidence(&report_page1_dma).unwrap();
+        assert_eq!(report_page1_dma[39], 15);
+        assert_eq!(
+            page1.total_sha256,
+            "5e4e57e2ff72c3269647ea4b148c422d900a919e97334971fd87247bdf085b3e"
+        );
+        assert_eq!(
+            page1.raw_sha256,
+            "a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95"
+        );
+        assert_eq!(page1.raw_sha256, NATIVE_RATE_POWER_RAW_SHA256[0]);
+        for command in &commands {
+            audit.page_consumed_and_reclaimed(command).unwrap();
+        }
+        audit.finish().unwrap();
+        let add_device = PassiveMcuCommand::AddDevice {
+            mac: [2, 0, 0, 0, 0, 1],
+        };
+        audit.before_passive_command(&add_device).unwrap();
+        audit.passive_command_completed(&add_device).unwrap();
+
+        let source = include_str!("vfio_read.rs");
+        let operation = source
+            .split("fn run_rate_power_evidence_operation(")
+            .nth(1)
+            .unwrap()
+            .split("impl FirmwareLoaderTransport")
+            .next()
+            .unwrap();
+        let prepare = operation.find("prepare_passive_receive()").unwrap();
+        let rx_path = operation.find("PassiveMcuCommand::SetRxPath").unwrap();
+        let pages = operation.find("submit_snapshot(").unwrap();
+        let finish = operation.find("rate_power_delivery.finish()").unwrap();
+        let add_device = operation.find("PassiveMcuCommand::AddDevice").unwrap();
+        assert!(prepare < rx_path && rx_path < pages && pages < finish && finish < add_device);
+        let lifecycle_sender = source
+            .split("fn issue_rate_power_evidence_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn run_rate_power_evidence_operation(")
+            .next()
+            .unwrap();
+        assert!(lifecycle_sender.contains("FirmwareLoaderTransport::next_sequence"));
+        let dispatch = source
+            .split("if operation == Operation::RunOneShotPowerSetup")
+            .nth(1)
+            .unwrap()
+            .split("if operation == Operation::RunOneShotPassiveSmeFull")
+            .next()
+            .unwrap();
+        assert_eq!(dispatch.matches("run_rate_power_evidence_operation(").count(), 1);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_fixed_prefix_uses_one_linux_sequence_domain() {
+        let mut sequence = 14u8;
+        let mut next = || {
+            sequence = sequence % 15 + 1;
+            sequence
+        };
+        assert_eq!(
+            [next(), next(), next(), next()],
+            [15, 1, 2, 3],
+            "EEPROM, PROTECT, MAC_ENABLE, and RX_PATH consume the production prefix"
+        );
+        assert_eq!(
+            [next(), next(), next(), next(), next(), next(), next(), next()],
+            [4, 5, 6, 7, 8, 9, 10, 11],
+            "the fixed production pages follow the completed prefix"
+        );
+        assert_eq!(next(), 12, "ADD_DEVICE naturally follows page 8");
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_boundary_rejects_escape_interleaving_reentry_and_partial_failure() {
+        let commands = realistic_rate_power_audit_commands(15).unwrap();
+        let rx_path = PassiveMcuCommand::SetRxPath {
+            channel: mt7921_port_spike::CandidateChannel {
+                band: mt7921_port_spike::PhysicalBand::Ghz2,
+                number: 1,
+                frequency_mhz: 2412,
+            },
+            antenna_mask: 3,
+        };
+
+        let mut escaped = RatePowerDeliveryAudit::default();
+        assert!(
+            escaped
+                .page_consumed_and_reclaimed(&commands[0])
+                .unwrap_err()
+                .contains("post-RX_PATH")
+        );
+
+        let mut partial_rx = RatePowerDeliveryAudit::default();
+        partial_rx.before_passive_command(&rx_path).unwrap();
+        assert!(partial_rx.finish().is_err());
+        assert!(
+            partial_rx
+                .before_passive_command(&PassiveMcuCommand::ProtectCtrl)
+                .unwrap_err()
+                .contains("before RX_PATH command completion")
+        );
+
+        let mut interleaved = rate_power_audit_after_rx_path();
+        interleaved
+            .page_consumed_and_reclaimed(&commands[0])
+            .unwrap();
+        assert!(
+            interleaved
+                .before_passive_command(&PassiveMcuCommand::ProtectCtrl)
+                .unwrap_err()
+                .contains("interleaved")
+        );
+        assert!(
+            interleaved
+                .before_passive_command(&rx_path)
+                .unwrap_err()
+                .contains("interleaved")
+        );
+        assert!(interleaved.finish().unwrap_err().contains("pages=1"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
