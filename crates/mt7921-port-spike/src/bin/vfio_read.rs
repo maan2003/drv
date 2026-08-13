@@ -64,13 +64,13 @@ use mt7921_port_spike::{
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
-    encode_legacy_wme_add_wcid_command, encode_pse_reg_read_command, encode_ptk_command,
-    encode_remove_wcid_command, linux_legacy_rate_context_reference,
-    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
-    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    parse_connac2_rx_frame, parse_passive_advertisement, parse_passive_scan_done,
-    parse_pse_reg_read_response, passive_mac_bar_offset, passive_mac_mmio_plan,
-    passive_mac_source_rmw_value, set_client_txwi_wcid, validate_passive_mac_bar_read,
+    encode_legacy_wme_add_wcid_command, encode_ptk_command, encode_remove_wcid_command,
+    linux_legacy_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
+    load_mt7921_firmware_with_passive_boundary, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
+    passive_mac_mmio_plan, passive_mac_source_rmw_value, set_client_txwi_wcid,
+    validate_passive_mac_bar_read,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -1601,6 +1601,12 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         })
     }
     fn command(&mut self, _: &PassiveMcuCommand, _: &[u8], _: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn install_rate_tx_power(
+        &mut self,
+        _: mt7921_port_spike::NicCapability,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
     fn next_event(&mut self, _: i64) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
@@ -5545,10 +5551,6 @@ fn run() -> Result<(), String> {
                                             record_sae_stage(
                                                 "client_interface_programmed omac=0 bss=0 wcid=19 identity_match=true",
                                             );
-                                            program_live_rate_power(
-                                                mechanics,
-                                                report.nic_capability,
-                                            )?;
                                             acquire_sae_tx_resources(
                                                 iommu,
                                                 ioas.id(),
@@ -9245,46 +9247,6 @@ impl VfioFirmwareLoader<'_> {
         self.observe_dmashdl("client_rate_power")?;
         Ok(())
     }
-
-    fn query_pse_base(&mut self) -> Result<u32, String> {
-        self.ensure_mcu_tx_allowed()?;
-        self.mcu.cancelled()?;
-        self.mcu
-            .wfdma
-            .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
-        self.sequence = self.sequence % 15 + 1;
-        let sequence = self.sequence;
-        let encoded = encode_pse_reg_read_command(sequence)
-            .map_err(|error| format!("encode PSE REG_READ: {error:?}"))?;
-        let descriptor_index = self.command_index;
-        let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
-        publish_mcu_bytes(
-            self.mcu.wfdma,
-            self.mcu.tx_ring,
-            self.mcu.payload,
-            &encoded,
-            sequence,
-            descriptor_index,
-        )?;
-        self.command_index = next;
-        let response = self
-            .mcu
-            .wait_response(sequence, Instant::now() + std::time::Duration::from_secs(3))?;
-        let value =
-            parse_pse_reg_read_response(response.event_id, response.option, &response.bytes)
-                .map_err(|error| {
-                    format!(
-                        "parse PSE REG_READ response eid={} option={:#04x}: {error:?}",
-                        response.event_id, response.option
-                    )
-                })?;
-        self.mcu
-            .tx_ring
-            .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
-        self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
-        self.observe_dmashdl("client_pse_query")?;
-        Ok(value)
-    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -9298,10 +9260,6 @@ impl RateTxPowerTransport for VfioRateTxPower<'_, '_> {
 
     fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error> {
         self.loader.send_rate_power_bytes(encoded)
-    }
-
-    fn query_pse_base(&mut self) -> Result<u32, Self::Error> {
-        self.loader.query_pse_base()
     }
 }
 
@@ -12642,6 +12600,13 @@ impl VfioPassiveMechanics<'_, '_, '_> {
 impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     type Error = PhysicalPassiveError;
 
+    fn install_rate_tx_power(
+        &mut self,
+        capability: mt7921_port_spike::NicCapability,
+    ) -> Result<(), Self::Error> {
+        program_live_rate_power(self, capability).map_err(PhysicalPassiveError)
+    }
+
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.firmware_owned_snapshot(generation)
     }
@@ -15291,6 +15256,13 @@ mod tests {
             Ok(())
         }
 
+        fn install_rate_tx_power(
+            &mut self,
+            _: mt7921_port_spike::NicCapability,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
         fn next_event(&mut self, _: i64) -> Result<Option<PassiveMechanicsEvent>, Self::Error> {
             Ok(None)
         }
@@ -16788,7 +16760,6 @@ mod tests {
             "fn send_acknowledged_uni_command(",
             "fn send_passive_command(",
             "fn send_rate_power_bytes(",
-            "fn query_pse_base(",
         ] {
             let body = loader.split(method).nth(1).unwrap();
             let guard = body.find("ensure_mcu_tx_allowed()?").unwrap();
@@ -18020,11 +17991,11 @@ mod tests {
             .split("let transport = adapter.into_transport();")
             .next()
             .unwrap();
-        let power = sae.find("program_live_rate_power").unwrap();
         let acquire = sae.find("acquire_sae_tx_resources").unwrap();
         let runtime = sae.find("PinnedClientRuntime::new").unwrap();
         let connect = sae.find("runtime.connect(request, deadline)").unwrap();
-        assert!(power < acquire && acquire < runtime && runtime < connect);
+        assert!(acquire < runtime && runtime < connect);
+        assert!(!sae.contains("program_live_rate_power"));
         assert!(!sae.contains("transmit_one_sae_auth"));
 
         let cleanup = source
@@ -18037,6 +18008,60 @@ mod tests {
         let mgmt = cleanup.find("ActiveArenaKind::MgmtRing").unwrap();
         let reset = cleanup.find("reset_vfio_device(&device)").unwrap();
         assert!(mgmt < reset);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn rate_power_loader_is_contiguous_no_ack_immediately_after_rx_path() {
+        let source = include_str!("vfio_read.rs");
+        let sender = source
+            .split("fn send_rate_power_bytes(")
+            .nth(1)
+            .unwrap()
+            .split("struct VfioRateTxPower")
+            .next()
+            .unwrap();
+        let publish = sender.find("publish_mcu_bytes(").unwrap();
+        let consumed = sender.find("dma_index_completed(").unwrap();
+        let reclaim = sender.find("write_descriptor_at(").unwrap();
+        assert!(publish < consumed && consumed < reclaim);
+        assert!(!sender.contains("wait_response("));
+        assert!(!sender.contains("encode_pse_reg_read_command"));
+
+        let transport = source
+            .split("impl RateTxPowerTransport for VfioRateTxPower")
+            .nth(1)
+            .unwrap()
+            .split("fn program_live_rate_power(")
+            .next()
+            .unwrap();
+        assert_eq!(transport.matches("fn send_and_wait_consumed(").count(), 1);
+        assert!(!transport.contains("query_pse_base"));
+
+        let adapter = include_str!("../../../mt7921-softmac-adapter/src/lib.rs");
+        let start = adapter
+            .split("self.issue(PassiveMcuCommand::SetRxPath")
+            .nth(1)
+            .unwrap()
+            .split("self.initialized = true")
+            .next()
+            .unwrap();
+        let power = start
+            .find("install_rate_tx_power(self.capability)")
+            .unwrap();
+        let next_command = start
+            .find("self.issue(PassiveMcuCommand::AddDevice")
+            .unwrap();
+        assert!(power < next_command);
+
+        let sae = source
+            .split("if operation == Operation::RunOneShotSaeAuth {")
+            .find(|segment| segment.contains("PinnedClientRuntime::new"))
+            .unwrap()
+            .split("let transport = adapter.into_transport();")
+            .next()
+            .unwrap();
+        assert_eq!(sae.matches("program_live_rate_power(").count(), 0);
     }
 
     #[test]

@@ -4329,8 +4329,6 @@ pub trait RateTxPowerTransport {
     type Error;
     /// Return after DMA consumption. This CE command has no response payload.
     fn send_and_wait_consumed(&mut self, encoded: &[u8]) -> Result<(), Self::Error>;
-    /// Mandatory pinned CE REG_READ query after every batch to prevent PSE underflow.
-    fn query_pse_base(&mut self) -> Result<u32, Self::Error>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4444,12 +4442,6 @@ fn submit_conservative_rate_tx_power<T: RateTxPowerTransport>(
                 error,
             }
         })?;
-        transport
-            .query_pse_base()
-            .map_err(|error| RateTxPowerInstallError::Transport {
-                command: index as u8,
-                error,
-            })?;
     }
     Ok(RateTxPowerSubmission {
         target_half_dbm: (limits.max_reg_power_dbm as i8 * 2)
@@ -8949,8 +8941,8 @@ mod tests {
 
         struct PowerTransport {
             completed: usize,
-            pse_reads: usize,
             fail_at: Option<usize>,
+            transcript: Vec<(usize, u8, u8)>,
         }
         impl RateTxPowerTransport for PowerTransport {
             type Error = ();
@@ -8958,18 +8950,19 @@ mod tests {
                 if self.fail_at == Some(self.completed) {
                     return Err(());
                 }
+                self.transcript.push((
+                    _encoded.len() - CONNAC2_MCU_TXD_BYTES,
+                    _encoded[39],
+                    _encoded[CONNAC2_MCU_TXD_BYTES + 6],
+                ));
                 self.completed += 1;
                 Ok(())
-            }
-            fn query_pse_base(&mut self) -> Result<u32, Self::Error> {
-                self.pse_reads += 1;
-                Ok(0)
             }
         }
         let mut transport = PowerTransport {
             completed: 0,
-            pse_reads: 0,
             fail_at: None,
+            transcript: Vec::new(),
         };
         let mut authorizer = RateTxPowerAuthorizer::new();
         let authorization = authorizer
@@ -8977,12 +8970,24 @@ mod tests {
             .unwrap();
         assert!(authorizer.permits(&authorization));
         assert_eq!(transport.completed, 8);
-        assert_eq!(transport.pse_reads, 8);
+        assert_eq!(
+            transport.transcript,
+            [
+                (1340, 1, 0),
+                (1016, 2, 0),
+                (1340, 3, 0),
+                (1340, 4, 0),
+                (1340, 5, 0),
+                (1340, 6, 0),
+                (1340, 7, 0),
+                (1340, 8, 1),
+            ]
+        );
 
         let mut other_transport = PowerTransport {
             completed: 0,
-            pse_reads: 0,
             fail_at: None,
+            transcript: Vec::new(),
         };
         let mut other_authorizer = RateTxPowerAuthorizer::new();
         let other_authorization = other_authorizer
@@ -8996,8 +9001,8 @@ mod tests {
         assert!(!authorizer.permits(&authorization));
         let mut transport = PowerTransport {
             completed: 0,
-            pse_reads: 0,
             fail_at: Some(3),
+            transcript: Vec::new(),
         };
         assert_eq!(
             RateTxPowerAuthorizer::new().submit(&mut transport, capability, limits, 1),
@@ -9010,8 +9015,8 @@ mod tests {
         authorizer.set_regulatory_domain(*b"IN");
         let mut transport = PowerTransport {
             completed: 0,
-            pse_reads: 0,
             fail_at: None,
+            transcript: Vec::new(),
         };
         assert_eq!(
             authorizer.submit(&mut transport, capability, limits, 1),

@@ -242,6 +242,9 @@ pub trait SourceExactPassiveMechanics {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error>;
+    /// Linux installs the complete no-ACK rate-power transaction immediately
+    /// after the one-time SET_RX_PATH command.
+    fn install_rate_tx_power(&mut self, capability: NicCapability) -> Result<(), Self::Error>;
     fn next_event(
         &mut self,
         deadline_nanos: i64,
@@ -297,6 +300,7 @@ impl<E: Error + 'static> Error for SourceExactTransportError<E> {}
 /// tune, and passive scan commands only; there is no general TX API.
 pub struct SourceExactPassiveTransport<M> {
     mechanics: M,
+    capability: NicCapability,
     mac: [u8; 6],
     antenna_mask: u8,
     mcu_sequence: u8,
@@ -329,6 +333,7 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         }
         Ok(Self {
             mechanics,
+            capability,
             mac,
             antenna_mask: 3,
             mcu_sequence: 0,
@@ -450,6 +455,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                 },
                 antenna_mask: self.antenna_mask,
             })?;
+            self.mechanics
+                .install_rate_tx_power(self.capability)
+                .map_err(SourceExactTransportError::Mechanics)?;
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
             self.issue(PassiveMcuCommand::AddBss)?;
             self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
@@ -1294,6 +1302,7 @@ mod tests {
         prerequisites: Option<PassivePrerequisites>,
         commands: Vec<(PassiveMcuCommand, Vec<u8>, bool)>,
         prepare_after_commands: Option<usize>,
+        rate_power_after_commands: Option<usize>,
         events: VecDeque<PassiveMechanicsEvent>,
         confirmed_scan_sequences: Vec<u8>,
     }
@@ -1318,6 +1327,11 @@ mod tests {
         ) -> Result<(), Self::Error> {
             self.commands
                 .push((command.clone(), encoded.to_vec(), wait_response));
+            Ok(())
+        }
+
+        fn install_rate_tx_power(&mut self, _: NicCapability) -> Result<(), Self::Error> {
+            self.rate_power_after_commands = Some(self.commands.len());
             Ok(())
         }
 
@@ -1546,6 +1560,7 @@ mod tests {
         assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
         assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
         assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
+        assert_eq!(adapter.transport.mechanics.rate_power_after_commands, Some(4));
         assert!(matches!(
             commands[3].0,
             PassiveMcuCommand::SetRxPath {
