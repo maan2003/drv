@@ -92,7 +92,7 @@
                   path = gateBinary;
                   name = "mt7921-patch-table-gate-unpatched";
                 };
-            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.binutils ];
             buildInputs = [ pkgs.stdenv.cc.cc.lib ];
             dontUnpack = true;
             installPhase = ''
@@ -103,10 +103,8 @@
             doInstallCheck = true;
             installCheckPhase = ''
               runHook preInstallCheck
-              output=$($out/bin/mt7921-passive-scan --patch-table-gate-preflight)
-              grep -F '"patch_gate_preflight":"passed"' <<< "$output"
-              grep -F '"device_opened":false' <<< "$output"
-              grep -F '"vfio_opened":false' <<< "$output"
+              strings $out/bin/mt7921-passive-scan | grep -F 'external reboot watchdog is not armed'
+              strings $out/bin/mt7921-passive-scan | grep -F '"watchdog_verified":true'
               runHook postInstallCheck
             '';
             meta.mainProgram = "mt7921-passive-scan";

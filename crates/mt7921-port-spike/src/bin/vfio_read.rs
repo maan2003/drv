@@ -2932,8 +2932,25 @@ fn run() -> Result<(), String> {
         if env::args().len() != 2 {
             return Err("patch-table gate preflight accepts no additional arguments".into());
         }
+        let operation = Operation::RunOneShotPatchTableGate;
+        if !operation.is_active_mcu()
+            || !operation.loads_firmware()
+            || !operation.uses_contained_transport_gate()
+        {
+            return Err("patch-table gate dispatch lost its active containment contract".into());
+        }
+        let patch = decompress_patch()?;
+        let ram = decompress_ram()?;
+        Patch::parse(&patch).map_err(|error| format!("parse verified patch: {error:?}"))?;
+        Firmware::parse(&ram).map_err(|error| format!("parse verified RAM: {error:?}"))?;
+        let watchdog = verify_external_watchdog_armed()?;
+        let watchdog_deadline = watchdog.deadline;
+        let containment = ContainmentLedger::acquire(Some(watchdog))?;
+        if containment.phase != RunPhase::Acquiring || containment.hardware_may_be_active() {
+            return Err("patch-table gate inert containment acquisition is invalid".into());
+        }
         println!(
-            "{{\"patch_gate_preflight\":\"passed\",\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}"
+            "{{\"patch_gate_preflight\":\"passed\",\"operation\":\"run-one-shot-patch-table-gate\",\"firmware_verified\":true,\"watchdog_verified\":true,\"watchdog_deadline\":{watchdog_deadline},\"containment_acquired\":true,\"device_opened\":false,\"vfio_opened\":false,\"lab_state_created\":false}}"
         );
         return Ok(());
     }
@@ -17463,6 +17480,10 @@ mod tests {
         let block = &run[preflight..operation_dispatch];
         assert!(block.contains("device_opened\\\":false"));
         assert!(block.contains("vfio_opened\\\":false"));
+        assert!(block.contains("decompress_patch()"));
+        assert!(block.contains("decompress_ram()"));
+        assert!(block.contains("verify_external_watchdog_armed()"));
+        assert!(block.contains("ContainmentLedger::acquire(Some(watchdog))"));
         assert!(!block.contains("OpenOptions"));
         assert!(!block.contains("/dev/vfio"));
     }
