@@ -2728,3 +2728,42 @@ mismatch before reset containment. `RESTORE end failed=0`; native `mt7921e`,
 iwd, and the boot ID recovered unchanged. The lab was idle and not
 quarantined, and the reboot watchdog was disarmed without a reboot. No retry
 was made.
+
+### Prepared normal full-firmware one-frame validation
+
+The semaphore-order fix is packaged for a single normal-operation validation
+without authorizing a radio run. Commit `b16d2489852f60de8edb121d484d4fdc4057d28a`
+produced package
+`/nix/store/aabzf4syi7sf0rk9nsyw4g8d7g097ip2-mt7921-full-firmware-validation-0.1.0`.
+Its fixed no-argument launcher has SHA-256
+`b3ec3653566c9c870423945303380fb4ac8349c90e3906907146dd49fc9c0a66`;
+the allowlisted ELF has SHA-256
+`93f6c17412c77379bbb7c02ae86846b503360541f6938b256077767922ff6832`;
+and the sorted eight-path closure has SHA-256
+`f1af719faf91f6daaa387edfce5f32f06e2fcbd627eabc122ed08af61d0288aa`.
+The launcher accepts only no arguments (fixed SAE/full-firmware operation) or
+the inert preflight argument, and rejects patch-table-gate dispatch.
+
+The canonical firmware, runtime-closure, external-watchdog, and containment
+preflight passed without opening the PCI device, VFIO, or lab state. Its
+durable report is
+`/var/lib/wifi-driver-lab/reports/20260813T091437Z-full-firmware-preflight.log`
+(SHA-256
+`a8d33f8c9732bec2aa184131947c4a033955db056bb65f84a14838f9bb34a2ae`).
+It proves normal SAE dispatch is distinct from the patch-table gate, requires
+RAM firmware, verifies both embedded firmware images, and leaves the watchdog
+disarmed with the lab idle.
+
+One future authorization permits exactly one attempt. Start only from native
+association plus an idle, non-quarantined lab; verify the exact package, ELF,
+closure, target SSID/BSSID/channel, credential file, and watchdog; then invoke
+the fixed launcher with E2E94 enabled. The existing final-observation gates
+must reacquire the same BSSID and channel before association. Evidence must
+contain the 41-row TMAC table immediately after patch RELEASE and before RAM,
+the RAM-start ACK, successful association, and the same table immediately
+before data. The sole permitted data publication is the existing TID-0
+BE/QIDX1 normal-rate-control QoS Null. Success requires non-dropped TX_FREE
+and a correlated ACKed TXS; that result immediately returns STOP into normal
+containment and restoration. Any mismatch or timeout is failure and also
+stops. No retry, EAPOL publication, VO publication, second probe, or other
+traffic is authorized.
