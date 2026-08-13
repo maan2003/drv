@@ -57,8 +57,9 @@ use mt7921_port_spike::{
     ConservativePowerLimits, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand,
     PassiveRxError, RateTxPowerAuthorizer, RateTxPowerTransport, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
-    encode_client_data_txwi, encode_client_edca_command, encode_client_interface_commands,
-    encode_client_management_tx, encode_client_post_assoc_beacon_timing_command,
+    encode_client_data_txwi, encode_client_early_edca_command, encode_client_edca_command,
+    encode_client_interface_commands, encode_client_management_tx,
+    encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
@@ -1091,6 +1092,8 @@ fn run_contained_dma_resource_round_trip(
                             e2e81_probe_done: false,
                             fw_snapshot_generation: None,
                             stable_mac_watcher: None,
+                            associated_edca_programmed: false,
+                            e2e93_probe: false,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
                             mgmt_tx_ring: &mut active.mgmt_tx_ring,
@@ -1608,7 +1611,7 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
             || encoded.get(36..39) != Some(&[0x1d, 0xa0, 1])
             || encoded.get(64..84)
                 != Some(&[
-                    7, 0, 15, 0, 94, 0, 2, 0, 0, 0, 3, 0, 7, 0, 47, 0, 2, 0, 0, 0,
+                    15, 0, 255, 3, 0, 0, 3, 0, 0, 0, 15, 0, 255, 3, 0, 0, 7, 0, 0, 0,
                 ])
             || encoded.get(104..107) != Some(&[0, 1, 0])
         {
@@ -1917,9 +1920,27 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             },
         ],
     };
+    let early_edca = encode_client_early_edca_command(1)
+        .map_err(|error| format!("self-test early EDCA fixture: {error}"))?;
+    if early_edca[64..108]
+        != [
+            15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 15, 0, 255, 3, 0, 0,
+            2, 0, 0, 0, 15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        ]
+    {
+        return Err("self-test early Linux EDCA golden mismatch".into());
+    }
+    let mut modeled_tmac_stage = 1;
     rx_gate
         .program_edca(edca, |_| Ok(()))
         .map_err(|error| format!("self-test post-ASSOC EDCA: {error}"))?;
+    modeled_tmac_stage += 1;
+    if modeled_tmac_stage != 2 {
+        return Err("self-test TMAC EDCA lifecycle did not finalize".into());
+    }
+    println!(
+        "self_test_tmac_transition early_edca=populated associated_edca=finalized raw_values=omitted data_ready=false"
+    );
     if rx_gate.qos_tx_ready() {
         return Err("self-test data TX opened before interface WCID update".into());
     }
@@ -2952,6 +2973,12 @@ fn run() -> Result<(), String> {
         Ok(_) => return Err("DRV_STABLE_MAC_TRANSITION_DIAGNOSTIC must equal 1".into()),
         Err(error) => return Err(format!("read stable-MAC diagnostic mode: {error}")),
     };
+    let e2e93_probe = match env::var("DRV_E2E93_EDCA_PROBE") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("DRV_E2E93_EDCA_PROBE must equal 1".into()),
+        Err(error) => return Err(format!("read E2E93 probe mode: {error}")),
+    };
     #[cfg(feature = "fuchsia-passive")]
     if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
         return Err("DMASHDL transition diagnostic requires the pinned SAE lifecycle".into());
@@ -2960,8 +2987,15 @@ fn run() -> Result<(), String> {
     if stable_mac_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
         return Err("stable-MAC transition diagnostic requires the pinned SAE lifecycle".into());
     }
+    #[cfg(feature = "fuchsia-passive")]
+    if e2e93_probe && operation != Operation::RunOneShotSaeAuth {
+        return Err("E2E93 probe requires the pinned SAE lifecycle".into());
+    }
     if dmashdl_transition_diagnostic && stable_mac_transition_diagnostic {
         return Err("DMASHDL and stable-MAC diagnostics are mutually exclusive".into());
+    }
+    if e2e93_probe && (dmashdl_transition_diagnostic || stable_mac_transition_diagnostic) {
+        return Err("E2E93 and transition-stop diagnostics are mutually exclusive".into());
     }
     #[cfg(not(feature = "fuchsia-passive"))]
     if dmashdl_transition_diagnostic {
@@ -2970,6 +3004,10 @@ fn run() -> Result<(), String> {
     #[cfg(not(feature = "fuchsia-passive"))]
     if stable_mac_transition_diagnostic {
         return Err("stable-MAC transition diagnostic requires fuchsia-passive".into());
+    }
+    #[cfg(not(feature = "fuchsia-passive"))]
+    if e2e93_probe {
+        return Err("E2E93 probe requires fuchsia-passive".into());
     }
     #[cfg(feature = "fuchsia-passive")]
     let contained_passive_channel = if operation == Operation::RunOneShotPassiveChannel1 {
@@ -4782,7 +4820,16 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
-                                stable_mac_watcher: stable_mac_transition_diagnostic.then(Vec::new),
+                                stable_mac_watcher: (stable_mac_transition_diagnostic
+                                    || e2e93_probe)
+                                    .then(|| StableMacWatcher {
+                                        before: Vec::new(),
+                                        transitioned: false,
+                                        tmac_transitioned: false,
+                                        stop_on_transition: stable_mac_transition_diagnostic,
+                                    }),
+                                associated_edca_programmed: false,
+                                e2e93_probe,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -4861,7 +4908,16 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
-                                stable_mac_watcher: stable_mac_transition_diagnostic.then(Vec::new),
+                                stable_mac_watcher: (stable_mac_transition_diagnostic
+                                    || e2e93_probe)
+                                    .then(|| StableMacWatcher {
+                                        before: Vec::new(),
+                                        transitioned: false,
+                                        tmac_transitioned: false,
+                                        stop_on_transition: stable_mac_transition_diagnostic,
+                                    }),
+                                associated_edca_programmed: false,
+                                e2e93_probe,
                                 mgmt_txwi,
                                 mgmt_frame,
                                 mgmt_tx_ring,
@@ -8393,6 +8449,11 @@ impl VfioFirmwareLoader<'_> {
             .bss_maybe_active = true;
         self.send_acknowledged_uni_command(2, &bss)?;
         record_sae_stage("client_bss_info_basic_acked bss=0 wmm=0 wcid=19");
+        let early_edca = encode_client_early_edca_command(1)?;
+        self.send_client_ce_no_ack_bytes(&early_edca, 0x1d, 108)?;
+        record_sae_stage(
+            "wmm_edca_program stage=early_bss result=complete source=mac80211_default qos=false ac_all=aifs2,cwmin15,cwmax1023,txop0,acmfalse data_tx_gate=closed",
+        );
         Ok(())
     }
 
@@ -10724,7 +10785,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 return Err(zx::Status::IO);
             }
             record_sae_stage(&format!(
-                "wmm_edca_program result=complete completion=true readback=transport_owned bss=0 wmm=0 ac_vo=aifs{},cwmin{},cwmax{},txop{},acm{} ac_vi=aifs{},cwmin{},cwmax{},txop{},acm{} ac_be=aifs{},cwmin{},cwmax{},txop{},acm{} ac_bk=aifs{},cwmin{},cwmax{},txop{},acm{} tid7_ac=vo qidx3_programmed=true data_ring=0 shared_with_management=true",
+                "wmm_edca_program stage=associated result=complete completion=true readback=transport_owned bss=0 wmm=0 ac_vo=aifs{},cwmin{},cwmax{},txop{},acm{} ac_vi=aifs{},cwmin{},cwmax{},txop{},acm{} ac_be=aifs{},cwmin{},cwmax{},txop{},acm{} ac_bk=aifs{},cwmin{},cwmax{},txop{},acm{} tid7_ac=vo qidx3_programmed=true data_ring=0 shared_with_management=true",
                 params.ac[0].aifs,
                 params.ac[0].cw_min,
                 params.ac[0].cw_max,
@@ -11327,10 +11388,20 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mgmt_tx_outstanding: MgmtTxOutstanding,
     e2e81_probe_done: bool,
     fw_snapshot_generation: Option<u64>,
-    stable_mac_watcher: Option<Vec<(u32, u32)>>,
+    stable_mac_watcher: Option<StableMacWatcher>,
+    associated_edca_programmed: bool,
+    e2e93_probe: bool,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct StableMacWatcher {
+    before: Vec<(u32, u32)>,
+    transitioned: bool,
+    tmac_transitioned: bool,
+    stop_on_transition: bool,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -11355,7 +11426,7 @@ impl Drop for VfioPassiveMechanics<'_, '_, '_> {
 #[cfg(feature = "fuchsia-passive")]
 impl VfioPassiveMechanics<'_, '_, '_> {
     fn observe_stable_mac(&mut self, preceded_by: &str) -> Result<bool, zx::Status> {
-        let Some(before) = self.stable_mac_watcher.as_mut() else {
+        let Some(watcher) = self.stable_mac_watcher.as_mut() else {
             return Ok(false);
         };
         let mut rows = vec![(0x820e_40c0, 0), (0x820e_40c4, 0)];
@@ -11379,26 +11450,32 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .read_firmware_snapshot_raw(*address)
                 .map_err(|_| zx::Status::IO)?;
         }
-        if before.is_empty() {
-            *before = rows;
+        if watcher.before.is_empty() {
+            watcher.before = rows;
             record_sae_stage("stable_mac_watcher seeded=true rows=55 raw_values=omitted");
             return Ok(false);
         }
-        for ((address, old), (_, value)) in before.iter().zip(&rows) {
-            if old != value {
-                let (region, offset) = if *address < 0x820e_5000 {
-                    ("tmac0", address - 0x820e_4000)
-                } else {
-                    ("rmac0", address - 0x820e_5000)
-                };
-                record_sae_stage(&format!(
-                    "stable_mac_transition region={region} offset={offset:#x} changed_mask={:08x} preceded_by={preceded_by} raw_values=omitted",
-                    old ^ value
-                ));
-                return Ok(true);
-            }
+        let changed = watcher
+            .before
+            .iter()
+            .zip(&rows)
+            .find_map(|((address, old), (_, value))| {
+                (old != value).then_some((*address, old ^ value))
+            });
+        watcher.before = rows;
+        if let Some((address, changed_mask)) = changed {
+            let (region, offset) = if address < 0x820e_5000 {
+                ("tmac0", address - 0x820e_4000)
+            } else {
+                ("rmac0", address - 0x820e_5000)
+            };
+            record_sae_stage(&format!(
+                "stable_mac_transition region={region} offset={offset:#x} changed_mask={changed_mask:08x} preceded_by={preceded_by} raw_values=omitted",
+            ));
+            watcher.transitioned = true;
+            watcher.tmac_transitioned |= region == "tmac0";
+            return Ok(true);
         }
-        *before = rows;
         Ok(false)
     }
 
@@ -12223,7 +12300,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::IO);
         }
         preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
-        if self.observe_stable_mac(&format!("uni_cid_{expected_cid}"))? {
+        if self.observe_stable_mac(&format!("uni_cid_{expected_cid}"))?
+            && self
+                .stable_mac_watcher
+                .as_ref()
+                .is_some_and(|watcher| watcher.stop_on_transition)
+        {
             record_sae_stage(
                 "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
             );
@@ -12291,8 +12373,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
+        let stage = if encoded.get(105) == Some(&0) {
+            "early_bss"
+        } else {
+            "associated"
+        };
         record_sae_stage(&format!(
-            "wtbl_command cid=legacy29 bytes={} raw={}",
+            "wtbl_command cid=legacy29 stage={stage} bytes={} raw={}",
             encoded.len(),
             encoded
                 .iter()
@@ -12307,13 +12394,21 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 ));
                 zx::Status::IO
             })?;
-        record_sae_stage(
-            "wmm_edca_transport completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux",
-        );
+        record_sae_stage(&format!(
+            "wmm_edca_transport stage={stage} completion=true dma_didx_consumed=true descriptor_reclaimed=true firmware_ack=not_requested_linux"
+        ));
+        if stage == "associated" {
+            self.associated_edca_programmed = true;
+        }
         if self.stable_mac_watcher.is_some() {
             for _ in 0..100 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if self.observe_stable_mac("set_edca_parms")? {
+                if self.observe_stable_mac("set_edca_parms")?
+                    && self
+                        .stable_mac_watcher
+                        .as_ref()
+                        .is_some_and(|watcher| watcher.stop_on_transition)
+                {
                     record_sae_stage(
                         "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
                     );
@@ -12348,7 +12443,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(
             "post_assoc_rx_filter result=published dma_didx_consumed=true firmware_ack=not_requested_linux",
         );
-        if self.observe_stable_mac("ce_set_rx_path")? {
+        if self.observe_stable_mac("ce_set_rx_path")?
+            && self
+                .stable_mac_watcher
+                .as_ref()
+                .is_some_and(|watcher| watcher.stop_on_transition)
+        {
             record_sae_stage(
                 "stable_mac_gate result=diagnostic_stop data_published=false probe_published=false",
             );
@@ -12395,6 +12495,23 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             // Same-session source-exact AC discriminator. The EAPOL timer is
             // only the post-association trigger; no EAPOL is published.
             self.e2e81_probe_done = true;
+            if self.e2e93_probe {
+                let early_bss = self.loader.client_interface.is_some();
+                let associated = self.associated_edca_programmed;
+                let tmac_transition = self
+                    .stable_mac_watcher
+                    .as_ref()
+                    .is_some_and(|watcher| watcher.tmac_transitioned);
+                if !(early_bss && associated && tmac_transition) {
+                    record_sae_stage(&format!(
+                        "e2e93_edca_gate result=mismatch early_bss={early_bss} associated={associated} stable_tmac_transition={tmac_transition} probe_published=false"
+                    ));
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
+                }
+                record_sae_stage(
+                    "e2e93_edca_gate result=match early_bss=true associated=true stable_tmac_transition=true raw_values=omitted",
+                );
+            }
             let ap: [u8; 6] = bytes[4..10].try_into().unwrap();
             let sta: [u8; 6] = bytes[10..16].try_into().unwrap();
             let make_null = |tid| {
@@ -12475,7 +12592,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 })?;
             self.e2e81_snapshot("after_BE");
             record_sae_stage(&format!(
-                "e2e90_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true raw_txs_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                "{}_evidence result=complete one_probe_only=true frame=qos_null tid=0 ac=BE normal_ra=true fixed_rate=false peer_wcid={} interface_wcid=19 be_dropped={} qidx_be=1 eapol_published=false vo_published=false retry_published=false raw_tx_free_telemetry=true raw_txs_telemetry=true protect_ctrl_present=true protect_ctrl_causal_claim=false",
+                if self.e2e93_probe { "e2e93" } else { "e2e90" },
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.dropped,
             ));

@@ -5707,6 +5707,34 @@ pub fn encode_client_edca_command(
     bss_index: u8,
     params: ClientEdcaParameters,
 ) -> Result<Vec<u8>, String> {
+    encode_client_edca_command_with_qos(sequence, bss_index, true, params)
+}
+
+/// mac80211's station-interface defaults installed by
+/// `ieee80211_set_wmm_default(..., enable_qos=false)` before association.
+pub fn encode_client_early_edca_command(sequence: u8) -> Result<Vec<u8>, String> {
+    encode_client_edca_command_with_qos(
+        sequence,
+        0,
+        false,
+        ClientEdcaParameters {
+            ac: [ClientEdcaAc {
+                cw_min: 15,
+                cw_max: 1023,
+                txop: 0,
+                aifs: 2,
+                acm: false,
+            }; 4],
+        },
+    )
+}
+
+fn encode_client_edca_command_with_qos(
+    sequence: u8,
+    bss_index: u8,
+    qos: bool,
+    params: ClientEdcaParameters,
+) -> Result<Vec<u8>, String> {
     if sequence == 0 || sequence > 15 || bss_index != 0 {
         return Err("client EDCA identity escaped the single station VIF".into());
     }
@@ -5720,8 +5748,10 @@ pub fn encode_client_edca_command(
         return Err("client EDCA parameters escaped firmware bounds".into());
     }
     let mut payload = [0u8; 44];
-    // Firmware slot order is the source-owned to_aci[] permutation.
-    for (ac, slot) in [1usize, 0, 2, 3].into_iter().enumerate() {
+    // `queue_params` is exposed here in semantic VO, VI, BE, BK order. Linux's
+    // driver iterates its hardware-queue order through to_aci[]; the resulting
+    // firmware payload order is BE, BK, VI, VO.
+    for (ac, slot) in [3usize, 2, 0, 1].into_iter().enumerate() {
         let value = params.ac[ac];
         let offset = slot * 10;
         payload[offset..offset + 2].copy_from_slice(&value.cw_min.to_le_bytes());
@@ -5731,7 +5761,7 @@ pub fn encode_client_edca_command(
         payload[offset + 9] = u8::from(value.acm);
     }
     payload[40] = bss_index;
-    payload[41] = 1;
+    payload[41] = u8::from(qos);
     payload[42] = 0;
     Ok(encode_legacy_mcu(0x1d, 0, &payload, sequence))
 }
@@ -8560,8 +8590,22 @@ mod tests {
         assert!(!state.qos_tx_ready());
         assert_eq!(edca_command.len(), 108);
         assert_eq!(&edca_command[36..39], &[0x1d, 0xa0, 1]);
-        assert_eq!(&edca_command[64..74], &[7, 0, 15, 0, 94, 0, 2, 0, 0, 0]);
-        assert_eq!(&edca_command[74..84], &[3, 0, 7, 0, 47, 0, 2, 0, 0, 0]);
+        // Independent Linux oracle raw payloads, excluding its transport
+        // envelope and sequence, for the early and associated sends.
+        assert_eq!(
+            &encode_client_early_edca_command(1).unwrap()[64..108],
+            &[
+                15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 15, 0, 255, 3, 0,
+                0, 2, 0, 0, 0, 15, 0, 255, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(
+            &edca_command[64..108],
+            &[
+                15, 0, 255, 3, 0, 0, 3, 0, 0, 0, 15, 0, 255, 3, 0, 0, 7, 0, 0, 0, 7, 0, 15, 0, 94,
+                0, 2, 0, 0, 0, 3, 0, 7, 0, 47, 0, 2, 0, 0, 0, 0, 1, 0, 0,
+            ]
+        );
         let transcript = std::cell::RefCell::new(transcript);
         state
             .complete_post_assoc_interface(
