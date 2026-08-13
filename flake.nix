@@ -745,6 +745,55 @@
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-root"
             '';
 
+          mt7921-full-firmware-inert-proof =
+            let
+              closure = pkgs.closureInfo {
+                rootPaths = [
+                  mt7921-full-firmware-validation
+                  mt7921-full-firmware-validation-supervisor
+                  mt7921-full-firmware-validation-manifest
+                  mt7921-full-firmware-validation-root-entry
+                ];
+              };
+            in
+            pkgs.runCommand "mt7921-full-firmware-inert-proof"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.nix ];
+                meta.mainProgram = "mt7921-full-firmware-inert-proof";
+              }
+              ''
+                mkdir -p "$out/bin" "$out/share/mt7921-full-firmware-inert-proof"
+                sort -u ${closure}/store-paths > "$out/share/mt7921-full-firmware-inert-proof/closure.paths"
+                while read -r path; do
+                  printf '%s\t%s\n' "$path" "$(${pkgs.nix}/bin/nix-store -q --hash "$path")"
+                done < "$out/share/mt7921-full-firmware-inert-proof/closure.paths" \
+                  > "$out/share/mt7921-full-firmware-inert-proof/closure.tsv"
+                substitute ${./nix/mt7921-full-firmware-inert-proof.sh} \
+                  "$out/bin/mt7921-full-firmware-inert-proof" \
+                  --subst-var-by shell ${pkgs.runtimeShell} \
+                  --subst-var-by package ${mt7921-full-firmware-validation} \
+                  --subst-var-by supervisor ${mt7921-full-firmware-validation-supervisor} \
+                  --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
+                  --subst-var-by root_entry ${mt7921-full-firmware-validation-root-entry} \
+                  --subst-var-by expected_paths "$out/share/mt7921-full-firmware-inert-proof/closure.paths" \
+                  --subst-var-by expected_hashes "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" \
+                  --subst-var-by commit aefc95ec3adea38d7ffbac4475cfbcb2848a9f38 \
+                  --subst-var-by id ${pkgs.coreutils}/bin/id \
+                  --subst-var-by date ${pkgs.coreutils}/bin/date \
+                  --subst-var-by install ${pkgs.coreutils}/bin/install \
+                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                  --subst-var-by hostname ${pkgs.nettools}/bin/hostname \
+                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                  --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
+                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum
+                chmod 0755 "$out/bin/mt7921-full-firmware-inert-proof"
+                ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-inert-proof"
+                "$out/bin/mt7921-full-firmware-inert-proof" --plan > plan
+                grep -F 'hardware_handoff=false active_validation=false' plan
+                grep -F 'canonical_fd3_fd4=true' plan
+                grep -F 'trap_safe=true' plan
+              '';
+
           bluetooth-sapphire-runner = pkgs.rustPlatform.buildRustPackage {
             pname = "bluetooth-sapphire-runner";
             version = "0.1.0";
