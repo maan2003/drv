@@ -1560,6 +1560,8 @@ mod tests {
         rx_dequeued: usize,
         fail_on: Option<&'static str>,
         reuse_channel: bool,
+        complete_on_association: bool,
+        validation_complete: bool,
     }
 
     // Deliberately redacted: frames and keys may contain SAE/RSN material.
@@ -1591,6 +1593,10 @@ mod tests {
     }
 
     impl Mt7921ClientEffects for FakeEffects {
+        fn validation_complete(&self) -> bool {
+            self.validation_complete
+        }
+
         fn revoke_scan(&mut self) {}
 
         fn revoke_lifecycle(&mut self) {}
@@ -1657,6 +1663,7 @@ mod tests {
         ) -> Result<(), zx::Status> {
             self.hit("association")?;
             self.association = Some(configuration.clone());
+            self.validation_complete = self.complete_on_association;
             Ok(())
         }
 
@@ -2480,7 +2487,10 @@ mod tests {
     #[test]
     fn pinned_runtime_drives_comeback_timer_and_disconnect_cancels_it() {
         futures::executor::block_on(async {
-            let mut effects = FakeEffects::default();
+            let mut effects = FakeEffects {
+                complete_on_association: true,
+                ..Default::default()
+            };
             effects
                 .rx
                 .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
@@ -2567,6 +2577,7 @@ mod tests {
                 &backend.effects.frames[2][24..]
             );
             assert_eq!(backend.effects.association.as_ref().unwrap().aid, Some(42));
+            assert!(backend.effects.validation_complete);
             drop(backend);
 
             let mut effects = FakeEffects::default();

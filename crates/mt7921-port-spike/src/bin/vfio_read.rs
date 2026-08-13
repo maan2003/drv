@@ -12178,6 +12178,24 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn validation_be_qos_null(peer: [u8; 6], client: [u8; 6]) -> Vec<u8> {
+    let mut frame = vec![0xc8, 0x01, 0, 0];
+    frame.extend_from_slice(&peer);
+    frame.extend_from_slice(&client);
+    frame.extend_from_slice(&peer);
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    frame
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn is_validation_be_qos_null(bytes: &[u8]) -> bool {
+    bytes.len() == 26
+        && bytes.get(..4) == Some(&[0xc8, 0x01, 0, 0])
+        && bytes.get(16..22) == bytes.get(4..10)
+        && bytes.get(22..26) == Some(&[0, 0, 0, 0])
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl Mt7921ClientEffects for LiveClientEffects {
     fn validation_complete(&self) -> bool {
         self.state.lock().unwrap().validation_complete
@@ -12382,8 +12400,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
         }
         drop(state);
         let eapol = is_anchored_eapol_data(bytes);
+        let validation_probe = self.suppress_eapol_liveness
+            && is_validation_be_qos_null(bytes)
+            && bytes.get(4..10) == Some(&self.target)
+            && bytes.get(10..16) == Some(&self.client);
         self.firmware
-            .tx_generation(eapol)
+            .tx_generation(eapol || validation_probe)
             .map_err(|_| zx::Status::ACCESS_DENIED)?;
         let association = self
             .firmware
@@ -12423,7 +12445,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             bytes.get(16..22) == Some(&[0x01, 0x80, 0xc2, 0, 0, 3]),
             bytes.get(4).is_some_and(|byte| byte & 1 == 0),
         ));
-        if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
+        if !eapol && !validation_probe && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
+        {
             return Err(zx::Status::ACCESS_DENIED);
         }
         match io.transmit_client(bytes, flags) {
@@ -12758,6 +12781,17 @@ impl Mt7921ClientEffects for LiveClientEffects {
         record_sae_stage(
             "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
         );
+        if self.suppress_eapol_liveness {
+            record_sae_stage(
+                "validation_post_assoc_boundary result=ready trigger=be_qos_null authenticator_m1_required=false",
+            );
+            let io = io.into_inner();
+            return self.send_wlan_frame(
+                &validation_be_qos_null(self.target, self.client),
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                io,
+            );
+        }
         if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
             record_sae_stage(&format!(
                 "fw_state_diagnostic result=failed generation={generation} status={status}"
@@ -13321,9 +13355,9 @@ struct DiagnosticTxResult {
 #[cfg(feature = "fuchsia-passive")]
 fn admit_one_validation_probe(
     already_published: &mut bool,
-    eapol_trigger: bool,
+    validation_probe: bool,
 ) -> Result<(), zx::Status> {
-    if !eapol_trigger {
+    if !validation_probe {
         return Err(zx::Status::ACCESS_DENIED);
     }
     if std::mem::replace(already_published, true) {
@@ -13335,7 +13369,7 @@ fn admit_one_validation_probe(
 #[cfg(feature = "fuchsia-passive")]
 fn e2e94_validation_trigger(
     control: u16,
-    eapol: bool,
+    validation_probe: bool,
     already_published: &mut bool,
 ) -> Result<bool, zx::Status> {
     if control & 0x000c == 0 {
@@ -13343,7 +13377,7 @@ fn e2e94_validation_trigger(
             .then_some(false)
             .ok_or(zx::Status::ACCESS_DENIED);
     }
-    admit_one_validation_probe(already_published, eapol)?;
+    admit_one_validation_probe(already_published, validation_probe)?;
     Ok(true)
 }
 
@@ -14462,8 +14496,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::CANCELED);
         }
         let eapol = is_anchored_eapol_data(bytes);
+        let validation_probe = is_validation_be_qos_null(bytes);
         let control = u16::from_le_bytes([bytes[0], bytes[1]]);
-        if eapol {
+        if eapol || validation_probe {
             self.loader
                 .capture_patch_table_snapshot("immediately_predata")
                 .map_err(|_| zx::Status::IO)?;
@@ -14473,13 +14508,14 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .trace_peer_wtbl_dw5("immediately_pre_data");
         }
         let validation_trigger = if self.e2e94_probe {
-            e2e94_validation_trigger(control, eapol, &mut self.e2e81_probe_done)?
+            e2e94_validation_trigger(control, validation_probe, &mut self.e2e81_probe_done)?
         } else {
             eapol && !self.e2e81_probe_done
         };
         if validation_trigger {
-            // Same-session source-exact AC discriminator. The EAPOL timer is
-            // only the post-association trigger; no EAPOL is published.
+            // Same-session source-exact AC discriminator. Validation invokes
+            // this only after the complete post-association firmware tail;
+            // no EAPOL is required or published.
             self.e2e81_probe_done = true;
             if self.e2e93_probe || self.e2e94_probe {
                 let probe = if self.e2e94_probe { "e2e94" } else { "e2e93" };
@@ -16634,6 +16670,7 @@ mod tests {
         tx: Vec<Vec<u8>>,
         rx: VecDeque<ClientRxFrame>,
         fail_uni: bool,
+        tx_status: Option<zx::Status>,
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -16726,6 +16763,124 @@ mod tests {
     }
 
     #[cfg(feature = "fuchsia-passive")]
+    fn validation_association() -> fidl_softmac::WlanAssociationConfig {
+        let ac =
+            |ecw_min, ecw_max, aifsn, txop_limit| fidl_driver::WlanWmmAccessCategoryParameters {
+                ecw_min,
+                ecw_max,
+                aifsn,
+                txop_limit,
+                acm: false,
+            };
+        fidl_softmac::WlanAssociationConfig {
+            bssid: Some([0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]),
+            aid: Some(4),
+            rates: Some(vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]),
+            qos: Some(true),
+            wmm_params: Some(fidl_driver::WlanWmmParameters {
+                apsd: false,
+                ac_be_params: ac(4, 10, 3, 0),
+                ac_bk_params: ac(4, 10, 7, 0),
+                ac_vi_params: ac(3, 4, 2, 94),
+                ac_vo_params: ac(2, 3, 2, 47),
+            }),
+            primary: Some(ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 36,
+            }),
+            bandwidth: Some(ChannelBandwidth::Cbw80),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn validation_effects() -> LiveClientEffects {
+        let peer = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
+        let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let physical = client_physical_channel(
+            channel,
+            ChannelBandwidth::Cbw80,
+            ChannelNumber {
+                number: 0,
+                ..channel
+            },
+        )
+        .unwrap();
+        let mut state = selected_live_state(peer, physical);
+        state.production_policy = Some(
+            ProductionValidationPolicy::bind(
+                b"ph1",
+                peer,
+                36,
+                client,
+                0,
+                parse_sha256_hex(
+                    "2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut effects = LiveClientEffects {
+            state: Arc::new(Mutex::new(state)),
+            target: peer,
+            client,
+            rcpi: 100,
+            dtim_period: 2,
+            firmware: ClientFirmwareEffectsState::default(),
+            peer_wcid: None,
+            post_association_data_wait: None,
+            eapol_start_deadline: None,
+            eapol_start_emitted: false,
+            suppress_eapol_liveness: true,
+        };
+        effects
+            .set_channel(
+                channel,
+                ChannelBandwidth::Cbw80,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+        ready_and_authorize(
+            &mut effects.state.lock().unwrap(),
+            peer,
+            channel,
+            ChannelBandwidth::Cbw80,
+        );
+        effects
+            .join_bss(&fidl_driver::JoinBssRequest {
+                bssid: Some(peer),
+                bss_type: Some(fidl_ieee80211::BssType::Infrastructure),
+                remote: Some(true),
+                beacon_period: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        effects
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn prepare_validation_preauth(effects: &mut LiveClientEffects, io: &mut TestClientIo) {
+        let mut sae = vec![0; 30];
+        sae[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        sae[4..10].copy_from_slice(&effects.target);
+        sae[10..16].copy_from_slice(&effects.client);
+        sae[16..22].copy_from_slice(&effects.target);
+        sae[24..26].copy_from_slice(&3u16.to_le_bytes());
+        sae[26..28].copy_from_slice(&2u16.to_le_bytes());
+        effects
+            .send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), io)
+            .unwrap();
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     impl mt7921_softmac_adapter::client_device::Mt7921ClientIo for TestClientIo {
         fn submit_uni(&mut self, cid: u8, bytes: &[u8]) -> Result<(), zx::Status> {
             if self.fail_uni || validate_uni_request(cid, bytes).is_err() {
@@ -16754,7 +16909,7 @@ mod tests {
             _: fidl_softmac::WlanTxInfoFlags,
         ) -> Result<(), zx::Status> {
             self.tx.push(bytes.to_vec());
-            Ok(())
+            self.tx_status.map_or(Ok(()), Err)
         }
         fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
             Ok(self.rx.pop_front())
@@ -17828,6 +17983,94 @@ mod tests {
         assert!(effects.eapol_start_deadline.is_none());
         assert!(!effects.eapol_start_emitted);
         assert!(io.tx.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn validation_publishes_exactly_one_be_probe_at_firmware_ready_without_m1() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        io.tx_status = Some(zx::Status::STOP);
+        let before = io.tx.len();
+
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+
+        assert!(effects.validation_complete());
+        assert_eq!(io.tx.len(), before + 1);
+        assert_eq!(
+            io.tx.last().unwrap(),
+            &validation_be_qos_null(effects.target, effects.client)
+        );
+        assert!(!io.tx.iter().any(|frame| is_anchored_eapol_data(frame)));
+        assert!(effects.firmware.qos_tx_ready());
+        assert!(effects.eapol_start_deadline.is_none());
+        assert!(!effects.eapol_start_emitted);
+        assert_eq!(
+            effects.send_wlan_frame(
+                &validation_be_qos_null(effects.target, effects.client),
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                &mut io,
+            ),
+            Err(zx::Status::ALREADY_EXISTS)
+        );
+        assert_eq!(io.tx.len(), before + 1);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn validation_drift_or_incomplete_tail_publishes_zero_probes() {
+        let mut drift = validation_effects();
+        drift.state.lock().unwrap().production_policy = None;
+        let mut drift_io = TestClientIo::default();
+        prepare_validation_preauth(&mut drift, &mut drift_io);
+        let before = drift_io.tx.len();
+        assert_eq!(
+            drift.notify_association_complete(&validation_association(), &mut drift_io),
+            Err(zx::Status::BAD_STATE)
+        );
+        assert_eq!(drift_io.tx.len(), before);
+
+        let mut incomplete = validation_effects();
+        let mut incomplete_io = TestClientIo {
+            fail_uni: true,
+            ..Default::default()
+        };
+        // Install preauth without transport failure, then fail the first
+        // association firmware command before the readiness boundary.
+        incomplete_io.fail_uni = false;
+        prepare_validation_preauth(&mut incomplete, &mut incomplete_io);
+        let before = incomplete_io.tx.len();
+        incomplete_io.fail_uni = true;
+        assert_eq!(
+            incomplete.notify_association_complete(&validation_association(), &mut incomplete_io,),
+            Err(zx::Status::IO)
+        );
+        assert_eq!(incomplete_io.tx.len(), before);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn validation_probe_tx_failure_is_terminal_and_never_retried() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        io.tx_status = Some(zx::Status::IO);
+        let before = io.tx.len();
+        assert_eq!(
+            effects.notify_association_complete(&validation_association(), &mut io),
+            Err(zx::Status::IO)
+        );
+        assert_eq!(io.tx.len(), before + 1);
+        // Re-entering the association tail is rejected by firmware state and
+        // cannot publish a second diagnostic frame.
+        assert_eq!(
+            effects.notify_association_complete(&validation_association(), &mut io),
+            Err(zx::Status::IO)
+        );
+        assert_eq!(io.tx.len(), before + 1);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -20124,12 +20367,41 @@ mod tests {
             )
             .unwrap();
 
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        let management_publications = io.tx.len();
+        io.tx_status = Some(zx::Status::STOP);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        assert!(effects.firmware.post_assoc_interface_programmed);
+        assert!(effects.firmware.post_assoc_beacon_timing_programmed);
+        assert!(effects.firmware.post_assoc_rx_filter_published);
+        assert!(effects.firmware.post_assoc_rlm_programmed);
+        assert!(effects.firmware.qos_tx_ready());
+        assert!(
+            io.uni
+                .iter()
+                .any(|command| command.get(36..39) == Some(&[0x1d, 0xa0, 1][..]))
+        );
+        assert!(
+            io.uni
+                .iter()
+                .any(|command| command.get(48..56) == Some(&[0, 19, 1, 0, 0, 0, 0, 0][..]))
+        );
+        assert_eq!(
+            &io.tx[management_publications..],
+            &[validation_be_qos_null(effects.target, effects.client)]
+        );
+        assert!(effects.validation_complete());
+
         let mut published = false;
         assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
         assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
         assert!(!e2e94_validation_trigger(0x0000, false, &mut published).unwrap());
-        assert!(e2e94_validation_trigger(0x0188, true, &mut published).unwrap());
-        assert!(e2e94_validation_trigger(0x0188, true, &mut published).is_err());
+        assert!(e2e94_validation_trigger(0x01c8, true, &mut published).unwrap());
+        assert!(e2e94_validation_trigger(0x01c8, true, &mut published).is_err());
         assert!(validation_probe_completed(&DiagnosticTxResult {
             free: Mt7921TxFree {
                 wcid: Some(7),
