@@ -153,9 +153,14 @@
               strings "$driver" | grep -F '"full_firmware_preflight":"passed"'
               strings "$driver" | grep -F 'ram_published_firmware_start_acked'
               strings "$driver" | grep -F 'post_release_before_ram'
+              strings "$driver" | grep -F 'immediately_before_rx_path'
+              strings "$driver" | grep -F 'after_rate_power_final'
               strings "$driver" | grep -F 'immediately_predata'
               strings "$driver" | grep -F 'e2e94_tx_success_gate result='
-              strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false retry_published=false'
+              strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false'
+              rate_output="$("$driver" --self-test-rate-power-delivery)"
+              test "$(printf '%s\n' "$rate_output" | grep -c '"rate_power_self_test":"command"')" -eq 10
+              printf '%s\n' "$rate_output" | grep -F '"rate_power_self_test":"passed"' | grep -F '"reg_read_between_pages":0' | grep -F '"safe_reclaims":8'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
               grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
@@ -246,10 +251,16 @@
                 TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
                 FRAME=qos_null_tid0_be_qidx1
                 SUCCESS=tx_free_status_0_count_1_and_correlated_txs_ack
+                PATCH_TABLE_SNAPSHOTS=before_rx_path_after_each_of_8_pages_and_after_final
+                PATCH_TABLE_REQUIRED_BEFORE_ADD_DEVICE=41_of_41
+                RATE_POWER_ORDER=rx_path_then_8_contiguous_0x4005d_then_add_device
+                RATE_POWER_REG_READ_BETWEEN_PAGES=0
+                RATE_POWER_LAST_MSG_PAGE=8
                 PATCH_TABLE_GATE=false
                 STOP_AFTER_ONE=true
                 EAPOL_START=false
                 VO_PROBE=false
+                SECOND_FRAME=false
                 RETRY=false
                 EOF
               '';

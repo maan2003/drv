@@ -1041,6 +1041,8 @@ fn run_contained_dma_resource_round_trip(
                 pcie_mac,
                 patch_table_page: active.patch_table_page.as_ref(),
                 normal_patch_table_capture: false,
+                #[cfg(feature = "fuchsia-passive")]
+                rate_power_delivery: RatePowerDeliveryAudit::default(),
                 bdf,
                 fwdl_ring: active.fwdl_ring.as_mut().expect("mapped"),
                 fwdl_payload: active.fwdl_payload.as_mut().expect("mapped"),
@@ -3109,8 +3111,62 @@ fn run_patch_table_gate_self_test() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "fuchsia-passive")]
+fn run_rate_power_delivery_self_test() -> Result<(), String> {
+    let mut audit = RatePowerDeliveryAudit::default();
+    let rx_path = PassiveMcuCommand::SetRxPath {
+        channel: mt7921_port_spike::CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz2,
+            number: 1,
+            frequency_mhz: 2412,
+        },
+        antenna_mask: 3,
+    };
+    audit.before_passive_command(&rx_path)?;
+    if audit
+        .before_passive_command(&PassiveMcuCommand::ProtectCtrl)
+        .is_ok()
+    {
+        return Err("rate-power self-test accepted an interleaved MCU command".into());
+    }
+    println!(
+        "{}",
+        r#"{"rate_power_self_test":"command","ordinal":0,"name":"SET_RX_PATH"}"#
+    );
+    for ordinal in 1..=8u8 {
+        let mut encoded = vec![0; if ordinal == 2 { 1016 } else { 1340 }];
+        encoded[36..39].copy_from_slice(&[0x5d, 0xa0, 1]);
+        encoded[46] = u8::from(ordinal == 8);
+        audit.page_consumed_and_reclaimed(&encoded)?;
+        println!(
+            r#"{{"rate_power_self_test":"command","ordinal":{ordinal},"cid":"0x4005d","wait_response":false,"dma_didx_consumed":true,"descriptor_reclaimed":true,"last_msg":{}}}"#,
+            encoded[46]
+        );
+    }
+    audit.finish()?;
+    audit.before_passive_command(&PassiveMcuCommand::AddDevice {
+        mac: [2, 0, 0, 0, 0, 1],
+    })?;
+    println!(
+        "{}",
+        r#"{"rate_power_self_test":"command","ordinal":9,"name":"ADD_DEVICE"}"#
+    );
+    println!(
+        "{}",
+        r#"{"rate_power_self_test":"passed","order":"RX_PATH,8xSET_RATE_TX_POWER,ADD_DEVICE","reg_read_between_pages":0,"pages":8,"last_msg_page":8,"safe_reclaims":8}"#
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let operation_argument = env::args().nth(1);
+    #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--self-test-rate-power-delivery") {
+        if env::args().len() != 2 {
+            return Err("rate-power delivery self-test accepts no additional arguments".into());
+        }
+        return run_rate_power_delivery_self_test();
+    }
     if operation_argument.as_deref() == Some("--full-firmware-preflight") {
         if env::args().len() != 2 {
             return Err("full-firmware preflight accepts no additional arguments".into());
@@ -5027,6 +5083,8 @@ fn run() -> Result<(), String> {
                     normal_patch_table_capture: cfg!(feature = "fuchsia-passive")
                         && e2e94_probe
                         && operation == Operation::RunOneShotSaeAuth,
+                    #[cfg(feature = "fuchsia-passive")]
+                    rate_power_delivery: RatePowerDeliveryAudit::default(),
                     bdf: &bdf,
                     fwdl_ring: &mut *fwdl_ring,
                     fwdl_payload: &mut *fwdl_payload,
@@ -7846,6 +7904,8 @@ struct VfioFirmwareLoader<'a> {
     pcie_mac: &'a ReadPage,
     patch_table_page: Option<&'a ReadPage>,
     normal_patch_table_capture: bool,
+    #[cfg(feature = "fuchsia-passive")]
+    rate_power_delivery: RatePowerDeliveryAudit,
     bdf: &'a str,
     fwdl_ring: &'a mut DmaArena,
     fwdl_payload: &'a mut DmaArena,
@@ -7860,6 +7920,66 @@ struct VfioFirmwareLoader<'a> {
     dmashdl: &'a ReadPage,
     dmashdl_watcher: Option<DmashdlTransitionWatcher>,
     start: Instant,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct RatePowerDeliveryAudit {
+    after_rx_path: bool,
+    pages: u8,
+    complete: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl RatePowerDeliveryAudit {
+    fn before_passive_command(&mut self, command: &PassiveMcuCommand) -> Result<(), String> {
+        match command {
+            PassiveMcuCommand::SetRxPath { .. } if !self.after_rx_path => {
+                self.after_rx_path = true;
+                Ok(())
+            }
+            PassiveMcuCommand::AddDevice { .. } if self.complete => Ok(()),
+            _ if self.after_rx_path && !self.complete => Err(format!(
+                "MCU command {command:?} interleaved in the SET_RATE_TX_POWER transaction"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn page_consumed_and_reclaimed(&mut self, encoded: &[u8]) -> Result<(), String> {
+        if !self.after_rx_path || self.complete || self.pages >= 8 {
+            return Err("SET_RATE_TX_POWER page escaped the RX_PATH transaction".into());
+        }
+        let ordinal = self.pages + 1;
+        let expected_len = if ordinal == 2 { 1016 } else { 1340 };
+        let last_msg = encoded.get(46).copied();
+        if encoded.len() != expected_len
+            || encoded.get(36..39) != Some(&[0x5d, 0xa0, 1])
+            || last_msg != Some(u8::from(ordinal == 8))
+        {
+            return Err(format!(
+                "SET_RATE_TX_POWER page {ordinal} diverged: len={} last_msg={last_msg:?}",
+                encoded.len()
+            ));
+        }
+        self.pages = ordinal;
+        record_sae_stage(&format!(
+            "rate_power_delivery page={ordinal} cid=0x4005d wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            u8::from(ordinal == 8)
+        ));
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        if !self.after_rx_path || self.pages != 8 {
+            return Err(format!(
+                "incomplete SET_RATE_TX_POWER transaction after_rx_path={} pages={}",
+                self.after_rx_path, self.pages
+            ));
+        }
+        self.complete = true;
+        Ok(())
+    }
 }
 
 struct PatchTableGate {
@@ -8011,9 +8131,9 @@ impl VfioFirmwareLoader<'_> {
         self.patch_gate.record_command(command, sequence, encoded)
     }
 
-    fn capture_patch_table_snapshot(&self, point: &str) -> Result<(), String> {
+    fn capture_patch_table_snapshot(&self, point: &str) -> Result<usize, String> {
         if !self.normal_patch_table_capture {
-            return Ok(());
+            return Ok(0);
         }
         let page = self
             .patch_table_page
@@ -8032,7 +8152,17 @@ impl VfioFirmwareLoader<'_> {
         );
         std::io::stdout()
             .flush()
-            .map_err(|error| format!("flush full-firmware patch-table snapshot: {error}"))
+            .map_err(|error| format!("flush full-firmware patch-table snapshot: {error}"))?;
+        Ok(populated)
+    }
+
+    fn require_complete_patch_table(&self, point: &str) -> Result<(), String> {
+        if self.normal_patch_table_capture && self.capture_patch_table_snapshot(point)? != 41 {
+            return Err(format!(
+                "full-firmware validation blocked before AddDevice: {point} is not 41/41"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -9244,6 +9374,12 @@ impl VfioFirmwareLoader<'_> {
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
         self.mcu.payload.zero_bytes(MCU_COMMAND_PAYLOAD_BYTES)?;
+        self.rate_power_delivery
+            .page_consumed_and_reclaimed(&encoded)?;
+        self.capture_patch_table_snapshot(&format!(
+            "after_rate_power_page_{}",
+            self.rate_power_delivery.pages
+        ))?;
         self.observe_dmashdl("client_rate_power")?;
         Ok(())
     }
@@ -9285,6 +9421,10 @@ fn program_live_rate_power(
             1,
         )
         .map_err(|error| format!("submit rate-power setup: {error:?}"))?;
+    mechanics.loader.rate_power_delivery.finish()?;
+    mechanics
+        .loader
+        .require_complete_patch_table("after_rate_power_final")?;
     authorizer
         .permits(&authorization)
         .then_some(())
@@ -13098,10 +13238,16 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 be.free.dropped,
             ));
             if self.e2e94_probe {
-                let passed = !be.free.dropped && be.txs_present && be.txs_acked;
+                let passed = be.free.status == 0
+                    && be.free.attempts == 1
+                    && !be.free.dropped
+                    && be.txs_present
+                    && be.txs_acked;
                 record_sae_stage(&format!(
-                    "e2e94_tx_success_gate result={} tx_free_success={} txs_present={} txs_acked={} stop_after_one=true eapol_published=false vo_published=false retry_published=false",
+                    "e2e94_tx_success_gate result={} tx_free_status={} tx_free_count={} tx_free_success={} txs_present={} txs_acked={} stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false",
                     if passed { "passed" } else { "failed" },
+                    be.free.status,
+                    be.free.attempts,
                     !be.free.dropped,
                     be.txs_present,
                     be.txs_acked,
@@ -13304,6 +13450,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
+        if matches!(command, PassiveMcuCommand::SetRxPath { .. }) {
+            self.loader
+                .capture_patch_table_snapshot("immediately_before_rx_path")
+                .map_err(PhysicalPassiveError)?;
+        }
+        self.loader
+            .rate_power_delivery
+            .before_passive_command(command)
+            .map_err(PhysicalPassiveError)?;
         observe_passive_command_provenance(&mut self.loader.mcu.descriptor_provenance, command)
             .map_err(PhysicalPassiveError)?;
         if matches!(command, PassiveMcuCommand::StartScan { .. }) {
