@@ -4529,15 +4529,35 @@ pub fn encode_conservative_rate_tx_power_commands(
             for (index, channel) in batch.iter().copied().enumerate() {
                 let offset = 44 + index * (1 + MT7921_SKU_RATE_COUNT);
                 request[offset] = channel;
-                request[offset + 1..offset + 1 + MT7921_SKU_RATE_COUNT].fill(target as u8);
-                if band == 2 {
-                    request[offset + 1..offset + 5].fill(127);
-                }
+                request[offset + 1..offset + 1 + MT7921_SKU_RATE_COUNT]
+                    .copy_from_slice(&mt7921_uniform_rate_power_sku(band, target));
             }
             commands.push(bytes);
         }
     }
     Ok(commands)
+}
+
+/// Reproduce the MT7921 portion of `mt76_connac_mcu_build_sku()` when
+/// `mt76_get_rate_power_limits()` has initialized every named rate to one
+/// target and no device-tree per-rate override is present.
+fn mt7921_uniform_rate_power_sku(band: u8, target: i8) -> [u8; MT7921_SKU_RATE_COUNT] {
+    let mut sku = [127u8; MT7921_SKU_RATE_COUNT];
+    if band == 1 {
+        sku[0..4].fill(target as u8); // CCK
+    }
+    sku[4..12].fill(target as u8); // OFDM
+    sku[12..20].fill(target as u8); // HT MCS 0, NSS 1
+    sku[20..28].fill(target as u8); // HT MCS 0, NSS 2
+    sku[28] = target as u8; // HT MCS 32
+    for nss in 0..4 {
+        // Linux copies ten VHT rates with a twelve-byte stride. The two
+        // firmware-reserved entries per NSS retain the initial value 127.
+        let offset = 29 + nss * 12;
+        sku[offset..offset + 10].fill(target as u8);
+    }
+    sku[77..161].fill(target as u8); // HE RU 26..996, twelve rates each
+    sku
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8263,6 +8283,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::vec;
     use std::vec::Vec;
 
@@ -8812,6 +8833,140 @@ mod tests {
     }
 
     #[test]
+    fn native_rate_power_oracle_reconstruction() {
+        fn sha256(bytes: &[u8]) -> std::string::String {
+            use std::fmt::Write as _;
+
+            let mut hex = std::string::String::with_capacity(64);
+            for byte in Sha256::digest(bytes) {
+                write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+            }
+            hex
+        }
+
+        // Named layout from mt76_connac_mcu_build_sku(): CCK 0..4, OFDM
+        // 4..12, HT 12..29, VHT 29..77, and HE RU 77..161.
+        let two_ghz = mt7921_uniform_rate_power_sku(1, 40);
+        let five_ghz = mt7921_uniform_rate_power_sku(2, 40);
+        let absent_channel = mt7921_uniform_rate_power_sku(2, 127);
+        assert_eq!(
+            sha256(&two_ghz),
+            "6e0acadca28bba3086430ad6f3c0b52007a6683f423b7176a0e33cabc2c927c9"
+        );
+        assert_eq!(
+            sha256(&five_ghz),
+            "073712b9d07c2ed258b49df4985e84310e7a6ebdaff219dccab8bcdc6aa2a62c"
+        );
+        assert_eq!(
+            sha256(&absent_channel),
+            "9c66e1b5c834aaf91bcb5fc3f13d72a6c698b05903a6ea5dc0e90feca233e13b"
+        );
+        assert_eq!(&two_ghz[0..4], &[40; 4]);
+        assert_eq!(&five_ghz[0..4], &[127; 4]);
+        for nss in 0..4 {
+            let vht = 29 + nss * 12;
+            assert_eq!(&five_ghz[vht..vht + 10], &[40; 10]);
+            assert_eq!(&five_ghz[vht + 10..vht + 12], &[127; 2]);
+        }
+        assert_eq!(&five_ghz[77..161], &[40; 84]);
+
+        let capability = NicCapability {
+            element_count: 0,
+            mac_address: None,
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 15,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let limits = ConservativePowerLimits {
+            alpha2: *b"00",
+            max_reg_power_dbm: 20,
+            sar_limit_half_dbm: Some(40),
+            external_safety_cap_half_dbm: Some(40),
+        };
+        let mut native = encode_conservative_rate_tx_power_commands(capability, limits, 4).unwrap();
+        // These runtime-oracle table entries had no registered channel, so
+        // Linux retained its initial 127 ceiling for all 161 entries.
+        const ABSENT_5GHZ: &[u8] = &[
+            38, 42, 46, 50, 54, 58, 62, 102, 106, 110, 114, 118, 122, 126, 134, 138, 142, 151, 155,
+            159, 169, 173, 177,
+        ];
+        let mut records = 0;
+        for command in &mut native {
+            let request = &mut command[CONNAC2_MCU_TXD_BYTES..];
+            let band = request[5];
+            for entry in request[44..].chunks_exact_mut(1 + MT7921_SKU_RATE_COUNT) {
+                if band == 2 && ABSENT_5GHZ.contains(&entry[0]) {
+                    entry[1..].copy_from_slice(&absent_channel);
+                }
+                let expected = if band == 1 {
+                    &two_ghz
+                } else if ABSENT_5GHZ.contains(&entry[0]) {
+                    &absent_channel
+                } else {
+                    &five_ghz
+                };
+                assert_eq!(&entry[1..], expected);
+                records += 1;
+            }
+        }
+        assert_eq!(records, 62);
+
+        let raw_hashes = [
+            "a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95",
+            "1c365518ffebb7a2b12b924bcfbe41436b4f2d52a83b07682d6f16c79eb39db0",
+            "1cbc40088bc367d75b2119806d3a8114ed3c4ce92a9572f262faace837343d36",
+            "f03e59182fd1e605df82de38305d445a015c9fc44c12da7802132514fed3e4d5",
+            "231e8db12ba160bdc12af55ef61c2da091387951c029008cc68b6b8d8a71d208",
+            "d8761b04f27de826280c55aac39a96e4d3bc0bb4d83330d910a4fd3ca70b90b2",
+            "e018434f160c1b67dc86477c602a87627b5553c5304359912347a04cbb3aad44",
+            "f1e5d489bb579d4d080eb8c2569e752c0b0dd87ccbdf02a112705536791d89df",
+        ];
+        let envelope_hashes = [
+            "f0fbbd04036c7dd71daf3b823e702d76edebfbe323c3c7bf91a0380cb9dc3360",
+            "5a29a8af375fbb07c4f700f69a71b163cdd14bc2bb9b0d507d7c615ed55ddf58",
+            "1e1495afe90625c2efce034866fcc6973c2bcc3bdbf5d937eb694c00b94cad46",
+            "47a910e750e6b5e1bafc15a8a34c89226f68d64a4d1b0e99055a79da3f096fb9",
+            "d7fadbe681688fecbd89d986f1c23cfb8fc5ac161cacb05308e666ff011ccd82",
+            "f5f9b18b306f6da5704a7390874700e6e8cedf0206ec7c3dd4ef864459e20cc3",
+            "8c8a2aaf95afca47d348762138cd9998d51a11378474431760d30418acda4762",
+            "aba6aa8523b112f59868435f78543b0a7fb6f82aa681096d7d86fd9082d4c533",
+        ];
+        for ((command, raw), envelope) in native.iter().zip(raw_hashes).zip(envelope_hashes) {
+            assert_eq!(sha256(&command[CONNAC2_MCU_TXD_BYTES..]), raw);
+            assert_eq!(sha256(command), envelope);
+        }
+
+        // The DMA descriptor is outside this byte vector. Masking the only
+        // dynamic envelope byte (sequence) leaves identical transport and
+        // request headers; payload policy is the only remaining divergence.
+        let userspace = encode_conservative_rate_tx_power_commands(
+            capability,
+            ConservativePowerLimits {
+                external_safety_cap_half_dbm: Some(0),
+                ..limits
+            },
+            1,
+        )
+        .unwrap();
+        for (native, userspace) in native.iter().zip(userspace) {
+            let mut native_header = native[..CONNAC2_MCU_TXD_BYTES + 44].to_vec();
+            let mut userspace_header = userspace[..CONNAC2_MCU_TXD_BYTES + 44].to_vec();
+            native_header[39] = 0;
+            userspace_header[39] = 0;
+            assert_eq!(native_header, userspace_header);
+        }
+    }
+
+    #[test]
     fn source_exact_conservative_rate_power_batches_fail_closed() {
         let reg_read = encode_pse_reg_read_command(9).unwrap();
         assert_eq!(&reg_read[36..40], &[0xc0, 0xa0, 0, 9]);
@@ -8869,12 +9024,7 @@ mod tests {
             assert!(request[4] >= 1 && request[4] <= 8);
             assert!(request[5] == 1 || request[5] == 2);
             for entry in request[44..].chunks_exact(1 + MT7921_SKU_RATE_COUNT) {
-                if request[5] == 2 {
-                    assert_eq!(&entry[1..5], &[127; 4]);
-                    assert!(entry[5..].iter().all(|power| *power == 8));
-                } else {
-                    assert!(entry[1..].iter().all(|power| *power == 8));
-                }
+                assert_eq!(&entry[1..], &mt7921_uniform_rate_power_sku(request[5], 8));
             }
         }
         assert_eq!(commands.last().unwrap()[CONNAC2_MCU_TXD_BYTES + 6], 1);

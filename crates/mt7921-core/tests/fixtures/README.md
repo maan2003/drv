@@ -11,6 +11,7 @@ MT7921 case:
 
 They exclude the 64-byte transport envelope, whose sequence is assigned at
 submission time. Each fixture includes the 44-byte zero-initialized request
-header and every channel's 161-entry SKU table. Linux sets the first four 5 GHz
-SKU entries to `127`; all other SKU entries are zero. The expected lengths are
-1340, 1016, then six times 1340 bytes.
+header and every channel's 161-entry SKU table. Linux leaves the first four
+5 GHz CCK entries and the two firmware-reserved entries in each of four VHT
+NSS strides at `127`; all named rates are zero. The expected lengths are 1340,
+1016, then six times 1340 bytes.

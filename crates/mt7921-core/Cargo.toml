@@ -11,3 +11,6 @@ path = "src/lib.rs"
 [dependencies]
 driver-runtime = { path = "../driver-runtime" }
 mt76-core = { path = "../mt76-core" }
+
+[dev-dependencies]
+sha2 = "=0.10.9"
