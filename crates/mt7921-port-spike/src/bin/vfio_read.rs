@@ -94,6 +94,8 @@ use num_bigint::BigUint;
 use sha2::{Digest as _, Sha256};
 #[cfg(feature = "fuchsia-passive")]
 use std::collections::VecDeque;
+#[cfg(feature = "fuchsia-passive")]
+use std::sync::OnceLock;
 use std::{
     cell::Cell,
     env,
@@ -177,6 +179,17 @@ fn record_sae_stage(event: &str) {
             TranscriptEvent::public("sae_auth_event", event).json()
         );
         Ok(())
+    });
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_sae_root_only_stage(event: &str) {
+    // The production supervisor captures stderr in a root-owned (0600)
+    // durable report.  Keep secret-bearing evidence out of TranscriptEvent's
+    // public channel so summary consumers only see hashes and structure.
+    let escaped = event.replace('\\', "\\\\").replace('"', "\\\"");
+    emit_sae_stage_best_effort(&escaped, |event| {
+        writeln!(std::io::stderr(), r#"{{"sae_auth_root_only":"{event}"}}"#)
     });
 }
 
@@ -3580,7 +3593,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
         return Err("completed validation TX guard admitted late SAE".into());
     }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3680,7 +3693,7 @@ fn run() -> Result<(), String> {
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -4308,7 +4321,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -8923,6 +8936,146 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+const ROOT_ONLY_MPDU_HEX_LIMIT: usize = 4096;
+
+#[cfg(feature = "fuchsia-passive")]
+static MANAGEMENT_TX_TELEMETRY_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[cfg(feature = "fuchsia-passive")]
+static MANAGEMENT_TX_COMPLETION_ORDER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "fuchsia-passive")]
+fn next_management_tx_completion_order() -> u64 {
+    MANAGEMENT_TX_COMPLETION_ORDER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn management_tx_monotonic_ns() -> u128 {
+    MANAGEMENT_TX_TELEMETRY_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn little_endian_dwords(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err("DMA evidence region is not dword aligned".into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+        .collect())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Debug, Eq, PartialEq)]
+struct ManagementTxDmaEvidence {
+    mpdu: Vec<u8>,
+    txwi: Vec<u8>,
+    txp: Vec<u8>,
+    descriptor: Vec<u8>,
+    frame_iova: u64,
+    txwi_iova: u64,
+    ring_iova: u64,
+    descriptor_index: usize,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ManagementTxDmaEvidence {
+    fn read(
+        frame: &DmaArena,
+        mpdu_len: usize,
+        txwi: &DmaArena,
+        ring: &DmaArena,
+        descriptor_index: usize,
+    ) -> Result<Self, String> {
+        let txwi_txp = txwi.read_bytes(0, 64)?;
+        Ok(Self {
+            mpdu: frame.read_bytes(0, mpdu_len)?,
+            txwi: txwi_txp[..32].to_vec(),
+            txp: txwi_txp[32..].to_vec(),
+            descriptor: ring.read_bytes(descriptor_index * 16, 16)?,
+            frame_iova: frame.iova,
+            txwi_iova: txwi.iova,
+            ring_iova: ring.iova,
+            descriptor_index,
+        })
+    }
+
+    fn hashes(&self) -> [String; 4] {
+        [
+            sha256_hex(&self.mpdu),
+            sha256_hex(&self.txwi),
+            sha256_hex(&self.txp),
+            sha256_hex(&self.descriptor),
+        ]
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn record_management_completion_received(route: &str, raw: &[u8], completion: MgmtTxCompletion) {
+    let receive_order = next_management_tx_completion_order();
+    let monotonic_ns = management_tx_monotonic_ns();
+    record_sae_stage(&management_completion_received_event(
+        route,
+        raw,
+        completion,
+        receive_order,
+        monotonic_ns,
+    ));
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn management_completion_received_event(
+    route: &str,
+    raw: &[u8],
+    completion: MgmtTxCompletion,
+    receive_order: u64,
+    monotonic_ns: u128,
+) -> String {
+    // The parsers validate these exact wire lengths but intentionally accept
+    // a larger DMA buffer.  Never publish padding or residual tail bytes.
+    let wire_len = match completion {
+        MgmtTxCompletion::Free(free) => {
+            if free.wcid.is_some() {
+                16
+            } else {
+                12
+            }
+        }
+        MgmtTxCompletion::Status(_) => 40,
+    };
+    let raw = &raw[..wire_len];
+    let raw_hex = bytes_hex(raw);
+    match completion {
+        MgmtTxCompletion::Free(free) => format!(
+            "management_tx_completion_received monotonic_ns={monotonic_ns} receive_order={receive_order} route={route} kind=tx_free raw_len={} raw={raw_hex} token={} wcid={:?} pair_word={:?} info_word={:#010x} dropped={} status={} attempts={}",
+            raw.len(),
+            free.token,
+            free.wcid,
+            free.pair_word,
+            free.info_word,
+            free.dropped,
+            free.status,
+            free.attempts,
+        ),
+        MgmtTxCompletion::Status(status) => format!(
+            "management_tx_completion_received monotonic_ns={monotonic_ns} receive_order={receive_order} route={route} kind=txs raw_len={} raw={raw_hex} pid={} wcid={} acked={}",
+            raw.len(),
+            status.pid,
+            status.wcid,
+            status.acked,
+        ),
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Debug, Eq, PartialEq)]
 struct RatePowerByteEvidence {
     total_sha256: String,
@@ -9811,25 +9964,31 @@ fn drain_rx_queue(
                 let packet_flag = (rxd0 >> 16) & 0x0f;
                 let completion = match packet_type {
                     6 => {
-                        let raw = response
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<String>();
-                        record_sae_stage(&format!(
-                            "tx_completion_raw route=mcu_normal packet_type=6 len={} bytes={raw}",
-                            response.len()
-                        ));
-                        Some(
-                            parse_mt7921_tx_free(&response)
-                                .map(MgmtTxCompletion::Free)
-                                .map_err(|error| format!("parse TX_FREE: {error:?}")),
-                        )
+                        let parsed = parse_mt7921_tx_free(&response)
+                            .map(MgmtTxCompletion::Free)
+                            .map_err(|error| format!("parse TX_FREE: {error:?}"));
+                        if let Ok(completion) = &parsed {
+                            record_management_completion_received(
+                                "mcu_normal",
+                                &response,
+                                *completion,
+                            );
+                        }
+                        Some(parsed)
                     }
-                    0 if response_len >= 40 && (rxd0 & 0xffff) as usize == response_len => Some(
-                        parse_mt7921_tx_status(&response)
+                    0 if response_len >= 40 && (rxd0 & 0xffff) as usize == response_len => {
+                        let parsed = parse_mt7921_tx_status(&response)
                             .map(MgmtTxCompletion::Status)
-                            .map_err(|error| format!("parse TXS: {error:?}")),
-                    ),
+                            .map_err(|error| format!("parse TXS: {error:?}"));
+                        if let Ok(completion) = &parsed {
+                            record_management_completion_received(
+                                "mcu_normal",
+                                &response,
+                                *completion,
+                            );
+                        }
+                        Some(parsed)
+                    }
                     _ => None,
                 };
                 if let Some(completion) = completion {
@@ -11462,23 +11621,19 @@ fn drain_data_rx_queue(
                     ));
                 }
                 let packet_type = mt7921_packet_type(&bytes);
-                if packet_type == Some(6) || packet_type == Some(0) && bytes.len() == 40 {
-                    let raw = bytes
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>();
-                    record_sae_stage(&format!(
-                        "tx_completion_raw packet_type={packet_type:?} len={} bytes={raw}",
-                        bytes.len()
-                    ));
-                }
                 let completion = match packet_type {
                     Some(6) => parse_mt7921_tx_free(&bytes)
                         .ok()
-                        .map(MgmtTxCompletion::Free),
+                        .map(MgmtTxCompletion::Free)
+                        .inspect(|completion| {
+                            record_management_completion_received("data_rx", &bytes, *completion)
+                        }),
                     Some(0) if bytes.len() == 40 => parse_mt7921_tx_status(&bytes)
                         .ok()
-                        .map(MgmtTxCompletion::Status),
+                        .map(MgmtTxCompletion::Status)
+                        .inspect(|completion| {
+                            record_management_completion_received("data_rx", &bytes, *completion)
+                        }),
                     _ => None,
                 };
                 if let Some(completion) = completion {
@@ -14303,13 +14458,41 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         self.tx_completions
             .append(&mut self.loader.mcu.tx_completions);
         for completion in self.tx_completions.drain(..) {
-            match self.mgmt_tx_outstanding.observe(completion)? {
+            let monotonic_ns = management_tx_monotonic_ns();
+            let identity = match completion {
+                MgmtTxCompletion::Free(free) => {
+                    format!("kind=tx_free token={} wcid={:?}", free.token, free.wcid)
+                }
+                MgmtTxCompletion::Status(status) => {
+                    format!("kind=txs pid={} wcid={}", status.pid, status.wcid)
+                }
+            };
+            let observation = self.mgmt_tx_outstanding.observe(completion).map_err(|error| {
+                record_sae_stage(&format!(
+                    "management_tx_completion_correlation monotonic_ns={monotonic_ns} {identity} outcome=rejected terminal_decision=none reason={error}"
+                ));
+                error
+            })?;
+            match observation {
                 MgmtTxObservation::Pending => {}
                 MgmtTxObservation::Terminal(terminal) => terminals.push(terminal),
                 MgmtTxObservation::IgnoredRetired => record_sae_stage(
                     "management_tx_completion outcome=ignored_retired reason=late_or_duplicate",
                 ),
             }
+            let (outcome, terminal_decision) = match observation {
+                MgmtTxObservation::Pending => ("correlated_pending", "none"),
+                MgmtTxObservation::Terminal(MgmtTxTerminal::Succeeded { .. }) => {
+                    ("correlated_terminal", "success")
+                }
+                MgmtTxObservation::Terminal(MgmtTxTerminal::Failed { .. }) => {
+                    ("correlated_terminal", "failure")
+                }
+                MgmtTxObservation::IgnoredRetired => ("ignored_retired", "unchanged"),
+            };
+            record_sae_stage(&format!(
+                "management_tx_completion_correlation monotonic_ns={monotonic_ns} {identity} outcome={outcome} terminal_decision={terminal_decision}"
+            ));
         }
         Ok(terminals)
     }
@@ -14333,15 +14516,17 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 }
                 return match terminal {
                     MgmtTxTerminal::Succeeded { free, status, .. } => {
+                        let monotonic_ns = management_tx_monotonic_ns();
                         record_sae_stage(&format!(
-                            "management_tx_terminal outcome=success token={token} pid={pid} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} sme_callback=success",
+                            "management_tx_terminal monotonic_ns={monotonic_ns} outcome=success token={token} pid={pid} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} sme_callback=success",
                             status.acked, free.dropped, free.status, free.attempts
                         ));
                         Ok(())
                     }
                     MgmtTxTerminal::Failed { free, status, .. } => {
+                        let monotonic_ns = management_tx_monotonic_ns();
                         record_sae_stage(&format!(
-                            "management_tx_terminal outcome=failed token={token} pid={pid} txs_present={} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} token_retired=true descriptor_retired=true transport_poisoned=false sme_callback=failure retry_owner=protocol",
+                            "management_tx_terminal monotonic_ns={monotonic_ns} outcome=failed token={token} pid={pid} txs_present={} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} token_retired=true descriptor_retired=true transport_poisoned=false sme_callback=failure retry_owner=protocol",
                             status.is_some(),
                             status.is_some_and(|status| status.acked),
                             free.dropped,
@@ -14360,8 +14545,9 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             }
             if Instant::now() >= deadline {
                 self.loader.uni_terminal_poisoned = true;
+                let monotonic_ns = management_tx_monotonic_ns();
                 record_sae_stage(&format!(
-                    "management_tx_terminal outcome=unresolved_timeout token={token} pid={pid} token_retired=false transport_poisoned=true sme_callback=failure"
+                    "management_tx_terminal monotonic_ns={monotonic_ns} outcome=unresolved_timeout token={token} pid={pid} token_retired=false transport_poisoned=true sme_callback=failure"
                 ));
                 return Err("REBOOT REQUIRED: management TX completion timed out unresolved; transport poisoned until containment".into());
             }
@@ -14658,19 +14844,85 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             };
             txwi.write_bytes(&txwi_bytes)?;
             ring.write_descriptor_at(0, descriptor);
+            if control & 0x000c == 0 {
+                let evidence =
+                    ManagementTxDmaEvidence::read(frame_arena, frame.len(), txwi, ring, 0)?;
+                let [mpdu_sha256, txwi_sha256, txp_sha256, descriptor_sha256] = evidence.hashes();
+                let txwi_dwords = little_endian_dwords(&evidence.txwi)?;
+                let txp_dwords = little_endian_dwords(&evidence.txp)?;
+                let descriptor_dwords = little_endian_dwords(&evidence.descriptor)?;
+                let subtype = control & 0x00f0;
+                let algorithm = evidence
+                    .mpdu
+                    .get(24..26)
+                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two bytes")));
+                let transaction = evidence
+                    .mpdu
+                    .get(26..28)
+                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two bytes")));
+                let group = (subtype == 0x00b0 && transaction == Some(1))
+                    .then(|| evidence.mpdu.get(30..32))
+                    .flatten()
+                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two bytes")));
+                let class = match (subtype, algorithm) {
+                    (0x00b0, Some(3)) => "sae-authentication",
+                    (0x00b0, _) => "authentication",
+                    (0x0000, _) => "association-request",
+                    (0x0020, _) => "reassociation-request",
+                    _ => "management",
+                };
+                let sequence = evidence
+                    .mpdu
+                    .get(22..24)
+                    .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two bytes")) >> 4)
+                    .unwrap_or(0);
+                let cidx = self.loader.mcu.wfdma.read(0xd4308)?;
+                let didx = self.loader.mcu.wfdma.read(0xd430c)?;
+                let monotonic_ns = management_tx_monotonic_ns();
+                record_sae_stage(&format!(
+                    "management_tx_dma_evidence monotonic_ns={monotonic_ns} source=actual_dma_readback point=immediately_before_doorbell phase=preassociation class={class} group={group:?} transaction={transaction:?} sequence={sequence} retry={} token={token} pid={pid} wcid={expected_wcid} queue=altx qidx=16 ring=0 rate=ofdm6 lifetime=0 retry_limit=15 mpdu_len={} mpdu_sha256={mpdu_sha256} txwi_len={} txwi_sha256={txwi_sha256} txwi_dwords={txwi_dwords:08x?} txp_len={} txp_sha256={txp_sha256} txp_dwords={txp_dwords:08x?} descriptor_len={} descriptor_sha256={descriptor_sha256} descriptor_dwords={descriptor_dwords:08x?} descriptor_index={} ring_base={:#010x} cidx={cidx} didx={didx} txwi_iova={:#010x} txwi_dma_len={} frame_iova={:#010x} frame_dma_len={} descriptor_buf0_iova={:#010x}",
+                    control & 0x0800 != 0,
+                    evidence.mpdu.len(),
+                    evidence.txwi.len(),
+                    evidence.txp.len(),
+                    evidence.descriptor.len(),
+                    evidence.descriptor_index,
+                    evidence.ring_iova,
+                    evidence.txwi_iova,
+                    txwi_bytes.len(),
+                    evidence.frame_iova,
+                    evidence.mpdu.len(),
+                    descriptor.buf0,
+                ));
+                let root_hex = if evidence.mpdu.len() <= ROOT_ONLY_MPDU_HEX_LIMIT {
+                    bytes_hex(&evidence.mpdu)
+                } else {
+                    "omitted-over-limit".into()
+                };
+                record_sae_root_only_stage(&format!(
+                    "management_tx_mpdu_secret point=immediately_before_doorbell token={token} pid={pid} mpdu_len={} mpdu_sha256={mpdu_sha256} hex_limit={ROOT_ONLY_MPDU_HEX_LIMIT} full_hex={root_hex}",
+                    evidence.mpdu.len(),
+                ));
+            }
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             // A doorbell failure is ambiguous until DIDX and DMA_DONE jointly
             // prove that the device consumed the complete TXWI/TXP envelope.
             outcome = MgmtTxPublicationOutcome::AmbiguousOwnership;
+            let doorbell_before_ns = management_tx_monotonic_ns();
             self.loader.mcu.wfdma.write_active_wfdma(0xd4308, 1)?;
+            let doorbell_after_ns = management_tx_monotonic_ns();
+            record_sae_stage(&format!(
+                "management_tx_doorbell token={token} pid={pid} monotonic_before_ns={doorbell_before_ns} monotonic_after_ns={doorbell_after_ns} ring=0 cidx=1"
+            ));
             loop {
                 let didx = self.loader.mcu.wfdma.read(0xd430c)?;
                 let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
                 if didx == 1 && descriptor_done {
                     outcome = MgmtTxPublicationOutcome::DescriptorConsumed;
-                    record_sae_stage(
-                        "management_tx_publication outcome=descriptor_consumed terminal=false dma_done=true ownership=device",
-                    );
+                    let monotonic_ns = management_tx_monotonic_ns();
+                    record_sae_stage(&format!(
+                        "management_tx_publication monotonic_ns={monotonic_ns} token={token} pid={pid} outcome=descriptor_consumed terminal=false dma_done=true ownership=device didx={didx}"
+                    ));
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -24721,11 +24973,12 @@ mod tests {
             .unwrap();
         let wipe = transmit.find("stage=buffer_wipe result=complete").unwrap();
         let identity = transmit.find("stage=identity result=allocated").unwrap();
-        let didx = transmit.find("read(0xd430c)").unwrap();
-        let descriptor_done = transmit.find("is_dma_done()").unwrap();
-        let descriptor_consumed = transmit
-            .find("MgmtTxPublicationOutcome::DescriptorConsumed")
-            .unwrap();
+        let didx = publish + transmit[publish..].find("read(0xd430c)").unwrap();
+        let descriptor_done = publish + transmit[publish..].find("is_dma_done()").unwrap();
+        let descriptor_consumed = publish
+            + transmit[publish..]
+                .find("MgmtTxPublicationOutcome::DescriptorConsumed")
+                .unwrap();
         let enqueue_success = transmit.rfind("Ok(())").unwrap();
         assert!(ownership < wipe && wipe < identity && identity < publish);
         assert!(publish < didx && didx < descriptor_done && descriptor_done < descriptor_consumed);
@@ -24744,6 +24997,133 @@ mod tests {
         assert!(publish < poison && poison < deferred_reclaim);
         assert!(!transmit[deferred_reclaim..].contains("reset_consumed_mgmt_tx_ring()"));
         assert!(!transmit.contains("write_active_wfdma(0xd4208"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn management_tx_evidence_hashes_actual_dma_regions() {
+        fn arena(fill: u8, iova: u64) -> DmaArena {
+            let ptr = NonNull::new(unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    PAGE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            })
+            .filter(|pointer| pointer.as_ptr() as isize != -1)
+            .unwrap();
+            unsafe { std::ptr::write_bytes(ptr.as_ptr(), fill, PAGE) };
+            DmaArena {
+                mapping: None,
+                ptr: Some(ptr),
+                len: PAGE,
+                iova,
+            }
+        }
+
+        let mut frame = arena(0x11, 0x0103_1000);
+        let mut txwi = arena(0x22, 0x0103_0000);
+        let mut ring = arena(0x33, 0x0103_2000);
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: txwi.iova as u32,
+                ctrl: 0x4040_0000,
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let evidence = ManagementTxDmaEvidence::read(&frame, 176, &txwi, &ring, 0).unwrap();
+        assert_eq!(evidence.frame_iova, frame.iova);
+        assert_eq!(evidence.txwi_iova, txwi.iova);
+        assert_eq!(evidence.ring_iova, ring.iova);
+        assert_eq!(evidence.descriptor_index, 0);
+        assert_eq!(evidence.mpdu.len(), 176);
+        assert_eq!(evidence.txwi.len(), 32);
+        assert_eq!(evidence.txp.len(), 32);
+        assert_eq!(evidence.descriptor.len(), 16);
+        let baseline = evidence.hashes();
+
+        frame.write_bytes_at(17, &[0x91]).unwrap();
+        let mpdu_mutated = ManagementTxDmaEvidence::read(&frame, 176, &txwi, &ring, 0)
+            .unwrap()
+            .hashes();
+        assert_ne!(mpdu_mutated[0], baseline[0]);
+        assert_eq!(mpdu_mutated[1..], baseline[1..]);
+
+        for offset in (0..32).step_by(4) {
+            txwi.write_bytes_at(offset, &[0xa2]).unwrap();
+            let mutated = ManagementTxDmaEvidence::read(&frame, 176, &txwi, &ring, 0)
+                .unwrap()
+                .hashes();
+            assert_ne!(mutated[1], mpdu_mutated[1], "TXWI dword {offset}");
+            assert_eq!(mutated[2..], mpdu_mutated[2..]);
+            txwi.write_bytes_at(offset, &[0x22]).unwrap();
+        }
+
+        for offset in (32..64).step_by(4) {
+            txwi.write_bytes_at(offset, &[0xb3]).unwrap();
+            let mutated = ManagementTxDmaEvidence::read(&frame, 176, &txwi, &ring, 0)
+                .unwrap()
+                .hashes();
+            assert_ne!(mutated[2], mpdu_mutated[2], "TXP dword {offset}");
+            assert_eq!(mutated[3], mpdu_mutated[3]);
+            txwi.write_bytes_at(offset, &[0x22]).unwrap();
+        }
+
+        for offset in (0..16).step_by(4) {
+            let original = ring.read_bytes(offset, 1).unwrap()[0];
+            ring.write_bytes_at(offset, &[original ^ 0xff]).unwrap();
+            let mutated = ManagementTxDmaEvidence::read(&frame, 176, &txwi, &ring, 0)
+                .unwrap()
+                .hashes();
+            assert_ne!(mutated[3], mpdu_mutated[3], "descriptor dword {offset}");
+            ring.write_bytes_at(offset, &[original]).unwrap();
+        }
+
+        for arena in [&frame, &txwi, &ring] {
+            unsafe { munmap(arena.ptr.unwrap().as_ptr(), arena.len) };
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn management_completion_telemetry_has_total_receive_order() {
+        let first = next_management_tx_completion_order();
+        let second = next_management_tx_completion_order();
+        assert!(second > first);
+
+        let source = include_str!("vfio_read.rs");
+        let receive = source
+            .split("fn record_management_completion_received(")
+            .nth(1)
+            .unwrap()
+            .split("struct RatePowerByteEvidence")
+            .next()
+            .unwrap();
+        assert!(receive.contains("monotonic_ns="));
+        assert!(receive.contains("receive_order="));
+        assert!(receive.contains("raw={raw_hex}"));
+        assert!(receive.contains("dropped={} status={} attempts={}"));
+        assert!(receive.contains("pid={} wcid={} acked={}"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn management_tx_free_public_telemetry_excludes_dma_tail() {
+        let mut raw = vec![0u8; 20];
+        raw[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+        raw[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+        raw[12..16].copy_from_slice(&((7u32 << 16) | 1).to_le_bytes());
+        raw[16..20].copy_from_slice(&[0xfe, 0xed, 0xfa, 0xce]);
+        let completion = MgmtTxCompletion::Free(parse_mt7921_tx_free(&raw).unwrap());
+
+        let public = management_completion_received_event("test", &raw, completion, 1, 2);
+        assert!(public.contains("raw_len=16"));
+        assert!(!public.contains("feedface"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -24960,7 +25340,10 @@ mod tests {
         let mut outstanding = MgmtTxOutstanding::default();
         let identity = outstanding.reserve().unwrap();
         assert_eq!(outstanding.last_identity(), Some(identity));
-        assert!(!outstanding.is_empty(), "an unresolved frame cannot be retired");
+        assert!(
+            !outstanding.is_empty(),
+            "an unresolved frame cannot be retired"
+        );
 
         let source = include_str!("vfio_read.rs");
         let wait = source
