@@ -464,6 +464,7 @@ fn client_support() -> ClientSupport {
         },
         spectrum_management: Default::default(),
         association: None,
+        association_contract: crate::client_device::AssociationRequestContract::ProductionSubsetV2,
     }
 }
 

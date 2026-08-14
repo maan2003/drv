@@ -563,6 +563,130 @@
             meta.mainProgram = "mt7921-full-firmware-validation";
           };
 
+          mt7921-native-oracle-204-diagnostic =
+            mt7921-full-firmware-validation.overrideAttrs (old: {
+              pname = "mt7921-native-oracle-204-diagnostic";
+              cargoBuildFlags = [
+                "--no-default-features"
+                "--features"
+                "fuchsia-passive,native-oracle-204-diagnostic"
+              ];
+              postFixup = ''
+                evidence_dir=$out/share/mt7921-full-firmware-validation
+                driver=$out/libexec/mt7921-full-firmware-validation
+                "$driver" --artifact-identity > "$evidence_dir/artifact-identity.json"
+                "$driver" --self-test-native-oracle-204-diagnostic > "$evidence_dir/native-oracle-204-self-test.json"
+                "$driver" --self-test-rate-power-delivery > "$evidence_dir/rate-power-self-test.jsonl"
+              '';
+              installCheckPhase = ''
+                runHook preInstallCheck
+                identity=$out/share/mt7921-full-firmware-validation/artifact-identity.json
+                selftest=$out/share/mt7921-full-firmware-validation/native-oracle-204-self-test.json
+                grep -F '"flavor":"native-oracle-204-diagnostic"' "$identity"
+                grep -F '"enabled_operation":"native-oracle-204-diagnostic"' "$identity"
+                grep -F '"association_request_contract":"native-oracle-204-diagnostic"' "$identity"
+                grep -F '"canonical_association_fixture_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' "$identity"
+                grep -F '"runtime_association_hash_policy":"exact-normalized-pre-dma"' "$identity"
+                grep -F '"diagnostic_safety_class":"unsupported-capability-advertisement-for-causal-diagnostic-only"' "$identity"
+                grep -F '"postassociation_physical_tx":"disabled"' "$identity"
+                grep -F '"m2_physical_tx":"suppressed"' "$identity"
+                grep -F '"active_capable":true' "$identity"
+                grep -F '"native_oracle_204_diagnostic_self_test":"passed"' "$selftest"
+                grep -F '"frame_len":204' "$selftest"
+                grep -F '"reject_175":true' "$selftest"
+                grep -F '"reject_119":true' "$selftest"
+                grep -F '"production_selectable":false' "$selftest"
+                strings "$out/libexec/mt7921-full-firmware-validation" | grep -F 'diagnostic_unsupported_advertisement profile=native-oracle-204-diagnostic'
+                if "$out/libexec/mt7921-full-firmware-validation" --run-one-shot-native-oracle-204-diagnostic 2>error; then exit 1; fi
+                grep -F 'unknown argument' error
+                runHook postInstallCheck
+              '';
+            });
+
+          mt7921-native-oracle-204-diagnostic-supervisor = pkgs.runCommand
+            "mt7921-native-oracle-204-diagnostic-supervisor"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+                "$out/bin/mt7921-native-oracle-204-diagnostic-supervisor" \
+                --subst-var-by runtime_path /run/current-system/sw/bin \
+                --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
+                --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
+                --subst-var-by validation_launcher ${mt7921-native-oracle-204-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by artifact_identity ${mt7921-native-oracle-204-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
+                --subst-var-by run_root /run --subst-var-by var_root /var \
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+              chmod 0755 "$out/bin/mt7921-native-oracle-204-diagnostic-supervisor"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-native-oracle-204-diagnostic-supervisor"
+              grep -F 'native-oracle-204-diagnostic' ${mt7921-native-oracle-204-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json
+            '';
+
+          mt7921-native-oracle-204-diagnostic-manifest =
+            let
+              package = mt7921-native-oracle-204-diagnostic;
+              supervisor = mt7921-native-oracle-204-diagnostic-supervisor;
+              closure = pkgs.closureInfo { rootPaths = [ package supervisor ]; };
+            in pkgs.runCommand "mt7921-native-oracle-204-diagnostic-manifest" { nativeBuildInputs = [ pkgs.coreutils pkgs.gnugrep ]; } ''
+              launcher=${package}/bin/mt7921-full-firmware-validation
+              elf=${package}/bin/mt7921-full-firmware-validation-driver
+              identity=${package}/share/mt7921-full-firmware-validation/artifact-identity.json
+              supervisor=${supervisor}/bin/mt7921-native-oracle-204-diagnostic-supervisor
+              grep -F '"diagnostic_safety_class":"unsupported-capability-advertisement-for-causal-diagnostic-only"' "$identity"
+              cat > "$out" <<EOF
+              PACKAGE=${package}
+              LAUNCHER=$launcher
+              LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
+              ELF=$elf
+              ELF_SHA256=$(sha256sum "$elf" | cut -d ' ' -f1)
+              ARTIFACT_IDENTITY=$identity
+              ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
+              SUPERVISOR=$supervisor
+              SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
+              CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
+              FLAVOR=native-oracle-204-diagnostic
+              OPERATION=native-oracle-204-diagnostic
+              ASSOCIATION_REQUEST_CONTRACT=native-oracle-204-diagnostic
+              CANONICAL_ASSOCIATION_FIXTURE_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
+              DIAGNOSTIC_SAFETY_CLASS=unsupported-capability-advertisement-for-causal-diagnostic-only
+              POSTASSOCIATION_PHYSICAL_TX=disabled
+              M2_PHYSICAL_TX=suppressed
+              ACTIVE_CAPABLE=true
+              EOF
+            '';
+
+          mt7921-native-oracle-204-diagnostic-root-entry = pkgs.runCommand
+            "mt7921-native-oracle-204-diagnostic-root-entry"
+            { nativeBuildInputs = [ pkgs.coreutils pkgs.bash ]; meta.mainProgram = "mt7921-native-oracle-204-diagnostic-root"; } ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-rate-power-evidence-root.sh} "$out/bin/mt7921-native-oracle-204-diagnostic-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by supervisor ${mt7921-native-oracle-204-diagnostic-supervisor}/bin/mt7921-native-oracle-204-diagnostic-supervisor \
+                --subst-var-by launcher ${mt7921-native-oracle-204-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by manifest ${mt7921-native-oracle-204-diagnostic-manifest} \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum --subst-var-by cut ${pkgs.coreutils}/bin/cut
+              chmod 0755 "$out/bin/mt7921-native-oracle-204-diagnostic-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-native-oracle-204-diagnostic-root"
+            '';
+
+          mt7921-native-oracle-204-diagnostic-isolation = pkgs.runCommand
+            "mt7921-native-oracle-204-diagnostic-isolation" { nativeBuildInputs = [ pkgs.gnugrep pkgs.coreutils ]; } ''
+              prod=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
+              diag=${mt7921-native-oracle-204-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json
+              ! cmp "$prod" "$diag"
+              grep -F '"association_request_contract":"mt7921-supported-subset-v2"' "$prod"
+              ! grep -q 'unsupported-capability-advertisement-for-causal-diagnostic-only' "$prod"
+              grep -F '"association_request_contract":"native-oracle-204-diagnostic"' "$diag"
+              grep -Fx 'FLAVOR=native-oracle-204-diagnostic' ${mt7921-native-oracle-204-diagnostic-manifest}
+              ! grep -q 'FLAVOR=native-oracle-204-diagnostic' ${mt7921-full-firmware-validation-manifest}
+              grep -F '${mt7921-native-oracle-204-diagnostic}/bin/mt7921-full-firmware-validation' \
+                ${mt7921-native-oracle-204-diagnostic-supervisor}/bin/mt7921-native-oracle-204-diagnostic-supervisor
+              ! grep -q '${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation' \
+                ${mt7921-native-oracle-204-diagnostic-supervisor}/bin/mt7921-native-oracle-204-diagnostic-supervisor
+              touch "$out"
+            '';
+
           mt7921-full-firmware-validation-launcher-test =
             pkgs.runCommand "mt7921-full-firmware-validation-launcher-test"
               {

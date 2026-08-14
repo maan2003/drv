@@ -156,6 +156,14 @@ const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 const SIG_ERR: usize = usize::MAX;
+#[cfg(all(
+    feature = "full-firmware-production",
+    feature = "native-oracle-204-diagnostic"
+))]
+compile_error!(
+    "production and native-oracle-204 diagnostic artifact features are mutually exclusive"
+);
+
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
 const RAM_PATH: &str = "/run/current-system/firmware/mediatek/WIFI_RAM_CODE_MT7961_1.bin.zst";
@@ -1834,6 +1842,8 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
         },
         spectrum_management: Default::default(),
         association,
+        association_contract:
+            mt7921_softmac_adapter::client_device::AssociationRequestContract::ProductionSubsetV2,
     }
 }
 
@@ -3844,7 +3854,14 @@ fn run() -> Result<(), String> {
         if env::args().len() != 2 {
             return Err("artifact identity accepts no additional arguments".into());
         }
-        let (flavor, operation, active_capable) = if cfg!(feature = "full-firmware-production") {
+        let (flavor, operation, active_capable) = if cfg!(feature = "native-oracle-204-diagnostic")
+        {
+            (
+                "native-oracle-204-diagnostic",
+                "native-oracle-204-diagnostic",
+                true,
+            )
+        } else if cfg!(feature = "full-firmware-production") {
             ("full-firmware-production", "run-one-shot-sae-auth", true)
         } else if cfg!(feature = "rate-power-evidence-only") {
             (
@@ -3855,11 +3872,39 @@ fn run() -> Result<(), String> {
         } else {
             ("unclassified", "none", false)
         };
-        if cfg!(feature = "full-firmware-production") {
+        if cfg!(feature = "full-firmware-production")
+            || cfg!(feature = "native-oracle-204-diagnostic")
+        {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
+            let (
+                association_contract,
+                canonical_hash,
+                runtime_hash_policy,
+                capability_source,
+                transformation_contract,
+                diagnostic_safety_class,
+            ) = if cfg!(feature = "native-oracle-204-diagnostic") {
+                (
+                    "native-oracle-204-diagnostic",
+                    "6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755",
+                    "exact-normalized-pre-dma",
+                    "captured-linux-6.18.40-native-oracle",
+                    "deviceops-exact-native-204-fail-closed",
+                    "unsupported-capability-advertisement-for-causal-diagnostic-only",
+                )
+            } else {
+                (
+                    "mt7921-supported-subset-v2",
+                    "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4",
+                    "input-dependent",
+                    "firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2",
+                    "device+pinned-regdb-authoritative-association-v2",
+                    "normal-production",
+                )
+            };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v2","canonical_association_fixture_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2","association_transformation_contract":"device+pinned-regdb-authoritative-association-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3877,6 +3922,57 @@ fn run() -> Result<(), String> {
                 option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified"),
             );
         }
+        return Ok(());
+    }
+    #[cfg(all(feature = "fuchsia-passive", feature = "native-oracle-204-diagnostic"))]
+    if operation_argument.as_deref() == Some("--self-test-native-oracle-204-diagnostic") {
+        if env::args().len() != 2 {
+            return Err("native oracle self-test accepts no additional arguments".into());
+        }
+        let raw = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
+            .map_err(|error| format!("native oracle raw fixture: {error}"))?;
+        let profile = fuchsia_softmac_port::linux_61840_oracle_profile();
+        let frame =
+            mt7921_softmac_adapter::client_device::prepare_native_oracle_204_diagnostic_frame(
+                &raw,
+                Some(&profile),
+            )
+            .map_err(|status| format!("native oracle DeviceOps preparation: {status}"))?
+            .ok_or("native oracle DeviceOps did not classify association request")?;
+        mt7921_softmac_adapter::client_device::validate_native_oracle_204_frame(&frame)
+            .map_err(|status| format!("native oracle exact hash: {status}"))?;
+        let capability = fixed_mt7921_rate_power_capability();
+        let query = query_from_capabilities(capability, &candidate_channels(capability));
+        let regulatory = regulatory_rate_power_snapshot_from_regdb_v20(
+            include_bytes!("../../../mt7921-core/tests/fixtures/regulatory.db"),
+            0,
+            *b"00",
+            capability,
+            [7; 32],
+        )
+        .map_err(|error| format!("regdb: {error:?}"))?;
+        let production_profile = mt7921_softmac_adapter::client_device::production_association_profile_from_query_and_regulatory(
+            &query,
+            fidl_ieee80211::WlanBand::FiveGhz,
+            36,
+            &regulatory,
+        )
+        .map_err(|status| format!("production profile: {status}"))?;
+        let production = mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+            &raw,
+            Some(&production_profile),
+        )
+        .map_err(|status| format!("production fixture: {status}"))?
+        .ok_or("production association missing")?;
+        if mt7921_softmac_adapter::client_device::validate_native_oracle_204_frame(&production)
+            .is_ok()
+            || mt7921_softmac_adapter::client_device::validate_native_oracle_204_frame(&raw).is_ok()
+        {
+            return Err("native oracle exact guard accepted 175/119 control".into());
+        }
+        println!(
+            "{{\"native_oracle_204_diagnostic_self_test\":\"passed\",\"frame_len\":204,\"normalized_sha256\":\"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755\",\"reject_175\":true,\"reject_119\":true,\"production_selectable\":false}}"
+        );
         return Ok(());
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -4219,7 +4315,9 @@ fn run() -> Result<(), String> {
         if env::args().len() != 2 {
             return Err("full-firmware preflight accepts no additional arguments".into());
         }
-        if !cfg!(feature = "full-firmware-production") {
+        if !cfg!(feature = "full-firmware-production")
+            && !cfg!(feature = "native-oracle-204-diagnostic")
+        {
             return Err("full-firmware preflight requires the production artifact flavor".into());
         }
         let operation = Operation::RunOneShotPowerSetup;
@@ -4689,7 +4787,8 @@ fn run() -> Result<(), String> {
     }
     #[cfg(feature = "fuchsia-passive")]
     if packaged_integration {
-        if !cfg!(feature = "full-firmware-production")
+        if !(cfg!(feature = "full-firmware-production")
+            || cfg!(feature = "native-oracle-204-diagnostic"))
             || operation != Operation::RunOneShotSaeAuth
             || production_policy.is_none()
             || _rate_power_evidence.as_ref().map(Vec::len) != Some(8)
@@ -6881,22 +6980,21 @@ fn run() -> Result<(), String> {
                                     query.sta_addr =
                                         Some(power_target.as_ref().expect("SAE target").3.bytes());
                                     let mut support = live_client_support(query);
-                                    support.association = Some(
-                                        mt7921_softmac_adapter::client_device::production_association_profile_from_query_and_regulatory(
-                                            &support.query,
-                                            fidl_ieee80211::WlanBand::FiveGhz,
-                                            target_bss
-                                                .as_ref()
-                                                .ok_or("target BSS was not retained")?
-                                                .primary
-                                                .number,
-                                            &rate_power_snapshot
-                                                .as_ref()
-                                                .ok_or("production validation requires a frozen regulatory snapshot")?
-                                                .snapshot,
-                                        )
-                                        .map_err(|_| "build pinned-regdb production association profile failed")?,
-                                    );
+                                    if cfg!(feature = "native-oracle-204-diagnostic") {
+                                        support.association = Some(
+                                            fuchsia_softmac_port::linux_61840_oracle_profile(),
+                                        );
+                                        support.association_contract = mt7921_softmac_adapter::client_device::AssociationRequestContract::NativeOracle204Diagnostic;
+                                    } else {
+                                        support.association = Some(
+                                            mt7921_softmac_adapter::client_device::production_association_profile_from_query_and_regulatory(
+                                                &support.query,
+                                                fidl_ieee80211::WlanBand::FiveGhz,
+                                                target_bss.as_ref().ok_or("target BSS was not retained")?.primary.number,
+                                                &rate_power_snapshot.as_ref().ok_or("production validation requires a frozen regulatory snapshot")?.snapshot,
+                                            ).map_err(|_| "build pinned-regdb production association profile failed")?,
+                                        );
+                                    }
                                     let device_info = wlan_mlme::mlme_device_info_from_softmac(
                                         support.query.clone(),
                                     )
@@ -13653,9 +13751,23 @@ impl Mt7921ClientEffects for LiveClientEffects {
     ) {
         let mut normalized = final_frame.to_vec();
         normalized[22..24].fill(0);
+        if cfg!(feature = "native-oracle-204-diagnostic") {
+            record_sae_stage(
+                "diagnostic_unsupported_advertisement profile=native-oracle-204-diagnostic scope=causal-passive-m1-only rrm=true extended_capabilities=true fils_ip_assignment=true production=false",
+            );
+        }
         record_sae_stage(&format!(
-            "association_capability_transformation source={} contract=device+pinned-regdb-authoritative-association-v2 base_ht_sha256={} base_vht_sha256={} authoritative_ht_sha256={} authoritative_vht_sha256={} final_ht_sha256={} final_vht_sha256={} normalized_frame_sha256={}",
-            mt7921_softmac_adapter::client_device::ASSOCIATION_CAPABILITY_INPUT_SOURCE,
+            "association_capability_transformation source={} contract={} base_ht_sha256={} base_vht_sha256={} authoritative_ht_sha256={} authoritative_vht_sha256={} final_ht_sha256={} final_vht_sha256={} normalized_frame_sha256={}",
+            if cfg!(feature = "native-oracle-204-diagnostic") {
+                "captured-linux-6.18.40-native-oracle"
+            } else {
+                mt7921_softmac_adapter::client_device::ASSOCIATION_CAPABILITY_INPUT_SOURCE
+            },
+            if cfg!(feature = "native-oracle-204-diagnostic") {
+                "deviceops-exact-native-204-fail-closed"
+            } else {
+                "device+pinned-regdb-authoritative-association-v2"
+            },
             sha256_hex(&evidence.base_ht),
             sha256_hex(&evidence.base_vht),
             sha256_hex(&evidence.authoritative_ht),
