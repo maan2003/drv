@@ -1113,6 +1113,7 @@ fn run_contained_dma_resource_round_trip(
                             associated_edca_programmed: false,
                             e2e93_probe: false,
                             e2e94_probe: false,
+                            validation_tx_gate: None,
                             authoritative_rate_power: None,
                             mgmt_txwi: &mut active.mgmt_txwi,
                             mgmt_frame: &mut active.mgmt_frame,
@@ -3521,8 +3522,65 @@ fn run_production_validation_self_test() -> Result<(), String> {
         36,
         [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
     )?;
+    let target = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
+    let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+    let management = |control: u16, body: &[u8]| {
+        let mut frame = control.to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&target);
+        frame.extend_from_slice(&client);
+        frame.extend_from_slice(&target);
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(body);
+        frame
+    };
+    let sae_commit = management(0x00b0, &[3, 0, 1, 0]);
+    let sae_confirm = management(0x00b0, &[3, 0, 2, 0]);
+    let association = management(0x0000, &[0x31, 0x15, 10, 0]);
+    let deauthentication = management(0x00c0, &[3, 0]);
+    let mut gate = ProductionValidationTxGate::new(target, client);
+    if gate.authorize_public(&sae_commit, 1) != Some("sae-authentication")
+        || gate.consume_physical(&sae_confirm).is_some()
+        || gate.consume_physical(&sae_commit).is_some()
+    {
+        return Err("production validation TX guard did not consume an exact-byte mismatch".into());
+    }
+    for (frame, class) in [
+        (&sae_commit, "sae-authentication"),
+        (&sae_confirm, "sae-authentication"),
+        (&association, "association-request"),
+    ] {
+        if gate.authorize_public(frame, 1) != Some(class)
+            || gate.consume_physical(frame) != Some(class)
+        {
+            return Err(format!("production validation TX guard rejected {class}"));
+        }
+    }
+    if gate.authorize_public(&deauthentication, 1).is_some()
+        || gate.consume_physical(&sae_commit).is_some()
+        || gate.authorize_public(&sae_commit, 2).is_some()
+    {
+        return Err("production validation TX guard admitted deauthentication".into());
+    }
+    gate.enter_post_association()
+        .map_err(|_| "enter post-association validation TX phase failed")?;
+    if gate.authorize_public(&sae_commit, 1).is_some()
+        || gate.authorize_public(&association, 1).is_some()
+        || gate.consume_physical(&sae_commit).is_some()
+    {
+        return Err("post-association validation TX guard admitted management TX".into());
+    }
+    gate.m1_delivered()
+        .map_err(|_| "enter M1-delivered validation TX phase failed")?;
+    gate.m2_intercepted()
+        .map_err(|_| "complete validation TX phase failed")?;
+    if gate.authorize_public(&sae_confirm, 1).is_some()
+        || gate.consume_physical(&sae_confirm).is_some()
+    {
+        return Err("completed validation TX guard admitted late SAE".into());
+    }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3622,7 +3680,7 @@ fn run() -> Result<(), String> {
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -4250,7 +4308,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -5962,6 +6020,7 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                validation_tx_gate: None,
                                 authoritative_rate_power: rate_power_snapshot.as_ref().map(
                                     |frozen| {
                                         (frozen.snapshot.clone(), frozen.expected_source_sha256)
@@ -6021,6 +6080,13 @@ fn run() -> Result<(), String> {
                                     RunPhase::FirmwareReady,
                                 )?;
                             validate_production_prefix_sequence(e2e94_probe, loader.sequence)?;
+                            let validation_tx_gate = e2e94_probe.then(|| {
+                                let target = power_target.as_ref().expect("SAE target");
+                                Arc::new(Mutex::new(ProductionValidationTxGate::new(
+                                    target.0,
+                                    target.3.bytes(),
+                                )))
+                            });
                             let mut mechanics = VfioPassiveMechanics {
                                 loader,
                                 ledger: capsule
@@ -6057,6 +6123,7 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                validation_tx_gate: validation_tx_gate.clone(),
                                 authoritative_rate_power: rate_power_snapshot.as_ref().map(
                                     |frozen| {
                                         (frozen.snapshot.clone(), frozen.expected_source_sha256)
@@ -6358,6 +6425,7 @@ fn run() -> Result<(), String> {
                                     let shared = Arc::new(Mutex::new(LiveClientState {
                                         selection,
                                         production_policy: Some(production_policy),
+                                        validation_tx_gate: validation_tx_gate.clone(),
                                         ..Default::default()
                                     }));
                                     let target_rcpi = target_bss
@@ -12009,6 +12077,151 @@ impl ValidatedCredentialPolicyBinding {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProductionValidationTxPhase {
+    #[default]
+    PreAssociation,
+    PostAssociationObservingM1,
+    M1DeliveredAwaitingM2Intent,
+    Complete,
+    Failed,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Debug)]
+struct ProductionValidationTxGate {
+    phase: ProductionValidationTxPhase,
+    target: [u8; 6],
+    client: [u8; 6],
+    generation: Option<u64>,
+    pending_physical: Option<(Vec<u8>, &'static str)>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ProductionValidationTxGate {
+    fn new(target: [u8; 6], client: [u8; 6]) -> Self {
+        Self {
+            phase: ProductionValidationTxPhase::PreAssociation,
+            target,
+            client,
+            generation: None,
+            pending_physical: None,
+        }
+    }
+
+    fn preassociation_frame_class(&self, bytes: &[u8]) -> Option<&'static str> {
+        let control = bytes
+            .get(..2)
+            .map(|field| u16::from_le_bytes([field[0], field[1]]))?;
+        if control & 0x000c != 0
+            || control & 0x4000 != 0
+            || bytes.get(4..10) != Some(&self.target)
+            || bytes.get(10..16) != Some(&self.client)
+            || bytes.get(16..22) != Some(&self.target)
+        {
+            return None;
+        }
+        match control & 0x00fc {
+            0x00b0
+                if bytes.get(24..26) == Some(&[3, 0])
+                    && matches!(bytes.get(26..28), Some([1, 0] | [2, 0])) =>
+            {
+                Some("sae-authentication")
+            }
+            0x0000 if bytes.len() >= 28 => Some("association-request"),
+            _ => None,
+        }
+    }
+
+    fn authorize_public(&mut self, bytes: &[u8], generation: u64) -> Option<&'static str> {
+        if self.phase != ProductionValidationTxPhase::PreAssociation
+            || self.generation.is_some_and(|current| current != generation)
+        {
+            return None;
+        }
+        let class = self.preassociation_frame_class(bytes)?;
+        self.generation = Some(generation);
+        self.pending_physical = Some((bytes.to_vec(), class));
+        Some(class)
+    }
+
+    fn consume_physical(&mut self, bytes: &[u8]) -> Option<&'static str> {
+        if self.phase != ProductionValidationTxPhase::PreAssociation {
+            return None;
+        }
+        let (pending, class) = self.pending_physical.take()?;
+        (pending == bytes).then_some(class)
+    }
+
+    fn enter_post_association(&mut self) -> Result<(), ()> {
+        if self.phase != ProductionValidationTxPhase::PreAssociation {
+            self.phase = ProductionValidationTxPhase::Failed;
+            return Err(());
+        }
+        self.pending_physical = None;
+        self.phase = ProductionValidationTxPhase::PostAssociationObservingM1;
+        Ok(())
+    }
+
+    fn m1_delivered(&mut self) -> Result<(), ()> {
+        if self.phase != ProductionValidationTxPhase::PostAssociationObservingM1 {
+            self.phase = ProductionValidationTxPhase::Failed;
+            return Err(());
+        }
+        self.phase = ProductionValidationTxPhase::M1DeliveredAwaitingM2Intent;
+        Ok(())
+    }
+
+    fn m2_intercepted(&mut self) -> Result<(), ()> {
+        if self.phase != ProductionValidationTxPhase::M1DeliveredAwaitingM2Intent {
+            return Err(());
+        }
+        self.phase = ProductionValidationTxPhase::Complete;
+        Ok(())
+    }
+
+    fn fail(&mut self) {
+        self.pending_physical = None;
+        self.phase = ProductionValidationTxPhase::Failed;
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct ProductionAssociationPhaseTransition {
+    gate: Option<Arc<Mutex<ProductionValidationTxGate>>>,
+    committed: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl ProductionAssociationPhaseTransition {
+    fn new(gate: Option<Arc<Mutex<ProductionValidationTxGate>>>) -> Self {
+        Self {
+            gate,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) -> Result<(), ()> {
+        if let Some(gate) = self.gate.as_ref() {
+            gate.lock().unwrap().enter_post_association()?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for ProductionAssociationPhaseTransition {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some(gate) = self.gate.as_ref() {
+                gate.lock().unwrap().fail();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 #[derive(Default)]
 struct LiveClientState {
     selection: ClientTargetBssLease,
@@ -12020,6 +12233,7 @@ struct LiveClientState {
     passive_m1_pending: bool,
     passive_m1_deliveries: u64,
     passive_m2_intents: u64,
+    validation_tx_gate: Option<Arc<Mutex<ProductionValidationTxGate>>>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -12379,6 +12593,17 @@ impl Mt7921ClientEffects for LiveClientEffects {
     fn eapol_ind_delivered_to_sme(&mut self) {
         let mut state = self.state.lock().unwrap();
         if state.passive_m1_pending && state.passive_m1_deliveries == 0 {
+            let phase_advanced = state
+                .validation_tx_gate
+                .as_ref()
+                .is_some_and(|gate| gate.lock().unwrap().m1_delivered().is_ok());
+            if !phase_advanced {
+                state.passive_m1_pending = false;
+                record_sae_stage(
+                    "passive_m1_observation result=blocked reason=tx_phase_transition sme_delivery=complete public_tx_count=0",
+                );
+                return;
+            }
             state.passive_m1_pending = false;
             state.passive_m1_deliveries = 1;
             state.validation_complete = true;
@@ -12402,6 +12627,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
         state.channel.revoke_authorization();
     }
     fn revoke_lifecycle(&mut self) {
+        if let Some(gate) = self.state.lock().unwrap().validation_tx_gate.as_ref() {
+            gate.lock().unwrap().fail();
+        }
         *self.state.lock().unwrap() = LiveClientState::default();
         // Device reset/stop owns transport containment. Do not issue new DMA
         // after lifecycle revocation; forget only after the owner contained it.
@@ -12505,11 +12733,31 @@ impl Mt7921ClientEffects for LiveClientEffects {
         {
             return Err(zx::Status::ACCESS_DENIED);
         }
+        let channel_generation = channel
+            .as_ref()
+            .expect("authorized channel was checked")
+            .generation;
         if management {
             if (sae && bytes.get(24..26) != Some(&[3, 0]))
                 || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
             {
                 return Err(zx::Status::ACCESS_DENIED);
+            }
+            if self.suppress_eapol_liveness {
+                let class = state.validation_tx_gate.as_ref().and_then(|gate| {
+                    gate.lock()
+                        .unwrap()
+                        .authorize_public(bytes, channel_generation)
+                });
+                let Some(class) = class else {
+                    record_sae_stage(
+                        "validation_tx_gate phase=preassociation result=blocked reason=frame_class_or_phase frame_published=false",
+                    );
+                    return Err(zx::Status::ACCESS_DENIED);
+                };
+                record_sae_stage(&format!(
+                    "validation_tx_gate phase=preassociation result=admitted class={class} ownership=pinned_sme_mlme generation=current"
+                ));
             }
             if sae && bytes.get(26..28) == Some(&[1, 0]) {
                 record_sae_commit_structure(bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
@@ -12645,9 +12893,19 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             if state.passive_m2_intents != 0 {
                 record_sae_stage(
-                    "passive_m1_tx_intercept result=duplicate_suppressed public_tx_count=0",
+                    "passive_m1_tx_intercept result=duplicate_blocked public_tx_count=0",
                 );
-                return Ok(());
+                return Err(zx::Status::ACCESS_DENIED);
+            }
+            let phase_advanced = state
+                .validation_tx_gate
+                .as_ref()
+                .is_some_and(|gate| gate.lock().unwrap().m2_intercepted().is_ok());
+            if !phase_advanced {
+                record_sae_stage(
+                    "passive_m1_tx_intercept result=blocked reason=tx_phase public_tx_count=0",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
             }
             let template = linux_qos_eapol_control_port_reference(bytes, 0, 0, 3)
                 .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
@@ -12779,6 +13037,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
         configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        let mut validation_phase_transition =
+            ProductionAssociationPhaseTransition::new(self.suppress_eapol_liveness.then(|| {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .validation_tx_gate
+                    .clone()
+                    .expect("production validation TX gate")
+            }));
         let Some(peer) = configuration.bssid else {
             record_sae_stage("association_config_validation result=invalid clause=missing_bssid");
             return Err(zx::Status::INVALID_ARGS);
@@ -13007,8 +13274,14 @@ impl Mt7921ClientEffects for LiveClientEffects {
             "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
         );
         if self.suppress_eapol_liveness {
+            if validation_phase_transition.commit().is_err() {
+                record_sae_stage(
+                    "validation_tx_phase transition=failed from=preassociation to=post_association_observing_m1",
+                );
+                return Err(zx::Status::BAD_STATE);
+            }
             record_sae_stage(
-                "passive_m1_observation boundary=post_assoc_tail result=ready frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
+                "passive_m1_observation boundary=post_assoc_tail result=ready tx_phase=post_association_observing_m1 frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
             );
             return Ok(());
         }
@@ -13481,15 +13754,28 @@ impl Mt7921ClientEffects for LiveClientEffects {
             if eapol && self.suppress_eapol_liveness {
                 let mut state = self.state.lock().unwrap();
                 state.passive_eapol_observed += 1;
-                if m1 && state.passive_m1_deliveries == 0 && !state.passive_m1_pending {
+                let observing_m1 = state.validation_tx_gate.as_ref().is_some_and(|gate| {
+                    gate.lock().unwrap().phase
+                        == ProductionValidationTxPhase::PostAssociationObservingM1
+                });
+                if m1
+                    && observing_m1
+                    && state.passive_m1_deliveries == 0
+                    && !state.passive_m1_pending
+                {
                     state.passive_m1_pending = true;
                     record_sae_stage(&format!(
                         "passive_m1_observation result=recognized gate=admitted sme_delivery=pending queue_order={} duplicate=false frame_tx_disabled_before_m1=true public_tx_count=0",
                         state.passive_rx_observed
                     ));
-                } else if m1 {
+                } else if m1 && observing_m1 {
                     record_sae_stage(&format!(
                         "passive_m1_observation result=duplicate gate=admitted sme_delivery=pending queue_order={} duplicate=true action=none public_tx_count=0",
+                        state.passive_rx_observed
+                    ));
+                } else if m1 {
+                    record_sae_stage(&format!(
+                        "passive_m1_observation result=blocked gate=tx_phase sme_delivery=none queue_order={} public_tx_count=0",
                         state.passive_rx_observed
                     ));
                 }
@@ -13580,6 +13866,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     associated_edca_programmed: bool,
     e2e93_probe: bool,
     e2e94_probe: bool,
+    validation_tx_gate: Option<Arc<Mutex<ProductionValidationTxGate>>>,
     authoritative_rate_power: Option<(RegulatoryRatePowerSnapshot, [u8; 32])>,
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
@@ -14754,14 +15041,22 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             }
             .trace_peer_wtbl_dw5("immediately_pre_data");
         }
-        let validation_trigger = if self.e2e94_probe {
-            record_sae_stage(
-                "passive_m1_tx_boundary violation=physical_path_reached frame_published=false",
-            );
-            return Err(zx::Status::ACCESS_DENIED);
-        } else {
-            eapol && !self.e2e81_probe_done
-        };
+        if self.e2e94_probe {
+            let class = self
+                .validation_tx_gate
+                .as_ref()
+                .and_then(|gate| gate.lock().unwrap().consume_physical(bytes));
+            let Some(class) = class else {
+                record_sae_stage(
+                    "passive_m1_tx_boundary result=blocked reason=frame_class_or_phase frame_published=false public_tx_count=0",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
+            };
+            record_sae_stage(&format!(
+                "passive_m1_tx_boundary result=admitted phase=preassociation class={class} ownership=pinned_sme_mlme physical_tx=true"
+            ));
+        }
+        let validation_trigger = !self.e2e94_probe && eapol && !self.e2e81_probe_done;
         if validation_trigger {
             // Same-session source-exact AC discriminator. Validation invokes
             // this only after the complete post-association firmware tail;
@@ -17045,6 +17340,9 @@ mod tests {
         )
         .unwrap();
         let mut state = selected_live_state(peer, physical);
+        state.validation_tx_gate = Some(Arc::new(Mutex::new(ProductionValidationTxGate::new(
+            peer, client,
+        ))));
         state.production_policy = Some(
             ProductionValidationPolicy::bind(
                 b"ph1",
@@ -18296,6 +18594,84 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn production_validation_tx_gate_scopes_physical_tx_to_required_preassociation_frames() {
+        let target = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
+        let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+        let management = |control: u16, body: &[u8]| {
+            let mut frame = control.to_le_bytes().to_vec();
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(&target);
+            frame.extend_from_slice(&client);
+            frame.extend_from_slice(&target);
+            frame.extend_from_slice(&[0, 0]);
+            frame.extend_from_slice(body);
+            frame
+        };
+        let commit = management(0x00b0, &[3, 0, 1, 0]);
+        let confirm = management(0x00b0, &[3, 0, 2, 0]);
+        let association = management(0x0800, &[0x31, 0x15, 10, 0]);
+        let deauthentication = management(0x00c0, &[3, 0]);
+        let mut qos_null = vec![0xc8, 0x01, 0, 0];
+        qos_null.extend_from_slice(&target);
+        qos_null.extend_from_slice(&client);
+        qos_null.extend_from_slice(&target);
+        qos_null.extend_from_slice(&[0, 0, 0, 0]);
+        let eapol = eapol_start_frame(client, target, true);
+
+        let mut gate = ProductionValidationTxGate::new(target, client);
+        assert!(gate.consume_physical(&commit).is_none());
+        assert_eq!(
+            gate.authorize_public(&commit, 7),
+            Some("sae-authentication")
+        );
+        assert!(gate.consume_physical(&confirm).is_none());
+        assert!(gate.consume_physical(&commit).is_none());
+        for (frame, class) in [
+            (&commit, "sae-authentication"),
+            (&confirm, "sae-authentication"),
+            (&association, "association-request"),
+        ] {
+            assert_eq!(gate.authorize_public(frame, 7), Some(class));
+            assert_eq!(gate.consume_physical(frame), Some(class));
+            assert!(gate.consume_physical(frame).is_none());
+        }
+        assert!(gate.authorize_public(&commit, 8).is_none());
+        assert!(gate.authorize_public(&deauthentication, 7).is_none());
+        assert!(gate.authorize_public(&qos_null, 7).is_none());
+        assert!(gate.authorize_public(&eapol, 7).is_none());
+
+        gate.enter_post_association().unwrap();
+        assert_eq!(
+            gate.phase,
+            ProductionValidationTxPhase::PostAssociationObservingM1
+        );
+        for frame in [
+            &commit,
+            &confirm,
+            &association,
+            &deauthentication,
+            &qos_null,
+            &eapol,
+        ] {
+            assert!(gate.authorize_public(frame, 7).is_none());
+            assert!(gate.consume_physical(frame).is_none());
+        }
+        gate.m1_delivered().unwrap();
+        assert_eq!(
+            gate.phase,
+            ProductionValidationTxPhase::M1DeliveredAwaitingM2Intent
+        );
+        assert!(gate.authorize_public(&eapol, 7).is_none());
+        assert!(gate.consume_physical(&eapol).is_none());
+        gate.m2_intercepted().unwrap();
+        assert_eq!(gate.phase, ProductionValidationTxPhase::Complete);
+        assert!(gate.authorize_public(&commit, 7).is_none());
+        assert!(gate.consume_physical(&commit).is_none());
+        assert_eq!(gate.m2_intercepted(), Err(()));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn passive_validation_drains_beacon_backlog_then_admits_one_closed_port_m1() {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
@@ -18398,6 +18774,19 @@ mod tests {
             Err(zx::Status::BAD_STATE)
         );
         assert_eq!(drift_io.tx.len(), before);
+        assert_eq!(
+            drift
+                .state
+                .lock()
+                .unwrap()
+                .validation_tx_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .phase,
+            ProductionValidationTxPhase::Failed
+        );
 
         let mut incomplete = validation_effects();
         let mut incomplete_io = TestClientIo {
@@ -18415,6 +18804,19 @@ mod tests {
             Err(zx::Status::IO)
         );
         assert_eq!(incomplete_io.tx.len(), before);
+        assert_eq!(
+            incomplete
+                .state
+                .lock()
+                .unwrap()
+                .validation_tx_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .phase,
+            ProductionValidationTxPhase::Failed
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -18473,10 +18875,11 @@ mod tests {
         assert!(passive_validation_succeeded(&effects.state.lock().unwrap()));
         assert_eq!(io.tx.len(), before);
 
-        // A duplicate exact M2 remains suppressed and does not count twice.
-        effects
-            .send_wlan_frame(&m2, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
-            .unwrap();
+        // A duplicate exact M2 is blocked after completion and does not count twice.
+        assert_eq!(
+            effects.send_wlan_frame(&m2, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
+            Err(zx::Status::ACCESS_DENIED)
+        );
         assert_eq!(effects.state.lock().unwrap().passive_m2_intents, 1);
         assert_eq!(io.tx.len(), before);
 
