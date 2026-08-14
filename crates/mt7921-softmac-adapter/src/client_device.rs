@@ -237,12 +237,13 @@ impl Mt7921AssociationState {
 /// unchanged and never retries them; production effects may consume their
 /// private bounded-validation completion sentinel before this boundary.
 pub trait Mt7921ClientEffects {
-    /// Reports that a bounded validation transmission completed successfully.
-    /// Production effects leave this false unless their physical completion
-    /// gate has consumed the single allowed validation frame.
+    /// Reports that the bounded validation observation reached the SME.
     fn validation_complete(&self) -> bool {
         false
     }
+
+    /// Confirms that an EAPOL indication was synchronously dispatched to SME.
+    fn eapol_ind_delivered_to_sme(&mut self) {}
 
     /// Immediately poison scan-derived authority in every shared TX handle.
     fn revoke_scan(&mut self);
@@ -470,6 +471,14 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
     pub fn validation_complete(&self) -> bool {
         self.backend.lock().unwrap().effects.validation_complete()
+    }
+
+    fn eapol_ind_delivered_to_sme(&self) {
+        self.backend
+            .lock()
+            .unwrap()
+            .effects
+            .eapol_ind_delivered_to_sme();
     }
 
     /// Borrow the already-connected pinned MLME as the only associated data
@@ -785,12 +794,16 @@ where
                             safe_sae_group(frame)
                         );
                     }
-                    if matches!(&event, fidl_mlme::MlmeEvent::EapolInd { .. }) {
+                    let eapol_ind = matches!(&event, fidl_mlme::MlmeEvent::EapolInd { .. });
+                    if eapol_ind {
                         println!(
                             "client_eapol_stage=mlme_indication_forwarded_to_sme controlled_port_closed_allowed=true"
                         );
                     }
                     Station::on_mlme_event(&mut self.sme, event);
+                    if eapol_ind {
+                        self.runner.eapol_ind_delivered_to_sme();
+                    }
                     progressed = true;
                     cycle_progressed = true;
                 }

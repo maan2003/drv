@@ -1261,6 +1261,8 @@
                 MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
                 GENERATED_CRATE_SOURCE_SHA256=$generated_source
                 ACTIVE_CAPABLE=true
+                OBSERVATION_MODE=passive-m1-observation
+                FRAME_TX_DISABLED_BEFORE_M1=true
                 EOF
                 runHook postInstall
               '';
@@ -1284,6 +1286,8 @@
                 grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$manifest"
                 grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$manifest"
                 grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
+                grep -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest"
+                grep -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest"
                 grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
                 grep -Fx '  exec /run/wrappers/bin/sudo -n "$runner" --plan' "$entry"
                 grep -Fx 'exec /run/wrappers/bin/sudo -n "$runner"' "$entry"

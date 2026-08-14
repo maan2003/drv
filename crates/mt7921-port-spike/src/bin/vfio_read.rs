@@ -12020,6 +12020,7 @@ struct LiveClientState {
     validation_complete: bool,
     passive_rx_observed: u64,
     passive_eapol_observed: u64,
+    passive_m1_pending: bool,
     passive_m1_deliveries: u64,
     passive_m2_intents: u64,
 }
@@ -12362,6 +12363,19 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 impl Mt7921ClientEffects for LiveClientEffects {
     fn validation_complete(&self) -> bool {
         self.state.lock().unwrap().validation_complete
+    }
+
+    fn eapol_ind_delivered_to_sme(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.passive_m1_pending && state.passive_m1_deliveries == 0 {
+            state.passive_m1_pending = false;
+            state.passive_m1_deliveries = 1;
+            state.validation_complete = true;
+            record_sae_stage(&format!(
+                "passive_m1_observation result=delivered gate=admitted sme_delivery=complete queue_order={} duplicate=false frame_tx_disabled_before_m1=true public_tx_count=0",
+                state.passive_rx_observed
+            ));
+        }
     }
 
     fn prepare_runtime_handoff(
@@ -13450,9 +13464,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
             if eapol && self.suppress_eapol_liveness {
                 let mut state = self.state.lock().unwrap();
                 state.passive_eapol_observed += 1;
-                if m1 && state.passive_m1_deliveries == 0 {
-                    state.passive_m1_deliveries = 1;
-                    state.validation_complete = true;
+                if m1 && state.passive_m1_deliveries == 0 && !state.passive_m1_pending {
+                    state.passive_m1_pending = true;
                     record_sae_stage(&format!(
                         "passive_m1_observation result=recognized gate=admitted sme_delivery=pending queue_order={} duplicate=false frame_tx_disabled_before_m1=true public_tx_count=0",
                         state.passive_rx_observed
@@ -18284,6 +18297,8 @@ mod tests {
         }
         assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, m1);
         assert!(!effects.firmware.controlled_port_open);
+        assert!(!effects.validation_complete());
+        effects.eapol_ind_delivered_to_sme();
         assert!(effects.validation_complete());
         assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 12);
         assert_eq!(effects.state.lock().unwrap().passive_m1_deliveries, 1);
