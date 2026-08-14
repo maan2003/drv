@@ -2192,7 +2192,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         generation: 1,
     };
     rx_gate
-        .bind_join(peer, rx_channel, 100)
+        .bind_join(peer, rx_channel, 100, 2)
         .map_err(|error| format!("self-test E2E48 bind: {error}"))?;
     let mut activation_commands = Vec::new();
     rx_gate
@@ -2277,7 +2277,6 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let activation_commands = std::cell::RefCell::new(activation_commands);
     rx_gate
         .complete_post_assoc_interface(
-            2,
             ClientPhysicalChannel {
                 band: 1,
                 primary: 36,
@@ -2303,7 +2302,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let expected_preauth =
         mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, peer_wcid.get(), peer, 100)
             .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
-    let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, true, true)
+    let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, 2, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(
         3,
@@ -3492,6 +3491,7 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
 
 #[cfg(feature = "fuchsia-passive")]
 fn run_production_validation_self_test() -> Result<(), String> {
+    validate_bss_wire_contract()?;
     let mut audit = RatePowerDeliveryAudit::default();
     for command in [
         PassiveMcuCommand::EepromBufferMode,
@@ -3593,9 +3593,46 @@ fn run_production_validation_self_test() -> Result<(), String> {
         return Err("completed validation TX guard admitted late SAE".into());
     }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON}}}"#
     );
     Ok(())
+}
+
+const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_bss_wire_contract() -> Result<(), String> {
+    let [_, initial] =
+        encode_client_interface_commands([0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a], true, 11, 12)?;
+    let associated = encode_client_bss_command(
+        7,
+        0,
+        [0xf2, 0xa3, 0x18, 0x4f, 0x30, 0x76],
+        36,
+        100,
+        2,
+        true,
+        true,
+    )?;
+    let bcnft = encode_client_post_assoc_beacon_timing_command(8, 0, 100, 2)?;
+    let valid = initial.len() == 84
+        && initial[54..56] == [32, 0]
+        && sha256_hex(&initial)
+            == "7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f"
+        && sha256_hex(&initial[48..])
+            == "c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"
+        && associated.len() == 92
+        && associated[54..56] == [32, 0]
+        && associated[76] == 2
+        && associated[84..88] == [15, 0, 8, 0]
+        && sha256_hex(&associated)
+            == "6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"
+        && sha256_hex(&associated[48..])
+            == "4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"
+        && bcnft[58] == associated[76];
+    valid
+        .then_some(())
+        .ok_or_else(|| "Connac2 BSS wire contract does not match native goldens".into())
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -3692,14 +3729,19 @@ fn run() -> Result<(), String> {
             ("unclassified", "none", false)
         };
         if cfg!(feature = "full-firmware-production") {
+            #[cfg(feature = "fuchsia-passive")]
+            validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v4","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
+                option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
+                option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_LIST").unwrap_or("unidentified"),
                 option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified"),
+                BSS_WIRE_CONTRACT_JSON,
             );
         } else {
             println!(
@@ -12927,6 +12969,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 bssid,
                 channel,
                 request.beacon_period.ok_or(zx::Status::INVALID_ARGS)?,
+                self.dtim_period,
             )
             .map_err(|_| zx::Status::BAD_STATE)
     }
@@ -13442,7 +13485,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
         let io = std::cell::RefCell::new(io);
         self.firmware
             .complete_post_assoc_interface(
-                self.dtim_period,
                 channel.channel,
                 |cid, command| {
                     io.borrow_mut()
@@ -15071,9 +15113,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             }
             self.peer_wcid = Some(wcid);
         }
-        if expected_cid == 2 && encoded.len() == 96 {
+        if expected_cid == 2 && encoded.len() == 92 {
             record_sae_stage(&format!(
-                "e2e81_bss_transcript bytes=96 bss_idx={} active={} omac_idx={} hw_bss_idx={} band_idx={} conn_type={:#010x} conn_state={} wmm_idx={} bmc_wcid={} beacon_interval={} dtim={} phymode={:#04x} sta_idx={} nonht_basic_phy={:#06x} qos={} cipher=firmware_vif_owned",
+                "e2e81_bss_transcript bytes=92 bss_idx={} active={} omac_idx={} hw_bss_idx={} band_idx={} conn_type={:#010x} conn_state={} wmm_idx={} bmc_wcid={} beacon_interval={} dtim={} phymode={:#04x} sta_idx={} nonht_basic_phy={:#06x} qos={} cipher=firmware_vif_owned",
                 encoded[48],
                 encoded[56],
                 encoded[57],
@@ -15088,7 +15130,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 encoded[77],
                 u16::from_le_bytes(encoded[78..80].try_into().unwrap()),
                 u16::from_le_bytes(encoded[80..82].try_into().unwrap()),
-                encoded[92],
+                encoded[88],
             ));
         }
         let sta_update_wcid = (expected_cid == 3 && encoded.len() >= 176)
@@ -15247,7 +15289,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         };
         let stage = match (expected_cid, encoded.len(), encoded.get(49).copied()) {
             (3, len, Some(1)) if len < 200 => Some("after_preauth_cid3_ack"),
-            (2, 96, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
+            (2, 92, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
             (3, len, Some(1)) if len >= 200 => Some("after_associated_cid3_ack"),
             (3, 108, Some(19)) => Some("after_interface_wcid_update"),
             (2, 60, _) if encoded.get(52..56) == Some(&[22, 0, 8, 0]) => {
@@ -18374,7 +18416,7 @@ mod tests {
         };
         let mut state = ClientFirmwareEffectsState::default();
         state
-            .bind_join(association.peer, test_channel_lease(36), 100)
+            .bind_join(association.peer, test_channel_lease(36), 100, 2)
             .unwrap();
         prepare_test_preauth(&mut state, association);
         assert!(state.set_controlled_port(true).is_err());
@@ -18445,7 +18487,7 @@ mod tests {
                 (136, 19, 8, 1),
                 (136, 7, 8, 1),
                 (88, 7, 20, 2),
-                (96, 0, 0, 1)
+                (92, 0, 0, 1)
             ]
         );
         assert!(!state.controlled_port_open);
@@ -18472,7 +18514,7 @@ mod tests {
         };
         let mut state = ClientFirmwareEffectsState::default();
         state
-            .bind_join(association.peer, test_channel_lease(36), 100)
+            .bind_join(association.peer, test_channel_lease(36), 100, 2)
             .unwrap();
         prepare_test_preauth(&mut state, association);
         state
@@ -18613,7 +18655,7 @@ mod tests {
         };
         let mut state = ClientFirmwareEffectsState::default();
         state
-            .bind_join(association.peer, test_channel_lease(36), 100)
+            .bind_join(association.peer, test_channel_lease(36), 100, 2)
             .unwrap();
         prepare_test_preauth(&mut state, association);
         state
@@ -19721,7 +19763,7 @@ mod tests {
         }
         physically_unbound
             .firmware
-            .bind_join(peer, test_channel_lease(36), 100)
+            .bind_join(peer, test_channel_lease(36), 100, 2)
             .unwrap();
         let mut no_wcid_io = TestClientIo::default();
         assert_eq!(

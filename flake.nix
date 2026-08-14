@@ -307,9 +307,21 @@
               export MT7921_MATERIALIZED_SOURCE_TREE_SHA256=$(cat "$ref/.drv-materialized-source-tree-sha256")
               export MT7921_GENERATED_CRATE_SOURCE_SHA256=$(cat "$ref/.drv-generated-crate-source-sha256")
               export MT7921_SOURCE_IDENTITY_SHA256=$(cat "$ref/.drv-source-identity-sha256")
+              export MT7921_PROJECT_CORE_SOURCE_SHA256=$(
+                find crates/mt7921-core -type f -print0 | sort -z \
+                  | while IFS= read -r -d $'\0' file; do printf '%s\0' "$file"; sha256sum "$file"; done \
+                  | sha256sum | cut -d ' ' -f1
+              )
+              export MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256=$(
+                printf '%s\n%s\n%s\n' "$MT7921_SOURCE_IDENTITY_SHA256" \
+                  "$MT7921_PROJECT_CORE_SOURCE_SHA256" connac2-bss-wire-v1 \
+                  | sha256sum | cut -d ' ' -f1
+              )
               test "''${#MT7921_MATERIALIZED_SOURCE_TREE_SHA256}" -eq 64
               test "''${#MT7921_GENERATED_CRATE_SOURCE_SHA256}" -eq 64
               test "''${#MT7921_SOURCE_IDENTITY_SHA256}" -eq 64
+              test "''${#MT7921_PROJECT_CORE_SOURCE_SHA256}" -eq 64
+              test "''${#MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256}" -eq 64
             '';
             doCheck = false;
             installPhase = ''
@@ -362,6 +374,9 @@
               SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/sae-h2e-association-request-self-test.json" | cut -d ' ' -f1)
               FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
               FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
+              PROJECT_CORE_SOURCE_SHA256=$MT7921_PROJECT_CORE_SOURCE_SHA256
+              COMPOSITE_ARTIFACT_SOURCE_SHA256=$MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256
+              BSS_WIRE_CONTRACT=connac2-bss-wire-v1
               REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               REGULATORY_GENERATION=0
               EOF
@@ -384,6 +399,19 @@
               grep -F '"m2_physical_tx":"suppressed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"frame":"none-post-association-public-before-m1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F "\"project_core_source_sha256\":\"$MT7921_PROJECT_CORE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F "\"composite_artifact_source_sha256\":\"$MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"artifact_identity":"mt7921-validation-v4"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"basic_tlv_len":32' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"initial_bss_payload_len":36,"initial_bss_command_len":84' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"associated_bss_payload_len":44,"associated_bss_command_len":92' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"qbss_payload_offset":36' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"dtim_source":"selected-beacon-shared-basic-bcnft"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"fuchsia_ordered_patch_list":"${mt7921FuchsiaSource.fuchsiaOrderedPatchList}"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -415,6 +443,10 @@
                 | grep -F '"success":"authenticator_m1_delivered_to_pinned_sme"' \
                 | grep -F '"second_frame":false' \
                 | grep -F '"tmac_population_invariant":false'
+              printf '%s\n' "$production_output" \
+                | grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' \
+                | grep -F '"associated_bss_command_len":92' \
+                | grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"'
               association_output="$("$driver" --self-test-sae-h2e-association-request)"
               printf '%s\n' "$association_output" \
                 | grep -F '"sae_h2e_association_request_self_test":"passed"' \
@@ -868,9 +900,13 @@
                 source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                project_core=$(sed -n 's/.*"project_core_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                composite_source=$(sed -n 's/.*"composite_artifact_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 test "''${#source_identity}" -eq 64
                 test "''${#materialized_tree}" -eq 64
                 test "''${#generated_source}" -eq 64
+                test "''${#project_core}" -eq 64
+                test "''${#composite_source}" -eq 64
                 cat > "$out" <<EOF
                 PACKAGE=${package}
                 LAUNCHER=$launcher
@@ -880,11 +916,25 @@
                 ARTIFACT_IDENTITY=$identity
                 ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
                 SOURCE_IDENTITY_SHA256=$source_identity
+                PROJECT_CORE_SOURCE_SHA256=$project_core
+                COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source
                 FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
                 FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
                 FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
                 MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
                 GENERATED_CRATE_SOURCE_SHA256=$generated_source
+                BSS_WIRE_CONTRACT=connac2-bss-wire-v1
+                BASIC_TLV_LEN=32
+                INITIAL_BSS_PAYLOAD_LEN=36
+                INITIAL_BSS_COMMAND_LEN=84
+                ASSOCIATED_BSS_PAYLOAD_LEN=44
+                ASSOCIATED_BSS_COMMAND_LEN=92
+                QBSS_PAYLOAD_OFFSET=36
+                DTIM_SOURCE=selected-beacon-shared-basic-bcnft
+                INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
+                INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
+                ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
+                ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
                 SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=$fixture
                 SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)
                 FLAVOR=full-firmware-production
@@ -927,6 +977,9 @@
                 grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$out"
                 grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$out"
                 grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$out"
+                grep -Fx "PROJECT_CORE_SOURCE_SHA256=$project_core" "$out"
+                grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$out"
+                grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$out"
                 grep -Fx "SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)" "$out"
               '';
 
@@ -1002,6 +1055,15 @@
               exit 64
               EOF
               chmod +x evidence-launcher
+              cat > stale-bss-identity.json <<'EOF'
+              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"cb80a23b89f042b88c8820c2a4ccff2d20257eb9d608af09013ec4d294e57303","basic_tlv_len":36,"associated_bss_command_len":96,"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
+              EOF
+              cat > stale-bss-launcher <<'EOF'
+              #!${pkgs.runtimeShell}
+              test "$1" = --artifact-identity
+              cat "$PWD/stale-bss-identity.json"
+              EOF
+              chmod +x stale-bss-launcher
               cat > evidence-manifest <<'EOF'
               FLAVOR=rate-power-evidence-only
               ACTIVE_CAPABLE=false
@@ -1019,12 +1081,14 @@
                 "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$production_identity"
               make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-manifest \
                 "$production_launcher" "$PWD/evidence-manifest" "$production_identity"
+              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-stale-bss \
+                "$PWD/stale-bss-launcher" ${mt7921-full-firmware-validation-manifest} "$PWD/stale-bss-identity.json"
               make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-elf \
                 "$production_launcher" "$PWD/evidence-manifest" "$evidence_identity"
               make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-manifest \
                 "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$evidence_identity"
               : > "$out"
-              for root in prod-wrong-elf prod-wrong-manifest evidence-wrong-elf evidence-wrong-manifest; do
+              for root in prod-wrong-elf prod-wrong-manifest prod-stale-bss evidence-wrong-elf evidence-wrong-manifest; do
                 if ./$root --plan; then
                   echo "cross-wired root unexpectedly passed: $root" >&2
                   exit 1
@@ -1109,7 +1173,13 @@
                 closure_manifest_sha256="$(${pkgs.coreutils}/bin/sha256sum "$out/share/mt7921-full-firmware-inert-proof/closure.tsv" | cut -d' ' -f1)"
                 source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' \
                   ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json)
+                project_core=$(sed -n 's/.*"project_core_source_sha256":"\([0-9a-f]*\)".*/\1/p' \
+                  ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json)
+                composite_source=$(sed -n 's/.*"composite_artifact_source_sha256":"\([0-9a-f]*\)".*/\1/p' \
+                  ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json)
                 test "''${#source_identity}" -eq 64
+                test "''${#project_core}" -eq 64
+                test "''${#composite_source}" -eq 64
                 substitute ${./nix/mt7921-full-firmware-inert-proof.sh} \
                   "$out/bin/mt7921-full-firmware-inert-proof" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
@@ -1122,6 +1192,8 @@
                   --subst-var-by closure_manifest_sha256 "$closure_manifest_sha256" \
                   --subst-var-by manifest_verifier "$out/libexec/mt7921-closure-manifest-verify" \
                   --subst-var-by source_identity "$source_identity" \
+                  --subst-var-by project_core "$project_core" \
+                  --subst-var-by composite_source "$composite_source" \
                   --subst-var-by id ${pkgs.coreutils}/bin/id \
                   --subst-var-by date ${pkgs.coreutils}/bin/date \
                   --subst-var-by install ${pkgs.coreutils}/bin/install \
@@ -1231,9 +1303,13 @@
                 source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                project_core=$(sed -n 's/.*"project_core_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
+                composite_source=$(sed -n 's/.*"composite_artifact_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
                 test "''${#source_identity}" -eq 64
                 test "''${#materialized_tree}" -eq 64
                 test "''${#generated_source}" -eq 64
+                test "''${#project_core}" -eq 64
+                test "''${#composite_source}" -eq 64
                 substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} \
                   "$out/bin/mt7921-full-firmware-inert-proof-root" \
                   --subst-var-by shell ${pkgs.runtimeShell} \
@@ -1251,6 +1327,8 @@
                   --subst-var-by fuchsia_patch_list ${mt7921FuchsiaSource.fuchsiaOrderedPatchList} \
                   --subst-var-by materialized_tree "$materialized_tree" \
                   --subst-var-by generated_source "$generated_source" \
+                  --subst-var-by project_core "$project_core" \
+                  --subst-var-by composite_source "$composite_source" \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                   --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                   --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
@@ -1273,6 +1351,20 @@
                 FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
                 MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
                 GENERATED_CRATE_SOURCE_SHA256=$generated_source
+                PROJECT_CORE_SOURCE_SHA256=$project_core
+                COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source
+                BSS_WIRE_CONTRACT=connac2-bss-wire-v1
+                BASIC_TLV_LEN=32
+                INITIAL_BSS_PAYLOAD_LEN=36
+                INITIAL_BSS_COMMAND_LEN=84
+                ASSOCIATED_BSS_PAYLOAD_LEN=44
+                ASSOCIATED_BSS_COMMAND_LEN=92
+                QBSS_PAYLOAD_OFFSET=36
+                DTIM_SOURCE=selected-beacon-shared-basic-bcnft
+                INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
+                INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
+                ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
+                ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
                 ACTIVE_CAPABLE=true
                 OBSERVATION_MODE=passive-m1-observation
                 FRAME_TX_DISABLED_BEFORE_M1=true
@@ -1304,6 +1396,9 @@
                 grep -Fx 'FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}' "$manifest"
                 grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$manifest"
                 grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$manifest"
+                grep -Fx "PROJECT_CORE_SOURCE_SHA256=$project_core" "$manifest"
+                grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$manifest"
+                grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$manifest"
                 grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
                 grep -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest"
                 grep -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest"
@@ -1358,7 +1453,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
+              {"artifact_identity":"mt7921-validation-v4","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1386,6 +1481,8 @@
                   --subst-var-by fuchsia_patch_list fixture.patch:3333 \
                   --subst-var-by materialized_tree 4444444444444444444444444444444444444444444444444444444444444444 \
                   --subst-var-by generated_source 5555555555555555555555555555555555555555555555555555555555555555 \
+                  --subst-var-by project_core 6666666666666666666666666666666666666666666666666666666666666666 \
+                  --subst-var-by composite_source 7777777777777777777777777777777777777777777777777777777777777777 \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                   --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                   --subst-var-by nix_store "$PWD/work/nix-store-stub" \
@@ -1408,6 +1505,20 @@
               FUCHSIA_ORDERED_PATCH_LIST=fixture.patch:3333
               MATERIALIZED_SOURCE_TREE_SHA256=4444444444444444444444444444444444444444444444444444444444444444
               GENERATED_CRATE_SOURCE_SHA256=5555555555555555555555555555555555555555555555555555555555555555
+              PROJECT_CORE_SOURCE_SHA256=6666666666666666666666666666666666666666666666666666666666666666
+              COMPOSITE_ARTIFACT_SOURCE_SHA256=7777777777777777777777777777777777777777777777777777777777777777
+              BSS_WIRE_CONTRACT=connac2-bss-wire-v1
+              BASIC_TLV_LEN=32
+              INITIAL_BSS_PAYLOAD_LEN=36
+              INITIAL_BSS_COMMAND_LEN=84
+              ASSOCIATED_BSS_PAYLOAD_LEN=44
+              ASSOCIATED_BSS_COMMAND_LEN=92
+              QBSS_PAYLOAD_OFFSET=36
+              DTIM_SOURCE=selected-beacon-shared-basic-bcnft
+              INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
+              INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
+              ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
+              ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
               ACTIVE_CAPABLE=true
               OBSERVATION_MODE=passive-m1-observation
               FRAME_TX_DISABLED_BEFORE_M1=true

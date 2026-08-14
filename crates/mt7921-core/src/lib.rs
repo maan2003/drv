@@ -2707,6 +2707,40 @@ fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
     bytes
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_client_bss_basic_payload(
+    bss_index: u8,
+    active: bool,
+    conn_state: u8,
+    bssid: [u8; 6],
+    beacon_interval: u16,
+    dtim_period: u8,
+    phymode: u8,
+    bmc_wcid: u16,
+    sta_idx: u16,
+    nonht_basic_phy: u16,
+) -> Vec<u8> {
+    // Linux's packed request header (4) followed by
+    // mt76_connac_bss_basic_tlv (32). The TLV ends with phymode_ext and
+    // link_idx; there is no host-layout padding before the following TLV.
+    let mut payload = vec![0; 36];
+    payload[0] = bss_index;
+    payload[4..8].copy_from_slice(&[0, 0, 32, 0]);
+    payload[8] = u8::from(active);
+    payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
+    payload[16] = conn_state;
+    payload[18..24].copy_from_slice(&bssid);
+    payload[24..26].copy_from_slice(&bmc_wcid.to_le_bytes());
+    payload[26..28].copy_from_slice(&beacon_interval.to_le_bytes());
+    payload[28] = dtim_period;
+    payload[29] = phymode;
+    payload[30..32].copy_from_slice(&sta_idx.to_le_bytes());
+    payload[32..34].copy_from_slice(&nonht_basic_phy.to_le_bytes());
+    payload[34] = 0; // phymode_ext: non-6-GHz
+    payload[35] = 0; // link_idx: first link
+    payload
+}
+
 /// Linux v7.1 `mt76_connac_mcu_uni_add_dev` for the first station VIF.
 ///
 /// This establishes OMAC/BSS index 0 and its reserved interface WCID 19 before
@@ -2731,14 +2765,8 @@ pub fn encode_client_interface_commands(
     dev[8] = u8::from(enable);
     dev[10..16].copy_from_slice(&client);
 
-    let mut bss = vec![0; 36];
     // bss_idx=0, UNI_BSS_INFO_BASIC, first station VIF/WMM/band/OMAC.
-    bss[4..8].copy_from_slice(&[0, 0, 32, 0]);
-    bss[8] = u8::from(enable);
-    bss[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
-    bss[16] = 1;
-    bss[24..26].copy_from_slice(&19u16.to_le_bytes());
-    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+    let bss = encode_client_bss_basic_payload(0, enable, 1, [0; 6], 0, 0, 0, 0, 0, 0);
 
     let dev = encode_uni_mcu(1, &dev, dev_sequence);
     let bss = encode_uni_mcu(2, &bss, bss_sequence);
@@ -6031,35 +6059,33 @@ pub fn encode_client_bss_command(
     bssid: [u8; 6],
     channel: u16,
     beacon_interval: u16,
+    dtim_period: u8,
     qos: bool,
     enable: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=15).contains(&sequence)
         || bssid == [0; 6]
         || beacon_interval == 0
+        || dtim_period == 0
         || !(1..=177).contains(&channel)
     {
         return Err("BSS update escaped station BASIC bounds".into());
     }
-    let mut payload = vec![0; 48];
-    payload[0] = bss_index;
-    payload[4..6].copy_from_slice(&0u16.to_le_bytes());
-    payload[6..8].copy_from_slice(&36u16.to_le_bytes());
-    payload[8] = u8::from(enable);
-    payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
-    payload[16] = u8::from(!enable);
-    payload[18..24].copy_from_slice(&bssid);
-    payload[24..26].copy_from_slice(&19u16.to_le_bytes());
-    payload[26..28].copy_from_slice(&beacon_interval.to_le_bytes());
-    payload[28] = 1;
-    payload[29] = if channel <= 14 { 0x4e } else { 0xb1 };
-    payload[30..32].copy_from_slice(&19u16.to_le_bytes());
+    let mut payload = encode_client_bss_basic_payload(
+        bss_index,
+        enable,
+        u8::from(!enable),
+        bssid,
+        beacon_interval,
+        dtim_period,
+        if channel <= 14 { 0x4e } else { 0xb1 },
+        19,
+        19,
+        if channel <= 14 { 0x53 } else { 0x78 },
+    );
     // mt76_connac_get_phy_mode_v2(..., link_sta=NULL) uses the local
     // MT7921 band capabilities, not the single legacy rate selected for TX.
-    payload[32..34].copy_from_slice(&(if channel <= 14 { 0x53u16 } else { 0x78u16 }).to_le_bytes());
-    payload[40..42].copy_from_slice(&15u16.to_le_bytes());
-    payload[42..44].copy_from_slice(&8u16.to_le_bytes());
-    payload[44] = u8::from(qos);
+    payload.extend_from_slice(&[15, 0, 8, 0, u8::from(qos), 0, 0, 0]);
     Ok(encode_uni_mcu(2, &payload, sequence))
 }
 
@@ -6356,6 +6382,7 @@ pub struct JoinedClientBss {
     pub channel: u16,
     pub channel_generation: u64,
     pub beacon_interval: u16,
+    pub dtim_period: u8,
 }
 
 /// The physical channel identity programmed by the mt7921 channel-switch
@@ -6929,7 +6956,6 @@ impl ClientFirmwareEffectsState {
 
     pub fn complete_post_assoc_interface(
         &mut self,
-        dtim_period: u8,
         channel: ClientPhysicalChannel,
         mut submit_uni: impl FnMut(u8, &[u8]) -> Result<(), String>,
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
@@ -6961,7 +6987,7 @@ impl ClientFirmwareEffectsState {
             self.next_sequence(),
             association.bss_index,
             joined.beacon_interval,
-            dtim_period,
+            joined.dtim_period,
         )?;
         submit_uni(2, &beacon)?;
         self.post_assoc_beacon_timing_programmed = true;
@@ -6983,9 +7009,11 @@ impl ClientFirmwareEffectsState {
         bssid: [u8; 6],
         channel: ClientChannelLease,
         beacon_interval: u16,
+        dtim_period: u8,
     ) -> Result<(), String> {
         if bssid == [0; 6]
             || beacon_interval == 0
+            || dtim_period == 0
             || self.preauth_peer.is_some()
             || self.association.is_some()
             || self.bss_programmed
@@ -6998,6 +7026,7 @@ impl ClientFirmwareEffectsState {
             channel: channel.channel.primary,
             channel_generation: channel.generation,
             beacon_interval,
+            dtim_period,
         };
         if self.joined.is_some_and(|current| current != joined) {
             return Err("join target changed without teardown".into());
@@ -7130,6 +7159,7 @@ impl ClientFirmwareEffectsState {
             joined.bssid,
             joined.channel,
             joined.beacon_interval,
+            joined.dtim_period,
             association.negotiated_qos,
             true,
         )?;
@@ -7145,6 +7175,7 @@ impl ClientFirmwareEffectsState {
                 joined.bssid,
                 joined.channel,
                 joined.beacon_interval,
+                joined.dtim_period,
                 association.negotiated_qos,
                 false,
             )
@@ -7189,6 +7220,7 @@ impl ClientFirmwareEffectsState {
                 joined.bssid,
                 joined.channel,
                 joined.beacon_interval,
+                joined.dtim_period,
                 association.negotiated_qos,
                 false,
             )
@@ -7508,6 +7540,7 @@ impl ClientFirmwareEffectsState {
                     joined.bssid,
                     joined.channel,
                     joined.beacon_interval,
+                    joined.dtim_period,
                     negotiated_qos,
                     false,
                 )
@@ -7573,6 +7606,7 @@ impl ClientFirmwareEffectsState {
             joined.bssid,
             joined.channel,
             joined.beacon_interval,
+            joined.dtim_period,
             association.negotiated_qos,
             false,
         )
@@ -9034,8 +9068,8 @@ mod tests {
             u32::from_le_bytes(bss[60..64].try_into().unwrap()),
             0x0001_0001
         );
-        assert_eq!(u16::from_le_bytes(bss[72..74].try_into().unwrap()), 19);
-        assert_eq!(u16::from_le_bytes(bss[78..80].try_into().unwrap()), 19);
+        assert_eq!(u16::from_le_bytes(bss[72..74].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(bss[78..80].try_into().unwrap()), 0);
 
         let [disable_bss, disable_dev] =
             encode_client_interface_commands(client, false, 2, 1).unwrap();
@@ -9054,6 +9088,77 @@ mod tests {
             assert!(encode_client_interface_commands(invalid, true, 1, 2).is_err());
         }
         assert!(encode_client_interface_commands(client, true, 1, 1).is_err());
+    }
+
+    #[test]
+    fn client_bss_basic_commands_match_packed_linux_native_records() {
+        let fixture = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let digit = |byte| match byte {
+                        b'0'..=b'9' => byte - b'0',
+                        b'a'..=b'f' => byte - b'a' + 10,
+                        _ => panic!("non-hex fixture"),
+                    };
+                    digit(pair[0]) << 4 | digit(pair[1])
+                })
+                .collect::<Vec<_>>()
+        };
+        let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+        let [_, initial] = encode_client_interface_commands(client, true, 11, 12).unwrap();
+        let initial_payload =
+            fixture("000000000000200001000000010001000100000000000000000000000000000000000000");
+        let initial_command = fixture(
+            "54000041000001800000000000000000000000000000000000000000000000003400020000a0000c0000000700000000000000000000200001000000010001000100000000000000000000000000000000000000",
+        );
+        assert_eq!(&initial[48..], initial_payload);
+        assert_eq!(initial, initial_command);
+
+        let peer = [0xf2, 0xa3, 0x18, 0x4f, 0x30, 0x76];
+        let associated = encode_client_bss_command(7, 0, peer, 36, 100, 2, true, true).unwrap();
+        let associated_payload = fixture(
+            "000000000000200001000000010001000000f2a3184f30761300640002b11300780000000f00080001000000",
+        );
+        let associated_command = fixture(
+            "5c000041000001800000000000000000000000000000000000000000000000003c00020000a000070000000700000000000000000000200001000000010001000000f2a3184f30761300640002b11300780000000f00080001000000",
+        );
+        assert_eq!(&associated[48..], associated_payload);
+        assert_eq!(associated, associated_command);
+        assert_eq!(associated.len(), 92);
+        assert_eq!(&associated[52..56], &[0, 0, 32, 0]);
+        assert_eq!(&associated[82..84], &[0, 0]); // phymode_ext, link_idx
+        assert_eq!(&associated[84..92], &[15, 0, 8, 0, 1, 0, 0, 0]);
+
+        let parse = |payload: &[u8]| -> Result<Vec<(u16, usize, usize)>, ()> {
+            let mut offset = 4;
+            let mut tlvs = Vec::new();
+            while offset < payload.len() {
+                let header = payload.get(offset..offset + 4).ok_or(())?;
+                let tag = u16::from_le_bytes([header[0], header[1]]);
+                let len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+                if len < 4 || offset + len > payload.len() || (tag == 0 && len != 32) {
+                    return Err(());
+                }
+                tlvs.push((tag, offset, len));
+                offset += len;
+            }
+            (offset == payload.len()).then_some(tlvs).ok_or(())
+        };
+        assert_eq!(
+            parse(&associated_payload),
+            Ok(vec![(0, 4, 32), (15, 36, 8)])
+        );
+
+        let mut stale_len36 = associated_payload.clone();
+        stale_len36[6..8].copy_from_slice(&36u16.to_le_bytes());
+        assert!(parse(&stale_len36).is_err());
+        let mut stale_total48 = associated_payload[..36].to_vec();
+        stale_total48[6..8].copy_from_slice(&36u16.to_le_bytes());
+        stale_total48.extend_from_slice(&[0; 4]);
+        stale_total48.extend_from_slice(&associated_payload[36..]);
+        assert_eq!(stale_total48.len(), 48);
+        assert!(parse(&stale_total48).is_err());
     }
 
     #[test]
@@ -9088,7 +9193,7 @@ mod tests {
         let lease = channels.establish_channel(physical).unwrap();
         assert!(channels.authorized_channel().is_err());
         assert_eq!(channels.authorize_channel(physical).unwrap(), lease);
-        state.bind_join(peer, lease, 100).unwrap();
+        state.bind_join(peer, lease, 100, 2).unwrap();
         let client = [6, 5, 4, 3, 2, 1];
         let mut association_response = [0; 22];
         association_response[..2].copy_from_slice(&0x0010u16.to_le_bytes());
@@ -9194,7 +9299,6 @@ mod tests {
         let transcript = std::cell::RefCell::new(transcript);
         state
             .complete_post_assoc_interface(
-                2,
                 ClientPhysicalChannel {
                     band: 1,
                     primary: 36,
@@ -9257,7 +9361,7 @@ mod tests {
         let bss_add = &transcript[1];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
-        assert_eq!(bss_add[92], 1);
+        assert_eq!(bss_add[88], 1);
         assert_eq!(transcript[2][112], 2);
         let interface_assoc = &transcript[3];
         assert_eq!(interface_assoc.len(), 108);
@@ -9309,7 +9413,7 @@ mod tests {
         };
 
         let mut rolled_back = ClientFirmwareEffectsState::default();
-        rolled_back.bind_join(peer, lease, 100).unwrap();
+        rolled_back.bind_join(peer, lease, 100, 2).unwrap();
         rolled_back
             .prepare_preauth_peer(
                 LegacyWmeAssociation {
@@ -9339,7 +9443,7 @@ mod tests {
         assert!(!rolled_back.firmware_uncertain);
 
         let mut dirty = ClientFirmwareEffectsState::default();
-        dirty.bind_join(peer, lease, 100).unwrap();
+        dirty.bind_join(peer, lease, 100, 2).unwrap();
         dirty
             .prepare_preauth_peer(
                 LegacyWmeAssociation {
@@ -10296,14 +10400,14 @@ mod tests {
         let client = [2, 2, 3, 4, 5, 6];
         let peer = [6, 5, 4, 3, 2, 1];
         let [dev, _] = encode_client_interface_commands(client, true, 1, 2).unwrap();
-        let bss = encode_client_bss_command(3, 0, peer, 36, 100, true, true).unwrap();
+        let bss = encode_client_bss_command(3, 0, peer, 36, 100, 2, true, true).unwrap();
         assert_eq!(dev[56], 1);
         assert_eq!(&bss[56..66], &[1, 0, 0, 0, 1, 0, 1, 0, 0, 0]);
         assert_eq!(&bss[66..72], &peer);
         assert_eq!(u16::from_le_bytes(bss[72..74].try_into().unwrap()), 19);
         assert_eq!(u16::from_le_bytes(bss[78..80].try_into().unwrap()), 19);
         assert_eq!(u16::from_le_bytes(bss[80..82].try_into().unwrap()), 0x78);
-        assert_eq!(bss[92], 1);
+        assert_eq!(bss[88], 1);
     }
 
     #[test]

@@ -21,6 +21,18 @@ esac
 @grep@ -Fx 'MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons' @manifest@ >/dev/null
 @grep@ -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' @manifest@ >/dev/null
 @grep@ -Fx 'M2_PHYSICAL_TX=suppressed' @manifest@ >/dev/null
+@grep@ -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' @manifest@ >/dev/null
+@grep@ -Fx 'BASIC_TLV_LEN=32' @manifest@ >/dev/null
+@grep@ -Fx 'INITIAL_BSS_PAYLOAD_LEN=36' @manifest@ >/dev/null
+@grep@ -Fx 'INITIAL_BSS_COMMAND_LEN=84' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATED_BSS_PAYLOAD_LEN=44' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATED_BSS_COMMAND_LEN=92' @manifest@ >/dev/null
+@grep@ -Fx 'QBSS_PAYLOAD_OFFSET=36' @manifest@ >/dev/null
+@grep@ -Fx 'DTIM_SOURCE=selected-beacon-shared-basic-bcnft' @manifest@ >/dev/null
+@grep@ -Fx 'INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f' @manifest@ >/dev/null
+@grep@ -Fx 'INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c' @manifest@ >/dev/null
 @grep@ -F '"observation_mode":"passive-m1-observation"' @artifact_identity@ >/dev/null
 @grep@ -F '"frame_tx_disabled_before_m1":true' @artifact_identity@ >/dev/null
 @grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' @artifact_identity@ >/dev/null
@@ -38,11 +50,24 @@ assert_identity_field() {
   @grep@ -F "\"$2\":\"$value\"" @artifact_identity@ >/dev/null
 }
 assert_identity_field SOURCE_IDENTITY_SHA256 source_identity_sha256
+assert_identity_field PROJECT_CORE_SOURCE_SHA256 project_core_source_sha256
+assert_identity_field COMPOSITE_ARTIFACT_SOURCE_SHA256 composite_artifact_source_sha256
 assert_identity_field FUCHSIA_BASE_REVISION fuchsia_base_revision
 assert_identity_field FUCHSIA_ORDERED_PATCH_SET_SHA256 fuchsia_ordered_patch_set_sha256
 assert_identity_field FUCHSIA_ORDERED_PATCH_LIST fuchsia_ordered_patch_list
 assert_identity_field MATERIALIZED_SOURCE_TREE_SHA256 materialized_source_tree_sha256
 assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha256
+@grep@ -F '"artifact_identity":"mt7921-validation-v4"' @artifact_identity@ >/dev/null
+@grep@ -F '"bss_wire_contract":"connac2-bss-wire-v1"' @artifact_identity@ >/dev/null
+@grep@ -F '"basic_tlv_len":32' @artifact_identity@ >/dev/null
+@grep@ -F '"initial_bss_payload_len":36,"initial_bss_command_len":84' @artifact_identity@ >/dev/null
+@grep@ -F '"associated_bss_payload_len":44,"associated_bss_command_len":92' @artifact_identity@ >/dev/null
+@grep@ -F '"qbss_payload_offset":36' @artifact_identity@ >/dev/null
+@grep@ -F '"dtim_source":"selected-beacon-shared-basic-bcnft"' @artifact_identity@ >/dev/null
+@grep@ -F '"initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f"' @artifact_identity@ >/dev/null
+@grep@ -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' @artifact_identity@ >/dev/null
+@grep@ -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' @artifact_identity@ >/dev/null
+@grep@ -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' @artifact_identity@ >/dev/null
 fixture=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
 fixture_sha=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)
 test -s "$fixture"

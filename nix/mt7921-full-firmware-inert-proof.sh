@@ -18,6 +18,7 @@ runtime=/run/current-system/sw/bin
 if [ "${1-}" = --plan ] && [ "$#" -eq 1 ]; then
   cat <<EOF
 INERT_PROOF_PLAN schema=$schema hardware_handoff=false active_validation=false
+IDENTITY project_core_source_sha256=@project_core@ composite_artifact_source_sha256=@composite_source@ bss_wire_contract=connac2-bss-wire-v1 basic_tlv_len=32 initial_payload_len=36 initial_command_len=84 associated_payload_len=44 associated_command_len=92 qbss_payload_offset=36 dtim_source=selected-beacon-shared-basic-bcnft
 CAPTURE hostname; boot_id; pci_driver; pci_power_state; pci_runtime_status; NetworkManager_state; ip_link; ipv4_addresses; ipv4_routes; iw_dev; iw_link; watchdog_status
 NORMALIZE drop_rx_tx_signal_bitrate; normalize_queue_length; normalize_address_lifetimes
 WATCHDOG arm=wifi-lab-watchdog_arm disarm=wifi-lab-watchdog_disarm_exact_token trap_safe=true
@@ -158,8 +159,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cp "$expected_hashes" "$out/closure.expected.tsv"
 cp "$closure_roots" "$out/closure.roots"
-printf 'SCHEMA=%s\nSOURCE_IDENTITY_SHA256=%s\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
-  "$schema" @source_identity@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
+printf 'SCHEMA=%s\nSOURCE_IDENTITY_SHA256=%s\nPROJECT_CORE_SOURCE_SHA256=%s\nCOMPOSITE_ARTIFACT_SOURCE_SHA256=%s\nBSS_WIRE_CONTRACT=connac2-bss-wire-v1\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
+  "$schema" @source_identity@ @project_core@ @composite_source@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
 
 cat >"$out/COMMANDS" <<EOF
 SCHEMA=$schema
@@ -185,6 +186,9 @@ env -i "$driver" --self-test-rate-power-delivery >"$out/selftest-rate.jsonl"
 env -i "$driver" --self-test-production-validation >"$out/selftest-production.jsonl"
 grep -F '"rate_power_self_test":"passed"' "$out/selftest-rate.jsonl" >/dev/null
 grep -F '"production_validation_self_test":"passed"' "$out/selftest-production.jsonl" >/dev/null
+grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$out/selftest-production.jsonl" >/dev/null
+grep -F '"associated_bss_command_len":92' "$out/selftest-production.jsonl" >/dev/null
+grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' "$out/selftest-production.jsonl" >/dev/null
 "$root_entry/bin/mt7921-full-firmware-validation-root" --plan >"$out/root-plan.txt"
 grep -F hardware_handoff=false "$out/root-plan.txt" >/dev/null
 
