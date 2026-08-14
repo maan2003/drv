@@ -74,6 +74,10 @@ The pinned `wlan-sme` AP/client policy and state machines compile directly on
 the host. `wlan-sme-host.patch` excludes only the generated endpoint-serving
 module and two binding-shape compatibility sites. Host responder tokens return
 an explicit transport-unavailable error rather than emulating Fuchsia channels.
+`wlan-sme-passive-observation-timeout-host.patch` adds one optional initial
+RSNA response timeout to `ClientConfig`. Its default preserves the pinned
+4000 ms policy; only passive validation requests 6000 ms so its 5000 ms
+read-only M1 observer reaches its own boundary first.
 
 The pinned SME uses Fuchsia Inspect only for diagnostics. Separately licensed
 path-shaped host facades retain scalar/string/byte property state and the API

@@ -2848,13 +2848,43 @@ snapshot, and the native association fixture proves a later EAPOL-Key TX but
 contains no timestamp. There is no equivalent native two-point delta or
 Linux/iwd M1 latency measurement. The prior one-second series therefore kept the
 original deadline. This telemetry-only variant tests a five-second observation
-deadline; the manifest's 25 seconds remains a sufficient enclosing budget.
+deadline. The caller's 25-second deadline encloses it, but the pinned SME's
+initial 4000 ms RSNA response timer did not: it ended the first five-second
+series before the observer boundary. Passive validation now selects a 6000 ms
+initial response timer and terminates at its own 5000 ms boundary; normal SME
+timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v3`. It enumerates the only safe register reads
+`linux-6.18.40-passive-m1-rx-v5`. It enumerates the only safe register reads
 (`0xd4208,0xd4528,0xd452c`), both snapshot boundaries, the exact pinned
 AP-to-client M1 scope, positive and ambiguous-negative results, best-effort
-read-only behavior with unchanged control flow except for the 5000 ms observation
-deadline, and the independent AP/over-air attribution requirement. Launcher, supervisor, root, and inert
+read-only behavior, the observer-owned 5000 ms deadline, the validation-only
+6000 ms initial RSNA response timer, unchanged normal-mode timers, and the
+independent AP/over-air attribution requirement. Launcher, supervisor, root, and inert
 artifacts compare against that installed ELF identity; stale identities are
 rejected before privileged dispatch.
+
+Post-association target beacons now add a read-only AP-side clue without changing
+power state or transmitting a poll.  For beacons whose transmitter and BSSID
+both equal the pinned AP, production validates the 12-byte beacon fixed body,
+walks the existing IE stream, and decodes TIM exactly as Linux
+`ieee80211_check_tim`: the normalized association AID selects `aid / 8` and
+`1 << (aid & 7)`, while bitmap-control bits 7:1 select the even partial-bitmap
+byte offset and bit 0 remains the multicast indication.  Telemetry records
+monotonic time since association, target-beacon and TIM counts, DTIM count and
+period, bitmap control/offset and partial bitmap, buffered-state transitions,
+and buffered-true count.  A true AID bit proves only that the AP queued unicast
+for this AID; it does not identify EAPOL or M1.  No observed true bit is
+inconclusive.  Malformed/truncated TIMs are reported and the beacon's normal
+receive delivery is preserved.
+
+An offline power-state audit found no hidden sleep transition in this
+validation path.  The extracted Fuchsia client emits the Linux-compatible
+association listen interval of five beacons, but that field alone does not put
+the station to sleep.  The port's post-association closure emits neither a
+PM-bit data/Null frame nor `SET_PS_PROFILE`/`UNI_BSS_INFO_PS`, U-APSD is absent,
+and it installs no firmware listen/doze profile.  This agrees with the pinned
+Linux post-ASSOC `cfg.ps=false` path already mapped in `mt7921-core/SOURCE-MAP.md`:
+beacon filtering is an RX optimization and awake mode emits no peer TX-PS
+mutation.  The audit is descriptive only; this change adds no power-save,
+Null/poll, monitor, or sniffer command.

@@ -213,6 +213,79 @@ fn client_dtim_period(ies: &[u8]) -> Result<u8, String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetBeaconTim<'a> {
+    dtim_count: u8,
+    dtim_period: u8,
+    bitmap_control: u8,
+    bitmap_offset: u8,
+    partial_virtual_bitmap: &'a [u8],
+    multicast_buffered: bool,
+    aid_buffered: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn parse_target_beacon_tim(
+    ies: &[u8],
+    normalized_aid: u16,
+) -> Result<Option<TargetBeaconTim<'_>>, &'static str> {
+    if !(1..=2007).contains(&normalized_aid) {
+        return Err("invalid_normalized_aid");
+    }
+    let mut offset = 0usize;
+    while offset < ies.len() {
+        let header = ies.get(offset..offset + 2).ok_or("truncated_ie_header")?;
+        let end = offset
+            .checked_add(2 + usize::from(header[1]))
+            .ok_or("ie_length_overflow")?;
+        let body = ies.get(offset + 2..end).ok_or("truncated_ie_body")?;
+        offset = end;
+        if header[0] != 5 {
+            continue;
+        }
+        if body.len() < 4 {
+            return Err("malformed_tim_length");
+        }
+        if body[1] == 0 {
+            return Err("zero_dtim_period");
+        }
+        // This is the same index/mask calculation as Linux
+        // ieee80211_check_tim: AID bits 13:0 select a byte and bit in the
+        // partial virtual bitmap; bitmap-control bit 0 is multicast only.
+        let aid = normalized_aid & 0x3fff;
+        let index = usize::from(aid / 8);
+        let mask = 1u8 << (aid & 7);
+        let bitmap_offset = body[2] & 0xfe;
+        let partial_virtual_bitmap = &body[3..];
+        let first = usize::from(bitmap_offset);
+        let aid_buffered = index
+            .checked_sub(first)
+            .and_then(|relative| partial_virtual_bitmap.get(relative))
+            .is_some_and(|byte| byte & mask != 0);
+        return Ok(Some(TargetBeaconTim {
+            dtim_count: body[0],
+            dtim_period: body[1],
+            bitmap_control: body[2],
+            bitmap_offset,
+            partial_virtual_bitmap,
+            multicast_buffered: body[2] & 1 != 0,
+            aid_buffered,
+        }));
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct TargetBeaconTimTelemetry {
+    beacon_count: u64,
+    tim_present_count: u64,
+    aid_buffered_true_count: u64,
+    aid_buffered_true_transition_count: u64,
+    previous_aid_buffered: Option<bool>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
 const WTBL_STAGE_ORDER: [&str; 11] = [
     "before_admission_clear",
     "after_admission_clear",
@@ -3146,6 +3219,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         eapol_start_deadline: None,
         eapol_start_emitted: false,
         suppress_eapol_liveness: false,
+        target_beacon_tim: TargetBeaconTimTelemetry::default(),
     };
     let support = live_client_support(query_from_capabilities(capability, &candidates));
     let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
@@ -3617,7 +3691,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v3";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v5";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
@@ -3626,15 +3700,19 @@ const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
 const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
 const PASSIVE_M1_TARGET_SCOPE: &str =
     "pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1";
-const PASSIVE_M1_BEHAVIOR: &str =
-    "best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms";
+const PASSIVE_M1_BEHAVIOR: &str = "best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged";
 const PASSIVE_M1_ATTRIBUTION_LIMIT: &str = "independent-ap-or-over-air-witness-required";
+const TARGET_BEACON_TIM_CONTRACT: &str = "linux-ieee80211-check-tim-v1";
+const TARGET_BEACON_TIM_TRUE_RESULT: &str = "ap-queued-unicast-for-normalized-aid-not-traffic-type";
+const TARGET_BEACON_TIM_NEVER_TRUE_RESULT: &str = "inconclusive";
 const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "fuchsia-passive")]
+const PASSIVE_M1_SME_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
     format!(
-        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},first-data-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}""#
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
     )
 }
 
@@ -3770,7 +3848,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v4","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v5","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -6572,6 +6650,7 @@ fn run() -> Result<(), String> {
                                         eapol_start_deadline: None,
                                         eapol_start_emitted: false,
                                         suppress_eapol_liveness: e2e94_probe,
+                                        target_beacon_tim: TargetBeaconTimTelemetry::default(),
                                         // Peer/key WCID state remains association-owned. The
                                         // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
@@ -6677,6 +6756,12 @@ fn run() -> Result<(), String> {
                                     };
                                     let mut sme_config = wlan_sme::client::ClientConfig::default();
                                     sme_config.wpa3_supported = true;
+                                    if e2e94_probe {
+                                        sme_config.initial_rsna_response_timeout =
+                                            Some(zx::MonotonicDuration::from_nanos(
+                                                PASSIVE_M1_SME_RESPONSE_TIMEOUT.as_nanos() as i64,
+                                            ));
+                                    }
                                     let mut runtime =
                                         futures::executor::block_on(PinnedClientRuntime::new(
                                             device,
@@ -12838,6 +12923,19 @@ fn classify_client_data_frame(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn is_exact_target_eapol_candidate(classification: &ClientDataFrameClassification) -> bool {
+    classification.frame_type == 2
+        && !classification.to_ds
+        && classification.from_ds
+        && classification.addr1_is_client
+        && classification.addr2_is_peer
+        && classification.addr3_is_bssid
+        && classification.snap_present
+        && classification.ether_type == Some(0x888e)
+        && classification.llc_result == "valid"
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn is_anchored_eapol_data(bytes: &[u8]) -> bool {
     let classification = classify_client_data_frame(bytes, [0; 6], [0; 6]);
     classification.frame_type == 2
@@ -12876,6 +12974,7 @@ struct LiveClientEffects {
     eapol_start_deadline: Option<(Instant, u64)>,
     eapol_start_emitted: bool,
     suppress_eapol_liveness: bool,
+    target_beacon_tim: TargetBeaconTimTelemetry,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -12944,6 +13043,87 @@ fn classify_eapol_key(bytes: &[u8]) -> Option<(u16, &'static str)> {
 #[cfg(feature = "fuchsia-passive")]
 fn is_authenticator_m1(bytes: &[u8]) -> bool {
     classify_eapol_key(bytes).is_some_and(|(_, class)| class == "authenticator_m1")
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl LiveClientEffects {
+    fn observe_target_beacon_tim(&mut self, bytes: &[u8]) {
+        let Some(association) = self.firmware.association else {
+            return;
+        };
+        let classification = classify_client_management_frame(bytes, self.client, self.target);
+        let control = bytes
+            .get(..2)
+            .map(|value| u16::from_le_bytes([value[0], value[1]]))
+            .unwrap_or(0);
+        if control & 0x00fc != 0x0080
+            || !classification.addr2_is_peer
+            || !classification.addr3_is_bssid
+        {
+            return;
+        }
+
+        self.target_beacon_tim.beacon_count += 1;
+        let beacon_count = self.target_beacon_tim.beacon_count;
+        let elapsed_ms = self
+            .post_association_data_wait
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0);
+        let Some(fixed) = bytes.get(24..36) else {
+            record_sae_stage(&format!(
+                "target_beacon_tim beacon_count={beacon_count} elapsed_ms={elapsed_ms} normalized_aid={} tim_present=false tim_present_count={} parse=truncated_fixed_fields aid_buffered=unknown buffered_semantics=inconclusive",
+                association.aid, self.target_beacon_tim.tim_present_count
+            ));
+            return;
+        };
+        let timestamp = u64::from_le_bytes(fixed[0..8].try_into().expect("fixed length"));
+        let beacon_interval = u16::from_le_bytes([fixed[8], fixed[9]]);
+        let capability = u16::from_le_bytes([fixed[10], fixed[11]]);
+        match parse_target_beacon_tim(&bytes[36..], association.aid) {
+            Ok(None) => record_sae_stage(&format!(
+                "target_beacon_tim beacon_count={beacon_count} elapsed_ms={elapsed_ms} normalized_aid={} timestamp={timestamp} beacon_interval={beacon_interval} capability=0x{capability:04x} tim_present=false tim_present_count={} parse=valid aid_buffered=unknown buffered_semantics=inconclusive",
+                association.aid, self.target_beacon_tim.tim_present_count
+            )),
+            Err(reason) => record_sae_stage(&format!(
+                "target_beacon_tim beacon_count={beacon_count} elapsed_ms={elapsed_ms} normalized_aid={} timestamp={timestamp} beacon_interval={beacon_interval} capability=0x{capability:04x} tim_present=unknown tim_present_count={} parse=malformed reason={reason} aid_buffered=unknown buffered_semantics=inconclusive",
+                association.aid, self.target_beacon_tim.tim_present_count
+            )),
+            Ok(Some(tim)) => {
+                self.target_beacon_tim.tim_present_count += 1;
+                if tim.aid_buffered {
+                    self.target_beacon_tim.aid_buffered_true_count += 1;
+                }
+                let transition = match (
+                    self.target_beacon_tim.previous_aid_buffered,
+                    tim.aid_buffered,
+                ) {
+                    (Some(false), true) => "false_to_true",
+                    (Some(true), false) => "true_to_false",
+                    (None, true) => "initial_true",
+                    (None, false) => "initial_false",
+                    _ => "unchanged",
+                };
+                if tim.aid_buffered && self.target_beacon_tim.previous_aid_buffered != Some(true) {
+                    self.target_beacon_tim.aid_buffered_true_transition_count += 1;
+                }
+                self.target_beacon_tim.previous_aid_buffered = Some(tim.aid_buffered);
+                record_sae_stage(&format!(
+                    "target_beacon_tim beacon_count={beacon_count} elapsed_ms={elapsed_ms} normalized_aid={} timestamp={timestamp} beacon_interval={beacon_interval} capability=0x{capability:04x} tim_present=true tim_present_count={} parse=valid dtim_count={} dtim_period={} bitmap_control=0x{:02x} bitmap_offset={} partial_virtual_bitmap={} multicast_buffered={} aid_buffered={} aid_buffered_true_count={} aid_buffered_transition={transition} aid_buffered_true_transition_count={} buffered_semantics=ap_queued_unicast_for_aid_not_traffic_type",
+                    association.aid,
+                    self.target_beacon_tim.tim_present_count,
+                    tim.dtim_count,
+                    tim.dtim_period,
+                    tim.bitmap_control,
+                    tim.bitmap_offset,
+                    bytes_hex(tim.partial_virtual_bitmap),
+                    tim.multicast_buffered,
+                    tim.aid_buffered,
+                    self.target_beacon_tim.aid_buffered_true_count,
+                    self.target_beacon_tim.aid_buffered_true_transition_count,
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -13626,6 +13806,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .firmware
             .association_generation
             .expect("successful association publishes its generation");
+        self.target_beacon_tim = TargetBeaconTimTelemetry::default();
         self.post_association_data_wait = Some(Instant::now());
         self.eapol_start_deadline = (!self.suppress_eapol_liveness)
             .then(|| (Instant::now() + EAPOL_START_WAIT, generation));
@@ -13712,6 +13893,28 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
+        if let Some(started) = self
+            .post_association_data_wait
+            .filter(|started| started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT)
+        {
+            if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=m1_timeout result=unavailable status={status}"
+                ));
+            }
+            record_sae_stage(&format!(
+                "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
+                started.elapsed().as_millis()
+            ));
+            self.post_association_data_wait = None;
+            if self.suppress_eapol_liveness {
+                self.state.lock().unwrap().validation_complete = true;
+                record_sae_stage(
+                    "passive_m1_observation result=deadline owner=validation elapsed_ms=5000 authenticator_m1=false",
+                );
+            }
+            return Ok(None);
+        }
         let Some(mut frame) = io.next_client_rx()? else {
             if self.suppress_eapol_liveness {
                 if self.eapol_start_deadline.take().is_some() {
@@ -13744,21 +13947,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     self.send_wlan_frame(&start, fidl_softmac::WlanTxInfoFlags::empty(), io)?;
                     record_sae_stage("eapol_liveness type=start timer=expired one_shot=completed");
                 }
-            }
-            if let Some(started) = self
-                .post_association_data_wait
-                .filter(|started| started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT)
-            {
-                if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
-                    record_sae_stage(&format!(
-                        "passive_m1_rx_snapshot phase=m1_timeout result=unavailable status={status}"
-                    ));
-                }
-                record_sae_stage(&format!(
-                    "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
-                    started.elapsed().as_millis()
-                ));
-                self.post_association_data_wait = None;
             }
             return Ok(None);
         };
@@ -13956,6 +14144,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 ));
                 return Ok(None);
             }
+            self.observe_target_beacon_tim(&frame.bytes);
             if classification.subtype == 1 {
                 record_sae_stage(
                     "association_response_admitted address_match=true channel_generation_match=true",
@@ -13992,7 +14181,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
         }
         if control & 0x000c == 0x0008 {
-            if let Some(started) = self.post_association_data_wait.take() {
+            let observation_started = if self.suppress_eapol_liveness {
+                self.post_association_data_wait
+            } else {
+                self.post_association_data_wait.take()
+            };
+            if let Some(started) = observation_started {
                 record_sae_stage(&format!(
                     "post_association_first_data result=observed elapsed_ms={} data_candidate=true",
                     started.elapsed().as_millis()
@@ -14070,6 +14264,10 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 drop("foreign_transmitter");
                 return Ok(None);
             }
+            if eapol && !classification.addr3_is_bssid {
+                drop("foreign_bssid");
+                return Ok(None);
+            }
             let current_channel = {
                 let state = self.state.lock().unwrap();
                 state.channel.authorized_channel().is_ok_and(|channel| {
@@ -14126,7 +14324,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     drop("security_replay_or_integrity");
                     zx::Status::IO_DATA_INTEGRITY
                 })?;
-            let m1 = eapol && is_authenticator_m1(&frame.bytes);
+            let m1 = is_exact_target_eapol_candidate(&classification)
+                && is_authenticator_m1(&frame.bytes);
             if eapol && self.suppress_eapol_liveness {
                 let mut state = self.state.lock().unwrap();
                 state.passive_eapol_observed += 1;
@@ -14157,6 +14356,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 }
             }
             if m1 {
+                self.post_association_data_wait = None;
                 self.eapol_start_deadline = None;
                 record_sae_stage("eapol_liveness type=start timer=cancelled one_shot=suppressed");
             }
@@ -18084,6 +18284,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: true,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
         effects
             .set_channel(
@@ -19084,6 +19285,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
 
         // The selector's scan 7 result is moved into the runtime. External BSS
@@ -19224,6 +19426,7 @@ mod tests {
             eapol_start_deadline: Some((Instant::now(), 1)),
             eapol_start_emitted: false,
             suppress_eapol_liveness: true,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
 
         assert!(effects.next_rx(&mut io).unwrap().is_none());
@@ -19456,6 +19659,13 @@ mod tests {
             fcs_error: false,
             pn: None,
         };
+        let mut foreign_bssid_m1 = m1.clone();
+        foreign_bssid_m1[16..22].copy_from_slice(&[9; 6]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: foreign_bssid_m1,
+            status: status.clone(),
+            security: Some(security),
+        });
         io.rx.push_back(ClientRxFrame {
             bytes: m1.clone(),
             status: status.clone(),
@@ -19465,12 +19675,15 @@ mod tests {
             assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes.len(), 308);
             assert!(!effects.validation_complete());
         }
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(effects.post_association_data_wait.is_some());
+        assert!(!effects.state.lock().unwrap().passive_m1_pending);
         assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, m1);
         assert!(!effects.firmware.controlled_port_open);
         assert!(!effects.validation_complete());
         effects.eapol_ind_delivered_to_sme();
         assert!(effects.validation_complete());
-        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 12);
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 13);
         assert_eq!(effects.state.lock().unwrap().passive_m1_deliveries, 1);
         assert_eq!(io.tx.len(), tx_before_rx);
 
@@ -19647,6 +19860,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -20018,6 +20232,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
         physically_unbound
             .set_channel(
@@ -20083,6 +20298,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
         effects
             .set_channel(
@@ -20173,6 +20389,7 @@ mod tests {
             eapol_start_deadline: None,
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
+            target_beacon_tim: TargetBeaconTimTelemetry::default(),
         };
         effects
             .set_channel(
@@ -23554,6 +23771,336 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn target_beacon_tim_matches_linux_aid_bitmap_semantics() {
+        let aid6 = parse_target_beacon_tim(&[5, 4, 1, 2, 0, 0x40], 6)
+            .unwrap()
+            .unwrap();
+        assert!(aid6.aid_buffered);
+        assert_eq!(aid6.bitmap_offset, 0);
+        assert!(!aid6.multicast_buffered);
+
+        let aid8 = parse_target_beacon_tim(&[5, 5, 0, 3, 0, 0, 1], 8)
+            .unwrap()
+            .unwrap();
+        assert!(aid8.aid_buffered);
+        assert_eq!(aid8.partial_virtual_bitmap, &[0, 1]);
+
+        let offset = parse_target_beacon_tim(&[5, 4, 0, 3, 2, 1], 16)
+            .unwrap()
+            .unwrap();
+        assert!(offset.aid_buffered);
+        assert_eq!(offset.bitmap_offset, 2);
+        assert!(
+            !parse_target_beacon_tim(&[5, 4, 0, 3, 2, 1], 8)
+                .unwrap()
+                .unwrap()
+                .aid_buffered
+        );
+
+        let multicast_only = parse_target_beacon_tim(&[5, 4, 0, 2, 1, 0], 6)
+            .unwrap()
+            .unwrap();
+        assert!(multicast_only.multicast_buffered);
+        assert!(!multicast_only.aid_buffered);
+        assert_eq!(parse_target_beacon_tim(&[0, 0], 6), Ok(None));
+        assert_eq!(parse_target_beacon_tim(&[5], 6), Err("truncated_ie_header"));
+        assert_eq!(
+            parse_target_beacon_tim(&[5, 4, 0, 2, 0], 6),
+            Err("truncated_ie_body")
+        );
+        assert_eq!(
+            parse_target_beacon_tim(&[5, 3, 0, 2, 0], 6),
+            Err("malformed_tim_length")
+        );
+        assert_eq!(
+            parse_target_beacon_tim(&[5, 4, 0, 0, 0, 0], 6),
+            Err("zero_dtim_period")
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn post_association_target_beacon_tim_telemetry_preserves_delivery_and_current_aid() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        effects.firmware.association.as_mut().unwrap().aid = 6;
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let status = fidl_softmac::WlanRxInfo {
+            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
+            mcs: 0,
+            rssi_dbm: -40,
+            snr_dbh: 0,
+        };
+        let beacon = |bssid: [u8; 6], ies: &[u8]| {
+            let mut frame = vec![0; 36];
+            frame[..2].copy_from_slice(&0x0080u16.to_le_bytes());
+            frame[4..10].fill(0xff);
+            frame[10..16].copy_from_slice(&bssid);
+            frame[16..22].copy_from_slice(&bssid);
+            frame[24..32].copy_from_slice(&123u64.to_le_bytes());
+            frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+            frame[34..36].copy_from_slice(&0x0431u16.to_le_bytes());
+            frame.extend_from_slice(ies);
+            frame
+        };
+
+        let buffered_aid6 = beacon(effects.target, &[5, 4, 1, 2, 0, 0x40]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: buffered_aid6.clone(),
+            status: status.clone(),
+            security: None,
+        });
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            buffered_aid6
+        );
+        assert_eq!(effects.target_beacon_tim.beacon_count, 1);
+        assert_eq!(effects.target_beacon_tim.tim_present_count, 1);
+        assert_eq!(effects.target_beacon_tim.aid_buffered_true_count, 1);
+
+        io.rx.push_back(ClientRxFrame {
+            bytes: beacon([9; 6], &[5, 4, 1, 2, 0, 0x40]),
+            status: status.clone(),
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(effects.target_beacon_tim.beacon_count, 1);
+
+        let mut wrong_channel_status = status.clone();
+        wrong_channel_status.primary.number = 40;
+        io.rx.push_back(ClientRxFrame {
+            bytes: beacon(effects.target, &[5, 4, 1, 2, 0, 0x40]),
+            status: wrong_channel_status,
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(effects.target_beacon_tim.beacon_count, 1);
+
+        let mut foreign_receiver = beacon(effects.target, &[5, 4, 1, 2, 0, 0x40]);
+        foreign_receiver[4..10].copy_from_slice(&[8; 6]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: foreign_receiver,
+            status: status.clone(),
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(effects.target_beacon_tim.beacon_count, 1);
+
+        effects.firmware.association.as_mut().unwrap().aid = 8;
+        io.rx.push_back(ClientRxFrame {
+            bytes: beacon(effects.target, &[5, 5, 0, 3, 0, 0, 1]),
+            status: status.clone(),
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(effects.target_beacon_tim.beacon_count, 2);
+        assert_eq!(effects.target_beacon_tim.aid_buffered_true_count, 2);
+
+        io.rx.push_back(ClientRxFrame {
+            bytes: beacon(effects.target, &[0, 0]),
+            status,
+            security: None,
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(effects.target_beacon_tim.beacon_count, 3);
+        assert_eq!(effects.target_beacon_tim.tim_present_count, 2);
+        assert!(effects.post_association_data_wait.is_some());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn run3_logged_classification_is_not_an_exact_target_eapol_candidate() {
+        let classification = ClientDataFrameClassification {
+            frame_type: 2,
+            subtype: 0,
+            to_ds: false,
+            from_ds: true,
+            protected: true,
+            header_offset: 24,
+            qos: false,
+            amsdu: false,
+            addr1_is_client: false,
+            addr2_is_peer: true,
+            addr3_is_bssid: false,
+            snap_present: false,
+            ether_type: Some(0),
+            llc_result: "non_snap",
+        };
+        assert!(!is_exact_target_eapol_candidate(&classification));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn synthetic_foreign_protected_frame_does_not_end_passive_m1_observation() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+
+        let foreign = [0x02, 0, 0, 0, 0, 0x99];
+        let mut frame = vec![0; 349];
+        frame[..2].copy_from_slice(&0x4208u16.to_le_bytes());
+        frame[4..10].copy_from_slice(&foreign);
+        frame[10..16].copy_from_slice(&effects.target);
+        frame[16..22].copy_from_slice(&foreign);
+        let classified = classify_client_data_frame(&frame, effects.client, effects.target);
+        assert_eq!(classified.frame_type, 2);
+        assert_eq!(classified.subtype, 0);
+        assert!(!classified.to_ds);
+        assert!(classified.from_ds);
+        assert!(classified.protected);
+        assert_eq!(classified.header_offset, 24);
+        assert!(!classified.qos);
+        assert!(!classified.amsdu);
+        assert!(!classified.addr1_is_client);
+        assert!(classified.addr2_is_peer);
+        assert!(!classified.addr3_is_bssid);
+        assert!(!classified.snap_present);
+        assert_eq!(classified.ether_type, Some(0));
+        assert_eq!(classified.llc_result, "non_snap");
+
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        io.rx.push_back(ClientRxFrame {
+            bytes: frame,
+            status: fidl_softmac::WlanRxInfo {
+                rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                data_rate: 0,
+                primary: channel,
+                bandwidth: ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+                mcs: 0,
+                rssi_dbm: -40,
+                snr_dbh: 0,
+            },
+            security: Some(ClientRxSecurity {
+                wcid: 19,
+                tid: 0,
+                key_id: 0,
+                security_mode: 0,
+                cm: true,
+                clm: false,
+                icv_error: false,
+                mic_error: false,
+                fcs_error: false,
+                pn: None,
+            }),
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(effects.post_association_data_wait.is_some());
+        assert!(!effects.validation_complete());
+
+        // Even a continuously nonempty RX queue cannot let the 6000 ms SME
+        // timer preempt the validation-owned 5000 ms observation boundary.
+        io.rx.push_back(ClientRxFrame {
+            bytes: vec![0; 24],
+            status: fidl_softmac::WlanRxInfo {
+                rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                data_rate: 0,
+                primary: channel,
+                bandwidth: ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+                mcs: 0,
+                rssi_dbm: -40,
+                snr_dbh: 0,
+            },
+            security: None,
+        });
+        effects.post_association_data_wait = Some(Instant::now() - PASSIVE_M1_FIRST_DATA_TIMEOUT);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(io.rx.len(), 1);
+        assert!(effects.post_association_data_wait.is_none());
+        assert!(effects.validation_complete());
+        assert_eq!(effects.state.lock().unwrap().passive_m1_deliveries, 0);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn normal_mode_unrelated_data_keeps_original_one_shot_observer_behavior() {
+        let mut effects = validation_effects();
+        effects.suppress_eapol_liveness = false;
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        assert!(effects.post_association_data_wait.is_some());
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0208u16.to_le_bytes());
+        frame[4..10].copy_from_slice(&[9; 6]);
+        frame[10..16].copy_from_slice(&effects.target);
+        frame[16..22].copy_from_slice(&[9; 6]);
+        io.rx.push_back(ClientRxFrame {
+            bytes: frame,
+            status: fidl_softmac::WlanRxInfo {
+                rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                data_rate: 0,
+                primary: channel,
+                bandwidth: ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+                mcs: 0,
+                rssi_dbm: -40,
+                snr_dbh: 0,
+            },
+            security: Some(ClientRxSecurity {
+                wcid: 19,
+                tid: 0,
+                key_id: 0,
+                security_mode: 0,
+                cm: false,
+                clm: false,
+                icv_error: false,
+                mic_error: false,
+                fcs_error: false,
+                pn: None,
+            }),
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(effects.post_association_data_wait.is_none());
+        assert!(!effects.validation_complete());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn data_candidate_classification_uses_exact_ds_qos_ht_and_llc_offsets() {
         let client = [2, 0, 0, 0, 0, 1];
         let peer = [2, 0, 0, 0, 0, 2];
@@ -23851,6 +24398,7 @@ mod tests {
                 eapol_start_deadline: None,
                 eapol_start_emitted: false,
                 suppress_eapol_liveness: false,
+                target_beacon_tim: TargetBeaconTimTelemetry::default(),
             };
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
@@ -25894,6 +26442,12 @@ mod tests {
             std::time::Duration::from_millis(5000)
         );
         assert_eq!(EAPOL_START_WAIT, std::time::Duration::from_secs(1));
+        assert_eq!(
+            PASSIVE_M1_SME_RESPONSE_TIMEOUT,
+            std::time::Duration::from_secs(6)
+        );
+        assert!(PASSIVE_M1_SME_RESPONSE_TIMEOUT > PASSIVE_M1_FIRST_DATA_TIMEOUT);
+        assert!(source.contains("sme_config.initial_rsna_response_timeout = Some("));
         assert!(source.contains(
             "let ready_deadline = Instant::now() + std::time::Duration::from_millis(1000)"
         ));
@@ -25904,20 +26458,24 @@ mod tests {
             .split("fn wait_response(")
             .next()
             .unwrap();
-        assert!(wait_tx_consumed.contains(
-            "let deadline = Instant::now() + std::time::Duration::from_millis(1000)"
-        ));
+        assert!(
+            wait_tx_consumed
+                .contains("let deadline = Instant::now() + std::time::Duration::from_millis(1000)")
+        );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v3\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v5\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c\"",
             "\"consuming_mib_reads\":false",
-            "\"snapshot_boundaries\":\"before-post-assoc-tail,first-data-timeout-5000ms\"",
+            "\"snapshot_boundaries\":\"before-post-assoc-tail,m1-observation-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
-            "\"behavior\":\"best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms\"",
+            "\"behavior\":\"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged\"",
             "\"attribution_limit\":\"independent-ap-or-over-air-witness-required\"",
+            "\"target_beacon_tim_contract\":\"linux-ieee80211-check-tim-v1\"",
+            "\"tim_true_result\":\"ap-queued-unicast-for-normalized-aid-not-traffic-type\"",
+            "\"tim_never_true_result\":\"inconclusive\"",
         ] {
             assert!(identity.contains(field), "missing identity field {field}");
         }
