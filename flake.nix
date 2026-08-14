@@ -976,7 +976,118 @@
               grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"' "$identity"
             '';
 
-          mt7921-full-firmware-validation-remote-entry = pkgs.stdenv.mkDerivation {
+          mt7921-full-firmware-validation-recovery-status = pkgs.stdenv.mkDerivation {
+            pname = "mt7921-full-firmware-validation-recovery-status";
+            version = "1";
+            dontUnpack = true;
+            nativeBuildInputs = [ pkgs.bash pkgs.gnugrep ];
+            doInstallCheck = true;
+            meta.mainProgram = "mt7921-full-firmware-validation-recovery-status";
+            installPhase = ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-full-firmware-validation-recovery-status.sh} \
+                "$out/bin/mt7921-full-firmware-validation-recovery-status" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by run_root /run \
+                --subst-var-by sys_root /sys \
+                --subst-var-by id ${pkgs.coreutils}/bin/id \
+                --subst-var-by basename ${pkgs.coreutils}/bin/basename \
+                --subst-var-by readlink ${pkgs.coreutils}/bin/readlink \
+                --subst-var-by systemctl ${pkgs.systemd}/bin/systemctl \
+                --subst-var-by ip ${pkgs.iproute2}/bin/ip \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by awk ${pkgs.gawk}/bin/awk \
+                --subst-var-by ping ${pkgs.iputils}/bin/ping
+              chmod 0755 "$out/bin/mt7921-full-firmware-validation-recovery-status"
+            '';
+            installCheckPhase = ''
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-recovery-status"
+              ! grep -Eq '@[a-z_]+' "$out/bin/mt7921-full-firmware-validation-recovery-status"
+              grep -F 'contract=mt7921-full-firmware-recovery-status-v1' "$out/bin/mt7921-full-firmware-validation-recovery-status"
+            '';
+          };
+
+          mt7921-full-firmware-validation-recovery-status-test = pkgs.runCommand
+            "mt7921-full-firmware-validation-recovery-status-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              mkdir -p root/run/wifi-driver-lab root/sys/bus/pci/devices/0000:05:00.0/net root/sys/drivers/mt7921e bin
+              ln -s ../../../../drivers/mt7921e root/sys/bus/pci/devices/0000:05:00.0/driver
+              touch root/sys/bus/pci/devices/0000:05:00.0/net/wlan-test
+              cat > bin/id <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo 0
+              EOF
+              cat > bin/systemctl <<'EOF'
+              #!${pkgs.runtimeShell}
+              test "$1" = is-active && test "$2" = --quiet && test "$3" = iwd.service
+              EOF
+              cat > bin/ip <<'EOF'
+              #!${pkgs.runtimeShell}
+              case "$1:$2" in
+                -4:addr) echo 'inet 192.0.2.2/24' ;;
+                route:show) echo 'default via 192.0.2.1 dev wlan-test' ;;
+                *) exit 1 ;;
+              esac
+              EOF
+              cat > bin/ping <<'EOF'
+              #!${pkgs.runtimeShell}
+              exit 0
+              EOF
+              chmod +x bin/*
+              substitute ${./nix/mt7921-full-firmware-validation-recovery-status.sh} status \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by run_root "$PWD/root/run" \
+                --subst-var-by sys_root "$PWD/root/sys" \
+                --subst-var-by id "$PWD/bin/id" \
+                --subst-var-by basename ${pkgs.coreutils}/bin/basename \
+                --subst-var-by readlink ${pkgs.coreutils}/bin/readlink \
+                --subst-var-by systemctl "$PWD/bin/systemctl" \
+                --subst-var-by ip "$PWD/bin/ip" \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by awk ${pkgs.gawk}/bin/awk \
+                --subst-var-by ping "$PWD/bin/ping"
+              chmod +x status
+              test "$(./status --version)" = mt7921-full-firmware-recovery-status-v1
+              ./status --idle
+              set +e
+              ./status --quarantined
+              rc=$?
+              set -e
+              test "$rc" -eq 1
+              ./status --native-ready 0000:05:00.0
+              : > root/run/wifi-driver-lab/a.state
+              ! ./status --idle
+              echo UNSAFE > root/run/wifi-driver-lab/a.state.safety
+              ./status --quarantined
+              echo SAFE > root/run/wifi-driver-lab/a.state.safety
+              ! ./status --quarantined
+              ! ./status --native-ready 0000:00:00.0
+              set +e
+              ./status arbitrary
+              rc=$?
+              set -e
+              test "$rc" -eq 64
+              touch "$out"
+            '';
+
+          mt7921-full-firmware-validation-remote-entry =
+            let
+              recoveryStatusRegisteredHash = pkgs.runCommand
+                "mt7921-full-firmware-validation-recovery-status-registered-hash"
+                {
+                  __structuredAttrs = true;
+                  exportReferencesGraph.recoveryStatus = [ mt7921-full-firmware-validation-recovery-status ];
+                  nativeBuildInputs = [ pkgs.jq ];
+                }
+                ''
+                  out="''${outputs[out]}"
+                  ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-validation-recovery-status}' \
+                    '.recoveryStatus[] | select(.path == $path) | .narHash' \
+                    "$NIX_ATTRS_JSON_FILE" > "$out"
+                '';
+            in
+            pkgs.stdenv.mkDerivation {
             pname = "mt7921-full-firmware-validation-remote-entry";
             version = "0.1.0";
             dontUnpack = true;
@@ -995,6 +1106,7 @@
                 --subst-var-by sleep ${pkgs.coreutils}/bin/sleep \
                 --subst-var-by timeout ${pkgs.coreutils}/bin/timeout \
                 --subst-var-by recovery_call_timeout_seconds 15 \
+                --subst-var-by home /home/maan2003 \
                 --subst-var-by xdg_runtime_dir /run/user/1002 \
                 --subst-var-by target_root /nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry \
                 --subst-var-by target_package /nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0 \
@@ -1002,7 +1114,10 @@
                 --subst-var-by target_supervisor /nix/store/a996mm46ml4m38zwv5iida1rf2nbpq1z-mt7921-full-firmware-validation-supervisor \
                 --subst-var-by target_nix_store /nix/store/m9gfpnfrwdhr2cqakrfki9p73rjlfqgd-lix-2.95.2/bin/nix-store \
                 --subst-var-by target_sha256sum /nix/store/mp8s10fwm685azvvv1qq7zyf7iajjlj8-coreutils-9.11/bin/sha256sum \
-                --subst-var-by target_recovery_helper /nix/store/ffqajh67zhg5kx3xl2vm18z4f8i108l8-wifi-driver-lab/bin/wifi-driver-lab \
+                --subst-var-by target_recovery_package ${mt7921-full-firmware-validation-recovery-status} \
+                --subst-var-by target_recovery_helper ${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status \
+                --subst-var-by target_recovery_registered_hash "$(cat ${recoveryStatusRegisteredHash})" \
+                --subst-var-by target_recovery_sha256 "$(sha256sum ${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status | cut -d ' ' -f1)" \
                 --subst-var-by target_sudo /run/wrappers/bin/sudo \
                 --subst-var-by target_root_registered_hash sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5 \
                 --subst-var-by target_package_registered_hash sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 \
@@ -1013,7 +1128,7 @@
                 --subst-var-by target_supervisor_sha256 06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 \
                 --subst-var-by target_identity_sha256 4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f \
                 --subst-var-by target_launcher_sha256 984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc \
-                --subst-var-by transport_contract openssh-absolute+ssh-config-disabled+batchmode+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+bounded-read-only-sudo-recovery-v1
+                --subst-var-by transport_contract openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-remote-entry"
               runHook postInstall
             '';
@@ -1026,7 +1141,7 @@
               grep -F 'remote "$target_entry"' "$out/bin/mt7921-full-firmware-validation-remote-entry"
               ! grep -F 'watchdog disarm' "$out/bin/mt7921-full-firmware-validation-remote-entry"
             '';
-          };
+            };
 
           mt7921-full-firmware-validation-delivery-manifest =
             let
@@ -1041,6 +1156,19 @@
                   out="''${outputs[out]}"
                   ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-validation-remote-entry}' \
                     '.remoteEntry[] | select(.path == $path) | .narHash' \
+                  "$NIX_ATTRS_JSON_FILE" > "$out"
+                '';
+              recoveryStatusRegisteredHash = pkgs.runCommand
+                "mt7921-full-firmware-validation-delivery-recovery-status-registered-hash"
+                {
+                  __structuredAttrs = true;
+                  exportReferencesGraph.recoveryStatus = [ mt7921-full-firmware-validation-recovery-status ];
+                  nativeBuildInputs = [ pkgs.jq ];
+                }
+                ''
+                  out="''${outputs[out]}"
+                  ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-validation-recovery-status}' \
+                    '.recoveryStatus[] | select(.path == $path) | .narHash' \
                     "$NIX_ATTRS_JSON_FILE" > "$out"
                 '';
             in
@@ -1052,7 +1180,7 @@
                 REMOTE_ENTRY=$entry
                 REMOTE_ENTRY_SHA256=$(sha256sum "$entry" | cut -d ' ' -f1)
                 REMOTE_ENTRY_REGISTERED_HASH=$(cat ${remoteEntryRegisteredHash})
-                REMOTE_TRANSPORT_CONTRACT=openssh-absolute+ssh-config-disabled+batchmode+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+bounded-read-only-sudo-recovery-v1
+                REMOTE_TRANSPORT_CONTRACT=openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
                 REMOTE_TARGET=user@no-plastic
                 REMOTE_TARGET_ROOT=/nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry
                 REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5
@@ -1070,6 +1198,11 @@
                 REMOTE_ACTIVE_ARGC=0
                 REMOTE_PLAN_ARGV=--plan
                 REMOTE_RECOVERY_CONTRACT=sudo-n-exact-helper-poll-only-bounded-no-disarm
+                REMOTE_RECOVERY_STATUS_PACKAGE=${mt7921-full-firmware-validation-recovery-status}
+                REMOTE_RECOVERY_STATUS_HELPER=${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status
+                REMOTE_RECOVERY_STATUS_HELPER_SHA256=$(sha256sum ${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status | cut -d ' ' -f1)
+                REMOTE_RECOVERY_STATUS_REGISTERED_HASH=$(cat ${recoveryStatusRegisteredHash})
+                REMOTE_RECOVERY_STATUS_CONTRACT=mt7921-full-firmware-recovery-status-v1
                 EOF
                 grep -Fx "REMOTE_ENTRY=$entry" "$out"
                 grep -Eq '^REMOTE_ENTRY_SHA256=[0-9a-f]{64}$' "$out"
@@ -1082,6 +1215,7 @@
             ''
               mkdir -p work/home/.ssh work/runtime/tailscale
               : > work/home/.ssh/no-plastic
+              : > work/home/.ssh/known_hosts
               chmod 0600 work/home/.ssh/no-plastic
               cat > work/tailscale-stub <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1103,14 +1237,17 @@
               test "$3" = -i
               test "$4" = "$HOME/.ssh/no-plastic"
               test "$5" = -o && test "$6" = BatchMode=yes
-              test "$7" = -o && test "$8" = ConnectTimeout=10
-              test "$9" = -o && test "''${10}" = ServerAliveInterval=2
-              test "''${11}" = -o && test "''${12}" = ServerAliveCountMax=3
-              test "''${13}" = -o && test "''${14}" = StrictHostKeyChecking=yes
-              test "''${15}" = -o && test "''${16}" = "$expected_proxy"
-              test "''${17}" = user@no-plastic
+              test "$7" = -o && test "$8" = IdentitiesOnly=yes
+              test "$9" = -o && test "''${10}" = ConnectTimeout=10
+              test "''${11}" = -o && test "''${12}" = ServerAliveInterval=2
+              test "''${13}" = -o && test "''${14}" = ServerAliveCountMax=3
+              test "''${15}" = -o && test "''${16}" = StrictHostKeyChecking=yes
+              test "''${17}" = -o && test "''${18}" = "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+              test "''${19}" = -o && test "''${20}" = GlobalKnownHostsFile=/dev/null
+              test "''${21}" = -o && test "''${22}" = "$expected_proxy"
+              test "''${23}" = user@no-plastic
               "$PWD/work/tailscale-stub" "--socket=$XDG_RUNTIME_DIR/tailscale/tailscaled.sock" nc no-plastic 22
-              shift 17
+              shift 23
               if [ "''${MODE-}" = hostkey ]; then
                 echo 'Host key verification failed.' >&2
                 exit 255
@@ -1123,7 +1260,10 @@
               identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
               launcher=$package/bin/mt7921-full-firmware-validation
               supervisor_file=$supervisor/bin/mt7921-full-firmware-validation-supervisor
-              if [ "$1" = /target/nix-store ]; then
+              if [ "$1" = /target/nix-store ] && [ "$2" = --verify-path ]; then
+                test "$#" -eq 3
+                exit 0
+              elif [ "$1" = /target/nix-store ]; then
                 test "$2" = -q && test "$3" = --hash
                 if [ "''${MODE-}" = wronghash ] && [ "$4" = "$root" ]; then
                   echo sha256:wrong
@@ -1134,6 +1274,7 @@
                   "$package") echo sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 ;;
                   "$manifest") echo sha256:115mazbd3qszngmb3jv0niggnjxs9wlx0dp6dyyy2qz3iadziap1 ;;
                   "$supervisor") echo sha256:0gd7njrkjjmakdfafhspmkrb2prcsczyrsmhsb53d27lpjl2a2qx ;;
+                  /target/recovery-package) echo sha256:recoveryregisteredhash00000000000000000000000000000000 ;;
                   *) exit 90 ;;
                 esac
               elif [ "$1" = /target/sha256sum ]; then
@@ -1143,6 +1284,7 @@
                   "$supervisor_file") hash=06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 ;;
                   "$identity") hash=4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f ;;
                   "$launcher") hash=984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc ;;
+                  /target/recovery) hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
                   *) exit 91 ;;
                 esac
                 printf '%s  %s\n' "$hash" "$2"
@@ -1153,19 +1295,17 @@
                 echo active >> "$PWD/active.calls"
                 if [ "''${MODE-}" = unknown ] || [ "''${MODE-}" = hang ]; then exit 255; fi
                 exit 0
-              elif [ "$1" = /target/sudo ] && [ "$2" = -n ] && [ "$3" = /target/recovery ] && [ "''${MODE-}" = unknown ]; then
-                case "$4" in
-                  --quarantined) exit 1 ;;
-                  --idle) exit 0 ;;
-                  --native-ready) test "$5" = 0000:05:00.0; exit 0 ;;
-                  *) exit 92 ;;
-                esac
-              elif [ "$1" = /target/sudo ] && [ "$2" = -n ] && [ "$3" = /target/recovery ] && [ "''${MODE-}" = hang ]; then
-                if [ ! -e "$PWD/hang.once" ]; then
+              elif [ "$1" = /target/sudo ] && [ "$2" = -n ] && [ "$3" = /target/recovery ]; then
+                if [ "''${MODE-}" = oldhelper ]; then
+                  echo 'usage: wifi-driver-lab PCI_BDF TIMEOUT_SECONDS -- COMMAND [ARG ...]' >&2
+                  exit 2
+                fi
+                if [ "''${MODE-}" = hang ] && [ -e "$PWD/active.calls" ] && [ ! -e "$PWD/hang.once" ]; then
                   touch "$PWD/hang.once"
                   ${pkgs.coreutils}/bin/sleep 5
                 fi
                 case "$4" in
+                  --version) echo mt7921-full-firmware-recovery-status-v1 ;;
                   --quarantined) exit 1 ;;
                   --idle) exit 0 ;;
                   --native-ready) test "$5" = 0000:05:00.0; exit 0 ;;
@@ -1184,6 +1324,7 @@
                 --subst-var-by sleep "$PWD/work/sleep-stub" \
                 --subst-var-by timeout ${pkgs.coreutils}/bin/timeout \
                 --subst-var-by recovery_call_timeout_seconds 1 \
+                --subst-var-by home "$PWD/work/home" \
                 --subst-var-by xdg_runtime_dir "$PWD/work/runtime" \
                 --subst-var-by target_root /nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry \
                 --subst-var-by target_package /nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0 \
@@ -1192,6 +1333,9 @@
                 --subst-var-by target_nix_store /target/nix-store \
                 --subst-var-by target_sha256sum /target/sha256sum \
                 --subst-var-by target_recovery_helper /target/recovery \
+                --subst-var-by target_recovery_package /target/recovery-package \
+                --subst-var-by target_recovery_registered_hash sha256:recoveryregisteredhash00000000000000000000000000000000 \
+                --subst-var-by target_recovery_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
                 --subst-var-by target_sudo /target/sudo \
                 --subst-var-by target_root_registered_hash sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5 \
                 --subst-var-by target_package_registered_hash sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 \
@@ -1249,12 +1393,21 @@
 
               rm -f active.calls
               set +e
+              MODE=oldhelper work/entry --plan >old.out 2>old.error
+              rc=$?
+              set -e
+              test "$rc" -eq 1
+              test ! -e active.calls
+              grep -F 'fixed recovery status version query failed' old.error
+
+              rm -f active.calls
+              set +e
               MODE=hostkey work/entry >hostkey.out 2>hostkey.error
               rc=$?
               set -e
               test "$rc" -eq 1
               test ! -e active.calls
-              grep -F 'remote registered-hash verification failed' hostkey.error
+              grep -F 'remote store content verification failed' hostkey.error
 
               set +e
               MODE=wronghash work/entry >wrong.out 2>wrong.error
