@@ -11678,22 +11678,73 @@ impl MgmtTxCompletionState {
         Ok(())
     }
 
-    fn finished(&self) -> Option<Result<(), String>> {
+    fn terminal(&self) -> Option<MgmtTxTerminal> {
+        if let Some(free) = self.free.filter(|free| free.dropped || free.status != 0) {
+            return Some(MgmtTxTerminal::Failed {
+                token: self.token,
+                pid: self.pid,
+                free,
+                status: self.status,
+            });
+        }
         let (free, status) = (self.free?, self.status?);
-        Some(if !free.dropped && status.acked {
-            Ok(())
+        Some(if status.acked {
+            MgmtTxTerminal::Succeeded {
+                token: self.token,
+                pid: self.pid,
+                free,
+                status,
+            }
         } else {
-            Err("SAE authentication MPDU was not acknowledged".into())
+            MgmtTxTerminal::Failed {
+                token: self.token,
+                pid: self.pid,
+                free,
+                status: Some(status),
+            }
         })
     }
 }
 
 #[cfg(feature = "fuchsia-passive")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MgmtTxTerminal {
+    Succeeded {
+        token: u16,
+        pid: u8,
+        free: Mt7921TxFree,
+        status: Mt7921TxStatus,
+    },
+    Failed {
+        token: u16,
+        pid: u8,
+        free: Mt7921TxFree,
+        status: Option<Mt7921TxStatus>,
+    },
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl MgmtTxTerminal {
+    fn identity(self) -> (u16, u8) {
+        match self {
+            Self::Succeeded { token, pid, .. } | Self::Failed { token, pid, .. } => (token, pid),
+        }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MgmtTxObservation {
+    Pending,
+    Terminal(MgmtTxTerminal),
+    IgnoredRetired,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MgmtTxPublicationOutcome {
     NotPublished,
-    Committed,
-    Completed,
+    DescriptorConsumed,
     AmbiguousOwnership,
 }
 
@@ -11703,6 +11754,7 @@ struct MgmtTxOutstanding {
     next_token: u16,
     next_pid: u8,
     entries: Vec<MgmtTxCompletionState>,
+    retired: Vec<(u16, u8)>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -11740,30 +11792,40 @@ impl MgmtTxOutstanding {
         }
     }
 
-    fn observe(
-        &mut self,
-        completion: MgmtTxCompletion,
-    ) -> Result<Option<MgmtTxPublicationOutcome>, String> {
-        let entry = match completion {
+    fn observe(&mut self, completion: MgmtTxCompletion) -> Result<MgmtTxObservation, String> {
+        let index = match completion {
             MgmtTxCompletion::Free(value) => self
                 .entries
-                .iter_mut()
-                .find(|entry| entry.token == value.token),
+                .iter()
+                .position(|entry| entry.token == value.token),
             MgmtTxCompletion::Status(value) => {
-                self.entries.iter_mut().find(|entry| entry.pid == value.pid)
+                self.entries.iter().position(|entry| entry.pid == value.pid)
             }
-        }
-        .ok_or("uncorrelated management TX completion")?;
-        entry.observe(completion)?;
-        let Some(result) = entry.finished() else {
-            return Ok(None);
         };
-        result?;
-        let token = entry.token;
-        let pid = entry.pid;
-        self.entries
-            .retain(|entry| entry.token != token || entry.pid != pid);
-        Ok(Some(MgmtTxPublicationOutcome::Completed))
+        let Some(index) = index else {
+            let retired = match completion {
+                MgmtTxCompletion::Free(value) => {
+                    self.retired.iter().any(|(token, _)| *token == value.token)
+                }
+                MgmtTxCompletion::Status(value) => {
+                    self.retired.iter().any(|(_, pid)| *pid == value.pid)
+                }
+            };
+            return if retired {
+                Ok(MgmtTxObservation::IgnoredRetired)
+            } else {
+                Err("uncorrelated management TX completion".into())
+            };
+        };
+        let entry = &mut self.entries[index];
+        entry.observe(completion)?;
+        let Some(terminal) = entry.terminal() else {
+            return Ok(MgmtTxObservation::Pending);
+        };
+        let identity = terminal.identity();
+        self.entries.remove(index);
+        self.retired.push(identity);
+        Ok(MgmtTxObservation::Terminal(terminal))
     }
 
     fn is_empty(&self) -> bool {
@@ -12827,9 +12889,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
             io.transmit_client(bytes, flags)?;
             if sae {
                 record_sae_stage(match bytes.get(26..28) {
-                    Some([1, 0]) => "sae_commit_tx_acked",
-                    Some([2, 0]) => "sae_confirm_tx_acked",
-                    _ => "sae_protocol_tx_acked",
+                    Some([1, 0]) => "sae_commit_tx_terminal_success sme_callback=success",
+                    Some([2, 0]) => "sae_confirm_tx_terminal_success sme_callback=success",
+                    _ => "sae_protocol_tx_terminal_success sme_callback=success",
                 });
             }
             return Ok(());
@@ -14232,17 +14294,75 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         Ok(())
     }
 
-    fn retire_mgmt_tx_completions(&mut self) -> Result<(), String> {
+    fn retire_mgmt_tx_completions(&mut self) -> Result<Vec<MgmtTxTerminal>, String> {
+        let mut terminals = Vec::new();
         self.tx_completions
             .append(&mut self.loader.mcu.tx_completions);
         for completion in self.tx_completions.drain(..) {
-            if self.mgmt_tx_outstanding.observe(completion)?
-                == Some(MgmtTxPublicationOutcome::Completed)
-            {
-                record_sae_stage("management_tx_completion outcome=completed");
+            match self.mgmt_tx_outstanding.observe(completion)? {
+                MgmtTxObservation::Pending => {}
+                MgmtTxObservation::Terminal(terminal) => terminals.push(terminal),
+                MgmtTxObservation::IgnoredRetired => record_sae_stage(
+                    "management_tx_completion outcome=ignored_retired reason=late_or_duplicate",
+                ),
             }
         }
-        Ok(())
+        Ok(terminals)
+    }
+
+    fn wait_mgmt_tx_terminal(&mut self, token: u16, pid: u8) -> Result<(), String> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            self.loader.mcu.handle_irq(None)?;
+            drain_data_rx_queue(
+                self.loader.mcu.wfdma,
+                &mut self.data,
+                &mut self.loader.mcu.descriptor_provenance,
+                &mut self.tx_completions,
+                Some(&mut self.loader.mcu.normal_rx_frames),
+            )?;
+            for terminal in self.retire_mgmt_tx_completions()? {
+                if terminal.identity() != (token, pid) {
+                    return Err(
+                        "management TX terminal identity crossed the synchronous owner".into(),
+                    );
+                }
+                return match terminal {
+                    MgmtTxTerminal::Succeeded { free, status, .. } => {
+                        record_sae_stage(&format!(
+                            "management_tx_terminal outcome=success token={token} pid={pid} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} sme_callback=success",
+                            status.acked, free.dropped, free.status, free.attempts
+                        ));
+                        Ok(())
+                    }
+                    MgmtTxTerminal::Failed { free, status, .. } => {
+                        record_sae_stage(&format!(
+                            "management_tx_terminal outcome=failed token={token} pid={pid} txs_present={} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} token_retired=true descriptor_retired=true transport_poisoned=false sme_callback=failure retry_owner=protocol",
+                            status.is_some(),
+                            status.is_some_and(|status| status.acked),
+                            free.dropped,
+                            free.status,
+                            free.attempts,
+                        ));
+                        Err(format!(
+                            "management TX terminal failure: dropped={} status={} attempts={} txs_acked={}",
+                            free.dropped,
+                            free.status,
+                            free.attempts,
+                            status.is_some_and(|status| status.acked)
+                        ))
+                    }
+                };
+            }
+            if Instant::now() >= deadline {
+                self.loader.uni_terminal_poisoned = true;
+                record_sae_stage(&format!(
+                    "management_tx_terminal outcome=unresolved_timeout token={token} pid={pid} token_retired=false transport_poisoned=true sme_callback=failure"
+                ));
+                return Err("REBOOT REQUIRED: management TX completion timed out unresolved; transport poisoned until containment".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn transmit_owned_client_frame(&mut self, frame: &[u8]) -> Result<(), String> {
@@ -14367,7 +14487,13 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         frame_arena: &mut DmaArena,
         frame: &[u8],
     ) -> Result<(), String> {
-        self.retire_mgmt_tx_completions()?;
+        let terminals = self.retire_mgmt_tx_completions()?;
+        if !terminals.is_empty() {
+            return Err(
+                "management TX terminal completion was not delivered to its synchronous owner"
+                    .into(),
+            );
+        }
         record_sae_stage(&format!(
             "management_tx_pre_submit stage=completion_check result={}",
             if self.mgmt_tx_outstanding.is_empty() {
@@ -14537,9 +14663,9 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 let didx = self.loader.mcu.wfdma.read(0xd430c)?;
                 let descriptor_done = ring.read_descriptor_at(0).is_dma_done();
                 if didx == 1 && descriptor_done {
-                    outcome = MgmtTxPublicationOutcome::Committed;
+                    outcome = MgmtTxPublicationOutcome::DescriptorConsumed;
                     record_sae_stage(
-                        "management_tx outcome=committed descriptor_consumed=true dma_done=true ownership=device",
+                        "management_tx_publication outcome=descriptor_consumed terminal=false dma_done=true ownership=device",
                     );
                     break;
                 }
@@ -14562,14 +14688,14 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         if outcome == MgmtTxPublicationOutcome::NotPublished {
             self.mgmt_tx_outstanding.abandon_last(token, pid);
         }
-        if outcome == MgmtTxPublicationOutcome::Committed {
+        if outcome == MgmtTxPublicationOutcome::DescriptorConsumed {
             result?;
             // DIDX plus DMA_DONE transfers the enqueue contract to the device,
             // but does not return the backing storage to the host.  Keep the
             // descriptor, TXWI, and frame intact until the next submission's
             // ring-local reset; TXS/TX_FREE remain correlated asynchronously.
             record_sae_stage(
-                "management_tx outcome=committed next=reclaim_deferred ownership=device",
+                "management_tx_publication outcome=awaiting_terminal_completion next=reclaim_deferred ownership=device",
             );
             return Ok(());
         }
@@ -15053,7 +15179,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 return Err(zx::Status::ACCESS_DENIED);
             };
             record_sae_stage(&format!(
-                "passive_m1_tx_boundary result=admitted phase=preassociation class={class} ownership=pinned_sme_mlme physical_tx=true"
+                "passive_m1_tx_boundary result=authorized phase=preassociation class={class} ownership=pinned_sme_mlme permit_consumed=true physical_submit_pending=true"
             ));
         }
         let validation_trigger = !self.e2e94_probe && eapol && !self.e2e81_probe_done;
@@ -15173,11 +15299,34 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
             return Ok(());
         }
-        let transmit = self.transmit_owned_client_frame(bytes);
-        let preserve = self.preserve_client_rx_during_control_wait();
+        let management = bytes
+            .get(..2)
+            .is_some_and(|control| u16::from_le_bytes([control[0], control[1]]) & 0x000c == 0);
+        let transmit = self.transmit_owned_client_frame(bytes).and_then(|()| {
+            if !management {
+                return Ok(());
+            }
+            let (token, pid) = self
+                .mgmt_tx_outstanding
+                .last_identity()
+                .ok_or("management TX publication omitted completion identity")?;
+            record_sae_stage(&format!(
+                "passive_m1_tx_boundary result=published token={token} pid={pid} physical_tx=true terminal_pending=true"
+            ));
+            self.wait_mgmt_tx_terminal(token, pid)
+        });
+        let preserve = if management {
+            Ok(())
+        } else {
+            self.preserve_client_rx_during_control_wait()
+        };
         transmit.map_err(|error| {
             let category = if error.contains("completion is still outstanding") {
                 "completion_outstanding"
+            } else if error.contains("terminal failure") {
+                "terminal_frame_failure"
+            } else if error.contains("completion timed out unresolved") {
+                "unresolved_completion_timeout"
             } else if error.contains("not safely reclaimable") {
                 "ownership_not_reclaimable"
             } else if error.contains("ring-0 indices") {
@@ -15194,7 +15343,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             record_sae_stage(&format!(
                 "management_tx_pre_submit result=error category={category}"
             ));
-            zx::Status::IO
+            if category == "terminal_frame_failure" {
+                zx::Status::UNAVAILABLE
+            } else {
+                zx::Status::IO
+            }
         })?;
         preserve.map_err(|_| zx::Status::IO_DATA_INTEGRITY)
     }
@@ -24665,11 +24818,14 @@ mod tests {
             ],
         ] {
             let mut state = MgmtTxCompletionState::new(0, 3);
-            assert!(state.finished().is_none());
+            assert!(state.terminal().is_none());
             state.observe(completions[0]).unwrap();
-            assert!(state.finished().is_none());
+            assert!(state.terminal().is_none());
             state.observe(completions[1]).unwrap();
-            assert_eq!(state.finished().unwrap(), Ok(()));
+            assert!(matches!(
+                state.terminal(),
+                Some(MgmtTxTerminal::Succeeded { .. })
+            ));
         }
     }
 
@@ -24701,6 +24857,10 @@ mod tests {
                 info_word: 0,
             }))
             .unwrap();
+        assert!(matches!(
+            state.terminal(),
+            Some(MgmtTxTerminal::Failed { .. })
+        ));
         assert!(
             state
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
@@ -24714,14 +24874,80 @@ mod tests {
                 }))
                 .is_err()
         );
-        state
-            .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
-                wcid: 19,
-                pid: 3,
-                acked: true,
-            }))
-            .unwrap();
-        assert!(state.finished().unwrap().is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn dropped_management_tx_retires_once_allows_retry_and_ignores_late_txs() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let (first_token, first_pid) = outstanding.reserve().unwrap();
+        assert!(matches!(
+            outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(19),
+                    token: first_token,
+                    dropped: true,
+                    attempts: 15,
+                    status: 1,
+                    pair_word: None,
+                    info_word: 0,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Terminal(MgmtTxTerminal::Failed { .. })
+        ));
+        assert!(outstanding.is_empty());
+        assert_eq!(
+            outstanding
+                .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid: first_pid,
+                    acked: true,
+                }))
+                .unwrap(),
+            MgmtTxObservation::IgnoredRetired
+        );
+        assert_eq!(
+            outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(19),
+                    token: first_token,
+                    dropped: true,
+                    attempts: 15,
+                    status: 1,
+                    pair_word: None,
+                    info_word: 0,
+                }))
+                .unwrap(),
+            MgmtTxObservation::IgnoredRetired
+        );
+
+        let (retry_token, retry_pid) = outstanding.reserve().unwrap();
+        assert_ne!((retry_token, retry_pid), (first_token, first_pid));
+        assert_eq!(
+            outstanding
+                .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 19,
+                    pid: retry_pid,
+                    acked: true,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Pending
+        );
+        assert!(matches!(
+            outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(19),
+                    token: retry_token,
+                    dropped: false,
+                    attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Terminal(MgmtTxTerminal::Succeeded { .. })
+        ));
+        assert!(outstanding.is_empty());
     }
 
     #[cfg(feature = "fuchsia-passive")]
