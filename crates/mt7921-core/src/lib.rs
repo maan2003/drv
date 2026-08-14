@@ -2795,7 +2795,7 @@ pub fn parse_client_join_roc_grant(bytes: &[u8]) -> Result<ClientJoinRocGrant, S
         return Err("wrong JOIN ROC event identity".into());
     }
     let grant = bytes.get(40..60).ok_or("truncated JOIN ROC grant")?;
-    if grant[0..4] != [0, 0, 20, 0] || grant[13] != 0 || grant[14] != 0xff {
+    if grant[0..4] != [0, 0, 20, 0] {
         return Err("invalid JOIN ROC grant TLV".into());
     }
     Ok(ClientJoinRocGrant {
@@ -12754,7 +12754,7 @@ mod tests {
     }
 
     #[test]
-    fn join_roc_grant_parser_binds_token_and_channel() {
+    fn join_roc_grant_parser_preserves_fields_without_requiring_echoes() {
         let mut bytes = [0u8; 60];
         bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
         bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
@@ -12778,8 +12778,16 @@ mod tests {
                 max_interval_ms: 2_000,
             }
         );
-        bytes[44] = 1;
-        assert_eq!(parse_client_join_roc_grant(&bytes).unwrap().bss_index, 1);
+        bytes[44..56].copy_from_slice(&[1, 3, 7, 44, 2, 1, 4, 42, 155, 1, 0, 0]);
+        let non_echoing = parse_client_join_roc_grant(&bytes).unwrap();
+        assert_eq!(non_echoing.bss_index, 1);
+        assert_eq!(non_echoing.token, 3);
+        assert_eq!(non_echoing.status, 7);
+        assert_eq!(non_echoing.primary_channel, 44);
+        assert_eq!(non_echoing.band, 1);
+        assert_eq!(non_echoing.bandwidth, 4);
+        assert_eq!(non_echoing.center_channel, 42);
+        assert_eq!(non_echoing.request_type, 1);
     }
 
     #[test]

@@ -16693,25 +16693,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                         return Err(zx::Status::IO_DATA_INTEGRITY);
                     }
                 };
-                if grant.token != token {
-                    record_sae_stage(&format!(
-                        "join_roc_grant result=stale_discarded expected_token={token} actual_token={}",
-                        grant.token
-                    ));
-                    continue;
-                }
-                if grant.bss_index != 0
-                    || grant.status != 0
-                    || grant.primary_channel != channel.primary as u8
-                    || grant.band != if channel.band == 1 { 2 } else { 1 }
-                    || grant.bandwidth != 0
-                    || grant.center_channel != channel.center as u8
-                    || grant.request_type != 0
-                {
-                    return Err(zx::Status::IO_DATA_INTEGRITY);
-                }
                 record_sae_stage(&format!(
-                    "join_roc_grant result=accepted token={token} generation={generation} max_interval_ms={}",
+                    "join_roc_grant result=accepted token={token} generation={generation} echoed_token={} status={} primary_channel={} band={} bandwidth={} center_channel={} request_type={} max_interval_ms={}",
+                    grant.token,
+                    grant.status,
+                    grant.primary_channel,
+                    grant.band,
+                    grant.bandwidth,
+                    grant.center_channel,
+                    grant.request_type,
                     grant.max_interval_ms
                 ));
                 return Ok(grant.max_interval_ms);
