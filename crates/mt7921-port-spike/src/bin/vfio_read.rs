@@ -15118,6 +15118,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     None => "mlme_association_disposition result=malformed status=unknown retry_supported=true".to_string(),
                 });
                 if status.is_some_and(|status| status != 0) {
+                    if status == Some(30) && comeback.is_some() {
+                        // A valid temporary-rejection response terminates this
+                        // attempt. Admit exactly one fresh association attempt;
+                        // its successful physical TX mints a new M1 latch.
+                        self.next_association_attempt_epoch = 0;
+                    }
                     self.abort_join_roc(io)?;
                     record_sae_stage(&format!(
                         "join_roc_lifecycle phase=association_response status={} abort=non_success_before_retry",
@@ -28219,7 +28225,6 @@ mod tests {
     #[test]
     fn normal_association_comeback_can_retry_with_same_preauth_wcid() {
         let mut effects = validation_effects();
-        effects.suppress_eapol_liveness = false;
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
         effects.abort_join_roc(&mut io).unwrap();
@@ -28229,6 +28234,7 @@ mod tests {
             .unwrap();
         let mut comeback = validation_association_response(&effects);
         comeback.bytes[26..28].copy_from_slice(&30u16.to_le_bytes());
+        comeback.bytes.extend_from_slice(&[56, 5, 3, 20, 0, 0, 0]);
         io.rx.push_back(comeback);
         assert!(effects.next_rx(&mut io).unwrap().is_some());
         assert_eq!(io.roc.last(), Some(&(false, 1, 0)));
@@ -28245,7 +28251,7 @@ mod tests {
                 (true, 1, 1_000),
             ]
         );
-        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Attempt(_)));
     }
 
     #[cfg(feature = "fuchsia-passive")]
