@@ -13753,8 +13753,16 @@ impl LiveClientEffects {
         if self.join_roc_generation.is_some() {
             return Err(zx::Status::BAD_STATE);
         }
+        // Linux JOIN ROC is always a 20 MHz transaction on the selected
+        // primary channel, independent of the wider association chandef.
+        let roc_channel = ClientPhysicalChannel {
+            center: channel.channel.primary,
+            bandwidth: 0,
+            center2: 0,
+            ..channel.channel
+        };
         let max_interval_ms =
-            match io.acquire_join_roc(channel.channel, channel.generation, duration_ms) {
+            match io.acquire_join_roc(roc_channel, channel.generation, duration_ms) {
                 Ok(max_interval_ms) => max_interval_ms,
                 Err(status) => {
                     if io.join_roc_active(channel.generation) {
@@ -19284,6 +19292,7 @@ mod tests {
     struct TestClientIo {
         uni: Vec<Vec<u8>>,
         roc: Vec<(bool, u64, u32)>,
+        roc_channels: Vec<ClientPhysicalChannel>,
         tx: Vec<Vec<u8>>,
         rx: VecDeque<ClientRxFrame>,
         fail_uni: bool,
@@ -19532,10 +19541,11 @@ mod tests {
         }
         fn acquire_join_roc(
             &mut self,
-            _: ClientPhysicalChannel,
+            channel: ClientPhysicalChannel,
             generation: u64,
             duration_ms: u32,
         ) -> Result<u32, zx::Status> {
+            self.roc_channels.push(channel);
             self.roc.push((true, generation, duration_ms));
             Ok(duration_ms)
         }
@@ -19643,6 +19653,16 @@ mod tests {
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
         assert_eq!(io.roc, vec![(true, channel.generation, 2_000)]);
+        assert_eq!(
+            io.roc_channels,
+            vec![ClientPhysicalChannel {
+                band: 1,
+                primary: 36,
+                center: 36,
+                bandwidth: 0,
+                center2: 0,
+            }]
+        );
 
         let stale = mt7921_port_spike::ClientChannelLease {
             generation: channel.generation + 1,
