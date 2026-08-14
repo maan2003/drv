@@ -3580,7 +3580,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
         return Err("completed validation TX guard admitted late SAE".into());
     }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3680,7 +3680,7 @@ fn run() -> Result<(), String> {
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -4308,7 +4308,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -11679,6 +11679,10 @@ impl MgmtTxCompletionState {
     }
 
     fn terminal(&self) -> Option<MgmtTxTerminal> {
+        // Linux mt7921 frees the token from TX_FREE even when no matching TXS
+        // arrives.  Preserve that retry-exhausted/drop behavior, but use a
+        // stricter success boundary for Fuchsia DeviceOps: positive TXS ACK
+        // plus successful TX_FREE.  Publication alone is never completion.
         if let Some(free) = self.free.filter(|free| free.dropped || free.status != 0) {
             return Some(MgmtTxTerminal::Failed {
                 token: self.token,
@@ -24702,7 +24706,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn management_tx_commits_before_asynchronous_rx_completion() {
+    fn management_tx_publishes_before_authoritative_terminal_completion() {
         let source = include_str!("vfio_read.rs");
         let transmit = source
             .split("fn transmit_one_sae_auth(")
@@ -24719,13 +24723,13 @@ mod tests {
         let identity = transmit.find("stage=identity result=allocated").unwrap();
         let didx = transmit.find("read(0xd430c)").unwrap();
         let descriptor_done = transmit.find("is_dma_done()").unwrap();
-        let committed = transmit
-            .find("MgmtTxPublicationOutcome::Committed")
+        let descriptor_consumed = transmit
+            .find("MgmtTxPublicationOutcome::DescriptorConsumed")
             .unwrap();
         let enqueue_success = transmit.rfind("Ok(())").unwrap();
         assert!(ownership < wipe && wipe < identity && identity < publish);
-        assert!(publish < didx && didx < descriptor_done && descriptor_done < committed);
-        assert!(committed < enqueue_success);
+        assert!(publish < didx && didx < descriptor_done && descriptor_done < descriptor_consumed);
+        assert!(descriptor_consumed < enqueue_success);
         assert!(!transmit.contains("drain_data_rx_queue("));
         assert!(!transmit.contains("TX completion timed out"));
         let publication_intent = transmit
@@ -24753,7 +24757,7 @@ mod tests {
             .split("fn receive_one_sae_auth(")
             .next()
             .unwrap();
-        assert!(transmit.contains("MgmtTxPublicationOutcome::Committed"));
+        assert!(transmit.contains("MgmtTxPublicationOutcome::DescriptorConsumed"));
         assert!(transmit.contains("next=reclaim_deferred"));
         let configure = source
             .split("fn configure_mgmt_tx_ring_for_submission(")
@@ -24952,6 +24956,27 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn unresolved_management_tx_timeout_keeps_identity_and_poisons_transport() {
+        let mut outstanding = MgmtTxOutstanding::default();
+        let identity = outstanding.reserve().unwrap();
+        assert_eq!(outstanding.last_identity(), Some(identity));
+        assert!(!outstanding.is_empty(), "an unresolved frame cannot be retired");
+
+        let source = include_str!("vfio_read.rs");
+        let wait = source
+            .split("fn wait_mgmt_tx_terminal(")
+            .nth(1)
+            .unwrap()
+            .split("fn transmit_owned_client_frame(")
+            .next()
+            .unwrap();
+        assert!(wait.contains("self.loader.uni_terminal_poisoned = true"));
+        assert!(wait.contains("outcome=unresolved_timeout"));
+        assert!(wait.contains("token_retired=false transport_poisoned=true"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn data_tx_status_correlates_against_the_reserved_station_wcid() {
         let mut outstanding = MgmtTxOutstanding::default();
         let (token, pid) = outstanding.reserve_for_wcid(7).unwrap();
@@ -25099,7 +25124,7 @@ mod tests {
             .unwrap();
         assert!(transmit.contains("MgmtTxPublicationOutcome::AmbiguousOwnership"));
         assert!(transmit.contains("uni_terminal_poisoned = true"));
-        assert!(transmit.contains("MgmtTxPublicationOutcome::Committed"));
+        assert!(transmit.contains("MgmtTxPublicationOutcome::DescriptorConsumed"));
         assert!(!transmit.contains("TX completion timed out"));
     }
 }

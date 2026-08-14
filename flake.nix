@@ -378,6 +378,7 @@
               grep -F '"required_pre_m1_management_tx":"sae-and-association"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"preassociation_physical_tx_classes":"sae-authentication,association-request"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"postassociation_physical_tx":"disabled"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"post_assoc_public_tx":"disabled-until-m1-observed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"m2_physical_tx":"suppressed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"frame":"none-post-association-public-before-m1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -892,6 +893,7 @@
                 REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
                 PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
                 POSTASSOCIATION_PHYSICAL_TX=disabled
+                MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
                 POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
                 M2_PHYSICAL_TX=suppressed
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
@@ -1276,6 +1278,7 @@
                 REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
                 PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
                 POSTASSOCIATION_PHYSICAL_TX=disabled
+                MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
                 POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
                 M2_PHYSICAL_TX=suppressed
                 EOF
@@ -1306,6 +1309,7 @@
                 grep -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' "$manifest"
                 grep -Fx 'PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request' "$manifest"
                 grep -Fx 'POSTASSOCIATION_PHYSICAL_TX=disabled' "$manifest"
+                grep -Fx 'MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons' "$manifest"
                 grep -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' "$manifest"
                 grep -Fx 'M2_PHYSICAL_TX=suppressed' "$manifest"
                 grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
@@ -1353,7 +1357,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1"}
+              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","frame":"none-post-association-public-before-m1"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1409,6 +1413,7 @@
               REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
               PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
               POSTASSOCIATION_PHYSICAL_TX=disabled
+              MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
               POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
               M2_PHYSICAL_TX=suppressed
               EOF

@@ -49,6 +49,7 @@ let
     "wlan-mlme-assoc-comeback-runtime-host.patch"
     "wlan-mlme-disconnect-fixed-telemetry-host.patch"
     "wlan-mlme-host-fixture.patch"
+    "wlan-mlme-sae-terminal-retry-host.patch"
   ];
   patchRows = map (file: {
     name = builtins.baseNameOf file;

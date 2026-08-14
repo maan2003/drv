@@ -38,6 +38,7 @@ fi
 @grep@ -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' "$manifest" >/dev/null
 @grep@ -Fx 'PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request' "$manifest" >/dev/null
 @grep@ -Fx 'POSTASSOCIATION_PHYSICAL_TX=disabled' "$manifest" >/dev/null
+@grep@ -Fx 'MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons' "$manifest" >/dev/null
 @grep@ -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' "$manifest" >/dev/null
 @grep@ -Fx 'M2_PHYSICAL_TX=suppressed' "$manifest" >/dev/null
 test "$(@sha256sum@ "$runner" | @cut@ -d ' ' -f1)" = @runner_sha256@
@@ -58,6 +59,7 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' "$identity" >/dev/null
 @grep@ -F '"preassociation_physical_tx_classes":"sae-authentication,association-request"' "$identity" >/dev/null
 @grep@ -F '"postassociation_physical_tx":"disabled"' "$identity" >/dev/null
+@grep@ -F '"management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons"' "$identity" >/dev/null
 @grep@ -F '"post_assoc_public_tx":"disabled-until-m1-observed"' "$identity" >/dev/null
 @grep@ -F '"m2_physical_tx":"suppressed"' "$identity" >/dev/null
 @grep@ -F '"frame":"none-post-association-public-before-m1"' "$identity" >/dev/null
