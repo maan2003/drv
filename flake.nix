@@ -976,6 +976,305 @@
               grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"' "$identity"
             '';
 
+          mt7921-full-firmware-validation-remote-entry = pkgs.stdenv.mkDerivation {
+            pname = "mt7921-full-firmware-validation-remote-entry";
+            version = "0.1.0";
+            dontUnpack = true;
+            nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ];
+            doInstallCheck = true;
+            meta.mainProgram = "mt7921-full-firmware-validation-remote-entry";
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-full-firmware-validation-remote-entry.sh} \
+                "$out/bin/mt7921-full-firmware-validation-remote-entry" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by ssh ${pkgs.openssh}/bin/ssh \
+                --subst-var-by tailscale ${pkgs.tailscale}/bin/tailscale \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sleep ${pkgs.coreutils}/bin/sleep \
+                --subst-var-by timeout ${pkgs.coreutils}/bin/timeout \
+                --subst-var-by recovery_call_timeout_seconds 15 \
+                --subst-var-by xdg_runtime_dir /run/user/1002 \
+                --subst-var-by target_root /nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/zjjzivq61vdmww20jmcbaiyfgx4p2vpw-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/a996mm46ml4m38zwv5iida1rf2nbpq1z-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_nix_store /nix/store/m9gfpnfrwdhr2cqakrfki9p73rjlfqgd-lix-2.95.2/bin/nix-store \
+                --subst-var-by target_sha256sum /nix/store/mp8s10fwm685azvvv1qq7zyf7iajjlj8-coreutils-9.11/bin/sha256sum \
+                --subst-var-by target_recovery_helper /nix/store/ffqajh67zhg5kx3xl2vm18z4f8i108l8-wifi-driver-lab/bin/wifi-driver-lab \
+                --subst-var-by target_sudo /run/wrappers/bin/sudo \
+                --subst-var-by target_root_registered_hash sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5 \
+                --subst-var-by target_package_registered_hash sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 \
+                --subst-var-by target_manifest_registered_hash sha256:115mazbd3qszngmb3jv0niggnjxs9wlx0dp6dyyy2qz3iadziap1 \
+                --subst-var-by target_supervisor_registered_hash sha256:0gd7njrkjjmakdfafhspmkrb2prcsczyrsmhsb53d27lpjl2a2qx \
+                --subst-var-by target_entry_sha256 22c6ed3bd7c8fdfc94a857b54d633d08342ee9544b5c0372a993686dc6738b2e \
+                --subst-var-by target_manifest_sha256 55d3e6c8ed134d1555b223c043917858d6b7d8e8d3195c3ec2a46d88920c7661 \
+                --subst-var-by target_supervisor_sha256 06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 \
+                --subst-var-by target_identity_sha256 4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f \
+                --subst-var-by target_launcher_sha256 984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc \
+                --subst-var-by transport_contract openssh-absolute+ssh-config-disabled+batchmode+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+bounded-read-only-sudo-recovery-v1
+              chmod 0755 "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              runHook postInstall
+            '';
+            installCheckPhase = ''
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              ! grep -Eq '@[a-z_]+' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              grep -F '${pkgs.openssh}/bin/ssh' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              grep -F '${pkgs.tailscale}/bin/tailscale' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              grep -F 'StrictHostKeyChecking=yes' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              grep -F 'remote "$target_entry"' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+              ! grep -F 'watchdog disarm' "$out/bin/mt7921-full-firmware-validation-remote-entry"
+            '';
+          };
+
+          mt7921-full-firmware-validation-delivery-manifest =
+            let
+              remoteEntryRegisteredHash = pkgs.runCommand
+                "mt7921-full-firmware-validation-remote-entry-registered-hash"
+                {
+                  __structuredAttrs = true;
+                  exportReferencesGraph.remoteEntry = [ mt7921-full-firmware-validation-remote-entry ];
+                  nativeBuildInputs = [ pkgs.jq ];
+                }
+                ''
+                  out="''${outputs[out]}"
+                  ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-validation-remote-entry}' \
+                    '.remoteEntry[] | select(.path == $path) | .narHash' \
+                    "$NIX_ATTRS_JSON_FILE" > "$out"
+                '';
+            in
+            pkgs.runCommand "mt7921-full-firmware-validation-delivery-manifest"
+              { nativeBuildInputs = [ pkgs.coreutils pkgs.gnugrep ]; }
+              ''
+                entry=${mt7921-full-firmware-validation-remote-entry}/bin/mt7921-full-firmware-validation-remote-entry
+                cat > "$out" <<EOF
+                REMOTE_ENTRY=$entry
+                REMOTE_ENTRY_SHA256=$(sha256sum "$entry" | cut -d ' ' -f1)
+                REMOTE_ENTRY_REGISTERED_HASH=$(cat ${remoteEntryRegisteredHash})
+                REMOTE_TRANSPORT_CONTRACT=openssh-absolute+ssh-config-disabled+batchmode+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+bounded-read-only-sudo-recovery-v1
+                REMOTE_TARGET=user@no-plastic
+                REMOTE_TARGET_ROOT=/nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry
+                REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5
+                REMOTE_TARGET_ENTRY_SHA256=22c6ed3bd7c8fdfc94a857b54d633d08342ee9544b5c0372a993686dc6738b2e
+                REMOTE_TARGET_PACKAGE=/nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0
+                REMOTE_TARGET_PACKAGE_REGISTERED_HASH=sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81
+                REMOTE_TARGET_MANIFEST=/nix/store/zjjzivq61vdmww20jmcbaiyfgx4p2vpw-mt7921-full-firmware-validation-manifest
+                REMOTE_TARGET_MANIFEST_REGISTERED_HASH=sha256:115mazbd3qszngmb3jv0niggnjxs9wlx0dp6dyyy2qz3iadziap1
+                REMOTE_TARGET_MANIFEST_SHA256=55d3e6c8ed134d1555b223c043917858d6b7d8e8d3195c3ec2a46d88920c7661
+                REMOTE_TARGET_SUPERVISOR=/nix/store/a996mm46ml4m38zwv5iida1rf2nbpq1z-mt7921-full-firmware-validation-supervisor
+                REMOTE_TARGET_SUPERVISOR_REGISTERED_HASH=sha256:0gd7njrkjjmakdfafhspmkrb2prcsczyrsmhsb53d27lpjl2a2qx
+                REMOTE_TARGET_SUPERVISOR_SHA256=06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8
+                REMOTE_TARGET_IDENTITY_SHA256=4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f
+                REMOTE_TARGET_LAUNCHER_SHA256=984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc
+                REMOTE_ACTIVE_ARGC=0
+                REMOTE_PLAN_ARGV=--plan
+                REMOTE_RECOVERY_CONTRACT=sudo-n-exact-helper-poll-only-bounded-no-disarm
+                EOF
+                grep -Fx "REMOTE_ENTRY=$entry" "$out"
+                grep -Eq '^REMOTE_ENTRY_SHA256=[0-9a-f]{64}$' "$out"
+                grep -Eq '^REMOTE_ENTRY_REGISTERED_HASH=sha256:[0123456789abcdfghijklmnpqrsvwxyz]{52}$' "$out"
+              '';
+
+          mt7921-full-firmware-validation-remote-entry-test = pkgs.runCommand
+            "mt7921-full-firmware-validation-remote-entry-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.python3 ]; }
+            ''
+              mkdir -p work/home/.ssh work/runtime/tailscale
+              : > work/home/.ssh/no-plastic
+              chmod 0600 work/home/.ssh/no-plastic
+              cat > work/tailscale-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf '<%s>' "$@" >> "$PWD/tailscale.transcript"
+              printf '\n' >> "$PWD/tailscale.transcript"
+              exit 0
+              EOF
+              cat > work/sleep-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              exit 0
+              EOF
+              cat > work/ssh-stub <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -euo pipefail
+              printf '<%s>' "$@" >> "$PWD/ssh.transcript"
+              printf '\n' >> "$PWD/ssh.transcript"
+              expected_proxy="ProxyCommand=$PWD/work/tailscale-stub --socket=$XDG_RUNTIME_DIR/tailscale/tailscaled.sock nc %h %p"
+              test "$1" = -F && test "$2" = /dev/null
+              test "$3" = -i
+              test "$4" = "$HOME/.ssh/no-plastic"
+              test "$5" = -o && test "$6" = BatchMode=yes
+              test "$7" = -o && test "$8" = ConnectTimeout=10
+              test "$9" = -o && test "''${10}" = ServerAliveInterval=2
+              test "''${11}" = -o && test "''${12}" = ServerAliveCountMax=3
+              test "''${13}" = -o && test "''${14}" = StrictHostKeyChecking=yes
+              test "''${15}" = -o && test "''${16}" = "$expected_proxy"
+              test "''${17}" = user@no-plastic
+              "$PWD/work/tailscale-stub" "--socket=$XDG_RUNTIME_DIR/tailscale/tailscaled.sock" nc no-plastic 22
+              shift 17
+              if [ "''${MODE-}" = hostkey ]; then
+                echo 'Host key verification failed.' >&2
+                exit 255
+              fi
+              root=/nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry
+              package=/nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0
+              manifest=/nix/store/zjjzivq61vdmww20jmcbaiyfgx4p2vpw-mt7921-full-firmware-validation-manifest
+              supervisor=/nix/store/a996mm46ml4m38zwv5iida1rf2nbpq1z-mt7921-full-firmware-validation-supervisor
+              entry=$root/bin/mt7921-full-firmware-validation-root
+              identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
+              launcher=$package/bin/mt7921-full-firmware-validation
+              supervisor_file=$supervisor/bin/mt7921-full-firmware-validation-supervisor
+              if [ "$1" = /target/nix-store ]; then
+                test "$2" = -q && test "$3" = --hash
+                if [ "''${MODE-}" = wronghash ] && [ "$4" = "$root" ]; then
+                  echo sha256:wrong
+                  exit 0
+                fi
+                case "$4" in
+                  "$root") echo sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5 ;;
+                  "$package") echo sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 ;;
+                  "$manifest") echo sha256:115mazbd3qszngmb3jv0niggnjxs9wlx0dp6dyyy2qz3iadziap1 ;;
+                  "$supervisor") echo sha256:0gd7njrkjjmakdfafhspmkrb2prcsczyrsmhsb53d27lpjl2a2qx ;;
+                  *) exit 90 ;;
+                esac
+              elif [ "$1" = /target/sha256sum ]; then
+                case "$2" in
+                  "$entry") hash=22c6ed3bd7c8fdfc94a857b54d633d08342ee9544b5c0372a993686dc6738b2e ;;
+                  "$manifest") hash=55d3e6c8ed134d1555b223c043917858d6b7d8e8d3195c3ec2a46d88920c7661 ;;
+                  "$supervisor_file") hash=06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 ;;
+                  "$identity") hash=4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f ;;
+                  "$launcher") hash=984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc ;;
+                  *) exit 91 ;;
+                esac
+                printf '%s  %s\n' "$hash" "$2"
+              elif [ "$1" = "$entry" ] && [ "''${2-}" = --plan ] && [ "$#" -eq 2 ]; then
+                printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=55d3e6c8ed134d1555b223c043917858d6b7d8e8d3195c3ec2a46d88920c7661 supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=--plan\n' "$manifest" "$supervisor_file" "$launcher"
+                printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 launcher=%s launcher_sha256=984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc\n' "$supervisor_file" "$launcher"
+              elif [ "$1" = "$entry" ] && [ "$#" -eq 1 ]; then
+                echo active >> "$PWD/active.calls"
+                if [ "''${MODE-}" = unknown ] || [ "''${MODE-}" = hang ]; then exit 255; fi
+                exit 0
+              elif [ "$1" = /target/sudo ] && [ "$2" = -n ] && [ "$3" = /target/recovery ] && [ "''${MODE-}" = unknown ]; then
+                case "$4" in
+                  --quarantined) exit 1 ;;
+                  --idle) exit 0 ;;
+                  --native-ready) test "$5" = 0000:05:00.0; exit 0 ;;
+                  *) exit 92 ;;
+                esac
+              elif [ "$1" = /target/sudo ] && [ "$2" = -n ] && [ "$3" = /target/recovery ] && [ "''${MODE-}" = hang ]; then
+                if [ ! -e "$PWD/hang.once" ]; then
+                  touch "$PWD/hang.once"
+                  ${pkgs.coreutils}/bin/sleep 5
+                fi
+                case "$4" in
+                  --quarantined) exit 1 ;;
+                  --idle) exit 0 ;;
+                  --native-ready) test "$5" = 0000:05:00.0; exit 0 ;;
+                  *) exit 92 ;;
+                esac
+              else
+                exit 93
+              fi
+              EOF
+              chmod 0755 work/{ssh,tailscale,sleep}-stub
+              substitute ${./nix/mt7921-full-firmware-validation-remote-entry.sh} work/entry \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by ssh "$PWD/work/ssh-stub" \
+                --subst-var-by tailscale "$PWD/work/tailscale-stub" \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sleep "$PWD/work/sleep-stub" \
+                --subst-var-by timeout ${pkgs.coreutils}/bin/timeout \
+                --subst-var-by recovery_call_timeout_seconds 1 \
+                --subst-var-by xdg_runtime_dir "$PWD/work/runtime" \
+                --subst-var-by target_root /nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/psvb40x78d1ycyn3lm7ajb19rzcz0fck-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/zjjzivq61vdmww20jmcbaiyfgx4p2vpw-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/a996mm46ml4m38zwv5iida1rf2nbpq1z-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_nix_store /target/nix-store \
+                --subst-var-by target_sha256sum /target/sha256sum \
+                --subst-var-by target_recovery_helper /target/recovery \
+                --subst-var-by target_sudo /target/sudo \
+                --subst-var-by target_root_registered_hash sha256:05j9qsxigai9m8ml7fadygbikyzq4l5a8xxv74ixaif5q699yrj5 \
+                --subst-var-by target_package_registered_hash sha256:1wik9p9vglvxjyd3qgshpiidc50c7vpjxqf4g1k081vz38mlnf81 \
+                --subst-var-by target_manifest_registered_hash sha256:115mazbd3qszngmb3jv0niggnjxs9wlx0dp6dyyy2qz3iadziap1 \
+                --subst-var-by target_supervisor_registered_hash sha256:0gd7njrkjjmakdfafhspmkrb2prcsczyrsmhsb53d27lpjl2a2qx \
+                --subst-var-by target_entry_sha256 22c6ed3bd7c8fdfc94a857b54d633d08342ee9544b5c0372a993686dc6738b2e \
+                --subst-var-by target_manifest_sha256 55d3e6c8ed134d1555b223c043917858d6b7d8e8d3195c3ec2a46d88920c7661 \
+                --subst-var-by target_supervisor_sha256 06dad0b5a78ab20b48af35a77e4930310a4341ac800e01bd9e77781341aee0c8 \
+                --subst-var-by target_identity_sha256 4000d9a5f0a2c07924c449d7c4aeae79c2e48ab0c5ed1ee1a39352c07972017f \
+                --subst-var-by target_launcher_sha256 984deb99a7b425864bec4a66c33ddf8da2792cb864eb31293f3ce17e06d483cc \
+                --subst-var-by transport_contract test-transport-v1
+              chmod 0755 work/entry
+              ${pkgs.python3}/bin/python - <<'PY' &
+              import socket
+              s = socket.socket(socket.AF_UNIX)
+              s.bind('work/runtime/tailscale/tailscaled.sock')
+              s.listen()
+              s.accept()
+              PY
+              socket_pid=$!
+              trap 'kill "$socket_pid" 2>/dev/null || true' EXIT
+              while [ ! -S work/runtime/tailscale/tailscaled.sock ]; do sleep 0.01; done
+              export HOME=$PWD/work/home XDG_RUNTIME_DIR=$PWD/work/runtime
+
+              work/entry --plan > plan
+              grep -F 'REMOTE_PLAN hardware_handoff=false watchdog_operation=false' plan
+              test ! -e active.calls
+
+              : > ssh.transcript
+              work/entry > active
+              test "$(wc -l < active.calls)" -eq 1
+              grep -F "</nix/store/dk1sqnbg2kjnbxaxzz6jpr6f8g267m9r-mt7921-full-firmware-validation-root-entry/bin/mt7921-full-firmware-validation-root>" ssh.transcript
+
+              rm active.calls
+              : > ssh.transcript
+              set +e
+              MODE=unknown work/entry > unknown 2>unknown.error
+              rc=$?
+              set -e
+              test "$rc" -eq 75
+              grep -F 'target recovery is complete; experiment outcome remains unknown' unknown.error
+              test "$(wc -l < active.calls)" -eq 1
+              grep -F '</target/sudo><-n></target/recovery><--quarantined>' ssh.transcript
+              grep -F '</target/sudo><-n></target/recovery><--idle>' ssh.transcript
+              grep -F '</target/sudo><-n></target/recovery><--native-ready><0000:05:00.0>' ssh.transcript
+
+              rm -f active.calls hang.once
+              set +e
+              MODE=hang work/entry > hang.out 2>hang.error
+              rc=$?
+              set -e
+              test "$rc" -eq 75
+              test -e hang.once
+              grep -F 'target recovery is complete; experiment outcome remains unknown' hang.error
+
+              rm -f active.calls
+              set +e
+              MODE=hostkey work/entry >hostkey.out 2>hostkey.error
+              rc=$?
+              set -e
+              test "$rc" -eq 1
+              test ! -e active.calls
+              grep -F 'remote registered-hash verification failed' hostkey.error
+
+              set +e
+              MODE=wronghash work/entry >wrong.out 2>wrong.error
+              rc=$?
+              set -e
+              test "$rc" -eq 1
+              test ! -e active.calls
+              grep -F 'remote registered hash mismatch' wrong.error
+
+              set +e
+              work/entry arbitrary >args.out 2>args.error
+              rc=$?
+              set -e
+              test "$rc" -eq 64
+              test ! -e active.calls
+              grep -F 'accepts no arguments except --plan' args.error
+              test -s tailscale.transcript
+              touch "$out"
+            '';
+
           mt7921-full-firmware-validation-manifest =
             let
               package = mt7921-full-firmware-validation;
