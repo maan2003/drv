@@ -20,9 +20,8 @@ use fuchsia_softmac_port::{
 use mt7921_port_spike::{
     CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
-    RegulatoryRatePowerSnapshot, SarFrequencyRange,
-    candidate_channels as capability_channels, encode_passive_mcu_command,
-    regulatory_rate_power_channel_skeleton,
+    RegulatoryRatePowerSnapshot, SarFrequencyRange, candidate_channels as capability_channels,
+    encode_passive_mcu_command, regulatory_rate_power_channel_skeleton,
 };
 use std::collections::VecDeque;
 use std::error::Error;
@@ -194,7 +193,6 @@ pub trait Mt7921PassiveTransport {
     }
     fn acquire_client_join_roc(
         &mut self,
-        _: u8,
         _: mt7921_port_spike::ClientPhysicalChannel,
         _: u64,
         _: u32,
@@ -204,7 +202,7 @@ pub trait Mt7921PassiveTransport {
     fn client_join_roc_active(&mut self, _: u64) -> bool {
         false
     }
-    fn abort_client_join_roc(&mut self, _: u8, _: u64) -> Result<(), zx::Status> {
+    fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
@@ -290,7 +288,6 @@ pub trait SourceExactPassiveMechanics {
     }
     fn acquire_client_join_roc(
         &mut self,
-        _: u8,
         _: mt7921_port_spike::ClientPhysicalChannel,
         _: u64,
         _: u32,
@@ -300,7 +297,7 @@ pub trait SourceExactPassiveMechanics {
     fn client_join_roc_active(&mut self, _: u64) -> bool {
         false
     }
-    fn abort_client_join_roc(&mut self, _: u8, _: u64) -> Result<(), zx::Status> {
+    fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
@@ -444,13 +441,18 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         &mut self,
         command: PassiveMcuCommand,
     ) -> Result<(), SourceExactTransportError<M::Error>> {
-        self.mcu_sequence = self.mcu_sequence % 15 + 1;
-        let encoded = encode_passive_mcu_command(&command, self.mcu_sequence)
+        let template_sequence = self.mcu_sequence % 15 + 1;
+        let encoded = encode_passive_mcu_command(&command, template_sequence)
             .map_err(SourceExactTransportError::Encode)?;
         let wait = command.expects_response();
         self.mechanics
             .command(&command, &encoded, wait)
-            .map_err(SourceExactTransportError::Mechanics)
+            .map_err(SourceExactTransportError::Mechanics)?;
+        self.mcu_sequence = self
+            .mechanics
+            .current_mcu_sequence()
+            .unwrap_or(template_sequence);
+        Ok(())
     }
 }
 
@@ -468,19 +470,18 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn acquire_client_join_roc(
         &mut self,
-        sequence: u8,
         channel: mt7921_port_spike::ClientPhysicalChannel,
         generation: u64,
         duration_ms: u32,
     ) -> Result<u32, zx::Status> {
         self.mechanics
-            .acquire_client_join_roc(sequence, channel, generation, duration_ms)
+            .acquire_client_join_roc(channel, generation, duration_ms)
     }
     fn client_join_roc_active(&mut self, generation: u64) -> bool {
         self.mechanics.client_join_roc_active(generation)
     }
-    fn abort_client_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
-        self.mechanics.abort_client_join_roc(sequence, generation)
+    fn abort_client_join_roc(&mut self, generation: u64) -> Result<(), zx::Status> {
+        self.mechanics.abort_client_join_roc(generation)
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.mechanics.diagnostic_association_snapshot(generation)
@@ -1179,16 +1180,17 @@ pub fn regulatory_rate_power_snapshot_from_fuchsia(
 ) -> Result<RegulatoryRatePowerSnapshot, RateTxPowerError> {
     let mut channels = regulatory_rate_power_channel_skeleton(capability)?;
     for input in &mut channels {
-        let candidate = candidates.iter().copied().find(|candidate| {
-            candidate.band == input.band && candidate.number == input.channel
-        });
+        let candidate = candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.band == input.band && candidate.number == input.channel);
         let Some(candidate) = candidate else { continue };
         if candidate.frequency_mhz != input.frequency_mhz {
             return Err(RateTxPowerError::InvalidChannelFrequency);
         }
         input.present = true;
-        let fuchsia_channel = to_fuchsia_channel(candidate)
-            .ok_or(RateTxPowerError::IncompleteSnapshot)?;
+        let fuchsia_channel =
+            to_fuchsia_channel(candidate).ok_or(RateTxPowerError::IncompleteSnapshot)?;
         input.disabled = !authorized.contains(&fuchsia_channel);
         input.max_reg_power_dbm = powers
             .iter()
@@ -1350,7 +1352,9 @@ mod tests {
         assert_eq!(&ht[16..], &[0; 10]);
         assert_eq!(
             vht,
-            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
+            [
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
+            ]
         );
         // MT7961 follows mt76_init_sband + mt7921_register_device's
         // non-MT7922 branch: SGI80 is advertised, SGI160 is not.
@@ -1383,33 +1387,35 @@ mod tests {
         );
         let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
         let regulatory = mt7921_port_spike::regulatory_rate_power_snapshot_from_regdb_v20(
-            database,
-            0,
-            *b"00",
-            capability,
-            [7; 32],
+            database, 0, *b"00", capability, [7; 32],
         )
         .unwrap();
-        let profile = crate::client_device::production_association_profile_from_query_and_regulatory(
-            &query,
-            WlanBand::FiveGhz,
-            36,
-            &regulatory,
-        )
-        .unwrap();
+        let profile =
+            crate::client_device::production_association_profile_from_query_and_regulatory(
+                &query,
+                WlanBand::FiveGhz,
+                36,
+                &regulatory,
+            )
+            .unwrap();
         assert_eq!(
             profile.ht_capabilities.unwrap(),
             [
-                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
+                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
             ]
         );
         assert_eq!(
             profile.vht_capabilities.unwrap(),
-            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
+            [
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
+            ]
         );
         let regulatory = profile.regulatory.unwrap();
-        assert_eq!((regulatory.min_tx_power_dbm, regulatory.max_tx_power_dbm), (0, 20));
+        assert_eq!(
+            (regulatory.min_tx_power_dbm, regulatory.max_tx_power_dbm),
+            (0, 20)
+        );
         assert_eq!(
             regulatory
                 .supported_channels
@@ -1417,8 +1423,8 @@ mod tests {
                 .map(|range| (range.first, range.count))
                 .collect::<Vec<_>>(),
             [
-                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
-                128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136,
+                140, 144, 149, 153, 157, 161, 165,
             ]
             .map(|channel| (channel, 1))
         );
@@ -1801,7 +1807,10 @@ mod tests {
         assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
         assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
         assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
-        assert_eq!(adapter.transport.mechanics.rate_power_after_commands, Some(4));
+        assert_eq!(
+            adapter.transport.mechanics.rate_power_after_commands,
+            Some(4)
+        );
         assert!(matches!(
             commands[3].0,
             PassiveMcuCommand::SetRxPath {
@@ -2332,14 +2341,27 @@ mod tests {
             unknown_elements: 0,
         };
         let candidates = capability_channels(capability);
-        let authorized = vec![ChannelNumber { band: WlanBand::TwoGhz, number: 1 }];
+        let authorized = vec![ChannelNumber {
+            band: WlanBand::TwoGhz,
+            number: 1,
+        }];
         let incomplete = regulatory_rate_power_snapshot_from_fuchsia(
-            3, *b"00", capability, &candidates, &authorized, &[], Vec::new(), None,
+            3,
+            *b"00",
+            capability,
+            &candidates,
+            &authorized,
+            &[],
+            Vec::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
             mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
-                capability, &incomplete, 3, 1,
+                capability,
+                &incomplete,
+                3,
+                1,
             ),
             Err(RateTxPowerError::InvalidRegulatoryLimit)
         );
@@ -2350,7 +2372,10 @@ mod tests {
             capability,
             &candidates,
             &authorized,
-            &[FuchsiaRegulatoryPower { channel: authorized[0], max_reg_power_dbm: 17 }],
+            &[FuchsiaRegulatoryPower {
+                channel: authorized[0],
+                max_reg_power_dbm: 17,
+            }],
             Vec::new(),
             None,
         )
@@ -2360,7 +2385,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(commands.len(), 2);
-        assert_eq!(complete.channels().iter().filter(|channel| channel.present).count(), 14);
-        assert_eq!(complete.channels().iter().filter(|channel| channel.disabled).count(), 13);
+        assert_eq!(
+            complete
+                .channels()
+                .iter()
+                .filter(|channel| channel.present)
+                .count(),
+            14
+        );
+        assert_eq!(
+            complete
+                .channels()
+                .iter()
+                .filter(|channel| channel.disabled)
+                .count(),
+            13
+        );
     }
 }

@@ -10076,6 +10076,16 @@ fn consume_client_mcu_sequence(current: u8, encoded: u8) -> Result<u8, String> {
     Ok(encoded)
 }
 
+fn stamp_next_mcu_sequence(current: u8, encoded: &[u8]) -> Result<(u8, Vec<u8>), String> {
+    if encoded.len() < 48 {
+        return Err("MCU command template omitted Connac2 TXD".into());
+    }
+    let sequence = current % 15 + 1;
+    let mut stamped = encoded.to_vec();
+    stamped[39] = sequence;
+    Ok((sequence, stamped))
+}
+
 fn validate_uni_request(expected_cid: u8, encoded: &[u8]) -> Result<u8, String> {
     let sequence = *encoded
         .get(39)
@@ -10856,11 +10866,7 @@ impl VfioFirmwareLoader<'_> {
         if encoded.len() != expected_len || encoded.get(36..39) != Some(&[cid, 0xa0, 1]) {
             return Err("client CE no-ACK command escaped expected envelope".into());
         }
-        let sequence = *encoded
-            .get(39)
-            .filter(|sequence| (1..=15).contains(*sequence))
-            .ok_or("client CE no-ACK command omitted valid sequence")?;
-        consume_client_mcu_sequence(self.sequence, sequence)?;
+        let (sequence, encoded) = stamp_next_mcu_sequence(self.sequence, encoded)?;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.sequence = sequence;
@@ -10868,7 +10874,7 @@ impl VfioFirmwareLoader<'_> {
             self.mcu.wfdma,
             self.mcu.tx_ring,
             self.mcu.payload,
-            encoded,
+            &encoded,
             sequence,
             descriptor_index,
         )?;
@@ -10917,7 +10923,8 @@ impl VfioFirmwareLoader<'_> {
         if self.client_interface.is_some() {
             return Err("client interface firmware context was already dirty".into());
         }
-        let [dev, bss] = encode_client_interface_commands(identity.bytes(), true, 14, 15)?;
+        let dev_sequence = self.sequence % 15 + 1;
+        let dev = encode_client_interface_dev_command(identity.bytes(), true, dev_sequence)?;
         // Publication can become ambiguous at any point after entry. Mark each
         // object dirty before submitting it so mandatory cleanup will disable
         // every object firmware may have observed.
@@ -10929,13 +10936,17 @@ impl VfioFirmwareLoader<'_> {
         self.send_acknowledged_uni_command(1, &dev)?;
         record_sae_stage("client_dev_info_active_acked omac=0 identity_match=true");
 
+        let bss_sequence = self.sequence % 15 + 1;
+        let bss = encode_client_interface_bss_command(true, bss_sequence)?;
+
         self.client_interface
             .as_mut()
             .expect("client interface state installed")
             .bss_maybe_active = true;
         self.send_acknowledged_uni_command(2, &bss)?;
         record_sae_stage("client_bss_info_basic_acked bss=0 wmm=0 wcid=19");
-        let early_edca = encode_client_early_edca_command(1)?;
+        let edca_sequence = self.sequence % 15 + 1;
+        let early_edca = encode_client_early_edca_command(edca_sequence)?;
         self.send_client_ce_no_ack_bytes(&early_edca, 0x1d, 108)?;
         record_sae_stage(
             "wmm_edca_program stage=early_bss result=complete source=mac80211_default qos=false ac_all=aifs2,cwmin15,cwmax1023,txop0,acmfalse data_tx_gate=closed",
@@ -11000,8 +11011,8 @@ impl VfioFirmwareLoader<'_> {
         let result = (|| -> Result<(), String> {
             self.ensure_mcu_tx_allowed()?;
             self.mcu.cancelled()?;
-            let sequence = validate_uni_request(expected_cid, encoded)?;
-            consume_client_mcu_sequence(self.sequence, sequence)?;
+            let (sequence, encoded) = stamp_next_mcu_sequence(self.sequence, encoded)?;
+            validate_uni_request(expected_cid, &encoded)?;
             if encoded.len() > MCU_COMMAND_SLOT_BYTES {
                 return Err("unified command exceeded one DMA slot".into());
             }
@@ -11029,7 +11040,7 @@ impl VfioFirmwareLoader<'_> {
                 self.mcu.wfdma,
                 self.mcu.tx_ring,
                 self.mcu.payload,
-                encoded,
+                &encoded,
                 sequence,
                 descriptor_index,
             )
@@ -11069,8 +11080,8 @@ impl VfioFirmwareLoader<'_> {
         let mut publication = PublicationState::Local;
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
-        let sequence = validate_uni_request(expected_cid, encoded)?;
-        consume_client_mcu_sequence(self.sequence, sequence)?;
+        let (sequence, encoded) = stamp_next_mcu_sequence(self.sequence, encoded)?;
+        validate_uni_request(expected_cid, &encoded)?;
         if encoded.len() > MCU_COMMAND_SLOT_BYTES {
             return Err("unified command exceeded one DMA slot".into());
         }
@@ -11114,7 +11125,7 @@ impl VfioFirmwareLoader<'_> {
             self.mcu.wfdma,
             self.mcu.tx_ring,
             self.mcu.payload,
-            encoded,
+            &encoded,
             sequence,
             descriptor_index,
         ) {
@@ -11227,10 +11238,6 @@ impl VfioFirmwareLoader<'_> {
     ) -> Result<(), String> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
-        let sequence = *encoded
-            .get(39)
-            .filter(|sequence| (1..=15).contains(*sequence))
-            .ok_or("passive command omitted valid sequence")?;
         if wait_response != command.expects_response() {
             return Err("passive response policy disagreed with encoded command".into());
         }
@@ -11239,22 +11246,27 @@ impl VfioFirmwareLoader<'_> {
             PassiveMcuCommand::AddBss => Some(2),
             _ => None,
         } {
+            let sequence = self.sequence % 15 + 1;
             self.send_acknowledged_uni_command(expected_cid, encoded)?;
             println!(
                 r#"{{"passive_scan_event":"command_completed","command":"{command:?}","sequence":{sequence}}}"#
             );
             return Ok(());
         }
+        let (sequence, encoded) = stamp_next_mcu_sequence(self.sequence, encoded)?;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.mcu
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+        // This is the publication boundary. Every error above is local and
+        // leaves the cursor reusable; every error below may have published.
+        self.sequence = sequence;
         publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
             self.mcu.payload,
-            encoded,
+            &encoded,
             sequence,
             descriptor_index,
         )?;
@@ -11296,17 +11308,10 @@ impl VfioFirmwareLoader<'_> {
     fn send_rate_power_bytes(&mut self, encoded: &[u8]) -> Result<(), String> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
-        let _template_sequence = *encoded
-            .get(39)
-            .filter(|sequence| (1..=15).contains(*sequence))
-            .ok_or("rate-power command omitted valid sequence")?;
         if encoded.get(36..39) != Some(&[0x5d, 0xa0, 1]) {
             return Err("rate-power command escaped CE SET_RATE_TX_POWER".into());
         }
-        self.sequence = self.sequence % 15 + 1;
-        let sequence = self.sequence;
-        let mut encoded = encoded.to_vec();
-        encoded[39] = sequence;
+        let (sequence, encoded) = stamp_next_mcu_sequence(self.sequence, encoded)?;
         // This is the final sequence-adjusted byte vector.  Reject it before
         // any producer index or descriptor can make it visible to firmware.
         validate_native_rate_power_page(
@@ -11318,6 +11323,9 @@ impl VfioFirmwareLoader<'_> {
         let before_ns = self.start.elapsed().as_nanos();
         let cidx_before = self.mcu.wfdma.read(0xd4418)?;
         let didx_before = self.mcu.wfdma.read(0xd441c)?;
+        // The producer write can make ownership ambiguous, so consume here,
+        // immediately before the physical publication attempt.
+        self.sequence = sequence;
         publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
@@ -13745,9 +13753,8 @@ impl LiveClientEffects {
         if self.join_roc_generation.is_some() {
             return Err(zx::Status::BAD_STATE);
         }
-        let sequence = self.firmware.reserve_mcu_sequence();
         let max_interval_ms =
-            match io.acquire_join_roc(sequence, channel.channel, channel.generation, duration_ms) {
+            match io.acquire_join_roc(channel.channel, channel.generation, duration_ms) {
                 Ok(max_interval_ms) => max_interval_ms,
                 Err(status) => {
                     if io.join_roc_active(channel.generation) {
@@ -13771,8 +13778,7 @@ impl LiveClientEffects {
             return Ok(());
         };
         self.join_roc_deadline = None;
-        let sequence = self.firmware.reserve_mcu_sequence();
-        io.abort_join_roc(sequence, generation).map_err(|status| {
+        io.abort_join_roc(generation).map_err(|status| {
             self.firmware.firmware_uncertain = true;
             status
         })
@@ -16623,7 +16629,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
 
     fn acquire_client_join_roc(
         &mut self,
-        sequence: u8,
         channel: mt7921_port_spike::ClientPhysicalChannel,
         generation: u64,
         duration_ms: u32,
@@ -16642,9 +16647,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             self.join_roc_token = 1;
         }
         let token = self.join_roc_token;
-        if sequence != self.loader.sequence % 15 + 1 {
-            return Err(zx::Status::IO_DATA_INTEGRITY);
-        }
+        let sequence = self.loader.sequence % 15 + 1;
         let command = encode_client_join_roc_acquire(sequence, 0, token, channel, duration_ms)
             .map_err(|_| zx::Status::INVALID_ARGS)?;
         self.active_join_roc = Some((token, generation));
@@ -16720,16 +16723,14 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .is_some_and(|(_, current)| current == generation)
     }
 
-    fn abort_client_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
+    fn abort_client_join_roc(&mut self, generation: u64) -> Result<(), zx::Status> {
         let Some((token, current)) = self.active_join_roc else {
             return Err(zx::Status::BAD_STATE);
         };
         if current != generation {
             return Err(zx::Status::BAD_STATE);
         }
-        if sequence != self.loader.sequence % 15 + 1 {
-            return Err(zx::Status::IO_DATA_INTEGRITY);
-        }
+        let sequence = self.loader.sequence % 15 + 1;
         self.active_join_roc = None;
         let command = encode_client_join_roc_abort(sequence, 0, token)
             .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
@@ -17463,18 +17464,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
-        let sequence = encoded
-            .get(39)
-            .copied()
-            .filter(|sequence| (1..=15).contains(sequence))
-            .ok_or_else(|| PhysicalPassiveError("passive command omitted valid sequence".into()))?;
-        let expected = self.loader.sequence % 15 + 1;
-        if sequence != expected {
-            return Err(PhysicalPassiveError(format!(
-                "passive command sequence {sequence} did not follow live loader sequence {}",
-                self.loader.sequence
-            )));
-        }
         if matches!(command, PassiveMcuCommand::SetRxPath { .. }) {
             self.loader
                 .capture_patch_table_snapshot("immediately_before_rx_path")
@@ -17491,7 +17480,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 .transition(RunPhase::PassiveReady, RunPhase::Scanning)
                 .map_err(PhysicalPassiveError)?;
         }
-        self.loader.sequence = sequence;
         self.loader
             .send_passive_command(command, encoded, wait_response)
             .map_err(PhysicalPassiveError)?;
@@ -19295,7 +19283,7 @@ mod tests {
     #[derive(Default)]
     struct TestClientIo {
         uni: Vec<Vec<u8>>,
-        roc: Vec<(bool, u8, u64, u32)>,
+        roc: Vec<(bool, u64, u32)>,
         tx: Vec<Vec<u8>>,
         rx: VecDeque<ClientRxFrame>,
         fail_uni: bool,
@@ -19544,16 +19532,15 @@ mod tests {
         }
         fn acquire_join_roc(
             &mut self,
-            sequence: u8,
             _: ClientPhysicalChannel,
             generation: u64,
             duration_ms: u32,
         ) -> Result<u32, zx::Status> {
-            self.roc.push((true, sequence, generation, duration_ms));
+            self.roc.push((true, generation, duration_ms));
             Ok(duration_ms)
         }
-        fn abort_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
-            self.roc.push((false, sequence, generation, 0));
+        fn abort_join_roc(&mut self, generation: u64) -> Result<(), zx::Status> {
+            self.roc.push((false, generation, 0));
             Ok(())
         }
         fn transmit_client(
@@ -19655,7 +19642,7 @@ mod tests {
 
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
-        assert_eq!(io.roc, vec![(true, 1, channel.generation, 2_000)]);
+        assert_eq!(io.roc, vec![(true, channel.generation, 2_000)]);
 
         let stale = mt7921_port_spike::ClientChannelLease {
             generation: channel.generation + 1,
@@ -19672,10 +19659,10 @@ mod tests {
         assert_eq!(
             io.roc,
             vec![
-                (true, 1, channel.generation, 2_000),
-                (false, 2, channel.generation, 0),
-                (true, 3, channel.generation, 1_000),
-                (false, 4, channel.generation, 0),
+                (true, channel.generation, 2_000),
+                (false, channel.generation, 0),
+                (true, channel.generation, 1_000),
+                (false, channel.generation, 0),
             ]
         );
     }
@@ -19701,9 +19688,9 @@ mod tests {
         assert_eq!(
             io.roc,
             vec![
-                (true, 1, channel.generation, 2_000),
-                (false, 2, channel.generation, 0),
-                (true, 3, channel.generation, 2_000),
+                (true, channel.generation, 2_000),
+                (false, channel.generation, 0),
+                (true, channel.generation, 2_000),
             ]
         );
     }
@@ -19714,7 +19701,7 @@ mod tests {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
-        assert_eq!(io.roc, vec![(true, 2, 1, 2_000)]);
+        assert_eq!(io.roc, vec![(true, 1, 2_000)]);
 
         let client = effects.client;
         let target = effects.target;
@@ -19752,11 +19739,11 @@ mod tests {
         };
         io.rx.push_back(auth(1, 30));
         assert!(effects.next_rx(&mut io).unwrap().is_some());
-        assert_eq!(io.roc, vec![(true, 2, 1, 2_000)]);
+        assert_eq!(io.roc, vec![(true, 1, 2_000)]);
 
         io.rx.push_back(auth(2, 0));
         assert!(effects.next_rx(&mut io).unwrap().is_some());
-        assert_eq!(io.roc, vec![(true, 2, 1, 2_000), (false, 3, 1, 0)]);
+        assert_eq!(io.roc, vec![(true, 1, 2_000), (false, 1, 0)]);
 
         let mut assoc = vec![0; 28];
         assoc[4..10].copy_from_slice(&target);
@@ -19765,7 +19752,7 @@ mod tests {
         effects
             .send_wlan_frame(&assoc, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
-        assert_eq!(io.roc.last(), Some(&(true, 4, 1, 1_000)));
+        assert_eq!(io.roc.last(), Some(&(true, 1, 1_000)));
         effects
             .notify_association_complete(&validation_association(), &mut io)
             .unwrap();
@@ -19793,7 +19780,7 @@ mod tests {
             effects.send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
             Err(zx::Status::UNAVAILABLE)
         );
-        assert_eq!(io.roc, vec![(true, 2, 1, 2_000), (false, 3, 1, 0)]);
+        assert_eq!(io.roc, vec![(true, 1, 2_000), (false, 1, 0)]);
         assert_eq!(effects.join_roc_generation, None);
     }
 
@@ -19841,14 +19828,13 @@ mod tests {
 
         fn acquire_client_join_roc(
             &mut self,
-            _: u8,
             _: ClientPhysicalChannel,
             _: u64,
             _: u32,
         ) -> Result<u32, zx::Status> {
             Ok(1_000)
         }
-        fn abort_client_join_roc(&mut self, _: u8, _: u64) -> Result<(), zx::Status> {
+        fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
             Ok(())
         }
 
@@ -20020,7 +20006,9 @@ mod tests {
             .split("struct VfioRateTxPower")
             .next()
             .unwrap();
-        let sequence = rate_sender.find("encoded[39] = sequence").unwrap();
+        let sequence = rate_sender
+            .find("stamp_next_mcu_sequence(self.sequence, encoded)")
+            .unwrap();
         let golden = rate_sender
             .find("validate_native_rate_power_page(")
             .unwrap();
@@ -28442,5 +28430,137 @@ mod tests {
         effects.invalidate_early_m1();
         assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
         assert_eq!(effects.post_assoc_rx_ready_generation, None);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn shared_mcu_cursor_models_every_lifecycle_failure_boundary_and_wrap() {
+        const COMMANDS: &[&str] = &[
+            "eeprom-buffer",
+            "protect-ctrl",
+            "mac-enable",
+            "rx-path",
+            "rate-power-1",
+            "rate-power-2",
+            "rate-power-3",
+            "rate-power-4",
+            "rate-power-5",
+            "rate-power-6",
+            "rate-power-7",
+            "rate-power-8",
+            "dev-active",
+            "bss-active",
+            "early-edca",
+            "rx-filter",
+            "channel-switch",
+            "scan-start",
+            "scan-cancel",
+            "join-roc-acquire",
+            "join-roc-abort",
+            "bss-assoc",
+            "sta-rec",
+            "wtbl",
+            "assoc-edca",
+            "beacon-offload",
+            "rlm",
+            "keys-remove",
+            "sta-remove",
+            "bss-disable",
+            "dev-disable",
+        ];
+        const CLEANUP_START: usize = 27;
+
+        for start in [0, 7, 14] {
+            for failed_at in 0..COMMANDS.len() {
+                for failure in [PublicationState::Local, PublicationState::Uncertain] {
+                    let mut cursor = start;
+                    let mut attempted = Vec::new();
+                    for (index, command) in COMMANDS.iter().enumerate() {
+                        if index == failed_at {
+                            let expected = cursor % 15 + 1;
+                            if failure.requires_containment() {
+                                cursor = expected;
+                            }
+                            attempted.push(*command);
+                        } else if index < failed_at || index >= CLEANUP_START {
+                            let expected = cursor % 15 + 1;
+                            let mut template = vec![0; 48];
+                            template[39] = 15 - expected;
+                            let (sequence, stamped) =
+                                stamp_next_mcu_sequence(cursor, &template).unwrap();
+                            assert_eq!(sequence, expected);
+                            assert_eq!(stamped[39], expected);
+                            cursor = sequence;
+                            attempted.push(*command);
+                        }
+                    }
+
+                    // Local failures are retryable at the same number;
+                    // uncertain publications consume it. Cleanup is always
+                    // attempted in order irrespective of the injected point.
+                    let published = if failed_at < CLEANUP_START {
+                        failed_at + COMMANDS.len() - CLEANUP_START
+                    } else {
+                        COMMANDS.len() - 1
+                    };
+                    let consumed = published + usize::from(failure.requires_containment());
+                    let mut expected_cursor = start;
+                    for _ in 0..consumed {
+                        expected_cursor = expected_cursor % 15 + 1;
+                    }
+                    assert_eq!(cursor, expected_cursor);
+                    assert_eq!(
+                        &attempted[attempted.len() - (COMMANDS.len() - CLEANUP_START)..],
+                        &COMMANDS[CLEANUP_START..],
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn production_client_publications_stamp_only_at_the_physical_sender() {
+        let source = include_str!("vfio_read.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let loader = production
+            .split("impl VfioFirmwareLoader<'_> {")
+            .nth(1)
+            .unwrap()
+            .split("struct VfioRateTxPower")
+            .next()
+            .unwrap();
+
+        for (method, next) in [
+            (
+                "fn send_client_ce_no_ack_bytes(",
+                "fn clear_client_rx_filter(",
+            ),
+            (
+                "fn send_unacknowledged_uni_command(",
+                "fn send_acknowledged_uni_command(",
+            ),
+            (
+                "fn send_acknowledged_uni_command(",
+                "fn send_passive_command(",
+            ),
+            ("fn send_passive_command(", "fn send_rate_power_bytes("),
+            ("fn send_rate_power_bytes(", "\n}\n\n#[cfg(feature"),
+        ] {
+            let body = loader
+                .split(method)
+                .nth(1)
+                .unwrap()
+                .split(next)
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("stamp_next_mcu_sequence(self.sequence, encoded)"),
+                "{method} must stamp from the physical cursor"
+            );
+            assert!(!body.contains("consume_client_mcu_sequence("), "{method}");
+        }
+        assert!(!production.contains("loader.sequence = sequence"));
+        assert!(!production.contains("reserve_mcu_sequence()"));
     }
 }
