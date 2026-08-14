@@ -375,6 +375,9 @@
               grep -F '"active_capable":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"observation_mode":"passive-m1-observation"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"frame_tx_disabled_before_m1":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"required_pre_m1_management_tx":"sae-and-association"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"post_assoc_public_tx":"disabled-until-m1-observed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"m2_physical_tx":"suppressed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -883,6 +886,9 @@
                 ACTIVE_CAPABLE=true
                 OBSERVATION_MODE=passive-m1-observation
                 FRAME_TX_DISABLED_BEFORE_M1=true
+                REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
+                POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
+                M2_PHYSICAL_TX=suppressed
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
                 SUPERVISOR=$supervisor
                 SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
@@ -906,7 +912,6 @@
                 PATCH_TABLE_GATE=false
                 M1_TIMEOUT_SECONDS=25
                 EAPOL_START=false
-                M2_PHYSICAL_TX=false
                 TX_COMPLETION_WAIT=false
                 DUPLICATE_M1_ACTION=none
                 RETRY=false
@@ -1263,6 +1268,9 @@
                 ACTIVE_CAPABLE=true
                 OBSERVATION_MODE=passive-m1-observation
                 FRAME_TX_DISABLED_BEFORE_M1=true
+                REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
+                POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
+                M2_PHYSICAL_TX=suppressed
                 EOF
                 runHook postInstall
               '';
@@ -1288,6 +1296,9 @@
                 grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
                 grep -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest"
                 grep -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest"
+                grep -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' "$manifest"
+                grep -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' "$manifest"
+                grep -Fx 'M2_PHYSICAL_TX=suppressed' "$manifest"
                 grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
                 grep -Fx '  exec /run/wrappers/bin/sudo -n "$runner" --plan' "$entry"
                 grep -Fx 'exec /run/wrappers/bin/sudo -n "$runner"' "$entry"
@@ -1333,7 +1344,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true}
+              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1386,6 +1397,9 @@
               ACTIVE_CAPABLE=true
               OBSERVATION_MODE=passive-m1-observation
               FRAME_TX_DISABLED_BEFORE_M1=true
+              REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
+              POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
+              M2_PHYSICAL_TX=suppressed
               EOF
               }
               make_entry entry "$PWD/work/sudo-stub"

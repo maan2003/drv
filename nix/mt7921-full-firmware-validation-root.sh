@@ -15,8 +15,14 @@ esac
 @grep@ -Fx 'ACTIVE_CAPABLE=true' @manifest@ >/dev/null
 @grep@ -Fx 'OBSERVATION_MODE=passive-m1-observation' @manifest@ >/dev/null
 @grep@ -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' @manifest@ >/dev/null
+@grep@ -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' @manifest@ >/dev/null
+@grep@ -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' @manifest@ >/dev/null
+@grep@ -Fx 'M2_PHYSICAL_TX=suppressed' @manifest@ >/dev/null
 @grep@ -F '"observation_mode":"passive-m1-observation"' @artifact_identity@ >/dev/null
 @grep@ -F '"frame_tx_disabled_before_m1":true' @artifact_identity@ >/dev/null
+@grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' @artifact_identity@ >/dev/null
+@grep@ -F '"post_assoc_public_tx":"disabled-until-m1-observed"' @artifact_identity@ >/dev/null
+@grep@ -F '"m2_physical_tx":"suppressed"' @artifact_identity@ >/dev/null
 @grep@ -Fx 'FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof' @manifest@ >/dev/null
 test "$(@launcher@ --artifact-identity)" = "$(@cat@ @artifact_identity@)"
 assert_identity_field() {

@@ -35,6 +35,9 @@ fi
 @grep@ -Fx 'ACTIVE_CAPABLE=true' "$manifest" >/dev/null
 @grep@ -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest" >/dev/null
 @grep@ -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest" >/dev/null
+@grep@ -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' "$manifest" >/dev/null
+@grep@ -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' "$manifest" >/dev/null
+@grep@ -Fx 'M2_PHYSICAL_TX=suppressed' "$manifest" >/dev/null
 test "$(@sha256sum@ "$runner" | @cut@ -d ' ' -f1)" = @runner_sha256@
 test "$(@nix_store@ -q --hash "$runner_package")" = @runner_registered_hash@
 test "$(@sha256sum@ "$0" | @cut@ -d ' ' -f1)" = "$(@sed@ -n 's/^ENTRYPOINT_SHA256=//p' "$manifest")"
@@ -50,6 +53,9 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"active_capable":true' "$identity" >/dev/null
 @grep@ -F '"observation_mode":"passive-m1-observation"' "$identity" >/dev/null
 @grep@ -F '"frame_tx_disabled_before_m1":true' "$identity" >/dev/null
+@grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' "$identity" >/dev/null
+@grep@ -F '"post_assoc_public_tx":"disabled-until-m1-observed"' "$identity" >/dev/null
+@grep@ -F '"m2_physical_tx":"suppressed"' "$identity" >/dev/null
 
 printf 'INERT_PROOF_ROOT privilege=sudo_-n runner=%s runner_sha256=%s runner_registered_hash=%s flavor=full-firmware-production operation=run-one-shot-sae-auth source_identity_sha256=@source_identity@ fuchsia_base_revision=@fuchsia_base_revision@ fuchsia_patch_set=@fuchsia_patch_set@ materialized_source_tree_sha256=@materialized_tree@ generated_crate_source_sha256=@generated_source@ active_capable=true mode=%s\n' \
   "$runner" @runner_sha256@ @runner_registered_hash@ "${operation:---execute}"

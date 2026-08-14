@@ -3522,7 +3522,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
         [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
     )?;
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3622,7 +3622,7 @@ fn run() -> Result<(), String> {
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -4250,7 +4250,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -18293,7 +18293,8 @@ mod tests {
             security: Some(security),
         });
         for _ in 0..11 {
-            assert!(effects.next_rx(&mut io).unwrap().is_none());
+            assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes.len(), 308);
+            assert!(!effects.validation_complete());
         }
         assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, m1);
         assert!(!effects.firmware.controlled_port_open);
