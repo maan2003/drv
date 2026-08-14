@@ -2849,3 +2849,12 @@ contains no timestamp. There is no equivalent native two-point delta or
 Linux/iwd M1 latency measurement. The one-second first-data deadline remains
 unchanged; the manifest's 25 seconds is the enclosing operation budget, not
 evidence supporting a speculative extension.
+
+The installed production identity binds this observation boundary as
+`linux-6.18.40-passive-m1-rx-v2`. It enumerates the only safe register reads
+(`0xd4208,0xd4528,0xd452c`), both snapshot boundaries, the exact pinned
+AP-to-client M1 scope, positive and ambiguous-negative results, best-effort
+read-only behavior with unchanged control flow and timeout, and the independent
+AP/over-air attribution requirement. Launcher, supervisor, root, and inert
+artifacts compare against that installed ELF identity; stale identities are
+rejected before privileged dispatch.

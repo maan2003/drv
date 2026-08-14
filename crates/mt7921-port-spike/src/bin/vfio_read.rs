@@ -3608,15 +3608,35 @@ fn run_production_validation_self_test() -> Result<(), String> {
     {
         return Err("completed validation TX guard admitted late SAE".into());
     }
+    let passive_m1_diagnostic_json = passive_m1_diagnostic_json();
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON},{PASSIVE_M1_DIAGNOSTIC_JSON}}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON},{passive_m1_diagnostic_json}}}"#
     );
     Ok(())
 }
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_DIAGNOSTIC_JSON: &str = r#""passive_m1_diagnostic_contract":"linux-6.18.40-safe-read-rx-dma-v1","no_m1_result":"no_m1_at_rx_dma_ambiguous","consuming_mib_reads":false,"definitive_attribution_requires":"independent-ap-or-over-air-witness""#;
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v2";
+const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
+const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
+const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
+const PASSIVE_M1_BEFORE_TAIL_BOUNDARY: &str = "before-post-assoc-tail";
+const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
+const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
+const PASSIVE_M1_TARGET_SCOPE: &str =
+    "pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1";
+const PASSIVE_M1_BEHAVIOR: &str =
+    "best-effort-read-only-telemetry,control-flow-and-timeout-unchanged";
+const PASSIVE_M1_ATTRIBUTION_LIMIT: &str = "independent-ap-or-over-air-witness-required";
+const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn passive_m1_diagnostic_json() -> String {
+    let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
+    format!(
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},first-data-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}""#
+    )
+}
 
 #[cfg(feature = "fuchsia-passive")]
 fn validate_bss_wire_contract() -> Result<(), String> {
@@ -3760,7 +3780,7 @@ fn run() -> Result<(), String> {
                 option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified"),
                 BSS_WIRE_CONTRACT_JSON,
-                PASSIVE_M1_DIAGNOSTIC_JSON,
+                passive_m1_diagnostic_json(),
             );
         } else {
             println!(
@@ -13727,7 +13747,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             if let Some(started) = self
                 .post_association_data_wait
-                .filter(|started| started.elapsed() >= std::time::Duration::from_secs(1))
+                .filter(|started| started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT)
             {
                 if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
                     record_sae_stage(&format!(
@@ -14472,7 +14492,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .loader
             .mcu
             .wfdma
-            .read(0xd452c)
+            .read(PASSIVE_M1_DATA_RING_DIDX)
             .map_err(|_| zx::Status::IO)?;
         let descriptor_ctrl =
             std::array::from_fn(|index| self.data.rx_ring.read_descriptor_at(index).ctrl);
@@ -14481,14 +14501,14 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .loader
             .mcu
             .wfdma
-            .read(0xd452c)
+            .read(PASSIVE_M1_DATA_RING_DIDX)
             .map_err(|_| zx::Status::IO)?;
         let snapshot = PassiveM1DiagnosticSnapshot {
             rx_dma_enabled: self
                 .loader
                 .mcu
                 .wfdma
-                .read(0xd4208)
+                .read(PASSIVE_M1_RX_DMA_GLO_CFG)
                 .map_err(|_| zx::Status::IO)?
                 & (1 << 2)
                 != 0,
@@ -14496,7 +14516,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 .loader
                 .mcu
                 .wfdma
-                .read(0xd4528)
+                .read(PASSIVE_M1_DATA_RING_CIDX)
                 .map_err(|_| zx::Status::IO)?,
             data_ring_didx_before,
             data_ring_didx_after,
@@ -14555,9 +14575,9 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     .authenticator_m1_total
                     .wrapping_sub(before.authenticator_m1_total);
                 let classification = if authenticator_m1_delta != 0 {
-                    "target_m1_observed_at_rx_dma"
+                    PASSIVE_M1_POSITIVE_RESULT
                 } else {
-                    "no_m1_at_rx_dma_ambiguous"
+                    PASSIVE_M1_NEGATIVE_RESULT
                 };
                 let rx_dma_activity = if completed_delta != 0 {
                     "present"
@@ -25851,7 +25871,11 @@ mod tests {
             .split("fn e2e81_snapshot(")
             .next()
             .unwrap();
-        for read in ["read(0xd4208)", "read(0xd4528)", "read(0xd452c)"] {
+        for read in [
+            "read(PASSIVE_M1_RX_DMA_GLO_CFG)",
+            "read(PASSIVE_M1_DATA_RING_CIDX)",
+            "read(PASSIVE_M1_DATA_RING_DIDX)",
+        ] {
             assert!(snapshot.contains(read), "missing safe source {read}");
         }
         assert!(
@@ -25861,9 +25885,28 @@ mod tests {
         assert!(!snapshot.contains("mac.read"));
         assert!(!snapshot.contains(".write("));
         assert!(!snapshot.contains("write_descriptor_at"));
-        assert!(snapshot.contains("no_m1_at_rx_dma_ambiguous"));
+        assert!(snapshot.contains("PASSIVE_M1_NEGATIVE_RESULT"));
+        assert!(snapshot.contains("PASSIVE_M1_POSITIVE_RESULT"));
         assert!(!snapshot.contains("ap_sent_no_m1"));
         assert!(!snapshot.contains("firmware_dropped_m1"));
+        assert_eq!(
+            PASSIVE_M1_FIRST_DATA_TIMEOUT,
+            std::time::Duration::from_millis(1000)
+        );
+        let identity = passive_m1_diagnostic_json();
+        for field in [
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v2\"",
+            "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c\"",
+            "\"consuming_mib_reads\":false",
+            "\"snapshot_boundaries\":\"before-post-assoc-tail,first-data-timeout-1000ms\"",
+            "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
+            "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
+            "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
+            "\"behavior\":\"best-effort-read-only-telemetry,control-flow-and-timeout-unchanged\"",
+            "\"attribution_limit\":\"independent-ap-or-over-air-witness-required\"",
+        ] {
+            assert!(identity.contains(field), "missing identity field {field}");
+        }
 
         let drain = source
             .split("fn drain_data_rx_queue(")
@@ -25905,7 +25948,7 @@ mod tests {
         assert!(before < tail);
 
         let deadline = production
-            .find("started.elapsed() >= std::time::Duration::from_secs(1)")
+            .find("started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT")
             .unwrap();
         let timeout = deadline
             + production[deadline..]
