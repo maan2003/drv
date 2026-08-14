@@ -15117,6 +15117,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     ),
                     None => "mlme_association_disposition result=malformed status=unknown retry_supported=true".to_string(),
                 });
+                if status.is_some_and(|status| status != 0) {
+                    self.abort_join_roc(io)?;
+                    record_sae_stage(&format!(
+                        "join_roc_lifecycle phase=association_response status={} abort=non_success_before_retry",
+                        status.expect("non-success status was checked")
+                    ));
+                }
             }
             if matches!(classification.subtype, 10 | 12) {
                 self.invalidate_early_m1();
@@ -28215,6 +28222,7 @@ mod tests {
         effects.suppress_eapol_liveness = false;
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
+        effects.abort_join_roc(&mut io).unwrap();
         let request = validation_association_request(&effects);
         effects
             .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
@@ -28223,9 +28231,20 @@ mod tests {
         comeback.bytes[26..28].copy_from_slice(&30u16.to_le_bytes());
         io.rx.push_back(comeback);
         assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(io.roc.last(), Some(&(false, 1, 0)));
         effects
             .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
             .unwrap();
+        assert_eq!(
+            io.roc,
+            vec![
+                (true, 1, 2_000),
+                (false, 1, 0),
+                (true, 1, 1_000),
+                (false, 1, 0),
+                (true, 1, 1_000),
+            ]
+        );
         assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
     }
 
