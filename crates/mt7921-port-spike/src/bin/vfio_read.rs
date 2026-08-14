@@ -3851,7 +3851,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v6","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"linux-6.18.40-semantic-v1","normalized_native_association_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3916,8 +3916,11 @@ fn run() -> Result<(), String> {
             }
             Ok(ies)
         };
-        if u16::from_le_bytes(frame[26..28].try_into().unwrap()) != 5 {
-            return Err("production ClientMlme listen interval drifted".into());
+        if frame.len() != 204
+            || u16::from_le_bytes(frame[24..26].try_into().unwrap()) != 0x1111
+            || u16::from_le_bytes(frame[26..28].try_into().unwrap()) != 5
+        {
+            return Err("production ClientMlme association fixed fields drifted".into());
         }
         let ies = parse_ies(&frame)?;
         let id_lengths = ies
@@ -3928,9 +3931,14 @@ fn run() -> Result<(), String> {
             != [
                 (0, 3),
                 (1, 8),
+                (33, 2),
+                (36, 56),
                 (48, 20),
+                (70, 5),
                 (45, 26),
+                (127, 10),
                 (191, 12),
+                (255, 2),
                 (244, 1),
                 (221, 7),
             ]
@@ -3940,21 +3948,30 @@ fn run() -> Result<(), String> {
             ));
         }
         let expected_rsne = [
-            1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0,
+            1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0x80, 0,
         ];
         let expected_ht = [
-            0x73, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0,
         ];
-        let expected_vht = [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+        let expected_vht = [
+            0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+        ];
         let expected_wmm = [0, 0x50, 0xf2, 2, 0, 1, 0];
-        if ies[2].1 != expected_rsne
-            || ies[3].1 != expected_ht
-            || ies[4].1 != expected_vht
-            || ies[5].1 != [0x20]
-            || ies[6].1 != expected_wmm
+        if ies[2].1 != [0, 20]
+            || ies[3].1.len() != 56
+            || ies[4].1 != expected_rsne
+            || ies[5].1 != [0x70, 0, 0, 0, 0]
+            || ies[6].1 != expected_ht
+            || ies[7].1 != [0x04, 0, 0x08, 0, 1, 0, 0, 0x40, 0, 1]
+            || ies[8].1 != expected_vht
+            || ies[9].1 != [0x06, 0x1a]
+            || ies[10].1 != [0x20]
+            || ies[11].1 != expected_wmm
         {
-            return Err("production ClientMlme RSN/HT/VHT/RSNXE/WMM bytes drifted".into());
+            return Err(format!(
+                "production ClientMlme RSN/HT/VHT/RSNXE/WMM bytes drifted: {ies:?}"
+            ));
         }
         let without_h2e_ies = parse_ies(&without_h2e)?;
         if without_h2e_ies.iter().any(|(id, _)| *id == 244)
@@ -3962,21 +3979,22 @@ fn run() -> Result<(), String> {
         {
             return Err("selected BSS without H2E incorrectly emitted RSNXE".into());
         }
-        let digest = Sha256::digest(&frame);
+        let mut normalized = frame.clone();
+        normalized[22..24].fill(0);
+        let digest = Sha256::digest(&normalized);
         let sha256 = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let frame_hex = frame
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        if sha256 != "6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755" {
+            return Err("normalized native association fixture hash drifted".into());
+        }
         let without_h2e_sha256 = Sha256::digest(&without_h2e)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         println!(
-            r#"{{"sae_h2e_association_request_self_test":"passed","constructor":"wlan_mlme::client::ClientMlme","listen_interval":5,"ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","rsne_body_hex":"0100000fac040100000fac040100000fac08cc00","ht_body_hex":"730903ffff000000000000000000000100000000000000000000","vht_body_hex":"b2719033faff0000faff0000","rsnxe":"244:1:20","wmm_body_hex":"0050f202000100","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","stale_listen_interval0":false,"stale_vendor_only":false,"frame_len":{},"frame_sha256":"{sha256}","frame_hex":"{frame_hex}","without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
+            r#"{{"sae_h2e_association_request_self_test":"passed","constructor":"wlan_mlme::client::ClientMlme+semantic-association-profile","association_request_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","normalized_native_fixture_sha256":"{sha256}","rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","stale_119_byte_request":false,"frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
             frame.len(),
         );
         return Ok(());
@@ -27155,6 +27173,14 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn early_m1_is_retained_through_tail_then_drained_once_before_hardware() {
+        // Corrected native capture timing: M1 arrived 4.807 ms after the
+        // association response and 20 us before the first STA_REC command.
+        const ASSOCIATION_RESPONSE_US: u64 = 0;
+        const EARLY_M1_US: u64 = 4_807;
+        const FIRST_STA_REC_US: u64 = 4_827;
+        assert_eq!(EARLY_M1_US - ASSOCIATION_RESPONSE_US, 4_807);
+        assert!(EARLY_M1_US < FIRST_STA_REC_US);
+
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
         let retained = drive_validation_to_retained_m1(&mut effects, &mut io);

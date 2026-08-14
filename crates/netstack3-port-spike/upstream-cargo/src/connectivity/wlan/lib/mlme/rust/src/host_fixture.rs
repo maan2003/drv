@@ -53,12 +53,14 @@ fn device_info() -> fidl_mlme::DeviceInfo {
             basic_rates: vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c],
             ht_cap: Some(Box::new(fidl_ieee80211::HtCapabilities {
                 bytes: [
-                    0xf3, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                    0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0,
                 ],
             })),
             vht_cap: Some(Box::new(fidl_ieee80211::VhtCapabilities {
-                bytes: [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0],
+                bytes: [
+                    0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+                ],
             })),
             primary_channels: vec![channel(36)],
         }],
@@ -328,14 +330,19 @@ async fn association_request(h2e: bool) -> Result<Vec<u8>, &'static str> {
     ))
     .await
     .map_err(|_| "ClientMlme fixture SAE completion failed")?;
-    effects
+    let frame = effects
         .lock()
         .unwrap()
         .frames
         .iter()
         .find(|(frame, _)| frame.first() == Some(&0))
         .map(|(frame, _)| frame.clone())
-        .ok_or("ClientMlme did not serialize an association request")
+        .ok_or("ClientMlme did not serialize an association request")?;
+    fuchsia_softmac_port::finalize_association_request(
+        &frame,
+        &fuchsia_softmac_port::linux_61840_oracle_profile(),
+    )
+    .map_err(|_| "ClientMlme association profile rejected")
 }
 
 /// Association requests produced by the production pinned `ClientMlme` from

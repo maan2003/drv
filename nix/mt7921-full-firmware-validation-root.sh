@@ -33,6 +33,8 @@ esac
 @grep@ -Fx 'INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATION_REQUEST_CONTRACT=linux-6.18.40-semantic-v1' @manifest@ >/dev/null
+@grep@ -Fx 'NORMALIZED_NATIVE_ASSOCIATION_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' @manifest@ >/dev/null
 @grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5' @manifest@ >/dev/null
 @grep@ -Fx 'EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1' @manifest@ >/dev/null
 @grep@ -Fx 'EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment' @manifest@ >/dev/null
@@ -71,7 +73,7 @@ assert_identity_field FUCHSIA_ORDERED_PATCH_SET_SHA256 fuchsia_ordered_patch_set
 assert_identity_field FUCHSIA_ORDERED_PATCH_LIST fuchsia_ordered_patch_list
 assert_identity_field MATERIALIZED_SOURCE_TREE_SHA256 materialized_source_tree_sha256
 assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha256
-@grep@ -F '"artifact_identity":"mt7921-validation-v6"' @artifact_identity@ >/dev/null
+@grep@ -F '"artifact_identity":"mt7921-validation-v7"' @artifact_identity@ >/dev/null
 @grep@ -F '"bss_wire_contract":"connac2-bss-wire-v1"' @artifact_identity@ >/dev/null
 @grep@ -F '"basic_tlv_len":32' @artifact_identity@ >/dev/null
 @grep@ -F '"initial_bss_payload_len":36,"initial_bss_command_len":84' @artifact_identity@ >/dev/null
@@ -82,6 +84,8 @@ assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha25
 @grep@ -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' @artifact_identity@ >/dev/null
+@grep@ -F '"association_request_contract":"linux-6.18.40-semantic-v1"' @artifact_identity@ >/dev/null
+@grep@ -F '"normalized_native_association_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' @artifact_identity@ >/dev/null
 @grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' @artifact_identity@ >/dev/null
 @grep@ -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' @artifact_identity@ >/dev/null
 @grep@ -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' @artifact_identity@ >/dev/null

@@ -23,6 +23,7 @@ fidl-fuchsia-wlan-softmac = { path = "../../../../../../sdk/fidl/fuchsia.wlan.so
 fidl-fuchsia-wlan-stats = { path = "../../../../../../sdk/fidl/fuchsia.wlan.stats" }
 fuchsia-sync = { path = "../../../../../lib/fuchsia-sync" }
 fuchsia-trace = { path = "../../../../../lib/trace/rust" }
+fuchsia-softmac-port = { path = "../../softmac-port" }
 futures.workspace = true
 fuchsia-async = { path = "../../../../../lib/fuchsia-async-host" }
 ieee80211 = { path = "../../ieee80211" }

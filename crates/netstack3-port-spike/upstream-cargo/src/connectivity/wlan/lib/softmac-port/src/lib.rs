@@ -4,9 +4,11 @@
 
 //! Host-portable extraction of pinned Fuchsia SoftMAC client MLME boundaries.
 
+mod association;
 mod open_client;
 mod sae;
 
+pub use association::*;
 pub use open_client::*;
 pub use sae::*;
 
