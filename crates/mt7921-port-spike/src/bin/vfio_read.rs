@@ -3522,7 +3522,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
         [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
     )?;
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3622,7 +3622,7 @@ fn run() -> Result<(), String> {
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -4250,7 +4250,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -6512,10 +6512,7 @@ fn run() -> Result<(), String> {
                                         })?;
                                     if e2e94_probe {
                                         let validation = shared.lock().unwrap();
-                                        if !validation.validation_complete
-                                            || validation.passive_m1_deliveries != 1
-                                            || validation.passive_m2_intents > 1
-                                        {
+                                        if !passive_validation_succeeded(&validation) {
                                             return Err("production validation connected without one admitted authenticator M1".into());
                                         }
                                         drop(validation);
@@ -12026,6 +12023,11 @@ struct LiveClientState {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn passive_validation_succeeded(state: &LiveClientState) -> bool {
+    state.validation_complete && state.passive_m1_deliveries == 1 && state.passive_m2_intents == 1
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl LiveClientState {
     fn authorize_sae(
         &mut self,
@@ -12342,13 +12344,22 @@ fn classify_eapol_key(bytes: &[u8]) -> Option<(u16, &'static str)> {
         return None;
     }
     let key_info = u16::from_be_bytes([eapol[5], eapol[6]]);
+    let descriptor_version = key_info & 0x0007;
     let pairwise = key_info & 0x0008 != 0;
+    let install = key_info & 0x0040 != 0;
     let ack = key_info & 0x0080 != 0;
     let mic = key_info & 0x0100 != 0;
-    let class = match (pairwise, ack, mic) {
-        (true, true, false) => "authenticator_m1",
-        (true, false, true) => "supplicant_m2_or_m4",
-        (true, true, true) => "authenticator_m3",
+    let secure = key_info & 0x0200 != 0;
+    let replay_counter = u64::from_be_bytes(eapol[9..17].try_into().ok()?);
+    let key_data_len = usize::from(u16::from_be_bytes([eapol[97], eapol[98]]));
+    if descriptor_version == 0 || replay_counter == 0 || packet_body_len != 95 + key_data_len {
+        return None;
+    }
+    let class = match (pairwise, install, ack, mic, secure) {
+        (true, false, true, false, false) if key_data_len == 0 => "authenticator_m1",
+        (true, false, false, true, false) if key_data_len != 0 => "supplicant_m2",
+        (true, true, true, true, true) if key_data_len != 0 => "authenticator_m3",
+        (true, false, false, true, true) if key_data_len == 0 => "supplicant_m4",
         _ => "other_eapol_key",
     };
     Some((key_info, class))
@@ -12619,6 +12630,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 );
                 return Err(zx::Status::ACCESS_DENIED);
             };
+            if key_class != "supplicant_m2" {
+                record_sae_stage(&format!(
+                    "passive_m1_tx_intercept result=blocked reason=not_m2 key_class={key_class} public_tx_count=0",
+                ));
+                return Err(zx::Status::ACCESS_DENIED);
+            }
             let mut state = self.state.lock().unwrap();
             if state.passive_m1_deliveries != 1 || !state.validation_complete {
                 record_sae_stage(
@@ -18226,6 +18243,59 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn production_eapol_key_classifier_distinguishes_exact_handshake_messages() {
+        let key = |key_info: u16, replay: u64, key_data: &[u8]| {
+            let body_len = 95 + key_data.len();
+            let mut frame = vec![0x08, 0x02, 0, 0];
+            frame.extend_from_slice(&[0; 20]);
+            frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            frame.extend_from_slice(&[2, 3]);
+            frame.extend_from_slice(&(body_len as u16).to_be_bytes());
+            frame.push(2);
+            frame.extend_from_slice(&key_info.to_be_bytes());
+            frame.extend_from_slice(&16u16.to_be_bytes());
+            frame.extend_from_slice(&replay.to_be_bytes());
+            frame.extend_from_slice(&[0; 32 + 16 + 8 + 8 + 16]);
+            frame.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
+            frame.extend_from_slice(key_data);
+            frame
+        };
+
+        assert_eq!(
+            classify_eapol_key(&key(0x008a, 1, &[])),
+            Some((0x008a, "authenticator_m1"))
+        );
+        assert_eq!(
+            classify_eapol_key(&key(0x010a, 1, &[48, 0])),
+            Some((0x010a, "supplicant_m2"))
+        );
+        assert_eq!(
+            classify_eapol_key(&key(0x13ca, 1, &[48, 0])),
+            Some((0x13ca, "authenticator_m3"))
+        );
+        assert_eq!(
+            classify_eapol_key(&key(0x030a, 1, &[])),
+            Some((0x030a, "supplicant_m4"))
+        );
+
+        assert!(classify_eapol_key(&key(0x010a, 0, &[48, 0])).is_none());
+        assert_eq!(
+            classify_eapol_key(&key(0x010a, 1, &[])),
+            Some((0x010a, "other_eapol_key"))
+        );
+        let mut malformed = key(0x010a, 1, &[48, 0]);
+        let llc = malformed
+            .windows(8)
+            .position(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+            .unwrap();
+        malformed[llc + 105..llc + 107].copy_from_slice(&3u16.to_be_bytes());
+        assert!(classify_eapol_key(&malformed).is_none());
+        malformed[llc + 9] = 0;
+        assert!(classify_eapol_key(&malformed).is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn passive_validation_drains_beacon_backlog_then_admits_one_closed_port_m1() {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
@@ -18349,24 +18419,89 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn validation_probe_tx_failure_is_terminal_and_never_retried() {
+    fn validation_records_exactly_one_m2_intent_without_transport_tx() {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
-        io.tx_status = Some(zx::Status::IO);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        effects.state.lock().unwrap().passive_m1_pending = true;
+        effects.eapol_ind_delivered_to_sme();
+        effects.eapol_ind_delivered_to_sme();
         let before = io.tx.len();
+        assert!(!passive_validation_succeeded(
+            &effects.state.lock().unwrap()
+        ));
+
+        let mut m2 = vec![0x88, 0x01, 0, 0];
+        m2.extend_from_slice(&effects.target);
+        m2.extend_from_slice(&effects.client);
+        m2.extend_from_slice(&effects.target);
+        m2.extend_from_slice(&[0, 0, 7, 0]);
+        m2.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        m2.extend_from_slice(&[2, 3, 0, 97, 2, 0x01, 0x0a, 0, 16]);
+        m2.extend_from_slice(&1u64.to_be_bytes());
+        m2.extend_from_slice(&[0x22; 32]);
+        m2.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        m2.extend_from_slice(&[0, 2, 48, 0]);
+
+        let eapol_start = eapol_start_frame(effects.client, effects.target, true);
         assert_eq!(
-            effects.notify_association_complete(&validation_association(), &mut io),
-            Err(zx::Status::IO)
+            effects.send_wlan_frame(
+                &eapol_start,
+                fidl_softmac::WlanTxInfoFlags::empty(),
+                &mut io
+            ),
+            Err(zx::Status::ACCESS_DENIED)
         );
-        assert_eq!(io.tx.len(), before + 1);
-        // Re-entering the association tail is rejected by firmware state and
-        // cannot publish a second diagnostic frame.
+        let mut malformed = m2.clone();
+        malformed.pop();
         assert_eq!(
-            effects.notify_association_complete(&validation_association(), &mut io),
-            Err(zx::Status::IO)
+            effects.send_wlan_frame(&malformed, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
+            Err(zx::Status::ACCESS_DENIED)
         );
-        assert_eq!(io.tx.len(), before + 1);
+        assert!(!passive_validation_succeeded(
+            &effects.state.lock().unwrap()
+        ));
+        assert_eq!(io.tx.len(), before);
+
+        effects
+            .send_wlan_frame(&m2, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        assert_eq!(effects.state.lock().unwrap().passive_m2_intents, 1);
+        assert!(passive_validation_succeeded(&effects.state.lock().unwrap()));
+        assert_eq!(io.tx.len(), before);
+
+        // A duplicate exact M2 remains suppressed and does not count twice.
+        effects
+            .send_wlan_frame(&m2, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        assert_eq!(effects.state.lock().unwrap().passive_m2_intents, 1);
+        assert_eq!(io.tx.len(), before);
+
+        // The Secure bit distinguishes M4 from M2; it cannot satisfy the gate.
+        let llc = m2
+            .windows(8)
+            .position(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+            .unwrap();
+        let key_info = llc + 13;
+        m2[key_info..key_info + 2].copy_from_slice(&0x030au16.to_be_bytes());
+        m2[llc + 10..llc + 12].copy_from_slice(&95u16.to_be_bytes());
+        m2.truncate(m2.len() - 2);
+        let key_data_len = m2.len() - 2;
+        m2[key_data_len..].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(
+            effects.send_wlan_frame(&m2, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
+            Err(zx::Status::ACCESS_DENIED)
+        );
+        assert_eq!(effects.state.lock().unwrap().passive_m2_intents, 1);
+        assert_eq!(io.tx.len(), before);
+
+        effects.state.lock().unwrap().passive_m2_intents = 2;
+        assert!(!passive_validation_succeeded(
+            &effects.state.lock().unwrap()
+        ));
     }
 
     #[cfg(feature = "fuchsia-passive")]

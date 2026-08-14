@@ -56,6 +56,7 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' "$identity" >/dev/null
 @grep@ -F '"post_assoc_public_tx":"disabled-until-m1-observed"' "$identity" >/dev/null
 @grep@ -F '"m2_physical_tx":"suppressed"' "$identity" >/dev/null
+@grep@ -F '"frame":"none-post-association-public-before-m1"' "$identity" >/dev/null
 
 printf 'INERT_PROOF_ROOT privilege=sudo_-n runner=%s runner_sha256=%s runner_registered_hash=%s flavor=full-firmware-production operation=run-one-shot-sae-auth source_identity_sha256=@source_identity@ fuchsia_base_revision=@fuchsia_base_revision@ fuchsia_patch_set=@fuchsia_patch_set@ materialized_source_tree_sha256=@materialized_tree@ generated_crate_source_sha256=@generated_source@ active_capable=true mode=%s\n' \
   "$runner" @runner_sha256@ @runner_registered_hash@ "${operation:---execute}"

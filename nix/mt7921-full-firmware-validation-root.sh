@@ -23,6 +23,7 @@ esac
 @grep@ -F '"required_pre_m1_management_tx":"sae-and-association"' @artifact_identity@ >/dev/null
 @grep@ -F '"post_assoc_public_tx":"disabled-until-m1-observed"' @artifact_identity@ >/dev/null
 @grep@ -F '"m2_physical_tx":"suppressed"' @artifact_identity@ >/dev/null
+@grep@ -F '"frame":"none-post-association-public-before-m1"' @artifact_identity@ >/dev/null
 @grep@ -Fx 'FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof' @manifest@ >/dev/null
 test "$(@launcher@ --artifact-identity)" = "$(@cat@ @artifact_identity@)"
 assert_identity_field() {

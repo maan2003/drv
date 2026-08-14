@@ -378,6 +378,7 @@
               grep -F '"required_pre_m1_management_tx":"sae-and-association"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"post_assoc_public_tx":"disabled-until-m1-observed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"m2_physical_tx":"suppressed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"frame":"none-post-association-public-before-m1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -435,7 +436,7 @@
                 | grep -F '"typed_binding_consumed":true' \
                 | grep -F '"rate_power_pages":8' \
                 | grep -F '"add_device_acked":true' \
-                | grep -F '"frame":"none_before_m1"' \
+                | grep -F '"frame":"none-post-association-public-before-m1"' \
                 | grep -F '"device_opened":false' \
                 | grep -F '"vfio_opened":false'
               launcher=$out/bin/mt7921-full-firmware-validation
@@ -904,7 +905,7 @@
                 TARGET_BSSID=72:a6:c7:7d:56:93
                 TARGET_CHANNEL=36
                 TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
-                FRAME=none_before_m1
+                FRAME=none-post-association-public-before-m1
                 SUCCESS=authenticator_m1_delivered_to_pinned_sme
                 RATE_POWER_ORDER=eeprom_prepare_protect_mac_enable_rx_path_then_8_contiguous_0x4005d_then_acked_add_device
                 RATE_POWER_REG_READ_BETWEEN_PAGES=0
@@ -1344,7 +1345,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed"}
+              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","frame":"none-post-association-public-before-m1"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
