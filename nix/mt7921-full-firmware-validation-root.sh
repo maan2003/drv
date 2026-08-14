@@ -33,14 +33,14 @@ esac
 @grep@ -Fx 'INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c' @manifest@ >/dev/null
-@grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v2' @manifest@ >/dev/null
+@grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v3' @manifest@ >/dev/null
 @grep@ -Fx 'SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c' @manifest@ >/dev/null
 @grep@ -Fx 'CONSUMING_MIB_READS=false' @manifest@ >/dev/null
-@grep@ -Fx 'SNAPSHOT_BOUNDARIES=before-post-assoc-tail,first-data-timeout-1000ms' @manifest@ >/dev/null
+@grep@ -Fx 'SNAPSHOT_BOUNDARIES=before-post-assoc-tail,first-data-timeout-5000ms' @manifest@ >/dev/null
 @grep@ -Fx 'POSITIVE_RESULT=target_m1_observed_at_rx_dma' @manifest@ >/dev/null
 @grep@ -Fx 'NEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous' @manifest@ >/dev/null
 @grep@ -Fx 'TARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1' @manifest@ >/dev/null
-@grep@ -Fx 'TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,control-flow-and-timeout-unchanged' @manifest@ >/dev/null
+@grep@ -Fx 'TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms' @manifest@ >/dev/null
 @grep@ -Fx 'ATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required' @manifest@ >/dev/null
 @grep@ -F '"observation_mode":"passive-m1-observation"' @artifact_identity@ >/dev/null
 @grep@ -F '"frame_tx_disabled_before_m1":true' @artifact_identity@ >/dev/null
@@ -77,14 +77,14 @@ assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha25
 @grep@ -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' @artifact_identity@ >/dev/null
-@grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v2"' @artifact_identity@ >/dev/null
+@grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v3"' @artifact_identity@ >/dev/null
 @grep@ -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c"' @artifact_identity@ >/dev/null
 @grep@ -F '"consuming_mib_reads":false' @artifact_identity@ >/dev/null
-@grep@ -F '"snapshot_boundaries":"before-post-assoc-tail,first-data-timeout-1000ms"' @artifact_identity@ >/dev/null
+@grep@ -F '"snapshot_boundaries":"before-post-assoc-tail,first-data-timeout-5000ms"' @artifact_identity@ >/dev/null
 @grep@ -F '"positive_result":"target_m1_observed_at_rx_dma"' @artifact_identity@ >/dev/null
 @grep@ -F '"negative_result":"no_m1_at_rx_dma_ambiguous"' @artifact_identity@ >/dev/null
 @grep@ -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' @artifact_identity@ >/dev/null
-@grep@ -F '"behavior":"best-effort-read-only-telemetry,control-flow-and-timeout-unchanged"' @artifact_identity@ >/dev/null
+@grep@ -F '"behavior":"best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms"' @artifact_identity@ >/dev/null
 @grep@ -F '"attribution_limit":"independent-ap-or-over-air-witness-required"' @artifact_identity@ >/dev/null
 fixture=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
 fixture_sha=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)

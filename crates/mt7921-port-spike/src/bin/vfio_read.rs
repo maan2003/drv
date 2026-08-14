@@ -3617,7 +3617,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v2";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v3";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
@@ -3627,9 +3627,9 @@ const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
 const PASSIVE_M1_TARGET_SCOPE: &str =
     "pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1";
 const PASSIVE_M1_BEHAVIOR: &str =
-    "best-effort-read-only-telemetry,control-flow-and-timeout-unchanged";
+    "best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms";
 const PASSIVE_M1_ATTRIBUTION_LIMIT: &str = "independent-ap-or-over-air-witness-required";
-const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
@@ -25891,18 +25891,32 @@ mod tests {
         assert!(!snapshot.contains("firmware_dropped_m1"));
         assert_eq!(
             PASSIVE_M1_FIRST_DATA_TIMEOUT,
-            std::time::Duration::from_millis(1000)
+            std::time::Duration::from_millis(5000)
         );
+        assert_eq!(EAPOL_START_WAIT, std::time::Duration::from_secs(1));
+        assert!(source.contains(
+            "let ready_deadline = Instant::now() + std::time::Duration::from_millis(1000)"
+        ));
+        let wait_tx_consumed = source
+            .split("fn wait_tx_consumed(&mut self, expected_dma_index: u32)")
+            .nth(1)
+            .unwrap()
+            .split("fn wait_response(")
+            .next()
+            .unwrap();
+        assert!(wait_tx_consumed.contains(
+            "let deadline = Instant::now() + std::time::Duration::from_millis(1000)"
+        ));
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v2\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v3\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c\"",
             "\"consuming_mib_reads\":false",
-            "\"snapshot_boundaries\":\"before-post-assoc-tail,first-data-timeout-1000ms\"",
+            "\"snapshot_boundaries\":\"before-post-assoc-tail,first-data-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
-            "\"behavior\":\"best-effort-read-only-telemetry,control-flow-and-timeout-unchanged\"",
+            "\"behavior\":\"best-effort-read-only-telemetry,control-flow-unchanged-except-observation-deadline-5000ms\"",
             "\"attribution_limit\":\"independent-ap-or-over-air-witness-required\"",
         ] {
             assert!(identity.contains(field), "missing identity field {field}");

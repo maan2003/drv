@@ -2830,7 +2830,7 @@ counters. The strict passive diagnostic therefore reads no MIB register.
 
 Production takes two bounded snapshots: immediately before the unchanged
 post-association interface/BCNFT/RXFILTER/RLM tail and when the unchanged
-one-second first-data deadline expires. Each records RX-DMA enable, a stable
+five-second first-data deadline expires. Each records RX-DMA enable, a stable
 DIDX/descriptor-control snapshot, software RX head/tail, and monotonic
 completion/error/client/EAPOL/authenticator-M1 counters incremented before
 rearm. The target M1 counter is scoped to the pinned AP-to-client address tuple and
@@ -2846,15 +2846,15 @@ recorded data-ring CIDX 7/DIDX 0 at associated setup, no later data descriptor,
 and no M1. Earlier native inventories contain only one post-association
 snapshot, and the native association fixture proves a later EAPOL-Key TX but
 contains no timestamp. There is no equivalent native two-point delta or
-Linux/iwd M1 latency measurement. The one-second first-data deadline remains
-unchanged; the manifest's 25 seconds is the enclosing operation budget, not
-evidence supporting a speculative extension.
+Linux/iwd M1 latency measurement. The prior one-second series therefore kept the
+original deadline. This telemetry-only variant tests a five-second observation
+deadline; the manifest's 25 seconds remains a sufficient enclosing budget.
 
-The installed production identity binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v2`. It enumerates the only safe register reads
+The telemetry-only five-second variant binds this observation boundary as
+`linux-6.18.40-passive-m1-rx-v3`. It enumerates the only safe register reads
 (`0xd4208,0xd4528,0xd452c`), both snapshot boundaries, the exact pinned
 AP-to-client M1 scope, positive and ambiguous-negative results, best-effort
-read-only behavior with unchanged control flow and timeout, and the independent
-AP/over-air attribution requirement. Launcher, supervisor, root, and inert
+read-only behavior with unchanged control flow except for the 5000 ms observation
+deadline, and the independent AP/over-air attribution requirement. Launcher, supervisor, root, and inert
 artifacts compare against that installed ELF identity; stale identities are
 rejected before privileged dispatch.
