@@ -2855,9 +2855,12 @@ initial response timer and terminates at its own 5000 ms boundary; normal SME
 timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v5`. It enumerates the only safe register reads
-(`0xd4208,0xd4528,0xd452c`), both snapshot boundaries, the exact pinned
-AP-to-client M1 scope, positive and ambiguous-negative results, best-effort
+`linux-6.18.40-passive-m1-rx-v6`. In addition to the RX-DMA reads, it records
+peer-WTBL DW2 AID and the two static RMAC receive-filter words at both
+boundaries. It enumerates the only safe register reads
+(`0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004`), both snapshot
+boundaries, the exact pinned AP-to-client M1 scope, positive and
+ambiguous-negative results, best-effort
 read-only behavior, the observer-owned 5000 ms deadline, the validation-only
 6000 ms initial RSNA response timer, unchanged normal-mode timers, and the
 independent AP/over-air attribution requirement. Launcher, supervisor, root, and inert

@@ -67,6 +67,33 @@ QoS peer state. Those values match the Linux source write transcript and
 oracle-visible state. Registers not captured on both sides are explicitly not
 claimed equal.
 
+### M1-ingress receive eligibility audit (2026-08-14)
+
+Pinned Linux 6.18.40 and 7.1.5 retain the same receive-filter bit assignments
+and preauthentication station construction. Before the first associated
+STA_REC seen in the native trace, the receive-relevant order is DEV_INFO
+(active local interface/MUAR), initial BSS_INFO (BSSID, connection state,
+BCNFT), channel/rate/power setup, then WCID-1 preauth STA_REC/WTBL. The preauth
+command has AID 0, peer address equal to the BSSID, BW 20, QoS/HT/VHT disabled,
+receive-valid/RCA1/RCA2 enabled, no cipher, no key, and a closed controlled
+port. Userspace emits those commands in the same relative order and the
+selected command bytes match after only the documented dynamic masks. Its
+association-response path snapshots this state before emitting the associated
+BSS/STA/EDCA/interface-WCID tail. Linux can receive unprotected M1 in that
+preauth state; pairwise key installation is not an M1 prerequisite.
+
+`RMAC_CTRL=0x000cef1a` has `DROP_OTHER_UC` set, as Linux does. That bit drops
+unicast not addressed to the programmed local interface; it is not a
+drop-all-unicast bit. BMC traffic uses a different receive/WTBL path and does
+not prove local-unicast matching succeeded. No Linux-named MT792x counter can
+distinguish an AP that did not send M1 from a frame rejected before RX DMA:
+MIB reads are consuming, and neither source version names an RMAC per-reason
+filter-drop, WTBL lookup hit/miss, or PLE/PSE RX-drop counter. Contract v6 adds
+only ordinary reads of peer-WTBL DW2 (`0x820d8108`) and RMAC RFCR/RFCR1
+(`0x820e5000`/`0x820e5004`) to both bounded snapshots. It logs the AID and
+named address/BSSID/other-unicast filter bits but retains the ambiguous-negative
+classification and the independent AP/over-air witness boundary.
+
 ## First EAPOL-Key TX
 
 After masking only frame length/body, WCID (both are now 1), PID/token,

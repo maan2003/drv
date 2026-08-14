@@ -3719,10 +3719,13 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v5";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v6";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
+const PASSIVE_M1_PEER_WTBL_DW2: u32 = 0x820d_8108;
+const PASSIVE_M1_RMAC_RFCR: u32 = 0x820e_5000;
+const PASSIVE_M1_RMAC_RFCR1: u32 = 0x820e_5004;
 const PASSIVE_M1_BEFORE_TAIL_BOUNDARY: &str = "before-post-assoc-tail";
 const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
 const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
@@ -3740,7 +3743,7 @@ const PASSIVE_M1_SME_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
     format!(
-        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
     )
 }
 
@@ -15529,6 +15532,9 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
 #[cfg(feature = "fuchsia-passive")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PassiveM1DiagnosticSnapshot {
+    peer_wtbl_aid: u16,
+    rmac_rfcr: u32,
+    rmac_rfcr1: u32,
     rx_dma_enabled: bool,
     data_ring_cidx: u32,
     data_ring_didx_before: u32,
@@ -15778,6 +15784,19 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         // ring layout. DMA_IDX, GLO_CFG, and descriptor memory are ordinary
         // reads. MIB counters are deliberately excluded: mt792x consumes even
         // RX-time counters when resetting survey state.
+        let mac = PassiveMacExecutor {
+            pages: self.mac_pages,
+        };
+        let peer_wtbl_aid = (mac
+            .read_firmware_snapshot_raw(PASSIVE_M1_PEER_WTBL_DW2)
+            .map_err(|_| zx::Status::IO)?
+            & 0x0fff) as u16;
+        let rmac_rfcr = mac
+            .read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR)
+            .map_err(|_| zx::Status::IO)?;
+        let rmac_rfcr1 = mac
+            .read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR1)
+            .map_err(|_| zx::Status::IO)?;
         let data_ring_didx_before = self
             .loader
             .mcu
@@ -15794,6 +15813,9 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .read(PASSIVE_M1_DATA_RING_DIDX)
             .map_err(|_| zx::Status::IO)?;
         let snapshot = PassiveM1DiagnosticSnapshot {
+            peer_wtbl_aid,
+            rmac_rfcr,
+            rmac_rfcr1,
             rx_dma_enabled: self
                 .loader
                 .mcu
@@ -15830,7 +15852,15 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             PassiveM1SnapshotPoint::BeforePostAssociationTail => {
                 self.passive_m1_baseline = Some(snapshot);
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=before_post_assoc_tail source=linux-6.18.40 contract=safe-read-rx-dma-v1 rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=RMAC_unicast_to_me,filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    "passive_m1_rx_snapshot phase=before_post_assoc_tail source=linux-6.18.40 contract=safe-read-rx-eligibility-v1 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    snapshot.peer_wtbl_aid,
+                    snapshot.rmac_rfcr,
+                    snapshot.rmac_rfcr1,
+                    snapshot.rmac_rfcr & (1 << 8) != 0,
+                    snapshot.rmac_rfcr & (1 << 9) != 0,
+                    snapshot.rmac_rfcr & (1 << 10) != 0,
+                    snapshot.rmac_rfcr & (1 << 17) != 0,
+                    snapshot.rmac_rfcr & (1 << 18) != 0,
                     snapshot.rx_dma_enabled,
                     snapshot.data_ring_cidx,
                     snapshot.data_ring_didx_before,
@@ -15875,7 +15905,15 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     "absent"
                 };
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=m1_timeout source=linux-6.18.40 contract=safe-read-rx-dma-v1 rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} rx_dma_activity={} classification={} omitted_consuming_mib=all omitted_unnamed=RMAC_unicast_to_me,filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    "passive_m1_rx_snapshot phase=m1_timeout source=linux-6.18.40 contract=safe-read-rx-eligibility-v1 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} rx_dma_activity={} classification={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    snapshot.peer_wtbl_aid,
+                    snapshot.rmac_rfcr,
+                    snapshot.rmac_rfcr1,
+                    snapshot.rmac_rfcr & (1 << 8) != 0,
+                    snapshot.rmac_rfcr & (1 << 9) != 0,
+                    snapshot.rmac_rfcr & (1 << 10) != 0,
+                    snapshot.rmac_rfcr & (1 << 17) != 0,
+                    snapshot.rmac_rfcr & (1 << 18) != 0,
                     snapshot.rx_dma_enabled,
                     snapshot.data_ring_cidx,
                     snapshot.data_ring_didx_before,
@@ -27924,6 +27962,9 @@ mod tests {
             .next()
             .unwrap();
         for read in [
+            "read_firmware_snapshot_raw(PASSIVE_M1_PEER_WTBL_DW2)",
+            "read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR)",
+            "read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR1)",
             "read(PASSIVE_M1_RX_DMA_GLO_CFG)",
             "read(PASSIVE_M1_DATA_RING_CIDX)",
             "read(PASSIVE_M1_DATA_RING_DIDX)",
@@ -27934,7 +27975,7 @@ mod tests {
             !snapshot.contains("0x820e_d"),
             "all MIB reads are consuming"
         );
-        assert!(!snapshot.contains("mac.read"));
+        assert!(!snapshot.contains("mac.read("));
         assert!(!snapshot.contains(".write("));
         assert!(!snapshot.contains("write_descriptor_at"));
         assert!(snapshot.contains("PASSIVE_M1_NEGATIVE_RESULT"));
@@ -27968,8 +28009,8 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v5\"",
-            "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v6\"",
+            "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
             "\"snapshot_boundaries\":\"before-post-assoc-tail,m1-observation-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
