@@ -313,7 +313,7 @@ fn connect_request(h2e: bool) -> fidl_mlme::ConnectRequest {
     }
 }
 
-async fn association_request(h2e: bool) -> Result<Vec<u8>, &'static str> {
+async fn raw_association_request(h2e: bool) -> Result<Vec<u8>, &'static str> {
     let (device, effects) = FakeDeviceOps::new();
     let (timer, _) = crate::common::timer::create_timer();
     let mut mlme = ClientMlme::new(Default::default(), device, timer)
@@ -330,19 +330,22 @@ async fn association_request(h2e: bool) -> Result<Vec<u8>, &'static str> {
     ))
     .await
     .map_err(|_| "ClientMlme fixture SAE completion failed")?;
-    let frame = effects
+    effects
         .lock()
         .unwrap()
         .frames
         .iter()
         .find(|(frame, _)| frame.first() == Some(&0))
         .map(|(frame, _)| frame.clone())
-        .ok_or("ClientMlme did not serialize an association request")?;
+        .ok_or("ClientMlme did not serialize an association request")
+}
+
+async fn association_request(h2e: bool) -> Result<Vec<u8>, &'static str> {
     fuchsia_softmac_port::finalize_association_request(
-        &frame,
+        &raw_association_request(h2e).await?,
         &fuchsia_softmac_port::linux_61840_oracle_profile(),
     )
-    .map_err(|_| "ClientMlme association profile rejected")
+    .map_err(|_| "ClientMlme oracle comparison profile rejected")
 }
 
 /// Association requests produced by the production pinned `ClientMlme` from
@@ -354,4 +357,10 @@ pub fn sae_h2e_association_request_fixture() -> Result<(Vec<u8>, Vec<u8>), &'sta
             association_request(false).await?,
         ))
     })
+}
+
+/// Unmodified bytes serialized by the pinned ClientMlme. Production applies
+/// its station-owned semantic profile later at the MT7921 DeviceOps boundary.
+pub fn raw_sae_h2e_association_request_fixture() -> Result<Vec<u8>, &'static str> {
+    futures::executor::block_on(raw_association_request(true))
 }

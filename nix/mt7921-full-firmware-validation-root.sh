@@ -33,8 +33,10 @@ esac
 @grep@ -Fx 'INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5' @manifest@ >/dev/null
 @grep@ -Fx 'ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c' @manifest@ >/dev/null
-@grep@ -Fx 'ASSOCIATION_REQUEST_CONTRACT=linux-6.18.40-semantic-v1' @manifest@ >/dev/null
-@grep@ -Fx 'NORMALIZED_NATIVE_ASSOCIATION_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' @manifest@ >/dev/null
+@grep@ -Fx 'ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1' @manifest@ >/dev/null
+@grep@ -Fx 'RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55' @manifest@ >/dev/null
+@grep@ -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' @manifest@ >/dev/null
+@grep@ -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' @manifest@ >/dev/null
 @grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5' @manifest@ >/dev/null
 @grep@ -Fx 'EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1' @manifest@ >/dev/null
 @grep@ -Fx 'EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment' @manifest@ >/dev/null
@@ -84,8 +86,10 @@ assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha25
 @grep@ -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' @artifact_identity@ >/dev/null
 @grep@ -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' @artifact_identity@ >/dev/null
-@grep@ -F '"association_request_contract":"linux-6.18.40-semantic-v1"' @artifact_identity@ >/dev/null
-@grep@ -F '"normalized_native_association_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' @artifact_identity@ >/dev/null
+@grep@ -F '"association_request_contract":"mt7921-supported-subset-v1"' @artifact_identity@ >/dev/null
+@grep@ -F '"runtime_default_association_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55"' @artifact_identity@ >/dev/null
+@grep@ -F '"oracle_comparison_contract":"linux-6.18.40-semantic-v1"' @artifact_identity@ >/dev/null
+@grep@ -F '"oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' @artifact_identity@ >/dev/null
 @grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' @artifact_identity@ >/dev/null
 @grep@ -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' @artifact_identity@ >/dev/null
 @grep@ -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' @artifact_identity@ >/dev/null
@@ -97,8 +101,8 @@ assert_identity_field GENERATED_CRATE_SOURCE_SHA256 generated_crate_source_sha25
 @grep@ -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' @artifact_identity@ >/dev/null
 @grep@ -F '"behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged"' @artifact_identity@ >/dev/null
 @grep@ -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"' @artifact_identity@ >/dev/null
-fixture=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
-fixture_sha=$(@sed@ -n 's/^SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)
+fixture=$(@sed@ -n 's/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
+fixture_sha=$(@sed@ -n 's/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)
 test -s "$fixture"
 test "$(@sha256sum@ "$fixture" | @cut@ -d ' ' -f1)" = "$fixture_sha"
 printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=%s supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=%s\n' \

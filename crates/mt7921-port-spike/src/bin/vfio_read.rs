@@ -1826,6 +1826,7 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
             ..Default::default()
         },
         spectrum_management: Default::default(),
+        association: Some(Default::default()),
     }
 }
 
@@ -3851,7 +3852,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"linux-6.18.40-semantic-v1","normalized_native_association_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v1","runtime_default_association_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3872,12 +3873,16 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     #[cfg(feature = "fuchsia-passive")]
-    if operation_argument.as_deref() == Some("--self-test-sae-h2e-association-request") {
+    if operation_argument.as_deref() == Some("--self-test-production-association-request") {
         if env::args().len() != 2 {
             return Err(
-                "SAE-H2E association-request self-test accepts no additional arguments".into(),
+                "production association-request self-test accepts no additional arguments".into(),
             );
         }
+        let frozen = read_rate_power_snapshot()?;
+        validate_native_rate_power_snapshot(&frozen)?;
+        let credential = read_sae_credential()?;
+        drop(credential);
         let base = option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified");
         let patch_set =
             option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified");
@@ -3989,12 +3994,61 @@ fn run() -> Result<(), String> {
         if sha256 != "6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755" {
             return Err("normalized native association fixture hash drifted".into());
         }
+        let raw_runtime = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
+            .map_err(|error| format!("production ClientMlme raw association fixture: {error}"))?;
+        let runtime = mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+            &raw_runtime,
+            Some(&Default::default()),
+        )
+        .map_err(|status| format!("production association profile failed: {status}"))?
+        .ok_or("production DeviceOps boundary did not classify association request")?;
+        let runtime_ies = parse_ies(&runtime)?;
+        let runtime_id_lengths = runtime_ies
+            .iter()
+            .map(|(id, body)| (*id, body.len()))
+            .collect::<Vec<_>>();
+        let runtime_rsn = runtime_ies
+            .iter()
+            .find(|(id, _)| *id == 48)
+            .ok_or("runtime RSN missing")?;
+        if runtime[..24] != raw_runtime[..24]
+            || runtime[26..28] != raw_runtime[26..28]
+            || runtime[4..10] != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
+            || runtime[10..16] != [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]
+            || runtime[16..22] != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
+        {
+            return Err("production DeviceOps preparation changed target, client, frame-control, sequence, or retry policy".into());
+        }
+        if runtime.len() != 119
+            || u16::from_le_bytes(runtime[24..26].try_into().unwrap()) != 0x0011
+            || runtime_id_lengths
+                != [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)]
+            || runtime_rsn.1[18..20] != [0x80, 0]
+        {
+            return Err(format!(
+                "production runtime association contract drifted: len={} cap=0x{:04x} ies={runtime_id_lengths:?} rsn={:02x?}",
+                runtime.len(),
+                u16::from_le_bytes(runtime[24..26].try_into().unwrap()),
+                &runtime_rsn.1[18..20]
+            ));
+        }
+        let mut normalized_runtime = runtime.clone();
+        normalized_runtime[22..24].fill(0);
+        let runtime_sha256 = Sha256::digest(&normalized_runtime)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if runtime_sha256 != "a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55"
+            || runtime_sha256 == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
+        {
+            return Err(format!("production runtime association hash drifted: {runtime_sha256}"));
+        }
         let without_h2e_sha256 = Sha256::digest(&without_h2e)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         println!(
-            r#"{{"sae_h2e_association_request_self_test":"passed","constructor":"wlan_mlme::client::ClientMlme+semantic-association-profile","association_request_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","normalized_native_fixture_sha256":"{sha256}","rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","stale_119_byte_request":false,"frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
+            r#"{{"production_association_request_self_test":"passed","oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation","association_request_contract":"mt7921-supported-subset-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","oracle_normalized_sha256":"{sha256}","runtime_default_normalized_sha256":"{runtime_sha256}","runtime_default_capability":"0x0011","runtime_default_rsn_capabilities":"0x0080","runtime_default_ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","runtime_default_frame_len":119,"rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","observed_stale_hash_8646ba36_rejected":true,"oracle_frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
             frame.len(),
         );
         return Ok(());

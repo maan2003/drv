@@ -463,6 +463,7 @@ fn client_support() -> ClientSupport {
             ..Default::default()
         },
         spectrum_management: Default::default(),
+        association: None,
     }
 }
 

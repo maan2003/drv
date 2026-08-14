@@ -103,6 +103,17 @@ case "$#:${1-}" in
       DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
       "$driver" --run-one-shot-sae-auth
     ;;
+  1:--self-test-production-association-request)
+    prepare_snapshot
+    prepare_credential
+    exec @env@ -i \
+      DRV_SAE_CREDENTIAL_FD=3 \
+      DRV_SAE_CREDENTIAL_LEN="$credential_len" \
+      DRV_REGULATORY_SNAPSHOT_FD=4 \
+      DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
+      DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
+      "$driver" --self-test-production-association-request
+    ;;
   1:--full-firmware-preflight)
     prepare_snapshot
     prepare_credential

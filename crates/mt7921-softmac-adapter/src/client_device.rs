@@ -31,6 +31,34 @@ use crate::ethernet::{
 };
 use fuchsia_softmac_port::{HardwareScanEvent, SoftmacHardware};
 
+/// Apply the station-owned association contract used by the physical
+/// production effect boundary. Exposed so the installed ELF can run the same
+/// transformation against a real ClientMlme serialization without hardware.
+pub fn apply_production_association_profile(
+    frame: &[u8],
+    profile: &fuchsia_softmac_port::AssociationRequestProfile,
+) -> Result<Vec<u8>, zx::Status> {
+    fuchsia_softmac_port::finalize_association_request(frame, profile)
+        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)
+}
+
+/// Prepare a frame at the production `DeviceOps` effect boundary. Only an
+/// association request is semantically rebuilt; every other frame remains
+/// byte-for-byte owned by ClientMlme.
+pub fn prepare_production_wlan_frame(
+    frame: &[u8],
+    profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
+) -> Result<Option<Vec<u8>>, zx::Status> {
+    if profile.is_some()
+        && frame.len() >= 28
+        && u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc == 0
+    {
+        apply_production_association_profile(frame, profile.unwrap()).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SafeAuthStage {
     algorithm: u16,
@@ -73,6 +101,10 @@ pub struct ClientSupport {
     pub mac_sublayer: fidl_common::MacSublayerSupport,
     pub security: fidl_common::SecuritySupport,
     pub spectrum_management: fidl_common::SpectrumManagementSupport,
+    /// Station-owned association semantics applied to the frame serialized by
+    /// this exact production ClientMlme before it crosses the physical effect
+    /// boundary.
+    pub association: Option<fuchsia_softmac_port::AssociationRequestProfile>,
 }
 
 /// One received frame and the source-exact receive status delivered with it.
@@ -1151,7 +1183,13 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         let ComposedBackend { effects, scan, .. } = &mut *backend;
         let tx_flags = wlan_softmac_class_support::tx_carrier(&buffer, tx_flags, associated)
             .map_or(tx_flags, |carrier| carrier.flags);
-        effects.send_wlan_frame(&buffer, tx_flags, scan)
+        let association =
+            prepare_production_wlan_frame(&buffer, self.support.association.as_ref())?;
+        effects.send_wlan_frame(
+            association.as_deref().unwrap_or(&buffer),
+            tx_flags,
+            scan,
+        )
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
@@ -1858,6 +1896,7 @@ mod tests {
                 ..Default::default()
             },
             spectrum_management: Default::default(),
+            association: None,
         }
     }
 
@@ -2040,6 +2079,116 @@ mod tests {
             assert_eq!(rx.bytes, [8, 1, 2, 3]);
             assert_eq!(rx.status, status);
             assert!(device.next_rx().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn production_frame_preparation_leaves_non_association_frames_owned_by_client_mlme() {
+        let mut authentication = vec![0u8; 30];
+        authentication[..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        authentication[1] |= 0x08; // Retry flag must not affect classification.
+        assert_eq!(
+            prepare_production_wlan_frame(&authentication, Some(&Default::default())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn production_device_rewrites_real_client_mlme_association_at_effect_boundary() {
+        futures::executor::block_on(async {
+            let mut device_support = support();
+            device_support.query.sta_addr = Some([0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]);
+            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+            device_support.query.hardware_capability = Some(0);
+            device_support.query.band_caps = Some(vec![
+                fidl_softmac::WlanSoftmacBandCapability {
+                    band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                    ht_caps: Some(fidl_ieee80211::HtCapabilities {
+                        bytes: [
+                            0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ],
+                    }),
+                    vht_caps: Some(fidl_ieee80211::VhtCapabilities {
+                        bytes: [
+                            0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+                        ],
+                    }),
+                    basic_rates: Some(vec![0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]),
+                    primary_channels: Some(vec![channel(36)]),
+                    ..Default::default()
+                },
+            ]);
+            device_support.association = Some(Default::default());
+            let effects = FakeEffects::default();
+            let device = Mt7921ClientDevice::new_offline_fake(effects, device_support);
+            let backend = Arc::clone(&device.backend);
+            let (timer, _) = wlan_mlme::common::timer::create_timer();
+            let mut mlme =
+                wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
+                    .await
+                    .unwrap();
+            let selected_bss = fidl_ieee80211::BssDescription {
+                bssid: [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                bss_type: fidl_ieee80211::BssType::Infrastructure,
+                beacon_period: 100,
+                capability_info: 0x1531,
+                ies: vec![
+                    0, 3, b'p', b'h', b'1', 1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48,
+                    0x60, 0x6c, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac,
+                    4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0, 244, 1, 0x20,
+                ],
+                primary: channel(36),
+                bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw80,
+                vht_secondary_80_channel: channel(0),
+                rssi_dbm: -40,
+                snr_db: 30,
+            };
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Connect(
+                fidl_mlme::ConnectRequest {
+                    selected_bss,
+                    connect_failure_timeout: 20,
+                    auth_type: fidl_mlme::AuthenticationTypes::Sae,
+                    sae_password: vec![],
+                    wep_key: None,
+                    security_ie: vec![
+                        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+                        0, 0x0f, 0xac, 8, 0xcc, 0,
+                    ],
+                    owe_public_key: None,
+                },
+            ))
+            .await
+            .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::SaeHandshakeResp(
+                fidl_mlme::SaeHandshakeResponse {
+                    peer_sta_address: [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+                    status_code: fidl_ieee80211::StatusCode::Success,
+                },
+            ))
+            .await
+            .unwrap();
+            let locked = backend.lock().unwrap();
+            let frame = locked.effects.frames.last().unwrap();
+            assert_eq!(frame.len(), 119);
+            assert_eq!(u16::from_le_bytes(frame[24..26].try_into().unwrap()), 0x0011);
+            assert_eq!(u16::from_le_bytes(frame[26..28].try_into().unwrap()), 5);
+            let rsn = frame.windows(2).position(|bytes| bytes == [48, 20]).unwrap();
+            assert_eq!(&frame[rsn + 20..rsn + 22], &[0x80, 0]);
+            let ids = {
+                let mut ids = Vec::new();
+                let mut offset = 28;
+                while offset < frame.len() {
+                    ids.push((frame[offset], usize::from(frame[offset + 1])));
+                    offset += 2 + usize::from(frame[offset + 1]);
+                }
+                ids
+            };
+            assert_eq!(
+                ids,
+                [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)]
+            );
+            assert_ne!(&frame[24..26], &[0x11, 0x02]);
         });
     }
 

@@ -198,8 +198,11 @@ pub fn finalize_association_request(
     rewrite_rsn_capabilities(&mut rsn, profile.rsn)?;
 
     let mut out = frame[..28].to_vec();
-    let mut capability = u16::from_le_bytes(out[24..26].try_into().unwrap());
-    capability &= !(0x0100 | 0x1000);
+    // Association capabilities describe station behavior, not the selected
+    // AP.  ClientMlme's intersection still retains AP-only short-slot and
+    // spectrum/RRM bits, so start from the only baseline bits implemented by
+    // this client and add semantic station features below.
+    let mut capability = u16::from_le_bytes(out[24..26].try_into().unwrap()) & 0x0011;
     if profile.regulatory.is_some() {
         capability |= 0x0100;
     }
