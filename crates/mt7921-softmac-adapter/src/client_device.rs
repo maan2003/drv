@@ -99,6 +99,13 @@ pub struct ClientRxSecurity {
     pub pn: Option<[u8; 6]>,
 }
 
+/// Read-only production diagnostic boundary around the passive M1 wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassiveM1SnapshotPoint {
+    BeforePostAssociationTail,
+    M1Timeout,
+}
+
 /// Synchronous, transport-owned client I/O boundary.  DeviceOps holds the
 /// composed backend lock while calling this interface, so an implementation
 /// owns the real mechanics directly and must not defer work or retain loader
@@ -109,6 +116,9 @@ pub trait Mt7921ClientIo {
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn passive_m1_snapshot(&mut self, _: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
         Ok(())
     }
     fn transmit_client(
@@ -440,6 +450,9 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.diagnostic_association_snapshot(generation))
+    }
+    fn passive_m1_snapshot(&mut self, point: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.passive_m1_snapshot(point))
     }
     fn transmit_client(
         &mut self,

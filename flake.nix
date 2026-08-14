@@ -377,6 +377,10 @@
               PROJECT_CORE_SOURCE_SHA256=$MT7921_PROJECT_CORE_SOURCE_SHA256
               COMPOSITE_ARTIFACT_SOURCE_SHA256=$MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256
               BSS_WIRE_CONTRACT=connac2-bss-wire-v1
+              PASSIVE_M1_DIAGNOSTIC_CONTRACT=linux-6.18.40-safe-read-rx-dma-v1
+              NO_M1_RESULT=no_m1_at_rx_dma_ambiguous
+              CONSUMING_MIB_READS=false
+              DEFINITIVE_ATTRIBUTION_REQUIRES=independent-ap-or-over-air-witness
               REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               REGULATORY_GENERATION=0
               EOF
@@ -412,6 +416,10 @@
               grep -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"passive_m1_diagnostic_contract":"linux-6.18.40-safe-read-rx-dma-v1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"no_m1_result":"no_m1_at_rx_dma_ambiguous"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"consuming_mib_reads":false' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"definitive_attribution_requires":"independent-ap-or-over-air-witness"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"fuchsia_ordered_patch_list":"${mt7921FuchsiaSource.fuchsiaOrderedPatchList}"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -443,6 +451,10 @@
                 | grep -F '"success":"authenticator_m1_delivered_to_pinned_sme"' \
                 | grep -F '"second_frame":false' \
                 | grep -F '"tmac_population_invariant":false'
+              printf '%s\n' "$production_output" \
+                | grep -F '"no_m1_result":"no_m1_at_rx_dma_ambiguous"' \
+                | grep -F '"consuming_mib_reads":false' \
+                | grep -F '"definitive_attribution_requires":"independent-ap-or-over-air-witness"'
               printf '%s\n' "$production_output" \
                 | grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' \
                 | grep -F '"associated_bss_command_len":92' \
@@ -935,6 +947,10 @@
                 INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
                 ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
                 ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
+                PASSIVE_M1_DIAGNOSTIC_CONTRACT=linux-6.18.40-safe-read-rx-dma-v1
+                NO_M1_RESULT=no_m1_at_rx_dma_ambiguous
+                CONSUMING_MIB_READS=false
+                DEFINITIVE_ATTRIBUTION_REQUIRES=independent-ap-or-over-air-witness
                 SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST=$fixture
                 SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)
                 FLAVOR=full-firmware-production
@@ -1365,6 +1381,10 @@
                 INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
                 ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
                 ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
+                PASSIVE_M1_DIAGNOSTIC_CONTRACT=linux-6.18.40-safe-read-rx-dma-v1
+                NO_M1_RESULT=no_m1_at_rx_dma_ambiguous
+                CONSUMING_MIB_READS=false
+                DEFINITIVE_ATTRIBUTION_REQUIRES=independent-ap-or-over-air-witness
                 ACTIVE_CAPABLE=true
                 OBSERVATION_MODE=passive-m1-observation
                 FRAME_TX_DISABLED_BEFORE_M1=true
@@ -1453,7 +1473,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v4","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
+              {"artifact_identity":"mt7921-validation-v4","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","passive_m1_diagnostic_contract":"linux-6.18.40-safe-read-rx-dma-v1","no_m1_result":"no_m1_at_rx_dma_ambiguous","consuming_mib_reads":false,"definitive_attribution_requires":"independent-ap-or-over-air-witness","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1519,6 +1539,10 @@
               INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
               ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
               ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
+              PASSIVE_M1_DIAGNOSTIC_CONTRACT=linux-6.18.40-safe-read-rx-dma-v1
+              NO_M1_RESULT=no_m1_at_rx_dma_ambiguous
+              CONSUMING_MIB_READS=false
+              DEFINITIVE_ATTRIBUTION_REQUIRES=independent-ap-or-over-air-witness
               ACTIVE_CAPABLE=true
               OBSERVATION_MODE=passive-m1-observation
               FRAME_TX_DISABLED_BEFORE_M1=true

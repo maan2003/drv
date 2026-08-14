@@ -195,6 +195,12 @@ pub trait Mt7921PassiveTransport {
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
         Ok(())
     }
+    fn passive_m1_snapshot(
+        &mut self,
+        _: client_device::PassiveM1SnapshotPoint,
+    ) -> Result<(), zx::Status> {
+        Ok(())
+    }
     fn transmit_client(
         &mut self,
         _: &[u8],
@@ -268,6 +274,12 @@ pub trait SourceExactPassiveMechanics {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
+    }
+    fn passive_m1_snapshot(
+        &mut self,
+        _: client_device::PassiveM1SnapshotPoint,
+    ) -> Result<(), zx::Status> {
         Ok(())
     }
     fn transmit_client(
@@ -426,6 +438,12 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.mechanics.diagnostic_association_snapshot(generation)
+    }
+    fn passive_m1_snapshot(
+        &mut self,
+        point: client_device::PassiveM1SnapshotPoint,
+    ) -> Result<(), zx::Status> {
+        self.mechanics.passive_m1_snapshot(point)
     }
 
     fn transmit_client(

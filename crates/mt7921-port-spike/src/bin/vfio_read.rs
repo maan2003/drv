@@ -78,7 +78,7 @@ use mt7921_port_spike::{
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
     ClientChannelEnsure, ClientRxFrame, ClientRxSecurity, ClientSupport, Mt7921ClientDevice,
-    Mt7921ClientEffects, PinnedClientRuntime,
+    Mt7921ClientEffects, PassiveM1SnapshotPoint, PinnedClientRuntime,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig};
@@ -1036,6 +1036,11 @@ fn run_contained_dma_resource_round_trip(
                     rx_head: 7,
                     rx_ring_index: 0,
                     rx_count: 8,
+                    completed_total: 0,
+                    rx_error_total: 0,
+                    client_frame_total: 0,
+                    eapol_total: 0,
+                    authenticator_m1_total: 0,
                     irq_bit: WM_RX_IRQ_BIT,
                 },
                 wm2: Some(ActiveMcuRx {
@@ -1045,6 +1050,11 @@ fn run_contained_dma_resource_round_trip(
                     rx_head: 7,
                     rx_ring_index: 4,
                     rx_count: 8,
+                    completed_total: 0,
+                    rx_error_total: 0,
+                    client_frame_total: 0,
+                    eapol_total: 0,
+                    authenticator_m1_total: 0,
                     irq_bit: WM2_RX_IRQ_BIT,
                 }),
                 extra_irq_mask: 0,
@@ -1110,6 +1120,11 @@ fn run_contained_dma_resource_round_trip(
                                 rx_head: 7,
                                 rx_ring_index: 2,
                                 rx_count: 8,
+                                completed_total: 0,
+                                rx_error_total: 0,
+                                client_frame_total: 0,
+                                eapol_total: 0,
+                                authenticator_m1_total: 0,
                                 irq_bit: DATA_RX_IRQ_BIT,
                             },
                             mac_pages: &active.passive_window_pages,
@@ -1122,6 +1137,7 @@ fn run_contained_dma_resource_round_trip(
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                             e2e81_probe_done: false,
                             fw_snapshot_generation: None,
+                            passive_m1_baseline: None,
                             stable_mac_watcher: None,
                             associated_edca_programmed: false,
                             e2e93_probe: false,
@@ -3593,12 +3609,14 @@ fn run_production_validation_self_test() -> Result<(), String> {
         return Err("completed validation TX guard admitted late SAE".into());
     }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON}}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON},{PASSIVE_M1_DIAGNOSTIC_JSON}}}"#
     );
     Ok(())
 }
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
+
+const PASSIVE_M1_DIAGNOSTIC_JSON: &str = r#""passive_m1_diagnostic_contract":"linux-6.18.40-safe-read-rx-dma-v1","no_m1_result":"no_m1_at_rx_dma_ambiguous","consuming_mib_reads":false,"definitive_attribution_requires":"independent-ap-or-over-air-witness""#;
 
 #[cfg(feature = "fuchsia-passive")]
 fn validate_bss_wire_contract() -> Result<(), String> {
@@ -3732,7 +3750,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v4","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v4","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3742,6 +3760,7 @@ fn run() -> Result<(), String> {
                 option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified"),
                 BSS_WIRE_CONTRACT_JSON,
+                PASSIVE_M1_DIAGNOSTIC_JSON,
             );
         } else {
             println!(
@@ -5945,6 +5964,11 @@ fn run() -> Result<(), String> {
                         rx_head: 7,
                         rx_ring_index: 0,
                         rx_count: 8,
+                        completed_total: 0,
+                        rx_error_total: 0,
+                        client_frame_total: 0,
+                        eapol_total: 0,
+                        authenticator_m1_total: 0,
                         irq_bit: WM_RX_IRQ_BIT,
                     },
                     wm2: Some(ActiveMcuRx {
@@ -5954,6 +5978,11 @@ fn run() -> Result<(), String> {
                         rx_head: 7,
                         rx_ring_index: 4,
                         rx_count: 8,
+                        completed_total: 0,
+                        rx_error_total: 0,
+                        client_frame_total: 0,
+                        eapol_total: 0,
+                        authenticator_m1_total: 0,
                         irq_bit: WM2_RX_IRQ_BIT,
                     }),
                     extra_irq_mask: 0,
@@ -6052,6 +6081,11 @@ fn run() -> Result<(), String> {
                                     rx_head: 7,
                                     rx_ring_index: 2,
                                     rx_count: 8,
+                                    completed_total: 0,
+                                    rx_error_total: 0,
+                                    client_frame_total: 0,
+                                    eapol_total: 0,
+                                    authenticator_m1_total: 0,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
                                 mac_pages: &*passive_window_pages,
@@ -6064,6 +6098,7 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
+                                passive_m1_baseline: None,
                                 stable_mac_watcher: (stable_mac_transition_diagnostic
                                     || e2e93_probe)
                                     .then(|| StableMacWatcher {
@@ -6155,6 +6190,11 @@ fn run() -> Result<(), String> {
                                     rx_head: 7,
                                     rx_ring_index: 2,
                                     rx_count: 8,
+                                    completed_total: 0,
+                                    rx_error_total: 0,
+                                    client_frame_total: 0,
+                                    eapol_total: 0,
+                                    authenticator_m1_total: 0,
                                     irq_bit: DATA_RX_IRQ_BIT,
                                 },
                                 mac_pages: &*passive_window_pages,
@@ -6167,6 +6207,7 @@ fn run() -> Result<(), String> {
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
                                 e2e81_probe_done: false,
                                 fw_snapshot_generation: None,
+                                passive_m1_baseline: None,
                                 stable_mac_watcher: (stable_mac_transition_diagnostic
                                     || e2e93_probe)
                                     .then(|| StableMacWatcher {
@@ -6823,6 +6864,11 @@ fn run() -> Result<(), String> {
                     rx_head: 7,
                     rx_ring_index: 0,
                     rx_count: 8,
+                    completed_total: 0,
+                    rx_error_total: 0,
+                    client_frame_total: 0,
+                    eapol_total: 0,
+                    authenticator_m1_total: 0,
                     irq_bit: WM_RX_IRQ_BIT,
                 },
                 wm2: None,
@@ -7566,6 +7612,11 @@ struct ActiveMcuRx<'a> {
     rx_head: usize,
     rx_ring_index: usize,
     rx_count: usize,
+    completed_total: u64,
+    rx_error_total: u64,
+    client_frame_total: u64,
+    eapol_total: u64,
+    authenticator_m1_total: u64,
     irq_bit: u32,
 }
 
@@ -11607,6 +11658,7 @@ fn drain_data_rx_queue(
             if !descriptor.is_dma_done() {
                 break;
             }
+            queue.completed_total = queue.completed_total.wrapping_add(1);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             let completed_index = queue.rx_tail;
             let length = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
@@ -11738,6 +11790,14 @@ fn drain_data_rx_queue(
                                     occurrence: None,
                                 },
                             };
+                            queue.client_frame_total = queue.client_frame_total.wrapping_add(1);
+                            if is_anchored_eapol_data(&frame.bytes) {
+                                queue.eapol_total = queue.eapol_total.wrapping_add(1);
+                                if is_pinned_target_authenticator_m1(&frame.bytes) {
+                                    queue.authenticator_m1_total =
+                                        queue.authenticator_m1_total.wrapping_add(1);
+                                }
+                            }
                             enqueue_client_rx_backlog(
                                 provenance,
                                 normal_rx_frames.as_deref_mut().unwrap(),
@@ -11746,6 +11806,7 @@ fn drain_data_rx_queue(
                             Ok(None)
                         }
                         Err(PassiveRxError::RxError) => {
+                            queue.rx_error_total = queue.rx_error_total.wrapping_add(1);
                             let class = bytes.get(..12).map_or("unknown", |header| {
                                 let rxd1 = u32::from_le_bytes(header[4..8].try_into().unwrap());
                                 let rxd2 = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -12765,6 +12826,24 @@ fn is_anchored_eapol_data(bytes: &[u8]) -> bool {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn is_pinned_target_authenticator_m1(bytes: &[u8]) -> bool {
+    let classification = classify_client_data_frame(
+        bytes,
+        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
+    );
+    classification.frame_type == 2
+        && !classification.to_ds
+        && classification.from_ds
+        && classification.addr1_is_client
+        && classification.addr2_is_peer
+        && classification.addr3_is_bssid
+        && classification.snap_present
+        && classification.ether_type == Some(0x888e)
+        && is_authenticator_m1(bytes)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
@@ -13483,6 +13562,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
             ));
         }
         let io = std::cell::RefCell::new(io);
+        if self.suppress_eapol_liveness
+            && let Err(status) = io
+                .borrow_mut()
+                .passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
+        {
+            record_sae_stage(&format!(
+                "passive_m1_rx_snapshot phase=before_post_assoc_tail result=unavailable status={status}"
+            ));
+        }
         self.firmware
             .complete_post_assoc_interface(
                 channel.channel,
@@ -13641,6 +13729,11 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 .post_association_data_wait
                 .filter(|started| started.elapsed() >= std::time::Duration::from_secs(1))
             {
+                if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
+                    record_sae_stage(&format!(
+                        "passive_m1_rx_snapshot phase=m1_timeout result=unavailable status={status}"
+                    ));
+                }
                 record_sae_stage(&format!(
                     "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
                     started.elapsed().as_millis()
@@ -14125,6 +14218,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mgmt_tx_outstanding: MgmtTxOutstanding,
     e2e81_probe_done: bool,
     fw_snapshot_generation: Option<u64>,
+    passive_m1_baseline: Option<PassiveM1DiagnosticSnapshot>,
     stable_mac_watcher: Option<StableMacWatcher>,
     associated_edca_programmed: bool,
     e2e93_probe: bool,
@@ -14134,6 +14228,23 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mgmt_txwi: &'c mut Option<DmaArena>,
     mgmt_frame: &'c mut Option<DmaArena>,
     mgmt_tx_ring: &'c mut Option<DmaArena>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PassiveM1DiagnosticSnapshot {
+    rx_dma_enabled: bool,
+    data_ring_cidx: u32,
+    data_ring_didx_before: u32,
+    data_ring_didx_after: u32,
+    descriptor_ctrl: [u32; 8],
+    rx_head: usize,
+    rx_tail: usize,
+    completed_total: u64,
+    rx_error_total: u64,
+    client_frame_total: u64,
+    eapol_total: u64,
+    authenticator_m1_total: u64,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -14349,6 +14460,135 @@ impl VfioPassiveMechanics<'_, '_, '_> {
         record_sae_stage(&format!(
             "fw_state_end point=post_assoc_before_first_eapol generation={generation} wcid=1 count=2944"
         ));
+        Ok(())
+    }
+
+    fn passive_m1_snapshot(&mut self, point: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
+        // Linux 6.18.40 names MT_RX_DATA_RING_BASE and the generic 0x10-byte
+        // ring layout. DMA_IDX, GLO_CFG, and descriptor memory are ordinary
+        // reads. MIB counters are deliberately excluded: mt792x consumes even
+        // RX-time counters when resetting survey state.
+        let data_ring_didx_before = self
+            .loader
+            .mcu
+            .wfdma
+            .read(0xd452c)
+            .map_err(|_| zx::Status::IO)?;
+        let descriptor_ctrl =
+            std::array::from_fn(|index| self.data.rx_ring.read_descriptor_at(index).ctrl);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let data_ring_didx_after = self
+            .loader
+            .mcu
+            .wfdma
+            .read(0xd452c)
+            .map_err(|_| zx::Status::IO)?;
+        let snapshot = PassiveM1DiagnosticSnapshot {
+            rx_dma_enabled: self
+                .loader
+                .mcu
+                .wfdma
+                .read(0xd4208)
+                .map_err(|_| zx::Status::IO)?
+                & (1 << 2)
+                != 0,
+            data_ring_cidx: self
+                .loader
+                .mcu
+                .wfdma
+                .read(0xd4528)
+                .map_err(|_| zx::Status::IO)?,
+            data_ring_didx_before,
+            data_ring_didx_after,
+            descriptor_ctrl,
+            rx_head: self.data.rx_head,
+            rx_tail: self.data.rx_tail,
+            completed_total: self.data.completed_total,
+            rx_error_total: self.data.rx_error_total,
+            client_frame_total: self.data.client_frame_total,
+            eapol_total: self.data.eapol_total,
+            authenticator_m1_total: self.data.authenticator_m1_total,
+        };
+        let ctrl = snapshot
+            .descriptor_ctrl
+            .iter()
+            .map(|value| format!("{value:08x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let unstable = snapshot.data_ring_didx_before != snapshot.data_ring_didx_after;
+        match point {
+            PassiveM1SnapshotPoint::BeforePostAssociationTail => {
+                self.passive_m1_baseline = Some(snapshot);
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=before_post_assoc_tail source=linux-6.18.40 contract=safe-read-rx-dma-v1 rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=RMAC_unicast_to_me,filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    snapshot.rx_dma_enabled,
+                    snapshot.data_ring_cidx,
+                    snapshot.data_ring_didx_before,
+                    snapshot.data_ring_didx_after,
+                    unstable,
+                    ctrl,
+                    snapshot.rx_head,
+                    snapshot.rx_tail,
+                    snapshot.completed_total,
+                    snapshot.rx_error_total,
+                    snapshot.client_frame_total,
+                    snapshot.eapol_total,
+                    snapshot.authenticator_m1_total,
+                ));
+            }
+            PassiveM1SnapshotPoint::M1Timeout => {
+                let Some(before) = self.passive_m1_baseline else {
+                    record_sae_stage(
+                        "passive_m1_rx_snapshot phase=m1_timeout result=unavailable reason=missing_baseline",
+                    );
+                    return Err(zx::Status::BAD_STATE);
+                };
+                let completed_delta = snapshot
+                    .completed_total
+                    .wrapping_sub(before.completed_total);
+                let rx_error_delta = snapshot.rx_error_total.wrapping_sub(before.rx_error_total);
+                let client_frame_delta = snapshot
+                    .client_frame_total
+                    .wrapping_sub(before.client_frame_total);
+                let eapol_delta = snapshot.eapol_total.wrapping_sub(before.eapol_total);
+                let authenticator_m1_delta = snapshot
+                    .authenticator_m1_total
+                    .wrapping_sub(before.authenticator_m1_total);
+                let classification = if authenticator_m1_delta != 0 {
+                    "target_m1_observed_at_rx_dma"
+                } else {
+                    "no_m1_at_rx_dma_ambiguous"
+                };
+                let rx_dma_activity = if completed_delta != 0 {
+                    "present"
+                } else {
+                    "absent"
+                };
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=m1_timeout source=linux-6.18.40 contract=safe-read-rx-dma-v1 rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} rx_dma_activity={} classification={} omitted_consuming_mib=all omitted_unnamed=RMAC_unicast_to_me,filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    snapshot.rx_dma_enabled,
+                    snapshot.data_ring_cidx,
+                    snapshot.data_ring_didx_before,
+                    snapshot.data_ring_didx_after,
+                    unstable,
+                    ctrl,
+                    snapshot.rx_head,
+                    snapshot.rx_tail,
+                    snapshot.completed_total,
+                    snapshot.rx_error_total,
+                    snapshot.client_frame_total,
+                    snapshot.eapol_total,
+                    snapshot.authenticator_m1_total,
+                    completed_delta,
+                    rx_error_delta,
+                    client_frame_delta,
+                    eapol_delta,
+                    authenticator_m1_delta,
+                    rx_dma_activity,
+                    classification,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -15092,6 +15332,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
 
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.firmware_owned_snapshot(generation)
+    }
+
+    fn passive_m1_snapshot(&mut self, point: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
+        VfioPassiveMechanics::passive_m1_snapshot(self, point)
     }
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
@@ -19032,6 +19276,14 @@ mod tests {
             classify_eapol_key(&key(0x010a, 1, &[])),
             Some((0x010a, "other_eapol_key"))
         );
+        let mut pinned_m1 = key(0x008a, 1, &[]);
+        pinned_m1[4..10].copy_from_slice(&[0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]);
+        pinned_m1[10..16].copy_from_slice(&[0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]);
+        pinned_m1[16..22].copy_from_slice(&[0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]);
+        assert!(is_pinned_target_authenticator_m1(&pinned_m1));
+        pinned_m1[4] ^= 1;
+        assert!(!is_pinned_target_authenticator_m1(&pinned_m1));
+
         let mut malformed = key(0x010a, 1, &[48, 0]);
         let llc = malformed
             .windows(8)
@@ -23057,6 +23309,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 4,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: WM2_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
@@ -23127,6 +23384,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 0,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: WM_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
@@ -23204,6 +23466,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 0,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: WM_RX_IRQ_BIT,
         };
         let mut unsolicited = Vec::new();
@@ -23354,6 +23621,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 2,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: DATA_RX_IRQ_BIT,
         };
         let mut provenance = DescriptorProvenance::new();
@@ -23449,6 +23721,11 @@ mod tests {
                 rx_head: 7,
                 rx_ring_index: 4,
                 rx_count: 8,
+                completed_total: 0,
+                rx_error_total: 0,
+                client_frame_total: 0,
+                eapol_total: 0,
+                authenticator_m1_total: 0,
                 irq_bit: WM2_RX_IRQ_BIT,
             };
             let mut provenance = DescriptorProvenance::new();
@@ -23698,6 +23975,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 2,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: DATA_RX_IRQ_BIT,
         };
         let mut provenance = DescriptorProvenance::new();
@@ -23752,6 +24034,11 @@ mod tests {
             rx_head: 7,
             rx_ring_index: 2,
             rx_count: 8,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
             irq_bit: DATA_RX_IRQ_BIT,
         };
         assert!(
@@ -25551,5 +25838,79 @@ mod tests {
         assert!(transmit.contains("uni_terminal_poisoned = true"));
         assert!(transmit.contains("MgmtTxPublicationOutcome::DescriptorConsumed"));
         assert!(!transmit.contains("TX completion timed out"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn passive_m1_snapshot_uses_only_named_non_destructive_sources() {
+        let source = include_str!("vfio_read.rs");
+        let snapshot = source
+            .split("fn passive_m1_snapshot(")
+            .nth(1)
+            .unwrap()
+            .split("fn e2e81_snapshot(")
+            .next()
+            .unwrap();
+        for read in ["read(0xd4208)", "read(0xd4528)", "read(0xd452c)"] {
+            assert!(snapshot.contains(read), "missing safe source {read}");
+        }
+        assert!(
+            !snapshot.contains("0x820e_d"),
+            "all MIB reads are consuming"
+        );
+        assert!(!snapshot.contains("mac.read"));
+        assert!(!snapshot.contains(".write("));
+        assert!(!snapshot.contains("write_descriptor_at"));
+        assert!(snapshot.contains("no_m1_at_rx_dma_ambiguous"));
+        assert!(!snapshot.contains("ap_sent_no_m1"));
+        assert!(!snapshot.contains("firmware_dropped_m1"));
+
+        let drain = source
+            .split("fn drain_data_rx_queue(")
+            .nth(1)
+            .unwrap()
+            .split("enum MgmtTxCompletion")
+            .next()
+            .unwrap();
+        let completed = drain
+            .find("queue.completed_total = queue.completed_total.wrapping_add(1)")
+            .unwrap();
+        let rearm = drain.find("write_descriptor_at(refill_index").unwrap();
+        assert!(completed < rearm);
+        for counter in [
+            "queue.rx_error_total =",
+            "queue.client_frame_total =",
+            "queue.eapol_total =",
+            "queue.authenticator_m1_total =",
+        ] {
+            assert!(
+                drain.find(counter).unwrap() < rearm,
+                "{counter} must precede rearm"
+            );
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn passive_m1_snapshots_bracket_the_unchanged_tail_and_deadline() {
+        let source = include_str!("vfio_read.rs");
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let before = production
+            .find("PassiveM1SnapshotPoint::BeforePostAssociationTail")
+            .unwrap();
+        let tail = before
+            + production[before..]
+                .find(".complete_post_assoc_interface(")
+                .unwrap();
+        assert!(before < tail);
+
+        let deadline = production
+            .find("started.elapsed() >= std::time::Duration::from_secs(1)")
+            .unwrap();
+        let timeout = deadline
+            + production[deadline..]
+                .find("PassiveM1SnapshotPoint::M1Timeout")
+                .unwrap();
+        assert!(deadline < timeout);
     }
 }
