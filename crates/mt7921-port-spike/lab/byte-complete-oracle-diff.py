@@ -22,6 +22,42 @@ FW_STATE = re.compile(r"fw_state region=(\S+) offset=(0x[0-9a-f]+) addr=(0x[0-9a
 MCU_SOURCE = re.compile(
     r"mcu_source cmd=(0x[0-9a-f]+) payload_len=([0-9]+) wait=([01])"
 )
+NATIVE_ASSOC = re.compile(r"kind=txwi .*frame_len=([0-9]+) fc=0x0000 .*payload_hash=omitted")
+USERSPACE_ASSOC = re.compile(r"association_request_structure .*ie_id_lengths=([^ ]+)")
+
+
+def association_source_categories(native_path, userspace_path):
+    native_len = None
+    with open(native_path, encoding="utf-8") as source:
+        for line in source:
+            match = NATIVE_ASSOC.search(line)
+            if match:
+                native_len = int(match.group(1))
+                break
+    userspace_categories = None
+    with open(userspace_path, encoding="utf-8") as source:
+        for line in source:
+            match = USERSPACE_ASSOC.search(line)
+            if match:
+                userspace_categories = match.group(1).split(",")
+                break
+    if native_len is None or userspace_categories is None:
+        raise ValueError("association source records not found")
+    userspace_len = 28 + sum(2 + int(item.split(":", 1)[1]) for item in userspace_categories)
+    return {
+        "comparison": "source-category-only",
+        "native": {
+            "mpdu_length": native_len,
+            "ie_categories": "unavailable",
+            "exact_bytes": "unavailable-payload-hash-omitted",
+        },
+        "userspace": {
+            "mpdu_length": userspace_len,
+            "ie_categories": userspace_categories,
+        },
+        "length_delta": native_len - userspace_len,
+        "invented_native_bytes": False,
+    }
 
 
 def command_sequence(path):
@@ -93,7 +129,13 @@ def main() -> None:
     )
     parser.add_argument("--firmware-state", nargs=2, metavar=("LINUX", "USERSPACE"))
     parser.add_argument("--command-sequence", nargs=2, metavar=("LINUX", "USERSPACE"))
+    parser.add_argument("--association-source-categories", nargs=2,
+                        metavar=("NATIVE", "USERSPACE"))
     args = parser.parse_args()
+    if args.association_source_categories:
+        print(json.dumps(association_source_categories(*args.association_source_categories),
+                         sort_keys=True))
+        return
     if args.firmware_state:
         difference = firmware_state_difference(*args.firmware_state)
         print(f"firmware_state first_difference={difference}")

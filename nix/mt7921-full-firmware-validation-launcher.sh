@@ -73,7 +73,7 @@ case "$#:${1-}" in
     prepare_credential
     if [ "$integration_backend" = 1 ]; then
       exec @env@ -i \
-        DRV_E2E94_EDCA_PROBE=1 \
+        DRV_PASSIVE_M1_OBSERVATION=1 \
         DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
         DRV_SAE_CHANNEL=36 \
         DRV_SAE_SSID=ph1 \
@@ -91,7 +91,7 @@ case "$#:${1-}" in
       DRV_IOMMU_GROUP="$DRV_IOMMU_GROUP" \
       DRV_VFIO_DEVICE="$DRV_VFIO_DEVICE" \
       DRV_LAB_SAFETY_STATE="$DRV_LAB_SAFETY_STATE" \
-      DRV_E2E94_EDCA_PROBE=1 \
+      DRV_PASSIVE_M1_OBSERVATION=1 \
       DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
       DRV_SAE_CHANNEL=36 \
       DRV_SAE_SSID=ph1 \

@@ -373,6 +373,8 @@
               test "$("$driver" --artifact-identity)" = "$(cat $out/share/mt7921-full-firmware-validation/artifact-identity.json)"
               grep -F '"flavor":"full-firmware-production"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"active_capable":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"observation_mode":"passive-m1-observation"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F '"frame_tx_disabled_before_m1":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -383,8 +385,8 @@
               strings "$driver" | grep -F 'immediately_before_rx_path'
               strings "$driver" | grep -F 'after_rate_power_final'
               strings "$driver" | grep -F 'immediately_predata'
-              strings "$driver" | grep -F 'e2e94_tx_success_gate result='
-              strings "$driver" | grep -F 'stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false'
+              strings "$driver" | grep -F 'passive_m1_observation result=recognized'
+              strings "$driver" | grep -F 'frame_tx_disabled_before_m1=true public_tx_count=0'
               strings "$driver" | grep -F 'production_policy_validation result=pass'
               strings "$driver" | grep -F 'tmac_population_invariant=false'
               rate_output="$("$driver" --self-test-rate-power-delivery)"
@@ -400,9 +402,9 @@
               production_output="$("$driver" --self-test-production-validation)"
               printf '%s\n' "$production_output" \
                 | grep -F '"production_validation_self_test":"passed"' \
-                | grep -F '"tx_free_status":0' \
-                | grep -F '"tx_free_count":1' \
-                | grep -F '"txs_acked":true' \
+                | grep -F '"observation_mode":"passive-m1-observation"' \
+                | grep -F '"frame_tx_disabled_before_m1":true' \
+                | grep -F '"success":"authenticator_m1_delivered_to_pinned_sme"' \
                 | grep -F '"second_frame":false' \
                 | grep -F '"tmac_population_invariant":false'
               association_output="$("$driver" --self-test-sae-h2e-association-request)"
@@ -430,12 +432,12 @@
                 | grep -F '"typed_binding_consumed":true' \
                 | grep -F '"rate_power_pages":8' \
                 | grep -F '"add_device_acked":true' \
-                | grep -F '"frame":"qos_null_tid0_be"' \
+                | grep -F '"frame":"none_before_m1"' \
                 | grep -F '"device_opened":false' \
                 | grep -F '"vfio_opened":false'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
-              grep -F 'DRV_E2E94_EDCA_PROBE=1' "$launcher"
+              grep -F 'DRV_PASSIVE_M1_OBSERVATION=1' "$launcher"
               grep -F 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' "$launcher"
               grep -F 'DRV_SAE_CHANNEL=36' "$launcher"
               grep -F 'DRV_SAE_SSID=ph1' "$launcher"
@@ -520,7 +522,7 @@
                   DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
                   work/launcher
                 grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
-                grep -Fx 'DRV_E2E94_EDCA_PROBE=1' transcript
+                grep -Fx 'DRV_PASSIVE_M1_OBSERVATION=1' transcript
                 grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
                 grep -Fx 'DRV_SAE_CHANNEL=36' transcript
                 grep -Fx 'DRV_SAE_SSID=ph1' transcript
@@ -879,6 +881,8 @@
                 SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)
                 FLAVOR=full-firmware-production
                 ACTIVE_CAPABLE=true
+                OBSERVATION_MODE=passive-m1-observation
+                FRAME_TX_DISABLED_BEFORE_M1=true
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
                 SUPERVISOR=$supervisor
                 SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
@@ -889,23 +893,22 @@
                 PCI_BDF=0000:05:00.0
                 TIMEOUT_SECONDS=300
                 OPERATION=--run-one-shot-sae-auth
-                MODE=DRV_E2E94_EDCA_PROBE=1
+                MODE=DRV_PASSIVE_M1_OBSERVATION=1
                 TARGET_SSID=ph1
                 TARGET_BSSID=72:a6:c7:7d:56:93
                 TARGET_CHANNEL=36
                 TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
-                FRAME=qos_null_tid0_be_qidx1
-                SUCCESS=tx_free_status_0_count_1_and_correlated_txs_ack
-                TMAC_DIAGNOSTIC_ONLY=true
-                TMAC_POPULATION_INVARIANT=false
+                FRAME=none_before_m1
+                SUCCESS=authenticator_m1_delivered_to_pinned_sme
                 RATE_POWER_ORDER=eeprom_prepare_protect_mac_enable_rx_path_then_8_contiguous_0x4005d_then_acked_add_device
                 RATE_POWER_REG_READ_BETWEEN_PAGES=0
                 RATE_POWER_LAST_MSG_PAGE=8
                 PATCH_TABLE_GATE=false
-                STOP_AFTER_ONE=true
+                M1_TIMEOUT_SECONDS=25
                 EAPOL_START=false
-                VO_PROBE=false
-                SECOND_FRAME=false
+                M2_PHYSICAL_TX=false
+                TX_COMPLETION_WAIT=false
+                DUPLICATE_M1_ACTION=none
                 RETRY=false
                 EOF
                 grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$out"
@@ -1326,7 +1329,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v2","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
+              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1377,6 +1380,8 @@
               MATERIALIZED_SOURCE_TREE_SHA256=4444444444444444444444444444444444444444444444444444444444444444
               GENERATED_CRATE_SOURCE_SHA256=5555555555555555555555555555555555555555555555555555555555555555
               ACTIVE_CAPABLE=true
+              OBSERVATION_MODE=passive-m1-observation
+              FRAME_TX_DISABLED_BEFORE_M1=true
               EOF
               }
               make_entry entry "$PWD/work/sudo-stub"

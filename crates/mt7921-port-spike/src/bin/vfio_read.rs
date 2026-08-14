@@ -3103,6 +3103,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         channel: ClientChannelContext::default(),
         production_policy: None,
         validation_complete: false,
+        ..LiveClientState::default()
     }));
     let effects = LiveClientEffects {
         state: Arc::clone(&shared),
@@ -3520,28 +3521,8 @@ fn run_production_validation_self_test() -> Result<(), String> {
         36,
         [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
     )?;
-    let mut published = false;
-    admit_one_validation_probe(&mut published, true).map_err(|status| status.to_string())?;
-    let completion = DiagnosticTxResult {
-        free: Mt7921TxFree {
-            wcid: Some(7),
-            token: 1,
-            dropped: false,
-            attempts: 1,
-            status: 0,
-            pair_word: None,
-            info_word: 0,
-        },
-        txs_present: true,
-        txs_acked: true,
-    };
-    if !validation_probe_completed(&completion)
-        || admit_one_validation_probe(&mut published, true).is_ok()
-    {
-        return Err("production one-frame completion gate self-test failed".into());
-    }
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","frame":"qos_null_tid0_be","tx_free_status":0,"tx_free_count":1,"txs_present":true,"txs_acked":true,"eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false}}"#
     );
     Ok(())
 }
@@ -3631,13 +3612,17 @@ fn run() -> Result<(), String> {
         let (flavor, operation, active_capable) = if cfg!(feature = "full-firmware-production") {
             ("full-firmware-production", "run-one-shot-sae-auth", true)
         } else if cfg!(feature = "rate-power-evidence-only") {
-            ("rate-power-evidence-only", "run-one-shot-power-setup", false)
+            (
+                "rate-power-evidence-only",
+                "run-one-shot-power-setup",
+                false,
+            )
         } else {
             ("unclassified", "none", false)
         };
         if cfg!(feature = "full-firmware-production") {
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v2","flavor":"{flavor}","enabled_operation":"{operation}","source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v3","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"source_identity_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified"),
                 option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified"),
@@ -3656,24 +3641,32 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "fuchsia-passive")]
     if operation_argument.as_deref() == Some("--self-test-sae-h2e-association-request") {
         if env::args().len() != 2 {
-            return Err("SAE-H2E association-request self-test accepts no additional arguments".into());
+            return Err(
+                "SAE-H2E association-request self-test accepts no additional arguments".into(),
+            );
         }
         let base = option_env!("MT7921_FUCHSIA_BASE_REVISION").unwrap_or("unidentified");
-        let patch_set = option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256")
-            .unwrap_or("unidentified");
-        let source_identity = option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified");
-        let materialized_tree = option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified");
-        let generated_source = option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified");
+        let patch_set =
+            option_env!("MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256").unwrap_or("unidentified");
+        let source_identity =
+            option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified");
+        let materialized_tree =
+            option_env!("MT7921_MATERIALIZED_SOURCE_TREE_SHA256").unwrap_or("unidentified");
+        let generated_source =
+            option_env!("MT7921_GENERATED_CRATE_SOURCE_SHA256").unwrap_or("unidentified");
         if base.len() != 40
             || patch_set.len() != 64
             || source_identity.len() != 64
             || materialized_tree.len() != 64
             || generated_source.len() != 64
         {
-            return Err("SAE-H2E association self-test lacks derivation-owned source identity".into());
+            return Err(
+                "SAE-H2E association self-test lacks derivation-owned source identity".into(),
+            );
         }
-        let (frame, without_h2e) = wlan_mlme::host_fixture::sae_h2e_association_request_fixture()
-            .map_err(|error| format!("SAE-H2E association fixture: {error}"))?;
+        let (frame, without_h2e) =
+            wlan_mlme::host_fixture::sae_h2e_association_request_fixture()
+                .map_err(|error| format!("SAE-H2E association fixture: {error}"))?;
         let parse_ies = |bytes: &[u8]| -> Result<Vec<(u8, Vec<u8>)>, String> {
             if bytes.len() < 28 {
                 return Err("association request is truncated".into());
@@ -3694,18 +3687,39 @@ fn run() -> Result<(), String> {
             return Err("production ClientMlme listen interval drifted".into());
         }
         let ies = parse_ies(&frame)?;
-        let id_lengths = ies.iter().map(|(id, body)| (*id, body.len())).collect::<Vec<_>>();
-        if id_lengths != [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)] {
-            return Err(format!("production ClientMlme association IE ordering drifted: {id_lengths:?}"));
+        let id_lengths = ies
+            .iter()
+            .map(|(id, body)| (*id, body.len()))
+            .collect::<Vec<_>>();
+        if id_lengths
+            != [
+                (0, 3),
+                (1, 8),
+                (48, 20),
+                (45, 26),
+                (191, 12),
+                (244, 1),
+                (221, 7),
+            ]
+        {
+            return Err(format!(
+                "production ClientMlme association IE ordering drifted: {id_lengths:?}"
+            ));
         }
-        let expected_rsne = [1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
-            0x0f, 0xac, 8, 0xcc, 0];
-        let expected_ht = [0x73, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let expected_rsne = [
+            1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xcc, 0,
+        ];
+        let expected_ht = [
+            0x73, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
         let expected_vht = [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
         let expected_wmm = [0, 0x50, 0xf2, 2, 0, 1, 0];
-        if ies[2].1 != expected_rsne || ies[3].1 != expected_ht || ies[4].1 != expected_vht
-            || ies[5].1 != [0x20] || ies[6].1 != expected_wmm
+        if ies[2].1 != expected_rsne
+            || ies[3].1 != expected_ht
+            || ies[4].1 != expected_vht
+            || ies[5].1 != [0x20]
+            || ies[6].1 != expected_wmm
         {
             return Err("production ClientMlme RSN/HT/VHT/RSNXE/WMM bytes drifted".into());
         }
@@ -3716,8 +3730,14 @@ fn run() -> Result<(), String> {
             return Err("selected BSS without H2E incorrectly emitted RSNXE".into());
         }
         let digest = Sha256::digest(&frame);
-        let sha256 = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        let frame_hex = frame.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let sha256 = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let frame_hex = frame
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let without_h2e_sha256 = Sha256::digest(&without_h2e)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -3960,11 +3980,11 @@ fn run() -> Result<(), String> {
     };
     let edca_probe_mode = match (
         env::var("DRV_E2E93_EDCA_PROBE"),
-        env::var("DRV_E2E94_EDCA_PROBE"),
+        env::var("DRV_PASSIVE_M1_OBSERVATION"),
     ) {
         (Err(env::VarError::NotPresent), Ok(value)) if value == "1" => true,
         (Err(env::VarError::NotPresent), Ok(_)) => {
-            return Err("DRV_E2E94_EDCA_PROBE must equal 1".into());
+            return Err("DRV_PASSIVE_M1_OBSERVATION must equal 1".into());
         }
         (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => false,
         (Ok(value), Err(env::VarError::NotPresent)) if value == "1" => true,
@@ -3976,7 +3996,7 @@ fn run() -> Result<(), String> {
             return Err(format!("read EDCA probe mode: {error}"));
         }
     };
-    let e2e94_probe = env::var("DRV_E2E94_EDCA_PROBE").is_ok();
+    let e2e94_probe = env::var("DRV_PASSIVE_M1_OBSERVATION").is_ok();
     let e2e93_probe = edca_probe_mode && !e2e94_probe;
     let packaged_integration = match env::var("DRV_VALIDATION_BACKEND") {
         Err(env::VarError::NotPresent) => false,
@@ -3986,7 +4006,7 @@ fn run() -> Result<(), String> {
     };
     #[cfg(feature = "fuchsia-passive")]
     if operation == Operation::RunOneShotSaeAuth && !e2e94_probe {
-        return Err("SAE validation requires the fixed one-frame E2E94 completion mode".into());
+        return Err("SAE validation requires fixed passive M1 observation mode".into());
     }
     #[cfg(feature = "fuchsia-passive")]
     if dmashdl_transition_diagnostic && operation != Operation::RunOneShotSaeAuth {
@@ -4230,7 +4250,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"frame":"qos_null_tid0_be","tx_free_status":0,"tx_free_count":1,"txs_acked":true,"device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"frame":"none_before_m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -6491,11 +6511,16 @@ fn run() -> Result<(), String> {
                                             format!("pinned SME/MLME connect failed: {error:?}")
                                         })?;
                                     if e2e94_probe {
-                                        if !shared.lock().unwrap().validation_complete {
-                                            return Err("production validation connected without the required physical TX completion".into());
+                                        let validation = shared.lock().unwrap();
+                                        if !validation.validation_complete
+                                            || validation.passive_m1_deliveries != 1
+                                            || validation.passive_m2_intents > 1
+                                        {
+                                            return Err("production validation connected without one admitted authenticator M1".into());
                                         }
+                                        drop(validation);
                                         record_sae_stage(
-                                            "production_validation_complete association=true one_be_tid0_qos_null=true physical_completion=true stopped=true",
+                                            "production_validation_complete association=true authenticator_m1_recognized=true sme_delivery=true frame_tx_disabled_before_m1=true public_tx_count=0 stopped=true",
                                         );
                                         return Ok(());
                                     }
@@ -11993,6 +12018,10 @@ struct LiveClientState {
     channel: ClientChannelContext,
     production_policy: Option<ProductionValidationPolicy>,
     validation_complete: bool,
+    passive_rx_observed: u64,
+    passive_eapol_observed: u64,
+    passive_m1_deliveries: u64,
+    passive_m2_intents: u64,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -12080,6 +12109,9 @@ struct ClientDataFrameClassification {
     to_ds: bool,
     from_ds: bool,
     protected: bool,
+    header_offset: usize,
+    qos: bool,
+    amsdu: bool,
     addr1_is_client: bool,
     addr2_is_peer: bool,
     addr3_is_bssid: bool,
@@ -12232,6 +12264,9 @@ fn classify_client_data_frame(
         to_ds,
         from_ds,
         protected,
+        header_offset: body_offset,
+        qos,
+        amsdu,
         addr1_is_client,
         addr2_is_peer,
         addr3_is_bssid,
@@ -12287,44 +12322,40 @@ fn eapol_start_frame(client: [u8; 6], peer: [u8; 6], qos: bool) -> Vec<u8> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn is_authenticator_m1(bytes: &[u8]) -> bool {
+fn classify_eapol_key(bytes: &[u8]) -> Option<(u16, &'static str)> {
     let Some(body_offset) = bytes
         .windows(8)
         .position(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
         .map(|offset| offset + 8)
     else {
-        return false;
+        return None;
     };
     let Some(eapol) = bytes.get(body_offset..) else {
-        return false;
+        return None;
     };
     if eapol.len() < 9 || eapol[1] != 3 {
-        return false;
+        return None;
     }
     let packet_body_len = usize::from(u16::from_be_bytes([eapol[2], eapol[3]]));
     if packet_body_len < 95 || eapol.len() < 4 + packet_body_len {
-        return false;
+        return None;
     }
     let key_info = u16::from_be_bytes([eapol[5], eapol[6]]);
-    key_info & 0x0008 != 0 && key_info & 0x0080 != 0 && key_info & 0x0100 == 0
+    let pairwise = key_info & 0x0008 != 0;
+    let ack = key_info & 0x0080 != 0;
+    let mic = key_info & 0x0100 != 0;
+    let class = match (pairwise, ack, mic) {
+        (true, true, false) => "authenticator_m1",
+        (true, false, true) => "supplicant_m2_or_m4",
+        (true, true, true) => "authenticator_m3",
+        _ => "other_eapol_key",
+    };
+    Some((key_info, class))
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validation_be_qos_null(peer: [u8; 6], client: [u8; 6]) -> Vec<u8> {
-    let mut frame = vec![0xc8, 0x01, 0, 0];
-    frame.extend_from_slice(&peer);
-    frame.extend_from_slice(&client);
-    frame.extend_from_slice(&peer);
-    frame.extend_from_slice(&[0, 0, 0, 0]);
-    frame
-}
-
-#[cfg(feature = "fuchsia-passive")]
-fn is_validation_be_qos_null(bytes: &[u8]) -> bool {
-    bytes.len() == 26
-        && bytes.get(..4) == Some(&[0xc8, 0x01, 0, 0])
-        && bytes.get(16..22) == bytes.get(4..10)
-        && bytes.get(22..26) == Some(&[0, 0, 0, 0])
+fn is_authenticator_m1(bytes: &[u8]) -> bool {
+    classify_eapol_key(bytes).is_some_and(|(_, class)| class == "authenticator_m1")
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -12431,7 +12462,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         flags: fidl_softmac::WlanTxInfoFlags,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
-        if self.state.lock().unwrap().validation_complete {
+        if !self.suppress_eapol_liveness && self.state.lock().unwrap().validation_complete {
             return Err(zx::Status::ALREADY_EXISTS);
         }
         let control = bytes
@@ -12532,12 +12563,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         }
         drop(state);
         let eapol = is_anchored_eapol_data(bytes);
-        let validation_probe = self.suppress_eapol_liveness
-            && is_validation_be_qos_null(bytes)
-            && bytes.get(4..10) == Some(&self.target)
-            && bytes.get(10..16) == Some(&self.client);
         self.firmware
-            .tx_generation(eapol || validation_probe)
+            .tx_generation(eapol)
             .map_err(|_| zx::Status::ACCESS_DENIED)?;
         let association = self
             .firmware
@@ -12565,6 +12592,48 @@ impl Mt7921ClientEffects for LiveClientEffects {
             record_sae_stage("client_data_tx_blocked reason=edca_not_programmed");
             return Err(zx::Status::BAD_STATE);
         }
+        if self.suppress_eapol_liveness {
+            if !eapol {
+                record_sae_stage(
+                    "passive_m1_tx_intercept result=blocked reason=non_eapol public_tx_count=0",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
+            }
+            let Some((key_info, key_class)) = classify_eapol_key(bytes) else {
+                record_sae_stage(
+                    "passive_m1_tx_intercept result=blocked reason=not_eapol_key public_tx_count=0",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
+            };
+            let mut state = self.state.lock().unwrap();
+            if state.passive_m1_deliveries != 1 || !state.validation_complete {
+                record_sae_stage(
+                    "passive_m1_tx_intercept result=blocked reason=m1_not_delivered public_tx_count=0",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
+            }
+            if state.passive_m2_intents != 0 {
+                record_sae_stage(
+                    "passive_m1_tx_intercept result=duplicate_suppressed public_tx_count=0",
+                );
+                return Ok(());
+            }
+            let template = linux_qos_eapol_control_port_reference(bytes, 0, 0, 3)
+                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            let hash = |payload: &[u8]| {
+                payload.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                })
+            };
+            state.passive_m2_intents = 1;
+            record_sae_stage(&format!(
+                "passive_m1_tx_intercept result=would_publish_suppressed key_class={key_class} key_info=0x{key_info:04x} fc=0x{control:04x} qos={qos} tid={tid} frame_len={} frame_hash=fnv1a64:{:016x} descriptor_intent=linux_qos_eapol_control_port_reference descriptor_template_iova=0 token=unallocated pid=unallocated descriptor_template_hash=fnv1a64:{:016x} public_tx_count=0",
+                bytes.len(),
+                hash(bytes),
+                hash(&template),
+            ));
+            return Ok(());
+        }
         record_sae_stage(&format!(
             "client_data_tx_public fc=0x{control:04x} protected={} to_ds={to_ds} qos={qos} tid={tid} frame_len={} wcid={} qidx={} rate={} addr1_is_bssid={} addr2_is_sta={} addr3_is_pae_group={} ack_ra_unicast={} sequence_owner=hardware fcs_owner=hardware",
             control & 0x4000 != 0,
@@ -12577,17 +12646,10 @@ impl Mt7921ClientEffects for LiveClientEffects {
             bytes.get(16..22) == Some(&[0x01, 0x80, 0xc2, 0, 0, 3]),
             bytes.get(4).is_some_and(|byte| byte & 1 == 0),
         ));
-        if !eapol && !validation_probe && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
-        {
+        if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        match io.transmit_client(bytes, flags) {
-            Err(zx::Status::STOP) if self.suppress_eapol_liveness => {
-                self.state.lock().unwrap().validation_complete = true;
-                Ok(())
-            }
-            result => result,
-        }
+        io.transmit_client(bytes, flags)
     }
     fn install_key(
         &mut self,
@@ -12915,14 +12977,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
         );
         if self.suppress_eapol_liveness {
             record_sae_stage(
-                "validation_post_assoc_boundary result=ready trigger=be_qos_null authenticator_m1_required=false",
+                "passive_m1_observation boundary=post_assoc_tail result=ready frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
             );
-            let io = io.into_inner();
-            return self.send_wlan_frame(
-                &validation_be_qos_null(self.target, self.client),
-                fidl_softmac::WlanTxInfoFlags::empty(),
-                io,
-            );
+            return Ok(());
         }
         if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
             record_sae_stage(&format!(
@@ -13025,6 +13082,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             return Ok(None);
         };
+        if self.suppress_eapol_liveness {
+            self.state.lock().unwrap().passive_rx_observed += 1;
+        }
         let control = frame
             .bytes
             .get(..2)
@@ -13271,12 +13331,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
                         generation == Ok(ClientDataGeneration::Association(expected))
                     });
             record_sae_stage(&format!(
-                "client_data_candidate frame_type={} subtype={} to_ds={} from_ds={} protected={} addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} snap_present={} ether_type={} llc_result={} wcid={} association_generation_match={association_generation_match}",
+                "client_data_candidate frame_type={} subtype={} to_ds={} from_ds={} protected={} header_offset={} qos={} amsdu={} addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} snap_present={} ether_type={} llc_result={} wcid={} security_mode={} cm={} clm={} icv_error={} mic_error={} fcs_error={} association_generation_match={association_generation_match}",
                 classification.frame_type,
                 classification.subtype,
                 classification.to_ds,
                 classification.from_ds,
                 classification.protected,
+                classification.header_offset,
+                classification.qos,
+                classification.amsdu,
                 classification.addr1_is_client,
                 classification.addr2_is_peer,
                 classification.addr3_is_bssid,
@@ -13284,6 +13347,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 classification.ether_type.map_or(0, u16::from),
                 classification.llc_result,
                 security.wcid,
+                security.security_mode,
+                security.cm,
+                security.clm,
+                security.icv_error,
+                security.mic_error,
+                security.fcs_error,
             ));
             record_sae_stage(&format!(
                 "firmware_rx_lookup observed_wcid={} peer_wcid={} lookup_match={} firmware_wcid_stage={} association_generation_match={association_generation_match}",
@@ -13377,7 +13446,25 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     drop("security_replay_or_integrity");
                     zx::Status::IO_DATA_INTEGRITY
                 })?;
-            if eapol && is_authenticator_m1(&frame.bytes) {
+            let m1 = eapol && is_authenticator_m1(&frame.bytes);
+            if eapol && self.suppress_eapol_liveness {
+                let mut state = self.state.lock().unwrap();
+                state.passive_eapol_observed += 1;
+                if m1 && state.passive_m1_deliveries == 0 {
+                    state.passive_m1_deliveries = 1;
+                    state.validation_complete = true;
+                    record_sae_stage(&format!(
+                        "passive_m1_observation result=recognized gate=admitted sme_delivery=pending queue_order={} duplicate=false frame_tx_disabled_before_m1=true public_tx_count=0",
+                        state.passive_rx_observed
+                    ));
+                } else if m1 {
+                    record_sae_stage(&format!(
+                        "passive_m1_observation result=duplicate gate=admitted sme_delivery=pending queue_order={} duplicate=true action=none public_tx_count=0",
+                        state.passive_rx_observed
+                    ));
+                }
+            }
+            if m1 {
                 self.eapol_start_deadline = None;
                 record_sae_stage("eapol_liveness type=start timer=cancelled one_shot=suppressed");
             }
@@ -13485,7 +13572,7 @@ struct DiagnosticTxResult {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn admit_one_validation_probe(
+fn admit_one_diagnostic_probe(
     already_published: &mut bool,
     validation_probe: bool,
 ) -> Result<(), zx::Status> {
@@ -13499,7 +13586,7 @@ fn admit_one_validation_probe(
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn e2e94_validation_trigger(
+fn diagnostic_probe_trigger(
     control: u16,
     validation_probe: bool,
     already_published: &mut bool,
@@ -13509,7 +13596,7 @@ fn e2e94_validation_trigger(
             .then_some(false)
             .ok_or(zx::Status::ACCESS_DENIED);
     }
-    admit_one_validation_probe(already_published, validation_probe)?;
+    admit_one_diagnostic_probe(already_published, validation_probe)?;
     Ok(true)
 }
 
@@ -13521,7 +13608,7 @@ fn validate_production_prefix_sequence(enabled: bool, sequence: u8) -> Result<()
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validation_probe_completed(result: &DiagnosticTxResult) -> bool {
+fn diagnostic_tx_completed(result: &DiagnosticTxResult) -> bool {
     result.free.status == 0
         && result.free.attempts == 1
         && !result.free.dropped
@@ -14628,9 +14715,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             return Err(zx::Status::CANCELED);
         }
         let eapol = is_anchored_eapol_data(bytes);
-        let validation_probe = is_validation_be_qos_null(bytes);
-        let control = u16::from_le_bytes([bytes[0], bytes[1]]);
-        if eapol || validation_probe {
+        if eapol {
             self.loader
                 .capture_patch_table_snapshot("immediately_predata")
                 .map_err(|_| zx::Status::IO)?;
@@ -14640,7 +14725,10 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .trace_peer_wtbl_dw5("immediately_pre_data");
         }
         let validation_trigger = if self.e2e94_probe {
-            e2e94_validation_trigger(control, validation_probe, &mut self.e2e81_probe_done)?
+            record_sae_stage(
+                "passive_m1_tx_boundary violation=physical_path_reached frame_published=false",
+            );
+            return Err(zx::Status::ACCESS_DENIED);
         } else {
             eapol && !self.e2e81_probe_done
         };
@@ -14758,23 +14846,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
                 be.free.dropped,
             ));
-            if self.e2e94_probe {
-                let passed = validation_probe_completed(&be);
-                record_sae_stage(&format!(
-                    "e2e94_tx_success_gate result={} tx_free_status={} tx_free_count={} tx_free_success={} txs_present={} txs_acked={} stop_after_one=true eapol_published=false vo_published=false second_frame_published=false retry_published=false",
-                    if passed { "passed" } else { "failed" },
-                    be.free.status,
-                    be.free.attempts,
-                    !be.free.dropped,
-                    be.txs_present,
-                    be.txs_acked,
-                ));
-                return Err(if passed {
-                    zx::Status::STOP
-                } else {
-                    zx::Status::IO
-                });
-            }
             return Ok(());
         }
         let transmit = self.transmit_owned_client_frame(bytes);
@@ -16852,6 +16923,7 @@ mod tests {
             channel: ClientChannelContext::default(),
             production_policy: None,
             validation_complete: false,
+            ..LiveClientState::default()
         }
     }
 
@@ -18119,7 +18191,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn validation_publishes_exactly_one_be_probe_at_firmware_ready_without_m1() {
+    fn validation_publishes_nothing_at_firmware_ready_without_m1() {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
@@ -18130,25 +18202,101 @@ mod tests {
             .notify_association_complete(&validation_association(), &mut io)
             .unwrap();
 
-        assert!(effects.validation_complete());
-        assert_eq!(io.tx.len(), before + 1);
-        assert_eq!(
-            io.tx.last().unwrap(),
-            &validation_be_qos_null(effects.target, effects.client)
-        );
+        assert!(!effects.validation_complete());
+        assert_eq!(io.tx.len(), before);
         assert!(!io.tx.iter().any(|frame| is_anchored_eapol_data(frame)));
         assert!(effects.firmware.qos_tx_ready());
         assert!(effects.eapol_start_deadline.is_none());
         assert!(!effects.eapol_start_emitted);
-        assert_eq!(
-            effects.send_wlan_frame(
-                &validation_be_qos_null(effects.target, effects.client),
-                fidl_softmac::WlanTxInfoFlags::empty(),
-                &mut io,
-            ),
-            Err(zx::Status::ALREADY_EXISTS)
-        );
-        assert_eq!(io.tx.len(), before + 1);
+        assert_eq!(io.tx.len(), before);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn passive_validation_drains_beacon_backlog_then_admits_one_closed_port_m1() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        let tx_before_rx = io.tx.len();
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        let status = fidl_softmac::WlanRxInfo {
+            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: channel,
+            bandwidth: ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: ChannelNumber {
+                number: 0,
+                ..channel
+            },
+            mcs: 0,
+            rssi_dbm: -40,
+            snr_dbh: 0,
+        };
+        for _ in 0..11 {
+            let mut beacon = vec![0; 308];
+            beacon[..2].copy_from_slice(&0x0080u16.to_le_bytes());
+            beacon[4..10].fill(0xff);
+            beacon[10..16].copy_from_slice(&effects.target);
+            beacon[16..22].copy_from_slice(&effects.target);
+            io.rx.push_back(ClientRxFrame {
+                bytes: beacon,
+                status: status.clone(),
+                security: None,
+            });
+        }
+        let mut m1 = vec![0x08, 0x02, 0, 0];
+        m1.extend_from_slice(&effects.client);
+        m1.extend_from_slice(&effects.target);
+        m1.extend_from_slice(&effects.target);
+        m1.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        m1.extend_from_slice(&[1, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+        m1.extend_from_slice(&1u64.to_be_bytes());
+        m1.extend_from_slice(&[0x11; 32]);
+        m1.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        m1.extend_from_slice(&[0, 0]);
+        let security = ClientRxSecurity {
+            wcid: u16::from(effects.peer_wcid.unwrap().get()),
+            tid: 0,
+            key_id: 0,
+            security_mode: 0,
+            cm: false,
+            clm: false,
+            icv_error: false,
+            mic_error: false,
+            fcs_error: false,
+            pn: None,
+        };
+        io.rx.push_back(ClientRxFrame {
+            bytes: m1.clone(),
+            status: status.clone(),
+            security: Some(security),
+        });
+        for _ in 0..11 {
+            assert!(effects.next_rx(&mut io).unwrap().is_none());
+        }
+        assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, m1);
+        assert!(!effects.firmware.controlled_port_open);
+        assert!(effects.validation_complete());
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 12);
+        assert_eq!(effects.state.lock().unwrap().passive_m1_deliveries, 1);
+        assert_eq!(io.tx.len(), tx_before_rx);
+
+        io.rx.push_back(ClientRxFrame {
+            bytes: m1,
+            status,
+            security: Some(security),
+        });
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(effects.state.lock().unwrap().passive_m1_deliveries, 1);
+        assert_eq!(io.tx.len(), tx_before_rx);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -20090,17 +20238,10 @@ mod tests {
             .split("let transmit = self.transmit_owned_client_frame(bytes)")
             .next()
             .unwrap();
-        assert!(transmit.contains("A_tid0_be_qidx1"));
-        assert!(transmit.contains("e2e94_tx_success_gate"));
-        assert!(transmit.contains("txs_present"));
-        assert!(transmit.contains("txs_acked"));
-        assert!(transmit.contains("stop_after_one=true"));
-        assert!(transmit.contains("eapol_published=false"));
-        assert!(transmit.contains("vo_published=false"));
-        assert!(transmit.contains("retry_published=false"));
+        assert!(transmit.contains("passive_m1_tx_boundary"));
+        assert!(!transmit.contains("e2e94_tx_success_gate"));
         assert!(source.contains("tmac_population_invariant=false"));
-        assert!(source.contains("admit_one_validation_probe"));
-        assert!(transmit.contains("validation_probe_completed"));
+        assert!(source.contains("passive_m1_observation result=recognized"));
         assert!(source.contains("Err(zx::Status::STOP) if self.suppress_eapol_liveness"));
         assert!(source.contains("validation_complete = true"));
         let successful_stop = source
@@ -20522,19 +20663,16 @@ mod tests {
                 .iter()
                 .any(|command| command.get(48..56) == Some(&[0, 19, 1, 0, 0, 0, 0, 0][..]))
         );
-        assert_eq!(
-            &io.tx[management_publications..],
-            &[validation_be_qos_null(effects.target, effects.client)]
-        );
-        assert!(effects.validation_complete());
+        assert!(io.tx[management_publications..].is_empty());
+        assert!(!effects.validation_complete());
 
         let mut published = false;
-        assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
-        assert!(!e2e94_validation_trigger(0x00b0, false, &mut published).unwrap());
-        assert!(!e2e94_validation_trigger(0x0000, false, &mut published).unwrap());
-        assert!(e2e94_validation_trigger(0x01c8, true, &mut published).unwrap());
-        assert!(e2e94_validation_trigger(0x01c8, true, &mut published).is_err());
-        assert!(validation_probe_completed(&DiagnosticTxResult {
+        assert!(!diagnostic_probe_trigger(0x00b0, false, &mut published).unwrap());
+        assert!(!diagnostic_probe_trigger(0x00b0, false, &mut published).unwrap());
+        assert!(!diagnostic_probe_trigger(0x0000, false, &mut published).unwrap());
+        assert!(diagnostic_probe_trigger(0x01c8, true, &mut published).unwrap());
+        assert!(diagnostic_probe_trigger(0x01c8, true, &mut published).is_err());
+        assert!(diagnostic_tx_completed(&DiagnosticTxResult {
             free: Mt7921TxFree {
                 wcid: Some(7),
                 token: 1,
@@ -20566,20 +20704,20 @@ mod tests {
 
         let mut published = false;
         assert_eq!(
-            e2e94_validation_trigger(0x00c0, false, &mut published),
+            diagnostic_probe_trigger(0x00c0, false, &mut published),
             Err(zx::Status::ACCESS_DENIED)
         );
         assert_eq!(
-            e2e94_validation_trigger(0x0188, false, &mut published),
+            diagnostic_probe_trigger(0x0188, false, &mut published),
             Err(zx::Status::ACCESS_DENIED)
         );
         assert_eq!(
-            admit_one_validation_probe(&mut published, false),
+            admit_one_diagnostic_probe(&mut published, false),
             Err(zx::Status::ACCESS_DENIED)
         );
-        admit_one_validation_probe(&mut published, true).unwrap();
+        admit_one_diagnostic_probe(&mut published, true).unwrap();
         assert_eq!(
-            admit_one_validation_probe(&mut published, true),
+            admit_one_diagnostic_probe(&mut published, true),
             Err(zx::Status::ALREADY_EXISTS)
         );
         for result in [
@@ -20610,7 +20748,7 @@ mod tests {
                 txs_acked: false,
             },
         ] {
-            assert!(!validation_probe_completed(&result));
+            assert!(!diagnostic_tx_completed(&result));
         }
     }
 

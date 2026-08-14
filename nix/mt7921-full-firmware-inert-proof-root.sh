@@ -33,6 +33,8 @@ fi
 @grep@ -Fx 'MATERIALIZED_SOURCE_TREE_SHA256=@materialized_tree@' "$manifest" >/dev/null
 @grep@ -Fx 'GENERATED_CRATE_SOURCE_SHA256=@generated_source@' "$manifest" >/dev/null
 @grep@ -Fx 'ACTIVE_CAPABLE=true' "$manifest" >/dev/null
+@grep@ -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest" >/dev/null
+@grep@ -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest" >/dev/null
 test "$(@sha256sum@ "$runner" | @cut@ -d ' ' -f1)" = @runner_sha256@
 test "$(@nix_store@ -q --hash "$runner_package")" = @runner_registered_hash@
 test "$(@sha256sum@ "$0" | @cut@ -d ' ' -f1)" = "$(@sed@ -n 's/^ENTRYPOINT_SHA256=//p' "$manifest")"
@@ -46,6 +48,8 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"materialized_source_tree_sha256":"@materialized_tree@"' "$identity" >/dev/null
 @grep@ -F '"generated_crate_source_sha256":"@generated_source@"' "$identity" >/dev/null
 @grep@ -F '"active_capable":true' "$identity" >/dev/null
+@grep@ -F '"observation_mode":"passive-m1-observation"' "$identity" >/dev/null
+@grep@ -F '"frame_tx_disabled_before_m1":true' "$identity" >/dev/null
 
 printf 'INERT_PROOF_ROOT privilege=sudo_-n runner=%s runner_sha256=%s runner_registered_hash=%s flavor=full-firmware-production operation=run-one-shot-sae-auth source_identity_sha256=@source_identity@ fuchsia_base_revision=@fuchsia_base_revision@ fuchsia_patch_set=@fuchsia_patch_set@ materialized_source_tree_sha256=@materialized_tree@ generated_crate_source_sha256=@generated_source@ active_capable=true mode=%s\n' \
   "$runner" @runner_sha256@ @runner_registered_hash@ "${operation:---execute}"

@@ -39,6 +39,16 @@ class CommandSequenceTest(unittest.TestCase):
             "cmd=0x400ff,payload_len=4,wait=0", "\n".join(differences)
         )
 
+    def test_association_comparison_does_not_invent_native_bytes(self):
+        native = HERE / "fixtures" / "association-native.log"
+        userspace = HERE / "fixtures" / "association-userspace.log"
+        report = ORACLE_DIFF.association_source_categories(native, userspace)
+        self.assertEqual(report["native"]["mpdu_length"], 204)
+        self.assertEqual(report["userspace"]["mpdu_length"], 119)
+        self.assertEqual(report["length_delta"], 85)
+        self.assertEqual(report["native"]["ie_categories"], "unavailable")
+        self.assertFalse(report["invented_native_bytes"])
+
 
 if __name__ == "__main__":
     unittest.main()
