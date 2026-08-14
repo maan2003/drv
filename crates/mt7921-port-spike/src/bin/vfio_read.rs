@@ -3220,6 +3220,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         eapol_start_emitted: false,
         suppress_eapol_liveness: false,
         target_beacon_tim: TargetBeaconTimTelemetry::default(),
+        early_m1: EarlyM1Latch::Inactive,
+        next_association_attempt_epoch: 0,
+        post_assoc_rx_ready_generation: None,
     };
     let support = live_client_support(query_from_capabilities(capability, &candidates));
     let device_info = wlan_mlme::mlme_device_info_from_softmac(support.query.clone())
@@ -3684,7 +3687,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
     }
     let passive_m1_diagnostic_json = passive_m1_diagnostic_json();
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,{BSS_WIRE_CONTRACT_JSON},{passive_m1_diagnostic_json}}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment",{BSS_WIRE_CONTRACT_JSON},{passive_m1_diagnostic_json}}}"#
     );
     Ok(())
 }
@@ -3848,7 +3851,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v5","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v6","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -6651,6 +6654,9 @@ fn run() -> Result<(), String> {
                                         eapol_start_emitted: false,
                                         suppress_eapol_liveness: e2e94_probe,
                                         target_beacon_tim: TargetBeaconTimTelemetry::default(),
+                                        early_m1: EarlyM1Latch::Inactive,
+                                        next_association_attempt_epoch: 0,
+                                        post_assoc_rx_ready_generation: None,
                                         // Peer/key WCID state remains association-owned. The
                                         // first-VIF OMAC/BSS/WCID context is installed below.
                                     };
@@ -12640,6 +12646,45 @@ impl ProductionAssociationPhaseTransition {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+struct AssociationRxTailGuard {
+    latch: EarlyM1Latch,
+    committed: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl AssociationRxTailGuard {
+    fn new(latch: EarlyM1Latch) -> Self {
+        Self {
+            latch,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self, generation: u64) -> Result<EarlyM1Latch, ()> {
+        let latch = std::mem::replace(&mut self.latch, EarlyM1Latch::Inactive);
+        let ready = match latch {
+            EarlyM1Latch::Retained { frame, .. } => EarlyM1Latch::Ready {
+                generation,
+                frame: Some(frame),
+            },
+            EarlyM1Latch::Inactive | EarlyM1Latch::Attempt(_) | EarlyM1Latch::Eligible(_) => {
+                EarlyM1Latch::Inactive
+            }
+            EarlyM1Latch::Ready { .. } | EarlyM1Latch::Poisoned => return Err(()),
+        };
+        self.committed = true;
+        Ok(ready)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for AssociationRxTailGuard {
+    fn drop(&mut self) {
+        // The owned retained frame scrubs itself if this guard is not committed.
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl Drop for ProductionAssociationPhaseTransition {
     fn drop(&mut self) {
         if !self.committed {
@@ -12663,6 +12708,77 @@ struct LiveClientState {
     passive_m1_deliveries: u64,
     passive_m2_intents: u64,
     validation_tx_gate: Option<Arc<Mutex<ProductionValidationTxGate>>>,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AssociationAttemptEpoch {
+    epoch: u64,
+    client: [u8; 6],
+    target: [u8; 6],
+    bssid: [u8; 6],
+    channel_generation: u64,
+    preauth_wcid: u16,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct VolatileZeroizingRxFrame(Option<ClientRxFrame>);
+
+#[cfg(feature = "fuchsia-passive")]
+impl VolatileZeroizingRxFrame {
+    fn new(frame: ClientRxFrame) -> Self {
+        Self(Some(frame))
+    }
+
+    fn get(&self) -> &ClientRxFrame {
+        self.0.as_ref().expect("retained frame is present")
+    }
+
+    fn take(mut self) -> ClientRxFrame {
+        self.0.take().expect("retained frame is present")
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn volatile_zeroize(bytes: &mut [u8]) {
+    for byte in bytes {
+        // Retained pre-association key material needs an optimizer-resistant scrub.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for VolatileZeroizingRxFrame {
+    fn drop(&mut self) {
+        if let Some(frame) = self.0.as_mut() {
+            volatile_zeroize(&mut frame.bytes);
+        }
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+enum EarlyM1Latch {
+    Inactive,
+    Attempt(AssociationAttemptEpoch),
+    Eligible(AssociationAttemptEpoch),
+    Retained {
+        attempt: AssociationAttemptEpoch,
+        replay: u64,
+        frame: VolatileZeroizingRxFrame,
+    },
+    Ready {
+        generation: u64,
+        frame: Option<VolatileZeroizingRxFrame>,
+    },
+    Poisoned,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Default for EarlyM1Latch {
+    fn default() -> Self {
+        Self::Inactive
+    }
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -12923,6 +13039,136 @@ fn classify_client_data_frame(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn complete_m1_mpdu_equal(a: &ClientRxFrame, b: &ClientRxFrame) -> bool {
+    // "Complete frame" means the source MPDU bytes, not ancillary RX status.
+    a.bytes == b.bytes
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn early_m1_duplicate_source(frame: &ClientRxFrame, attempt: AssociationAttemptEpoch) -> bool {
+    let c = classify_client_data_frame(&frame.bytes, attempt.client, attempt.target);
+    c.frame_type == 2
+        && c.subtype == 0
+        && c.header_offset == 24
+        && !c.to_ds
+        && c.from_ds
+        && !c.protected
+        && !c.qos
+        && c.addr1_is_client
+        && c.addr2_is_peer
+        && c.addr3_is_bssid
+        && c.snap_present
+        && c.ether_type == Some(0x888e)
+        && frame.security.is_some_and(|security| {
+            security.wcid == attempt.preauth_wcid
+                && security.tid == 0
+                && security.key_id == 0
+                && security.security_mode == 0
+                && !security.cm
+                && !security.clm
+                && !security.icv_error
+                && !security.mic_error
+                && !security.fcs_error
+        })
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedM1Disposition {
+    Identical,
+    Poison,
+    Nonmatching,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn retained_m1_disposition(
+    retained: &ClientRxFrame,
+    replay: u64,
+    incoming: &ClientRxFrame,
+    attempt: AssociationAttemptEpoch,
+) -> RetainedM1Disposition {
+    match strict_early_m1_replay(
+        incoming,
+        attempt.client,
+        attempt.target,
+        attempt.preauth_wcid,
+    ) {
+        Some(candidate_replay)
+            if candidate_replay == replay && complete_m1_mpdu_equal(retained, incoming) =>
+        {
+            RetainedM1Disposition::Identical
+        }
+        Some(_) => RetainedM1Disposition::Poison,
+        None if early_m1_duplicate_source(incoming, attempt) => RetainedM1Disposition::Poison,
+        None => RetainedM1Disposition::Nonmatching,
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn strict_early_m1_replay(
+    frame: &ClientRxFrame,
+    client: [u8; 6],
+    target: [u8; 6],
+    preauth_wcid: u16,
+) -> Option<u64> {
+    let classification = classify_client_data_frame(&frame.bytes, client, target);
+    let control = u16::from_le_bytes(frame.bytes.get(..2)?.try_into().ok()?);
+    if control & 0x0403 != 0
+        || frame
+            .bytes
+            .get(22)
+            .is_none_or(|sequence| sequence & 0x0f != 0)
+    {
+        return None;
+    }
+    // Linux mac80211's control-port exception is deliberately broader. This
+    // latch admits exactly one non-QoS RFC1042/RSN authenticator M1 frame.
+    if classification.frame_type != 2
+        || classification.subtype != 0
+        || classification.header_offset != 24
+        || classification.to_ds
+        || !classification.from_ds
+        || classification.protected
+        || classification.qos
+        || classification.amsdu
+        || !classification.addr1_is_client
+        || !classification.addr2_is_peer
+        || !classification.addr3_is_bssid
+        || frame.bytes.get(24..32) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+    {
+        return None;
+    }
+    let eapol = frame
+        .bytes
+        .get(classification.header_offset.checked_add(8)?..)?;
+    if eapol.len() != 99
+        || !matches!(eapol[0], 1 | 2)
+        || eapol[1] != 3
+        || u16::from_be_bytes([eapol[2], eapol[3]]) != 95
+        || eapol[4] != 2
+        || u16::from_be_bytes([eapol[5], eapol[6]]) != 0x008a
+        || u16::from_be_bytes([eapol[7], eapol[8]]) != 16
+        || u16::from_be_bytes([eapol[97], eapol[98]]) != 0
+    {
+        return None;
+    }
+    let replay = u64::from_be_bytes(eapol[9..17].try_into().ok()?);
+    let security = frame.security?;
+    (replay != 0
+        && preauth_wcid != 1023
+        && security.wcid == preauth_wcid
+        && security.tid == 0
+        && security.key_id == 0
+        && security.security_mode == 0
+        && !security.cm
+        && !security.clm
+        && !security.icv_error
+        && !security.mic_error
+        && !security.fcs_error)
+        .then_some(replay)
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn is_exact_target_eapol_candidate(classification: &ClientDataFrameClassification) -> bool {
     classification.frame_type == 2
         && !classification.to_ds
@@ -12975,6 +13221,9 @@ struct LiveClientEffects {
     eapol_start_emitted: bool,
     suppress_eapol_liveness: bool,
     target_beacon_tim: TargetBeaconTimTelemetry,
+    early_m1: EarlyM1Latch,
+    next_association_attempt_epoch: u64,
+    post_assoc_rx_ready_generation: Option<u64>,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -13047,6 +13296,32 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 impl LiveClientEffects {
+    fn invalidate_early_m1(&mut self) {
+        self.early_m1 = EarlyM1Latch::Inactive;
+        self.post_assoc_rx_ready_generation = None;
+    }
+
+    fn mint_association_attempt(
+        &mut self,
+        channel_generation: u64,
+        preauth_wcid: u16,
+    ) -> Result<(), zx::Status> {
+        if self.next_association_attempt_epoch != 0 {
+            return Err(zx::Status::ALREADY_EXISTS);
+        }
+        self.invalidate_early_m1();
+        self.next_association_attempt_epoch = 1;
+        self.early_m1 = EarlyM1Latch::Attempt(AssociationAttemptEpoch {
+            epoch: self.next_association_attempt_epoch,
+            client: self.client,
+            target: self.target,
+            bssid: self.target,
+            channel_generation,
+            preauth_wcid,
+        });
+        Ok(())
+    }
+
     fn observe_target_beacon_tim(&mut self, bytes: &[u8]) {
         let Some(association) = self.firmware.association else {
             return;
@@ -13127,6 +13402,13 @@ impl LiveClientEffects {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+impl Drop for LiveClientEffects {
+    fn drop(&mut self) {
+        self.invalidate_early_m1();
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl Mt7921ClientEffects for LiveClientEffects {
     fn validation_complete(&self) -> bool {
         self.state.lock().unwrap().validation_complete
@@ -13159,11 +13441,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
     fn prepare_runtime_handoff(
         &mut self,
     ) -> mt7921_softmac_adapter::client_device::ClientRuntimeScanState {
+        self.invalidate_early_m1();
         self.state.lock().unwrap().channel.revoke_authorization();
         mt7921_softmac_adapter::client_device::ClientRuntimeScanState::ExternalSelection
     }
 
     fn revoke_scan(&mut self) {
+        self.invalidate_early_m1();
         let mut state = self.state.lock().unwrap();
         state.selection.invalidate();
         state.channel.revoke_authorization();
@@ -13172,6 +13456,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if let Some(gate) = self.state.lock().unwrap().validation_tx_gate.as_ref() {
             gate.lock().unwrap().fail();
         }
+        self.invalidate_early_m1();
         *self.state.lock().unwrap() = LiveClientState::default();
         // Device reset/stop owns transport containment. Do not issue new DMA
         // after lifecycle revocation; forget only after the owner contained it.
@@ -13218,6 +13503,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         secondary: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
         let physical = client_physical_channel(primary, bandwidth, secondary)?;
+        self.invalidate_early_m1();
         let mut state = self.state.lock().unwrap();
         state.selection.channel_changed(physical);
         state
@@ -13366,8 +13652,30 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     "firmware_wcid_stage stage=preauth peer_wcid={} sta_state=none aid=0 peer_identity=true keys=false port_open=false",
                     peer_wcid.get()
                 ));
+                self.next_association_attempt_epoch = 0;
+            }
+            let association_wcid = if control & 0x00fc == 0 {
+                if bytes.get(16..22) != Some(&self.target) {
+                    return Err(zx::Status::ACCESS_DENIED);
+                }
+                let wcid = self.peer_wcid.ok_or(zx::Status::BAD_STATE)?.get();
+                Some(u16::from(wcid))
+            } else {
+                None
+            };
+            if self.suppress_eapol_liveness
+                && association_wcid.is_some()
+                && self.next_association_attempt_epoch != 0
+            {
+                return Err(zx::Status::ALREADY_EXISTS);
             }
             io.transmit_client(bytes, flags)?;
+            if self.suppress_eapol_liveness
+                && let Some(preauth_wcid) = association_wcid
+            {
+                // Mint only after the association request reached successful physical TX.
+                self.mint_association_attempt(channel_generation, preauth_wcid)?;
+            }
             if sae {
                 record_sae_stage(match bytes.get(26..28) {
                     Some([1, 0]) => "sae_commit_tx_terminal_success sme_callback=success",
@@ -13580,6 +13888,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
+        self.post_assoc_rx_ready_generation = None;
+        let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
         let mut validation_phase_transition =
             ProductionAssociationPhaseTransition::new(self.suppress_eapol_liveness.then(|| {
                 self.state
@@ -13825,6 +14135,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
         record_sae_stage(
             "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
         );
+        if !self.firmware.qos_tx_ready() || self.firmware.association_generation != Some(generation)
+        {
+            self.firmware.firmware_uncertain = true;
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        let ready_latch = rx_tail_guard.commit(generation).map_err(|_| {
+            self.firmware.firmware_uncertain = true;
+            zx::Status::IO_DATA_INTEGRITY
+        })?;
         if self.suppress_eapol_liveness {
             if validation_phase_transition.commit().is_err() {
                 record_sae_stage(
@@ -13832,11 +14151,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 );
                 return Err(zx::Status::BAD_STATE);
             }
+            self.early_m1 = ready_latch;
+            self.post_assoc_rx_ready_generation = Some(generation);
             record_sae_stage(
                 "passive_m1_observation boundary=post_assoc_tail result=ready tx_phase=post_association_observing_m1 frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
             );
             return Ok(());
         }
+        self.early_m1 = ready_latch;
+        self.post_assoc_rx_ready_generation = Some(generation);
         if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
             record_sae_stage(&format!(
                 "fw_state_diagnostic result=failed generation={generation} status={status}"
@@ -13853,6 +14176,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         if request.peer_addr != Some(association.peer) {
             return Err(zx::Status::INVALID_ARGS);
         }
+        self.invalidate_early_m1();
+        // Clear association eligibility before the first fallible teardown operation.
         let io = std::cell::RefCell::new(io);
         self.firmware
             .teardown(
@@ -13876,6 +14201,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
         Ok(())
     }
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
+        if !up {
+            self.invalidate_early_m1();
+        }
         self.firmware
             .set_controlled_port(up)
             .map_err(|_| zx::Status::BAD_STATE)?;
@@ -13893,29 +14221,50 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
-        if let Some(started) = self
-            .post_association_data_wait
-            .filter(|started| started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT)
-        {
-            if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
+        // Drain a successfully committed retained M1 before timers or hardware IO.
+        let early_frame = match &mut self.early_m1 {
+            EarlyM1Latch::Ready { generation, frame }
+                if self.firmware.association_generation == Some(*generation)
+                    && self.post_assoc_rx_ready_generation == Some(*generation) =>
+            {
+                frame.take().map(VolatileZeroizingRxFrame::take)
+            }
+            EarlyM1Latch::Ready { .. } => {
+                self.invalidate_early_m1();
+                None
+            }
+            _ => None,
+        };
+        if early_frame.is_none() {
+            if let Some(started) = self
+                .post_association_data_wait
+                .filter(|started| started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT)
+            {
+                if let Err(status) = io.passive_m1_snapshot(PassiveM1SnapshotPoint::M1Timeout) {
+                    record_sae_stage(&format!(
+                        "passive_m1_rx_snapshot phase=m1_timeout result=unavailable status={status}"
+                    ));
+                }
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=m1_timeout result=unavailable status={status}"
+                    "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
+                    started.elapsed().as_millis()
                 ));
+                self.post_association_data_wait = None;
+                if self.suppress_eapol_liveness {
+                    self.state.lock().unwrap().validation_complete = true;
+                    record_sae_stage(
+                        "passive_m1_observation result=deadline owner=validation elapsed_ms=5000 authenticator_m1=false",
+                    );
+                }
+                return Ok(None);
             }
-            record_sae_stage(&format!(
-                "post_association_first_data result=deadline elapsed_ms={} data_candidate=false",
-                started.elapsed().as_millis()
-            ));
-            self.post_association_data_wait = None;
-            if self.suppress_eapol_liveness {
-                self.state.lock().unwrap().validation_complete = true;
-                record_sae_stage(
-                    "passive_m1_observation result=deadline owner=validation elapsed_ms=5000 authenticator_m1=false",
-                );
-            }
-            return Ok(None);
         }
-        let Some(mut frame) = io.next_client_rx()? else {
+        let drained_early = early_frame.is_some();
+        let frame = match early_frame {
+            Some(frame) => Some(frame),
+            None => io.next_client_rx()?,
+        };
+        let Some(mut frame) = frame else {
             if self.suppress_eapol_liveness {
                 if self.eapol_start_deadline.take().is_some() {
                     record_sae_stage(
@@ -13950,7 +14299,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             return Ok(None);
         };
-        if self.suppress_eapol_liveness {
+        if self.suppress_eapol_liveness && !drained_early {
             self.state.lock().unwrap().passive_rx_observed += 1;
         }
         let control = frame
@@ -14157,6 +14506,37 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     .bytes
                     .get(26..28)
                     .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                let current_generation = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .channel
+                    .authorized_channel()
+                    .ok()
+                    .map(|channel| channel.generation);
+                let eligible = match self.early_m1 {
+                    EarlyM1Latch::Attempt(attempt) => {
+                        status == Some(0)
+                            && frame.bytes.len() >= 30
+                            && current_generation == Some(attempt.channel_generation)
+                            && attempt.client == self.client
+                            && attempt.target == self.target
+                            && attempt.bssid == self.target
+                            && self
+                                .peer_wcid
+                                .is_some_and(|wcid| u16::from(wcid.get()) == attempt.preauth_wcid)
+                    }
+                    _ => false,
+                };
+                if eligible {
+                    let EarlyM1Latch::Attempt(attempt) = self.early_m1 else {
+                        unreachable!()
+                    };
+                    self.early_m1 = EarlyM1Latch::Eligible(attempt);
+                } else {
+                    // Failure, malformed, stale, and duplicate status responses revoke eligibility.
+                    self.invalidate_early_m1();
+                }
                 let comeback = association_comeback_interval(&frame.bytes, 30);
                 if let Some((tu, ms)) = comeback {
                     record_sae_stage(&format!(
@@ -14177,6 +14557,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 });
             }
             if matches!(classification.subtype, 10 | 12) {
+                self.invalidate_early_m1();
                 self.eapol_start_deadline = None;
             }
         }
@@ -14248,8 +14629,126 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     security.wcid
                 ));
             };
+            let firmware_rx_ready =
+                self.firmware
+                    .association_generation
+                    .is_some_and(|generation| {
+                        self.firmware.qos_tx_ready()
+                            && self.post_assoc_rx_ready_generation == Some(generation)
+                    });
+            if !firmware_rx_ready {
+                let authorized_channel = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .channel
+                    .authorized_channel()
+                    .ok()
+                    .map(|channel| {
+                        (
+                            channel.generation,
+                            channel.channel.band,
+                            channel.channel.primary,
+                        )
+                    });
+                let latch = std::mem::replace(&mut self.early_m1, EarlyM1Latch::Inactive);
+                match latch {
+                    EarlyM1Latch::Eligible(attempt)
+                        if authorized_channel
+                            == Some((
+                                attempt.channel_generation,
+                                match frame.status.primary.band {
+                                    WlanBand::TwoGhz => 0,
+                                    WlanBand::FiveGhz => 1,
+                                    _ => u8::MAX,
+                                },
+                                u16::from(frame.status.primary.number),
+                            ))
+                            && strict_early_m1_replay(
+                                &frame,
+                                attempt.client,
+                                attempt.target,
+                                attempt.preauth_wcid,
+                            )
+                            .is_some() =>
+                    {
+                        let replay = strict_early_m1_replay(
+                            &frame,
+                            attempt.client,
+                            attempt.target,
+                            attempt.preauth_wcid,
+                        )
+                        .unwrap();
+                        self.early_m1 = EarlyM1Latch::Retained {
+                            attempt,
+                            replay,
+                            frame: VolatileZeroizingRxFrame::new(frame),
+                        };
+                        record_sae_stage("early_m1_latch result=retained delivery=deferred");
+                        return Ok(None);
+                    }
+                    EarlyM1Latch::Retained {
+                        attempt,
+                        replay,
+                        frame: retained,
+                    } if authorized_channel
+                        != Some((
+                            attempt.channel_generation,
+                            match frame.status.primary.band {
+                                WlanBand::TwoGhz => 0,
+                                WlanBand::FiveGhz => 1,
+                                _ => u8::MAX,
+                            },
+                            u16::from(frame.status.primary.number),
+                        )) =>
+                    {
+                        self.early_m1 = EarlyM1Latch::Retained {
+                            attempt,
+                            replay,
+                            frame: retained,
+                        };
+                    }
+                    EarlyM1Latch::Retained {
+                        attempt,
+                        replay,
+                        frame: retained,
+                    } => match retained_m1_disposition(retained.get(), replay, &frame, attempt) {
+                        RetainedM1Disposition::Identical => {
+                            self.early_m1 = EarlyM1Latch::Retained {
+                                attempt,
+                                replay,
+                                frame: retained,
+                            };
+                            record_sae_stage(
+                                "early_m1_latch result=duplicate action=ignore complete_frame_identical=true",
+                            );
+                            return Ok(None);
+                        }
+                        RetainedM1Disposition::Poison => {
+                            self.early_m1 = EarlyM1Latch::Poisoned;
+                            self.firmware.firmware_uncertain = true;
+                            record_sae_stage(
+                                "early_m1_latch result=poisoned reason=changed_complete_frame_or_replay",
+                            );
+                            return Err(zx::Status::IO_DATA_INTEGRITY);
+                        }
+                        RetainedM1Disposition::Nonmatching => {
+                            self.early_m1 = EarlyM1Latch::Retained {
+                                attempt,
+                                replay,
+                                frame: retained,
+                            };
+                        }
+                    },
+                    other => self.early_m1 = other,
+                }
+            }
             if self.firmware.association.is_none() {
                 drop("no_association");
+                return Ok(None);
+            }
+            if eapol && !firmware_rx_ready {
+                drop("post_assoc_rx_not_ready");
                 return Ok(None);
             }
             if classification.to_ds || !classification.from_ds {
@@ -18285,6 +18784,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: true,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
         effects
             .set_channel(
@@ -19286,6 +19788,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
 
         // The selector's scan 7 result is moved into the runtime. External BSS
@@ -19427,6 +19932,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: true,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
 
         assert!(effects.next_rx(&mut io).unwrap().is_none());
@@ -19861,6 +20369,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
         let association = fidl_softmac::WlanAssociationConfig {
             bssid: Some(peer),
@@ -20233,6 +20744,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
         physically_unbound
             .set_channel(
@@ -20299,6 +20813,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
         effects
             .set_channel(
@@ -20390,6 +20907,9 @@ mod tests {
             eapol_start_emitted: false,
             suppress_eapol_liveness: false,
             target_beacon_tim: TargetBeaconTimTelemetry::default(),
+            early_m1: EarlyM1Latch::Inactive,
+            next_association_attempt_epoch: 0,
+            post_assoc_rx_ready_generation: None,
         };
         effects
             .set_channel(
@@ -24399,6 +24919,9 @@ mod tests {
                 eapol_start_emitted: false,
                 suppress_eapol_liveness: false,
                 target_beacon_tim: TargetBeaconTimTelemetry::default(),
+                early_m1: EarlyM1Latch::Inactive,
+                next_association_attempt_epoch: 0,
+                post_assoc_rx_ready_generation: None,
             };
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
@@ -26527,5 +27050,419 @@ mod tests {
                 .find("PassiveM1SnapshotPoint::M1Timeout")
                 .unwrap();
         assert!(deadline < timeout);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn validation_association_request(effects: &LiveClientEffects) -> Vec<u8> {
+        let mut bytes = vec![0; 28];
+        bytes[0..2].copy_from_slice(&0x0000u16.to_le_bytes());
+        bytes[4..10].copy_from_slice(&effects.target);
+        bytes[10..16].copy_from_slice(&effects.client);
+        bytes[16..22].copy_from_slice(&effects.target);
+        bytes[24..26].copy_from_slice(&0x0011u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&5u16.to_le_bytes());
+        bytes
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn validation_rx_status() -> fidl_softmac::WlanRxInfo {
+        fidl_softmac::WlanRxInfo {
+            rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+            valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+            phy: fidl_ieee80211::WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 36,
+            },
+            bandwidth: ChannelBandwidth::Cbw80,
+            vht_secondary_80_channel: ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 0,
+            },
+            mcs: 0,
+            rssi_dbm: -40,
+            snr_dbh: 0,
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn validation_association_response(effects: &LiveClientEffects) -> ClientRxFrame {
+        let mut bytes = vec![0; 30];
+        bytes[0..2].copy_from_slice(&0x0010u16.to_le_bytes());
+        bytes[4..10].copy_from_slice(&effects.client);
+        bytes[10..16].copy_from_slice(&effects.target);
+        bytes[16..22].copy_from_slice(&effects.target);
+        bytes[26..28].copy_from_slice(&0u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&0xc004u16.to_le_bytes());
+        ClientRxFrame {
+            bytes,
+            status: validation_rx_status(),
+            security: None,
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn validation_early_m1(effects: &LiveClientEffects, replay: u64) -> ClientRxFrame {
+        let mut bytes = vec![0x08, 0x02, 0, 0];
+        bytes.extend_from_slice(&effects.client);
+        bytes.extend_from_slice(&effects.target);
+        bytes.extend_from_slice(&effects.target);
+        bytes.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        bytes.extend_from_slice(&[2, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+        bytes.extend_from_slice(&replay.to_be_bytes());
+        bytes.extend_from_slice(&[0x42; 32]);
+        bytes.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        bytes.extend_from_slice(&[0, 0]);
+        ClientRxFrame {
+            bytes,
+            status: validation_rx_status(),
+            security: Some(ClientRxSecurity {
+                wcid: u16::from(effects.peer_wcid.unwrap().get()),
+                tid: 0,
+                key_id: 0,
+                security_mode: 0,
+                cm: false,
+                clm: false,
+                icv_error: false,
+                mic_error: false,
+                fcs_error: false,
+                pn: None,
+            }),
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn drive_validation_to_retained_m1(
+        effects: &mut LiveClientEffects,
+        io: &mut TestClientIo,
+    ) -> Vec<u8> {
+        prepare_validation_preauth(effects, io);
+        let request = validation_association_request(effects);
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), io)
+            .unwrap();
+        io.rx.push_back(validation_association_response(effects));
+        assert!(effects.next_rx(io).unwrap().is_some());
+        let m1 = validation_early_m1(effects, 7);
+        let expected = m1.bytes.clone();
+        io.rx.push_back(m1);
+        assert!(effects.next_rx(io).unwrap().is_none());
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Retained { .. }));
+        expected
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn early_m1_is_retained_through_tail_then_drained_once_before_hardware() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        let retained = drive_validation_to_retained_m1(&mut effects, &mut io);
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 2);
+        let queued = validation_early_m1(&effects, 8);
+        let queued_bytes = queued.bytes.clone();
+        io.rx.push_back(queued);
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        let generation = effects.firmware.association_generation.unwrap();
+        assert_eq!(effects.post_assoc_rx_ready_generation, Some(generation));
+        assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, retained);
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 2);
+        assert_eq!(
+            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            queued_bytes
+        );
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 3);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 3);
+        assert!(matches!(
+            effects.early_m1,
+            EarlyM1Latch::Ready { frame: None, .. }
+        ));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn wrong_channel_m1_is_not_retained() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        let request = validation_association_request(&effects);
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        io.rx.push_back(validation_association_response(&effects));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        let mut wrong_channel = validation_early_m1(&effects, 7);
+        wrong_channel.status.primary.number = 40;
+        io.rx.push_back(wrong_channel);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Eligible(_)));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn association_tail_failure_destroys_retained_m1_without_readiness() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        drive_validation_to_retained_m1(&mut effects, &mut io);
+        io.fail_uni = true;
+        assert!(
+            effects
+                .notify_association_complete(&validation_association(), &mut io)
+                .is_err()
+        );
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
+        assert_eq!(effects.post_assoc_rx_ready_generation, None);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn wrong_channel_changed_replay_does_not_poison_retained_m1() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        drive_validation_to_retained_m1(&mut effects, &mut io);
+        let mut wrong_channel = validation_early_m1(&effects, 8);
+        wrong_channel.status.primary.number = 40;
+        io.rx.push_back(wrong_channel);
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Retained { .. }));
+        assert!(!effects.firmware.firmware_uncertain);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn normal_association_comeback_can_retry_with_same_preauth_wcid() {
+        let mut effects = validation_effects();
+        effects.suppress_eapol_liveness = false;
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        let request = validation_association_request(&effects);
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        let mut comeback = validation_association_response(&effects);
+        comeback.bytes[26..28].copy_from_slice(&30u16.to_le_bytes());
+        io.rx.push_back(comeback);
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn retained_m1_rejects_same_preauth_retry_and_lifecycle_revoke_invalidates() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        drive_validation_to_retained_m1(&mut effects, &mut io);
+        let request = validation_association_request(&effects);
+        assert_eq!(
+            effects.send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io,),
+            Err(zx::Status::ALREADY_EXISTS)
+        );
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Retained { .. }));
+        effects.revoke_lifecycle();
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
+        assert_eq!(effects.post_assoc_rx_ready_generation, None);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn volatile_zeroize_overwrites_every_byte() {
+        let mut bytes = [0x5a; 127];
+        volatile_zeroize(&mut bytes);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn exact_early_m1_fixture() -> ClientRxFrame {
+        let client = [6, 5, 4, 3, 2, 1];
+        let target = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let mut bytes = vec![0x08, 0x02, 0, 0];
+        bytes.extend_from_slice(&client);
+        bytes.extend_from_slice(&target);
+        bytes.extend_from_slice(&target);
+        bytes.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        bytes.extend_from_slice(&[2, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
+        bytes.extend_from_slice(&7u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x42; 32]);
+        bytes.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
+        bytes.extend_from_slice(&[0, 0]);
+        ClientRxFrame {
+            bytes,
+            status: fidl_softmac::WlanRxInfo {
+                rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                data_rate: 0,
+                primary: ChannelNumber {
+                    band: WlanBand::FiveGhz,
+                    number: 36,
+                },
+                bandwidth: ChannelBandwidth::Cbw20,
+                vht_secondary_80_channel: ChannelNumber {
+                    band: WlanBand::FiveGhz,
+                    number: 0,
+                },
+                mcs: 0,
+                rssi_dbm: -40,
+                snr_dbh: 0,
+            },
+            security: Some(ClientRxSecurity {
+                wcid: 7,
+                tid: 0,
+                key_id: 0,
+                security_mode: 0,
+                cm: false,
+                clm: false,
+                icv_error: false,
+                mic_error: false,
+                fcs_error: false,
+                pn: None,
+            }),
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn strict_early_m1_parser_rejects_every_broader_control_port_shape() {
+        let client = [6, 5, 4, 3, 2, 1];
+        let target = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let valid = exact_early_m1_fixture();
+        assert_eq!(strict_early_m1_replay(&valid, client, target, 7), Some(7));
+
+        let mut invalid = Vec::new();
+        for (offset, bit) in [
+            (0, 0x80),
+            (0, 0x01),
+            (1, 0x40),
+            (1, 0x04),
+            (1, 0x01),
+            (22, 0x01),
+        ] {
+            let mut frame = exact_early_m1_fixture();
+            frame.bytes[offset] ^= bit;
+            invalid.push(frame);
+        }
+        for offset in [4usize, 10, 16, 24, 30, 32, 33, 36, 37, 38, 39, 40, 129, 130] {
+            let mut frame = exact_early_m1_fixture();
+            frame.bytes[offset] ^= 1;
+            invalid.push(frame);
+        }
+        let mut trailing = exact_early_m1_fixture();
+        trailing.bytes.push(0);
+        invalid.push(trailing);
+        let mut truncated = exact_early_m1_fixture();
+        truncated.bytes.pop();
+        invalid.push(truncated);
+        let mut zero_replay = exact_early_m1_fixture();
+        zero_replay.bytes[41..49].fill(0);
+        invalid.push(zero_replay);
+        let security_mutations: [fn(&mut ClientRxSecurity); 9] = [
+            |s: &mut ClientRxSecurity| s.wcid = 1023,
+            |s: &mut ClientRxSecurity| s.tid = 1,
+            |s: &mut ClientRxSecurity| s.key_id = 1,
+            |s: &mut ClientRxSecurity| s.security_mode = 1,
+            |s: &mut ClientRxSecurity| s.cm = true,
+            |s: &mut ClientRxSecurity| s.clm = true,
+            |s: &mut ClientRxSecurity| s.icv_error = true,
+            |s: &mut ClientRxSecurity| s.mic_error = true,
+            |s: &mut ClientRxSecurity| s.fcs_error = true,
+        ];
+        for mutate in security_mutations {
+            let mut frame = exact_early_m1_fixture();
+            mutate(frame.security.as_mut().unwrap());
+            invalid.push(frame);
+        }
+        for frame in invalid {
+            assert_eq!(strict_early_m1_replay(&frame, client, target, 7), None);
+        }
+        assert_eq!(strict_early_m1_replay(&valid, client, target, 1023), None);
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn retained_m1_duplicate_policy_is_raw_mpdu_exact_and_metadata_independent() {
+        let attempt = AssociationAttemptEpoch {
+            epoch: 1,
+            client: [6, 5, 4, 3, 2, 1],
+            target: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            bssid: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            channel_generation: 9,
+            preauth_wcid: 7,
+        };
+        let retained = exact_early_m1_fixture();
+        let mut identical = exact_early_m1_fixture();
+        identical.status.rssi_dbm = -99;
+        assert_eq!(
+            retained_m1_disposition(&retained, 7, &identical, attempt),
+            RetainedM1Disposition::Identical
+        );
+        for offset in [1usize, 22, 48, 64] {
+            let mut changed = exact_early_m1_fixture();
+            changed.bytes[offset] ^= if offset == 1 { 0x08 } else { 1 };
+            assert_eq!(
+                retained_m1_disposition(&retained, 7, &changed, attempt),
+                RetainedM1Disposition::Poison
+            );
+        }
+        let mut malformed_body = exact_early_m1_fixture();
+        malformed_body.bytes[38] ^= 1;
+        assert_eq!(
+            retained_m1_disposition(&retained, 7, &malformed_body, attempt),
+            RetainedM1Disposition::Poison
+        );
+        let mut protected = exact_early_m1_fixture();
+        protected.bytes[1] |= 0x40;
+        assert_eq!(
+            retained_m1_disposition(&retained, 7, &protected, attempt),
+            RetainedM1Disposition::Nonmatching
+        );
+        let mut error = exact_early_m1_fixture();
+        error.security.as_mut().unwrap().fcs_error = true;
+        assert_eq!(
+            retained_m1_disposition(&retained, 7, &error, attempt),
+            RetainedM1Disposition::Nonmatching
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn early_m1_epoch_and_tail_are_exclusive_and_generation_bound() {
+        let mut effects = validation_effects();
+        effects.mint_association_attempt(9, 7).unwrap();
+        let first = match effects.early_m1 {
+            EarlyM1Latch::Attempt(attempt) => attempt,
+            _ => panic!(),
+        };
+        assert_eq!(
+            effects.mint_association_attempt(9, 7),
+            Err(zx::Status::ALREADY_EXISTS)
+        );
+        assert_eq!(first.epoch, 1);
+        effects.early_m1 = EarlyM1Latch::Retained {
+            attempt: first,
+            replay: 7,
+            frame: VolatileZeroizingRxFrame::new(exact_early_m1_fixture()),
+        };
+        let guard = AssociationRxTailGuard::new(std::mem::take(&mut effects.early_m1));
+        effects.early_m1 = guard.commit(44).unwrap();
+        effects.post_assoc_rx_ready_generation = Some(44);
+        assert_eq!(effects.post_assoc_rx_ready_generation, Some(44));
+        match &mut effects.early_m1 {
+            EarlyM1Latch::Ready { generation, frame } => {
+                assert_eq!(*generation, 44);
+                assert!(frame.take().is_some());
+                assert!(frame.take().is_none());
+            }
+            _ => panic!(),
+        }
+        effects.invalidate_early_m1();
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
+        assert_eq!(effects.post_assoc_rx_ready_generation, None);
     }
 }
