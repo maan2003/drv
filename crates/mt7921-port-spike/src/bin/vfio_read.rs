@@ -33,8 +33,11 @@ use mt7921_port_spike::{
     PassiveMcuCommand, PassiveRxError, PhysicalBand, RateTxPowerAuthorizer, RateTxPowerTransport,
     RegulatoryRatePowerSnapshot, candidate_channels, classify_preassociation_sae_auth,
     connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi,
-    encode_client_early_edca_command, encode_client_edca_command, encode_client_interface_commands,
-    encode_client_management_tx, encode_client_post_assoc_beacon_timing_command,
+    encode_client_early_edca_command, encode_client_edca_command,
+    encode_client_interface_bss_command, encode_client_interface_commands,
+    encode_client_interface_dev_command, encode_client_join_roc_abort,
+    encode_client_join_roc_acquire, encode_client_management_tx,
+    encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
@@ -43,9 +46,9 @@ use mt7921_port_spike::{
     encode_remove_wcid_command, linux_legacy_rate_context_reference,
     linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
     linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    narrow_regulatory_rate_power_snapshot, parse_connac2_rx_frame, parse_passive_advertisement,
-    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
-    passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
+    narrow_regulatory_rate_power_snapshot, parse_client_join_roc_grant, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
+    passive_mac_mmio_plan, passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
     regulatory_rate_power_snapshot_from_regdb_v20, set_client_txwi_wcid,
     validate_passive_mac_bar_read,
 };
@@ -1211,6 +1214,8 @@ fn run_contained_dma_resource_round_trip(
                             mac_pages: &active.passive_window_pages,
                             dmashdl: active.dmashdl.as_ref().expect("mapped"),
                             peer_wcid: None,
+                            join_roc_token: 0,
+                            active_join_roc: None,
                             scan_started: None,
                             pending_scan_done: None,
                             advertisements: Vec::new(),
@@ -3233,6 +3238,8 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         dtim_period: 2,
         firmware: ClientFirmwareEffectsState::default(),
         peer_wcid: None,
+        join_roc_generation: None,
+        join_roc_deadline: None,
         post_association_data_wait: None,
         eapol_start_deadline: None,
         eapol_start_emitted: false,
@@ -3705,7 +3712,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
     }
     let passive_m1_diagnostic_json = passive_m1_diagnostic_json();
     println!(
-        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment",{BSS_WIRE_CONTRACT_JSON},{passive_m1_diagnostic_json}}}"#
+        r#"{{"production_validation_self_test":"passed","prefix":"EEPROM,prepare,Protect,MacEnable,RX_PATH,8xSET_RATE_TX_POWER,ACKed_ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7,8,9,10,11,12","target":"ph1/72:a6:c7:7d:56:93/channel36/8a:fd:2a:8b:70:5a","regulatory_generation":0,"regulatory_source_sha256":"2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","validation_tx_phase_model":"preassociation,post-association-observing-m1,m1-delivered-awaiting-m2-intent,complete-or-failed","eapol_liveness":false,"eapol_start":false,"second_frame":false,"retry":false,"tmac_population_invariant":false,"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment",{BSS_WIRE_CONTRACT_JSON},{passive_m1_diagnostic_json}}}"#
     );
     Ok(())
 }
@@ -3904,7 +3911,7 @@ fn run() -> Result<(), String> {
                 )
             };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -4798,7 +4805,7 @@ fn run() -> Result<(), String> {
         run_production_validation_self_test()?;
         println!(
             "{}",
-            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
+            r#"{"packaged_zero_arg_integration":"passed","dispatch":"normal-full-firmware-sae","fd3_eof":true,"fd4_eof":true,"typed_binding_consumed":true,"rate_power_pages":8,"add_device_acked":true,"association_tail":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","success":"authenticator_m1_delivered_to_pinned_sme","device_opened":false,"vfio_opened":false}"#
         );
         return Ok(());
     }
@@ -6507,6 +6514,8 @@ fn run() -> Result<(), String> {
                                 mac_pages: &*passive_window_pages,
                                 dmashdl,
                                 peer_wcid: None,
+                                join_roc_token: 0,
+                                active_join_roc: None,
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
@@ -6616,6 +6625,8 @@ fn run() -> Result<(), String> {
                                 mac_pages: &*passive_window_pages,
                                 dmashdl,
                                 peer_wcid: None,
+                                join_roc_token: 0,
+                                active_join_roc: None,
                                 scan_started: None,
                                 pending_scan_done: None,
                                 advertisements: Vec::new(),
@@ -6964,6 +6975,8 @@ fn run() -> Result<(), String> {
                                         )?,
                                         firmware: ClientFirmwareEffectsState::default(),
                                         peer_wcid: None,
+                                        join_roc_generation: None,
+                                        join_roc_deadline: None,
                                         post_association_data_wait: None,
                                         eapol_start_deadline: None,
                                         eapol_start_emitted: false,
@@ -10056,7 +10069,13 @@ fn classify_uni_ack(expected_cid: u8, response: &ReceivedMcuResponse) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "fuchsia-passive")]
+fn consume_client_mcu_sequence(current: u8, encoded: u8) -> Result<u8, String> {
+    if encoded != current % 15 + 1 {
+        return Err("client MCU command sequence diverged from shared cursor".into());
+    }
+    Ok(encoded)
+}
+
 fn validate_uni_request(expected_cid: u8, encoded: &[u8]) -> Result<u8, String> {
     let sequence = *encoded
         .get(39)
@@ -10837,20 +10856,23 @@ impl VfioFirmwareLoader<'_> {
         if encoded.len() != expected_len || encoded.get(36..39) != Some(&[cid, 0xa0, 1]) {
             return Err("client CE no-ACK command escaped expected envelope".into());
         }
-        self.sequence = self.sequence % 15 + 1;
-        let sequence = self.sequence;
-        let mut encoded = encoded.to_vec();
-        encoded[39] = sequence;
+        let sequence = *encoded
+            .get(39)
+            .filter(|sequence| (1..=15).contains(*sequence))
+            .ok_or("client CE no-ACK command omitted valid sequence")?;
+        consume_client_mcu_sequence(self.sequence, sequence)?;
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+        self.sequence = sequence;
         publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
             self.mcu.payload,
-            &encoded,
+            encoded,
             sequence,
             descriptor_index,
         )?;
+
         self.command_index = next;
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         loop {
@@ -10873,7 +10895,8 @@ impl VfioFirmwareLoader<'_> {
     }
 
     fn clear_client_rx_filter(&mut self) -> Result<(), String> {
-        let clear = encode_client_post_assoc_rx_filter_clear_command(1)?;
+        let sequence = self.sequence % 15 + 1;
+        let clear = encode_client_post_assoc_rx_filter_clear_command(sequence)?;
         self.send_client_ce_no_ack_bytes(&clear, 0x0a, 132)?;
         record_sae_stage(
             "post_assoc_rx_filter_clear result=published dma_didx_consumed=true firmware_ack=not_requested_linux cleanup=universal",
@@ -10925,9 +10948,10 @@ impl VfioFirmwareLoader<'_> {
         let Some(state) = self.client_interface else {
             return Ok(());
         };
-        let [bss, dev] = encode_client_interface_commands(state.identity.bytes(), false, 12, 13)?;
         let mut errors = Vec::new();
         if state.bss_maybe_active {
+            let sequence = self.sequence % 15 + 1;
+            let bss = encode_client_interface_bss_command(false, sequence)?;
             match self.send_acknowledged_uni_command(2, &bss) {
                 Ok(()) => {
                     self.client_interface
@@ -10940,6 +10964,8 @@ impl VfioFirmwareLoader<'_> {
             }
         }
         if state.dev_maybe_active {
+            let sequence = self.sequence % 15 + 1;
+            let dev = encode_client_interface_dev_command(state.identity.bytes(), false, sequence)?;
             match self.send_acknowledged_uni_command(1, &dev) {
                 Ok(()) => {
                     self.client_interface
@@ -10964,6 +10990,77 @@ impl VfioFirmwareLoader<'_> {
         }
     }
 
+    #[cfg(feature = "fuchsia-passive")]
+    fn send_unacknowledged_uni_command(
+        &mut self,
+        expected_cid: u8,
+        encoded: &[u8],
+    ) -> Result<(), (String, PublicationState)> {
+        let mut publication = PublicationState::Local;
+        let result = (|| -> Result<(), String> {
+            self.ensure_mcu_tx_allowed()?;
+            self.mcu.cancelled()?;
+            let sequence = validate_uni_request(expected_cid, encoded)?;
+            consume_client_mcu_sequence(self.sequence, sequence)?;
+            if encoded.len() > MCU_COMMAND_SLOT_BYTES {
+                return Err("unified command exceeded one DMA slot".into());
+            }
+            let descriptor_index = self.command_index;
+            let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
+            let cidx = self.mcu.wfdma.read(0xd4418)?;
+            let didx = self.mcu.wfdma.read(0xd441c)?;
+            if cidx != descriptor_index as u32
+                || didx != descriptor_index as u32
+                || !self
+                    .mcu
+                    .tx_ring
+                    .read_descriptor_at(descriptor_index)
+                    .is_dma_done()
+            {
+                self.uni_terminal_poisoned = true;
+                return Err("unacknowledged UNI ring was not CPU-owned".into());
+            }
+            self.mcu
+                .wfdma
+                .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
+            publication.begin().expect("fresh publication state");
+            self.sequence = sequence;
+            publish_mcu_bytes(
+                self.mcu.wfdma,
+                self.mcu.tx_ring,
+                self.mcu.payload,
+                encoded,
+                sequence,
+                descriptor_index,
+            )
+            .map_err(|error| {
+                self.uni_terminal_poisoned = true;
+                format!("unacknowledged UNI publication failed: {error}")
+            })?;
+            publication.published().expect("publication completed");
+            self.command_index = next;
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let didx = self.mcu.wfdma.read(0xd441c).map_err(|error| {
+                    self.uni_terminal_poisoned = true;
+                    error
+                })?;
+                if dma_index_completed(didx, next as u32) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    self.uni_terminal_poisoned = true;
+                    return Err("unacknowledged UNI DMA consumption timed out".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            reclaim_uni_dma_slot(self.mcu.tx_ring, self.mcu.payload, descriptor_index)?;
+            self.observe_dmashdl(format!("client_uni_no_ack_cid_{expected_cid}"))?;
+            Ok(())
+        })();
+        result.map_err(|error| (error, publication))
+    }
+
     fn send_acknowledged_uni_command(
         &mut self,
         expected_cid: u8,
@@ -10973,6 +11070,7 @@ impl VfioFirmwareLoader<'_> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         let sequence = validate_uni_request(expected_cid, encoded)?;
+        consume_client_mcu_sequence(self.sequence, sequence)?;
         if encoded.len() > MCU_COMMAND_SLOT_BYTES {
             return Err("unified command exceeded one DMA slot".into());
         }
@@ -11011,6 +11109,7 @@ impl VfioFirmwareLoader<'_> {
             .wfdma
             .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
         publication.begin().expect("fresh publication state");
+        self.sequence = sequence;
         if let Err(error) = publish_mcu_bytes(
             self.mcu.wfdma,
             self.mcu.tx_ring,
@@ -13546,6 +13645,8 @@ struct LiveClientEffects {
     dtim_period: u8,
     firmware: ClientFirmwareEffectsState,
     peer_wcid: Option<ClientWcid>,
+    join_roc_generation: Option<u64>,
+    join_roc_deadline: Option<Instant>,
     post_association_data_wait: Option<Instant>,
     eapol_start_deadline: Option<(Instant, u64)>,
     eapol_start_emitted: bool,
@@ -13626,6 +13727,57 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 impl LiveClientEffects {
+    fn acquire_join_roc(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+        channel: mt7921_port_spike::ClientChannelLease,
+        duration_ms: u32,
+    ) -> Result<(), zx::Status> {
+        if self.join_roc_generation == Some(channel.generation) {
+            if self
+                .join_roc_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+            {
+                return Ok(());
+            }
+            self.abort_join_roc(io)?;
+        }
+        if self.join_roc_generation.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let sequence = self.firmware.reserve_mcu_sequence();
+        let max_interval_ms =
+            match io.acquire_join_roc(sequence, channel.channel, channel.generation, duration_ms) {
+                Ok(max_interval_ms) => max_interval_ms,
+                Err(status) => {
+                    if io.join_roc_active(channel.generation) {
+                        self.join_roc_generation = Some(channel.generation);
+                        self.abort_join_roc(io)?;
+                    }
+                    return Err(status);
+                }
+            };
+        self.join_roc_generation = Some(channel.generation);
+        self.join_roc_deadline =
+            Some(Instant::now() + std::time::Duration::from_millis(u64::from(max_interval_ms)));
+        Ok(())
+    }
+
+    fn abort_join_roc(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        let Some(generation) = self.join_roc_generation.take() else {
+            return Ok(());
+        };
+        self.join_roc_deadline = None;
+        let sequence = self.firmware.reserve_mcu_sequence();
+        io.abort_join_roc(sequence, generation).map_err(|status| {
+            self.firmware.firmware_uncertain = true;
+            status
+        })
+    }
+
     fn invalidate_early_m1(&mut self) {
         self.early_m1 = EarlyM1Latch::Inactive;
         self.post_assoc_rx_ready_generation = None;
@@ -13926,10 +14078,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
         {
             return Err(zx::Status::ACCESS_DENIED);
         }
-        let channel_generation = channel
-            .as_ref()
-            .expect("authorized channel was checked")
-            .generation;
+        let channel = *channel.as_ref().expect("authorized channel was checked");
+        let channel_generation = channel.generation;
         if management {
             if (sae && bytes.get(24..26) != Some(&[3, 0]))
                 || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
@@ -14001,7 +14151,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                             negotiated_qos: false,
                             mfp_required: false,
                         },
-                        channel.expect("authorized channel was checked"),
+                        channel,
                         |cid, command| {
                             io.submit_uni(cid, command)
                                 .map_err(|status| status.to_string())
@@ -14033,7 +14183,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
             {
                 return Err(zx::Status::ALREADY_EXISTS);
             }
-            io.transmit_client(bytes, flags)?;
+            let roc_duration_ms = if sae { 2_000 } else { 1_000 };
+            self.acquire_join_roc(io, channel, roc_duration_ms)?;
+            if let Err(status) = io.transmit_client(bytes, flags) {
+                let _ = self.abort_join_roc(io);
+                return Err(status);
+            }
             if self.suppress_eapol_liveness
                 && let Some(preauth_wcid) = association_wcid
             {
@@ -14252,284 +14407,304 @@ impl Mt7921ClientEffects for LiveClientEffects {
         configuration: &fidl_softmac::WlanAssociationConfig,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
-        self.post_assoc_rx_ready_generation = None;
-        let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
-        let mut validation_phase_transition =
-            ProductionAssociationPhaseTransition::new(self.suppress_eapol_liveness.then(|| {
+        let result = (|| {
+            self.post_assoc_rx_ready_generation = None;
+            let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
+            let mut validation_phase_transition = ProductionAssociationPhaseTransition::new(
+                self.suppress_eapol_liveness.then(|| {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .validation_tx_gate
+                        .clone()
+                        .expect("production validation TX gate")
+                }),
+            );
+            let Some(peer) = configuration.bssid else {
+                record_sae_stage(
+                    "association_config_validation result=invalid clause=missing_bssid",
+                );
+                return Err(zx::Status::INVALID_ARGS);
+            };
+            let Some(aid) = configuration.aid else {
+                record_sae_stage("association_config_validation result=invalid clause=missing_aid");
+                return Err(zx::Status::INVALID_ARGS);
+            };
+            // Client MLME masks the five reserved on-wire AID bits before this
+            // FIDL boundary. Requiring their raw 0xc000 form here rejects every
+            // successful infrastructure association before firmware activation.
+            if !(1..=2007).contains(&aid) {
+                record_sae_stage(&format!(
+                    "association_config_validation result=invalid clause=normalized_aid_range aid={aid}"
+                ));
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            if peer != self.target {
+                record_sae_stage(
+                    "association_config_validation result=denied clause=foreign_bssid",
+                );
+                return Err(zx::Status::ACCESS_DENIED);
+            }
+            let negotiated_qos = configuration.qos.unwrap_or(false);
+            if negotiated_qos != configuration.wmm_params.is_some() {
+                record_sae_stage(
+                    "association_config_validation result=invalid clause=wmm_negotiation",
+                );
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+            if self.suppress_eapol_liveness {
                 self.state
                     .lock()
                     .unwrap()
-                    .validation_tx_gate
-                    .clone()
-                    .expect("production validation TX gate")
-            }));
-        let Some(peer) = configuration.bssid else {
-            record_sae_stage("association_config_validation result=invalid clause=missing_bssid");
-            return Err(zx::Status::INVALID_ARGS);
-        };
-        let Some(aid) = configuration.aid else {
-            record_sae_stage("association_config_validation result=invalid clause=missing_aid");
-            return Err(zx::Status::INVALID_ARGS);
-        };
-        // Client MLME masks the five reserved on-wire AID bits before this
-        // FIDL boundary. Requiring their raw 0xc000 form here rejects every
-        // successful infrastructure association before firmware activation.
-        if !(1..=2007).contains(&aid) {
+                    .production_policy
+                    .as_ref()
+                    .ok_or(zx::Status::BAD_STATE)?
+                    .validate_association(peer, primary.number, self.client)
+                    .map_err(|error| {
+                        record_sae_stage(&format!(
+                            "production_policy_validation result=denied reason={error}"
+                        ));
+                        zx::Status::ACCESS_DENIED
+                    })?;
+                record_sae_stage(
+                    "production_policy_validation result=pass ssid=ph1 bssid=true channel=36 client=true regulatory_generation=0 regulatory_source=true",
+                );
+            }
+            let band = match primary.band {
+                fidl_ieee80211::WlanBand::TwoGhz => 0,
+                fidl_ieee80211::WlanBand::FiveGhz => 1,
+                _ => return Err(zx::Status::NOT_SUPPORTED),
+            };
+            let (basic_rates, legacy_rates) = linux_legacy_rate_context_reference(
+                band,
+                configuration
+                    .rates
+                    .as_deref()
+                    .ok_or(zx::Status::INVALID_ARGS)?,
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+            let ht_cap = configuration.ht_cap.map(|cap| cap.bytes);
+            let vht_cap = configuration.vht_cap.map(|cap| cap.bytes);
+            if vht_cap.is_some() && ht_cap.is_none() {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let bandwidth = match configuration.bandwidth {
+                Some(fidl_ieee80211::ChannelBandwidth::Cbw20) => 0,
+                Some(fidl_ieee80211::ChannelBandwidth::Cbw40)
+                | Some(fidl_ieee80211::ChannelBandwidth::Cbw40Below) => 1,
+                Some(fidl_ieee80211::ChannelBandwidth::Cbw80) => 2,
+                Some(fidl_ieee80211::ChannelBandwidth::Cbw160)
+                | Some(fidl_ieee80211::ChannelBandwidth::Cbw80P80) => 3,
+                _ => return Err(zx::Status::INVALID_ARGS),
+            };
             record_sae_stage(&format!(
-                "association_config_validation result=invalid clause=normalized_aid_range aid={aid}"
+                "e2e81_linux_sta_context source=association_config basic_rates={basic_rates:#06x} legacy_rates={legacy_rates:#06x} ht_present={} vht_present={} he_present=false he_reason=pinned_api_omission bandwidth={bandwidth} qidx_mapping=3_minus_mac80211_ac tid7_ac=vo qidx=3",
+                ht_cap.is_some(),
+                vht_cap.is_some(),
             ));
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        if peer != self.target {
-            record_sae_stage("association_config_validation result=denied clause=foreign_bssid");
-            return Err(zx::Status::ACCESS_DENIED);
-        }
-        let negotiated_qos = configuration.qos.unwrap_or(false);
-        if negotiated_qos != configuration.wmm_params.is_some() {
-            record_sae_stage("association_config_validation result=invalid clause=wmm_negotiation");
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
-        if self.suppress_eapol_liveness {
-            self.state
+            record_sae_stage(&format!(
+                "association_config_validation result=pass bssid_match=true normalized_aid={aid} keys=false port_open=false protected_management=closed"
+            ));
+            let channel = self
+                .state
                 .lock()
                 .unwrap()
-                .production_policy
-                .as_ref()
-                .ok_or(zx::Status::BAD_STATE)?
-                .validate_association(peer, primary.number, self.client)
-                .map_err(|error| {
-                    record_sae_stage(&format!(
-                        "production_policy_validation result=denied reason={error}"
-                    ));
-                    zx::Status::ACCESS_DENIED
-                })?;
-            record_sae_stage(
-                "production_policy_validation result=pass ssid=ph1 bssid=true channel=36 client=true regulatory_generation=0 regulatory_source=true",
-            );
-        }
-        let band = match primary.band {
-            fidl_ieee80211::WlanBand::TwoGhz => 0,
-            fidl_ieee80211::WlanBand::FiveGhz => 1,
-            _ => return Err(zx::Status::NOT_SUPPORTED),
-        };
-        let (basic_rates, legacy_rates) = linux_legacy_rate_context_reference(
-            band,
-            configuration
-                .rates
-                .as_deref()
-                .ok_or(zx::Status::INVALID_ARGS)?,
-        )
-        .map_err(|_| zx::Status::INVALID_ARGS)?;
-        let ht_cap = configuration.ht_cap.map(|cap| cap.bytes);
-        let vht_cap = configuration.vht_cap.map(|cap| cap.bytes);
-        if vht_cap.is_some() && ht_cap.is_none() {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let bandwidth = match configuration.bandwidth {
-            Some(fidl_ieee80211::ChannelBandwidth::Cbw20) => 0,
-            Some(fidl_ieee80211::ChannelBandwidth::Cbw40)
-            | Some(fidl_ieee80211::ChannelBandwidth::Cbw40Below) => 1,
-            Some(fidl_ieee80211::ChannelBandwidth::Cbw80) => 2,
-            Some(fidl_ieee80211::ChannelBandwidth::Cbw160)
-            | Some(fidl_ieee80211::ChannelBandwidth::Cbw80P80) => 3,
-            _ => return Err(zx::Status::INVALID_ARGS),
-        };
-        record_sae_stage(&format!(
-            "e2e81_linux_sta_context source=association_config basic_rates={basic_rates:#06x} legacy_rates={legacy_rates:#06x} ht_present={} vht_present={} he_present=false he_reason=pinned_api_omission bandwidth={bandwidth} qidx_mapping=3_minus_mac80211_ac tid7_ac=vo qidx=3",
-            ht_cap.is_some(),
-            vht_cap.is_some(),
-        ));
-        record_sae_stage(&format!(
-            "association_config_validation result=pass bssid_match=true normalized_aid={aid} keys=false port_open=false protected_management=closed"
-        ));
-        let channel = self
-            .state
-            .lock()
-            .unwrap()
-            .channel
-            .authorized_channel()
-            .map_err(|_| zx::Status::BAD_STATE)?;
-        let peer_wcid = self.peer_wcid.ok_or(zx::Status::BAD_STATE)?;
-        self.firmware
-            .associate(
-                LegacyWmeAssociation {
-                    bss_index: 0,
-                    peer_wcid,
-                    aid,
-                    peer,
-                    rcpi: self.rcpi,
-                    basic_rates,
-                    legacy_rates,
-                    ht_cap,
-                    vht_cap,
-                    bandwidth,
-                    negotiated_qos,
-                    // This FIDL association seam does not carry RSN MFP
-                    // negotiation. IGTK installation remains supported but
-                    // cannot become a mandatory readiness predicate here.
-                    mfp_required: false,
-                },
-                channel,
-                |cid, command| {
-                    io.submit_uni(cid, command)
-                        .map_err(|status| status.to_string())
-                },
-            )
-            .map_err(|_| zx::Status::IO)?;
-        if let Some(wmm) = configuration.wmm_params {
-            let convert = |ac: fidl_driver::WlanWmmAccessCategoryParameters| {
-                if ac.ecw_min > 14 || ac.ecw_max > 14 || ac.ecw_max < ac.ecw_min {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                Ok(ClientEdcaAc {
-                    cw_min: (1u16 << ac.ecw_min) - 1,
-                    cw_max: (1u16 << ac.ecw_max) - 1,
-                    txop: ac.txop_limit,
-                    aifs: u16::from(ac.aifsn),
-                    acm: ac.acm,
-                })
-            };
-            let params = ClientEdcaParameters {
-                ac: [
-                    convert(wmm.ac_vo_params)?,
-                    convert(wmm.ac_vi_params)?,
-                    convert(wmm.ac_be_params)?,
-                    convert(wmm.ac_bk_params)?,
-                ],
-            };
-            if let Err(error) = self.firmware.program_edca(params, |command| {
-                io.submit_edca(command).map_err(|status| status.to_string())
-            }) {
-                record_sae_stage(&format!("wmm_edca_program result=error reason={error}"));
-                let _ = self.firmware.teardown(
+                .channel
+                .authorized_channel()
+                .map_err(|_| zx::Status::BAD_STATE)?;
+            let peer_wcid = self.peer_wcid.ok_or(zx::Status::BAD_STATE)?;
+            self.firmware
+                .associate(
+                    LegacyWmeAssociation {
+                        bss_index: 0,
+                        peer_wcid,
+                        aid,
+                        peer,
+                        rcpi: self.rcpi,
+                        basic_rates,
+                        legacy_rates,
+                        ht_cap,
+                        vht_cap,
+                        bandwidth,
+                        negotiated_qos,
+                        // This FIDL association seam does not carry RSN MFP
+                        // negotiation. IGTK installation remains supported but
+                        // cannot become a mandatory readiness predicate here.
+                        mfp_required: false,
+                    },
+                    channel,
                     |cid, command| {
                         io.submit_uni(cid, command)
                             .map_err(|status| status.to_string())
                     },
-                    |_| Ok(()),
+                )
+                .map_err(|_| zx::Status::IO)?;
+            if let Some(wmm) = configuration.wmm_params {
+                let convert = |ac: fidl_driver::WlanWmmAccessCategoryParameters| {
+                    if ac.ecw_min > 14 || ac.ecw_max > 14 || ac.ecw_max < ac.ecw_min {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    Ok(ClientEdcaAc {
+                        cw_min: (1u16 << ac.ecw_min) - 1,
+                        cw_max: (1u16 << ac.ecw_max) - 1,
+                        txop: ac.txop_limit,
+                        aifs: u16::from(ac.aifsn),
+                        acm: ac.acm,
+                    })
+                };
+                let params = ClientEdcaParameters {
+                    ac: [
+                        convert(wmm.ac_vo_params)?,
+                        convert(wmm.ac_vi_params)?,
+                        convert(wmm.ac_be_params)?,
+                        convert(wmm.ac_bk_params)?,
+                    ],
+                };
+                if let Err(error) = self.firmware.program_edca(params, |command| {
+                    io.submit_edca(command).map_err(|status| status.to_string())
+                }) {
+                    record_sae_stage(&format!("wmm_edca_program result=error reason={error}"));
+                    let _ = self.firmware.teardown(
+                        |cid, command| {
+                            io.submit_uni(cid, command)
+                                .map_err(|status| status.to_string())
+                        },
+                        |_| Ok(()),
+                    );
+                    return Err(zx::Status::IO);
+                }
+                record_sae_stage(&format!(
+                    "wmm_edca_program stage=associated result=complete completion=true readback=transport_owned bss=0 wmm=0 ac_vo=aifs{},cwmin{},cwmax{},txop{},acm{} ac_vi=aifs{},cwmin{},cwmax{},txop{},acm{} ac_be=aifs{},cwmin{},cwmax{},txop{},acm{} ac_bk=aifs{},cwmin{},cwmax{},txop{},acm{} tid7_ac=vo qidx3_programmed=true data_ring=0 shared_with_management=true",
+                    params.ac[0].aifs,
+                    params.ac[0].cw_min,
+                    params.ac[0].cw_max,
+                    params.ac[0].txop,
+                    params.ac[0].acm,
+                    params.ac[1].aifs,
+                    params.ac[1].cw_min,
+                    params.ac[1].cw_max,
+                    params.ac[1].txop,
+                    params.ac[1].acm,
+                    params.ac[2].aifs,
+                    params.ac[2].cw_min,
+                    params.ac[2].cw_max,
+                    params.ac[2].txop,
+                    params.ac[2].acm,
+                    params.ac[3].aifs,
+                    params.ac[3].cw_min,
+                    params.ac[3].cw_max,
+                    params.ac[3].txop,
+                    params.ac[3].acm,
+                ));
+            }
+            let io = std::cell::RefCell::new(&mut *io);
+            if self.suppress_eapol_liveness
+                && let Err(status) = io
+                    .borrow_mut()
+                    .passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
+            {
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=before_post_assoc_tail result=unavailable status={status}"
+                ));
+            }
+            self.firmware
+                .complete_post_assoc_interface(
+                    channel.channel,
+                    |cid, command| {
+                        io.borrow_mut()
+                            .submit_uni(cid, command)
+                            .map_err(|status| status.to_string())
+                    },
+                    |command| {
+                        io.borrow_mut()
+                            .submit_ce_no_ack(command)
+                            .map_err(|status| status.to_string())
+                    },
+                )
+                .map_err(|error| {
+                    record_sae_stage(&format!(
+                        "post_assoc_interface_wcid result=error wcid=19 reason={error}"
+                    ));
+                    zx::Status::IO
+                })?;
+            self.abort_join_roc(&mut **io.borrow_mut())?;
+            record_sae_stage(
+                "join_roc_lifecycle phase=association_complete abort=after_post_assoc_tail before_m1",
+            );
+            record_sae_stage(
+                "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=closed",
+            );
+            record_sae_stage(&format!(
+                "post_assoc_bss_updates result=complete order=BCNFT,SET_RXFILTER,RLM beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
+                self.firmware.joined.expect("join retained").beacon_interval,
+                self.dtim_period,
+                channel.channel.primary,
+                channel.channel.center,
+                channel.channel.bandwidth,
+            ));
+            let generation = self
+                .firmware
+                .association_generation
+                .expect("successful association publishes its generation");
+            self.target_beacon_tim = TargetBeaconTimTelemetry::default();
+            self.post_association_data_wait = Some(Instant::now());
+            self.eapol_start_deadline = (!self.suppress_eapol_liveness)
+                .then(|| (Instant::now() + EAPOL_START_WAIT, generation));
+            self.eapol_start_emitted = false;
+            if self.suppress_eapol_liveness {
+                record_sae_stage(
+                    "eapol_liveness type=start timer=disabled one_shot=validation_mode",
                 );
-                return Err(zx::Status::IO);
             }
             record_sae_stage(&format!(
-                "wmm_edca_program stage=associated result=complete completion=true readback=transport_owned bss=0 wmm=0 ac_vo=aifs{},cwmin{},cwmax{},txop{},acm{} ac_vi=aifs{},cwmin{},cwmax{},txop{},acm{} ac_be=aifs{},cwmin{},cwmax{},txop{},acm{} ac_bk=aifs{},cwmin{},cwmax{},txop{},acm{} tid7_ac=vo qidx3_programmed=true data_ring=0 shared_with_management=true",
-                params.ac[0].aifs,
-                params.ac[0].cw_min,
-                params.ac[0].cw_max,
-                params.ac[0].txop,
-                params.ac[0].acm,
-                params.ac[1].aifs,
-                params.ac[1].cw_min,
-                params.ac[1].cw_max,
-                params.ac[1].txop,
-                params.ac[1].acm,
-                params.ac[2].aifs,
-                params.ac[2].cw_min,
-                params.ac[2].cw_max,
-                params.ac[2].txop,
-                params.ac[2].acm,
-                params.ac[3].aifs,
-                params.ac[3].cw_min,
-                params.ac[3].cw_max,
-                params.ac[3].txop,
-                params.ac[3].acm,
+                "firmware_wcid_stage stage=associated peer_wcid={} sta_state=assoc normalized_aid={aid} peer_identity=true keys=false port_open=false protected_management=closed",
+                peer_wcid.get()
             ));
-        }
-        let io = std::cell::RefCell::new(io);
-        if self.suppress_eapol_liveness
-            && let Err(status) = io
-                .borrow_mut()
-                .passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
-        {
             record_sae_stage(&format!(
-                "passive_m1_rx_snapshot phase=before_post_assoc_tail result=unavailable status={status}"
+                "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid={} wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true",
+                peer_wcid.get()
             ));
-        }
-        self.firmware
-            .complete_post_assoc_interface(
-                channel.channel,
-                |cid, command| {
-                    io.borrow_mut()
-                        .submit_uni(cid, command)
-                        .map_err(|status| status.to_string())
-                },
-                |command| {
-                    io.borrow_mut()
-                        .submit_ce_no_ack(command)
-                        .map_err(|status| status.to_string())
-                },
-            )
-            .map_err(|error| {
-                record_sae_stage(&format!(
-                    "post_assoc_interface_wcid result=error wcid=19 reason={error}"
-                ));
-                zx::Status::IO
+            record_sae_stage(
+                "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
+            );
+            if !self.firmware.qos_tx_ready()
+                || self.firmware.association_generation != Some(generation)
+            {
+                self.firmware.firmware_uncertain = true;
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
+            let ready_latch = rx_tail_guard.commit(generation).map_err(|_| {
+                self.firmware.firmware_uncertain = true;
+                zx::Status::IO_DATA_INTEGRITY
             })?;
-        record_sae_stage(
-            "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=closed",
-        );
-        record_sae_stage(&format!(
-            "post_assoc_bss_updates result=complete order=BCNFT,SET_RXFILTER,RLM beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
-            self.firmware.joined.expect("join retained").beacon_interval,
-            self.dtim_period,
-            channel.channel.primary,
-            channel.channel.center,
-            channel.channel.bandwidth,
-        ));
-        let generation = self
-            .firmware
-            .association_generation
-            .expect("successful association publishes its generation");
-        self.target_beacon_tim = TargetBeaconTimTelemetry::default();
-        self.post_association_data_wait = Some(Instant::now());
-        self.eapol_start_deadline = (!self.suppress_eapol_liveness)
-            .then(|| (Instant::now() + EAPOL_START_WAIT, generation));
-        self.eapol_start_emitted = false;
-        if self.suppress_eapol_liveness {
-            record_sae_stage("eapol_liveness type=start timer=disabled one_shot=validation_mode");
-        }
-        record_sae_stage(&format!(
-            "firmware_wcid_stage stage=associated peer_wcid={} sta_state=assoc normalized_aid={aid} peer_identity=true keys=false port_open=false protected_management=closed",
-            peer_wcid.get()
-        ));
-        record_sae_stage(&format!(
-            "association_data_rx_activation bss_active=true bss_idx=0 bmc_wcid=19 peer_wcid={} wtbl_state=assoc no_rx_trans=true association_generation={generation} controlled_port_open=false eapol_ready=true",
-            peer_wcid.get()
-        ));
-        record_sae_stage(
-            "association_firmware_configured=true eapol_start_emitted=false supplicant_wait=authenticator_m1",
-        );
-        if !self.firmware.qos_tx_ready() || self.firmware.association_generation != Some(generation)
-        {
-            self.firmware.firmware_uncertain = true;
-            return Err(zx::Status::IO_DATA_INTEGRITY);
-        }
-        let ready_latch = rx_tail_guard.commit(generation).map_err(|_| {
-            self.firmware.firmware_uncertain = true;
-            zx::Status::IO_DATA_INTEGRITY
-        })?;
-        if self.suppress_eapol_liveness {
-            if validation_phase_transition.commit().is_err() {
+            if self.suppress_eapol_liveness {
+                if validation_phase_transition.commit().is_err() {
+                    record_sae_stage(
+                        "validation_tx_phase transition=failed from=preassociation to=post_association_observing_m1",
+                    );
+                    return Err(zx::Status::BAD_STATE);
+                }
+                self.early_m1 = ready_latch;
+                self.post_assoc_rx_ready_generation = Some(generation);
                 record_sae_stage(
-                    "validation_tx_phase transition=failed from=preassociation to=post_association_observing_m1",
+                    "passive_m1_observation boundary=post_assoc_tail result=ready tx_phase=post_association_observing_m1 frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
                 );
-                return Err(zx::Status::BAD_STATE);
+                return Ok(());
             }
             self.early_m1 = ready_latch;
             self.post_assoc_rx_ready_generation = Some(generation);
-            record_sae_stage(
-                "passive_m1_observation boundary=post_assoc_tail result=ready tx_phase=post_association_observing_m1 frame_tx_disabled_before_m1=true eapol_start=false public_tx_count=0",
-            );
-            return Ok(());
+            if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
+                record_sae_stage(&format!(
+                    "fw_state_diagnostic result=failed generation={generation} status={status}"
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.abort_join_roc(io);
         }
-        self.early_m1 = ready_latch;
-        self.post_assoc_rx_ready_generation = Some(generation);
-        if let Err(status) = io.borrow_mut().diagnostic_association_snapshot(generation) {
-            record_sae_stage(&format!(
-                "fw_state_diagnostic result=failed generation={generation} status={status}"
-            ));
-        }
-        Ok(())
+        result
     }
     fn clear_association(
         &mut self,
@@ -14585,6 +14760,12 @@ impl Mt7921ClientEffects for LiveClientEffects {
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<Option<ClientRxFrame>, zx::Status> {
+        if self
+            .join_roc_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.abort_join_roc(io)?;
+        }
         // Drain a successfully committed retained M1 before timers or hardware IO.
         let early_frame = match &mut self.early_m1 {
             EarlyM1Latch::Ready { generation, frame }
@@ -14707,6 +14888,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     ));
                     return Ok(None);
                 }
+            }
+            if frame.bytes.get(26..28) == Some(&[2, 0]) {
+                self.abort_join_roc(io)?;
             }
         } else if control & 0x000c == 0 {
             let subtype = ((control >> 4) & 15) as u8;
@@ -15294,6 +15478,8 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     mac_pages: &'b [Option<ReadPage>; PASSIVE_MAC_BAR_PAGES.len()],
     dmashdl: &'b ReadPage,
     peer_wcid: Option<ClientWcid>,
+    join_roc_token: u8,
+    active_join_roc: Option<(u8, u64)>,
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
@@ -15393,6 +15579,20 @@ fn diagnostic_tx_completed(result: &DiagnosticTxResult) -> bool {
 #[cfg(feature = "fuchsia-passive")]
 impl Drop for VfioPassiveMechanics<'_, '_, '_> {
     fn drop(&mut self) {
+        if let Some((token, generation)) = self.active_join_roc.take() {
+            let sequence = self.loader.sequence % 15 + 1;
+            let result = encode_client_join_roc_abort(sequence, 0, token)
+                .map_err(|error| error.to_string())
+                .and_then(|command| {
+                    self.loader
+                        .send_unacknowledged_uni_command(0x27, &command)
+                        .map_err(|(error, _)| error)
+                });
+            record_sae_stage(&format!(
+                "join_roc_cleanup owner=mechanics_drop token={token} generation={generation} result={}",
+                if result.is_ok() { "published" } else { "error" }
+            ));
+        }
         if !self.mgmt_tx_outstanding.is_empty() {
             self.loader.uni_terminal_poisoned = true;
             record_sae_stage(
@@ -16419,6 +16619,128 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
 
     fn passive_m1_snapshot(&mut self, point: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
         VfioPassiveMechanics::passive_m1_snapshot(self, point)
+    }
+
+    fn acquire_client_join_roc(
+        &mut self,
+        sequence: u8,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+        generation: u64,
+        duration_ms: u32,
+    ) -> Result<u32, zx::Status> {
+        if self
+            .active_join_roc
+            .is_some_and(|(_, current)| current == generation)
+        {
+            return Ok(duration_ms);
+        }
+        if self.active_join_roc.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        self.join_roc_token = self.join_roc_token.wrapping_add(1);
+        if self.join_roc_token == 0 {
+            self.join_roc_token = 1;
+        }
+        let token = self.join_roc_token;
+        if sequence != self.loader.sequence % 15 + 1 {
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        let command = encode_client_join_roc_acquire(sequence, 0, token, channel, duration_ms)
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+        self.active_join_roc = Some((token, generation));
+        if let Err((error, publication)) =
+            self.loader.send_unacknowledged_uni_command(0x27, &command)
+        {
+            if publication == PublicationState::Local {
+                self.active_join_roc = None;
+            }
+            record_sae_stage(&format!(
+                "join_roc_acquire result=error token={token} generation={generation} reason={error}"
+            ));
+            return Err(zx::Status::IO);
+        }
+        record_sae_stage(&format!(
+            "join_roc_acquire result=published token={token} generation={generation} bss=0 channel={} band={} bandwidth=0 duration_ms={duration_ms}",
+            channel.primary, channel.band
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if self.loader.mcu.handle_irq(None).is_err() {
+                return Err(zx::Status::IO);
+            }
+            if let Some(index) = self
+                .loader
+                .mcu
+                .unsolicited
+                .iter()
+                .position(|event| event.event_id == 0x27)
+            {
+                let event = self.loader.mcu.unsolicited.remove(index);
+                let grant = match parse_client_join_roc_grant(&event.bytes) {
+                    Ok(grant) => grant,
+                    Err(_) => {
+                        return Err(zx::Status::IO_DATA_INTEGRITY);
+                    }
+                };
+                if grant.token != token {
+                    record_sae_stage(&format!(
+                        "join_roc_grant result=stale_discarded expected_token={token} actual_token={}",
+                        grant.token
+                    ));
+                    continue;
+                }
+                if grant.bss_index != 0
+                    || grant.status != 0
+                    || grant.primary_channel != channel.primary as u8
+                    || grant.band != if channel.band == 1 { 2 } else { 1 }
+                    || grant.bandwidth != 0
+                    || grant.center_channel != channel.center as u8
+                    || grant.request_type != 0
+                {
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
+                }
+                record_sae_stage(&format!(
+                    "join_roc_grant result=accepted token={token} generation={generation} max_interval_ms={}",
+                    grant.max_interval_ms
+                ));
+                return Ok(grant.max_interval_ms);
+            }
+            if Instant::now() >= deadline {
+                record_sae_stage(&format!(
+                    "join_roc_grant result=timeout token={token} generation={generation}"
+                ));
+                return Err(zx::Status::TIMED_OUT);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn client_join_roc_active(&mut self, generation: u64) -> bool {
+        self.active_join_roc
+            .is_some_and(|(_, current)| current == generation)
+    }
+
+    fn abort_client_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
+        let Some((token, current)) = self.active_join_roc else {
+            return Err(zx::Status::BAD_STATE);
+        };
+        if current != generation {
+            return Err(zx::Status::BAD_STATE);
+        }
+        if sequence != self.loader.sequence % 15 + 1 {
+            return Err(zx::Status::IO_DATA_INTEGRITY);
+        }
+        self.active_join_roc = None;
+        let command = encode_client_join_roc_abort(sequence, 0, token)
+            .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+        self.loader.send_unacknowledged_uni_command(0x27, &command).map_err(|(error, _)| {
+            record_sae_stage(&format!("join_roc_abort result=error token={token} generation={generation} reason={error}"));
+            zx::Status::IO
+        })?;
+        record_sae_stage(&format!(
+            "join_roc_abort result=published token={token} generation={generation} bss=0"
+        ));
+        Ok(())
     }
 
     fn submit_client_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status> {
@@ -18973,6 +19295,7 @@ mod tests {
     #[derive(Default)]
     struct TestClientIo {
         uni: Vec<Vec<u8>>,
+        roc: Vec<(bool, u8, u64, u32)>,
         tx: Vec<Vec<u8>>,
         rx: VecDeque<ClientRxFrame>,
         fail_uni: bool,
@@ -19143,6 +19466,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -19217,6 +19542,20 @@ mod tests {
             self.uni.push(bytes.to_vec());
             Ok(())
         }
+        fn acquire_join_roc(
+            &mut self,
+            sequence: u8,
+            _: ClientPhysicalChannel,
+            generation: u64,
+            duration_ms: u32,
+        ) -> Result<u32, zx::Status> {
+            self.roc.push((true, sequence, generation, duration_ms));
+            Ok(duration_ms)
+        }
+        fn abort_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
+            self.roc.push((false, sequence, generation, 0));
+            Ok(())
+        }
         fn transmit_client(
             &mut self,
             bytes: &[u8],
@@ -19228,6 +19567,234 @@ mod tests {
         fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
             Ok(self.rx.pop_front())
         }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn terminal_cleanup_allocates_per_attempt_across_failures_and_wrap() {
+        let identity = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+        for start in [2u8, 8, 14] {
+            for failed_step in 0..3 {
+                let mut cursor = start;
+                let mut attempts = Vec::new();
+                let mut errors = Vec::new();
+                for step in 0..3 {
+                    let sequence = cursor % 15 + 1;
+                    let command = match step {
+                        0 => encode_client_post_assoc_rx_filter_clear_command(sequence).unwrap(),
+                        1 => encode_client_interface_bss_command(false, sequence).unwrap(),
+                        2 => {
+                            encode_client_interface_dev_command(identity, false, sequence).unwrap()
+                        }
+                        _ => unreachable!(),
+                    };
+                    cursor = consume_client_mcu_sequence(cursor, command[39]).unwrap();
+                    let cid = if step == 0 { command[36] } else { command[34] };
+                    attempts.push((step, cid, command[39]));
+                    if step == failed_step {
+                        errors.push(step);
+                    }
+                }
+                assert_eq!(attempts.len(), 3);
+                assert_eq!(errors, vec![failed_step]);
+                assert_eq!(
+                    attempts.iter().map(|attempt| attempt.2).collect::<Vec<_>>(),
+                    vec![start % 15 + 1, (start + 1) % 15 + 1, (start + 2) % 15 + 1]
+                );
+                assert_eq!(
+                    attempts.iter().map(|attempt| attempt.1).collect::<Vec<_>>(),
+                    vec![0x0a, 2, 1]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn late_or_wrong_cleanup_ack_cannot_complete_the_next_command() {
+        let envelope = |sequence| mt7921_port_spike::DownloadResponse {
+            length: 12,
+            packet_type: 0xe000,
+            event_id: 1,
+            sequence,
+            option: 0,
+            extended_event_id: 0,
+        };
+        assert!(response_for_sequence(Some(10), envelope(9), vec![9]).is_none());
+        let matching = response_for_sequence(Some(10), envelope(10), vec![10]).unwrap();
+        let mut bytes = vec![0; 44];
+        bytes[36] = 2;
+        let wrong_cid = ReceivedMcuResponse { bytes, ..matching };
+        assert!(classify_uni_ack(1, &wrong_cid).is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn physical_client_mcu_cursor_spans_roc_uni_ce_and_abort() {
+        let mut cursor = 0;
+        for sequence in [1, 2, 3, 4, 5] {
+            cursor = consume_client_mcu_sequence(cursor, sequence).unwrap();
+        }
+        assert_eq!(cursor, 5);
+        assert!(consume_client_mcu_sequence(cursor, 5).is_err());
+        assert_eq!(consume_client_mcu_sequence(15, 1), Ok(1));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn join_roc_lifecycle_is_generation_bound_and_never_aborts_unacquired() {
+        let mut effects = validation_effects();
+        let channel = effects
+            .state
+            .lock()
+            .unwrap()
+            .channel
+            .authorized_channel()
+            .unwrap();
+        let mut io = TestClientIo::default();
+
+        effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
+        effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
+        assert_eq!(io.roc, vec![(true, 1, channel.generation, 2_000)]);
+
+        let stale = mt7921_port_spike::ClientChannelLease {
+            generation: channel.generation + 1,
+            ..channel
+        };
+        assert_eq!(
+            effects.acquire_join_roc(&mut io, stale, 1_000),
+            Err(zx::Status::BAD_STATE)
+        );
+        effects.abort_join_roc(&mut io).unwrap();
+        effects.abort_join_roc(&mut io).unwrap();
+        effects.acquire_join_roc(&mut io, channel, 1_000).unwrap();
+        effects.abort_join_roc(&mut io).unwrap();
+        assert_eq!(
+            io.roc,
+            vec![
+                (true, 1, channel.generation, 2_000),
+                (false, 2, channel.generation, 0),
+                (true, 3, channel.generation, 1_000),
+                (false, 4, channel.generation, 0),
+            ]
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn join_roc_expiry_reaps_through_shared_sequence_before_reacquire() {
+        let mut effects = validation_effects();
+        let channel = effects
+            .state
+            .lock()
+            .unwrap()
+            .channel
+            .authorized_channel()
+            .unwrap();
+        let mut io = TestClientIo::default();
+
+        effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
+        effects.join_roc_deadline = Some(Instant::now());
+        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
+
+        assert_eq!(
+            io.roc,
+            vec![
+                (true, 1, channel.generation, 2_000),
+                (false, 2, channel.generation, 0),
+                (true, 3, channel.generation, 2_000),
+            ]
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn join_roc_spans_status30_confirm_and_association_tail_before_m1() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        assert_eq!(io.roc, vec![(true, 2, 1, 2_000)]);
+
+        let client = effects.client;
+        let target = effects.target;
+        let auth = |transaction: u16, status: u16| {
+            let mut bytes = vec![0; 30];
+            bytes[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            bytes[4..10].copy_from_slice(&client);
+            bytes[10..16].copy_from_slice(&target);
+            bytes[16..22].copy_from_slice(&target);
+            bytes[24..26].copy_from_slice(&3u16.to_le_bytes());
+            bytes[26..28].copy_from_slice(&transaction.to_le_bytes());
+            bytes[28..30].copy_from_slice(&status.to_le_bytes());
+            ClientRxFrame {
+                bytes,
+                status: fidl_softmac::WlanRxInfo {
+                    rx_flags: fidl_softmac::WlanRxInfoFlags::empty(),
+                    valid_fields: fidl_softmac::WlanRxInfoValid::RSSI,
+                    phy: fidl_ieee80211::WlanPhyType::Ofdm,
+                    data_rate: 0,
+                    primary: ChannelNumber {
+                        band: WlanBand::FiveGhz,
+                        number: 36,
+                    },
+                    bandwidth: ChannelBandwidth::Cbw20,
+                    vht_secondary_80_channel: ChannelNumber {
+                        band: WlanBand::FiveGhz,
+                        number: 0,
+                    },
+                    mcs: 0,
+                    rssi_dbm: -40,
+                    snr_dbh: 0,
+                },
+                security: None,
+            }
+        };
+        io.rx.push_back(auth(1, 30));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(io.roc, vec![(true, 2, 1, 2_000)]);
+
+        io.rx.push_back(auth(2, 0));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert_eq!(io.roc, vec![(true, 2, 1, 2_000), (false, 3, 1, 0)]);
+
+        let mut assoc = vec![0; 28];
+        assoc[4..10].copy_from_slice(&target);
+        assoc[10..16].copy_from_slice(&client);
+        assoc[16..22].copy_from_slice(&target);
+        effects
+            .send_wlan_frame(&assoc, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        assert_eq!(io.roc.last(), Some(&(true, 4, 1, 1_000)));
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+        assert!(io.roc.last().is_some_and(|entry| !entry.0));
+        assert_eq!(effects.join_roc_generation, None);
+        assert!(effects.post_assoc_rx_ready_generation.is_some());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn join_roc_tx_failure_aborts_the_acquired_token_before_return() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo {
+            tx_status: Some(zx::Status::UNAVAILABLE),
+            ..TestClientIo::default()
+        };
+        let mut sae = vec![0; 30];
+        sae[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+        sae[4..10].copy_from_slice(&effects.target);
+        sae[10..16].copy_from_slice(&effects.client);
+        sae[16..22].copy_from_slice(&effects.target);
+        sae[24..26].copy_from_slice(&3u16.to_le_bytes());
+        sae[26..28].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            effects.send_wlan_frame(&sae, fidl_softmac::WlanTxInfoFlags::empty(), &mut io),
+            Err(zx::Status::UNAVAILABLE)
+        );
+        assert_eq!(io.roc, vec![(true, 2, 1, 2_000), (false, 3, 1, 0)]);
+        assert_eq!(effects.join_roc_generation, None);
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -19269,6 +19836,19 @@ mod tests {
         }
 
         fn submit_client_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+            Ok(())
+        }
+
+        fn acquire_client_join_roc(
+            &mut self,
+            _: u8,
+            _: ClientPhysicalChannel,
+            _: u64,
+            _: u32,
+        ) -> Result<u32, zx::Status> {
+            Ok(1_000)
+        }
+        fn abort_client_join_roc(&mut self, _: u8, _: u64) -> Result<(), zx::Status> {
             Ok(())
         }
 
@@ -20149,6 +20729,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -20293,6 +20875,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: Some((Instant::now(), 1)),
             eapol_start_emitted: false,
@@ -20730,6 +21314,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -20911,6 +21497,16 @@ mod tests {
             );
         }
         assert!(effects.firmware.association.is_none());
+        let retry_channel = effects
+            .state
+            .lock()
+            .unwrap()
+            .channel
+            .authorized_channel()
+            .unwrap();
+        effects
+            .acquire_join_roc(&mut io, retry_channel, 1_000)
+            .unwrap();
         effects
             .notify_association_complete(&association, &mut io)
             .unwrap();
@@ -21105,6 +21701,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -21174,6 +21772,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -21268,6 +21868,8 @@ mod tests {
             dtim_period: 2,
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
+            join_roc_generation: None,
+            join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
             eapol_start_emitted: false,
@@ -25280,6 +25882,8 @@ mod tests {
                 dtim_period: 2,
                 firmware: ClientFirmwareEffectsState::default(),
                 peer_wcid: None,
+                join_roc_generation: None,
+                join_roc_deadline: None,
                 post_association_data_wait: None,
                 eapol_start_deadline: None,
                 eapol_start_emitted: false,

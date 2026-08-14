@@ -362,6 +362,21 @@ pub trait Mt7921ClientIo {
     fn submit_uni(&mut self, expected_cid: u8, encoded: &[u8]) -> Result<(), zx::Status>;
     fn submit_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
+    fn acquire_join_roc(
+        &mut self,
+        _: u8,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: u64,
+        _: u32,
+    ) -> Result<u32, zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn join_roc_active(&mut self, _: u64) -> bool {
+        false
+    }
+    fn abort_join_roc(&mut self, _: u8, _: u64) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
         Ok(())
     }
@@ -703,6 +718,23 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     }
     fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.submit_client_ce_no_ack(encoded))
+    }
+    fn acquire_join_roc(
+        &mut self,
+        sequence: u8,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+        generation: u64,
+        duration_ms: u32,
+    ) -> Result<u32, zx::Status> {
+        self.with_transport_mut(|transport| {
+            transport.acquire_client_join_roc(sequence, channel, generation, duration_ms)
+        })
+    }
+    fn join_roc_active(&mut self, generation: u64) -> bool {
+        self.with_transport_mut(|transport| transport.client_join_roc_active(generation))
+    }
+    fn abort_join_roc(&mut self, sequence: u8, generation: u64) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.abort_client_join_roc(sequence, generation))
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.diagnostic_association_snapshot(generation))

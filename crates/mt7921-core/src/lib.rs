@@ -2707,6 +2707,110 @@ fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
     bytes
 }
 
+/// Source-exact MT7921 JOIN remain-on-channel acquisition (UNI ROC, CID 0x27).
+///
+/// This is the firmware transaction used by Linux's `mgd_prepare_tx`; it is
+/// distinct from the host-side channel authorization lease.
+pub fn encode_client_join_roc_acquire(
+    sequence: u8,
+    bss_index: u8,
+    token: u8,
+    channel: ClientPhysicalChannel,
+    duration_ms: u32,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bss_index != 0
+        || token == 0
+        || duration_ms == 0
+        || channel.primary == 0
+        || channel.primary > u16::from(u8::MAX)
+        || channel.center == 0
+        || channel.center > u16::from(u8::MAX)
+        || channel.center2 != 0
+        || channel.bandwidth != 0
+        || channel.band > 1
+    {
+        return Err("JOIN ROC acquisition identity is invalid".into());
+    }
+    let primary = channel.primary as u8;
+    let center = channel.center as u8;
+    let mut body = [0u8; 28];
+    body[4..8].copy_from_slice(&[0, 0, 24, 0]); // UNI_ROC_ACQUIRE
+    body[8] = bss_index;
+    body[9] = token;
+    body[10] = primary;
+    body[11] = match primary.cmp(&center) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Greater => 3,
+        core::cmp::Ordering::Equal => 0,
+    };
+    body[12] = if channel.band == 1 { 2 } else { 1 };
+    body[13] = 0; // CMD_CBW_20MHZ
+    body[14] = center;
+    body[15] = 0;
+    body[16] = 0; // CMD_CBW_20MHZ from AP
+    body[17] = center;
+    body[18] = 0;
+    body[19] = 0; // MT7921_ROC_REQ_JOIN
+    body[20..24].copy_from_slice(&duration_ms.to_le_bytes());
+    body[24] = 0xff;
+    Ok(encode_uni_mcu(0x27, &body, sequence))
+}
+
+/// Source-exact MT7921 JOIN remain-on-channel abort (UNI ROC, CID 0x27).
+pub fn encode_client_join_roc_abort(
+    sequence: u8,
+    bss_index: u8,
+    token: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || token == 0 {
+        return Err("JOIN ROC abort identity is invalid".into());
+    }
+    let mut body = [0u8; 16];
+    body[4..8].copy_from_slice(&[1, 0, 12, 0]); // UNI_ROC_ABORT
+    body[8] = bss_index;
+    body[9] = token;
+    body[10] = 0xff;
+    Ok(encode_uni_mcu(0x27, &body, sequence))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientJoinRocGrant {
+    pub bss_index: u8,
+    pub token: u8,
+    pub status: u8,
+    pub primary_channel: u8,
+    pub band: u8,
+    pub bandwidth: u8,
+    pub center_channel: u8,
+    pub request_type: u8,
+    pub max_interval_ms: u32,
+}
+
+/// Parse the unsolicited UNI ROC grant event (EID 0x27). The first four event
+/// body bytes are the UNI event header; Linux likewise advances past them.
+pub fn parse_client_join_roc_grant(bytes: &[u8]) -> Result<ClientJoinRocGrant, String> {
+    let response = parse_download_response(bytes, 0).map_err(|_| "truncated JOIN ROC event")?;
+    if response.event_id != 0x27 || response.sequence != 0 || response.option & (1 << 2) == 0 {
+        return Err("wrong JOIN ROC event identity".into());
+    }
+    let grant = bytes.get(40..60).ok_or("truncated JOIN ROC grant")?;
+    if grant[0..4] != [0, 0, 20, 0] || grant[13] != 0 || grant[14] != 0xff {
+        return Err("invalid JOIN ROC grant TLV".into());
+    }
+    Ok(ClientJoinRocGrant {
+        bss_index: grant[4],
+        token: grant[5],
+        status: grant[6],
+        primary_channel: grant[7],
+        band: grant[9],
+        bandwidth: grant[10],
+        center_channel: grant[11],
+        request_type: grant[13],
+        max_interval_ms: u32::from_le_bytes(grant[16..20].try_into().expect("fixed field")),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_client_bss_basic_payload(
     bss_index: u8,
@@ -2759,6 +2863,20 @@ pub fn encode_client_interface_commands(
     {
         return Err("client interface identity or sequence is invalid".into());
     }
+    let dev = encode_client_interface_dev_command(client, enable, dev_sequence)?;
+    let bss = encode_client_interface_bss_command(enable, bss_sequence)?;
+    Ok(if enable { [dev, bss] } else { [bss, dev] })
+}
+
+/// Encode the DEV_INFO_ACTIVE half of client interface setup or teardown.
+pub fn encode_client_interface_dev_command(
+    client: [u8; 6],
+    enable: bool,
+    sequence: u8,
+) -> Result<Vec<u8>, String> {
+    if client == [0; 6] || client[0] & 3 != 2 || !(1..=15).contains(&sequence) {
+        return Err("client interface DEV identity or sequence is invalid".into());
+    }
     let mut dev = vec![0; 16];
     // omac_idx=0, band_idx=0, DEV_INFO_ACTIVE, link_idx=0.
     dev[4..8].copy_from_slice(&[0, 0, 12, 0]);
@@ -2766,11 +2884,16 @@ pub fn encode_client_interface_commands(
     dev[10..16].copy_from_slice(&client);
 
     // bss_idx=0, UNI_BSS_INFO_BASIC, first station VIF/WMM/band/OMAC.
-    let bss = encode_client_bss_basic_payload(0, enable, 1, [0; 6], 0, 0, 0, 0, 0, 0);
+    Ok(encode_uni_mcu(1, &dev, sequence))
+}
 
-    let dev = encode_uni_mcu(1, &dev, dev_sequence);
-    let bss = encode_uni_mcu(2, &bss, bss_sequence);
-    Ok(if enable { [dev, bss] } else { [bss, dev] })
+/// Encode the BSS_INFO_BASIC half of client interface setup or teardown.
+pub fn encode_client_interface_bss_command(enable: bool, sequence: u8) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) {
+        return Err("client interface BSS sequence is invalid".into());
+    }
+    let bss = encode_client_bss_basic_payload(0, enable, 1, [0; 6], 0, 0, 0, 0, 0, 0);
+    Ok(encode_uni_mcu(2, &bss, sequence))
 }
 
 /// Encode only the pinned Linux commands required by the conservative passive
@@ -7063,6 +7186,10 @@ impl ClientFirmwareEffectsState {
     fn next_sequence(&mut self) -> u8 {
         self.sequence = self.sequence % 15 + 1;
         self.sequence
+    }
+
+    pub fn reserve_mcu_sequence(&mut self) -> u8 {
+        self.next_sequence()
     }
 
     pub fn prepare_preauth_peer(
@@ -12596,6 +12723,63 @@ mod tests {
             firmware_download_mode(0, true),
             DL_MODE_NEED_RESPONSE | DL_MODE_WORKING_PDA_CR4
         );
+    }
+
+    #[test]
+    fn join_roc_commands_match_linux_packed_payloads() {
+        let channel = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 36,
+            bandwidth: 0,
+            center2: 0,
+        };
+        let acquire = encode_client_join_roc_acquire(7, 0, 9, channel, 2_000).unwrap();
+        assert_eq!(acquire.len(), 76);
+        assert_eq!(&acquire[34..36], &0x27u16.to_le_bytes());
+        assert_eq!(
+            &acquire[48..],
+            &[
+                0, 0, 0, 0, 0, 0, 24, 0, 0, 9, 36, 0, 2, 0, 36, 0, 0, 36, 0, 0, 0xd0, 0x07, 0, 0,
+                0xff, 0, 0, 0,
+            ]
+        );
+        let abort = encode_client_join_roc_abort(8, 0, 9).unwrap();
+        assert_eq!(abort.len(), 64);
+        assert_eq!(
+            &abort[48..],
+            &[0, 0, 0, 0, 1, 0, 12, 0, 0, 9, 0xff, 0, 0, 0, 0, 0]
+        );
+        assert!(encode_client_join_roc_abort(8, 0, 0).is_err());
+    }
+
+    #[test]
+    fn join_roc_grant_parser_binds_token_and_channel() {
+        let mut bytes = [0u8; 60];
+        bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        bytes[28] = 0x27;
+        bytes[29] = 0;
+        bytes[30] = 1 << 2;
+        bytes[40..44].copy_from_slice(&[0, 0, 20, 0]);
+        bytes[44..56].copy_from_slice(&[0, 9, 0, 36, 0, 2, 0, 36, 0, 0, 0xff, 0]);
+        bytes[56..60].copy_from_slice(&2_000u32.to_le_bytes());
+        assert_eq!(
+            parse_client_join_roc_grant(&bytes).unwrap(),
+            ClientJoinRocGrant {
+                bss_index: 0,
+                token: 9,
+                status: 0,
+                primary_channel: 36,
+                band: 2,
+                bandwidth: 0,
+                center_channel: 36,
+                request_type: 0,
+                max_interval_ms: 2_000,
+            }
+        );
+        bytes[44] = 1;
+        assert_eq!(parse_client_join_roc_grant(&bytes).unwrap().bss_index, 1);
     }
 
     #[test]
