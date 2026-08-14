@@ -29,7 +29,7 @@ use mt7921_port_spike::{
     CONNAC2_MCU_TXD_BYTES, ClientChannelContext, ClientDataGeneration, ClientEdcaAc,
     ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
-    ClientWcid, LegacyWmeAssociation, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
+    ClientWcid, LegacyWmeAssociation, NicCapability, NicPhyCapability, PhysicalBand, CandidateChannel, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
     RateTxPowerAuthorizer, RateTxPowerTransport, RegulatoryRatePowerSnapshot, candidate_channels,
     classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
     encode_client_data_txwi, encode_client_early_edca_command, encode_client_edca_command,
@@ -1798,6 +1798,11 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
             _ => vec![],
         });
     }
+    let association = Some(mt7921_softmac_adapter::client_device::production_association_profile_from_query(
+        &query,
+        fidl_ieee80211::WlanBand::FiveGhz,
+    )
+    .expect("production 5 GHz SoftMAC query must carry authoritative HT/VHT capabilities"));
     ClientSupport {
         query,
         discovery: fidl_softmac::DiscoverySupport {
@@ -1826,7 +1831,7 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
             ..Default::default()
         },
         spectrum_management: Default::default(),
-        association: Some(Default::default()),
+        association,
     }
 }
 
@@ -3852,7 +3857,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v1","runtime_default_association_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v1","canonical_association_fixture_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3996,12 +4001,102 @@ fn run() -> Result<(), String> {
         }
         let raw_runtime = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
             .map_err(|error| format!("production ClientMlme raw association fixture: {error}"))?;
+        let canonical_profile = fuchsia_softmac_port::AssociationRequestProfile {
+            ht_capabilities: Some([
+                0xf3, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ]),
+            vht_capabilities: Some([
+                0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0,
+            ]),
+            ..Default::default()
+        };
+        let canonical_runtime =
+            mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+                &raw_runtime,
+                Some(&canonical_profile),
+            )
+            .map_err(|status| format!("canonical production association profile failed: {status}"))?
+            .ok_or("production DeviceOps boundary did not classify association request")?;
+        if mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+            &raw_runtime,
+            None,
+        )
+        .is_ok()
+            || mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+                &raw_runtime,
+                Some(&Default::default()),
+            )
+            .is_ok()
+        {
+            return Err("production association accepted missing authoritative HT/VHT inputs".into());
+        }
+
+        let nic = NicCapability {
+            element_count: 1,
+            mac_address: Some([0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]),
+            phy: Some(NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 3,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let query = query_from_capabilities(
+            nic,
+            &[CandidateChannel {
+                band: PhysicalBand::Ghz5,
+                number: 36,
+                frequency_mhz: 5180,
+            }],
+        );
+        let authoritative_profile =
+            mt7921_softmac_adapter::client_device::production_association_profile_from_query(
+                &query,
+                fidl_ieee80211::WlanBand::FiveGhz,
+            )
+            .map_err(|status| format!("authoritative SoftMAC query profile failed: {status}"))?;
+        if authoritative_profile.ht_capabilities.as_ref().unwrap()[0..3] != [0xf3, 0x09, 3]
+            || authoritative_profile.vht_capabilities.unwrap()
+                != [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+        {
+            return Err("firmware NIC capability to association profile drifted".into());
+        }
+        let mut alternate_base = raw_runtime.clone();
+        let mut offset = 28;
+        while offset < alternate_base.len() {
+            let len = usize::from(alternate_base[offset + 1]);
+            match alternate_base[offset] {
+                45 => alternate_base[offset + 2] ^= 0x8c,
+                191 => alternate_base[offset + 4] ^= 0x10,
+                _ => {}
+            }
+            offset += 2 + len;
+        }
         let runtime = mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
             &raw_runtime,
-            Some(&Default::default()),
+            Some(&authoritative_profile),
         )
-        .map_err(|status| format!("production association profile failed: {status}"))?
+        .map_err(|status| format!("device-derived production association profile failed: {status}"))?
         .ok_or("production DeviceOps boundary did not classify association request")?;
+        let alternate_runtime =
+            mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
+                &alternate_base,
+                Some(&authoritative_profile),
+            )
+            .map_err(|status| {
+                format!("alternate-base production association profile failed: {status}")
+            })?
+            .ok_or("production DeviceOps boundary did not classify alternate association request")?;
+        if runtime != alternate_runtime {
+            return Err("authoritative HT/VHT transform retained base-dependent bytes".into());
+        }
         let runtime_ies = parse_ies(&runtime)?;
         let runtime_id_lengths = runtime_ies
             .iter()
@@ -4011,6 +4106,14 @@ fn run() -> Result<(), String> {
             .iter()
             .find(|(id, _)| *id == 48)
             .ok_or("runtime RSN missing")?;
+        let runtime_ht = runtime_ies
+            .iter()
+            .find(|(id, _)| *id == 45)
+            .ok_or("runtime HT missing")?;
+        let runtime_vht = runtime_ies
+            .iter()
+            .find(|(id, _)| *id == 191)
+            .ok_or("runtime VHT missing")?;
         if runtime[..24] != raw_runtime[..24]
             || runtime[26..28] != raw_runtime[26..28]
             || runtime[4..10] != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
@@ -4024,6 +4127,8 @@ fn run() -> Result<(), String> {
             || runtime_id_lengths
                 != [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)]
             || runtime_rsn.1[18..20] != [0x80, 0]
+            || runtime_ht.1.as_slice() != authoritative_profile.ht_capabilities.as_ref().unwrap()
+            || runtime_vht.1.as_slice() != authoritative_profile.vht_capabilities.as_ref().unwrap()
         {
             return Err(format!(
                 "production runtime association contract drifted: len={} cap=0x{:04x} ies={runtime_id_lengths:?} rsn={:02x?}",
@@ -4032,23 +4137,30 @@ fn run() -> Result<(), String> {
                 &runtime_rsn.1[18..20]
             ));
         }
+        let mut normalized_canonical = canonical_runtime.clone();
+        normalized_canonical[22..24].fill(0);
+        let canonical_sha256 = sha256_hex(&normalized_canonical);
+        if canonical_sha256 != "aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4"
+            || canonical_sha256 == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
+        {
+            return Err(format!(
+                "fully specified canonical association hash drifted: {canonical_sha256}"
+            ));
+        }
         let mut normalized_runtime = runtime.clone();
         normalized_runtime[22..24].fill(0);
-        let runtime_sha256 = Sha256::digest(&normalized_runtime)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if runtime_sha256 != "a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55"
-            || runtime_sha256 == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
-        {
-            return Err(format!("production runtime association hash drifted: {runtime_sha256}"));
+        let runtime_sha256 = sha256_hex(&normalized_runtime);
+        if runtime_sha256 != "aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4" {
+            return Err(format!(
+                "two-stream device-query association fixture drifted: {runtime_sha256}"
+            ));
         }
         let without_h2e_sha256 = Sha256::digest(&without_h2e)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         println!(
-            r#"{{"production_association_request_self_test":"passed","oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation","association_request_contract":"mt7921-supported-subset-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","oracle_normalized_sha256":"{sha256}","runtime_default_normalized_sha256":"{runtime_sha256}","runtime_default_capability":"0x0011","runtime_default_rsn_capabilities":"0x0080","runtime_default_ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","runtime_default_frame_len":119,"rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","observed_stale_hash_8646ba36_rejected":true,"oracle_frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
+            r#"{{"production_association_request_self_test":"passed","oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation","association_request_contract":"mt7921-supported-subset-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","oracle_normalized_sha256":"{sha256}","canonical_fixture_normalized_sha256":"{canonical_sha256}","device_query_fixture_normalized_sha256":"{runtime_sha256}","runtime_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","two_distinct_base_inputs":true,"missing_authoritative_input_rejected":true,"runtime_capability":"0x0011","runtime_rsn_capabilities":"0x0080","runtime_ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","runtime_frame_len":119,"rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","observed_stale_hash_8646ba36_rejected":true,"oracle_frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
             frame.len(),
         );
         return Ok(());
@@ -13484,6 +13596,26 @@ impl Drop for LiveClientEffects {
 impl Mt7921ClientEffects for LiveClientEffects {
     fn validation_complete(&self) -> bool {
         self.state.lock().unwrap().validation_complete
+    }
+
+    fn association_capability_transformation(
+        &mut self,
+        evidence: &mt7921_softmac_adapter::client_device::AssociationCapabilityTransformation,
+        final_frame: &[u8],
+    ) {
+        let mut normalized = final_frame.to_vec();
+        normalized[22..24].fill(0);
+        record_sae_stage(&format!(
+            "association_capability_transformation source={} contract=device-authoritative-ht-vht-v1 base_ht_sha256={} base_vht_sha256={} authoritative_ht_sha256={} authoritative_vht_sha256={} final_ht_sha256={} final_vht_sha256={} normalized_frame_sha256={}",
+            mt7921_softmac_adapter::client_device::ASSOCIATION_CAPABILITY_INPUT_SOURCE,
+            sha256_hex(&evidence.base_ht),
+            sha256_hex(&evidence.base_vht),
+            sha256_hex(&evidence.authoritative_ht),
+            sha256_hex(&evidence.authoritative_vht),
+            sha256_hex(&evidence.final_ht),
+            sha256_hex(&evidence.final_vht),
+            sha256_hex(&normalized),
+        ));
     }
 
     fn eapol_ind_delivered_to_sme(&mut self) {

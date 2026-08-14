@@ -391,7 +391,10 @@
               BSS_WIRE_CONTRACT=connac2-bss-wire-v1
               PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
               ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1
-              RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55
+              CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4
+              RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
+              ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1
+              ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1
               ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
               ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
               EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
@@ -514,10 +517,15 @@
                 | grep -F '"rsnxe_source":"selected_bss"' \
                 | grep -F '"selected_bss_without_h2e":"rsnxe_absent_wmm_present"' \
                 | grep -F '"observed_stale_hash_8646ba36_rejected":true' \
-                | grep -F '"runtime_default_normalized_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55"' \
-                | grep -F '"runtime_default_capability":"0x0011"' \
-                | grep -F '"runtime_default_rsn_capabilities":"0x0080"' \
-                | grep -F '"runtime_default_frame_len":119' \
+                | grep -F '"canonical_fixture_normalized_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4"' \
+                | grep -F '"device_query_fixture_normalized_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4"' \
+                | grep -F '"runtime_hash_policy":"input-dependent"' \
+                | grep -F '"association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1"' \
+                | grep -F '"association_transformation_contract":"device-authoritative-ht-vht-v1"' \
+                | grep -F '"two_distinct_base_inputs":true,"missing_authoritative_input_rejected":true' \
+                | grep -F '"runtime_capability":"0x0011"' \
+                | grep -F '"runtime_rsn_capabilities":"0x0080"' \
+                | grep -F '"runtime_frame_len":119' \
                 | grep -F '"oracle_frame_len":204' \
                 | grep -F '"fuchsia_base_revision":"${mt7921FuchsiaSource.fuchsiaBaseRevision}"' \
                 | grep -F '"fuchsia_ordered_patch_set_sha256":"${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}"'
@@ -596,7 +604,7 @@
                 : > work/var/regulatory.db
                 printf 'Passphrase=eight-by\n' > work/var/ph1.psk
                 cp work/var/ph1.psk work/var/mock-ph1.psk
-                printf '%s\n' '{"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","association_request_contract":"mt7921-supported-subset-v1","runtime_default_association_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}' > work/var/artifact-identity.json
+                printf '%s\n' '{"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","association_request_contract":"mt7921-supported-subset-v1","canonical_association_fixture_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}' > work/var/artifact-identity.json
                 substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
                   --subst-var-by shell ${pkgs.runtimeShell} \
                   --subst-var-by driver "$PWD/work/bin/validation-stub" \
@@ -1024,7 +1032,10 @@
                 ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
                 PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
                 ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1
-                RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55
+                CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4
+                RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
+                ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1
+                ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1
                 ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
                 ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
                 EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
@@ -1086,7 +1097,10 @@
                 grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$out"
                 grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$out"
                 grep -Fx 'ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1' "$out"
-                grep -Fx 'RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55' "$out"
+                grep -Fx 'CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4' "$out"
+                grep -Fx 'RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent' "$out"
+                grep -Fx 'ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1' "$out"
+                grep -Fx 'ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1' "$out"
                 grep -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' "$out"
                 grep -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' "$out"
                 grep -Fx "PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)" "$out"
@@ -1185,7 +1199,7 @@
               cat "$PWD/stale-telemetry-identity.json"
               EOF
               chmod +x stale-telemetry-launcher
-              sed 's/"runtime_default_association_sha256":"[^"]*"/"runtime_default_association_sha256":"stale"/' \
+              sed 's/"association_capability_input_source":"[^"]*"/"association_capability_input_source":"stale"/' \
                 ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 > stale-runtime-identity.json
               sed 's/"oracle_comparison_contract":"[^"]*"/"oracle_comparison_contract":"stale"/' \
@@ -1526,7 +1540,10 @@
                 ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
                 PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
                 ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1
-                RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55
+                CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4
+                RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
+                ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1
+                ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1
                 ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
                 ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
                 EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
@@ -1577,7 +1594,10 @@
                 grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$manifest"
                 grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$manifest"
                 grep -Fx 'ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1' "$manifest"
-                grep -Fx 'RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55' "$manifest"
+                grep -Fx 'CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4' "$manifest"
+                grep -Fx 'RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent' "$manifest"
+                grep -Fx 'ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1' "$manifest"
+                grep -Fx 'ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1' "$manifest"
                 grep -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' "$manifest"
                 grep -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' "$manifest"
                 grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
@@ -1634,7 +1654,7 @@
               echo sha256:registered-proof-stub
               EOF
               cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","association_request_contract":"mt7921-supported-subset-v1","runtime_default_association_sha256":"a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
+              {"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","association_request_contract":"mt7921-supported-subset-v1","canonical_association_fixture_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
               EOF
               cat > work/launcher <<'EOF'
               #!${pkgs.runtimeShell}
@@ -1702,7 +1722,10 @@
               ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
               PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
               ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v1
-              RUNTIME_DEFAULT_ASSOCIATION_SHA256=a0a6903ba753ebe8e8063804a448eacada51d5dd994c6f547a03fda49a90ce55
+              CANONICAL_ASSOCIATION_FIXTURE_SHA256=aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4
+              RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
+              ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability-to-softmac-query-band-v1
+              ASSOCIATION_TRANSFORMATION_CONTRACT=device-authoritative-ht-vht-v1
               ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
               ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
               EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
@@ -1738,7 +1761,7 @@
               grep -Fx 'ROOT_UID=0 ARGC=1 ARG1=--plan' proof-transcript
               cp sudo-transcript before
               cp work/identity work/identity.good
-              sed -i 's/"runtime_default_association_sha256":"[^"]*"/"runtime_default_association_sha256":"stale"/' work/identity
+              sed -i 's/"association_capability_input_source":"[^"]*"/"association_capability_input_source":"stale"/' work/identity
               if work/entry --plan; then exit 1; fi
               cmp before sudo-transcript
               cp work/identity.good work/identity

@@ -42,6 +42,108 @@ pub fn apply_production_association_profile(
         .map_err(|_| zx::Status::IO_DATA_INTEGRITY)
 }
 
+/// Stable ownership contract for association HT/VHT inputs. The values come
+/// from the firmware NIC capability decoded into the SoftMAC query, not from
+/// the AP-intersected frame serialized by ClientMlme.
+pub const ASSOCIATION_CAPABILITY_INPUT_SOURCE: &str =
+    "firmware-nic-capability-to-softmac-query-band-v1";
+
+pub fn production_association_profile_from_query(
+    query: &fidl_softmac::WlanSoftmacQueryResponse,
+    band: fidl_ieee80211::WlanBand,
+) -> Result<fuchsia_softmac_port::AssociationRequestProfile, zx::Status> {
+    let capability = query
+        .band_caps
+        .as_ref()
+        .and_then(|capabilities| {
+            capabilities
+                .iter()
+                .find(|capability| capability.band == Some(band))
+        })
+        .ok_or(zx::Status::NOT_SUPPORTED)?;
+    let ht_capabilities = capability
+        .ht_caps
+        .as_ref()
+        .map(|capability| capability.bytes)
+        .ok_or(zx::Status::NOT_SUPPORTED)?;
+    let vht_capabilities = capability
+        .vht_caps
+        .as_ref()
+        .map(|capability| capability.bytes)
+        .ok_or(zx::Status::NOT_SUPPORTED)?;
+    Ok(fuchsia_softmac_port::AssociationRequestProfile {
+        ht_capabilities: Some(ht_capabilities),
+        vht_capabilities: Some(vht_capabilities),
+        ..Default::default()
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssociationCapabilityTransformation {
+    pub base_ht: [u8; 26],
+    pub base_vht: [u8; 12],
+    pub authoritative_ht: [u8; 26],
+    pub authoritative_vht: [u8; 12],
+    pub final_ht: [u8; 26],
+    pub final_vht: [u8; 12],
+}
+
+fn association_ht_vht(frame: &[u8]) -> Result<([u8; 26], [u8; 12]), zx::Status> {
+    let mut offset = 28usize;
+    let mut ht = None;
+    let mut vht = None;
+    while offset < frame.len() {
+        let header = frame
+            .get(offset..offset + 2)
+            .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        let end = offset
+            .checked_add(2 + usize::from(header[1]))
+            .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        let body = frame
+            .get(offset + 2..end)
+            .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+        match header[0] {
+            45 => ht = Some(body.try_into().map_err(|_| zx::Status::IO_DATA_INTEGRITY)?),
+            191 => vht = Some(body.try_into().map_err(|_| zx::Status::IO_DATA_INTEGRITY)?),
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok((
+        ht.ok_or(zx::Status::IO_DATA_INTEGRITY)?,
+        vht.ok_or(zx::Status::IO_DATA_INTEGRITY)?,
+    ))
+}
+
+fn prepare_production_wlan_frame_with_evidence(
+    frame: &[u8],
+    profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
+) -> Result<Option<(Vec<u8>, AssociationCapabilityTransformation)>, zx::Status> {
+    if frame.len() < 28 || u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc != 0 {
+        return Ok(None);
+    }
+    let profile = profile.ok_or(zx::Status::BAD_STATE)?;
+    let authoritative_ht = profile.ht_capabilities.ok_or(zx::Status::BAD_STATE)?;
+    let authoritative_vht = profile.vht_capabilities.ok_or(zx::Status::BAD_STATE)?;
+    let (base_ht, base_vht) = association_ht_vht(frame)?;
+    let final_frame = apply_production_association_profile(frame, profile)?;
+    let (final_ht, final_vht) = association_ht_vht(&final_frame)?;
+    if final_ht != authoritative_ht || final_vht != authoritative_vht {
+        return Err(zx::Status::IO_DATA_INTEGRITY);
+    }
+    Ok(Some((
+        final_frame,
+        AssociationCapabilityTransformation {
+            base_ht,
+            base_vht,
+            authoritative_ht,
+            authoritative_vht,
+            final_ht,
+            final_vht,
+        },
+    )))
+}
+
 /// Prepare a frame at the production `DeviceOps` effect boundary. Only an
 /// association request is semantically rebuilt; every other frame remains
 /// byte-for-byte owned by ClientMlme.
@@ -49,14 +151,8 @@ pub fn prepare_production_wlan_frame(
     frame: &[u8],
     profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
 ) -> Result<Option<Vec<u8>>, zx::Status> {
-    if profile.is_some()
-        && frame.len() >= 28
-        && u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc == 0
-    {
-        apply_production_association_profile(frame, profile.unwrap()).map(Some)
-    } else {
-        Ok(None)
-    }
+    prepare_production_wlan_frame_with_evidence(frame, profile)
+        .map(|prepared| prepared.map(|(frame, _)| frame))
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +382,15 @@ pub trait Mt7921ClientEffects {
 
     /// Confirms that an EAPOL indication was synchronously dispatched to SME.
     fn eapol_ind_delivered_to_sme(&mut self) {}
+
+    /// Observe the exact production association transformation immediately
+    /// before the resulting bytes cross the physical effect boundary.
+    fn association_capability_transformation(
+        &mut self,
+        _: &AssociationCapabilityTransformation,
+        _: &[u8],
+    ) {
+    }
 
     /// Immediately poison scan-derived authority in every shared TX handle.
     fn revoke_scan(&mut self);
@@ -1183,10 +1288,17 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         let ComposedBackend { effects, scan, .. } = &mut *backend;
         let tx_flags = wlan_softmac_class_support::tx_carrier(&buffer, tx_flags, associated)
             .map_or(tx_flags, |carrier| carrier.flags);
-        let association =
-            prepare_production_wlan_frame(&buffer, self.support.association.as_ref())?;
+        let association = prepare_production_wlan_frame_with_evidence(
+            &buffer,
+            self.support.association.as_ref(),
+        )?;
+        if let Some((frame, evidence)) = association.as_ref() {
+            effects.association_capability_transformation(evidence, frame);
+        }
         effects.send_wlan_frame(
-            association.as_deref().unwrap_or(&buffer),
+            association
+                .as_ref()
+                .map_or(&buffer[..], |(frame, _)| frame.as_slice()),
             tx_flags,
             scan,
         )
@@ -2119,7 +2231,13 @@ mod tests {
                     ..Default::default()
                 },
             ]);
-            device_support.association = Some(Default::default());
+            device_support.association = Some(
+                production_association_profile_from_query(
+                    &device_support.query,
+                    fidl_ieee80211::WlanBand::FiveGhz,
+                )
+                .unwrap(),
+            );
             let effects = FakeEffects::default();
             let device = Mt7921ClientDevice::new_offline_fake(effects, device_support);
             let backend = Arc::clone(&device.backend);
