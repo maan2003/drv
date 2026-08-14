@@ -1216,17 +1216,20 @@ pub fn query_from_capabilities(
     }
 }
 
-// Linux v7.1.5 mt76/mac80211.c::mt76_init_sband and
-// mt7921/init.c::mt7921_register_device. The firmware NIC PHY TLV supplies
-// the supported modes and stream count; this host representation deliberately
-// omits HE because the pinned Fuchsia BandCapability has no HE field.
+// Linux v7.1.5 mt76/mac80211 capability initialization plus the supported
+// association-time narrowing performed by mac80211's HT/VHT IE builders. The
+// firmware NIC PHY TLV supplies the modes and stream count; this host
+// representation deliberately omits HE because the pinned Fuchsia
+// BandCapability has no HE field.
 fn mt7921_ht_vht_capabilities(
     phy: mt7921_port_spike::NicPhyCapability,
 ) -> (Option<HtCapabilities>, Option<VhtCapabilities>) {
     let streams = usize::from(phy.spatial_streams.clamp(1, 8));
     let mut ht = [0; 26];
-    // LDPC | 20/40 | greenfield | SGI20 | SGI40 | RX-STBC-1 | max AMSDU.
-    let mut ht_cap = 0x0973u16;
+    // mt76 initializes LDPC, 20/40, greenfield, SGI20/40, RX-STBC-1 and max
+    // AMSDU. ieee80211_add_ht_ie then writes the disabled SMPS encoding when
+    // runtime SMPS is off; leaving the two-bit field zero means static SMPS.
+    let mut ht_cap = 0x097fu16;
     if streams > 1 {
         ht_cap |= 0x0080;
     }
@@ -1237,9 +1240,11 @@ fn mt7921_ht_vht_capabilities(
 
     let vht = phy.vht.then(|| {
         let mut bytes = [0; 12];
-        // MPDU-11454 | RX-LDPC | SGI80 | RX-STBC-1 | SU/MU beamformee |
-        // beamformee STS-3 | max AMPDU exponent | invariant antenna patterns.
-        let mut cap = 0x3390_7132u32;
+        // MT7961's association subset: MPDU-11454 | RX-LDPC | SGI80 |
+        // RX-STBC-1 | SU beamformee | beamformee STS-3 | max AMPDU exponent |
+        // invariant antenna patterns. Registration includes MU beamformee,
+        // but ieee80211_add_vht_ie removes it without AP MU-beamformer support.
+        let mut cap = 0x3380_7132u32;
         if streams > 1 {
             cap |= 0x0000_0080;
         }
@@ -1251,6 +1256,9 @@ fn mt7921_ht_vht_capabilities(
         }
         bytes[4..6].copy_from_slice(&mcs_map.to_le_bytes());
         bytes[8..10].copy_from_slice(&mcs_map.to_le_bytes());
+        // mt76_init_stream_cap sets IEEE80211_VHT_EXT_NSS_BW_CAPABLE after
+        // mt792x advertises SUPPORTS_VHT_EXT_NSS_BW.
+        bytes[10..12].copy_from_slice(&0x2000u16.to_le_bytes());
         VhtCapabilities { bytes }
     });
     (Some(HtCapabilities { bytes: ht }), vht)
@@ -1290,19 +1298,85 @@ mod tests {
         let band = &query.band_caps.unwrap()[0];
         let ht = band.ht_caps.unwrap().bytes;
         let vht = band.vht_caps.unwrap().bytes;
-        assert_eq!(&ht[0..3], &[0xf3, 0x09, 0x03]);
+        assert_eq!(&ht[0..3], &[0xff, 0x09, 0x03]);
         assert_eq!(&ht[3..15], &[0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(ht[15], 1);
         assert_eq!(&ht[16..], &[0; 10]);
         assert_eq!(
             vht,
-            [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
         );
         // MT7961 follows mt76_init_sband + mt7921_register_device's
         // non-MT7922 branch: SGI80 is advertised, SGI160 is not.
         assert_ne!(vht[0] & 0x20, 0);
         assert_eq!(vht[0] & 0x40, 0);
         assert!(query.supported_phys.unwrap().contains(&WlanPhyType::He));
+    }
+
+    #[test]
+    fn actual_softmac_query_and_pinned_regdb_form_supported_subset_v2() {
+        let capability = NicCapability {
+            element_count: 1,
+            mac_address: Some([2, 0, 0, 0, 0, 1]),
+            phy: Some(mt7921_port_spike::NicPhyCapability {
+                ht: true,
+                vht: true,
+                has_5ghz: true,
+                max_bandwidth: 2,
+                spatial_streams: 2,
+                hardware_path: 3,
+                he: true,
+            }),
+            has_6ghz: Some(false),
+            chip_capability: None,
+            unknown_elements: 0,
+        };
+        let query = query_from_capabilities(
+            capability,
+            &mt7921_port_spike::candidate_channels(capability),
+        );
+        let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
+        let regulatory = mt7921_port_spike::regulatory_rate_power_snapshot_from_regdb_v20(
+            database,
+            0,
+            *b"00",
+            capability,
+            [7; 32],
+        )
+        .unwrap();
+        let profile = crate::client_device::production_association_profile_from_query_and_regulatory(
+            &query,
+            WlanBand::FiveGhz,
+            36,
+            &regulatory,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.ht_capabilities.unwrap(),
+            [
+                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(
+            profile.vht_capabilities.unwrap(),
+            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
+        );
+        let regulatory = profile.regulatory.unwrap();
+        assert_eq!((regulatory.min_tx_power_dbm, regulatory.max_tx_power_dbm), (0, 20));
+        assert_eq!(
+            regulatory
+                .supported_channels
+                .iter()
+                .map(|range| (range.first, range.count))
+                .collect::<Vec<_>>(),
+            [
+                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
+                128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+            ]
+            .map(|channel| (channel, 1))
+        );
+        assert_eq!(profile.station, Default::default());
     }
 
     fn connac2_envelope(mcu_normal: bool, group5: bool) -> (Vec<u8>, Vec<u8>) {

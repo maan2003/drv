@@ -10347,11 +10347,15 @@ mod tests {
     }
 
     #[test]
-    fn independent_linux_ht_vht_assoc_transcript_has_every_required_tlv() {
+    fn corrected_linux_ht_vht_caps_reach_sta_rec_without_drift() {
         let mut ht = [0u8; 26];
-        ht[..3].copy_from_slice(&[0xf3, 0x09, 0x03]);
+        ht[..3].copy_from_slice(&[0xff, 0x09, 0x03]);
         ht[3..5].copy_from_slice(&[0xff, 0xff]);
-        let vht = [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+        ht[15] = 1;
+        let vht = [
+            0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+        ];
+        assert_eq!(&vht[10..12], &[0, 0x20]);
         let encoded = encode_legacy_wme_add_wcid_command(
             9,
             0,
@@ -10368,13 +10372,18 @@ mod tests {
         .unwrap();
         assert_eq!(encoded.len(), 232);
         assert_eq!(u16::from_le_bytes(encoded[50..52].try_into().unwrap()), 8);
-        assert_eq!(&encoded[76..84], &[9, 0, 8, 0, 0xf3, 0x09, 0, 0]);
+        assert_eq!(&encoded[76..84], &[9, 0, 8, 0, 0xff, 0x09, 0, 0]);
         assert_eq!(
             &encoded[84..100],
             &[
-                10, 0, 16, 0, 0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0
+                10, 0, 16, 0, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0xfa, 0xff, 0, 0, 0, 0
             ]
         );
+        // Linux STA_REC_VHT ends with rts_bw_sig plus three reserved bytes;
+        // query/request tx_highest is not part of this firmware TLV.
+        assert_eq!(&encoded[96..100], &[0; 4]);
+        assert_ne!(&encoded[80..82], &[0xf3, 0x09]);
+        assert_ne!(&encoded[88..92], &[0x90, 0x33, 0xfa, 0xff]);
         assert_eq!(encoded[88] & 0x40, 0); // negotiated STA_REC_VHT SGI160 clear
         assert_eq!(&encoded[100..108], &[15, 0, 8, 0, 8, 1, 1, 0]);
         assert_eq!(

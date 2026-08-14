@@ -26,15 +26,15 @@ use fuchsia_softmac_port::{
 use ieee80211::MacAddrBytes as _;
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_port_spike::{
-    CONNAC2_MCU_TXD_BYTES, ClientChannelContext, ClientDataGeneration, ClientEdcaAc,
-    ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
+    CONNAC2_MCU_TXD_BYTES, CandidateChannel, ClientChannelContext, ClientDataGeneration,
+    ClientEdcaAc, ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
-    ClientWcid, LegacyWmeAssociation, NicCapability, NicPhyCapability, PhysicalBand, CandidateChannel, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
-    RateTxPowerAuthorizer, RateTxPowerTransport, RegulatoryRatePowerSnapshot, candidate_channels,
-    classify_preassociation_sae_auth, connac2_group1_pn, encode_client_bss_command,
-    encode_client_data_txwi, encode_client_early_edca_command, encode_client_edca_command,
-    encode_client_interface_commands, encode_client_management_tx,
-    encode_client_post_assoc_beacon_timing_command,
+    ClientWcid, LegacyWmeAssociation, NicCapability, NicPhyCapability, PassiveMacMmioOperation,
+    PassiveMcuCommand, PassiveRxError, PhysicalBand, RateTxPowerAuthorizer, RateTxPowerTransport,
+    RegulatoryRatePowerSnapshot, candidate_channels, classify_preassociation_sae_auth,
+    connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi,
+    encode_client_early_edca_command, encode_client_edca_command, encode_client_interface_commands,
+    encode_client_management_tx, encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
@@ -1798,11 +1798,13 @@ fn live_client_support(mut query: fidl_softmac::WlanSoftmacQueryResponse) -> Cli
             _ => vec![],
         });
     }
-    let association = Some(mt7921_softmac_adapter::client_device::production_association_profile_from_query(
-        &query,
-        fidl_ieee80211::WlanBand::FiveGhz,
-    )
-    .expect("production 5 GHz SoftMAC query must carry authoritative HT/VHT capabilities"));
+    let association = Some(
+        mt7921_softmac_adapter::client_device::production_association_profile_from_query(
+            &query,
+            fidl_ieee80211::WlanBand::FiveGhz,
+        )
+        .expect("production 5 GHz SoftMAC query must carry authoritative HT/VHT capabilities"),
+    );
     ClientSupport {
         query,
         discovery: fidl_softmac::DiscoverySupport {
@@ -3857,7 +3859,7 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "fuchsia-passive")]
             validate_bss_wire_contract()?;
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v1","canonical_association_fixture_sha256":"aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"mt7921-supported-subset-v2","canonical_association_fixture_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2","association_transformation_contract":"device+pinned-regdb-authoritative-association-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -4002,12 +4004,22 @@ fn run() -> Result<(), String> {
         let raw_runtime = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
             .map_err(|error| format!("production ClientMlme raw association fixture: {error}"))?;
         let canonical_profile = fuchsia_softmac_port::AssociationRequestProfile {
+            regulatory: Some(fuchsia_softmac_port::RegulatoryAssociationCapabilities {
+                min_tx_power_dbm: 0,
+                max_tx_power_dbm: 20,
+                supported_channels: [
+                    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132,
+                    136, 140, 144, 149, 153, 157, 161, 165,
+                ]
+                .map(|first| fuchsia_softmac_port::SupportedChannelRange { first, count: 1 })
+                .to_vec(),
+            }),
             ht_capabilities: Some([
-                0xf3, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
+                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
             ]),
             vht_capabilities: Some([
-                0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0,
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
             ]),
             ..Default::default()
         };
@@ -4018,18 +4030,17 @@ fn run() -> Result<(), String> {
             )
             .map_err(|status| format!("canonical production association profile failed: {status}"))?
             .ok_or("production DeviceOps boundary did not classify association request")?;
-        if mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
-            &raw_runtime,
-            None,
-        )
-        .is_ok()
+        if mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(&raw_runtime, None)
+            .is_ok()
             || mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
                 &raw_runtime,
                 Some(&Default::default()),
             )
             .is_ok()
         {
-            return Err("production association accepted missing authoritative HT/VHT inputs".into());
+            return Err(
+                "production association accepted missing authoritative HT/VHT inputs".into(),
+            );
         }
 
         let nic = NicCapability {
@@ -4048,25 +4059,29 @@ fn run() -> Result<(), String> {
             chip_capability: None,
             unknown_elements: 0,
         };
-        let query = query_from_capabilities(
-            nic,
-            &[CandidateChannel {
-                band: PhysicalBand::Ghz5,
-                number: 36,
-                frequency_mhz: 5180,
-            }],
-        );
+        let query = query_from_capabilities(nic, &candidate_channels(nic));
+        let database = include_bytes!("../../../mt7921-core/tests/fixtures/regulatory.db");
+        let regulatory =
+            regulatory_rate_power_snapshot_from_regdb_v20(database, 0, *b"00", nic, [7; 32])
+                .map_err(|error| format!("self-test pinned regdb profile: {error:?}"))?;
         let authoritative_profile =
-            mt7921_softmac_adapter::client_device::production_association_profile_from_query(
+            mt7921_softmac_adapter::client_device::production_association_profile_from_query_and_regulatory(
                 &query,
                 fidl_ieee80211::WlanBand::FiveGhz,
+                36,
+                &regulatory,
             )
             .map_err(|status| format!("authoritative SoftMAC query profile failed: {status}"))?;
-        if authoritative_profile.ht_capabilities.as_ref().unwrap()[0..3] != [0xf3, 0x09, 3]
+        if authoritative_profile.ht_capabilities.as_ref().unwrap()[0..3] != [0xff, 0x09, 3]
             || authoritative_profile.vht_capabilities.unwrap()
-                != [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+                != [
+                    0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+                ]
+            || authoritative_profile.regulatory != canonical_profile.regulatory
         {
-            return Err("firmware NIC capability to association profile drifted".into());
+            return Err(
+                "firmware NIC capability plus pinned regdb association profile drifted".into(),
+            );
         }
         let mut alternate_base = raw_runtime.clone();
         let mut offset = 28;
@@ -4083,7 +4098,9 @@ fn run() -> Result<(), String> {
             &raw_runtime,
             Some(&authoritative_profile),
         )
-        .map_err(|status| format!("device-derived production association profile failed: {status}"))?
+        .map_err(|status| {
+            format!("device-derived production association profile failed: {status}")
+        })?
         .ok_or("production DeviceOps boundary did not classify association request")?;
         let alternate_runtime =
             mt7921_softmac_adapter::client_device::prepare_production_wlan_frame(
@@ -4093,7 +4110,9 @@ fn run() -> Result<(), String> {
             .map_err(|status| {
                 format!("alternate-base production association profile failed: {status}")
             })?
-            .ok_or("production DeviceOps boundary did not classify alternate association request")?;
+            .ok_or(
+                "production DeviceOps boundary did not classify alternate association request",
+            )?;
         if runtime != alternate_runtime {
             return Err("authoritative HT/VHT transform retained base-dependent bytes".into());
         }
@@ -4122,10 +4141,20 @@ fn run() -> Result<(), String> {
         {
             return Err("production DeviceOps preparation changed target, client, frame-control, sequence, or retry policy".into());
         }
-        if runtime.len() != 119
-            || u16::from_le_bytes(runtime[24..26].try_into().unwrap()) != 0x0011
+        if runtime.len() != 175
+            || u16::from_le_bytes(runtime[24..26].try_into().unwrap()) != 0x0111
             || runtime_id_lengths
-                != [(0, 3), (1, 8), (48, 20), (45, 26), (191, 12), (244, 1), (221, 7)]
+                != [
+                    (0, 3),
+                    (1, 8),
+                    (33, 2),
+                    (36, 50),
+                    (48, 20),
+                    (45, 26),
+                    (191, 12),
+                    (244, 1),
+                    (221, 7),
+                ]
             || runtime_rsn.1[18..20] != [0x80, 0]
             || runtime_ht.1.as_slice() != authoritative_profile.ht_capabilities.as_ref().unwrap()
             || runtime_vht.1.as_slice() != authoritative_profile.vht_capabilities.as_ref().unwrap()
@@ -4140,8 +4169,11 @@ fn run() -> Result<(), String> {
         let mut normalized_canonical = canonical_runtime.clone();
         normalized_canonical[22..24].fill(0);
         let canonical_sha256 = sha256_hex(&normalized_canonical);
-        if canonical_sha256 != "aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4"
-            || canonical_sha256 == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
+        if canonical_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"
+            || canonical_sha256
+                == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
+            || canonical_sha256
+                == "aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4"
         {
             return Err(format!(
                 "fully specified canonical association hash drifted: {canonical_sha256}"
@@ -4150,7 +4182,7 @@ fn run() -> Result<(), String> {
         let mut normalized_runtime = runtime.clone();
         normalized_runtime[22..24].fill(0);
         let runtime_sha256 = sha256_hex(&normalized_runtime);
-        if runtime_sha256 != "aa0306b8149896b679356f23657c7a77b49b82bfd4d485e3009831e4473437c4" {
+        if runtime_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4" {
             return Err(format!(
                 "two-stream device-query association fixture drifted: {runtime_sha256}"
             ));
@@ -4160,7 +4192,7 @@ fn run() -> Result<(), String> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         println!(
-            r#"{{"production_association_request_self_test":"passed","oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation","association_request_contract":"mt7921-supported-subset-v1","oracle_comparison_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","oracle_normalized_sha256":"{sha256}","canonical_fixture_normalized_sha256":"{canonical_sha256}","device_query_fixture_normalized_sha256":"{runtime_sha256}","runtime_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability-to-softmac-query-band-v1","association_transformation_contract":"device-authoritative-ht-vht-v1","two_distinct_base_inputs":true,"missing_authoritative_input_rejected":true,"runtime_capability":"0x0011","runtime_rsn_capabilities":"0x0080","runtime_ie_id_lengths":"0:3,1:8,48:20,45:26,191:12,244:1,221:7","runtime_frame_len":119,"rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","observed_stale_hash_8646ba36_rejected":true,"oracle_frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
+            r#"{{"production_association_request_self_test":"passed","oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation","association_request_contract":"mt7921-supported-subset-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1","listen_interval":5,"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7","oracle_normalized_sha256":"{sha256}","canonical_fixture_normalized_sha256":"{canonical_sha256}","device_query_fixture_normalized_sha256":"{runtime_sha256}","runtime_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2","association_transformation_contract":"device+pinned-regdb-authoritative-association-v2","two_distinct_base_inputs":true,"missing_authoritative_input_rejected":true,"runtime_capability":"0x0111","runtime_rsn_capabilities":"0x0080","runtime_ie_id_lengths":"0:3,1:8,33:2,36:50,48:20,45:26,191:12,244:1,221:7","runtime_frame_len":175,"rsn_capabilities":"0x0080","rsnxe_source":"selected_bss","selected_bss_without_h2e":"rsnxe_absent_wmm_present","unsupported_runtime_advertisements":"rrm,extended-capabilities,fils-ip-address-assignment omitted unless implemented","observed_stale_hashes_8646ba36_and_aa0306_rejected":true,"oracle_frame_len":{},"without_h2e_frame_sha256":"{without_h2e_sha256}","source_identity_sha256":"{source_identity}","materialized_source_tree_sha256":"{materialized_tree}","generated_crate_source_sha256":"{generated_source}","fuchsia_base_revision":"{base}","fuchsia_ordered_patch_set_sha256":"{patch_set}"}}"#,
             frame.len(),
         );
         return Ok(());
@@ -6848,7 +6880,23 @@ fn run() -> Result<(), String> {
                                         query_from_capabilities(report.nic_capability, &candidates);
                                     query.sta_addr =
                                         Some(power_target.as_ref().expect("SAE target").3.bytes());
-                                    let support = live_client_support(query);
+                                    let mut support = live_client_support(query);
+                                    support.association = Some(
+                                        mt7921_softmac_adapter::client_device::production_association_profile_from_query_and_regulatory(
+                                            &support.query,
+                                            fidl_ieee80211::WlanBand::FiveGhz,
+                                            target_bss
+                                                .as_ref()
+                                                .ok_or("target BSS was not retained")?
+                                                .primary
+                                                .number,
+                                            &rate_power_snapshot
+                                                .as_ref()
+                                                .ok_or("production validation requires a frozen regulatory snapshot")?
+                                                .snapshot,
+                                        )
+                                        .map_err(|_| "build pinned-regdb production association profile failed")?,
+                                    );
                                     let device_info = wlan_mlme::mlme_device_info_from_softmac(
                                         support.query.clone(),
                                     )
@@ -13606,7 +13654,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
         let mut normalized = final_frame.to_vec();
         normalized[22..24].fill(0);
         record_sae_stage(&format!(
-            "association_capability_transformation source={} contract=device-authoritative-ht-vht-v1 base_ht_sha256={} base_vht_sha256={} authoritative_ht_sha256={} authoritative_vht_sha256={} final_ht_sha256={} final_vht_sha256={} normalized_frame_sha256={}",
+            "association_capability_transformation source={} contract=device+pinned-regdb-authoritative-association-v2 base_ht_sha256={} base_vht_sha256={} authoritative_ht_sha256={} authoritative_vht_sha256={} final_ht_sha256={} final_vht_sha256={} normalized_frame_sha256={}",
             mt7921_softmac_adapter::client_device::ASSOCIATION_CAPABILITY_INPUT_SOURCE,
             sha256_hex(&evidence.base_ht),
             sha256_hex(&evidence.base_vht),
@@ -19446,10 +19494,12 @@ mod tests {
             band.basic_rates,
             [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c]
         );
-        assert_eq!(band.ht_cap.as_ref().unwrap().bytes[0..3], [0xf3, 0x09, 3]);
+        assert_eq!(band.ht_cap.as_ref().unwrap().bytes[0..3], [0xff, 0x09, 3]);
         assert_eq!(
             band.vht_cap.as_ref().unwrap().bytes,
-            [0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+            [
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
+            ]
         );
         assert!(info.qos_capable);
         assert_eq!(
