@@ -7079,7 +7079,6 @@ impl ClientFirmwareEffectsState {
 
     pub fn complete_post_assoc_interface(
         &mut self,
-        channel: ClientPhysicalChannel,
         mut submit_uni: impl FnMut(u8, &[u8]) -> Result<(), String>,
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
@@ -7092,7 +7091,7 @@ impl ClientFirmwareEffectsState {
         if self.post_assoc_interface_programmed
             || self.post_assoc_beacon_timing_programmed
             || self.post_assoc_rx_filter_published
-            || self.post_assoc_rlm_programmed
+            || !self.post_assoc_rlm_programmed
             || self.firmware_uncertain
             || (association.negotiated_qos && self.edca_programmed.is_none())
         {
@@ -7117,13 +7116,6 @@ impl ClientFirmwareEffectsState {
         let rx_filter = encode_client_post_assoc_rx_filter_command(self.next_sequence())?;
         submit_ce_no_ack(&rx_filter)?;
         self.post_assoc_rx_filter_published = true;
-        let rlm = encode_client_post_assoc_rlm_command(
-            self.next_sequence(),
-            association.bss_index,
-            channel,
-        )?;
-        submit_uni(2, &rlm)?;
-        self.post_assoc_rlm_programmed = true;
         self.firmware_uncertain = false;
         Ok(())
     }
@@ -7318,6 +7310,35 @@ impl ClientFirmwareEffectsState {
             ));
         }
         self.firmware_uncertain = false;
+        let rlm = encode_client_post_assoc_rlm_command(
+            self.next_sequence(),
+            association.bss_index,
+            channel.channel,
+        )?;
+        self.firmware_uncertain = true;
+        if let Err(error) = submit(2, &rlm) {
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                joined.dtim_period,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            if rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
+            }
+            self.firmware_uncertain = rollback_bss.is_err();
+            return Err(format!(
+                "post-BSS RLM failed: {error}; rollback_bss={rollback_bss:?}"
+            ));
+        }
+        self.post_assoc_rlm_programmed = true;
+        self.firmware_uncertain = false;
         if let Err(error) = after_bss() {
             let rollback_bss = encode_client_bss_command(
                 self.next_sequence(),
@@ -7333,6 +7354,7 @@ impl ClientFirmwareEffectsState {
             if rollback_bss.is_ok() {
                 self.bss_programmed = false;
                 self.bss_binding = None;
+                self.post_assoc_rlm_programmed = false;
             }
             self.firmware_uncertain = rollback_bss.is_err();
             return Err(format!(
@@ -7377,6 +7399,7 @@ impl ClientFirmwareEffectsState {
             self.bss_programmed = rollback_bss.is_err();
             if rollback_bss.is_ok() {
                 self.bss_binding = None;
+                self.post_assoc_rlm_programmed = false;
             }
             if rollback_wcid.is_ok() {
                 self.preauth_peer = None;
@@ -9385,7 +9408,7 @@ mod tests {
                 association,
                 lease,
                 |_, command| {
-                    if association_command_count.get() == 1 {
+                    if association_command_count.get() == 2 {
                         assert!(post_bss_boundary_seen.get());
                     }
                     transcript.push(command.to_vec());
@@ -9395,8 +9418,8 @@ mod tests {
                 || {
                     assert_eq!(
                         association_command_count.get(),
-                        1,
-                        "exactly the associated BSS must precede the boundary"
+                        2,
+                        "exactly associated BSS and RLM must precede the boundary"
                     );
                     post_bss_boundary_seen.set(true);
                     Ok(())
@@ -9404,6 +9427,9 @@ mod tests {
             )
             .unwrap();
         assert!(post_bss_boundary_seen.get());
+        assert_eq!(transcript.len(), 3);
+        assert_eq!(&transcript[2][48..52], &[0, 0, 0, 0]);
+        assert_eq!(&transcript[2][52..56], &[2, 0, 16, 0]);
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9469,13 +9495,6 @@ mod tests {
         let transcript = std::cell::RefCell::new(transcript);
         state
             .complete_post_assoc_interface(
-                ClientPhysicalChannel {
-                    band: 1,
-                    primary: 36,
-                    center: 42,
-                    bandwidth: 2,
-                    center2: 0,
-                },
                 |_, command| {
                     transcript.borrow_mut().push(command.to_vec());
                     Ok(())
@@ -9515,9 +9534,9 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>(),
-            [3, 2, 3, 3, 2, 0x0a, 2, 0x0a, 3, 2]
+            [3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
         );
-        assert_eq!(transcript[5][80], 1);
+        assert_eq!(transcript[6][80], 1);
         assert_eq!(transcript[7][80], 2);
         assert!(!state.post_assoc_rx_filter_published);
         let preauth_add = &transcript[0];
@@ -9644,9 +9663,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(boundary_transcript, [(2, 1), (2, 0)]);
+        assert_eq!(boundary_transcript, [(2, 1), (2, 36), (2, 0)]);
         assert!(boundary_failure.association.is_none());
         assert!(!boundary_failure.bss_programmed);
+        assert!(!boundary_failure.post_assoc_rlm_programmed);
         assert!(!boundary_failure.firmware_uncertain);
 
         let mut dirty = ClientFirmwareEffectsState::default();

@@ -2394,13 +2394,6 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let activation_commands = std::cell::RefCell::new(activation_commands);
     rx_gate
         .complete_post_assoc_interface(
-            ClientPhysicalChannel {
-                band: 1,
-                primary: 36,
-                center: 42,
-                bandwidth: 2,
-                center2: 0,
-            },
             |cid, command| {
                 activation_commands
                     .borrow_mut()
@@ -2422,7 +2415,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, 2, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(
-        3,
+        4,
         0,
         peer_wcid.get(),
         42,
@@ -2435,23 +2428,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         0,
     )
     .map_err(|error| format!("self-test association peer fixture: {error}"))?;
-    let expected_interface = encode_client_post_assoc_interface_wcid_command(5, 0, peer)
+    let expected_interface = encode_client_post_assoc_interface_wcid_command(6, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
-    let expected_beacon = encode_client_post_assoc_beacon_timing_command(6, 0, 100, 2)
+    let expected_beacon = encode_client_post_assoc_beacon_timing_command(7, 0, 100, 2)
         .map_err(|error| format!("self-test association beacon fixture: {error}"))?;
-    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(7)
+    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(8)
         .map_err(|error| format!("self-test association RX-filter fixture: {error}"))?;
-    let expected_rlm = encode_client_post_assoc_rlm_command(
-        8,
-        0,
-        ClientPhysicalChannel {
-            band: 1,
-            primary: 36,
-            center: 42,
-            bandwidth: 2,
-            center2: 0,
-        },
-    )
+    let expected_rlm = encode_client_post_assoc_rlm_command(3, 0, rx_channel.channel)
     .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == peer_wcid.get()
         && expected_peer[121] == 1
@@ -2466,11 +2449,11 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         != [
             (3, expected_preauth),
             (2, expected_bss),
+            (2, expected_rlm),
             (3, expected_peer),
             (3, expected_interface),
             (2, expected_beacon),
             (0x0a, expected_rx_filter),
-            (2, expected_rlm),
         ]
         || !wtbl_structure
         || unavailable_readback != WtblPeerReadback::Unavailable
@@ -2492,7 +2475,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,peer_associated,EDCA,interface_wcid19,BCNFT,SET_RXFILTER,RLM cid_order=3,2,3,legacy29,3,2,legacy10,2 ack_order=interface,BCNFT,RLM no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,RLM,peer_associated,EDCA,interface_wcid19,BCNFT,SET_RXFILTER cid_order=3,2,2,3,legacy29,3,2,legacy10 ack_order=RLM,interface,BCNFT no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
         peer_wcid.get()
     );
     // Source-exact discriminator: ieee80211_send_nullfunc only requests the
@@ -3724,7 +3707,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v9";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v10";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
@@ -3732,7 +3715,7 @@ const PASSIVE_M1_PEER_WTBL_DW2: u32 = 0x820d_8108;
 const PASSIVE_M1_RMAC_RFCR: u32 = 0x820e_5000;
 const PASSIVE_M1_RMAC_RFCR1: u32 = 0x820e_5004;
 const PASSIVE_M1_BEFORE_BSS_BOUNDARY: &str = "before-associated-bss";
-const PASSIVE_M1_AFTER_PUMP_BOUNDARY: &str = "after-associated-bss-before-sta-pump-15ms";
+const PASSIVE_M1_AFTER_PUMP_BOUNDARY: &str = "after-associated-bss-rlm-before-sta-pump-15ms";
 const PASSIVE_M1_AFTER_TAIL_BOUNDARY: &str = "after-post-association-tail";
 const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
 const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
@@ -3923,7 +3906,7 @@ fn run() -> Result<(), String> {
                 )
             };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v9","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v10","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -14667,7 +14650,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                                 PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta,
                             ) {
                                 record_sae_stage(&format!(
-                                    "passive_m1_rx_snapshot phase=after_associated_bss_before_sta result=unavailable status={status}"
+                                    "passive_m1_rx_snapshot phase=after_associated_bss_rlm_before_sta result=unavailable status={status}"
                                 ));
                             }
                         }
@@ -14739,7 +14722,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
             }
             self.firmware
                 .complete_post_assoc_interface(
-                    channel.channel,
                     |cid, command| {
                         io.borrow_mut()
                             .submit_uni(cid, command)
@@ -14775,7 +14757,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=closed",
             );
             record_sae_stage(&format!(
-                "post_assoc_bss_updates result=complete order=BCNFT,SET_RXFILTER,RLM beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
+                "post_assoc_bss_updates result=complete order=RLM-before-M1-pump-and-STA,BCNFT,SET_RXFILTER beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
                 self.firmware.joined.expect("join retained").beacon_interval,
                 self.dtim_period,
                 channel.channel.primary,
@@ -16005,12 +15987,12 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta => {
                 let Some(before) = self.passive_m1_baseline else {
                     record_sae_stage(
-                        "passive_m1_rx_snapshot phase=after_associated_bss_before_sta result=unavailable reason=missing_baseline",
+                        "passive_m1_rx_snapshot phase=after_associated_bss_rlm_before_sta result=unavailable reason=missing_baseline",
                     );
                     return Err(zx::Status::BAD_STATE);
                 };
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=after_associated_bss_before_sta source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
+                    "passive_m1_rx_snapshot phase=after_associated_bss_rlm_before_sta source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
                     snapshot.peer_wtbl_aid,
                     snapshot.rmac_rfcr,
                     snapshot.rmac_rfcr1,
@@ -16994,7 +16976,15 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         }
         if expected_cid == 2 && encoded.len() == 92 {
             record_sae_stage(&format!(
-                "e2e81_bss_transcript bytes=92 bss_idx={} active={} omac_idx={} hw_bss_idx={} band_idx={} conn_type={:#010x} conn_state={} wmm_idx={} bmc_wcid={} beacon_interval={} dtim={} phymode={:#04x} sta_idx={} nonht_basic_phy={:#06x} qos={} cipher=firmware_vif_owned",
+                "associated_bss_info_native_compare source=linux-6.18.40/7.1.5 normalized=payload-only transport_sequence_checksum=excluded bytes=44 payload_sha256={} payload_raw={} request_reserved_zero={} basic_tag={} basic_len={} bss_idx={} active={} omac_idx={} hw_bss_idx={} band_idx={} conn_type={:#010x} conn_state={} wmm_idx={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} bmc_wcid={} beacon_interval={} dtim={} phymode={:#04x} sta_idx={} nonht_basic_phy={:#06x} phymode_ext={} link_idx={} qbss_tag={} qbss_len={} qos={} qbss_reserved_zero={} cipher=firmware_vif_owned",
+                sha256_hex(&encoded[48..]),
+                encoded[48..]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                encoded[49..52].iter().all(|byte| *byte == 0),
+                u16::from_le_bytes(encoded[52..54].try_into().unwrap()),
+                u16::from_le_bytes(encoded[54..56].try_into().unwrap()),
                 encoded[48],
                 encoded[56],
                 encoded[57],
@@ -17003,15 +16993,22 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 u32::from_le_bytes(encoded[60..64].try_into().unwrap()),
                 encoded[64],
                 encoded[65],
+                encoded[66], encoded[67], encoded[68], encoded[69], encoded[70], encoded[71],
                 u16::from_le_bytes(encoded[72..74].try_into().unwrap()),
                 u16::from_le_bytes(encoded[74..76].try_into().unwrap()),
                 encoded[76],
                 encoded[77],
                 u16::from_le_bytes(encoded[78..80].try_into().unwrap()),
                 u16::from_le_bytes(encoded[80..82].try_into().unwrap()),
+                encoded[82],
+                encoded[83],
+                u16::from_le_bytes(encoded[84..86].try_into().unwrap()),
+                u16::from_le_bytes(encoded[86..88].try_into().unwrap()),
                 encoded[88],
+                encoded[89..92].iter().all(|byte| *byte == 0),
             ));
         }
+
         let sta_update_wcid = (expected_cid == 3 && encoded.len() >= 176)
             .then(|| encoded.get(49).copied())
             .flatten();
@@ -28240,10 +28237,10 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v9\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v10\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
-            "\"snapshot_boundaries\":\"before-associated-bss,after-associated-bss-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms\"",
+            "\"snapshot_boundaries\":\"before-associated-bss,after-associated-bss-rlm-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
@@ -28283,7 +28280,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn post_bss_pump_precedes_peer_sta_and_the_unchanged_tail() {
+    fn post_bss_rlm_pump_precedes_peer_sta_and_the_remaining_tail() {
         let source = include_str!("vfio_read.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let before = production
@@ -28320,11 +28317,15 @@ mod tests {
         let bss_complete = associate_core
             .find("self.firmware_uncertain = false;")
             .unwrap();
+        let rlm = associate_core
+            .find("encode_client_post_assoc_rlm_command(")
+            .unwrap();
         let callback = associate_core.find("after_bss()").unwrap();
         let peer_sta = associate_core
             .find("encode_legacy_wme_add_wcid_command(")
             .unwrap();
-        assert!(bss_complete < callback);
+        assert!(bss_complete < rlm);
+        assert!(rlm < callback);
         assert!(callback < peer_sta);
 
         let deadline = production

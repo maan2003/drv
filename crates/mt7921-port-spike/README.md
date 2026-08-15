@@ -2855,13 +2855,26 @@ initial response timer and terminates at its own 5000 ms boundary; normal SME
 timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v9`. In addition to the RX-DMA reads, it records
+`linux-6.18.40-passive-m1-rx-v10`. In addition to the RX-DMA reads, it records
 a baseline immediately before associated BSS programming. Pinned Linux 6.18.40
 programs the associated BSS before the peer STA_REC, and the corrected native
 timeline records the 44-byte CID-2 BSS_INFO 4.696 ms before M1 and the first
 184-byte CID-3 STA_REC 20 us after M1. The existing RX/MCU path therefore pumps
 for at most 15 ms immediately after the BSS ACK and before peer STA_REC/WTBL.
-An exact M1 is retained until the unchanged association tail commits and is
+The associated BSS payload is byte-identical after excluding the MCU transport
+envelope: request `00 00 00 00`, BASIC tag/length `00 00 20 00`, active 1,
+OMAC/HW-BSS/band 0, connection type `0x00010001`, state 0, WMM 0, the selected
+BSSID, BMC WCID 19, beacon interval 100, selected-beacon DTIM 2, PHY `0xb1`,
+STA index 19, non-HT-basic PHY `0x0078`, zero PHY extension/link index, and QBSS
+tag/length `0f 00 08 00` with QoS 1 and zero reserved bytes. Runtime telemetry
+prints the complete 44 bytes, their SHA-256, and every decoded field; transport
+sequence/checksum fields are the only normalization and are outside that
+payload. The first semantic divergence was instead command placement: the
+corrected native timeline puts its 20-byte CID-2 RLM immediately after BASIC+
+QBSS and before M1/STA_REC, whereas v9 delayed RLM to the post-STA tail. V10
+moves that already source-exact, synchronously ACKed RLM to immediately after
+the BSS ACK and runs the bounded pump only after the RLM ACK. No other command
+semantics changed. An exact M1 is retained until the remaining association tail commits and is
 delivered afterward; a timeout always falls through to that same tail and the
 existing five-second wait. Read-only snapshots expose cumulative RX deltas at
 post-BSS/pre-STA and post-tail boundaries relative to the pre-BSS baseline. It
