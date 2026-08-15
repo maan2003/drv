@@ -2855,7 +2855,7 @@ initial response timer and terminates at its own 5000 ms boundary; normal SME
 timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v7`. In addition to the RX-DMA reads, it records
+`linux-6.18.40-passive-m1-rx-v8`. In addition to the RX-DMA reads, it records
 a snapshot immediately before associated BSS/STA/WTBL/EDCA programming, then pumps
 the existing RX/MCU path for at most 15 ms without transmitting. An exact M1 is
 retained until the unchanged association tail commits and is delivered afterward;
@@ -2895,3 +2895,30 @@ Linux post-ASSOC `cfg.ps=false` path already mapped in `mt7921-core/SOURCE-MAP.m
 beacon filtering is an RX optimization and awake mode emits no peer TX-PS
 mutation.  The audit is descriptive only; this change adds no power-save,
 Null/poll, monitor, or sniffer command.
+
+The v8 over-air state-machine audit binds the corrected native association
+oracle (`20260814T111237Z-linux-oracle-0000_05_00.0.log`, SHA-256
+`4dbcc30d32fa59398a7d5086070483583341f1f9fecbf996bf2d6dabd392d214`)
+to the public native iwd SAE record and the v7 campaign. Native and userspace
+both send group-20 H2E commit transaction 1/status 126, handle status 77, then
+send group-19 transaction 1/status 126 with one Rejected Groups IE. Randomized
+scalar/element bytes are intentionally not equality-comparable. The native
+artifact starts at association and therefore does not expose SAE confirm
+counters or SAE inter-frame timing. V8 adds read-only per-frame SAE TX/RX
+monotonic time, retry/sequence control, transaction/status/group, confirm
+counter, public-field length and hash. Association-response records now also
+carry monotonic time; every duplicate would retain its sequence/retry bit in
+the existing receive path.
+
+The association request differs without changing the RSN contract: native is
+204 bytes with capability `0x1111`, Supported Channels length 56, and IEs
+70/127/255, while userspace is 175 bytes with capability `0x0111`, Supported
+Channels length 50, and omits those optional radio-measurement/extended/HE
+advertisements. Both use listen interval 5 and identical SSID, rates, RSN,
+HT, VHT, RSNXE and WMM content where comparable. This supported-subset
+difference is not source-proven to suppress M1 after an accepted status-0
+response, so it is not changed. In each eligible v7 run the AP sent one
+status-0 response with retry clear and a unique sequence, and sent no
+same-sequence retry during the 15 ms pre-tail pump or five-second observation;
+that is positive AP-side evidence, though not an independent sniffer proof,
+that hardware acknowledged the response.

@@ -53,7 +53,7 @@ fi
 @grep@ -Fx 'ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2' "$manifest" >/dev/null
 @grep@ -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' @manifest@ >/dev/null
 @grep@ -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' @manifest@ >/dev/null
-@grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v7' "$manifest" >/dev/null
+@grep@ -Fx 'PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v8' "$manifest" >/dev/null
 @grep@ -Fx 'EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1' "$manifest" >/dev/null
 @grep@ -Fx 'EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment' "$manifest" >/dev/null
 @grep@ -Fx 'SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004' "$manifest" >/dev/null
@@ -90,7 +90,7 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"generated_crate_source_sha256":"@generated_source@"' "$identity" >/dev/null
 @grep@ -F '"project_core_source_sha256":"@project_core@"' "$identity" >/dev/null
 @grep@ -F '"composite_artifact_source_sha256":"@composite_source@"' "$identity" >/dev/null
-@grep@ -F '"artifact_identity":"mt7921-validation-v7"' "$identity" >/dev/null
+@grep@ -F '"artifact_identity":"mt7921-validation-v8"' "$identity" >/dev/null
 @grep@ -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$identity" >/dev/null
 @grep@ -F '"basic_tlv_len":32' "$identity" >/dev/null
 @grep@ -F '"initial_bss_payload_len":36,"initial_bss_command_len":84' "$identity" >/dev/null
@@ -108,7 +108,7 @@ test "$($launcher --artifact-identity)" = "$(@cat@ "$identity")"
 @grep@ -F '"association_transformation_contract":"device+pinned-regdb-authoritative-association-v2"' "$identity" >/dev/null
 @grep@ -F '"oracle_comparison_contract":"linux-6.18.40-semantic-v1"' "$identity" >/dev/null
 @grep@ -F '"oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' "$identity" >/dev/null
-@grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v7"' "$identity" >/dev/null
+@grep@ -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v8"' "$identity" >/dev/null
 @grep@ -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' "$identity" >/dev/null
 @grep@ -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' "$identity" >/dev/null
 @grep@ -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004"' "$identity" >/dev/null

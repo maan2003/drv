@@ -3719,7 +3719,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v7";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v8";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
@@ -3917,7 +3917,7 @@ fn run() -> Result<(), String> {
                 )
             };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v7","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v8","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -12693,6 +12693,49 @@ struct ReceivedSaeAuth {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn record_sae_auth_frame_structure(direction: &str, frame: &[u8]) {
+    let control = frame
+        .get(..2)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]));
+    let sequence_control = frame
+        .get(22..24)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]));
+    let algorithm = frame
+        .get(24..26)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]));
+    let transaction = frame
+        .get(26..28)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]));
+    let status = frame
+        .get(28..30)
+        .map(|value| u16::from_le_bytes([value[0], value[1]]));
+    let fields = frame.get(30..).unwrap_or_default();
+    let group = (transaction == Some(1) && fields.len() >= 2)
+        .then(|| u16::from_le_bytes([fields[0], fields[1]]));
+    let confirm_counter = (transaction == Some(2) && fields.len() >= 2)
+        .then(|| u16::from_le_bytes([fields[0], fields[1]]));
+    record_sae_stage(&format!(
+        "sae_auth_frame_structure monotonic_ns={} direction={direction} retry={} sequence={} fragment={} algorithm={} transaction={} status={} group={} confirm_counter={} fields_len={} fields_sha256={} fixed_fields_complete={}",
+        management_tx_monotonic_ns(),
+        control.is_some_and(|value| value & 0x0800 != 0),
+        sequence_control.map_or_else(|| "unknown".to_string(), |value| (value >> 4).to_string()),
+        sequence_control.map_or_else(|| "unknown".to_string(), |value| (value & 15).to_string()),
+        algorithm.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        transaction.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        group.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        confirm_counter.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        fields.len(),
+        sha256_hex(fields),
+        control.is_some()
+            && sequence_control.is_some()
+            && algorithm.is_some()
+            && transaction.is_some()
+            && status.is_some(),
+    ));
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn record_sae_commit_structure(frame: &[u8]) -> Result<(), String> {
     let header = frame
         .get(..32)
@@ -14156,6 +14199,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     "validation_tx_gate phase=preassociation result=admitted class={class} ownership=pinned_sme_mlme generation=current"
                 ));
             }
+            if sae {
+                record_sae_auth_frame_structure("tx", bytes);
+            }
             if sae && bytes.get(26..28) == Some(&[1, 0]) {
                 record_sae_commit_structure(bytes).map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
             }
@@ -14939,10 +14985,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 return Ok(None);
             }
             match classify_preassociation_sae_auth(&frame.bytes, self.client, self.target) {
-                Ok(Some(auth)) => record_sae_stage(&format!(
-                    "client_rx_admitted subtype=auth transaction={} status={} address_match=true",
-                    auth.transaction, auth.status
-                )),
+                Ok(Some(auth)) => {
+                    record_sae_auth_frame_structure("rx", &frame.bytes);
+                    record_sae_stage(&format!(
+                        "client_rx_admitted subtype=auth transaction={} status={} address_match=true",
+                        auth.transaction, auth.status
+                    ));
+                }
                 Ok(None) => unreachable!("authentication subtype was checked"),
                 Err(reason) => {
                     record_sae_stage(&format!(
@@ -15061,7 +15110,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     .get(22..24)
                     .map(|field| u16::from_le_bytes([field[0], field[1]]) >> 4);
                 record_sae_stage(&format!(
-                    "association_response_structure capability={} status={} raw_aid={} retry={} sequence={} fixed_fields_complete={}",
+                    "association_response_structure monotonic_ns={} capability={} status={} raw_aid={} retry={} sequence={} fixed_fields_complete={}",
+                    management_tx_monotonic_ns(),
                     capability
                         .map_or_else(|| "unknown".to_string(), |value| format!("0x{value:04x}")),
                     status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
@@ -28029,6 +28079,37 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn over_air_state_machine_telemetry_is_read_only_and_covers_both_directions() {
+        let source = include_str!("vfio_read.rs");
+        let telemetry = source
+            .split("fn record_sae_auth_frame_structure(")
+            .nth(1)
+            .unwrap()
+            .split("fn record_sae_commit_structure(")
+            .next()
+            .unwrap();
+        for field in [
+            "monotonic_ns={}",
+            "retry={}",
+            "sequence={}",
+            "fragment={}",
+            "transaction={}",
+            "status={}",
+            "group={}",
+            "confirm_counter={}",
+            "fields_sha256={}",
+        ] {
+            assert!(telemetry.contains(field), "missing {field}");
+        }
+        assert!(!telemetry.contains("submit_"));
+        assert!(!telemetry.contains("transmit_"));
+        assert!(source.contains("record_sae_auth_frame_structure(\"tx\", bytes)"));
+        assert!(source.contains("record_sae_auth_frame_structure(\"rx\", &frame.bytes)"));
+        assert!(source.contains("association_response_structure monotonic_ns={}"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn passive_m1_snapshot_uses_only_named_non_destructive_sources() {
         let source = include_str!("vfio_read.rs");
         let snapshot = source
@@ -28086,7 +28167,7 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v7\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v8\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
             "\"snapshot_boundaries\":\"before-associated-bss-sta-edca,after-pre-associated-rx-pump-15ms,m1-observation-timeout-5000ms\"",
