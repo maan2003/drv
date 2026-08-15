@@ -2855,13 +2855,18 @@ initial response timer and terminates at its own 5000 ms boundary; normal SME
 timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v8`. In addition to the RX-DMA reads, it records
-a snapshot immediately before associated BSS/STA/WTBL/EDCA programming, then pumps
-the existing RX/MCU path for at most 15 ms without transmitting. An exact M1 is
-retained until the unchanged association tail commits and is delivered afterward;
-a timeout always falls through to that same tail and the existing five-second wait. It also records
-peer-WTBL DW2 AID and the two static RMAC receive-filter words at both
-boundaries. It enumerates the only safe register reads
+`linux-6.18.40-passive-m1-rx-v9`. In addition to the RX-DMA reads, it records
+a baseline immediately before associated BSS programming. Pinned Linux 6.18.40
+programs the associated BSS before the peer STA_REC, and the corrected native
+timeline records the 44-byte CID-2 BSS_INFO 4.696 ms before M1 and the first
+184-byte CID-3 STA_REC 20 us after M1. The existing RX/MCU path therefore pumps
+for at most 15 ms immediately after the BSS ACK and before peer STA_REC/WTBL.
+An exact M1 is retained until the unchanged association tail commits and is
+delivered afterward; a timeout always falls through to that same tail and the
+existing five-second wait. Read-only snapshots expose cumulative RX deltas at
+post-BSS/pre-STA and post-tail boundaries relative to the pre-BSS baseline. It
+also records peer-WTBL DW2 AID and the two static RMAC receive-filter words at
+all boundaries. It enumerates the only safe register reads
 (`0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004`), both snapshot
 boundaries, the exact pinned AP-to-client M1 scope, positive and
 ambiguous-negative results, best-effort

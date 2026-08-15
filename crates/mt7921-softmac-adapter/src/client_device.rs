@@ -349,8 +349,9 @@ pub struct ClientRxSecurity {
 /// Read-only production diagnostic boundary around the passive M1 wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PassiveM1SnapshotPoint {
-    BeforePostAssociationTail,
-    AfterPreAssociationPump,
+    BeforeAssociatedBss,
+    AfterAssociatedBssBeforeSta,
+    AfterPostAssociationTail,
     M1Timeout,
 }
 

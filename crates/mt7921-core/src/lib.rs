@@ -7258,6 +7258,7 @@ impl ClientFirmwareEffectsState {
         association: LegacyWmeAssociation,
         channel: ClientChannelLease,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut after_bss: impl FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
         let joined = self
             .joined
@@ -7317,6 +7318,27 @@ impl ClientFirmwareEffectsState {
             ));
         }
         self.firmware_uncertain = false;
+        if let Err(error) = after_bss() {
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                joined.dtim_period,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            if rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
+            }
+            self.firmware_uncertain = rollback_bss.is_err();
+            return Err(format!(
+                "post-BSS/pre-STA boundary failed: {error}; rollback_bss={rollback_bss:?}"
+            ));
+        }
         let command = encode_legacy_wme_add_wcid_command(
             self.next_sequence(),
             association.bss_index,
@@ -9350,17 +9372,38 @@ mod tests {
                         generation: lease.generation + 1,
                         ..lease
                     },
-                    |_, _| Ok(())
+                    |_, _| Ok(()),
+                    || Ok(()),
                 )
                 .is_err()
         );
 
+        let post_bss_boundary_seen = std::cell::Cell::new(false);
+        let association_command_count = std::cell::Cell::new(0usize);
         state
-            .associate(association, lease, |_, command| {
-                transcript.push(command.to_vec());
-                Ok(())
-            })
+            .associate(
+                association,
+                lease,
+                |_, command| {
+                    if association_command_count.get() == 1 {
+                        assert!(post_bss_boundary_seen.get());
+                    }
+                    transcript.push(command.to_vec());
+                    association_command_count.set(association_command_count.get() + 1);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(
+                        association_command_count.get(),
+                        1,
+                        "exactly the associated BSS must precede the boundary"
+                    );
+                    post_bss_boundary_seen.set(true);
+                    Ok(())
+                },
+            )
             .unwrap();
+        assert!(post_bss_boundary_seen.get());
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9555,19 +9598,56 @@ mod tests {
         let mut transcript = Vec::new();
         assert!(
             rolled_back
-                .associate(association, lease, |cid, command| {
-                    transcript.push((cid, command[56]));
-                    if transcript.len() == 1 {
-                        Err("ambiguous BSS add".into())
-                    } else {
-                        Ok(())
-                    }
-                })
+                .associate(
+                    association,
+                    lease,
+                    |cid, command| {
+                        transcript.push((cid, command[56]));
+                        if transcript.len() == 1 {
+                            Err("ambiguous BSS add".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || Ok(()),
+                )
                 .is_err()
         );
         assert_eq!(transcript, [(2, 1), (2, 0)]);
         assert!(!rolled_back.bss_programmed);
         assert!(!rolled_back.firmware_uncertain);
+
+        let mut boundary_failure = ClientFirmwareEffectsState::default();
+        boundary_failure.bind_join(peer, lease, 100, 2).unwrap();
+        boundary_failure
+            .prepare_preauth_peer(
+                LegacyWmeAssociation {
+                    aid: 0,
+                    negotiated_qos: false,
+                    ..association
+                },
+                lease,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let mut boundary_transcript = Vec::new();
+        assert!(
+            boundary_failure
+                .associate(
+                    association,
+                    lease,
+                    |cid, command| {
+                        boundary_transcript.push((cid, command[56]));
+                        Ok(())
+                    },
+                    || Err("RX pump failed".into()),
+                )
+                .is_err()
+        );
+        assert_eq!(boundary_transcript, [(2, 1), (2, 0)]);
+        assert!(boundary_failure.association.is_none());
+        assert!(!boundary_failure.bss_programmed);
+        assert!(!boundary_failure.firmware_uncertain);
 
         let mut dirty = ClientFirmwareEffectsState::default();
         dirty.bind_join(peer, lease, 100, 2).unwrap();
@@ -9584,7 +9664,7 @@ mod tests {
             .unwrap();
         assert!(
             dirty
-                .associate(association, lease, |_, _| Err("no ACK".into()))
+                .associate(association, lease, |_, _| Err("no ACK".into()), || Ok(()),)
                 .is_err()
         );
         assert!(dirty.bss_programmed);

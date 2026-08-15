@@ -2322,10 +2322,15 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         )
         .map_err(|error| format!("self-test preauth peer: {error}"))?;
     rx_gate
-        .associate(association, rx_channel, |cid, command| {
-            activation_commands.push((cid, command.to_vec()));
-            Ok(())
-        })
+        .associate(
+            association,
+            rx_channel,
+            |cid, command| {
+                activation_commands.push((cid, command.to_vec()));
+                Ok(())
+            },
+            || Ok(()),
+        )
         .map_err(|error| format!("self-test E2E48 association: {error}"))?;
     if rx_gate.qos_tx_ready() {
         return Err("self-test data TX opened before post-ASSOC commands".into());
@@ -3719,15 +3724,16 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v8";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v9";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
 const PASSIVE_M1_PEER_WTBL_DW2: u32 = 0x820d_8108;
 const PASSIVE_M1_RMAC_RFCR: u32 = 0x820e_5000;
 const PASSIVE_M1_RMAC_RFCR1: u32 = 0x820e_5004;
-const PASSIVE_M1_BEFORE_TAIL_BOUNDARY: &str = "before-associated-bss-sta-edca";
-const PASSIVE_M1_AFTER_PUMP_BOUNDARY: &str = "after-pre-associated-rx-pump-15ms";
+const PASSIVE_M1_BEFORE_BSS_BOUNDARY: &str = "before-associated-bss";
+const PASSIVE_M1_AFTER_PUMP_BOUNDARY: &str = "after-associated-bss-before-sta-pump-15ms";
+const PASSIVE_M1_AFTER_TAIL_BOUNDARY: &str = "after-post-association-tail";
 const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
 const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
 const PASSIVE_M1_TARGET_SCOPE: &str =
@@ -3739,14 +3745,14 @@ const TARGET_BEACON_TIM_TRUE_RESULT: &str = "ap-queued-unicast-for-normalized-ai
 const TARGET_BEACON_TIM_NEVER_TRUE_RESULT: &str = "inconclusive";
 const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "fuchsia-passive")]
-const PRE_ASSOCIATED_M1_PUMP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(15);
+const POST_BSS_PRE_STA_M1_PUMP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(15);
 #[cfg(feature = "fuchsia-passive")]
 const PASSIVE_M1_SME_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
     format!(
-        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},{PASSIVE_M1_AFTER_PUMP_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_BSS_BOUNDARY},{PASSIVE_M1_AFTER_PUMP_BOUNDARY},{PASSIVE_M1_AFTER_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
     )
 }
 
@@ -3917,7 +3923,7 @@ fn run() -> Result<(), String> {
                 )
             };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v8","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v9","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -13784,7 +13790,7 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 impl LiveClientEffects {
-    fn pump_pre_associated_m1(
+    fn pump_post_bss_pre_sta_m1(
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
     ) -> Result<(), zx::Status> {
@@ -13798,16 +13804,16 @@ impl LiveClientEffects {
             }
             if matches!(self.early_m1, EarlyM1Latch::Retained { .. }) {
                 record_sae_stage(&format!(
-                    "pre_associated_m1_pump result=m1_retained elapsed_us={} polls={} non_m1_deliveries={} tail=required",
+                    "post_bss_pre_sta_m1_pump result=m1_retained elapsed_us={} polls={} non_m1_deliveries={} tail=required",
                     started.elapsed().as_micros(),
                     polls,
                     non_m1_deliveries,
                 ));
                 return Ok(());
             }
-            if started.elapsed() >= PRE_ASSOCIATED_M1_PUMP_TIMEOUT {
+            if started.elapsed() >= POST_BSS_PRE_STA_M1_PUMP_TIMEOUT {
                 record_sae_stage(&format!(
-                    "pre_associated_m1_pump result=bounded_fallback elapsed_us={} polls={} non_m1_deliveries={} tail=required",
+                    "post_bss_pre_sta_m1_pump result=bounded_fallback elapsed_us={} polls={} non_m1_deliveries={} tail=required",
                     started.elapsed().as_micros(),
                     polls,
                     non_m1_deliveries,
@@ -14427,7 +14433,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .ok_or(zx::Status::INVALID_ARGS)?;
         let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
         let key_type = configuration.key_type.ok_or(zx::Status::INVALID_ARGS)?;
-        let io = std::cell::RefCell::new(io);
+        let io = std::cell::RefCell::new(&mut *io);
         let result = match key_type {
             fidl_ieee80211::KeyType::Pairwise
                 if configuration.peer_addr == Some(association.peer)
@@ -14613,26 +14619,23 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 .authorized_channel()
                 .map_err(|_| zx::Status::BAD_STATE)?;
             let peer_wcid = self.peer_wcid.ok_or(zx::Status::BAD_STATE)?;
+            let io = std::cell::RefCell::new(&mut *io);
             if self.suppress_eapol_liveness {
-                if let Err(status) =
-                    io.passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
+                if let Err(status) = io
+                    .borrow_mut()
+                    .passive_m1_snapshot(PassiveM1SnapshotPoint::BeforeAssociatedBss)
                 {
                     record_sae_stage(&format!(
-                        "passive_m1_rx_snapshot phase=before_associated_bss_sta_edca result=unavailable status={status}"
-                    ));
-                }
-                self.pump_pre_associated_m1(io)?;
-                if let Err(status) =
-                    io.passive_m1_snapshot(PassiveM1SnapshotPoint::AfterPreAssociationPump)
-                {
-                    record_sae_stage(&format!(
-                        "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump result=unavailable status={status}"
+                        "passive_m1_rx_snapshot phase=before_associated_bss result=unavailable status={status}"
                     ));
                 }
             }
             let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
-            self.firmware
-                .associate(
+            // Keep the core state locally so the Linux-proven post-BSS/pre-STA
+            // callback can pump RX through the remaining LiveClientEffects.
+            // Restore it before propagating every result.
+            let mut firmware = std::mem::take(&mut self.firmware);
+            let associate_result = firmware.associate(
                     LegacyWmeAssociation {
                         bss_index: 0,
                         peer_wcid,
@@ -14652,11 +14655,27 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     },
                     channel,
                     |cid, command| {
-                        io.submit_uni(cid, command)
+                        io.borrow_mut()
+                            .submit_uni(cid, command)
                             .map_err(|status| status.to_string())
                     },
-                )
-                .map_err(|_| zx::Status::IO)?;
+                    || {
+                        if self.suppress_eapol_liveness {
+                            self.pump_post_bss_pre_sta_m1(&mut **io.borrow_mut())
+                                .map_err(|status| status.to_string())?;
+                            if let Err(status) = io.borrow_mut().passive_m1_snapshot(
+                                PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta,
+                            ) {
+                                record_sae_stage(&format!(
+                                    "passive_m1_rx_snapshot phase=after_associated_bss_before_sta result=unavailable status={status}"
+                                ));
+                            }
+                        }
+                        Ok(())
+                    },
+                );
+            self.firmware = firmware;
+            associate_result.map_err(|_| zx::Status::IO)?;
             if let Some(wmm) = configuration.wmm_params {
                 let convert = |ac: fidl_driver::WlanWmmAccessCategoryParameters| {
                     if ac.ecw_min > 14 || ac.ecw_max > 14 || ac.ecw_max < ac.ecw_min {
@@ -14679,12 +14698,15 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     ],
                 };
                 if let Err(error) = self.firmware.program_edca(params, |command| {
-                    io.submit_edca(command).map_err(|status| status.to_string())
+                    io.borrow_mut()
+                        .submit_edca(command)
+                        .map_err(|status| status.to_string())
                 }) {
                     record_sae_stage(&format!("wmm_edca_program result=error reason={error}"));
                     let _ = self.firmware.teardown(
                         |cid, command| {
-                            io.submit_uni(cid, command)
+                            io.borrow_mut()
+                                .submit_uni(cid, command)
                                 .map_err(|status| status.to_string())
                         },
                         |_| Ok(()),
@@ -14715,7 +14737,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     params.ac[3].acm,
                 ));
             }
-            let io = std::cell::RefCell::new(&mut *io);
             self.firmware
                 .complete_post_assoc_interface(
                     channel.channel,
@@ -14736,6 +14757,16 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     ));
                     zx::Status::IO
                 })?;
+            if self.suppress_eapol_liveness {
+                if let Err(status) = io
+                    .borrow_mut()
+                    .passive_m1_snapshot(PassiveM1SnapshotPoint::AfterPostAssociationTail)
+                {
+                    record_sae_stage(&format!(
+                        "passive_m1_rx_snapshot phase=after_post_association_tail result=unavailable status={status}"
+                    ));
+                }
+            }
             self.abort_join_roc(&mut **io.borrow_mut())?;
             record_sae_stage(
                 "join_roc_lifecycle phase=association_complete abort=after_post_assoc_tail before_m1",
@@ -15944,10 +15975,10 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .join(",");
         let unstable = snapshot.data_ring_didx_before != snapshot.data_ring_didx_after;
         match point {
-            PassiveM1SnapshotPoint::BeforePostAssociationTail => {
+            PassiveM1SnapshotPoint::BeforeAssociatedBss => {
                 self.passive_m1_baseline = Some(snapshot);
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=before_associated_bss_sta_edca source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    "passive_m1_rx_snapshot phase=before_associated_bss source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
                     snapshot.peer_wtbl_aid,
                     snapshot.rmac_rfcr,
                     snapshot.rmac_rfcr1,
@@ -15971,15 +16002,42 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     snapshot.authenticator_m1_total,
                 ));
             }
-            PassiveM1SnapshotPoint::AfterPreAssociationPump => {
+            PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta => {
                 let Some(before) = self.passive_m1_baseline else {
                     record_sae_stage(
-                        "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump result=unavailable reason=missing_baseline",
+                        "passive_m1_rx_snapshot phase=after_associated_bss_before_sta result=unavailable reason=missing_baseline",
                     );
                     return Err(zx::Status::BAD_STATE);
                 };
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
+                    "passive_m1_rx_snapshot phase=after_associated_bss_before_sta source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
+                    snapshot.peer_wtbl_aid,
+                    snapshot.rmac_rfcr,
+                    snapshot.rmac_rfcr1,
+                    snapshot.rx_dma_enabled,
+                    snapshot
+                        .completed_total
+                        .wrapping_sub(before.completed_total),
+                    snapshot.rx_error_total.wrapping_sub(before.rx_error_total),
+                    snapshot
+                        .client_frame_total
+                        .wrapping_sub(before.client_frame_total),
+                    snapshot.eapol_total.wrapping_sub(before.eapol_total),
+                    snapshot
+                        .authenticator_m1_total
+                        .wrapping_sub(before.authenticator_m1_total),
+                    snapshot.authenticator_m1_total != before.authenticator_m1_total,
+                ));
+            }
+            PassiveM1SnapshotPoint::AfterPostAssociationTail => {
+                let Some(before) = self.passive_m1_baseline else {
+                    record_sae_stage(
+                        "passive_m1_rx_snapshot phase=after_post_association_tail result=unavailable reason=missing_baseline",
+                    );
+                    return Err(zx::Status::BAD_STATE);
+                };
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=after_post_association_tail source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
                     snapshot.peer_wtbl_aid,
                     snapshot.rmac_rfcr,
                     snapshot.rmac_rfcr1,
@@ -20511,10 +20569,15 @@ mod tests {
         assert!(state.set_controlled_port(true).is_err());
         let mut association_commands = Vec::new();
         state
-            .associate(association, test_channel_lease(36), |_, command| {
-                association_commands.push(command.to_vec());
-                Ok(())
-            })
+            .associate(
+                association,
+                test_channel_lease(36),
+                |_, command| {
+                    association_commands.push(command.to_vec());
+                    Ok(())
+                },
+                || Ok(()),
+            )
             .unwrap();
         assert_eq!(association_commands.len(), 2);
         validate_uni_request(2, &association_commands[0]).unwrap();
@@ -20607,7 +20670,12 @@ mod tests {
             .unwrap();
         prepare_test_preauth(&mut state, association);
         state
-            .associate(association, test_channel_lease(36), |_, _| Ok(()))
+            .associate(
+                association,
+                test_channel_lease(36),
+                |_, _| Ok(()),
+                || Ok(()),
+            )
             .unwrap();
         state
             .install_ptk(&[1; 16], 0, |_, _| Ok(()), |_| Ok(()))
@@ -20748,7 +20816,12 @@ mod tests {
             .unwrap();
         prepare_test_preauth(&mut state, association);
         state
-            .associate(association, test_channel_lease(36), |_, _| Ok(()))
+            .associate(
+                association,
+                test_channel_lease(36),
+                |_, _| Ok(()),
+                || Ok(()),
+            )
             .unwrap();
         let association_generation =
             ClientDataGeneration::Association(state.association_generation.unwrap());
@@ -28167,10 +28240,10 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v8\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v9\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
-            "\"snapshot_boundaries\":\"before-associated-bss-sta-edca,after-pre-associated-rx-pump-15ms,m1-observation-timeout-5000ms\"",
+            "\"snapshot_boundaries\":\"before-associated-bss,after-associated-bss-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
@@ -28210,32 +28283,49 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn pre_associated_pump_precedes_the_unchanged_tail_and_deadline() {
+    fn post_bss_pump_precedes_peer_sta_and_the_unchanged_tail() {
         let source = include_str!("vfio_read.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let before = production
-            .find("PassiveM1SnapshotPoint::BeforePostAssociationTail")
+            .find("PassiveM1SnapshotPoint::BeforeAssociatedBss")
             .unwrap();
-        let pump = before
+        let associate = before
             + production[before..]
-                .find(".pump_pre_associated_m1(io)")
+                .find("let associate_result = firmware.associate(")
+                .unwrap();
+        let pump = associate
+            + production[associate..]
+                .find(".pump_post_bss_pre_sta_m1(")
                 .unwrap();
         let after = pump
             + production[pump..]
-                .find("PassiveM1SnapshotPoint::AfterPreAssociationPump")
+                .find("PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta")
                 .unwrap();
-        let associated = after
+        let tail = after
             + production[after..]
-                .find("self.firmware\n                .associate(")
-                .unwrap();
-        let tail = associated
-            + production[associated..]
                 .find(".complete_post_assoc_interface(")
                 .unwrap();
-        assert!(before < pump);
+        let post_tail = tail
+            + production[tail..]
+                .find("PassiveM1SnapshotPoint::AfterPostAssociationTail")
+                .unwrap();
+        assert!(before < associate);
+        assert!(associate < pump);
         assert!(pump < after);
-        assert!(after < associated);
-        assert!(associated < tail);
+        assert!(after < tail);
+        assert!(tail < post_tail);
+
+        let core = include_str!("../../../mt7921-core/src/lib.rs");
+        let associate_core = core.split("    pub fn associate(").nth(1).unwrap();
+        let bss_complete = associate_core
+            .find("self.firmware_uncertain = false;")
+            .unwrap();
+        let callback = associate_core.find("after_bss()").unwrap();
+        let peer_sta = associate_core
+            .find("encode_legacy_wme_add_wcid_command(")
+            .unwrap();
+        assert!(bss_complete < callback);
+        assert!(callback < peer_sta);
 
         let deadline = production
             .find("started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT")
@@ -28357,8 +28447,8 @@ mod tests {
         const FIRST_STA_REC_US: u64 = 4_827;
         assert_eq!(EARLY_M1_US - ASSOCIATION_RESPONSE_US, 4_807);
         assert!(EARLY_M1_US < FIRST_STA_REC_US);
-        assert!(PRE_ASSOCIATED_M1_PUMP_TIMEOUT >= std::time::Duration::from_millis(10));
-        assert!(PRE_ASSOCIATED_M1_PUMP_TIMEOUT <= std::time::Duration::from_millis(20));
+        assert!(POST_BSS_PRE_STA_M1_PUMP_TIMEOUT >= std::time::Duration::from_millis(10));
+        assert!(POST_BSS_PRE_STA_M1_PUMP_TIMEOUT <= std::time::Duration::from_millis(20));
 
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
@@ -28380,8 +28470,9 @@ mod tests {
         assert_eq!(
             io.snapshots,
             [
-                PassiveM1SnapshotPoint::BeforePostAssociationTail,
-                PassiveM1SnapshotPoint::AfterPreAssociationPump,
+                PassiveM1SnapshotPoint::BeforeAssociatedBss,
+                PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta,
+                PassiveM1SnapshotPoint::AfterPostAssociationTail,
             ]
         );
         let generation = effects.firmware.association_generation.unwrap();
@@ -28395,7 +28486,7 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn pre_associated_m1_timeout_falls_through_to_the_unchanged_tail() {
+    fn post_bss_pre_sta_m1_timeout_falls_through_to_the_unchanged_tail() {
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
         prepare_validation_preauth(&mut effects, &mut io);
@@ -28418,8 +28509,9 @@ mod tests {
         assert_eq!(
             io.snapshots,
             [
-                PassiveM1SnapshotPoint::BeforePostAssociationTail,
-                PassiveM1SnapshotPoint::AfterPreAssociationPump,
+                PassiveM1SnapshotPoint::BeforeAssociatedBss,
+                PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta,
+                PassiveM1SnapshotPoint::AfterPostAssociationTail,
             ]
         );
         assert!(effects.firmware.association.is_some());
