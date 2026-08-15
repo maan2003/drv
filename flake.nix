@@ -1232,10 +1232,10 @@
                 --subst-var-by recovery_call_timeout_seconds 15 \
                 --subst-var-by home /home/maan2003 \
                 --subst-var-by xdg_runtime_dir /run/user/1002 \
-                --subst-var-by target_root /nix/store/m1rm3abrxd9dpspfyf739qfxzvjd906c-mt7921-full-firmware-validation-root-entry \
-                --subst-var-by target_package /nix/store/dpajvyicq04zqn5xk89hyzhh3smrrh9s-mt7921-full-firmware-validation-0.1.0 \
-                --subst-var-by target_manifest /nix/store/qjqnirv4n9fycyxjy0cxx6725k3sbkgn-mt7921-full-firmware-validation-manifest \
-                --subst-var-by target_supervisor /nix/store/d3nhjaqr5cxn65jjs5bimzy9yx2psm9w-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_root /nix/store/j98lfwgq6jpi77iqwk3srqb0fg792x1x-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/k7jwy1nlp2hxr7gz13f2spcljbplvgiz-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/c93vrcpvarj9nsdcrn8jh93l1pp6chxr-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/vdjlazxmvdin2916x7y8krgfr1cci2k3-mt7921-full-firmware-validation-supervisor \
                 --subst-var-by target_nix_store /nix/store/m9gfpnfrwdhr2cqakrfki9p73rjlfqgd-lix-2.95.2/bin/nix-store \
                 --subst-var-by target_sha256sum /nix/store/mp8s10fwm685azvvv1qq7zyf7iajjlj8-coreutils-9.11/bin/sha256sum \
                 --subst-var-by target_recovery_package ${mt7921-full-firmware-validation-recovery-status} \
@@ -1243,15 +1243,15 @@
                 --subst-var-by target_recovery_registered_hash "$(cat ${recoveryStatusRegisteredHash})" \
                 --subst-var-by target_recovery_sha256 "$(sha256sum ${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status | cut -d ' ' -f1)" \
                 --subst-var-by target_sudo /run/wrappers/bin/sudo \
-                --subst-var-by target_root_registered_hash sha256:15mgzc1cxzxn22rr6hgd2la7p8q0w9j1xn2w6hiv05kdpzqrpvbd \
-                --subst-var-by target_package_registered_hash sha256:0hfj3gpzr3jazs6114zg0q39hzqcp2kz76j5i0rmv3096v79ilwj \
-                --subst-var-by target_manifest_registered_hash sha256:11cvifa2sri0mg8s8n0jx6w50vcp8x81pifv38j56r6aazz1apfb \
-                --subst-var-by target_supervisor_registered_hash sha256:0yymp57vkjgz7ika9fdz8qk8bkfh85j9ycb4famr1dg8lqs1njdj \
-                --subst-var-by target_entry_sha256 7229617c6e6aaa738917c33be82851cb576eafddbdf2668aee97970e14f158d7 \
-                --subst-var-by target_manifest_sha256 ae21a876cba9a0a5e4e3467721ed9e6de8a6ae40aee01a6b3c1d38b85b51008d \
-                --subst-var-by target_supervisor_sha256 d315ed30107c2eaa1c0ea2661524965ba68100a5fb8bfb95b2d2040e16ae284f \
-                --subst-var-by target_identity_sha256 537b4268fe61034ca0b1d09abc2652d67b7e1671baa209bce7fe604d1735e0f1 \
-                --subst-var-by target_launcher_sha256 6d6b9b345c69351621916c8e47c27c0d254d29ab7a415aee7970318f3db9c0cf \
+                --subst-var-by target_root_registered_hash sha256:051x64hrbn4ipnifssws8c55kj5abbwalahqmhl49diiliipy5yi \
+                --subst-var-by target_package_registered_hash sha256:0ipq0lp1p9daanw6acyg1grx1ivf5ki73zkis609pdxmrw9i6l23 \
+                --subst-var-by target_manifest_registered_hash sha256:0k1yw2zjl8apyng1zdv0j1fp1ah6hqkyhwm2wxip4hh2iak298yg \
+                --subst-var-by target_supervisor_registered_hash sha256:1vyb1kih5a0n7vazlxzn02qg4yyh39ykpz7wjizap0my5r907j8n \
+                --subst-var-by target_entry_sha256 34e82e6e9737783851c34878b3c0f01c9ba94ee61d03e62f549e1bf035d7a465 \
+                --subst-var-by target_manifest_sha256 ba043714e3596fb89a63e1d0e1e8e795aeda82604abb6e6ee4942cc02a859abe \
+                --subst-var-by target_supervisor_sha256 487fa431e346a170c2a03266f1a55426a3fcbe3e804c41b53828421552a226ca \
+                --subst-var-by target_identity_sha256 005da7effa48e7aa1ce4ea037c781cc0b62d6871e342f1406edde8d5a761f68b \
+                --subst-var-by target_launcher_sha256 0bce960bf0b8d87527efd3c94d126296a5b3eee12861e4a6489ea9cd3bdd6f41 \
                 --subst-var-by transport_contract openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-remote-entry"
               runHook postInstall
@@ -1306,19 +1306,19 @@
                 REMOTE_ENTRY_REGISTERED_HASH=$(cat ${remoteEntryRegisteredHash})
                 REMOTE_TRANSPORT_CONTRACT=openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
                 REMOTE_TARGET=user@no-plastic
-                REMOTE_TARGET_ROOT=/nix/store/m1rm3abrxd9dpspfyf739qfxzvjd906c-mt7921-full-firmware-validation-root-entry
-                REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:15mgzc1cxzxn22rr6hgd2la7p8q0w9j1xn2w6hiv05kdpzqrpvbd
-                REMOTE_TARGET_ENTRY_SHA256=7229617c6e6aaa738917c33be82851cb576eafddbdf2668aee97970e14f158d7
-                REMOTE_TARGET_PACKAGE=/nix/store/dpajvyicq04zqn5xk89hyzhh3smrrh9s-mt7921-full-firmware-validation-0.1.0
-                REMOTE_TARGET_PACKAGE_REGISTERED_HASH=sha256:0hfj3gpzr3jazs6114zg0q39hzqcp2kz76j5i0rmv3096v79ilwj
-                REMOTE_TARGET_MANIFEST=/nix/store/qjqnirv4n9fycyxjy0cxx6725k3sbkgn-mt7921-full-firmware-validation-manifest
-                REMOTE_TARGET_MANIFEST_REGISTERED_HASH=sha256:11cvifa2sri0mg8s8n0jx6w50vcp8x81pifv38j56r6aazz1apfb
-                REMOTE_TARGET_MANIFEST_SHA256=ae21a876cba9a0a5e4e3467721ed9e6de8a6ae40aee01a6b3c1d38b85b51008d
-                REMOTE_TARGET_SUPERVISOR=/nix/store/d3nhjaqr5cxn65jjs5bimzy9yx2psm9w-mt7921-full-firmware-validation-supervisor
-                REMOTE_TARGET_SUPERVISOR_REGISTERED_HASH=sha256:0yymp57vkjgz7ika9fdz8qk8bkfh85j9ycb4famr1dg8lqs1njdj
-                REMOTE_TARGET_SUPERVISOR_SHA256=d315ed30107c2eaa1c0ea2661524965ba68100a5fb8bfb95b2d2040e16ae284f
-                REMOTE_TARGET_IDENTITY_SHA256=537b4268fe61034ca0b1d09abc2652d67b7e1671baa209bce7fe604d1735e0f1
-                REMOTE_TARGET_LAUNCHER_SHA256=6d6b9b345c69351621916c8e47c27c0d254d29ab7a415aee7970318f3db9c0cf
+                REMOTE_TARGET_ROOT=/nix/store/j98lfwgq6jpi77iqwk3srqb0fg792x1x-mt7921-full-firmware-validation-root-entry
+                REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:051x64hrbn4ipnifssws8c55kj5abbwalahqmhl49diiliipy5yi
+                REMOTE_TARGET_ENTRY_SHA256=34e82e6e9737783851c34878b3c0f01c9ba94ee61d03e62f549e1bf035d7a465
+                REMOTE_TARGET_PACKAGE=/nix/store/k7jwy1nlp2hxr7gz13f2spcljbplvgiz-mt7921-full-firmware-validation-0.1.0
+                REMOTE_TARGET_PACKAGE_REGISTERED_HASH=sha256:0ipq0lp1p9daanw6acyg1grx1ivf5ki73zkis609pdxmrw9i6l23
+                REMOTE_TARGET_MANIFEST=/nix/store/c93vrcpvarj9nsdcrn8jh93l1pp6chxr-mt7921-full-firmware-validation-manifest
+                REMOTE_TARGET_MANIFEST_REGISTERED_HASH=sha256:0k1yw2zjl8apyng1zdv0j1fp1ah6hqkyhwm2wxip4hh2iak298yg
+                REMOTE_TARGET_MANIFEST_SHA256=ba043714e3596fb89a63e1d0e1e8e795aeda82604abb6e6ee4942cc02a859abe
+                REMOTE_TARGET_SUPERVISOR=/nix/store/vdjlazxmvdin2916x7y8krgfr1cci2k3-mt7921-full-firmware-validation-supervisor
+                REMOTE_TARGET_SUPERVISOR_REGISTERED_HASH=sha256:1vyb1kih5a0n7vazlxzn02qg4yyh39ykpz7wjizap0my5r907j8n
+                REMOTE_TARGET_SUPERVISOR_SHA256=487fa431e346a170c2a03266f1a55426a3fcbe3e804c41b53828421552a226ca
+                REMOTE_TARGET_IDENTITY_SHA256=005da7effa48e7aa1ce4ea037c781cc0b62d6871e342f1406edde8d5a761f68b
+                REMOTE_TARGET_LAUNCHER_SHA256=0bce960bf0b8d87527efd3c94d126296a5b3eee12861e4a6489ea9cd3bdd6f41
                 REMOTE_ACTIVE_ARGC=0
                 REMOTE_PLAN_ARGV=--plan
                 REMOTE_RECOVERY_CONTRACT=sudo-n-exact-helper-poll-only-bounded-no-disarm
@@ -1376,10 +1376,10 @@
                 echo 'Host key verification failed.' >&2
                 exit 255
               fi
-              root=/nix/store/m1rm3abrxd9dpspfyf739qfxzvjd906c-mt7921-full-firmware-validation-root-entry
-              package=/nix/store/dpajvyicq04zqn5xk89hyzhh3smrrh9s-mt7921-full-firmware-validation-0.1.0
-              manifest=/nix/store/qjqnirv4n9fycyxjy0cxx6725k3sbkgn-mt7921-full-firmware-validation-manifest
-              supervisor=/nix/store/d3nhjaqr5cxn65jjs5bimzy9yx2psm9w-mt7921-full-firmware-validation-supervisor
+              root=/nix/store/j98lfwgq6jpi77iqwk3srqb0fg792x1x-mt7921-full-firmware-validation-root-entry
+              package=/nix/store/k7jwy1nlp2hxr7gz13f2spcljbplvgiz-mt7921-full-firmware-validation-0.1.0
+              manifest=/nix/store/c93vrcpvarj9nsdcrn8jh93l1pp6chxr-mt7921-full-firmware-validation-manifest
+              supervisor=/nix/store/vdjlazxmvdin2916x7y8krgfr1cci2k3-mt7921-full-firmware-validation-supervisor
               entry=$root/bin/mt7921-full-firmware-validation-root
               identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
               launcher=$package/bin/mt7921-full-firmware-validation
@@ -1394,27 +1394,27 @@
                   exit 0
                 fi
                 case "$4" in
-                  "$root") echo sha256:15mgzc1cxzxn22rr6hgd2la7p8q0w9j1xn2w6hiv05kdpzqrpvbd ;;
-                  "$package") echo sha256:0hfj3gpzr3jazs6114zg0q39hzqcp2kz76j5i0rmv3096v79ilwj ;;
-                  "$manifest") echo sha256:11cvifa2sri0mg8s8n0jx6w50vcp8x81pifv38j56r6aazz1apfb ;;
-                  "$supervisor") echo sha256:0yymp57vkjgz7ika9fdz8qk8bkfh85j9ycb4famr1dg8lqs1njdj ;;
+                  "$root") echo sha256:051x64hrbn4ipnifssws8c55kj5abbwalahqmhl49diiliipy5yi ;;
+                  "$package") echo sha256:0ipq0lp1p9daanw6acyg1grx1ivf5ki73zkis609pdxmrw9i6l23 ;;
+                  "$manifest") echo sha256:0k1yw2zjl8apyng1zdv0j1fp1ah6hqkyhwm2wxip4hh2iak298yg ;;
+                  "$supervisor") echo sha256:1vyb1kih5a0n7vazlxzn02qg4yyh39ykpz7wjizap0my5r907j8n ;;
                   /target/recovery-package) echo sha256:recoveryregisteredhash00000000000000000000000000000000 ;;
                   *) exit 90 ;;
                 esac
               elif [ "$1" = /target/sha256sum ]; then
                 case "$2" in
-                  "$entry") hash=7229617c6e6aaa738917c33be82851cb576eafddbdf2668aee97970e14f158d7 ;;
-                  "$manifest") hash=ae21a876cba9a0a5e4e3467721ed9e6de8a6ae40aee01a6b3c1d38b85b51008d ;;
-                  "$supervisor_file") hash=d315ed30107c2eaa1c0ea2661524965ba68100a5fb8bfb95b2d2040e16ae284f ;;
-                  "$identity") hash=537b4268fe61034ca0b1d09abc2652d67b7e1671baa209bce7fe604d1735e0f1 ;;
-                  "$launcher") hash=6d6b9b345c69351621916c8e47c27c0d254d29ab7a415aee7970318f3db9c0cf ;;
+                  "$entry") hash=34e82e6e9737783851c34878b3c0f01c9ba94ee61d03e62f549e1bf035d7a465 ;;
+                  "$manifest") hash=ba043714e3596fb89a63e1d0e1e8e795aeda82604abb6e6ee4942cc02a859abe ;;
+                  "$supervisor_file") hash=487fa431e346a170c2a03266f1a55426a3fcbe3e804c41b53828421552a226ca ;;
+                  "$identity") hash=005da7effa48e7aa1ce4ea037c781cc0b62d6871e342f1406edde8d5a761f68b ;;
+                  "$launcher") hash=0bce960bf0b8d87527efd3c94d126296a5b3eee12861e4a6489ea9cd3bdd6f41 ;;
                   /target/recovery) hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
                   *) exit 91 ;;
                 esac
                 printf '%s  %s\n' "$hash" "$2"
               elif [ "$1" = "$entry" ] && [ "''${2-}" = --plan ] && [ "$#" -eq 2 ]; then
-                printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=ae21a876cba9a0a5e4e3467721ed9e6de8a6ae40aee01a6b3c1d38b85b51008d supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=--plan\n' "$manifest" "$supervisor_file" "$launcher"
-                printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=d315ed30107c2eaa1c0ea2661524965ba68100a5fb8bfb95b2d2040e16ae284f launcher=%s launcher_sha256=6d6b9b345c69351621916c8e47c27c0d254d29ab7a415aee7970318f3db9c0cf\n' "$supervisor_file" "$launcher"
+                printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=ba043714e3596fb89a63e1d0e1e8e795aeda82604abb6e6ee4942cc02a859abe supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=--plan\n' "$manifest" "$supervisor_file" "$launcher"
+                printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=487fa431e346a170c2a03266f1a55426a3fcbe3e804c41b53828421552a226ca launcher=%s launcher_sha256=0bce960bf0b8d87527efd3c94d126296a5b3eee12861e4a6489ea9cd3bdd6f41\n' "$supervisor_file" "$launcher"
               elif [ "$1" = "$entry" ] && [ "$#" -eq 1 ]; then
                 echo active >> "$PWD/active.calls"
                 if [ "''${MODE-}" = unknown ] || [ "''${MODE-}" = hang ]; then exit 255; fi
@@ -1450,10 +1450,10 @@
                 --subst-var-by recovery_call_timeout_seconds 1 \
                 --subst-var-by home "$PWD/work/home" \
                 --subst-var-by xdg_runtime_dir "$PWD/work/runtime" \
-                --subst-var-by target_root /nix/store/m1rm3abrxd9dpspfyf739qfxzvjd906c-mt7921-full-firmware-validation-root-entry \
-                --subst-var-by target_package /nix/store/dpajvyicq04zqn5xk89hyzhh3smrrh9s-mt7921-full-firmware-validation-0.1.0 \
-                --subst-var-by target_manifest /nix/store/qjqnirv4n9fycyxjy0cxx6725k3sbkgn-mt7921-full-firmware-validation-manifest \
-                --subst-var-by target_supervisor /nix/store/d3nhjaqr5cxn65jjs5bimzy9yx2psm9w-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_root /nix/store/j98lfwgq6jpi77iqwk3srqb0fg792x1x-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/k7jwy1nlp2hxr7gz13f2spcljbplvgiz-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/c93vrcpvarj9nsdcrn8jh93l1pp6chxr-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/vdjlazxmvdin2916x7y8krgfr1cci2k3-mt7921-full-firmware-validation-supervisor \
                 --subst-var-by target_nix_store /target/nix-store \
                 --subst-var-by target_sha256sum /target/sha256sum \
                 --subst-var-by target_recovery_helper /target/recovery \
@@ -1461,15 +1461,15 @@
                 --subst-var-by target_recovery_registered_hash sha256:recoveryregisteredhash00000000000000000000000000000000 \
                 --subst-var-by target_recovery_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
                 --subst-var-by target_sudo /target/sudo \
-                --subst-var-by target_root_registered_hash sha256:15mgzc1cxzxn22rr6hgd2la7p8q0w9j1xn2w6hiv05kdpzqrpvbd \
-                --subst-var-by target_package_registered_hash sha256:0hfj3gpzr3jazs6114zg0q39hzqcp2kz76j5i0rmv3096v79ilwj \
-                --subst-var-by target_manifest_registered_hash sha256:11cvifa2sri0mg8s8n0jx6w50vcp8x81pifv38j56r6aazz1apfb \
-                --subst-var-by target_supervisor_registered_hash sha256:0yymp57vkjgz7ika9fdz8qk8bkfh85j9ycb4famr1dg8lqs1njdj \
-                --subst-var-by target_entry_sha256 7229617c6e6aaa738917c33be82851cb576eafddbdf2668aee97970e14f158d7 \
-                --subst-var-by target_manifest_sha256 ae21a876cba9a0a5e4e3467721ed9e6de8a6ae40aee01a6b3c1d38b85b51008d \
-                --subst-var-by target_supervisor_sha256 d315ed30107c2eaa1c0ea2661524965ba68100a5fb8bfb95b2d2040e16ae284f \
-                --subst-var-by target_identity_sha256 537b4268fe61034ca0b1d09abc2652d67b7e1671baa209bce7fe604d1735e0f1 \
-                --subst-var-by target_launcher_sha256 6d6b9b345c69351621916c8e47c27c0d254d29ab7a415aee7970318f3db9c0cf \
+                --subst-var-by target_root_registered_hash sha256:051x64hrbn4ipnifssws8c55kj5abbwalahqmhl49diiliipy5yi \
+                --subst-var-by target_package_registered_hash sha256:0ipq0lp1p9daanw6acyg1grx1ivf5ki73zkis609pdxmrw9i6l23 \
+                --subst-var-by target_manifest_registered_hash sha256:0k1yw2zjl8apyng1zdv0j1fp1ah6hqkyhwm2wxip4hh2iak298yg \
+                --subst-var-by target_supervisor_registered_hash sha256:1vyb1kih5a0n7vazlxzn02qg4yyh39ykpz7wjizap0my5r907j8n \
+                --subst-var-by target_entry_sha256 34e82e6e9737783851c34878b3c0f01c9ba94ee61d03e62f549e1bf035d7a465 \
+                --subst-var-by target_manifest_sha256 ba043714e3596fb89a63e1d0e1e8e795aeda82604abb6e6ee4942cc02a859abe \
+                --subst-var-by target_supervisor_sha256 487fa431e346a170c2a03266f1a55426a3fcbe3e804c41b53828421552a226ca \
+                --subst-var-by target_identity_sha256 005da7effa48e7aa1ce4ea037c781cc0b62d6871e342f1406edde8d5a761f68b \
+                --subst-var-by target_launcher_sha256 0bce960bf0b8d87527efd3c94d126296a5b3eee12861e4a6489ea9cd3bdd6f41 \
                 --subst-var-by transport_contract test-transport-v1
               chmod 0755 work/entry
               ${pkgs.python3}/bin/python - <<'PY' &
@@ -1491,7 +1491,7 @@
               : > ssh.transcript
               work/entry > active
               test "$(wc -l < active.calls)" -eq 1
-              grep -F "</nix/store/m1rm3abrxd9dpspfyf739qfxzvjd906c-mt7921-full-firmware-validation-root-entry/bin/mt7921-full-firmware-validation-root>" ssh.transcript
+              grep -F "</nix/store/j98lfwgq6jpi77iqwk3srqb0fg792x1x-mt7921-full-firmware-validation-root-entry/bin/mt7921-full-firmware-validation-root>" ssh.transcript
 
               rm active.calls
               : > ssh.transcript
