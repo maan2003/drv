@@ -5977,6 +5977,45 @@ fn encode_legacy_wme_wcid_command(
     Ok(expanded)
 }
 
+/// Linux's first `mt7921_mac_sta_add` command for a newly allocated peer.
+///
+/// This publishes only `STA_REC_BASIC` plus an empty reset-and-set WTBL
+/// request.  The later preauthentication station update adds PHY/RA/state and
+/// the nested WTBL TLVs; they are two distinct firmware transitions.
+pub fn encode_initial_peer_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    peer: [u8; 6],
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || wcid == 0 || peer == [0; 6] {
+        return Err("initial peer WCID identity is invalid".into());
+    }
+    let mut body = vec![0; 40];
+    body[0..8].copy_from_slice(&[bss_index, wcid, 2, 0, 1, 0, 0, 0]);
+    body[8..12].copy_from_slice(&[0, 0, 20, 0]);
+    body[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
+    body[16] = 0;
+    body[17] = 0;
+    body[18..20].copy_from_slice(&0u16.to_le_bytes());
+    body[20..26].copy_from_slice(&peer);
+    body[26..28].copy_from_slice(&1u16.to_le_bytes());
+    body[28..32].copy_from_slice(&[13, 0, 12, 0]);
+    body[32..40].copy_from_slice(&[wcid, 1, 0, 0, 0, 0, 0, 0]);
+
+    let total = 48 + body.len();
+    let mut bytes = vec![0; total];
+    bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&3u16.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 0x07;
+    bytes[48..].copy_from_slice(&body);
+    Ok(bytes)
+}
+
 pub fn encode_preauth_peer_wcid_command(
     sequence: u8,
     bss_index: u8,
@@ -7214,6 +7253,12 @@ impl ClientFirmwareEffectsState {
                 Err("preauth peer changed without teardown".into())
             };
         }
+        let initial = encode_initial_peer_wcid_command(
+            self.next_sequence(),
+            peer.bss_index,
+            peer.peer_wcid.get(),
+            peer.peer,
+        )?;
         let command = encode_preauth_peer_wcid_command(
             self.next_sequence(),
             peer.bss_index,
@@ -7222,7 +7267,8 @@ impl ClientFirmwareEffectsState {
             peer.rcpi,
         )?;
         self.firmware_uncertain = true;
-        if let Err(error) = submit(3, &command) {
+        let result = submit(3, &initial).and_then(|()| submit(3, &command));
+        if let Err(error) = result {
             let rollback = encode_remove_wcid_command(
                 self.next_sequence(),
                 peer.bss_index,
@@ -9427,9 +9473,9 @@ mod tests {
             )
             .unwrap();
         assert!(post_bss_boundary_seen.get());
-        assert_eq!(transcript.len(), 3);
-        assert_eq!(&transcript[2][48..52], &[0, 0, 0, 0]);
-        assert_eq!(&transcript[2][52..56], &[2, 0, 16, 0]);
+        assert_eq!(transcript.len(), 5);
+        assert_eq!(&transcript[3][48..52], &[0, 0, 0, 0]);
+        assert_eq!(&transcript[3][52..56], &[2, 0, 16, 0]);
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9521,7 +9567,7 @@ mod tests {
             .unwrap();
         let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 10);
+        assert_eq!(transcript.len(), 11);
         assert_eq!(
             transcript
                 .iter()
@@ -9534,12 +9580,18 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>(),
-            [3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
+            [3, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
         );
-        assert_eq!(transcript[6][80], 1);
-        assert_eq!(transcript[7][80], 2);
+        assert_eq!(transcript[7][80], 1);
+        assert_eq!(transcript[8][80], 2);
         assert!(!state.post_assoc_rx_filter_published);
-        let preauth_add = &transcript[0];
+        let initial_add = &transcript[0];
+        assert_eq!(initial_add.len(), 88);
+        assert_eq!(
+            &initial_add[48..],
+            &encode_initial_peer_wcid_command(1, 0, 1, peer).unwrap()[48..]
+        );
+        let preauth_add = &transcript[1];
         assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
         assert_eq!(&preauth_add[68..74], &peer);
@@ -9547,12 +9599,12 @@ mod tests {
             u16::from_le_bytes(preauth_add[66..68].try_into().unwrap()),
             0
         );
-        let bss_add = &transcript[1];
+        let bss_add = &transcript[2];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[88], 1);
-        assert_eq!(transcript[2][112], 2);
-        let interface_assoc = &transcript[3];
+        assert_eq!(transcript[4][112], 2);
+        let interface_assoc = &transcript[5];
         assert_eq!(interface_assoc.len(), 108);
         assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
         assert_eq!(
@@ -9566,8 +9618,8 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[9][56], 0);
-        assert_eq!(transcript[8][49], 1);
+        assert_eq!(transcript[10][56], 0);
+        assert_eq!(transcript[9][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);

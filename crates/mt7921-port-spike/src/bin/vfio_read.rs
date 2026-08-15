@@ -2409,13 +2409,16 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         )
         .map_err(|error| format!("self-test post-ASSOC interface WCID: {error}"))?;
     let activation_commands = activation_commands.into_inner();
+    let expected_initial =
+        mt7921_port_spike::encode_initial_peer_wcid_command(1, 0, peer_wcid.get(), peer)
+            .map_err(|error| format!("self-test initial peer fixture: {error}"))?;
     let expected_preauth =
-        mt7921_port_spike::encode_preauth_peer_wcid_command(1, 0, peer_wcid.get(), peer, 100)
+        mt7921_port_spike::encode_preauth_peer_wcid_command(2, 0, peer_wcid.get(), peer, 100)
             .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
-    let expected_bss = encode_client_bss_command(2, 0, peer, 36, 100, 2, true, true)
+    let expected_bss = encode_client_bss_command(3, 0, peer, 36, 100, 2, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(
-        4,
+        5,
         0,
         peer_wcid.get(),
         42,
@@ -2428,14 +2431,14 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         0,
     )
     .map_err(|error| format!("self-test association peer fixture: {error}"))?;
-    let expected_interface = encode_client_post_assoc_interface_wcid_command(6, 0, peer)
+    let expected_interface = encode_client_post_assoc_interface_wcid_command(7, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
-    let expected_beacon = encode_client_post_assoc_beacon_timing_command(7, 0, 100, 2)
+    let expected_beacon = encode_client_post_assoc_beacon_timing_command(8, 0, 100, 2)
         .map_err(|error| format!("self-test association beacon fixture: {error}"))?;
-    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(8)
+    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(9)
         .map_err(|error| format!("self-test association RX-filter fixture: {error}"))?;
-    let expected_rlm = encode_client_post_assoc_rlm_command(3, 0, rx_channel.channel)
-    .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
+    let expected_rlm = encode_client_post_assoc_rlm_command(4, 0, rx_channel.channel)
+        .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == peer_wcid.get()
         && expected_peer[121] == 1
         && expected_peer[122..124] == [4, 0]
@@ -2447,6 +2450,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let all_ones_readback = classify_wtbl_peer_readback(&peer, Err(WtblPeerReadback::AllOnes));
     if activation_commands
         != [
+            (3, expected_initial),
             (3, expected_preauth),
             (2, expected_bss),
             (2, expected_rlm),
@@ -16993,7 +16997,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 u32::from_le_bytes(encoded[60..64].try_into().unwrap()),
                 encoded[64],
                 encoded[65],
-                encoded[66], encoded[67], encoded[68], encoded[69], encoded[70], encoded[71],
+                encoded[66],
+                encoded[67],
+                encoded[68],
+                encoded[69],
+                encoded[70],
+                encoded[71],
                 u16::from_le_bytes(encoded[72..74].try_into().unwrap()),
                 u16::from_le_bytes(encoded[74..76].try_into().unwrap()),
                 encoded[76],
@@ -17164,7 +17173,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             pages: self.mac_pages,
         };
         let stage = match (expected_cid, encoded.len(), encoded.get(49).copied()) {
-            (3, len, Some(1)) if len < 200 => Some("after_preauth_cid3_ack"),
+            (3, 88, Some(1)) => Some("after_initial_peer_cid3_ack"),
+            (3, 176, Some(1)) => Some("after_preauth_cid3_ack"),
             (2, 92, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
             (3, len, Some(1)) if len >= 200 => Some("after_associated_cid3_ack"),
             (3, 108, Some(19)) => Some("after_interface_wcid_update"),
@@ -20494,6 +20504,23 @@ mod tests {
             ]
         );
         assert_eq!(&encoded[168..176], &[13, 0, 8, 0, 1, 0, 1, 0]);
+
+        let initial = mt7921_port_spike::encode_initial_peer_wcid_command(
+            12,
+            0,
+            7,
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+        )
+        .unwrap();
+        assert_eq!(initial.len(), 88);
+        assert_eq!(validate_uni_request(3, &initial).unwrap(), 12);
+        assert_eq!(
+            &initial[48..],
+            &[
+                0, 7, 2, 0, 1, 0, 0, 0, 0, 0, 20, 0, 2, 0, 1, 0, 0, 0, 0, 0, 16, 32, 48, 64, 80,
+                96, 1, 0, 13, 0, 12, 0, 7, 1, 0, 0, 0, 0, 0, 0,
+            ]
+        );
 
         let preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
             8,

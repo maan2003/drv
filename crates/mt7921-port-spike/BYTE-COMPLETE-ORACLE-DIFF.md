@@ -218,3 +218,46 @@ The admission-clear register trace selected WCID 1 explicitly. Its programmed
 low index was 1 on both paths, with bit 12 set for the write and busy clear in
 the observed completion; direct LMAC address `0x820d8114` was used for peer
 DW5. Interface WCID 19 was not selected by either peer clear.
+
+## BSS/RLM-to-M1 normalized transcript (2026-08-15)
+
+This audit uses the corrected native private-frame oracle
+`20260814T111237Z-linux-oracle-0000_05_00.0.log` (SHA-256
+`4dbcc30d32fa59398a7d5086070483583341f1f9fecbf996bf2d6dabd392d214`),
+the source-instrumented raw/state oracle
+`20260812T175733Z-linux-oracle-0000_05_00.0.log`, and userspace campaign-v10
+attempt 1 (`20260815T020200Z-0000_05_00.0.log`, SHA-256
+`49d4de075e7cde7370ea2bc11aaff7e5fc56e3987ccc3557565b281d4d1754ec`).
+The corrected oracle owns frame order/timing; the older oracle owns raw command
+bytes and staged WTBL state. Where its raw logger retained only the first 64
+bytes, the remainder below is reconstructed from the pinned Linux 6.18.40
+TLV builders and the logger's complete TLV/decoded-field transcript. Only MCU
+sequence/checksum and the ROC token are normalized. WCID 1 and BSS 0 are not
+normalized because both paths allocated those exact IDs.
+
+| Boundary from last common selected channel | Native Linux | Userspace v10 | Normalized result |
+|---|---|---|---|
+| Scan/channel ownership | background scan completion, ROC/channel context, then channel 36/80 MHz | scan event 13, gate, channel-switch response event 237, channel 36/80 MHz | Same semantic channel; event sequence IDs dynamic. |
+| DEV/BSS preauth | CID 1 DEV active; CID 3 initial peer; CID 2 BSS BASIC+QBSS; CID 2 RLM | CID 1 DEV active; CID 2 basic BSS; legacy EDCA; no initial peer/BSS-target/RLM transition | **First presence/order divergence is the absent initial CID 3 peer allocation.** Later BSS/RLM omissions remain follow-up differences and are not changed here. |
+| Initial peer CID 3 | 40-byte payload, SHA-256 `2135af4e55ab272449d675701c5dd24fc460cd7ae18e4fb2dc51421b6f0b82f6`; BASIC `state=0,new=1,aid=0,qos=0`, empty reset-and-set WTBL; ACK event 1; DW5 `0x00000000` | absent | Source-exact payload is now emitted before the existing full preauth update. |
+| Preauth BSS | 44 bytes, BASIC `active=1,conn_state=1,dtim=0,qos=0`, then RLM 20 bytes | earlier generic BSS only | Present/order mismatch; deliberately not changed because it follows the initial-peer divergence. |
+| Full preauth CID 3 | 128-byte payload, reconstructed SHA-256 `069e6523e65fd9525c88527735447215db979ae35e4e1b44289c620777b0b999`; BASIC/PHY/RA/STATE/WTBL, PHY type `0x15`, rates `0x0015/0x3fc0`; ACK event 1; DW5 `0x32000000` | 128-byte payload inside 176-byte envelope, PHY type `0x08`, rates `0x0001/0x0040`; ACK event 1; DW5 `0x32000040` | Payload and named `CHANGE_BW_RATE` bit 6 differ. The missing initial command is earlier than these decoded-field differences. |
+| SAE + ROC | acquire token, grant event 39, SAE commit/anti-clogging/confirm, abort | acquire/grant event 39, same three SAE stages, abort CID 0x27 | Presence/order equivalent; token and timing dynamic. |
+| Association request | acquire/grant event 39, association request, status-0 response | same; v10 response at 71,969,741 ns | Equivalent through successful association response. |
+| Associated BSS CID 2 | 44 bytes, SHA-256 `1d53ec7b42d2af141587b384ea71b900b315d95c034ac26a24949a0af84256d4`; BASIC+QBSS, `conn_state=0,dtim=2,qos=1` | exact same length/hash/decoded fields; ACK event 1 | Exact after transport normalization. |
+| Associated RLM CID 2 | 20 bytes, SHA-256 `4828fa8ea2e7889bd7c2d55b03af43e05c7fc5da18a3b3e651070a06f285f188`; primary 36, center 42, BW 80, center2 0 | exact same length/hash/decoded fields; ACK event 1 | Exact and ordered before the M1 pump. |
+| M1 boundary | corrected oracle: BSS at 96,985,687,548,786 ns; RLM at 96,985,688,729,990 ns; M1 at 96,985,692,244,299 ns; associated STA follows at 96,985,692,264,437 ns | pump window after BSS+RLM sees no M1; associated STA/tail then timeout | Native gaps: BSS→RLM 1.181 ms, RLM→M1 3.514 ms, M1→STA 20.138 µs. Userspace preserves BSS→RLM→pump order but receives zero RX DMA completions. |
+
+At native M1, staged state is safely source-established as peer WTBL DW5
+`0x32000000`: the raw oracle reads that value after both preauth and associated
+BSS ACK, and RLM does not write WTBL. RFCR/RFCR1 are source-reconstructed as
+`0x000ce70a`/`0x7fc019d0`: the corrected timeline places M1 before associated
+STA and the later post-association RX-filter update, while the userspace safe
+read at the homologous BSS+RLM boundary reports those values. No claim is made
+for counters or unnamed fields. Userspace v10 instead carries DW5
+`0x32000040` from full preauth through associated BSS and RLM; bit 6 lies in
+the source-named `CHANGE_BW_RATE` field. Thus the earliest source-proven
+semantic divergence that persists into BSS+RLM→M1 is Linux's initial minimal
+peer transition being absent before the full preauth station update. The
+implementation below restores only that command and leaves later BSS/PHY/RA
+and filter differences for subsequent one-cause campaigns.
