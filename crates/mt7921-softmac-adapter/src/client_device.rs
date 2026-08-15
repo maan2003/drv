@@ -350,6 +350,7 @@ pub struct ClientRxSecurity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PassiveM1SnapshotPoint {
     BeforePostAssociationTail,
+    AfterPreAssociationPump,
     M1Timeout,
 }
 

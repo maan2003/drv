@@ -3719,14 +3719,15 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v6";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v7";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
 const PASSIVE_M1_PEER_WTBL_DW2: u32 = 0x820d_8108;
 const PASSIVE_M1_RMAC_RFCR: u32 = 0x820e_5000;
 const PASSIVE_M1_RMAC_RFCR1: u32 = 0x820e_5004;
-const PASSIVE_M1_BEFORE_TAIL_BOUNDARY: &str = "before-post-assoc-tail";
+const PASSIVE_M1_BEFORE_TAIL_BOUNDARY: &str = "before-associated-bss-sta-edca";
+const PASSIVE_M1_AFTER_PUMP_BOUNDARY: &str = "after-pre-associated-rx-pump-15ms";
 const PASSIVE_M1_POSITIVE_RESULT: &str = "target_m1_observed_at_rx_dma";
 const PASSIVE_M1_NEGATIVE_RESULT: &str = "no_m1_at_rx_dma_ambiguous";
 const PASSIVE_M1_TARGET_SCOPE: &str =
@@ -3738,12 +3739,14 @@ const TARGET_BEACON_TIM_TRUE_RESULT: &str = "ap-queued-unicast-for-normalized-ai
 const TARGET_BEACON_TIM_NEVER_TRUE_RESULT: &str = "inconclusive";
 const PASSIVE_M1_FIRST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "fuchsia-passive")]
+const PRE_ASSOCIATED_M1_PUMP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(15);
+#[cfg(feature = "fuchsia-passive")]
 const PASSIVE_M1_SME_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
     format!(
-        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_TAIL_BOUNDARY},{PASSIVE_M1_AFTER_PUMP_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
     )
 }
 
@@ -13738,6 +13741,40 @@ fn is_authenticator_m1(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "fuchsia-passive")]
 impl LiveClientEffects {
+    fn pump_pre_associated_m1(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        let started = Instant::now();
+        let mut polls = 0u32;
+        let mut non_m1_deliveries = 0u32;
+        loop {
+            polls = polls.wrapping_add(1);
+            if self.next_rx(io)?.is_some() {
+                non_m1_deliveries = non_m1_deliveries.wrapping_add(1);
+            }
+            if matches!(self.early_m1, EarlyM1Latch::Retained { .. }) {
+                record_sae_stage(&format!(
+                    "pre_associated_m1_pump result=m1_retained elapsed_us={} polls={} non_m1_deliveries={} tail=required",
+                    started.elapsed().as_micros(),
+                    polls,
+                    non_m1_deliveries,
+                ));
+                return Ok(());
+            }
+            if started.elapsed() >= PRE_ASSOCIATED_M1_PUMP_TIMEOUT {
+                record_sae_stage(&format!(
+                    "pre_associated_m1_pump result=bounded_fallback elapsed_us={} polls={} non_m1_deliveries={} tail=required",
+                    started.elapsed().as_micros(),
+                    polls,
+                    non_m1_deliveries,
+                ));
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     fn acquire_join_roc(
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
@@ -14426,7 +14463,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
     ) -> Result<(), zx::Status> {
         let result = (|| {
             self.post_assoc_rx_ready_generation = None;
-            let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
             let mut validation_phase_transition = ProductionAssociationPhaseTransition::new(
                 self.suppress_eapol_liveness.then(|| {
                     self.state
@@ -14531,6 +14567,24 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 .authorized_channel()
                 .map_err(|_| zx::Status::BAD_STATE)?;
             let peer_wcid = self.peer_wcid.ok_or(zx::Status::BAD_STATE)?;
+            if self.suppress_eapol_liveness {
+                if let Err(status) =
+                    io.passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
+                {
+                    record_sae_stage(&format!(
+                        "passive_m1_rx_snapshot phase=before_associated_bss_sta_edca result=unavailable status={status}"
+                    ));
+                }
+                self.pump_pre_associated_m1(io)?;
+                if let Err(status) =
+                    io.passive_m1_snapshot(PassiveM1SnapshotPoint::AfterPreAssociationPump)
+                {
+                    record_sae_stage(&format!(
+                        "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump result=unavailable status={status}"
+                    ));
+                }
+            }
+            let rx_tail_guard = AssociationRxTailGuard::new(std::mem::take(&mut self.early_m1));
             self.firmware
                 .associate(
                     LegacyWmeAssociation {
@@ -14616,15 +14670,6 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 ));
             }
             let io = std::cell::RefCell::new(&mut *io);
-            if self.suppress_eapol_liveness
-                && let Err(status) = io
-                    .borrow_mut()
-                    .passive_m1_snapshot(PassiveM1SnapshotPoint::BeforePostAssociationTail)
-            {
-                record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=before_post_assoc_tail result=unavailable status={status}"
-                ));
-            }
             self.firmware
                 .complete_post_assoc_interface(
                     channel.channel,
@@ -15852,7 +15897,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             PassiveM1SnapshotPoint::BeforePostAssociationTail => {
                 self.passive_m1_baseline = Some(snapshot);
                 record_sae_stage(&format!(
-                    "passive_m1_rx_snapshot phase=before_post_assoc_tail source=linux-6.18.40 contract=safe-read-rx-eligibility-v1 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
+                    "passive_m1_rx_snapshot phase=before_associated_bss_sta_edca source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} drop_a3_mac={} drop_a3_bssid={} drop_a2_bssid={} drop_other_bss={} drop_other_uc={} rx_dma_enabled={} cidx={} didx_before={} didx_after={} unstable={} descriptor_ctrl=[{}] rx_head={} rx_tail={} completed_total={} rx_error_total={} client_frame_total={} eapol_total={} authenticator_m1_total={} omitted_consuming_mib=all omitted_unnamed=filter_drop_count,WTBL_lookup_hit_miss,PLE_PSE_rx_drop",
                     snapshot.peer_wtbl_aid,
                     snapshot.rmac_rfcr,
                     snapshot.rmac_rfcr1,
@@ -15874,6 +15919,33 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     snapshot.client_frame_total,
                     snapshot.eapol_total,
                     snapshot.authenticator_m1_total,
+                ));
+            }
+            PassiveM1SnapshotPoint::AfterPreAssociationPump => {
+                let Some(before) = self.passive_m1_baseline else {
+                    record_sae_stage(
+                        "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump result=unavailable reason=missing_baseline",
+                    );
+                    return Err(zx::Status::BAD_STATE);
+                };
+                record_sae_stage(&format!(
+                    "passive_m1_rx_snapshot phase=after_pre_associated_rx_pump source=linux-6.18.40 contract=safe-read-rx-eligibility-v2 peer_wtbl_aid={} rmac_rfcr={:#010x} rmac_rfcr1={:#010x} rx_dma_enabled={} completed_delta={} rx_error_delta={} client_frame_delta={} eapol_delta={} authenticator_m1_delta={} retained={} omitted_consuming_mib=all",
+                    snapshot.peer_wtbl_aid,
+                    snapshot.rmac_rfcr,
+                    snapshot.rmac_rfcr1,
+                    snapshot.rx_dma_enabled,
+                    snapshot
+                        .completed_total
+                        .wrapping_sub(before.completed_total),
+                    snapshot.rx_error_total.wrapping_sub(before.rx_error_total),
+                    snapshot
+                        .client_frame_total
+                        .wrapping_sub(before.client_frame_total),
+                    snapshot.eapol_total.wrapping_sub(before.eapol_total),
+                    snapshot
+                        .authenticator_m1_total
+                        .wrapping_sub(before.authenticator_m1_total),
+                    snapshot.authenticator_m1_total != before.authenticator_m1_total,
                 ));
             }
             PassiveM1SnapshotPoint::M1Timeout => {
@@ -19336,6 +19408,7 @@ mod tests {
         roc_channels: Vec<ClientPhysicalChannel>,
         tx: Vec<Vec<u8>>,
         rx: VecDeque<ClientRxFrame>,
+        snapshots: Vec<PassiveM1SnapshotPoint>,
         fail_uni: bool,
         tx_status: Option<zx::Status>,
     }
@@ -19592,6 +19665,10 @@ mod tests {
         }
         fn abort_join_roc(&mut self, generation: u64) -> Result<(), zx::Status> {
             self.roc.push((false, generation, 0));
+            Ok(())
+        }
+        fn passive_m1_snapshot(&mut self, point: PassiveM1SnapshotPoint) -> Result<(), zx::Status> {
+            self.snapshots.push(point);
             Ok(())
         }
         fn transmit_client(
@@ -28009,10 +28086,10 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v6\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v7\"",
             "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
-            "\"snapshot_boundaries\":\"before-post-assoc-tail,m1-observation-timeout-5000ms\"",
+            "\"snapshot_boundaries\":\"before-associated-bss-sta-edca,after-pre-associated-rx-pump-15ms,m1-observation-timeout-5000ms\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
@@ -28052,17 +28129,32 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
-    fn passive_m1_snapshots_bracket_the_unchanged_tail_and_deadline() {
+    fn pre_associated_pump_precedes_the_unchanged_tail_and_deadline() {
         let source = include_str!("vfio_read.rs");
         let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let before = production
             .find("PassiveM1SnapshotPoint::BeforePostAssociationTail")
             .unwrap();
-        let tail = before
+        let pump = before
             + production[before..]
+                .find(".pump_pre_associated_m1(io)")
+                .unwrap();
+        let after = pump
+            + production[pump..]
+                .find("PassiveM1SnapshotPoint::AfterPreAssociationPump")
+                .unwrap();
+        let associated = after
+            + production[after..]
+                .find("self.firmware\n                .associate(")
+                .unwrap();
+        let tail = associated
+            + production[associated..]
                 .find(".complete_post_assoc_interface(")
                 .unwrap();
-        assert!(before < tail);
+        assert!(before < pump);
+        assert!(pump < after);
+        assert!(after < associated);
+        assert!(associated < tail);
 
         let deadline = production
             .find("started.elapsed() >= PASSIVE_M1_FIRST_DATA_TIMEOUT")
@@ -28184,32 +28276,75 @@ mod tests {
         const FIRST_STA_REC_US: u64 = 4_827;
         assert_eq!(EARLY_M1_US - ASSOCIATION_RESPONSE_US, 4_807);
         assert!(EARLY_M1_US < FIRST_STA_REC_US);
+        assert!(PRE_ASSOCIATED_M1_PUMP_TIMEOUT >= std::time::Duration::from_millis(10));
+        assert!(PRE_ASSOCIATED_M1_PUMP_TIMEOUT <= std::time::Duration::from_millis(20));
 
         let mut effects = validation_effects();
         let mut io = TestClientIo::default();
-        let retained = drive_validation_to_retained_m1(&mut effects, &mut io);
-        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 2);
-        let queued = validation_early_m1(&effects, 8);
-        let queued_bytes = queued.bytes.clone();
-        io.rx.push_back(queued);
+        prepare_validation_preauth(&mut effects, &mut io);
+        let request = validation_association_request(&effects);
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        io.rx.push_back(validation_association_response(&effects));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        let early = validation_early_m1(&effects, 8);
+        let expected = early.bytes.clone();
+        io.rx.push_back(early);
+
         effects
             .notify_association_complete(&validation_association(), &mut io)
             .unwrap();
+
+        assert_eq!(
+            io.snapshots,
+            [
+                PassiveM1SnapshotPoint::BeforePostAssociationTail,
+                PassiveM1SnapshotPoint::AfterPreAssociationPump,
+            ]
+        );
         let generation = effects.firmware.association_generation.unwrap();
         assert_eq!(effects.post_assoc_rx_ready_generation, Some(generation));
-        assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, retained);
-        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 2);
-        assert_eq!(
-            effects.next_rx(&mut io).unwrap().unwrap().bytes,
-            queued_bytes
-        );
-        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 3);
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
-        assert_eq!(effects.state.lock().unwrap().passive_rx_observed, 3);
+        assert_eq!(effects.next_rx(&mut io).unwrap().unwrap().bytes, expected);
         assert!(matches!(
             effects.early_m1,
             EarlyM1Latch::Ready { frame: None, .. }
         ));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn pre_associated_m1_timeout_falls_through_to_the_unchanged_tail() {
+        let mut effects = validation_effects();
+        let mut io = TestClientIo::default();
+        prepare_validation_preauth(&mut effects, &mut io);
+        let request = validation_association_request(&effects);
+        effects
+            .send_wlan_frame(&request, fidl_softmac::WlanTxInfoFlags::empty(), &mut io)
+            .unwrap();
+        io.rx.push_back(validation_association_response(&effects));
+        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        let commands_before = io.uni.len();
+
+        effects
+            .notify_association_complete(&validation_association(), &mut io)
+            .unwrap();
+
+        assert!(
+            io.uni.len() > commands_before,
+            "normal associated tail must run"
+        );
+        assert_eq!(
+            io.snapshots,
+            [
+                PassiveM1SnapshotPoint::BeforePostAssociationTail,
+                PassiveM1SnapshotPoint::AfterPreAssociationPump,
+            ]
+        );
+        assert!(effects.firmware.association.is_some());
+        assert!(effects.firmware.qos_tx_ready());
+        assert!(effects.post_assoc_rx_ready_generation.is_some());
+        assert!(matches!(effects.early_m1, EarlyM1Latch::Inactive));
     }
 
     #[cfg(feature = "fuchsia-passive")]
