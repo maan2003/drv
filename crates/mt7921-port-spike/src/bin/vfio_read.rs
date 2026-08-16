@@ -15799,9 +15799,9 @@ fn diagnostic_probe_trigger(
 
 #[cfg(feature = "fuchsia-passive")]
 fn validate_production_prefix_sequence(enabled: bool, sequence: u8) -> Result<(), String> {
-    (!enabled || sequence == 14)
+    (!enabled || sequence == 15)
         .then_some(())
-        .ok_or_else(|| format!("production firmware prefix sequence drifted from 14 to {sequence}"))
+        .ok_or_else(|| format!("production firmware prefix sequence drifted from 15 to {sequence}"))
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -24058,8 +24058,8 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn production_validation_rejects_non_eapol_second_publication_and_failed_completion() {
-        validate_production_prefix_sequence(true, 14).unwrap();
-        assert!(validate_production_prefix_sequence(true, 13).is_err());
+        validate_production_prefix_sequence(true, 15).unwrap();
+        assert!(validate_production_prefix_sequence(true, 14).is_err());
         let mut anchored = vec![0x88, 0x01];
         anchored.resize(26, 0);
         anchored.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
