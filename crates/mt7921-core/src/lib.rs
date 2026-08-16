@@ -7330,6 +7330,11 @@ impl ClientFirmwareEffectsState {
             joined.channel,
             joined.beacon_interval,
         )?;
+        let rlm = encode_client_post_assoc_rlm_command(
+            self.next_sequence(),
+            peer.bss_index,
+            channel.channel,
+        )?;
         let command = encode_preauth_peer_wcid_command(
             self.next_sequence(),
             peer.bss_index,
@@ -7346,6 +7351,7 @@ impl ClientFirmwareEffectsState {
                 self.bss_programmed = true;
                 self.bss_binding = Some((peer.bss_index, false));
             })
+            .and_then(|()| submit(2, &rlm))
             .and_then(|()| submit(3, &command));
         if let Err(error) = result {
             let rollback = encode_remove_wcid_command(
@@ -9573,9 +9579,16 @@ mod tests {
             )
             .unwrap();
         assert!(post_bss_boundary_seen.get());
-        assert_eq!(transcript.len(), 6);
-        assert_eq!(&transcript[4][48..52], &[0, 0, 0, 0]);
-        assert_eq!(&transcript[4][52..56], &[2, 0, 16, 0]);
+        assert_eq!(transcript.len(), 7);
+        assert_eq!(
+            transcript[..4]
+                .iter()
+                .map(|command| command[39])
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(&transcript[5][48..52], &[0, 0, 0, 0]);
+        assert_eq!(&transcript[5][52..56], &[2, 0, 16, 0]);
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9667,7 +9680,7 @@ mod tests {
             .unwrap();
         let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 12);
+        assert_eq!(transcript.len(), 13);
         assert_eq!(
             transcript
                 .iter()
@@ -9680,10 +9693,10 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>(),
-            [3, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
+            [3, 2, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
         );
-        assert_eq!(transcript[8][80], 1);
-        assert_eq!(transcript[9][80], 2);
+        assert_eq!(transcript[9][80], 1);
+        assert_eq!(transcript[10][80], 2);
         assert!(!state.post_assoc_rx_filter_published);
         let initial_add = &transcript[0];
         assert_eq!(initial_add.len(), 88);
@@ -9701,7 +9714,15 @@ mod tests {
         assert_eq!(&preauth_bss[72..80], &[19, 0, 100, 0, 0, 0xb1, 19, 0]);
         assert_eq!(&preauth_bss[80..84], &[0x78, 0, 0, 0]);
         assert_eq!(&preauth_bss[84..92], &[15, 0, 8, 0, 0, 0, 0, 0]);
-        let preauth_add = &transcript[2];
+        let preauth_rlm = &transcript[2];
+        assert_eq!(preauth_rlm.len(), 68);
+        assert_eq!(
+            &preauth_rlm[48..],
+            &[
+                0, 0, 0, 0, 2, 0, 16, 0, 36, 36, 0, 0, 2, 3, 1, 4, 0, 1, 0, 0
+            ]
+        );
+        let preauth_add = &transcript[3];
         assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
         assert_eq!(&preauth_add[68..74], &peer);
@@ -9709,12 +9730,12 @@ mod tests {
             u16::from_le_bytes(preauth_add[66..68].try_into().unwrap()),
             0
         );
-        let bss_add = &transcript[3];
+        let bss_add = &transcript[4];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[88], 1);
-        assert_eq!(transcript[5][112], 2);
-        let interface_assoc = &transcript[6];
+        assert_eq!(transcript[6][112], 2);
+        let interface_assoc = &transcript[7];
         assert_eq!(interface_assoc.len(), 108);
         assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
         assert_eq!(
@@ -9728,11 +9749,70 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[11][56], 0);
-        assert_eq!(transcript[10][49], 1);
+        assert_eq!(transcript[12][56], 0);
+        assert_eq!(transcript[11][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);
+    }
+
+    #[test]
+    fn preauth_rlm_failure_rolls_back_wcid_and_bss_with_reserved_sequences() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let lease = ClientChannelLease {
+            channel: ClientPhysicalChannel {
+                band: 1,
+                primary: 36,
+                center: 42,
+                bandwidth: 2,
+                center2: 0,
+            },
+            generation: 1,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        let peer_wcid = state.allocate_peer_wcid().unwrap();
+        state.bind_join(peer, lease, 100, 2).unwrap();
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid,
+            aid: 0,
+            peer,
+            rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
+            negotiated_qos: false,
+            mfp_required: false,
+        };
+        let mut transcript = Vec::new();
+        assert!(
+            state
+                .prepare_preauth_peer(association, lease, |cid, command| {
+                    transcript.push((cid, command[39], command.len(), command[56]));
+                    if transcript.len() == 3 {
+                        Err("ambiguous preauth RLM".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(
+            transcript,
+            [
+                (3, 1, 88, 0),
+                (2, 2, 92, 1),
+                (2, 3, 68, 36),
+                (3, 5, 88, 0),
+                (2, 6, 92, 0),
+            ]
+        );
+        assert!(state.preauth_peer.is_none());
+        assert!(!state.bss_programmed);
+        assert!(!state.firmware_uncertain);
+        assert_eq!(state.allocate_peer_wcid().unwrap(), peer_wcid);
     }
 
     #[test]

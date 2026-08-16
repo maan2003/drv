@@ -17257,6 +17257,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let stage = match (expected_cid, encoded.len(), encoded.get(49).copied()) {
             (3, 88, Some(1)) => Some("after_initial_peer_cid3_ack"),
             (3, 176, Some(1)) => Some("after_preauth_cid3_ack"),
+            (2, 92, _) if encoded.get(56) == Some(&1) && encoded.get(76) == Some(&0) => {
+                Some("after_preauth_bss_ack")
+            }
             (2, 92, _) if encoded.get(56) == Some(&1) => Some("after_association_bss_ack"),
             (3, len, Some(1)) if len >= 200 => Some("after_associated_cid3_ack"),
             (3, 108, Some(19)) => Some("after_interface_wcid_update"),
