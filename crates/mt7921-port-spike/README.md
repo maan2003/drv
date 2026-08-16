@@ -2855,7 +2855,7 @@ initial response timer and terminates at its own 5000 ms boundary; normal SME
 timers remain unchanged.
 
 The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v10`. In addition to the RX-DMA reads, it records
+`linux-6.18.40-passive-m1-rx-v11`. In addition to the RX-DMA reads, it records
 a baseline immediately before associated BSS programming. Pinned Linux 6.18.40
 programs the associated BSS before the peer STA_REC, and the corrected native
 timeline records the 44-byte CID-2 BSS_INFO 4.696 ms before M1 and the first
@@ -2880,7 +2880,7 @@ existing five-second wait. Read-only snapshots expose cumulative RX deltas at
 post-BSS/pre-STA and post-tail boundaries relative to the pre-BSS baseline. It
 also records peer-WTBL DW2 AID and the two static RMAC receive-filter words at
 all boundaries. It enumerates the only safe register reads
-(`0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004`), both snapshot
+(`0xd4208,0xd4508,0xd450c,0xd4528,0xd452c,0xd4548,0xd454c,0x820d8108,0x820e5000,0x820e5004`), covering CIDX and DIDX for WM ring 0, data ring 2, and WM2 ring 4. V11 also records every ring descriptor ownership word, software head/tail, and completion count at each boundary, so normal RX misrouting to either MCU ring is independently visible without a consuming counter. A zero across all three host routes remains ambiguous before DMA. It retains all snapshot
 boundaries, the exact pinned AP-to-client M1 scope, positive and
 ambiguous-negative results, best-effort
 read-only behavior, the observer-owned 5000 ms deadline, the validation-only

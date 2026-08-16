@@ -657,3 +657,23 @@ Every report ends `RESTORE end failed=0`. Final authoritative recovery is
 idle=true (status 0), quarantined=false (status 1) and native-ready=true
 (status 0): `mt7921e` is rebound in PCI D0, iwd is active, the watchdog is
 inactive/non-failed, and the WLAN default route is present.
+
+### Next evidence boundary: all host RX routes (campaign pending)
+
+The v1 oracle cannot supply the unknown native filter, scan, DEV/BSS-churn or
+runtime `KeepFullPwr` payload bytes, so none is reproduced by inference. Linux
+6.18.40 also names no non-consuming MT7921 firmware pre-DMA drop or WTBL lookup
+counter. The next independent observation is therefore the complete set of
+host-global RX routes that the port configures: WM ring 0, data ring 2, and WM2
+ring 4.
+
+Telemetry contract `linux-6.18.40-passive-m1-rx-v11` snapshots each ring's
+named CIDX/DIDX registers, all eight descriptor ownership words, software
+head/tail, and a completion count incremented before descriptor rearm at the
+existing pre-BSS, post-BSS+RLM pump, post-tail, and M1-timeout boundaries. This
+can distinguish “no RX DMA on any configured host route” from an M1 or other
+normal frame routed through an MCU ring. It remains read-only and consuming-MIB
+free. A negative result still cannot distinguish AP-no-send from a firmware
+pre-DMA drop; that requires AP control-plane or independent over-air evidence.
+No hardware result is claimed here: the new exactly-three guarded campaign is
+pending full package, supervisor, manifest, root, remote and inert validation.

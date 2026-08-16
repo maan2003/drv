@@ -3742,10 +3742,14 @@ fn run_production_validation_self_test() -> Result<(), String> {
 
 const BSS_WIRE_CONTRACT_JSON: &str = r#""bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c""#;
 
-const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v10";
+const PASSIVE_M1_TELEMETRY_CONTRACT: &str = "linux-6.18.40-passive-m1-rx-v11";
 const PASSIVE_M1_RX_DMA_GLO_CFG: usize = 0xd4208;
+const PASSIVE_M1_WM_RING_CIDX: usize = 0xd4508;
+const PASSIVE_M1_WM_RING_DIDX: usize = 0xd450c;
 const PASSIVE_M1_DATA_RING_CIDX: usize = 0xd4528;
 const PASSIVE_M1_DATA_RING_DIDX: usize = 0xd452c;
+const PASSIVE_M1_WM2_RING_CIDX: usize = 0xd4548;
+const PASSIVE_M1_WM2_RING_DIDX: usize = 0xd454c;
 const PASSIVE_M1_PEER_WTBL_DW2: u32 = 0x820d_8108;
 const PASSIVE_M1_RMAC_RFCR: u32 = 0x820e_5000;
 const PASSIVE_M1_RMAC_RFCR1: u32 = 0x820e_5004;
@@ -3770,7 +3774,7 @@ const PASSIVE_M1_SME_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration
 fn passive_m1_diagnostic_json() -> String {
     let first_data_timeout_ms = PASSIVE_M1_FIRST_DATA_TIMEOUT.as_millis();
     format!(
-        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_BSS_BOUNDARY},{PASSIVE_M1_AFTER_PUMP_BOUNDARY},{PASSIVE_M1_AFTER_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
+        r#""passive_m1_telemetry_contract":"{PASSIVE_M1_TELEMETRY_CONTRACT}","safe_read_registers":"0x{PASSIVE_M1_RX_DMA_GLO_CFG:x},0x{PASSIVE_M1_WM_RING_CIDX:x},0x{PASSIVE_M1_WM_RING_DIDX:x},0x{PASSIVE_M1_DATA_RING_CIDX:x},0x{PASSIVE_M1_DATA_RING_DIDX:x},0x{PASSIVE_M1_WM2_RING_CIDX:x},0x{PASSIVE_M1_WM2_RING_DIDX:x},0x{PASSIVE_M1_PEER_WTBL_DW2:x},0x{PASSIVE_M1_RMAC_RFCR:x},0x{PASSIVE_M1_RMAC_RFCR1:x}","consuming_mib_reads":false,"snapshot_boundaries":"{PASSIVE_M1_BEFORE_BSS_BOUNDARY},{PASSIVE_M1_AFTER_PUMP_BOUNDARY},{PASSIVE_M1_AFTER_TAIL_BOUNDARY},m1-observation-timeout-{first_data_timeout_ms}ms","rx_routing_witness":"host-global-rings-0,2,4-cidx+didx+descriptor-ownership+drain-count","positive_result":"{PASSIVE_M1_POSITIVE_RESULT}","negative_result":"{PASSIVE_M1_NEGATIVE_RESULT}","target_scope":"{PASSIVE_M1_TARGET_SCOPE}","behavior":"{PASSIVE_M1_BEHAVIOR}","attribution_limit":"{PASSIVE_M1_ATTRIBUTION_LIMIT}","target_beacon_tim_contract":"{TARGET_BEACON_TIM_CONTRACT}","tim_true_result":"{TARGET_BEACON_TIM_TRUE_RESULT}","tim_never_true_result":"{TARGET_BEACON_TIM_NEVER_TRUE_RESULT}""#
     )
 }
 
@@ -10604,6 +10608,7 @@ fn drain_rx_queue(
             if !descriptor.is_dma_done() {
                 break;
             }
+            queue.completed_total = queue.completed_total.wrapping_add(1);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             let completed_index = queue.rx_tail;
             let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
@@ -15830,6 +15835,20 @@ struct PassiveM1DiagnosticSnapshot {
     client_frame_total: u64,
     eapol_total: u64,
     authenticator_m1_total: u64,
+    routes: [PassiveM1RxRouteSnapshot; 3],
+}
+
+#[cfg(feature = "fuchsia-passive")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PassiveM1RxRouteSnapshot {
+    ring: usize,
+    cidx: u32,
+    didx_before: u32,
+    didx_after: u32,
+    descriptor_ctrl: [u32; 8],
+    rx_head: usize,
+    rx_tail: usize,
+    completed_total: u64,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -16095,6 +16114,40 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .wfdma
             .read(PASSIVE_M1_DATA_RING_DIDX)
             .map_err(|_| zx::Status::IO)?;
+        let wm2 = self.loader.mcu.wm2.as_ref().ok_or(zx::Status::BAD_STATE)?;
+        let capture_route = |queue: &ActiveMcuRx<'_>, cidx, didx| {
+            let didx_before = self.loader.mcu.wfdma.read(didx)?;
+            let descriptor_ctrl =
+                std::array::from_fn(|index| queue.rx_ring.read_descriptor_at(index).ctrl);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            Ok::<_, String>(PassiveM1RxRouteSnapshot {
+                ring: queue.rx_ring_index,
+                cidx: self.loader.mcu.wfdma.read(cidx)?,
+                didx_before,
+                didx_after: self.loader.mcu.wfdma.read(didx)?,
+                descriptor_ctrl,
+                rx_head: queue.rx_head,
+                rx_tail: queue.rx_tail,
+                completed_total: queue.completed_total,
+            })
+        };
+        let routes = [
+            capture_route(
+                &self.loader.mcu.wm,
+                PASSIVE_M1_WM_RING_CIDX,
+                PASSIVE_M1_WM_RING_DIDX,
+            ),
+            capture_route(
+                &self.data,
+                PASSIVE_M1_DATA_RING_CIDX,
+                PASSIVE_M1_DATA_RING_DIDX,
+            ),
+            capture_route(wm2, PASSIVE_M1_WM2_RING_CIDX, PASSIVE_M1_WM2_RING_DIDX),
+        ];
+        let [Ok(wm), Ok(data), Ok(wm2)] = routes else {
+            return Err(zx::Status::IO);
+        };
+        let routes = [wm, data, wm2];
         let snapshot = PassiveM1DiagnosticSnapshot {
             peer_wtbl_aid,
             rmac_rfcr,
@@ -16123,6 +16176,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             client_frame_total: self.data.client_frame_total,
             eapol_total: self.data.eapol_total,
             authenticator_m1_total: self.data.authenticator_m1_total,
+            routes,
         };
         let ctrl = snapshot
             .descriptor_ctrl
@@ -16131,6 +16185,57 @@ impl VfioPassiveMechanics<'_, '_, '_> {
             .collect::<Vec<_>>()
             .join(",");
         let unstable = snapshot.data_ring_didx_before != snapshot.data_ring_didx_after;
+        let phase = match point {
+            PassiveM1SnapshotPoint::BeforeAssociatedBss => "before_associated_bss",
+            PassiveM1SnapshotPoint::AfterAssociatedBssBeforeSta => {
+                "after_associated_bss_rlm_before_sta"
+            }
+            PassiveM1SnapshotPoint::AfterPostAssociationTail => "after_post_association_tail",
+            PassiveM1SnapshotPoint::M1Timeout => "m1_timeout",
+        };
+        let route_state = snapshot
+            .routes
+            .iter()
+            .map(|route| {
+                let done = route
+                    .descriptor_ctrl
+                    .iter()
+                    .filter(|ctrl| **ctrl & (1 << 31) != 0)
+                    .count();
+                format!(
+                    "ring{}:cidx{}:didx{}-{}:head{}:tail{}:completed{}:dma_done{}:unstable{}",
+                    route.ring,
+                    route.cidx,
+                    route.didx_before,
+                    route.didx_after,
+                    route.rx_head,
+                    route.rx_tail,
+                    route.completed_total,
+                    done,
+                    route.didx_before != route.didx_after
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let route_delta = self.passive_m1_baseline.map(|before| {
+            snapshot
+                .routes
+                .iter()
+                .zip(before.routes)
+                .map(|(after, before)| {
+                    format!(
+                        "ring{}:{}",
+                        after.ring,
+                        after.completed_total.wrapping_sub(before.completed_total)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        record_sae_stage(&format!(
+            "passive_m1_rx_routes phase={phase} contract=safe-read-global-rx-routing-v1 routes=[{route_state}] completed_delta_from_before_bss=[{}] route_scope=host-global-rings-0,2,4 classification_limit=no-firmware-pre-dma-drop-attribution",
+            route_delta.as_deref().unwrap_or("baseline")
+        ));
         match point {
             PassiveM1SnapshotPoint::BeforeAssociatedBss => {
                 self.passive_m1_baseline = Some(snapshot);
@@ -28424,8 +28529,12 @@ mod tests {
             "read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR)",
             "read_firmware_snapshot_raw(PASSIVE_M1_RMAC_RFCR1)",
             "read(PASSIVE_M1_RX_DMA_GLO_CFG)",
+            "PASSIVE_M1_WM_RING_CIDX",
+            "PASSIVE_M1_WM_RING_DIDX",
             "read(PASSIVE_M1_DATA_RING_CIDX)",
             "read(PASSIVE_M1_DATA_RING_DIDX)",
+            "PASSIVE_M1_WM2_RING_CIDX",
+            "PASSIVE_M1_WM2_RING_DIDX",
         ] {
             assert!(snapshot.contains(read), "missing safe source {read}");
         }
@@ -28467,10 +28576,11 @@ mod tests {
         );
         let identity = passive_m1_diagnostic_json();
         for field in [
-            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v10\"",
-            "\"safe_read_registers\":\"0xd4208,0xd4528,0xd452c,0x820d8108,0x820e5000,0x820e5004\"",
+            "\"passive_m1_telemetry_contract\":\"linux-6.18.40-passive-m1-rx-v11\"",
+            "\"safe_read_registers\":\"0xd4208,0xd4508,0xd450c,0xd4528,0xd452c,0xd4548,0xd454c,0x820d8108,0x820e5000,0x820e5004\"",
             "\"consuming_mib_reads\":false",
             "\"snapshot_boundaries\":\"before-associated-bss,after-associated-bss-rlm-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms\"",
+            "\"rx_routing_witness\":\"host-global-rings-0,2,4-cidx+didx+descriptor-ownership+drain-count\"",
             "\"positive_result\":\"target_m1_observed_at_rx_dma\"",
             "\"negative_result\":\"no_m1_at_rx_dma_ambiguous\"",
             "\"target_scope\":\"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\"",
