@@ -468,3 +468,71 @@ The durable reports are:
 Each report ended with `RESTORE end failed=0`. Final recovery checks found an
 idle, non-quarantined, native-ready lab; `mt7921e` bound in PCI D0; active iwd;
 inactive/non-failed watchdog; a WLAN default route; and successful HTTPS.
+
+## Chronological hidden firmware-context audit: post-CLC FWLOG (2026-08-16)
+
+The corrected native oracle report `/tmp/native-150155.log` (SHA-256
+`02f920fbc26aa54179f2d29b5d1952e4cced87621d1136c68c6dc3a6bf194387`)
+contains 1,836 `MT76_ORACLE` records. Reading it chronologically, rather than
+starting at preauthentication, proves the following boundary:
+
+- the installed firmware/patch bootstrap and scatter progression reaches the
+  same firmware-start, NIC-capability, EEPROM/EFUSE and first CLC operations;
+  the command stream is byte/order-equal through userspace MCU sequence 13;
+- native then emits CE `FWLOG_2_HOST` (`cmd=0x400c5`, payload length 4,
+  no response), in a 68-byte envelope at MCU sequence 14. The Linux
+  `mt7921_mcu_fw_log_2_host(dev, 1)` source supplies payload `01 00 00 00`;
+- userspace formerly omitted that persistent firmware setting and made
+  channel-domain its sequence 14. This is the earliest source-proven
+  persistent divergence in the audited interval.
+
+The implementation now encodes that exact 68-byte no-response command and
+orders it after the first CLC response and before channel-domain. Its encoder,
+golden-order and no-response classification are tested, and the source map
+records the Linux ownership. The production-prefix safety gate was advanced
+from 14 to 15 after the campaign exposed that mechanical expectation as stale;
+the corrected package builds successfully. Nothing here establishes that
+firmware logging changes peer WTBL state or M1 delivery, and in particular
+nothing makes `CHANGE_BW_RATE` causal.
+
+Later native commands were deliberately not folded into this change. The
+corrected oracle next emits EEPROM buffer mode (`0x21ed`), protection
+(`0x3eed`), a second CLC (`0x4005c`), then channel-domain (`0x4000f`), eight
+rate-power pages (`0x4005d`), TX-power feature control (`0x400ca`), MAC enable
+(`0x46ed`), another domain update, RX-path configuration (`0x4eed`) and a
+second eight-page rate batch. The corresponding later DEV/MUAR, BSS,
+MAC/PHY/RX, channel/RLM, RX-filter, scan, ROC, power and offload commands
+remain later audit territory. The next earliest ordered difference is
+therefore already source-proven: native EEPROM buffer mode immediately
+follows FWLOG, whereas current userspace prematurely sends channel-domain and
+has not yet reproduced native protection plus second-CLC-before-domain order.
+
+### Exactly-three guarded campaign outcome
+
+The pinned pre-gate-correction artifact was invoked exactly three times; no
+fourth active invocation was made. All three reports directly prove successful
+publication of sequence 14:
+
+`{"firmware_bootstrap_transcript":"firmware_log_to_host","cid":"0x400c5","sequence":14,"bytes":68,"payload_raw":"01000000","wait_response":false}`
+
+followed by
+`{"firmware_bootstrap_event":"firmware_log_to_host_tx_complete","sequence":14}`.
+Each then published channel-domain as sequence 15 and stopped at the
+fail-closed production-prefix guard, whose old expectation was 14. Thus these
+runs prove exact FWLOG transport but do **not** reach initial peer, WTBL
+snapshots, association disposition, `e2e81_sta_rec_transcript`, or the M1
+window; there is no WTBL/M1 result to infer from them. The durable reports are:
+
+- `20260816T053518Z-0000_05_00.0.log`, SHA-256
+  `5900f62eaa85c29e750e0b0543fe9c7e414f44f196414cbf5a9e3a183e4694a1`
+- `20260816T053845Z-0000_05_00.0.log`, SHA-256
+  `3dc45d8683ca88ceef489cd2e9fe21094f4804318f579cde22f0fd4e6d92ca0f`
+- `20260816T053954Z-0000_05_00.0.log`, SHA-256
+  `c1cd142cee573f46390d992edcf10e70e73c5fc25c19707cd0d19974ac807595`
+
+Every report ends with `RESTORE end failed=0`. Final authoritative recovery
+checks returned idle status 0, quarantined status 1 (not quarantined), and
+native-ready status 0. `mt7921e` is rebound in PCI D0, iwd is active, the
+watchdog is inactive/non-failed, the WLAN default route is present, and HTTPS
+succeeds. The corrected, locally build-validated artifact was not subjected to
+another hardware invocation because that would violate the three-run ceiling.
