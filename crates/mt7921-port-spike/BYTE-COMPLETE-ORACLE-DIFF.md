@@ -606,3 +606,54 @@ PROTECT commands in userspace. They are one parity batch. Unknown RX-filter,
 scan-request and interface-churn payloads remain explicit gaps. The change
 does not add probes, keys, data TX, public post-association TX, or any causal
 claim about M1.
+
+### Native channel-domain-to-preauth parity campaign outcome
+
+The parity batch above was packaged from commit `cb7d56da` and pinned by
+commit `885dd358`. Package, supervisor, manifest, root-entry, remote-entry,
+remote-entry test, inert proof and inert-proof root-entry all built. The remote
+closure and every file/registered hash were verified before handoff, and the
+remote root `--plan` remained inert (`hardware_handoff=false`).
+
+Exactly three new guarded production invocations were made; there was no
+fourth. All three reports reproduce the corrected runtime prefix after the
+loader-owned channel-domain sequence 3: rate pages at sequences 4--11,
+`KeepFullPower` 12, MAC enable 13, the repeated channel domain 14, initial
+channel-1 RX path 15, the second rate pages 1--8, radio LED controls 9 and 10,
+DEV 11, BSS 12, zero initial EDCA 13, passive RX filter 14, channel switch 15,
+and scan sequence 1. Every one of the 16 rate pages reports its native golden
+raw hash, DMA consumption and descriptor reclamation. This directly excludes
+the source-proven independent runtime ordering/omission differences corrected
+by the batch; it does not equate the explicitly unknown native first-filter,
+scan-request or lifecycle-churn payloads.
+
+The initial-peer, preauth-BSS and preauth-RLM ACKs leave DW5 zero. The same
+176-byte preauth STA_REC used by earlier campaigns still produces the identical
+post-preauth vector in all three runs:
+
+`38409356 7dc7a672 42000000 00000000 10000000 32000040 ffffffff 00000000 00000000 00000000`
+
+Thus DW5 remains `0x32000040` (`CHANGE_BW_RATE=2`) rather than the native
+oracle's `0x32000000`. The completed exact runtime prefix did not remove this
+firmware-state difference, so the remaining cause is not any independently
+source-proven omission corrected here.
+
+All three runs reached status-0 association and emitted the 232-byte associated
+STA_REC. Their normalized AIDs were 10, 9 and 6; run two first handled a
+status-30 comeback. Every associated CID-3 ACK produced DW5 `0x32000827`
+(`CHANGE_BW_RATE=1`, SGI160 set). No run observed EAPOL or authenticator M1 and
+none began the four-way handshake. Run one observed one non-EAPOL client frame
+at the M1 deadline; runs two and three had no RX DMA activity there. The durable
+reports are:
+
+- `20260816T065528Z-0000_05_00.0.log`, SHA-256
+  `e88757e1a149fcbb6a49608d06d595d9fcc9711ffb57a665a79e42695e57dace`
+- `20260816T065642Z-0000_05_00.0.log`, SHA-256
+  `715b501e4db48e83f81f60c21269060c76d5bcfd760451b12243c02411ac7b31`
+- `20260816T065753Z-0000_05_00.0.log`, SHA-256
+  `f96778b0dbde334e0f256d68f9e68da47468acffd4f6bc70c6339fa0d3739a19`
+
+Every report ends `RESTORE end failed=0`. Final authoritative recovery is
+idle=true (status 0), quarantined=false (status 1) and native-ready=true
+(status 0): `mt7921e` is rebound in PCI D0, iwd is active, the watchdog is
+inactive/non-failed, and the WLAN default route is present.
