@@ -3653,6 +3653,8 @@ fn run_production_validation_self_test() -> Result<(), String> {
         audit.page_consumed_and_reclaimed(&page)?;
     }
     audit.finish()?;
+    audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
+    audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
     let add_device = PassiveMcuCommand::AddDevice {
         mac: [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
     };
