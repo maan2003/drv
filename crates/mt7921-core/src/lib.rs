@@ -2095,6 +2095,7 @@ pub enum DownloadCommand {
     ReadEepromBlock {
         address: u32,
     },
+    FirmwareLogToHost,
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
@@ -2440,6 +2441,9 @@ pub fn encode_download_command(
             payload[..4].copy_from_slice(&address.to_le_bytes());
             (0xed, 0, 0x01, 1, payload)
         }
+        // mt7921_run_firmware() enables firmware-to-host logging after CLC
+        // calibration and before the later hardware initialization commands.
+        DownloadCommand::FirmwareLogToHost => (0xc5, 1, 0, 0, vec![1, 0, 0, 0]),
         DownloadCommand::PatchSemaphoreGet => (0x10, 3, 0, 0, 1u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0, 0, 0u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchFinish => (0x07, 3, 0, 0, vec![0; 4]),
@@ -3953,6 +3957,13 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                     .checked_add(1)
                     .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
             }
+            let firmware_log = DownloadCommand::FirmwareLogToHost;
+            let completion = loader_command(transport, firmware_log)?;
+            expect_loader_completion(
+                firmware_log,
+                completion,
+                FirmwareCommandCompletion::NoResponse,
+            )?;
             if configure_channel_domain {
                 let command = conservative_channel_domain(
                     report.nic_capability,
@@ -12980,6 +12991,11 @@ mod tests {
         assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 0, 5, 0, 1, 0, 1]);
         assert_eq!(&eeprom[64..68], &MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
         assert_eq!(&eeprom[68..], &[0; 20]);
+        let firmware_log = encode_download_command(DownloadCommand::FirmwareLogToHost, 6).unwrap();
+        assert_eq!(firmware_log.len(), CONNAC2_MCU_TXD_BYTES + 4);
+        assert_eq!(&firmware_log[36..40], &[0xc5, 0xa0, 1, 6]);
+        assert_eq!(&firmware_log[40..64], &[0; 24]);
+        assert_eq!(&firmware_log[64..68], &[1, 0, 0, 0]);
         assert_eq!(
             encode_download_command(DownloadCommand::ReadEepromBlock { address: 0x551 }, 5),
             Err(DownloadCommandError::InvalidEepromAddress)
@@ -14299,7 +14315,9 @@ mod tests {
                 return Ok(completion);
             }
             Ok(match command {
-                DownloadCommand::NicPowerControl => FirmwareCommandCompletion::NoResponse,
+                DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost => {
+                    FirmwareCommandCompletion::NoResponse
+                }
                 DownloadCommand::GetNicCapability => {
                     FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
                 }
@@ -14555,6 +14573,7 @@ mod tests {
                     14,
                 ),
                 LoaderTrace::SetClc(0, 15),
+                LoaderTrace::Command(DownloadCommand::FirmwareLogToHost, 1),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
@@ -14634,7 +14653,7 @@ mod tests {
         assert!(matches!(
             &transport.trace[transport.trace.len() - 2..],
             [
-                LoaderTrace::SetChannelDomain(39, 1),
+                LoaderTrace::SetChannelDomain(39, 2),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
             ]
         ));

@@ -10453,8 +10453,8 @@ fn classify_mcu_completion(
                 .map_err(|error| format!("parse EEPROM response: {error:?}"))?;
             Ok(FirmwareCommandCompletion::EepromBlock(block))
         }
-        DownloadCommand::NicPowerControl => {
-            Err("NIC power command unexpectedly requested RX classification".into())
+        DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost => {
+            Err("no-response command unexpectedly requested RX classification".into())
         }
     }
 }
@@ -11635,7 +11635,10 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
-        let expects_response = command != DownloadCommand::NicPowerControl;
+        let expects_response = !matches!(
+            command,
+            DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost
+        );
         if expects_response {
             self.mcu
                 .wfdma
@@ -11676,6 +11679,12 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             self.capture_patch_table_snapshot("post_release_before_ram")?;
         }
         self.record_patch_gate_command(command, sequence, encoded)?;
+        if command == DownloadCommand::FirmwareLogToHost {
+            println!(
+                "{{\"firmware_bootstrap_transcript\":\"firmware_log_to_host\",\"cid\":\"0x400c5\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"01000000\",\"wait_response\":false}}",
+                encoded.len()
+            );
+        }
         self.mcu
             .tx_ring
             .write_descriptor_at(descriptor_index, DmaDescriptor::reset());
@@ -11686,6 +11695,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             DownloadCommand::FirmwareStart { .. } => Some("ram_published_firmware_start_acked"),
             DownloadCommand::GetNicCapability => Some("nic_capability_response"),
             DownloadCommand::ReadEepromBlock { .. } => Some("eeprom_efuse_acquired"),
+            DownloadCommand::FirmwareLogToHost => Some("firmware_log_to_host_tx_complete"),
             _ => None,
         };
         if let Some(event) = milestone {

@@ -3195,7 +3195,7 @@ drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1359	enumerator	MCU_CE_CMD_
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1360	enumerator	MCU_CE_CMD_REG_WRITE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1361	enumerator	MCU_CE_CMD_REG_READ	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1362	enumerator	MCU_CE_CMD_CHIP_CONFIG	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1363	enumerator	MCU_CE_CMD_FWLOG_2_HOST	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1363	enumerator	MCU_CE_CMD_FWLOG_2_HOST	DownloadCommand::FirmwareLogToHost	exact	68-byte no-response CE command; enabled immediately after CLC like mt7921_run_firmware
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1364	enumerator	MCU_CE_CMD_GET_WTBL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1365	enumerator	MCU_CE_CMD_GET_TXPWR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h	1368	enum	__anone602538c2303	-	unmapped	-
@@ -3836,11 +3836,11 @@ drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	560	member	rsv	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	580	struct	tlv_hdr	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	581	member	type	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	582	member	len	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	624	function	mt7921_mcu_fw_log_2_host	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	624	function	mt7921_mcu_fw_log_2_host	DownloadCommand::FirmwareLogToHost	exact	control 1 and three reserved zero bytes; no-response completion
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	626	struct	__anone31f438c0408	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	627	member	ctrl_val	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	628	member	pad	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	637	function	mt7921_run_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	637	function	mt7921_run_firmware	run_firmware_loader	adapted	firmware log enable restored after CLC before later hardware setup
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	656	prototype	EXPORT_SYMBOL_GPL	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	658	function	mt7921_mcu_radio_led_ctrl	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mcu.c	660	struct	__anone31f438c0508	-	unmapped	-
@@ -4310,7 +4310,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	202	prototype	mt7921_reg_map	
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	204	prototype	__mt7921_start	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	205	prototype	mt7921_register_device	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	206	prototype	mt7921_unregister_device	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	207	prototype	mt7921_run_firmware	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	207	prototype	mt7921_run_firmware	run_firmware_loader	adapted	firmware log enable restored after CLC before later hardware setup
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	208	prototype	mt7921_set_channel	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	209	prototype	mt7921_mcu_set_bss_pm	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	211	prototype	mt7921_mcu_sta_update	-	unmapped	-
@@ -4318,7 +4318,7 @@ drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	214	prototype	mt7921_mcu_set_
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	215	prototype	mt7921_mcu_set_tx	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	216	prototype	mt7921_mcu_set_eeprom	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	217	prototype	mt7921_mcu_get_rx_rate	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	219	prototype	mt7921_mcu_fw_log_2_host	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	219	prototype	mt7921_mcu_fw_log_2_host	DownloadCommand::FirmwareLogToHost	exact	control 1 and three reserved zero bytes; no-response completion
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	220	prototype	mt7921_mcu_rx_event	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	221	prototype	mt7921_mcu_set_rxfilter	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h	223	prototype	mt7921_mcu_radio_led_ctrl	-	unmapped	-
