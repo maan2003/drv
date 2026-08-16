@@ -658,7 +658,7 @@ idle=true (status 0), quarantined=false (status 1) and native-ready=true
 (status 0): `mt7921e` is rebound in PCI D0, iwd is active, the watchdog is
 inactive/non-failed, and the WLAN default route is present.
 
-### Next evidence boundary: all host RX routes (campaign pending)
+### All-host-RX-route campaign result (2026-08-16)
 
 The v1 oracle cannot supply the unknown native filter, scan, DEV/BSS-churn or
 runtime `KeepFullPwr` payload bytes, so none is reproduced by inference. Linux
@@ -675,5 +675,34 @@ can distinguish “no RX DMA on any configured host route” from an M1 or other
 normal frame routed through an MCU ring. It remains read-only and consuming-MIB
 free. A negative result still cannot distinguish AP-no-send from a firmware
 pre-DMA drop; that requires AP control-plane or independent over-air evidence.
-No hardware result is claimed here: the new exactly-three guarded campaign is
-pending full package, supervisor, manifest, root, remote and inert validation.
+The pinned artifact passed full package, supervisor, manifest, root, remote,
+inert, registered-hash and file-hash validation. Its remote `--plan` reported
+`hardware_handoff=false`. It was then invoked exactly three times; there was
+no fourth active invocation. All three runs reached status-0 association, with
+normalized AIDs 2, 10 and 9, and timed out without EAPOL or authenticator M1.
+
+The route witness was stable and consistent across all runs. Relative to the
+pre-associated-BSS baseline, WM ring 0 completed zero additional descriptors
+at the post-BSS+RLM, post-tail and M1-timeout boundaries. WM2 ring 4 completed
+2 descriptors after BSS+RLM, 5 after the full tail and 18 by timeout in every
+run, matching the MCU-event path. Data ring 2 completed 5, 0 and 4 descriptors
+by timeout respectively. The first and third runs classified those data-ring
+frames as non-EAPOL client candidates attributed by firmware to interface WCID
+19 rather than peer WCID 1; the second saw no normal RX DMA. No descriptor was
+unstable, and no configured host route contained M1. This excludes silent
+normal-frame routing into either MCU ring for these attempts. It does not
+distinguish AP-no-send from a firmware drop before host DMA.
+
+The durable reports are:
+
+- `20260816T072800Z-0000_05_00.0.log`, SHA-256
+  `17cceb6ee3ba70af00fb60552118b4fb777e23eeef6fa5a43b24560cb3d6b211`
+- `20260816T073010Z-0000_05_00.0.log`, SHA-256
+  `5e9bf10177f7f508b4040210461fbd9b10a8edaa9c1c7b19d100d2a854d0a4da`
+- `20260816T073144Z-0000_05_00.0.log`, SHA-256
+  `216a40687d52712e4b15c16f2858716f063e7a4313e74377d2ad37941f8cefbd`
+
+Every report ends `RESTORE end failed=0`. After each run the authoritative
+status was idle and native-ready, with iwd active, the watchdog
+inactive/non-failed, and a WLAN default route. Final HTTPS verification also
+succeeded.

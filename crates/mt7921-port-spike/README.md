@@ -2889,6 +2889,17 @@ independent AP/over-air attribution requirement. Launcher, supervisor, root, and
 artifacts compare against that installed ELF identity; stale identities are
 rejected before privileged dispatch.
 
+The guarded v11 artifact was invoked exactly three times after inert remote
+preflight; no fourth invocation was made. All three attempts associated but
+observed no M1. From the pre-BSS baseline through the M1 deadline, WM ring 0
+had zero new completions in every run, WM2 ring 4 had the same 2/5/18
+post-BSS+RLM/post-tail/timeout event progression, and data ring 2 had 5, 0 and
+4 timeout completions. The data completions were non-EAPOL frames; no M1 was
+present on any configured host route. This excludes MCU-ring misrouting for
+the attempts while retaining the explicit AP-no-send versus firmware
+pre-DMA-drop ambiguity. The durable reports and hashes are recorded in
+`BYTE-COMPLETE-ORACLE-DIFF.md`.
+
 Post-association target beacons now add a read-only AP-side clue without changing
 power state or transmitting a poll.  For beacons whose transmitter and BSSID
 both equal the pinned AP, production validates the 12-byte beacon fixed body,
