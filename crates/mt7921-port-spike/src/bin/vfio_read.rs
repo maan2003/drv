@@ -3609,6 +3609,8 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
         );
     }
     audit.finish()?;
+    audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
+    audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
     audit.before_passive_command(&PassiveMcuCommand::AddDevice {
         mac: [2, 0, 0, 0, 0, 1],
     })?;
@@ -3621,7 +3623,7 @@ fn run_rate_power_delivery_self_test() -> Result<(), String> {
     );
     println!(
         "{}",
-        r#"{"rate_power_self_test":"passed","audit":"hardware_post_dma_consumption_reclaim","order":"RX_PATH,8xSET_RATE_TX_POWER,ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7","total_lengths":"1404,1080,1404,1404,1404,1404,1404,1404","raw_lengths":"1340,1016,1340,1340,1340,1340,1340,1340","reg_read_between_pages":0,"pages":8,"last_msg_page":8,"safe_reclaims":8}"#
+        r#"{"rate_power_self_test":"passed","audit":"hardware_post_dma_consumption_reclaim","order":"RX_PATH,8xSET_RATE_TX_POWER,RADIO_LED_ENABLE,RADIO_ON_LED,ADD_DEVICE","sequences":"15,1,2,3,4,5,6,7","total_lengths":"1404,1080,1404,1404,1404,1404,1404,1404","raw_lengths":"1340,1016,1340,1340,1340,1340,1340,1340","reg_read_between_pages":0,"pages":8,"last_msg_page":8,"safe_reclaims":8}"#
     );
     Ok(())
 }
@@ -23979,6 +23981,12 @@ mod tests {
             audit.page_consumed_and_reclaimed(command).unwrap();
         }
         audit.finish().unwrap();
+        audit
+            .before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 })
+            .unwrap();
+        audit
+            .before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 })
+            .unwrap();
         let add_device = PassiveMcuCommand::AddDevice {
             mac: [2, 0, 0, 0, 0, 1],
         };
