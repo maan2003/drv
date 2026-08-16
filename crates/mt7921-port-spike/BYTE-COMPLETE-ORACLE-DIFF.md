@@ -328,3 +328,76 @@ The reports are:
 
 After the third and final run, recovery restored `mt7921e`, PCI D0, active
 iwd, an idle/non-quarantined lab, the default route, and successful HTTPS.
+
+### Full-preauth STA_REC/WTBL and preauth-BSS campaign (2026-08-16)
+
+The corrected source-instrumented Linux 6.18.40 oracle
+`20260812T175733Z-linux-oracle-0000_05_00.0.log` establishes the complete
+full-preauth CID 3 builder transcript. After normalizing MCU sequence, peer
+identity and RCPI, the corrected userspace encoder is byte-equivalent: the
+128-byte payload/176-byte envelope has outer tags in order BASIC
+`0/20`, PHY `21/12`, RA `1/16`, STATE `7/12`, and WTBL `13/60`.
+The nested reset-and-set WTBL request has operation 1 and tags in order GENERIC
+`0/20`, RX `1/12`, HDR_TRANS `6/8`, and SMPS `13/8`. Decoded values
+also agree: infrastructure STA, state 2/new, QoS/AID zero, basic
+`0x0015`, OFDM PHY `0x08`, RA legacy `0x3fc0`, state 0, GENERIC
+MUAR/skip-TX/QoS zero, RX RCA1/RCA2/RV one, header to-DS/no-RX-transform one,
+and SMPS one. There is therefore no remaining host STA_REC field or nested
+WTBL TLV divergence that can directly explain the firmware result.
+
+The source symbol for WTBL DW5 bits 7..5 is
+`MT_WTBL_W5_CHANGE_BW_RATE = GENMASK(7, 5)`. Bit 6 is not an independent
+boolean flag: it is the middle bit of that three-bit field. At the exact
+post-preauth-ACK boundary, native DW5 is `0x32000000`
+(`CHANGE_BW_RATE=0`) while all corrected userspace attempts read
+`0x32000040` (`CHANGE_BW_RATE=2`). Neither pinned mt76 version exposes a
+host command field named CHANGE_BW_RATE. The full commands, including
+`WTBL_SMPS.smps=1`, are identical, so firmware derives the physical WTBL
+field from command ordering/context rather than copying an unequal STA_REC
+byte. No direct WTBL write or speculative clear was added.
+
+The first source-proven transcript difference before that identical full
+STA_REC was Linux's preauth CID-2 BSS BASIC+QBSS update. Its exact 44-byte
+payload is active infrastructure-station connection state 1, target BSSID,
+BMC/STA WCID 19, beacon interval 100, DTIM 0, 5-GHz local PHY mode `0xb1`,
+non-HT-basic PHY `0x0078`, followed by an eight-byte QBSS TLV with QoS
+disabled. Commit `f5fa4237c009dc9611e309f7a26cae5385fbc16b` adds only that
+ACKed command between the already-correct initial peer command and full
+preauth STA_REC. Exact payload and lifecycle ordering/rollback tests cover the
+new transition.
+
+The new root-only safe read records peer WTBL DW0..DW9 after every relevant
+ACK. All three guarded attempts produced the identical post-preauth vector:
+
+`38409356 7dc7a672 42000000 00000000 10000000 32000040 ffffffff 00000000 00000000 00000000`
+
+DW0/DW1 carry the selected peer address in hardware layout; DW2 is the
+preassociation generic control word (AID zero); DW3 is zero; DW4 is
+`0x10000000`; DW5 decodes as CHANGE_BW_RATE 2, all four named SGI bits zero,
+BW_CAP 0, MPDU fail/OK counters 4/4 and rate index 1; DW6 reads the documented
+all-ones diagnostic value; DW7..DW9 are zero. The older native oracle safely
+read DW5 at this same post-preauth boundary as `0x32000000`; it did not
+publish privacy-sensitive DW0/DW1 or the other dwords, so no unsupported
+native values are inferred.
+
+The preauth-BSS campaign was run exactly three times, with no fourth. The BSS
+command did not alter the resulting vector or DW5 field. Attempts one and
+three reached status-0 association (attempt three after status-30 comeback);
+attempt two completed preauth but failed during SAE/MLME before association.
+No attempt observed EAPOL/authenticator M1 or began the four-way handshake.
+The reports are:
+
+- `20260816T042907Z-0000_05_00.0.log`, SHA-256
+  `1c132925d8d23382e5786df88205fd336e0b81991092aa066ed370db4c589eb6`
+- `20260816T043045Z-0000_05_00.0.log`, SHA-256
+  `9589cc7efb36eb6523d01a8bc59cd6bcd9855214a28a8e3cf46755be860dd916`
+- `20260816T043446Z-0000_05_00.0.log`, SHA-256
+  `887ccc65833fc1a325a9429f89f4dad700d9a6f427d70e2c93a12e6965c4d0fb`
+
+The preauth BSS difference is therefore corrected and excluded. The earliest
+remaining ordered native/userspace difference is now the immediately
+following preauth CID-2 RLM command, which Linux ACKs before the full
+preauth STA_REC and userspace still omits at that boundary. No RLM behavior
+change is included in this campaign. Final recovery restored `mt7921e`, PCI
+D0, active iwd, an idle/non-quarantined lab, inactive/non-failed watchdog,
+default route, and HTTPS.
