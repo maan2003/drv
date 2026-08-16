@@ -261,3 +261,36 @@ semantic divergence that persists into BSS+RLM→M1 is Linux's initial minimal
 peer transition being absent before the full preauth station update. The
 implementation below restores only that command and leaves later BSS/PHY/RA
 and filter differences for subsequent one-cause campaigns.
+
+### Minimal-peer CID-3 campaign result (2026-08-16)
+
+Commit `086dc8094380f4af138addc4a2520e4ed62f2700` was exercised exactly three
+times after a root-only inert proof. All attempts published and ACKed the
+source-exact initial 88-byte-enveloped/40-byte-payload CID 3 command before the
+existing full preauth update. The initial ACK left peer DW5 at `0x00000000` in
+all three attempts. The subsequent full preauth ACK changed it to
+`0x32000040`, and associated BSS plus RLM left it at `0x32000040`. Thus the
+missing initial command was a real earliest presence/order divergence, but the
+campaign disproves it as the cause of the persistent named bit-6 state or the
+missing M1.
+
+All three attempts reached a status-0 association response and retained exact
+associated BSS payload hash
+`1d53ec7b42d2af141587b384ea71b900b315d95c034ac26a24949a0af84256d4`.
+Attempts two and three first received status 30 and correctly completed the
+comeback retry. No attempt observed authenticator M1 or began the four-way
+handshake; attempts one and three did observe unrelated client frames at RX
+DMA during the five-second window. The reports are:
+
+- `20260816T031831Z-0000_05_00.0.log`, SHA-256
+  `072eb4625e6eaa5b1c02f479cccf0d4ac5af142dce257ac2108cf6b5894c50cf`
+- `20260816T032043Z-0000_05_00.0.log`, SHA-256
+  `4260ff9251dcf9dc6bb973b840903f7b3a6f9c5c1153e0a7896797bce70024a6`
+- `20260816T032245Z-0000_05_00.0.log`, SHA-256
+  `1dafe19d8ace2d572bca1723871c6313f7f777f942d19989bbaa544190156a4d`
+
+The earliest remaining source-proven semantic divergence is therefore inside
+the full preauth CID 3 update: native PHY/rate fields are type `0x15`, basic
+rates `0x0015`, legacy rates `0x3fc0`; userspace emits type `0x08`, basic rates
+`0x0001`, legacy rates `0x0040`. No follow-up behavior change is included in
+this campaign result.
