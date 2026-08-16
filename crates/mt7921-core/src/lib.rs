@@ -2631,7 +2631,10 @@ pub fn encode_channel_domain_command(
 pub enum PassiveMcuCommand {
     EepromBufferMode,
     ProtectCtrl,
+    /// Initial runtime-power policy installed by mt7921 registration.
+    KeepFullPower,
     MacEnable,
+    SetChannelDomain(ChannelDomainCommand),
     SetRxPath {
         channel: CandidateChannel,
         antenna_mask: u8,
@@ -2648,6 +2651,9 @@ pub enum PassiveMcuCommand {
     },
     AddBss,
     SetPassiveRxFilter,
+    RadioLedCtrl {
+        value: u8,
+    },
     StartScan {
         scan_sequence: u8,
         channel: CandidateChannel,
@@ -2969,15 +2975,22 @@ pub fn encode_passive_mcu_command(
         PassiveMcuCommand::EepromBufferMode => {
             encode_legacy_mcu(0xed, 0x21, &[1, 0, 0, 0], sequence)
         }
-        // mt7921_mac_init -> mt76_connac_mcu_set_rts_thresh(0x92b, band 0).
-        // This closes the source init transcript; it is not claimed causal.
         PassiveMcuCommand::ProtectCtrl => encode_legacy_mcu(
             0xed,
             0x3e,
             &[1, 0, 0, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0],
             sequence,
         ),
+        PassiveMcuCommand::KeepFullPower => {
+            let mut payload = vec![0; 328];
+            payload[8..22].copy_from_slice(b"KeepFullPwr 0\0");
+            encode_legacy_mcu(0xca, 0, &payload, sequence)
+        }
         PassiveMcuCommand::MacEnable => encode_legacy_mcu(0xed, 0x46, &[1, 0, 0, 0], sequence),
+        PassiveMcuCommand::SetChannelDomain(command) => {
+            return encode_channel_domain_command(command, sequence)
+                .map_err(|_| PassiveMcuCommandError::UnsupportedChannel);
+        }
         PassiveMcuCommand::SetRxPath {
             channel,
             antenna_mask,
@@ -3037,6 +3050,12 @@ pub fn encode_passive_mcu_command(
             payload[4] = 1;
             payload[8..12].copy_from_slice(&0x8000_0040u32.to_le_bytes());
             encode_legacy_mcu(0x0a, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::RadioLedCtrl { value } => {
+            if !matches!(value, 1..=3) {
+                return Err(PassiveMcuCommandError::UnsupportedChannel);
+            }
+            encode_legacy_mcu(0xed, 0x05, &[*value, 0, 0, 0], sequence)
         }
         PassiveMcuCommand::StartScan {
             scan_sequence,
@@ -13799,6 +13818,18 @@ mod tests {
         let eeprom = encode_passive_mcu_command(&PassiveMcuCommand::EepromBufferMode, 1).unwrap();
         assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 1, 1, 0, 0x21, 0, 1]);
         assert_eq!(&eeprom[64..], &[1, 0, 0, 0]);
+        let full_power = encode_passive_mcu_command(&PassiveMcuCommand::KeepFullPower, 4).unwrap();
+        assert_eq!(&full_power[36..40], &[0xca, 0xa0, 1, 4]);
+        assert_eq!(full_power.len(), 392);
+        assert_eq!(&full_power[64..72], &[0; 8]);
+        assert_eq!(&full_power[72..86], b"KeepFullPwr 0\0");
+        assert!(full_power[86..].iter().all(|byte| *byte == 0));
+        assert!(!PassiveMcuCommand::KeepFullPower.expects_response());
+        let led =
+            encode_passive_mcu_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 }, 5).unwrap();
+        assert_eq!(&led[36..44], &[0xed, 0xa0, 1, 5, 0, 5, 0, 1]);
+        assert_eq!(&led[64..], &[2, 0, 0, 0]);
+        assert!(!PassiveMcuCommand::RadioLedCtrl { value: 2 }.expects_response());
         let rx_path = encode_passive_mcu_command(
             &PassiveMcuCommand::SetRxPath {
                 channel,

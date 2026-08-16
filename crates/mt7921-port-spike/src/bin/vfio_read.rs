@@ -9489,6 +9489,7 @@ enum RatePowerDeliveryPhase {
     BeforeRxPath,
     RxPathInFlight,
     PageBatch {
+        batch: u8,
         pages: u8,
         previous_sequence: Option<u8>,
     },
@@ -9834,6 +9835,7 @@ impl RatePowerDeliveryAudit {
         match (&self.phase, command) {
             (RatePowerDeliveryPhase::RxPathInFlight, PassiveMcuCommand::SetRxPath { .. }) => {
                 self.phase = RatePowerDeliveryPhase::PageBatch {
+                    batch: 2,
                     pages: 0,
                     previous_sequence: None,
                 };
@@ -9851,6 +9853,7 @@ impl RatePowerDeliveryAudit {
 
     fn page_consumed_and_reclaimed(&mut self, encoded: &[u8]) -> Result<(), String> {
         let RatePowerDeliveryPhase::PageBatch {
+            batch,
             pages,
             previous_sequence,
         } = &mut self.phase
@@ -9874,7 +9877,7 @@ impl RatePowerDeliveryAudit {
         *pages = ordinal;
         *previous_sequence = sequence;
         record_sae_stage(&format!(
-            "rate_power_delivery page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={} normalized_envelope_sha256={} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
+            "rate_power_delivery batch={batch} page={ordinal} cid=0x4005d sequence={} total_length={expected_total_length} raw_length={expected_raw_length} raw_sha256={} normalized_envelope_sha256={} native_golden_match=true txd_length={expected_total_length} legacy_length={} wait_response=false dma_didx_consumed=true descriptor_reclaimed=true last_msg={}",
             sequence.expect("validated sequence"),
             evidence.raw_sha256,
             evidence.normalized_envelope_sha256,
@@ -9884,9 +9887,34 @@ impl RatePowerDeliveryAudit {
         Ok(())
     }
 
+    fn begin_batch(&mut self) -> Result<(), String> {
+        match self.phase {
+            RatePowerDeliveryPhase::BeforeRxPath => {
+                self.phase = RatePowerDeliveryPhase::PageBatch {
+                    batch: 1,
+                    pages: 0,
+                    previous_sequence: None,
+                };
+                Ok(())
+            }
+            RatePowerDeliveryPhase::PageBatch {
+                batch: 2, pages: 0, ..
+            } => Ok(()),
+            _ => Err("rate-power batch began outside a native boundary".into()),
+        }
+    }
+
     fn finish(&mut self) -> Result<(), String> {
         match self.phase {
-            RatePowerDeliveryPhase::PageBatch { pages: 8, .. } => {
+            RatePowerDeliveryPhase::PageBatch {
+                batch: 1, pages: 8, ..
+            } => {
+                self.phase = RatePowerDeliveryPhase::BeforeRxPath;
+                Ok(())
+            }
+            RatePowerDeliveryPhase::PageBatch {
+                batch: 2, pages: 8, ..
+            } => {
                 self.phase = RatePowerDeliveryPhase::BatchComplete;
                 Ok(())
             }
@@ -11504,6 +11532,7 @@ fn program_live_rate_power(
         (snapshot, source)
     };
     validate_native_rate_power_snapshot_parts(&snapshot, expected_source_sha256)?;
+    mechanics.loader.rate_power_delivery.begin_batch()?;
     let mut transport = VfioRateTxPower {
         loader: &mut *mechanics.loader,
     };
@@ -11681,13 +11710,21 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             self.capture_patch_table_snapshot("post_release_before_ram")?;
         }
         self.record_patch_gate_command(command, sequence, encoded)?;
-        if matches!(command, DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl) {
+        if matches!(
+            command,
+            DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl
+        ) {
             let (name, cid, payload) = match command {
                 DownloadCommand::EepromBufferMode => ("eeprom_buffer_mode", "0x21ed", "01000000"),
-                DownloadCommand::ProtectControl => ("protect_control", "0x3eed", "010000002b09000002000000"),
+                DownloadCommand::ProtectControl => {
+                    ("protect_control", "0x3eed", "010000002b09000002000000")
+                }
                 _ => unreachable!(),
             };
-            println!("{{\"firmware_bootstrap_transcript\":\"{name}\",\"cid\":\"{cid}\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"{payload}\",\"wait_response\":true}}", encoded.len());
+            println!(
+                "{{\"firmware_bootstrap_transcript\":\"{name}\",\"cid\":\"{cid}\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"{payload}\",\"wait_response\":true}}",
+                encoded.len()
+            );
         }
         if command == DownloadCommand::FirmwareLogToHost {
             println!(

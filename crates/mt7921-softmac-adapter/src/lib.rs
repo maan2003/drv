@@ -21,7 +21,8 @@ use mt7921_port_spike::{
     CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
     RegulatoryRatePowerSnapshot, SarFrequencyRange, candidate_channels as capability_channels,
-    encode_passive_mcu_command, regulatory_rate_power_channel_skeleton,
+    conservative_channel_domain, encode_passive_mcu_command,
+    regulatory_rate_power_channel_skeleton,
 };
 use std::collections::VecDeque;
 use std::error::Error;
@@ -327,6 +328,7 @@ pub enum SourceExactTransportError<E> {
     UnsupportedSpatialStreams,
     MandatoryDependency(PassivePrerequisites),
     InvalidSequence,
+    InvalidChannelDomain,
     InvalidDwell,
     UnsupportedMultiChannelScan,
     ChannelNotSelected,
@@ -405,8 +407,8 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         &mut self.mechanics
     }
 
-    /// Execute the source-ordered EEPROM-buffer command and mandatory receive
-    /// preparation without enabling MAC/channel/scan operation.
+    /// Execute mandatory receive preparation without replaying loader-owned
+    /// EEPROM/protection commands.
     pub fn prepare_receive_only(
         &mut self,
     ) -> Result<PassivePrerequisites, SourceExactTransportError<M::Error>> {
@@ -417,7 +419,6 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
                 data_rx_owned: true,
             });
         }
-        self.issue(PassiveMcuCommand::EepromBufferMode)?;
         let prerequisites = self
             .mechanics
             .prepare_passive_receive()
@@ -452,6 +453,19 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
             .mechanics
             .current_mcu_sequence()
             .unwrap_or(template_sequence);
+        Ok(())
+    }
+
+    fn install_rate_tx_power(&mut self) -> Result<(), SourceExactTransportError<M::Error>> {
+        self.mechanics
+            .install_rate_tx_power(self.capability)
+            .map_err(SourceExactTransportError::Mechanics)?;
+        if let Some(sequence) = self.mechanics.current_mcu_sequence() {
+            if !(1..=15).contains(&sequence) {
+                return Err(SourceExactTransportError::InvalidSequence);
+            }
+            self.mcu_sequence = sequence;
+        }
         Ok(())
     }
 }
@@ -518,8 +532,14 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         let channel = context.channel;
         if !self.initialized {
             self.prepare_receive_only()?;
-            self.issue(PassiveMcuCommand::ProtectCtrl)?;
+            // Registration's regulatory notifier publishes one complete SKU
+            // batch before runtime-power and PHY start.
+            self.install_rate_tx_power()?;
+            self.issue(PassiveMcuCommand::KeepFullPower)?;
             self.issue(PassiveMcuCommand::MacEnable)?;
+            let domain = conservative_channel_domain(self.capability, *b"00", true, 0)
+                .map_err(|_| SourceExactTransportError::InvalidChannelDomain)?;
+            self.issue(PassiveMcuCommand::SetChannelDomain(domain))?;
             self.issue(PassiveMcuCommand::SetRxPath {
                 // Linux starts the PHY with mac80211's initial 2.4 GHz
                 // channel definition, then applies the requested channel
@@ -532,15 +552,9 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                 },
                 antenna_mask: self.antenna_mask,
             })?;
-            self.mechanics
-                .install_rate_tx_power(self.capability)
-                .map_err(SourceExactTransportError::Mechanics)?;
-            if let Some(sequence) = self.mechanics.current_mcu_sequence() {
-                if !(1..=15).contains(&sequence) {
-                    return Err(SourceExactTransportError::InvalidSequence);
-                }
-                self.mcu_sequence = sequence;
-            }
+            self.install_rate_tx_power()?;
+            self.issue(PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
+            self.issue(PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
             self.issue(PassiveMcuCommand::AddBss)?;
             self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
@@ -1801,11 +1815,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.scan_id, Some(1));
         let commands = &adapter.transport.mechanics.commands;
-        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(1));
-        assert_eq!(commands.len(), 9);
-        assert!(matches!(commands[0].0, PassiveMcuCommand::EepromBufferMode));
-        assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
-        assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
+        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(0));
+        assert_eq!(commands.len(), 11);
+        assert!(matches!(commands[0].0, PassiveMcuCommand::KeepFullPower));
+        assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
+        assert!(matches!(
+            commands[2].0,
+            PassiveMcuCommand::SetChannelDomain(_)
+        ));
         assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
         assert_eq!(
             adapter.transport.mechanics.rate_power_after_commands,
@@ -1822,19 +1839,30 @@ mod tests {
                 antenna_mask: 3,
             }
         ));
-        assert!(matches!(commands[4].0, PassiveMcuCommand::AddDevice { .. }));
-        assert!(matches!(commands[5].0, PassiveMcuCommand::AddBss));
         assert!(matches!(
-            commands[6].0,
+            commands[4].0,
+            PassiveMcuCommand::RadioLedCtrl { value: 1 }
+        ));
+        assert!(matches!(
+            commands[5].0,
+            PassiveMcuCommand::RadioLedCtrl { value: 2 }
+        ));
+        assert!(matches!(commands[6].0, PassiveMcuCommand::AddDevice { .. }));
+        assert!(matches!(commands[7].0, PassiveMcuCommand::AddBss));
+        assert!(matches!(
+            commands[8].0,
             PassiveMcuCommand::SetPassiveRxFilter
         ));
         assert!(matches!(
-            commands[7].0,
+            commands[9].0,
             PassiveMcuCommand::ChannelSwitch { .. }
         ));
-        assert!(matches!(commands[8].0, PassiveMcuCommand::StartScan { .. }));
-        assert!(!commands[8].2);
-        let scan_request = &commands[8].1[64..];
+        assert!(matches!(
+            commands[10].0,
+            PassiveMcuCommand::StartScan { .. }
+        ));
+        assert!(!commands[10].2);
+        let scan_request = &commands[10].1[64..];
         assert_eq!(scan_request[2], 0);
         assert_eq!(scan_request[4], 0);
         assert_eq!(scan_request[5], 0);
