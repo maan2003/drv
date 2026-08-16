@@ -706,3 +706,58 @@ Every report ends `RESTORE end failed=0`. After each run the authoritative
 status was idle and native-ready, with iwd active, the watchdog
 inactive/non-failed, and a WLAN default route. Final HTTPS verification also
 succeeded.
+
+### Fixed fresh-LAA attribution campaign (2026-08-16)
+
+A separate `fresh-laa-diagnostic` artifact bound one fixed, newly selected
+locally administered unicast address, `02:7d:91:4c:b8:3e`, through the complete
+userspace session. The typed identity is the source for DEV_INFO/MUAR, BSS OMAC
+context, the SoftMAC query/SME station identity and SAE calculations,
+pre-association management headers, M1 matching, and RX local-address
+classification. The artifact rejects the native address, the AP address, zero,
+and multicast addresses. Normal production remains pinned to the native
+address. Root-only runtime records in every run reported both
+`session_identity` and `session_identity_bound`, with all seven binding checks
+true.
+
+The package's fresh-identity cross-layer self-test, the full packaged
+production integration test, the unchanged production package, diagnostic
+supervisor, manifest, root entry, and inert proof all built successfully. The
+inert plan reported `hardware_handoff=false`, identity mode
+`fixed-fresh-laa-diagnostic`, and mandatory native-identity restoration before
+watchdog disarm. Five delivered file hashes and the root NAR hash matched
+exactly between the local and no-plastic stores.
+
+The pinned root was invoked exactly three times with the same fresh LAA; there
+was no fourth invocation. All three completed SAE group-20 rejection, group-19
+commit, and transaction-2/status-0 confirm. Each emitted four actual-DMA
+management witnesses (group-20 commit, group-19 commit, confirm, and
+association request), all with retry false and successful TXS/TX_FREE terminal
+completion. The association request and response also had retry false. The
+per-run results were:
+
+| report | association | normalized AID | timeout RX-route deltas (ring 0/2/4) | M1 |
+| --- | --- | ---: | --- | --- |
+| `20260816T080530Z-0000_05_00.0.log` | status 0 | 6 | 0 / 0 / 18 | absent |
+| `20260816T081014Z-0000_05_00.0.log` | status 0 | 2 | 0 / 0 / 18 | absent |
+| `20260816T081058Z-0000_05_00.0.log` | status 0 | 10 | 0 / 5 / 17 | absent |
+
+The report SHA-256 values are respectively
+`17a7da1f04a22cf2862cbf1072a803faf6357ebaa888125b744ce4007f029677`,
+`0f440a23c48e4ff3298d818ecc0491b3f17168590460d2603c07c5a4b1ed6bbb`,
+and `e8e2d801b4ed70cf3ce95426dc2836213b702538a16604c550af357cc4b311f5`.
+Ring 0 never advanced after the pre-BSS baseline. The first two runs had no
+data-ring completion; the third had five non-M1 data-ring completions. None of
+the configured host routes contained EAPOL or authenticator M1.
+
+Every report ends `RESTORE end failed=0`. After each run the authoritative
+helper returned idle status 0, quarantined status 1, and native-ready status 0.
+The final state has the native `8a:fd:2a:8b:70:5a` identity on `wlan2`,
+`mt7921e` bound in PCI D0, active iwd, a disarmed inactive/non-failed watchdog,
+a WLAN default route, and successful HTTPS.
+
+Changing only the userspace station identity did not produce M1 in any of the
+three controlled attempts. Therefore stale AP/per-station state tied only to
+the native MAC is not sufficient to explain the missing M1 in these runs. This
+does not distinguish AP non-transmission from a firmware drop before host DMA,
+and it does not exclude state keyed by something other than the station MAC.

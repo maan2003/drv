@@ -2951,3 +2951,25 @@ status-0 response with retry clear and a unique sequence, and sent no
 same-sequence retry during the 15 ms pre-tail pump or five-second observation;
 that is positive AP-side evidence, though not an independent sniffer proof,
 that hardware acknowledged the response.
+
+### Fresh-LAA M1 attribution result
+
+A dedicated `fresh-laa-diagnostic` artifact used one fixed locally administered
+unicast address as the single typed identity across DEV_INFO/MUAR, BSS OMAC,
+SoftMAC/SME and SAE, management TX, M1 matching, and RX classification. It
+rejects the native/AP/zero/multicast identities, leaves normal production
+unchanged, and requires restoration of the native address before watchdog
+disarm. Its package, production regression, cross-layer identity test,
+supervisor, manifest, root, inert plan, remote closure, and exact local/remote
+hash checks passed.
+
+The pinned root was invoked exactly three times with that same fresh identity,
+with no fourth run. All three completed SAE status 0 and status-0 association
+without an association retry (normalized AIDs 6, 2, and 10), but no configured
+RX route observed EAPOL or authenticator M1. The timeout ring 0/2/4 completion
+deltas were 0/0/18, 0/0/18, and 0/5/17. Every run restored with `failed=0`;
+authoritative final recovery is idle, non-quarantined, native-ready, PCI D0,
+iwd active, watchdog disarmed/inactive, default route present, and HTTPS
+working. Thus stale AP state keyed only by the native station MAC is not
+sufficient for these observations; AP non-transmission versus a pre-host-DMA
+firmware drop remains unresolved.
