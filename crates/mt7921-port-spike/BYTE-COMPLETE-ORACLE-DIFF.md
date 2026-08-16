@@ -401,3 +401,70 @@ preauth STA_REC and userspace still omits at that boundary. No RLM behavior
 change is included in this campaign. Final recovery restored `mt7921e`, PCI
 D0, active iwd, an idle/non-quarantined lab, inactive/non-failed watchdog,
 default route, and HTTPS.
+
+### Preauth RLM campaign result (2026-08-16)
+
+The remaining native preauth CID-2 RLM transition is now emitted after the
+preauth BSS ACK and before the full preauth CID-3 STA_REC. Its exact 20-byte
+payload is
+`0000000002001000242a00020203010401010000` (SHA-256
+`4828fa8ea2e7889bd7c2d55b03af43e05c7fc5da18a3b3e651070a06f285f188`),
+identical to the corrected Linux oracle and the already-proven associated RLM
+payload. Every field comes from the authorized active channel definition:
+BSS 0, primary 36, center 42, center2 0, 80-MHz bandwidth code 2 and 5-GHz
+band code 1; the pinned encoder supplies two TX streams, three RX streams,
+short slot 1, HT operation-info byte 4 and secondary-channel offset 1 for a
+primary channel below center. The success transcript is exactly CID order
+`3,2,2,3` with consecutive MCU sequences for initial peer, preauth BSS,
+preauth RLM and full preauth STA_REC. An injected ambiguous RLM failure proves
+that the full STA_REC is not submitted and cleanup reserves later sequences
+for WCID removal and BSS disable, releases WCID 1 only after both ACKs, and
+otherwise retains firmware-uncertain state for teardown.
+
+Commit `1b4e7445dfc9c11e6a5117d2abec3737853e6544` and its pinned artifact were
+exercised exactly three times after package, root-entry, remote-entry,
+delivery-manifest, remote-entry-test, inert-proof-root-entry-test and remote
+`--plan` validation. There was no fourth active invocation. In every report
+the ACK order was directly visible as `after_initial_peer_cid3_ack`,
+`after_preauth_bss_ack`, `after_rlm_ack`, then the 176-byte
+`e2e81_sta_rec_transcript` and `after_preauth_cid3_ack`. The first three ACKs
+left the WTBL vector at
+
+`00000000 00000000 00000000 00000000 00000000 00000000 ffffffff 00000000 00000000 00000000`
+
+and the identical full STA_REC then produced, in all three runs,
+
+`38409356 7dc7a672 42000000 00000000 10000000 32000040 ffffffff 00000000 00000000 00000000`.
+
+Thus preauth RLM does not change DW5 on this firmware. The named
+`CHANGE_BW_RATE` field remains 0 through its ACK and becomes 2 only at the
+full preauth CID-3 ACK, versus the native oracle's 0 at that boundary. This
+campaign corrects and excludes the last known missing preauth CID-2 command;
+the earliest remaining state divergence is now the firmware result of the
+byte-equivalent full preauth CID-3 update. It must depend on still-unidentified
+prior firmware/global context or an unobserved native transition, not on an
+unequal known preauth BSS, RLM, STA_REC or nested WTBL byte. No speculative
+physical WTBL write or fourth campaign run was made.
+
+Attempt one reached a status-0 association response with normalized AID 9,
+completed the associated BSS/RLM/full-STA_REC/tail sequence, and changed DW5
+to `0x32000827` (`CHANGE_BW_RATE=1`, SGI160 set) at the associated CID-3 ACK.
+It saw three non-EAPOL client frames attributed to interface WCID 19 rather
+than peer WCID 1, then timed out without authenticator M1. Attempt two sent the
+association request but received no admitted association response and ended
+with pinned SME/MLME connect failure. Attempt three reached status-0
+association with normalized AID 8, completed the same associated sequence and
+same `0x32000827` DW5 result, but saw no RX DMA activity during the M1 window.
+No attempt observed EAPOL/authenticator M1 or began the four-way handshake.
+The durable reports are:
+
+- `20260816T050151Z-0000_05_00.0.log`, SHA-256
+  `d07542373c3762bbf03bc57e74d9e01b1fc1f04d8a79d4973d2242dcb35cc244`
+- `20260816T050308Z-0000_05_00.0.log`, SHA-256
+  `a6a128b2715500a914a366c6a9c104e117379786e009ff9ee215d577a46fccda`
+- `20260816T050417Z-0000_05_00.0.log`, SHA-256
+  `2e1eda48d3cb4f4b92197d422513e534a13fb0fee1850b125e595e596a5fa8e5`
+
+Each report ended with `RESTORE end failed=0`. Final recovery checks found an
+idle, non-quarantined, native-ready lab; `mt7921e` bound in PCI D0; active iwd;
+inactive/non-failed watchdog; a WLAN default route; and successful HTTPS.
