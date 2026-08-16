@@ -557,6 +557,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             self.issue(PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
             self.issue(PassiveMcuCommand::AddBss)?;
+            self.issue(PassiveMcuCommand::InitialEdca)?;
             self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
             self.initialized = true;
         }
@@ -1789,8 +1790,14 @@ mod tests {
     #[test]
     fn real_fuchsia_adapter_drives_source_exact_passive_closure() {
         let capability = nic();
-        let transport =
-            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let transport = SourceExactPassiveTransport::new(
+            ScriptedMechanics {
+                mcu_sequence: Some(3),
+                ..Default::default()
+            },
+            capability,
+        )
+        .unwrap();
         let mut adapter = Mt7921SoftmacAdapter::new(
             transport,
             capability,
@@ -1816,7 +1823,7 @@ mod tests {
         assert_eq!(response.scan_id, Some(1));
         let commands = &adapter.transport.mechanics.commands;
         assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(0));
-        assert_eq!(commands.len(), 11);
+        assert_eq!(commands.len(), 12);
         assert!(matches!(commands[0].0, PassiveMcuCommand::KeepFullPower));
         assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
         assert!(matches!(
@@ -1827,6 +1834,10 @@ mod tests {
         assert_eq!(
             adapter.transport.mechanics.rate_power_after_commands,
             Some(4)
+        );
+        assert_eq!(
+            adapter.transport.mechanics.rate_power_sequences,
+            [4, 5, 6, 7, 8, 9, 10, 11, 1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert!(matches!(
             commands[3].0,
@@ -1849,20 +1860,21 @@ mod tests {
         ));
         assert!(matches!(commands[6].0, PassiveMcuCommand::AddDevice { .. }));
         assert!(matches!(commands[7].0, PassiveMcuCommand::AddBss));
+        assert!(matches!(commands[8].0, PassiveMcuCommand::InitialEdca));
         assert!(matches!(
-            commands[8].0,
+            commands[9].0,
             PassiveMcuCommand::SetPassiveRxFilter
         ));
         assert!(matches!(
-            commands[9].0,
+            commands[10].0,
             PassiveMcuCommand::ChannelSwitch { .. }
         ));
         assert!(matches!(
-            commands[10].0,
+            commands[11].0,
             PassiveMcuCommand::StartScan { .. }
         ));
-        assert!(!commands[10].2);
-        let scan_request = &commands[10].1[64..];
+        assert!(!commands[11].2);
+        let scan_request = &commands[11].1[64..];
         assert_eq!(scan_request[2], 0);
         assert_eq!(scan_request[4], 0);
         assert_eq!(scan_request[5], 0);

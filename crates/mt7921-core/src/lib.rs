@@ -2650,6 +2650,7 @@ pub enum PassiveMcuCommand {
         mac: [u8; 6],
     },
     AddBss,
+    InitialEdca,
     SetPassiveRxFilter,
     RadioLedCtrl {
         value: u8,
@@ -3045,6 +3046,9 @@ pub fn encode_passive_mcu_command(
             payload[30..32].copy_from_slice(&19u16.to_le_bytes());
             encode_uni_mcu(2, &payload, sequence)
         }
+        // add_interface -> mt7921_mcu_set_tx before mac80211 has supplied
+        // per-AC parameters: the packed 44-byte request is zero initialized.
+        PassiveMcuCommand::InitialEdca => encode_legacy_mcu(0x1d, 0, &[0; 44], sequence),
         PassiveMcuCommand::SetPassiveRxFilter => {
             let mut payload = vec![0; 68];
             payload[4] = 1;

@@ -498,7 +498,7 @@ nothing makes `CHANGE_BW_RATE` causal.
 Later native commands were deliberately not folded into this change. The
 corrected oracle next emits EEPROM buffer mode (`0x21ed`), protection
 (`0x3eed`), a second CLC (`0x4005c`), then channel-domain (`0x4000f`), eight
-rate-power pages (`0x4005d`), TX-power feature control (`0x400ca`), MAC enable
+rate-power pages (`0x4005d`), `CHIP_CONFIG KeepFullPwr 0` (`0x400ca`), MAC enable
 (`0x46ed`), another domain update, RX-path configuration (`0x4eed`) and a
 second eight-page rate batch. The corresponding later DEV/MUAR, BSS,
 MAC/PHY/RX, channel/RLM, RX-filter, scan, ROC, power and offload commands
@@ -567,3 +567,42 @@ There was no fourth invocation. Every report ends `RESTORE end failed=0`.
 Final helper results are idle=true (status 0), quarantined=false (status 1),
 and native-ready=true (status 0); iwd is active, the watchdog inactive and
 non-failed, `mt7921e` is bound in D0, and route/HTTPS checks pass.
+
+## Normalized channel-domain-to-preauth transcript audit
+
+The contiguous native interval below starts at the already-pinned first
+channel-domain publication (MCU sequence 3) and ends at the JOIN ROC acquire
+immediately after initial peer entry. `H` is SHA-256 of the raw command payload
+(not the TXD); `M` means the value is the previously documented dynamic-field
+masked hash. A dash is not a guessed hash: the v1 oracle recorded command ID,
+length, wait policy and ordering but not payload bytes, and the runtime input
+needed to reconstruct that particular request is absent. Such rows are audit
+findings, not implementation evidence.
+
+| Native MCU sequence/order | Decode; payload bytes; H | Response/publication | Userspace counterpart before this batch | Result/safe state |
+|---|---|---|---|---|
+| 3 | `SET_CHAN_DOMAIN`, world/indoor, 14 2-GHz + 25 5-GHz NO_IR records; 324; `469e06becefcdafc327fe6152badc9f6c675ce70cf4a7adccaef19ba9d49cdb8` | no response; DMA consumption is the publication proof | loader exact | unchanged; no TX authorization |
+| 4–11 | `SET_RATE_TX_POWER`, pages 1–8; 1340,1016,1340×6; `a518536c...`, `1c365518...`, `1cbc4008...`, `f03e5918...`, `231e8db1...`, `d8761b04...`, `e018434f...`, `f1e5d489...` | no response; every page must be consumed/reclaimed contiguously | absent | **implemented** as batch 1; authorization remains fail-closed until all eight pages finish |
+| 12 | `CHIP_CONFIG`, `KeepFullPwr 0`; 328; `3c100eb1f6c440797689fecba2e58c12284ab44adb1be729b91ab5a2204d37ec` | no response; consumed/reclaimed | absent | **implemented**; power policy only, no causal claim |
+| 13 | `MAC_INIT_CTRL` enable; 4; `67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450` | ACK | present later | moved into exact position |
+| 14 | second `SET_CHAN_DOMAIN`; same 324 bytes/hash as sequence 3 | no response; consumed/reclaimed | absent | **implemented**; same mask-zero domain |
+| 15 | `SET_RX_PATH`, channel 1/20 MHz, two streams, mask 3; 76; `a54c28bd0366bf194e9ca42e67f3ce521a58bf0614191eb7d80a06c9d171733c` | ACK | exact but earlier | moved into exact position |
+| 1–8 | second rate-power pages; same eight lengths/hashes | no response; per-page consumed/reclaimed | one exact batch | retained as batch 2; audit now distinguishes both batches |
+| 9,10 | `ID_RADIO_ON_OFF_CTRL`: LED control enable then radio-on; 4 each; `67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450`, `26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece` | no response; each consumed/reclaimed | absent | **implemented** in exact order; neither command changes frame authority |
+| 11 | UNI `DEV_INFO_ACTIVE`, OMAC/BSS 0 and public client MAC; 16; `3944445ae0cfffa1b5aaa8b80fce43830ac5fd0b9e0edf519ec11fb8c86e4ba4` (M; actual captured userspace MAC payload `d34128c7430dbb1948491ad8c689ed56de9f315b2ffeb3ed49ed64b4232c5d33`) | ACK; interface/MUAR publication | `AddDevice` exact | retained; now naturally follows both LED commands |
+| 12 | UNI initial `BSS_INFO_BASIC`; 36; `13df0bf1b8e1588d780ddf827378e59c665f7636e6853fd5fcd775991a08a310` | ACK | `AddBss` exact | retained |
+| 13 | CE `SET_EDCA_PARMS`, zero-initialized pre-conf_tx request; 44; `85759b3811ff7dc47b03792ac85317be51431a3f9e01dcafce317ed736a391b0` | no response; consumed/reclaimed | absent | **implemented**; no queued frame or TX publication |
+| 14,15 | CE `SET_RX_FILTER`, two mac80211 filter updates; 68 each; H unavailable from v1 oracle | no response; consumed/reclaimed | one constrained passive filter (`22ee6f1c4b4fd9f2f1e2e83c14791cc74eccc2700f4facd7b0da24743d46f856`) | not changed: duplicating an unknown first filter value would be speculative |
+| 1 | CE `START_HW_SCAN`; 1186; H unavailable because the oracle omitted the request-dependent SSID/channel material | no response; completion is unsolicited scan-done event | constrained one-channel passive scan (`bbb21a3f1befb15c49f0a808056ca338bdeeae1b9bb4a8b1e1e0cabcacfbc6ac`) | intentionally not equated; userspace remains passive/no-probe |
+| 2–5 | UNI BSS 36 ACK; DEV 16 ACK disable; DEV 16 ACK enable; BSS 36 ACK | ACK each; firmware interface/BSS state transitions | userspace does a later DEV/BSS programming pair | not reordered: the v1 record does not identify the mac80211 lifecycle inputs that caused the native churn |
+| 6 | `CHIP_CONFIG`, 328, runtime `KeepFullPwr` transition; H unavailable from v1 record | no response; consumed/reclaimed | absent at this boundary | not inserted ahead of unresolved lifecycle transitions |
+| 7 | UNI preauth `STA_REC`/WTBL entry; 128 in oracle interval (the selected normalized preauth payload hash is `d89e17e60112f3387fdf5c6e7c2216b0c35ab39ad70d2b5fca0059c91aec8c4a`) | ACK; preauth peer/WCID publication | exact 128-byte preauth entry exists after its local initial-peer/BSS/RLM setup, but follows a shorter userspace lifecycle | payload retained; no claim that preceding unresolved rows are equivalent |
+| 8 | UNI JOIN `ROC_ACQUIRE`, channel 36, token/generation and bounded duration; 28; representative 2000 ms payload `dfd0f3841477e3be950981a6a50a720d72e5972569365727cd05f0398326f348` | no command ACK; unsolicited ROC grant is required before use | exact acquire/grant parser | retained; abort/timeout cleanup revokes the lease |
+
+The persistent exact independent divergences in this interval were therefore
+one missing rate batch, runtime-power placement, the repeated domain update,
+LED commands and zero initial EDCA, plus duplicated loader-owned EEPROM and
+PROTECT commands in userspace. They are one parity batch. Unknown RX-filter,
+scan-request and interface-churn payloads remain explicit gaps. The change
+does not add probes, keys, data TX, public post-association TX, or any causal
+claim about M1.

@@ -9494,6 +9494,8 @@ enum RatePowerDeliveryPhase {
         previous_sequence: Option<u8>,
     },
     BatchComplete,
+    LedEnablePublished,
+    LedOnPublished,
     AddDeviceInFlight,
     Complete,
 }
@@ -9806,7 +9808,21 @@ impl RatePowerDeliveryAudit {
                 self.phase = RatePowerDeliveryPhase::RxPathInFlight;
                 Ok(())
             }
-            (RatePowerDeliveryPhase::BatchComplete, PassiveMcuCommand::AddDevice { .. }) => {
+            (
+                RatePowerDeliveryPhase::BatchComplete,
+                PassiveMcuCommand::RadioLedCtrl { value: 1 },
+            ) => {
+                self.phase = RatePowerDeliveryPhase::LedEnablePublished;
+                Ok(())
+            }
+            (
+                RatePowerDeliveryPhase::LedEnablePublished,
+                PassiveMcuCommand::RadioLedCtrl { value: 2 },
+            ) => {
+                self.phase = RatePowerDeliveryPhase::LedOnPublished;
+                Ok(())
+            }
+            (RatePowerDeliveryPhase::LedOnPublished, PassiveMcuCommand::AddDevice { .. }) => {
                 self.phase = RatePowerDeliveryPhase::AddDeviceInFlight;
                 Ok(())
             }
@@ -9818,6 +9834,12 @@ impl RatePowerDeliveryAudit {
                 "MCU command {command:?} interleaved in the contiguous SET_RATE_TX_POWER batch"
             )),
             (RatePowerDeliveryPhase::BatchComplete, _) => Err(format!(
+                "MCU command {command:?} replaced the naturally following radio-LED enable"
+            )),
+            (RatePowerDeliveryPhase::LedEnablePublished, _) => Err(format!(
+                "MCU command {command:?} replaced the naturally following radio-LED on"
+            )),
+            (RatePowerDeliveryPhase::LedOnPublished, _) => Err(format!(
                 "MCU command {command:?} replaced the naturally following ADD_DEVICE"
             )),
             (RatePowerDeliveryPhase::AddDeviceInFlight, _) => {
@@ -9929,6 +9951,8 @@ impl RatePowerDeliveryAudit {
         match self.phase {
             RatePowerDeliveryPhase::PageBatch { pages, .. } => pages,
             RatePowerDeliveryPhase::BatchComplete
+            | RatePowerDeliveryPhase::LedEnablePublished
+            | RatePowerDeliveryPhase::LedOnPublished
             | RatePowerDeliveryPhase::AddDeviceInFlight
             | RatePowerDeliveryPhase::Complete => 8,
             RatePowerDeliveryPhase::BeforeRxPath | RatePowerDeliveryPhase::RxPathInFlight => 0,
@@ -23821,9 +23845,7 @@ mod tests {
             .split("self.initialized = true")
             .next()
             .unwrap();
-        let power = start
-            .find("install_rate_tx_power(self.capability)")
-            .unwrap();
+        let power = start.find("self.install_rate_tx_power()").unwrap();
         let next_command = start
             .find("self.issue(PassiveMcuCommand::AddDevice")
             .unwrap();
@@ -23892,6 +23914,12 @@ mod tests {
             audit.page_consumed_and_reclaimed(command).unwrap();
         }
         audit.finish().unwrap();
+        audit
+            .before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 })
+            .unwrap();
+        audit
+            .before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 })
+            .unwrap();
         audit
             .before_passive_command(&PassiveMcuCommand::AddDevice {
                 mac: [2, 0, 0, 0, 0, 1],
