@@ -12103,6 +12103,39 @@ fn run_passive_prepare_steps<E>(
 #[cfg(feature = "fuchsia-passive")]
 impl PassiveMacExecutor<'_> {
     fn trace_peer_wtbl_dw5(&self, stage: &str) {
+        let mut dwords = [0u32; 10];
+        let mut complete = true;
+        for (index, value) in dwords.iter_mut().enumerate() {
+            match self.read_firmware_snapshot_raw(0x820d_8100 + index as u32 * 4) {
+                Ok(read) => *value = read,
+                Err(_) => complete = false,
+            }
+        }
+        if complete {
+            let dw5 = dwords[5];
+            record_sae_root_only_stage(&format!(
+                "wtbl_dwords stage={stage} peer_wcid=1 dw0={:#010x} dw1={:#010x} dw2={:#010x} dw3={:#010x} dw4={:#010x} dw5={:#010x} dw6={:#010x} dw7={:#010x} dw8={:#010x} dw9={:#010x} change_bw_rate={} sgi20={} sgi40={} sgi80={} sgi160={} bw_cap={} mpdu_fail={} mpdu_ok={} rate_idx={}",
+                dwords[0],
+                dwords[1],
+                dwords[2],
+                dwords[3],
+                dwords[4],
+                dw5,
+                dwords[6],
+                dwords[7],
+                dwords[8],
+                dwords[9],
+                (dw5 >> 5) & 7,
+                (dw5 >> 8) & 1,
+                (dw5 >> 9) & 1,
+                (dw5 >> 10) & 1,
+                (dw5 >> 11) & 1,
+                (dw5 >> 12) & 3,
+                (dw5 >> 23) & 7,
+                (dw5 >> 26) & 7,
+                (dw5 >> 29) & 7,
+            ));
+        }
         match self.read_firmware_snapshot_raw(0x820d_8114) {
             Ok(value) => record_sae_stage(&format!(
                 "wtbl_stage stage={stage} peer_wcid=1 interface_wcid=19 selector=direct_lmac_addr address=0x820d8114 dw5={value:#010x} sgi160={}",

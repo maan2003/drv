@@ -6283,6 +6283,38 @@ pub fn encode_client_bss_command(
     Ok(encode_uni_mcu(2, &payload, sequence))
 }
 
+/// Linux's preauthentication BSS BASIC+QBSS update immediately before the
+/// full peer STA_REC. At this boundary DTIM is deliberately not active yet.
+pub fn encode_client_preauth_bss_command(
+    sequence: u8,
+    bss_index: u8,
+    bssid: [u8; 6],
+    channel: u16,
+    beacon_interval: u16,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bssid == [0; 6]
+        || beacon_interval == 0
+        || !(1..=177).contains(&channel)
+    {
+        return Err("preauth BSS update escaped station BASIC bounds".into());
+    }
+    let mut payload = encode_client_bss_basic_payload(
+        bss_index,
+        true,
+        1,
+        bssid,
+        beacon_interval,
+        0,
+        if channel <= 14 { 0x4e } else { 0xb1 },
+        19,
+        19,
+        if channel <= 14 { 0x53 } else { 0x78 },
+    );
+    payload.extend_from_slice(&[15, 0, 8, 0, 0, 0, 0, 0]);
+    Ok(encode_uni_mcu(2, &payload, sequence))
+}
+
 pub struct SensitiveUniCommand(Vec<u8>);
 
 impl SensitiveUniCommand {
@@ -7291,6 +7323,13 @@ impl ClientFirmwareEffectsState {
             peer.peer_wcid.get(),
             peer.peer,
         )?;
+        let bss = encode_client_preauth_bss_command(
+            self.next_sequence(),
+            peer.bss_index,
+            joined.bssid,
+            joined.channel,
+            joined.beacon_interval,
+        )?;
         let command = encode_preauth_peer_wcid_command(
             self.next_sequence(),
             peer.bss_index,
@@ -7301,7 +7340,13 @@ impl ClientFirmwareEffectsState {
             peer.legacy_rates,
         )?;
         self.firmware_uncertain = true;
-        let result = submit(3, &initial).and_then(|()| submit(3, &command));
+        let result = submit(3, &initial)
+            .and_then(|()| submit(2, &bss))
+            .map(|()| {
+                self.bss_programmed = true;
+                self.bss_binding = Some((peer.bss_index, false));
+            })
+            .and_then(|()| submit(3, &command));
         if let Err(error) = result {
             let rollback = encode_remove_wcid_command(
                 self.next_sequence(),
@@ -7312,12 +7357,29 @@ impl ClientFirmwareEffectsState {
                 false,
             )
             .and_then(|command| submit(3, &command));
-            self.firmware_uncertain = rollback.is_err();
-            if rollback.is_ok() {
+            let rollback_bss = if self.bss_programmed {
+                encode_client_bss_command(
+                    self.next_sequence(),
+                    peer.bss_index,
+                    joined.bssid,
+                    joined.channel,
+                    joined.beacon_interval,
+                    joined.dtim_period,
+                    false,
+                    false,
+                )
+                .and_then(|command| submit(2, &command))
+            } else {
+                Ok(())
+            };
+            self.firmware_uncertain = rollback.is_err() || rollback_bss.is_err();
+            if rollback.is_ok() && rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
                 self.release_allocated_peer(peer.peer_wcid)?;
             }
             return Err(format!(
-                "preauth WCID add failed: {error}; rollback_wcid={rollback:?}"
+                "preauth WCID add failed: {error}; rollback_wcid={rollback:?}; rollback_bss={rollback_bss:?}"
             ));
         }
         self.preauth_peer = Some(peer);
@@ -7350,7 +7412,11 @@ impl ClientFirmwareEffectsState {
                     && preauth.aid == 0
             })
             .ok_or("association requires an ACKed preauth peer WCID")?;
-        if self.association.is_some() || self.bss_programmed || self.firmware_uncertain {
+        if self.association.is_some()
+            || !self.bss_programmed
+            || self.bss_binding != Some((association.bss_index, false))
+            || self.firmware_uncertain
+        {
             return Err("client firmware association state is not clean".into());
         }
         let bss = encode_client_bss_command(
@@ -9507,9 +9573,9 @@ mod tests {
             )
             .unwrap();
         assert!(post_bss_boundary_seen.get());
-        assert_eq!(transcript.len(), 5);
-        assert_eq!(&transcript[3][48..52], &[0, 0, 0, 0]);
-        assert_eq!(&transcript[3][52..56], &[2, 0, 16, 0]);
+        assert_eq!(transcript.len(), 6);
+        assert_eq!(&transcript[4][48..52], &[0, 0, 0, 0]);
+        assert_eq!(&transcript[4][52..56], &[2, 0, 16, 0]);
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9601,7 +9667,7 @@ mod tests {
             .unwrap();
         let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 11);
+        assert_eq!(transcript.len(), 12);
         assert_eq!(
             transcript
                 .iter()
@@ -9614,10 +9680,10 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>(),
-            [3, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
+            [3, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
         );
-        assert_eq!(transcript[7][80], 1);
-        assert_eq!(transcript[8][80], 2);
+        assert_eq!(transcript[8][80], 1);
+        assert_eq!(transcript[9][80], 2);
         assert!(!state.post_assoc_rx_filter_published);
         let initial_add = &transcript[0];
         assert_eq!(initial_add.len(), 88);
@@ -9625,7 +9691,17 @@ mod tests {
             &initial_add[48..],
             &encode_initial_peer_wcid_command(1, 0, 1, peer).unwrap()[48..]
         );
-        let preauth_add = &transcript[1];
+        let preauth_bss = &transcript[1];
+        assert_eq!(preauth_bss.len(), 92);
+        assert_eq!(&preauth_bss[48..52], &[0, 0, 0, 0]);
+        assert_eq!(&preauth_bss[52..56], &[0, 0, 32, 0]);
+        assert_eq!(preauth_bss[56], 1);
+        assert_eq!(preauth_bss[64], 1);
+        assert_eq!(&preauth_bss[66..72], &peer);
+        assert_eq!(&preauth_bss[72..80], &[19, 0, 100, 0, 0, 0xb1, 19, 0]);
+        assert_eq!(&preauth_bss[80..84], &[0x78, 0, 0, 0]);
+        assert_eq!(&preauth_bss[84..92], &[15, 0, 8, 0, 0, 0, 0, 0]);
+        let preauth_add = &transcript[2];
         assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
         assert_eq!(&preauth_add[68..74], &peer);
@@ -9633,12 +9709,12 @@ mod tests {
             u16::from_le_bytes(preauth_add[66..68].try_into().unwrap()),
             0
         );
-        let bss_add = &transcript[2];
+        let bss_add = &transcript[3];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[88], 1);
-        assert_eq!(transcript[4][112], 2);
-        let interface_assoc = &transcript[5];
+        assert_eq!(transcript[5][112], 2);
+        let interface_assoc = &transcript[6];
         assert_eq!(interface_assoc.len(), 108);
         assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
         assert_eq!(
@@ -9652,8 +9728,8 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[10][56], 0);
-        assert_eq!(transcript[9][49], 1);
+        assert_eq!(transcript[11][56], 0);
+        assert_eq!(transcript[10][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);
