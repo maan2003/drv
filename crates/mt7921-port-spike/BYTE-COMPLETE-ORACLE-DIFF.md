@@ -241,7 +241,7 @@ normalized because both paths allocated those exact IDs.
 | DEV/BSS preauth | CID 1 DEV active; CID 3 initial peer; CID 2 BSS BASIC+QBSS; CID 2 RLM | CID 1 DEV active; CID 2 basic BSS; legacy EDCA; no initial peer/BSS-target/RLM transition | **First presence/order divergence is the absent initial CID 3 peer allocation.** Later BSS/RLM omissions remain follow-up differences and are not changed here. |
 | Initial peer CID 3 | 40-byte payload, SHA-256 `2135af4e55ab272449d675701c5dd24fc460cd7ae18e4fb2dc51421b6f0b82f6`; BASIC `state=0,new=1,aid=0,qos=0`, empty reset-and-set WTBL; ACK event 1; DW5 `0x00000000` | absent | Source-exact payload is now emitted before the existing full preauth update. |
 | Preauth BSS | 44 bytes, BASIC `active=1,conn_state=1,dtim=0,qos=0`, then RLM 20 bytes | earlier generic BSS only | Present/order mismatch; deliberately not changed because it follows the initial-peer divergence. |
-| Full preauth CID 3 | 128-byte payload, reconstructed SHA-256 `069e6523e65fd9525c88527735447215db979ae35e4e1b44289c620777b0b999`; BASIC/PHY/RA/STATE/WTBL, PHY type `0x15`, rates `0x0015/0x3fc0`; ACK event 1; DW5 `0x32000000` | 128-byte payload inside 176-byte envelope, PHY type `0x08`, rates `0x0001/0x0040`; ACK event 1; DW5 `0x32000040` | Payload and named `CHANGE_BW_RATE` bit 6 differ. The missing initial command is earlier than these decoded-field differences. |
+| Full preauth CID 3 | 128-byte payload, reconstructed SHA-256 `069e6523e65fd9525c88527735447215db979ae35e4e1b44289c620777b0b999`; BASIC/PHY/RA/STATE/WTBL, PHY TLV tag `0x0015`, PHY type `0x08`, rates `0x0015/0x3fc0`; ACK event 1; DW5 `0x32000000` | 128-byte payload inside 176-byte envelope, the same tag/type `0x0015/0x08`, rates `0x0001/0x0040`; ACK event 1; DW5 `0x32000040` | Only the decoded basic/legacy rate fields differ here. The missing initial command is earlier than these decoded-field differences. |
 | SAE + ROC | acquire token, grant event 39, SAE commit/anti-clogging/confirm, abort | acquire/grant event 39, same three SAE stages, abort CID 0x27 | Presence/order equivalent; token and timing dynamic. |
 | Association request | acquire/grant event 39, association request, status-0 response | same; v10 response at 71,969,741 ns | Equivalent through successful association response. |
 | Associated BSS CID 2 | 44 bytes, SHA-256 `1d53ec7b42d2af141587b384ea71b900b315d95c034ac26a24949a0af84256d4`; BASIC+QBSS, `conn_state=0,dtim=2,qos=1` | exact same length/hash/decoded fields; ACK event 1 | Exact after transport normalization. |
@@ -290,7 +290,41 @@ DMA during the five-second window. The reports are:
   `1dafe19d8ace2d572bca1723871c6313f7f777f942d19989bbaa544190156a4d`
 
 The earliest remaining source-proven semantic divergence is therefore inside
-the full preauth CID 3 update: native PHY/rate fields are type `0x15`, basic
-rates `0x0015`, legacy rates `0x3fc0`; userspace emits type `0x08`, basic rates
-`0x0001`, legacy rates `0x0040`. No follow-up behavior change is included in
+the full preauth CID 3 update: native and userspace both use PHY TLV tag
+`0x0015` and PHY type `0x08`, while native basic/legacy rates are
+`0x0015/0x3fc0` and userspace emits `0x0001/0x0040`. No follow-up behavior change is included in
 this campaign result.
+
+### Negotiated preauth-rate campaign result (2026-08-16)
+
+Commit `cae49b18a92c294e3ec51f077d6e17580fcfb7a8` was exercised exactly three
+times after the packaged inert proof. The implementation parses Supported
+Rates and Extended Supported Rates from the selected AP beacon, intersects
+them by rate value with the selected local 5 GHz band's supported-rate list,
+preserves the AP basic markers, and translates the result through the pinned
+Linux/mac80211 band table. It does not derive rates from constants. All three
+preauth commands decoded as PHY TLV tag `0x0015`, basic rates `0x0015`,
+unchanged OFDM PHY type `0x08`, and RA legacy rates `0x3fc0`. Their
+associated updates independently retained negotiated HT/VHT and decoded as
+PHY type `0x38`, the same rates, HT/VHT/AMSDU present, and six WTBL TLVs.
+
+All three attempts reached a status-0 association response (attempt two first
+received status 30 and completed its comeback retry). None observed an EAPOL
+frame or authenticator M1, and none began the four-way handshake. Attempts one
+and three observed unrelated client frames at RX DMA; attempt two had no RX
+DMA delta during the M1 window. The full preauth rate correction also left
+peer WTBL DW5 at `0x32000040` before and after associated admission clear in
+all three attempts. It therefore disproves the legacy-rate bitmap mismatch as
+the cause of either named bit 6 or the missing M1.
+
+The reports are:
+
+- `20260816T035544Z-0000_05_00.0.log`, SHA-256
+  `bbde49a6fae6dfbaea508bdf6b1ab8806d81a6b3674af1fa100cedc4ba3e58c3`
+- `20260816T035730Z-0000_05_00.0.log`, SHA-256
+  `bc130eec65c50cb670daac3dc3258e19c0d1bb2e01441c67f6fbbdc596129b93`
+- `20260816T035855Z-0000_05_00.0.log`, SHA-256
+  `a6d59a16ae66b9e61db4f84c3790cde42b6acb071cdc8b0bebd6769711931ca9`
+
+After the third and final run, recovery restored `mt7921e`, PCI D0, active
+iwd, an idle/non-quarantined lab, the default route, and successful HTTPS.
