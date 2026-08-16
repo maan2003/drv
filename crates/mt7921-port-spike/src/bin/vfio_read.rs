@@ -10434,6 +10434,8 @@ fn classify_mcu_completion(
         }
         DownloadCommand::PatchStart { .. }
         | DownloadCommand::TargetAddressLength { .. }
+        | DownloadCommand::EepromBufferMode
+        | DownloadCommand::ProtectControl
         | DownloadCommand::FirmwareStart { .. } => Ok(FirmwareCommandCompletion::Ack),
         DownloadCommand::GetNicCapability => {
             let body = response
@@ -11679,6 +11681,14 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             self.capture_patch_table_snapshot("post_release_before_ram")?;
         }
         self.record_patch_gate_command(command, sequence, encoded)?;
+        if matches!(command, DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl) {
+            let (name, cid, payload) = match command {
+                DownloadCommand::EepromBufferMode => ("eeprom_buffer_mode", "0x21ed", "01000000"),
+                DownloadCommand::ProtectControl => ("protect_control", "0x3eed", "010000002b09000002000000"),
+                _ => unreachable!(),
+            };
+            println!("{{\"firmware_bootstrap_transcript\":\"{name}\",\"cid\":\"{cid}\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"{payload}\",\"wait_response\":true}}", encoded.len());
+        }
         if command == DownloadCommand::FirmwareLogToHost {
             println!(
                 "{{\"firmware_bootstrap_transcript\":\"firmware_log_to_host\",\"cid\":\"0x400c5\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"01000000\",\"wait_response\":false}}",
@@ -11696,6 +11706,8 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             DownloadCommand::GetNicCapability => Some("nic_capability_response"),
             DownloadCommand::ReadEepromBlock { .. } => Some("eeprom_efuse_acquired"),
             DownloadCommand::FirmwareLogToHost => Some("firmware_log_to_host_tx_complete"),
+            DownloadCommand::EepromBufferMode => Some("eeprom_buffer_mode_acked"),
+            DownloadCommand::ProtectControl => Some("protect_control_acked"),
             _ => None,
         };
         if let Some(event) = milestone {
@@ -15799,9 +15811,9 @@ fn diagnostic_probe_trigger(
 
 #[cfg(feature = "fuchsia-passive")]
 fn validate_production_prefix_sequence(enabled: bool, sequence: u8) -> Result<(), String> {
-    (!enabled || sequence == 15)
+    (!enabled || sequence == 3)
         .then_some(())
-        .ok_or_else(|| format!("production firmware prefix sequence drifted from 15 to {sequence}"))
+        .ok_or_else(|| format!("production firmware prefix sequence drifted from 3 to {sequence}"))
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -24058,8 +24070,8 @@ mod tests {
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn production_validation_rejects_non_eapol_second_publication_and_failed_completion() {
-        validate_production_prefix_sequence(true, 15).unwrap();
-        assert!(validate_production_prefix_sequence(true, 14).is_err());
+        validate_production_prefix_sequence(true, 3).unwrap();
+        assert!(validate_production_prefix_sequence(true, 2).is_err());
         let mut anchored = vec![0x88, 0x01];
         anchored.resize(26, 0);
         anchored.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);

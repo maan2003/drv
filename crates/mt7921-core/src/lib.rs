@@ -2096,6 +2096,8 @@ pub enum DownloadCommand {
         address: u32,
     },
     FirmwareLogToHost,
+    EepromBufferMode,
+    ProtectControl,
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
@@ -2444,6 +2446,14 @@ pub fn encode_download_command(
         // mt7921_run_firmware() enables firmware-to-host logging after CLC
         // calibration and before the later hardware initialization commands.
         DownloadCommand::FirmwareLogToHost => (0xc5, 1, 0, 0, vec![1, 0, 0, 0]),
+        DownloadCommand::EepromBufferMode => (0xed, 1, 0x21, 1, vec![1, 0, 0, 0]),
+        DownloadCommand::ProtectControl => (
+            0xed,
+            1,
+            0x3e,
+            1,
+            vec![1, 0, 0, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0],
+        ),
         DownloadCommand::PatchSemaphoreGet => (0x10, 3, 0, 0, 1u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0, 0, 0u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchFinish => (0x07, 3, 0, 0, vec![0; 4]),
@@ -3964,6 +3974,22 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                 completion,
                 FirmwareCommandCompletion::NoResponse,
             )?;
+            for command in [
+                DownloadCommand::EepromBufferMode,
+                DownloadCommand::ProtectControl,
+            ] {
+                let completion = loader_command(transport, command)?;
+                expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+            }
+            for command in &commands {
+                if let Some(response) = loader_set_clc(transport, command)? {
+                    report.special_unii_mask = response.special_unii_mask;
+                }
+                report.clc_rules_applied = report
+                    .clc_rules_applied
+                    .checked_add(1)
+                    .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
+            }
             if configure_channel_domain {
                 let command = conservative_channel_domain(
                     report.nic_capability,
@@ -14318,6 +14344,9 @@ mod tests {
                 DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost => {
                     FirmwareCommandCompletion::NoResponse
                 }
+                DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl => {
+                    FirmwareCommandCompletion::Ack
+                }
                 DownloadCommand::GetNicCapability => {
                     FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
                 }
@@ -14508,7 +14537,7 @@ mod tests {
                     unique_country_codes: 1,
                     world_domain_available: true,
                 },
-                clc_rules_applied: 1,
+                clc_rules_applied: 2,
                 special_unii_mask: 0x1f,
             }
         );
@@ -14574,6 +14603,9 @@ mod tests {
                 ),
                 LoaderTrace::SetClc(0, 15),
                 LoaderTrace::Command(DownloadCommand::FirmwareLogToHost, 1),
+                LoaderTrace::Command(DownloadCommand::EepromBufferMode, 2),
+                LoaderTrace::Command(DownloadCommand::ProtectControl, 3),
+                LoaderTrace::SetClc(0, 4),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
@@ -14653,7 +14685,7 @@ mod tests {
         assert!(matches!(
             &transport.trace[transport.trace.len() - 2..],
             [
-                LoaderTrace::SetChannelDomain(39, 2),
+                LoaderTrace::SetChannelDomain(39, 5),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
             ]
         ));
