@@ -13,6 +13,7 @@ fuchsia-passive = []
 rate-power-evidence-only = []
 full-firmware-production = []
 native-oracle-204-diagnostic = []
+fresh-laa-diagnostic = []
 default = ["fuchsia-passive", "rate-power-evidence-only"]
 
 [dependencies]

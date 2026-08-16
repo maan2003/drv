@@ -11,6 +11,9 @@ sys_root=@sys_root@
 run_root=@run_root@
 var_root=@var_root@
 id_command=@id_command@
+native_client_mac=@native_client_mac@
+session_client_mac=@session_client_mac@
+identity_mode=@identity_mode@
 umask 077
 
 plan=false
@@ -51,7 +54,8 @@ if $plan; then
     echo "durable report directory is not writable by root" >&2
     exit 77
   }
-  printf 'PLAN mode=inert hardware_handoff=false uid=0 privilege_contract=sudo_-n durable_report_dir=%s durable_report_writable=true supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+  printf 'PLAN mode=inert hardware_handoff=false identity_mode=%s native_identity_restore_required=true uid=0 privilege_contract=sudo_-n durable_report_dir=%s durable_report_writable=true supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+    "$identity_mode" \
     "$root" \
     "$(readlink -f "$0")" "$(sha256sum "$(readlink -f "$0")" | cut -d ' ' -f1)" \
     "$wifi_driver_lab" "$(sha256sum "$wifi_driver_lab" | cut -d ' ' -f1)" \
@@ -133,17 +137,17 @@ case $connected_frequency in
 esac
 if [[ $connected_bssid != 72:a6:c7:7d:56:93 \
    || $connected_channel != 36 \
-   || $connected_client_mac != 8a:fd:2a:8b:70:5a ]]; then
+   || $connected_client_mac != "$native_client_mac" ]]; then
   echo "connected Wi-Fi target drifted from fixed ph1 validation policy" >&2
   exit 1
 fi
 export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \
-  DRV_SAE_CLIENT_MAC=$connected_client_mac
+  DRV_SAE_CLIENT_MAC=$session_client_mac
 token=$("$wifi_lab_watchdog" arm) || exit 1
 printf 'START realtime=%s bdf=%s\n' "$start" "$bdf" >> "$timeline"
-printf 'TARGET bssid=%s channel=%s frequency=%s client_mac=%s\n' \
+printf 'TARGET bssid=%s channel=%s frequency=%s native_client_mac=%s session_client_mac=%s identity_mode=%s\n' \
   "$connected_bssid" "$connected_channel" "$connected_frequency" \
-  "$connected_client_mac" >> "$timeline"
+  "$connected_client_mac" "$session_client_mac" "$identity_mode" >> "$timeline"
 sync -f "$timeline"
 
 "$wifi_driver_lab" "$bdf" 300 -- "$@" &
@@ -194,6 +198,7 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
 
   associated_if=""
   ipv4_if=""
+  native_identity_restored=false
   for net in "$sys_root"/class/net/wlan*; do
     [[ -e $net ]] || continue
     name=$(basename "$net")
@@ -202,6 +207,9 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
     carrier=$(cat "$net/carrier" 2>/dev/null || printf 0)
     printf 'WLAN name=%s operstate=%s carrier=%s address=%s\n' \
       "$name" "$operstate" "$carrier" "$address" >> "$timeline"
+    if [[ $(readlink -f "$net/device") == "$device_path" && $address == "$native_client_mac" ]]; then
+      native_identity_restored=true
+    fi
     station=$(timeout 2 iwctl station "$name" show 2>&1)
     station_rc=$?
     printf '%s' "$station" | head -c 2048 | sed 's/^/IWD_STATION /' >> "$timeline" || true
@@ -259,7 +267,7 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
   done
   if ((${#states[@]} == 0)) && ! $unsafe \
     && [[ $driver == mt7921e && $power == D0 && $iwd_active == active ]] \
-    && $association && $dhcp && $default_route && $connectivity; then
+    && $native_identity_restored && $association && $dhcp && $default_route && $connectivity; then
     "$wifi_lab_watchdog" disarm "$token"
     outcome=passed
     reason=none
@@ -283,9 +291,9 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
   sleep 2
 done
 
-printf 'INCOMPLETE realtime=%s wiphy_ready=%s usable_interface_ready=%s association=%s ipv4=%s default_route=%s connectivity=%s association_failure=%s watchdog=armed\n' \
-  "$(date --iso-8601=ns)" "$wiphy_ready" "$interface_ready" "$association" "$dhcp" \
-  "$default_route" "$connectivity" "$association_failure" >> "$timeline"
+printf 'INCOMPLETE realtime=%s wiphy_ready=%s usable_interface_ready=%s native_identity_restored=%s association=%s ipv4=%s default_route=%s connectivity=%s association_failure=%s watchdog=armed\n' \
+  "$(date --iso-8601=ns)" "$wiphy_ready" "$interface_ready" "$native_identity_restored" \
+  "$association" "$dhcp" "$default_route" "$connectivity" "$association_failure" >> "$timeline"
 sync -f "$timeline"
 ((experiment_rc != 0)) && exit "$experiment_rc"
 exit 75

@@ -314,6 +314,7 @@
             MT7921_FUCHSIA_BASE_REVISION = mt7921FuchsiaSource.fuchsiaBaseRevision;
             MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256 = mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256;
             MT7921_FUCHSIA_ORDERED_PATCH_LIST = mt7921FuchsiaSource.fuchsiaOrderedPatchList;
+            session_client_mac = "8a:fd:2a:8b:70:5a";
             preBuild = ''
               ref=reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}
               export MT7921_MATERIALIZED_SOURCE_TREE_SHA256=$(cat "$ref/.drv-materialized-source-tree-sha256")
@@ -361,6 +362,7 @@
                 --subst-var-by credential_file /var/lib/iwd/ph1.psk \
                 --subst-var-by mock_credential_file "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" \
                 --subst-var-by artifact_identity "$out/share/mt7921-full-firmware-validation/artifact-identity.json" \
+                --subst-var-by session_client_mac "$session_client_mac" \
                 --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
@@ -603,6 +605,57 @@
               '';
             });
 
+          mt7921-fresh-laa-diagnostic =
+            mt7921-full-firmware-validation.overrideAttrs (old: {
+              pname = "mt7921-fresh-laa-diagnostic";
+              session_client_mac = "02:7d:91:4c:b8:3e";
+              cargoBuildFlags = [
+                "--no-default-features"
+                "--features"
+                "fuchsia-passive,full-firmware-production,fresh-laa-diagnostic"
+              ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                driver=$out/libexec/mt7921-full-firmware-validation
+                identity=$out/share/mt7921-full-firmware-validation/artifact-identity.json
+                grep -F '"flavor":"fresh-laa-diagnostic"' "$identity"
+                grep -F '"diagnostic_safety_class":"fixed-fresh-laa-stale-ap-state-attribution-only"' "$identity"
+                grep -F '"session_identity_contract":"single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1"' "$identity"
+                grep -F '"session_client_mac":"02:7d:91:4c:b8:3e"' "$identity"
+                "$driver" --self-test-fresh-laa-identity | grep -F '"fresh_laa_identity_self_test":"passed"'
+                grep -F 'DRV_SAE_CLIENT_MAC=02:7d:91:4c:b8:3e' "$out/bin/mt7921-full-firmware-validation"
+                "$driver" --self-test-production-validation | grep -F '"production_validation_self_test":"passed"'
+                MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation" \
+                  | grep -F '"packaged_zero_arg_integration":"passed"'
+                runHook postInstallCheck
+              '';
+            });
+
+          mt7921-fresh-laa-diagnostic-supervisor = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-supervisor"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+                "$out/bin/mt7921-fresh-laa-diagnostic-supervisor" \
+                --subst-var-by runtime_path /run/current-system/sw/bin \
+                --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
+                --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
+                --subst-var-by validation_launcher ${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by artifact_identity ${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
+                --subst-var-by run_root /run --subst-var-by var_root /var \
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 02:7d:91:4c:b8:3e \
+                --subst-var-by identity_mode fixed-fresh-laa-diagnostic
+              chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              grep -F 'native_identity_restored' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              grep -F 'session_client_mac=02:7d:91:4c:b8:3e' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+            '';
+
           mt7921-native-oracle-204-diagnostic-supervisor = pkgs.runCommand
             "mt7921-native-oracle-204-diagnostic-supervisor"
             { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
@@ -617,7 +670,10 @@
                 --subst-var-by artifact_identity ${mt7921-native-oracle-204-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run --subst-var-by var_root /var \
-                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-native-oracle-204-diagnostic-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-native-oracle-204-diagnostic-supervisor"
               grep -F 'native-oracle-204-diagnostic' ${mt7921-native-oracle-204-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json
@@ -738,6 +794,7 @@
                   --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
                   --subst-var-by mock_credential_file "$PWD/work/var/mock-ph1.psk" \
                   --subst-var-by artifact_identity "$PWD/work/var/artifact-identity.json" \
+                  --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
                   --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                   --subst-var-by sed ${pkgs.gnused}/bin/sed \
                   --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
@@ -906,7 +963,10 @@
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
-                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-rate-power-evidence-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-supervisor"
               grep -F '${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence' \
@@ -1019,7 +1079,10 @@
                   --subst-var-by sys_root "$PWD/work/sys" \
                   --subst-var-by run_root "$PWD/work/run" \
                   --subst-var-by var_root "$PWD/work/var" \
-                  --subst-var-by id_command "$id"
+                  --subst-var-by id_command "$id" \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by identity_mode native-handoff
                 chmod 0755 "$output"
               }
               make_supervisor "$PWD/work/bin/id-unprivileged" work/supervisor-unprivileged
@@ -1030,7 +1093,7 @@
 
               make_supervisor "$PWD/work/bin/id-root" work/supervisor-root
               ${pkgs.bash}/bin/bash work/supervisor-root --plan 0000:05:00.0 -- "$launcher" > plan
-              grep -F 'mode=inert hardware_handoff=false uid=0 privilege_contract=sudo_-n' plan
+              grep -F 'mode=inert hardware_handoff=false identity_mode=native-handoff native_identity_restore_required=true uid=0 privilege_contract=sudo_-n' plan
               grep -F 'durable_report_writable=true' plan
               test ! -e transcript
 
@@ -1073,11 +1136,15 @@
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
                 --subst-var-by validation_launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor full-firmware-production \
                 --subst-var-by recovery_samples 45 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
-                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -F 'connected Wi-Fi target drifted from fixed ph1 validation policy' \
@@ -1698,6 +1765,7 @@
                 --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor full-firmware-production \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                 --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                 --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
@@ -1709,6 +1777,83 @@
               grep -F "s/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST=//p" "$out/bin/mt7921-full-firmware-validation-root"
               grep -F "s/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p" "$out/bin/mt7921-full-firmware-validation-root"
               ! grep -F 'SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST' "$out/bin/mt7921-full-firmware-validation-root"
+            '';
+
+          mt7921-fresh-laa-diagnostic-manifest =
+            let closure = pkgs.closureInfo { rootPaths = [ mt7921-fresh-laa-diagnostic mt7921-fresh-laa-diagnostic-supervisor ]; };
+            in pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-manifest"
+            { nativeBuildInputs = [ pkgs.coreutils pkgs.gnused pkgs.gnugrep ]; }
+            ''
+              package=${mt7921-fresh-laa-diagnostic}
+              supervisor=${mt7921-fresh-laa-diagnostic-supervisor}
+              fixture=$package/share/mt7921-full-firmware-validation/production-association-request-self-test.json
+              sed \
+                -e 's|${mt7921-full-firmware-validation}|${mt7921-fresh-laa-diagnostic}|g' \
+                -e 's|${mt7921-full-firmware-validation-supervisor}|${mt7921-fresh-laa-diagnostic-supervisor}|g' \
+                ${mt7921-full-firmware-validation-manifest} > "$out"
+              sed -i \
+                -e 's/^FLAVOR=.*/FLAVOR=fresh-laa-diagnostic/' \
+                -e 's/^TARGET_CLIENT_MAC=.*/TARGET_CLIENT_MAC=02:7d:91:4c:b8:3e/' \
+                -e "s/^LAUNCHER_SHA256=.*/LAUNCHER_SHA256=$(sha256sum $package\/bin\/mt7921-full-firmware-validation | cut -d ' ' -f1)/" \
+                -e "s/^ELF_SHA256=.*/ELF_SHA256=$(sha256sum $package\/bin\/mt7921-full-firmware-validation-driver | cut -d ' ' -f1)/" \
+                -e "s/^ARTIFACT_IDENTITY_SHA256=.*/ARTIFACT_IDENTITY_SHA256=$(sha256sum $package\/share\/mt7921-full-firmware-validation\/artifact-identity.json | cut -d ' ' -f1)/" \
+                -e "s/^SUPERVISOR_SHA256=.*/SUPERVISOR_SHA256=$(sha256sum $supervisor\/bin\/mt7921-fresh-laa-diagnostic-supervisor | cut -d ' ' -f1)/" \
+                -e "s/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=.*/PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum $fixture | cut -d ' ' -f1)/" \
+                "$out"
+              closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
+              sed -i "s/^CLOSURE_SHA256=.*/CLOSURE_SHA256=$closure_sha/" "$out"
+              cat >> "$out" <<'EOF'
+              IDENTITY_MODE=fixed-fresh-laa-diagnostic
+              NATIVE_CLIENT_MAC=8a:fd:2a:8b:70:5a
+              SESSION_IDENTITY_CONTRACT=single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1
+              RECOVERY_IDENTITY_CONTRACT=native-address-required-before-watchdog-disarm
+              EOF
+              grep -Fx 'FLAVOR=fresh-laa-diagnostic' "$out"
+              grep -Fx 'TARGET_CLIENT_MAC=02:7d:91:4c:b8:3e' "$out"
+              grep -Fx 'NATIVE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$out"
+            '';
+
+          mt7921-fresh-laa-diagnostic-root-entry = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-root-entry"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; meta.mainProgram = "mt7921-fresh-laa-diagnostic-root"; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-full-firmware-validation-root.sh} \
+                "$out/bin/mt7921-fresh-laa-diagnostic-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by supervisor ${mt7921-fresh-laa-diagnostic-supervisor}/bin/mt7921-fresh-laa-diagnostic-supervisor \
+                --subst-var-by launcher ${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by manifest ${mt7921-fresh-laa-diagnostic-manifest} \
+                --subst-var-by artifact_identity ${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor fresh-laa-diagnostic \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
+              chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-root"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-fresh-laa-diagnostic-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-fresh-laa-diagnostic-root"
+            '';
+
+          mt7921-fresh-laa-diagnostic-inert-proof = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-inert-proof"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              identity=${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json
+              launcher=${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation
+              supervisor=${mt7921-fresh-laa-diagnostic-supervisor}/bin/mt7921-fresh-laa-diagnostic-supervisor
+              root=${mt7921-fresh-laa-diagnostic-root-entry}/bin/mt7921-fresh-laa-diagnostic-root
+              test "$("$launcher" --artifact-identity)" = "$(cat "$identity")"
+              grep -F 'DRV_SAE_CLIENT_MAC=02:7d:91:4c:b8:3e' "$launcher"
+              grep -F 'identity_mode=fixed-fresh-laa-diagnostic' "$supervisor"
+              grep -F 'native_identity_restored' "$supervisor"
+              grep -F 'hardware_handoff=false' "$supervisor"
+              grep -F '/run/wrappers/bin/sudo -n' "$root"
+              grep -Fx 'RECOVERY_IDENTITY_CONTRACT=native-address-required-before-watchdog-disarm' ${mt7921-fresh-laa-diagnostic-manifest}
+              touch "$out"
             '';
 
           mt7921-validation-flavor-cross-wire-test = pkgs.runCommand
@@ -1736,6 +1881,7 @@
                   --subst-var-by launcher "$launcher" \
                   --subst-var-by manifest "$manifest" \
                   --subst-var-by artifact_identity "$identity" \
+                  --subst-var-by flavor full-firmware-production \
                   --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                   --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                   --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
@@ -2070,6 +2216,7 @@
                   --subst-var-by manifest "$manifest" \
                   --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                   --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor full-firmware-production \
                   --subst-var-by source_identity "$source_identity" \
                   --subst-var-by fuchsia_base_revision ${mt7921FuchsiaSource.fuchsiaBaseRevision} \
                   --subst-var-by fuchsia_patch_set ${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256} \

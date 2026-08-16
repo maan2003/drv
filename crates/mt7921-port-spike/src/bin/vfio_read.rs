@@ -167,6 +167,16 @@ const SIG_ERR: usize = usize::MAX;
 compile_error!(
     "production and native-oracle-204 diagnostic artifact features are mutually exclusive"
 );
+#[cfg(all(
+    feature = "fresh-laa-diagnostic",
+    not(feature = "full-firmware-production")
+))]
+compile_error!("fresh-LAA diagnostic requires the full production protocol implementation");
+#[cfg(all(
+    feature = "fresh-laa-diagnostic",
+    feature = "native-oracle-204-diagnostic"
+))]
+compile_error!("fresh-LAA and native-oracle-204 diagnostic features are mutually exclusive");
 
 const PATCH_PATH: &str =
     "/run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst";
@@ -3656,7 +3666,7 @@ fn run_production_validation_self_test() -> Result<(), String> {
     audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
     audit.before_passive_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
     let add_device = PassiveMcuCommand::AddDevice {
-        mac: [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        mac: fixed_validation_client(),
     };
     audit.before_passive_command(&add_device)?;
     audit.passive_command_completed(&add_device)?;
@@ -3667,17 +3677,17 @@ fn run_production_validation_self_test() -> Result<(), String> {
         b"ph1",
         [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
         36,
-        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        fixed_validation_client(),
         0,
         source,
     )?;
     policy.validate_association(
         [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
         36,
-        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        fixed_validation_client(),
     )?;
     let target = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
-    let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+    let client = fixed_validation_client();
     let management = |control: u16, body: &[u8]| {
         let mut frame = control.to_le_bytes().to_vec();
         frame.extend_from_slice(&[0, 0]);
@@ -3780,8 +3790,7 @@ fn passive_m1_diagnostic_json() -> String {
 
 #[cfg(feature = "fuchsia-passive")]
 fn validate_bss_wire_contract() -> Result<(), String> {
-    let [_, initial] =
-        encode_client_interface_commands([0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a], true, 11, 12)?;
+    let [_, initial] = encode_client_interface_commands(fixed_validation_client(), true, 11, 12)?;
     let associated = encode_client_bss_command(
         7,
         0,
@@ -3895,8 +3904,9 @@ fn run() -> Result<(), String> {
         if env::args().len() != 2 {
             return Err("artifact identity accepts no additional arguments".into());
         }
-        let (flavor, operation, active_capable) = if cfg!(feature = "native-oracle-204-diagnostic")
-        {
+        let (flavor, operation, active_capable) = if cfg!(feature = "fresh-laa-diagnostic") {
+            ("fresh-laa-diagnostic", "run-one-shot-sae-auth", true)
+        } else if cfg!(feature = "native-oracle-204-diagnostic") {
             (
                 "native-oracle-204-diagnostic",
                 "native-oracle-204-diagnostic",
@@ -3925,7 +3935,16 @@ fn run() -> Result<(), String> {
                 capability_source,
                 transformation_contract,
                 diagnostic_safety_class,
-            ) = if cfg!(feature = "native-oracle-204-diagnostic") {
+            ) = if cfg!(feature = "fresh-laa-diagnostic") {
+                (
+                    "mt7921-supported-subset-v2",
+                    "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4",
+                    "input-dependent",
+                    "firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2",
+                    "device+pinned-regdb-authoritative-association-v2",
+                    "fixed-fresh-laa-stale-ap-state-attribution-only",
+                )
+            } else if cfg!(feature = "native-oracle-204-diagnostic") {
                 (
                     "native-oracle-204-diagnostic",
                     "6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755",
@@ -3944,8 +3963,18 @@ fn run() -> Result<(), String> {
                     "normal-production",
                 )
             };
+            let session_identity_contract = if cfg!(feature = "fresh-laa-diagnostic") {
+                "single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1"
+            } else {
+                "native-handoff-vif-identity"
+            };
+            let session_client_mac = if cfg!(feature = "fresh-laa-diagnostic") {
+                "02:7d:91:4c:b8:3e"
+            } else {
+                "8a:fd:2a:8b:70:5a"
+            };
             println!(
-                r#"{{"artifact_identity":"mt7921-validation-v10","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
+                r#"{{"artifact_identity":"mt7921-validation-v10","association_request_contract":"{association_contract}","canonical_association_fixture_sha256":"{canonical_hash}","runtime_association_hash_policy":"{runtime_hash_policy}","association_capability_input_source":"{capability_source}","association_transformation_contract":"{transformation_contract}","diagnostic_safety_class":"{diagnostic_safety_class}","session_identity_contract":"{session_identity_contract}","session_client_mac":"{session_client_mac}","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","flavor":"{flavor}","enabled_operation":"{operation}","observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","join_roc_contract":"linux-mgd-prepare-complete-v1","frame":"none-post-association-public-before-m1","source_identity_sha256":"{}","project_core_source_sha256":"{}","composite_artifact_source_sha256":"{}","fuchsia_base_revision":"{}","fuchsia_ordered_patch_set_sha256":"{}","fuchsia_ordered_patch_list":"{}","materialized_source_tree_sha256":"{}","generated_crate_source_sha256":"{}",{}, {},"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":{active_capable}}}"#,
                 option_env!("MT7921_SOURCE_IDENTITY_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_PROJECT_CORE_SOURCE_SHA256").unwrap_or("unidentified"),
                 option_env!("MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256").unwrap_or("unidentified"),
@@ -3963,6 +3992,51 @@ fn run() -> Result<(), String> {
                 option_env!("MT7921_SOURCE_COMMIT").unwrap_or("unidentified"),
             );
         }
+        return Ok(());
+    }
+    #[cfg(feature = "fuchsia-passive")]
+    if operation_argument.as_deref() == Some("--self-test-fresh-laa-identity") {
+        if env::args().len() != 2 || !cfg!(feature = "fresh-laa-diagnostic") {
+            return Err("fresh-LAA identity self-test requires its diagnostic artifact".into());
+        }
+        let target = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
+        let client = validate_session_identity(ClientVifIdentity(FRESH_DIAGNOSTIC_CLIENT), target)?;
+        for rejected in [NATIVE_VALIDATION_CLIENT, [0; 6], target, [3, 1, 2, 3, 4, 5]] {
+            if validate_session_identity(ClientVifIdentity(rejected), target).is_ok() {
+                return Err("fresh-LAA identity self-test admitted a forbidden identity".into());
+            }
+        }
+        let dev = encode_client_interface_dev_command(client.bytes(), true, 1)?;
+        if !dev.windows(6).any(|window| window == client.bytes()) {
+            return Err("DEV_INFO/MUAR command omitted diagnostic identity".into());
+        }
+        let mut management = vec![0xb0, 0, 0, 0];
+        management.extend_from_slice(&target);
+        management.extend_from_slice(&client.bytes());
+        management.extend_from_slice(&target);
+        management.extend_from_slice(&[0, 0, 3, 0, 1, 0]);
+        let mut gate = ProductionValidationTxGate::new(target, client.bytes());
+        if gate.authorize_public(&management, 1) != Some("sae-authentication")
+            || gate.consume_physical(&management) != Some("sae-authentication")
+        {
+            return Err("management header did not retain diagnostic identity".into());
+        }
+        let mut received = management.clone();
+        received[4..10].copy_from_slice(&client.bytes());
+        received[10..16].copy_from_slice(&target);
+        let classification = classify_client_management_frame(&received, client.bytes(), target);
+        if !classification.addr1_is_client
+            || !classification.addr2_is_peer
+            || !classification.addr3_is_bssid
+        {
+            return Err(
+                "RX local-address classification did not retain diagnostic identity".into(),
+            );
+        }
+        println!(
+            "{}",
+            r#"{"fresh_laa_identity_self_test":"passed","single_source":true,"dev_info_muar":true,"bss_omac":true,"sme_sta_addr":true,"sae_management_headers":true,"rx_local_match":true,"forbidden_native_ap_zero_multicast":true}"#
+        );
         return Ok(());
     }
     #[cfg(all(feature = "fuchsia-passive", feature = "native-oracle-204-diagnostic"))]
@@ -4138,8 +4212,9 @@ fn run() -> Result<(), String> {
         if sha256 != "6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755" {
             return Err("normalized native association fixture hash drifted".into());
         }
-        let raw_runtime = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
+        let mut raw_runtime = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture()
             .map_err(|error| format!("production ClientMlme raw association fixture: {error}"))?;
+        raw_runtime[10..16].copy_from_slice(&fixed_validation_client());
         let canonical_profile = fuchsia_softmac_port::AssociationRequestProfile {
             regulatory: Some(fuchsia_softmac_port::RegulatoryAssociationCapabilities {
                 min_tx_power_dbm: 0,
@@ -4182,7 +4257,7 @@ fn run() -> Result<(), String> {
 
         let nic = NicCapability {
             element_count: 1,
-            mac_address: Some([0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]),
+            mac_address: Some(fixed_validation_client()),
             phy: Some(NicPhyCapability {
                 ht: true,
                 vht: true,
@@ -4273,7 +4348,7 @@ fn run() -> Result<(), String> {
         if runtime[..24] != raw_runtime[..24]
             || runtime[26..28] != raw_runtime[26..28]
             || runtime[4..10] != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
-            || runtime[10..16] != [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]
+            || runtime[10..16] != fixed_validation_client()
             || runtime[16..22] != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
         {
             return Err("production DeviceOps preparation changed target, client, frame-control, sequence, or retry policy".into());
@@ -4304,6 +4379,7 @@ fn run() -> Result<(), String> {
             ));
         }
         let mut normalized_canonical = canonical_runtime.clone();
+        normalized_canonical[10..16].copy_from_slice(&NATIVE_VALIDATION_CLIENT);
         normalized_canonical[22..24].fill(0);
         let canonical_sha256 = sha256_hex(&normalized_canonical);
         if canonical_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"
@@ -4317,6 +4393,7 @@ fn run() -> Result<(), String> {
             ));
         }
         let mut normalized_runtime = runtime.clone();
+        normalized_runtime[10..16].copy_from_slice(&NATIVE_VALIDATION_CLIENT);
         normalized_runtime[22..24].fill(0);
         let runtime_sha256 = sha256_hex(&normalized_runtime);
         if runtime_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4" {
@@ -4408,7 +4485,7 @@ fn run() -> Result<(), String> {
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
             36,
-            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            fixed_validation_client(),
             &frozen,
         )?;
         let consumed_binding = binding.consume(
@@ -4416,7 +4493,7 @@ fn run() -> Result<(), String> {
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
             36,
-            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            fixed_validation_client(),
             &frozen,
         )?;
         let credential_policy_binding = consumed_binding.marker();
@@ -4424,7 +4501,7 @@ fn run() -> Result<(), String> {
         policy.validate_association(
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
             36,
-            [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+            fixed_validation_client(),
         )?;
         let page_evidence = validate_native_rate_power_snapshot(&frozen)?;
         let actual_raw_sha256 = page_evidence
@@ -4748,9 +4825,12 @@ fn run() -> Result<(), String> {
         ) {
             return Err("DRV_SAE_CHANNEL is unsupported".into());
         }
-        let client = parse_client_mac(
-            &env::var("DRV_SAE_CLIENT_MAC")
-                .map_err(|_| "DRV_SAE_CLIENT_MAC is required for power setup")?,
+        let client = validate_session_identity(
+            parse_client_mac(
+                &env::var("DRV_SAE_CLIENT_MAC")
+                    .map_err(|_| "DRV_SAE_CLIENT_MAC is required for power setup")?,
+            )?,
+            bssid,
         )?;
         if !packaged_integration {
             verify_no_usable_mt792x_acpi_sar()?;
@@ -4759,6 +4839,19 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    #[cfg(feature = "fuchsia-passive")]
+    if cfg!(feature = "fresh-laa-diagnostic") && operation == Operation::RunOneShotSaeAuth {
+        let target = power_target.as_ref().expect("fresh-LAA target");
+        record_sae_root_only_stage(&format!(
+            "session_identity mode=fixed-fresh-laa-diagnostic mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} native_mac_rejected=true ap_mac_rejected=true single_typed_source=true",
+            target.3.bytes()[0],
+            target.3.bytes()[1],
+            target.3.bytes()[2],
+            target.3.bytes()[3],
+            target.3.bytes()[4],
+            target.3.bytes()[5],
+        ));
+    }
     #[cfg(feature = "fuchsia-passive")]
     let rate_power_snapshot = matches!(
         operation,
@@ -7109,6 +7202,13 @@ fn run() -> Result<(), String> {
                                             record_sae_stage(
                                                 "client_interface_programmed omac=0 bss=0 wcid=19 identity_match=true",
                                             );
+                                            if cfg!(feature = "fresh-laa-diagnostic") {
+                                                let mac = client.bytes();
+                                                record_sae_root_only_stage(&format!(
+                                                    "session_identity_bound mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} dev_info_muar=true bss_omac0=true sme_query_sta_addr=true sae_peer_calculation=true management_tx_gate=true rx_local_match=true",
+                                                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                                ));
+                                            }
                                             acquire_sae_tx_resources(
                                                 iommu,
                                                 ioas.id(),
@@ -13032,7 +13132,7 @@ impl ProductionValidationPolicy {
         if ssid != b"ph1"
             || bssid != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
             || channel != 36
-            || client != [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]
+            || client != fixed_validation_client()
             || regulatory_generation != 0
             || regulatory_source_sha256 != authoritative_source
         {
@@ -13847,7 +13947,7 @@ fn is_anchored_eapol_data(bytes: &[u8]) -> bool {
 fn is_pinned_target_authenticator_m1(bytes: &[u8]) -> bool {
     let classification = classify_client_data_frame(
         bytes,
-        [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
+        fixed_validation_client(),
         [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
     );
     classification.frame_type == 2
@@ -18149,6 +18249,20 @@ fn parse_mac(value: &str) -> Result<[u8; 6], String> {
 struct ClientVifIdentity([u8; 6]);
 
 #[cfg(feature = "fuchsia-passive")]
+const NATIVE_VALIDATION_CLIENT: [u8; 6] = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+#[cfg(feature = "fuchsia-passive")]
+const FRESH_DIAGNOSTIC_CLIENT: [u8; 6] = [0x02, 0x7d, 0x91, 0x4c, 0xb8, 0x3e];
+
+#[cfg(feature = "fuchsia-passive")]
+const fn fixed_validation_client() -> [u8; 6] {
+    if cfg!(feature = "fresh-laa-diagnostic") {
+        FRESH_DIAGNOSTIC_CLIENT
+    } else {
+        NATIVE_VALIDATION_CLIENT
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 impl ClientVifIdentity {
     const fn bytes(self) -> [u8; 6] {
         self.0
@@ -18162,6 +18276,25 @@ fn parse_client_mac(value: &str) -> Result<ClientVifIdentity, String> {
         return Err("client MAC must be a locally administered unicast address".into());
     }
     Ok(ClientVifIdentity(address))
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_session_identity(
+    identity: ClientVifIdentity,
+    bssid: [u8; 6],
+) -> Result<ClientVifIdentity, String> {
+    let address = identity.bytes();
+    if address == [0; 6] || address[0] & 3 != 2 || address == bssid {
+        return Err("session identity must be nonzero local unicast and differ from AP".into());
+    }
+    if cfg!(feature = "fresh-laa-diagnostic") {
+        if address != FRESH_DIAGNOSTIC_CLIENT || address == NATIVE_VALIDATION_CLIENT {
+            return Err("fresh-LAA diagnostic identity is not the compiled fixed identity".into());
+        }
+    } else if address != NATIVE_VALIDATION_CLIENT {
+        return Err("production session identity drifted from native handoff identity".into());
+    }
+    Ok(identity)
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -23504,6 +23637,7 @@ mod tests {
             "driver == mt7921e",
             "power == D0",
             "iwd_active == active",
+            "$native_identity_restored",
             "$association && $dhcp && $default_route && $connectivity",
         ] {
             assert!(recovered.contains(proof), "{proof}");
@@ -23532,7 +23666,8 @@ mod tests {
         assert!(derive < iw && iw < address && address < export && export < handoff);
         assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));
         assert!(supervisor.contains("target Wi-Fi interface is not connected"));
-        assert!(supervisor.contains("DRV_SAE_CLIENT_MAC=$connected_client_mac"));
+        assert!(supervisor.contains("DRV_SAE_CLIENT_MAC=$session_client_mac"));
+        assert!(supervisor.contains("connected_client_mac != \"$native_client_mac\""));
         assert!(supervisor.contains("local unicast VIF address"));
         let pre_handoff = &supervisor[..handoff];
         for forbidden in ["passphrase", "password", ".psk", "/var/lib/iwd"] {

@@ -11,7 +11,7 @@ case "$#:${1-}" in
 esac
 
 @sha256sum@ @manifest@ >/dev/null
-@grep@ -Fx 'FLAVOR=full-firmware-production' @manifest@ >/dev/null
+@grep@ -Fx 'FLAVOR=@flavor@' @manifest@ >/dev/null
 @grep@ -Fx 'ACTIVE_CAPABLE=true' @manifest@ >/dev/null
 @grep@ -Fx 'OBSERVATION_MODE=passive-m1-observation' @manifest@ >/dev/null
 @grep@ -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' @manifest@ >/dev/null
@@ -111,7 +111,7 @@ fixture=$(@sed@ -n 's/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST=//p' @manifest@)
 fixture_sha=$(@sed@ -n 's/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p' @manifest@)
 test -s "$fixture"
 test "$(@sha256sum@ "$fixture" | @cut@ -d ' ' -f1)" = "$fixture_sha"
-printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=%s supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=%s\n' \
+printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=%s supervisor=%s launcher=%s flavor=@flavor@ active_capable=true bdf=0000:05:00.0 mode=%s\n' \
   @manifest@ "$(@sha256sum@ @manifest@ | @cut@ -d ' ' -f1)" \
   @supervisor@ @launcher@ "${operation:---active}"
 if [ -n "$operation" ]; then
