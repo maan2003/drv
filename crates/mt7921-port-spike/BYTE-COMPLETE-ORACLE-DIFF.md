@@ -472,7 +472,7 @@ inactive/non-failed watchdog; a WLAN default route; and successful HTTPS.
 ## Chronological hidden firmware-context audit: post-CLC FWLOG (2026-08-16)
 
 The corrected native oracle report `/tmp/native-150155.log` (SHA-256
-`02f920fbc26aa54179f2d29b5d1952e4cced87621d1136c68c6dc3a6bf194387`)
+`02f920fcbccf87f59ca2c54634cddf5185219e03ace517047d071f8f2d876059`)
 contains 1,836 `MT76_ORACLE` records. Reading it chronologically, rather than
 starting at preauthentication, proves the following boundary:
 
