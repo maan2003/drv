@@ -536,3 +536,34 @@ native-ready status 0. `mt7921e` is rebound in PCI D0, iwd is active, the
 watchdog is inactive/non-failed, the WLAN default route is present, and HTTPS
 succeeds. The corrected, locally build-validated artifact was not subjected to
 another hardware invocation because that would violate the three-run ceiling.
+
+### Contiguous native post-FWLOG prefix campaign
+
+The known contiguous prefix is now complete: FWLOG sequence 14 (no response),
+EEPROM_BUFFER_MODE sequence 15 (ACK, 68 bytes, payload `01000000`), PROTECT
+sequence 1 (ACK, 76 bytes, payload `010000002b09000002000000`), the repeated
+CLC rule sequence 2 (response), then channel-domain sequence 3 (39 channels,
+publication completion). The three guarded runs reproduced this exact order
+and reached peer/association processing. This is an ordering correction, not
+a causal claim.
+
+All runs retained the same WTBL transition: initial-peer and preauth-BSS
+`CHANGE_BW_RATE=0`; full preauth CID-3 produced DW5 `0x32000040` and
+`CHANGE_BW_RATE=2`; successful associated CID-3 produced `0x32000827` and
+`CHANGE_BW_RATE=1`. Run one handled a status-30 comeback and then associated
+successfully with AID 9; runs two and three associated successfully with AIDs
+6 and 2. All emitted the 232-byte `e2e81_sta_rec_transcript`. None admitted
+authenticator M1: run one observed one non-EAPOL client frame, while runs two
+and three saw no M1-window RX DMA activity. The reports are:
+
+- `20260816T060926Z-0000_05_00.0.log`, SHA-256
+  `0407d7fdc23ece89089f2db3a82844c43ecab86996bac204508305e35b37a882`
+- `20260816T061045Z-0000_05_00.0.log`, SHA-256
+  `3abfee8c12503e1584deab8eb888515a463b81c82bae6864b7f2de51110a56b6`
+- `20260816T061203Z-0000_05_00.0.log`, SHA-256
+  `2984c5b5925d2e825854e0933dc7698403081d938e50d1759713c25b8097cf08`
+
+There was no fourth invocation. Every report ends `RESTORE end failed=0`.
+Final helper results are idle=true (status 0), quarantined=false (status 1),
+and native-ready=true (status 0); iwd is active, the watchdog inactive and
+non-failed, `mt7921e` is bound in D0, and route/HTTPS checks pass.
