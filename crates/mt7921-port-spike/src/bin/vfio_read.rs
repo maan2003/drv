@@ -11648,6 +11648,8 @@ fn run_rate_power_evidence_operation(
     if !power_authorizer.permits(&authorization) {
         return Err("rate-power authorization is not live".into());
     }
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
+    issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
     issue_rate_power_evidence_command(mechanics, PassiveMcuCommand::AddDevice { mac })?;
     println!(
         "{}",
