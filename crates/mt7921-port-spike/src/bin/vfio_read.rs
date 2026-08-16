@@ -44,11 +44,12 @@ use mt7921_port_spike::{
     encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
     encode_passive_mcu_command, encode_ptk_command, encode_regulatory_rate_tx_power_commands,
     encode_remove_wcid_command, linux_legacy_rate_context_reference,
-    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
-    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    narrow_regulatory_rate_power_snapshot, parse_client_join_roc_grant, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
+    linux_preauth_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
+    load_mt7921_firmware_with_passive_boundary, narrow_regulatory_rate_power_snapshot,
+    parse_client_join_roc_grant, parse_connac2_rx_frame, parse_passive_advertisement,
+    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
+    passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
     regulatory_rate_power_snapshot_from_regdb_v20, set_client_txwi_wcid,
     validate_passive_mac_bar_read,
 };
@@ -221,6 +222,24 @@ fn client_dtim_period(ies: &[u8]) -> Result<u8, String> {
         offset = end;
     }
     Err("target beacon omitted TIM DTIM period".into())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn client_preauth_rates(ies: &[u8], local_rates: &[u8]) -> Result<(u16, u16), String> {
+    let mut peer_rates = Vec::new();
+    let mut offset = 0;
+    while offset + 2 <= ies.len() {
+        let len = usize::from(ies[offset + 1]);
+        let end = offset + 2 + len;
+        if end > ies.len() {
+            return Err("target beacon IE stream is truncated".into());
+        }
+        if matches!(ies[offset], 1 | 50) {
+            peer_rates.extend_from_slice(&ies[offset + 2..end]);
+        }
+        offset = end;
+    }
+    linux_preauth_rate_context_reference(1, local_rates, &peer_rates)
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -2412,9 +2431,16 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let expected_initial =
         mt7921_port_spike::encode_initial_peer_wcid_command(1, 0, peer_wcid.get(), peer)
             .map_err(|error| format!("self-test initial peer fixture: {error}"))?;
-    let expected_preauth =
-        mt7921_port_spike::encode_preauth_peer_wcid_command(2, 0, peer_wcid.get(), peer, 100)
-            .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
+    let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
+        2,
+        0,
+        peer_wcid.get(),
+        peer,
+        100,
+        association.basic_rates,
+        association.legacy_rates,
+    )
+    .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
     let expected_bss = encode_client_bss_command(3, 0, peer, 36, 100, 2, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(
@@ -3222,12 +3248,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         validation_complete: false,
         ..LiveClientState::default()
     }));
-    let effects = LiveClientEffects {
+    let mut effects = LiveClientEffects {
         state: Arc::clone(&shared),
         target: peer,
         client,
         rcpi: 100,
         dtim_period: 2,
+        preauth_rates: Some((0x0015, 0x3fc0)),
         firmware: ClientFirmwareEffectsState::default(),
         peer_wcid: None,
         join_roc_generation: None,
@@ -6957,7 +6984,7 @@ fn run() -> Result<(), String> {
                                                 as u8
                                         })
                                         .ok_or("target BSS was not retained")?;
-                                    let effects = LiveClientEffects {
+                                    let mut effects = LiveClientEffects {
                                         state: shared.clone(),
                                         target: power_target.as_ref().expect("SAE target").0,
                                         client: power_target
@@ -6972,6 +6999,7 @@ fn run() -> Result<(), String> {
                                                 .ok_or("target BSS was not retained")?
                                                 .ies,
                                         )?,
+                                        preauth_rates: Some((0x0015, 0x3fc0)),
                                         firmware: ClientFirmwareEffectsState::default(),
                                         peer_wcid: None,
                                         join_roc_generation: None,
@@ -7007,6 +7035,26 @@ fn run() -> Result<(), String> {
                                             ).map_err(|_| "build pinned-regdb production association profile failed")?,
                                         );
                                     }
+                                    let local_rates = support
+                                        .query
+                                        .band_caps
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .find(|band| {
+                                            band.band == Some(fidl_ieee80211::WlanBand::FiveGhz)
+                                        })
+                                        .and_then(|band| band.basic_rates.as_deref())
+                                        .ok_or(
+                                            "selected local 5 GHz band omitted supported rates",
+                                        )?;
+                                    effects.preauth_rates = Some(client_preauth_rates(
+                                        &target_bss
+                                            .as_ref()
+                                            .ok_or("target BSS was not retained")?
+                                            .ies,
+                                        local_rates,
+                                    )?);
                                     let device_info = wlan_mlme::mlme_device_info_from_softmac(
                                         support.query.clone(),
                                     )
@@ -13693,6 +13741,7 @@ struct LiveClientEffects {
     client: [u8; 6],
     rcpi: u8,
     dtim_period: u8,
+    preauth_rates: Option<(u16, u16)>,
     firmware: ClientFirmwareEffectsState,
     peer_wcid: Option<ClientWcid>,
     join_roc_generation: Option<u64>,
@@ -14236,8 +14285,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
                             aid: 0,
                             peer: self.target,
                             rcpi: self.rcpi,
-                            basic_rates: 1,
-                            legacy_rates: 0x40,
+                            basic_rates: self.preauth_rates.ok_or(zx::Status::BAD_STATE)?.0,
+                            legacy_rates: self.preauth_rates.ok_or(zx::Status::BAD_STATE)?.1,
                             ht_cap: None,
                             vht_cap: None,
                             bandwidth: 0,
@@ -19690,6 +19739,7 @@ mod tests {
             client,
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -20397,6 +20447,15 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn preauth_rates_decode_both_beacon_ies_and_intersect_local_band() {
+        let ies = [1, 4, 0x8c, 0x12, 0x98, 0x24, 50, 4, 0xb0, 0x48, 0x60, 0x6c];
+        let local = [0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+        assert_eq!(client_preauth_rates(&ies, &local), Ok((0x0015, 0x3fc0)));
+        assert!(client_preauth_rates(&[1, 9, 0x8c], &local).is_err());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn live_support_satisfies_pinned_device_info_contract() {
         let capability = mt7921_port_spike::NicCapability {
             element_count: 1,
@@ -20528,6 +20587,8 @@ mod tests {
             7,
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             100,
+            1,
+            0x40,
         )
         .unwrap();
         assert_eq!(preauth[65], 0);
@@ -21000,6 +21061,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -21146,6 +21208,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -21585,6 +21648,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -21972,6 +22036,7 @@ mod tests {
             client: [6, 5, 4, 3, 2, 1],
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -22043,6 +22108,7 @@ mod tests {
             client,
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -22139,6 +22205,7 @@ mod tests {
             client,
             rcpi: 100,
             dtim_period: 2,
+            preauth_rates: Some((0x0015, 0x3fc0)),
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
@@ -26147,12 +26214,13 @@ mod tests {
             )
             .unwrap();
             let shared = Arc::new(Mutex::new(selected_live_state(peer, physical)));
-            let effects = LiveClientEffects {
+            let mut effects = LiveClientEffects {
                 state: Arc::clone(&shared),
                 target: peer,
                 client,
                 rcpi: 100,
                 dtim_period: 2,
+                preauth_rates: Some((0x0015, 0x3fc0)),
                 firmware: ClientFirmwareEffectsState::default(),
                 peer_wcid: None,
                 join_roc_generation: None,

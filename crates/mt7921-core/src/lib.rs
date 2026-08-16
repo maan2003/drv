@@ -6022,9 +6022,22 @@ pub fn encode_preauth_peer_wcid_command(
     wcid: u8,
     peer: [u8; 6],
     rcpi: u8,
+    basic_rates: u16,
+    legacy_rates: u16,
 ) -> Result<Vec<u8>, String> {
     encode_legacy_wme_wcid_command(
-        sequence, bss_index, wcid, 0, peer, rcpi, 1, 0x40, None, None, 0, false,
+        sequence,
+        bss_index,
+        wcid,
+        0,
+        peer,
+        rcpi,
+        basic_rates,
+        legacy_rates,
+        None,
+        None,
+        0,
+        false,
     )
 }
 
@@ -6210,6 +6223,25 @@ pub fn linux_legacy_rate_context_reference(
         supported << 6
     };
     Ok((basic, legacy))
+}
+
+/// Build Linux's preauthentication PHY/RA rate context from the selected
+/// local band and the peer's Supported/Extended Supported Rates IEs.
+pub fn linux_preauth_rate_context_reference(
+    band: u8,
+    local_encoded_rates: &[u8],
+    peer_encoded_rates: &[u8],
+) -> Result<(u16, u16), String> {
+    let mut negotiated = Vec::new();
+    for peer in peer_encoded_rates {
+        if local_encoded_rates
+            .iter()
+            .any(|local| local & 0x7f == peer & 0x7f)
+        {
+            negotiated.push(*peer);
+        }
+    }
+    linux_legacy_rate_context_reference(band, &negotiated)
 }
 
 /// Linux v7.1 `mt76_connac_mcu_uni_add_bss` station BASIC+QBSS request.
@@ -7265,6 +7297,8 @@ impl ClientFirmwareEffectsState {
             peer.peer_wcid.get(),
             peer.peer,
             peer.rcpi,
+            peer.basic_rates,
+            peer.legacy_rates,
         )?;
         self.firmware_uncertain = true;
         let result = submit(3, &initial).and_then(|()| submit(3, &command));
@@ -10600,29 +10634,41 @@ mod tests {
 
     #[test]
     fn independent_linux_five_ghz_rate_context_exposes_legacy_fixture_divergence() {
-        let rates = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
-        let (basic, legacy) = linux_legacy_rate_context_reference(1, &rates).unwrap();
+        let local = [0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+        let peer = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
+        let (basic, legacy) = linux_preauth_rate_context_reference(1, &local, &peer).unwrap();
         assert_eq!(basic, 0x15);
         assert_eq!(legacy, 0x3fc0);
 
-        let encoded = encode_legacy_wme_add_wcid_command(
+        let encoded = encode_preauth_peer_wcid_command(
             9,
             0,
             7,
-            42,
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             100,
             basic,
             legacy,
-            None,
-            None,
-            0,
         )
         .unwrap();
+        // STA_REC_PHY tag 0x0015 and phy_type OFDM (0x08) never diverged;
+        // the little-endian basic bitmap and RA legacy bitmap did.
+        assert_eq!(
+            &encoded[76..100],
+            &[
+                0x15, 0, 0x0c, 0, 0x15, 0, 0x08, 0, 0, 100, 0, 0, 0x01, 0, 0x10, 0, 0xc0, 0x3f, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
         assert_eq!(&encoded[80..82], &[0x15, 0]);
+        assert_eq!(encoded[82], 0x08);
         assert_eq!(&encoded[92..94], &[0xc0, 0x3f]);
         assert_ne!(&encoded[80..82], &[1, 0]);
         assert_ne!(&encoded[92..94], &[0x40, 0]);
+
+        let local_without_9_mbps = [0x0c, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+        let (_, filtered) =
+            linux_preauth_rate_context_reference(1, &local_without_9_mbps, &peer).unwrap();
+        assert_eq!(filtered, 0x3f40);
     }
 
     #[test]
