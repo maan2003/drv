@@ -51,6 +51,8 @@ let
     "wlan-mlme-host-fixture.patch"
     "wlan-mlme-sae-terminal-retry-host.patch"
     "wlan-sme-passive-observation-timeout-host.patch"
+    "wlan-rsn-rsnxe-m2-host.patch"
+    "wlan-sme-rsnxe-m2-host.patch"
   ];
   patchRows = map (file: {
     name = builtins.baseNameOf file;

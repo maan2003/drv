@@ -112,6 +112,7 @@ pub struct BoundedNetstackProof {
     now: Duration,
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
+    tx_dropped: u64,
 }
 
 impl BoundedNetstackProof {
@@ -142,6 +143,7 @@ impl BoundedNetstackProof {
             now: Duration::ZERO,
             resolved: None,
             socket: None,
+            tx_dropped: 0,
         })
     }
 
@@ -164,11 +166,31 @@ impl BoundedNetstackProof {
             }
             self.runner.stack_mut().poll_at(self.now, 64);
             while self.runner.pump().transmitted != 0 {}
-            while self
-                .tx
-                .pump_one(target)
-                .map_err(|_| "associated data TX failed")?
-            {}
+            loop {
+                match self.tx.pump_one(target) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(EthernetTxPumpError::Target(_)) => {
+                        // The MAC could not deliver this frame (for example fifteen
+                        // unacknowledged attempts); it is dropped like on any NIC and
+                        // the netstack retransmits at its own cadence.
+                        self.tx_dropped += 1;
+                        println!(
+                            "client_data_tx_error stage=ethernet_pump kind=target_rejected dropped_total={}",
+                            self.tx_dropped
+                        );
+                    }
+                    Err(error) => {
+                        let kind = match error {
+                            EthernetTxPumpError::Closed => "closed",
+                            EthernetTxPumpError::LinkDown => "link_down",
+                            EthernetTxPumpError::Target(_) => "target_rejected",
+                        };
+                        println!("client_data_tx_error stage=ethernet_pump kind={kind}");
+                        return Err("associated data TX failed");
+                    }
+                }
+            }
             while target
                 .pump_receive(deadline)
                 .map_err(|_| "associated data RX failed")?
@@ -368,7 +390,11 @@ impl Mt7921EthernetTx {
         };
         let Some(frame) = frame else { return Ok(false) };
         if let Err(error) = target.transmit_ethernet(frame.as_bytes()) {
-            self.state.lock().unwrap().egress.push_front(frame);
+            // The frame is consumed even when the MAC rejects it: retrying the same
+            // frame forever would wedge the egress queue behind one undeliverable
+            // packet, whereas dropping it lets the netstack's own retransmission
+            // timers decide what to send next.
+            push_event(&mut self.state.lock().unwrap(), EthernetDeviceEvent::TransmitReady);
             return Err(EthernetTxPumpError::Target(error));
         }
         push_event(

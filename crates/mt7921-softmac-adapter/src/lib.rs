@@ -18,7 +18,7 @@ use fuchsia_softmac_port::{
     WlanSoftmacQueryResponse, construct_bss_description,
 };
 use mt7921_port_spike::{
-    CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
+    CandidateChannel, ChannelSwitchReason, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
     RegulatoryRatePowerSnapshot, SarFrequencyRange, candidate_channels as capability_channels,
     conservative_channel_domain, encode_passive_mcu_command,
@@ -176,6 +176,16 @@ pub trait Mt7921PassiveTransport {
         }
         self.set_channel(context.channel)
     }
+    /// Linux `mt7921_set_channel`: CHANNEL_SWITCH with `CH_SWITCH_NORMAL` on
+    /// the association chandef, issued before the JOIN ROC so the radio is
+    /// calibrated for the connected channel instead of staying in the scan
+    /// (`CH_SWITCH_SCAN_BYPASS_DPD`) form.
+    fn establish_client_channel(
+        &mut self,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error>;
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error>;
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error>;
@@ -233,6 +243,28 @@ pub struct PhysicalChannelContext {
     pub center_channel: u8,
     pub bandwidth: u8,
     pub center_channel2: u8,
+    pub switch_reason: ChannelSwitchReason,
+}
+
+/// Linux `ieee80211_channel_to_frequency` for the bands MT7921 serves; the
+/// client channel carries only band and number.
+pub fn client_channel_candidate(
+    channel: mt7921_port_spike::ClientPhysicalChannel,
+) -> Option<CandidateChannel> {
+    let number = channel.primary;
+    match channel.band {
+        0 if (1..=14).contains(&number) => Some(CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz2,
+            number,
+            frequency_mhz: if number == 14 { 2484 } else { 2407 + 5 * number },
+        }),
+        1 if (36..=177).contains(&number) => Some(CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz5,
+            number,
+            frequency_mhz: 5000 + 5 * number,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,6 +431,16 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         })
     }
 
+    /// Override the interface MAC published by DEV_INFO_ACTIVE during
+    /// initialization. Linux programs DEV_INFO exactly once per interface-up
+    /// with the interface address mac80211 was given, so a client session
+    /// must present its own identity here rather than the EEPROM address;
+    /// firmware keeps the first address it saw in the RMAC own-MAC table.
+    pub fn with_interface_mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac = mac;
+        self
+    }
+
     pub fn into_mechanics(self) -> M {
         self.mechanics
     }
@@ -491,6 +533,23 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         self.mechanics
             .acquire_client_join_roc(channel, generation, duration_ms)
     }
+    fn establish_client_channel(
+        &mut self,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        let candidate = client_channel_candidate(channel).ok_or(zx::Status::INVALID_ARGS)?;
+        if channel.center > u16::from(u8::MAX) || channel.center2 > u16::from(u8::MAX) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        self.set_channel_context(PhysicalChannelContext {
+            channel: candidate,
+            center_channel: channel.center as u8,
+            bandwidth: channel.bandwidth,
+            center_channel2: channel.center2 as u8,
+            switch_reason: ChannelSwitchReason::Normal,
+        })
+        .map_err(|_| zx::Status::IO)
+    }
     fn client_join_roc_active(&mut self, generation: u64) -> bool {
         self.mechanics.client_join_roc_active(generation)
     }
@@ -525,6 +584,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             center_channel: channel.number as u8,
             bandwidth: 0,
             center_channel2: 0,
+            switch_reason: ChannelSwitchReason::ScanBypassDpd,
         })
     }
 
@@ -567,6 +627,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             bandwidth: context.bandwidth,
             center_channel2: context.center_channel2,
             antenna_mask: self.antenna_mask,
+            switch_reason: context.switch_reason,
         })?;
         self.selected = Some(channel);
         Ok(())
@@ -689,6 +750,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                         bandwidth: 0,
                         center_channel2: 0,
                         antenna_mask: self.antenna_mask,
+                        switch_reason: ChannelSwitchReason::ScanBypassDpd,
                     })?;
                     self.selected = Some(channel);
                     self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
@@ -973,6 +1035,10 @@ impl<T: Mt7921PassiveTransport> SoftmacHardware for Mt7921SoftmacAdapter<T> {
                 center_channel: shape.center_channel,
                 bandwidth: shape.bandwidth,
                 center_channel2: shape.center_channel2,
+                // Linux mt7921_config -> mt7921_set_channel: the configured
+                // (operating) chandef is switched with CH_SWITCH_NORMAL; only
+                // the scan-driven switches use CH_SWITCH_SCAN_BYPASS_DPD.
+                switch_reason: ChannelSwitchReason::Normal,
             })
             .map_err(|error| self.transport_failure(error))?;
         Ok(())

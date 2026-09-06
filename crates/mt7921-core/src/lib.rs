@@ -1620,6 +1620,12 @@ pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
 pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
 pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
 pub const MT7921_RX_RING_SLOTS: usize = 8;
+/// Associated-client data RX ring (WFDMA RX ring 2).  Linux sizes
+/// `MT_RXQ_MAIN` at 1536 entries; eight entries (the pre-firmware MCU
+/// response shape) overflowed as soon as the AP answered DHCP while the host
+/// was waiting synchronously on a TX completion, and the firmware silently
+/// dropped frames it had already acknowledged on air.
+pub const MT7921_DATA_RX_RING_COUNT: usize = 64;
 pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1662,6 +1668,38 @@ pub fn prepare_mcu_rx_ring(
         descriptors,
         producer_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
     })
+}
+
+/// Data RX ring descriptors: the MCU ring layout (2048-byte buffers, one
+/// vacant slot so producer and consumer never alias full) at
+/// `MT7921_DATA_RX_RING_COUNT` entries.
+pub fn prepare_data_rx_ring(
+    ring_iova: u64,
+    buffers_iova: u64,
+) -> Result<Vec<DmaDescriptor>, DescriptorError> {
+    let count = MT7921_DATA_RX_RING_COUNT;
+    let ring_bytes = (count * 16).next_multiple_of(4096) as u64;
+    let buffers_bytes = (count * MT7921_MCU_RX_BUFFER_BYTES) as u64;
+    if !ring_iova.is_multiple_of(4096)
+        || !buffers_iova.is_multiple_of(4096)
+        || ring_iova
+            .checked_add(ring_bytes - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || buffers_iova
+            .checked_add(buffers_bytes - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || (ring_iova < buffers_iova + buffers_bytes && buffers_iova < ring_iova + ring_bytes)
+    {
+        return Err(DescriptorError::InvalidArena);
+    }
+    let mut descriptors = vec![DmaDescriptor::reset(); count];
+    for (index, descriptor) in descriptors.iter_mut().enumerate().take(count - 1) {
+        *descriptor = mt7921_dma_rx(DmaSegment {
+            iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
+            len: MT7921_MCU_RX_BUFFER_BYTES as u16,
+        })?;
+    }
+    Ok(descriptors)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2627,6 +2665,18 @@ pub fn encode_channel_domain_command(
     Ok(bytes)
 }
 
+/// `switch_reason` of Linux `mt7921_mcu_set_chan_info`.
+///
+/// `CH_SWITCH_SCAN_BYPASS_DPD` (9) is the off-channel/scan form; the connected
+/// chandef is programmed by `mt7921_set_channel` with `CH_SWITCH_NORMAL` (0),
+/// which is also what runs the per-channel calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ChannelSwitchReason {
+    Normal = 0,
+    ScanBypassDpd = 9,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PassiveMcuCommand {
     EepromBufferMode,
@@ -2645,6 +2695,7 @@ pub enum PassiveMcuCommand {
         bandwidth: u8,
         center_channel2: u8,
         antenna_mask: u8,
+        switch_reason: ChannelSwitchReason,
     },
     AddDevice {
         mac: [u8; 6],
@@ -3015,6 +3066,7 @@ pub fn encode_passive_mcu_command(
             bandwidth,
             center_channel2,
             antenna_mask,
+            switch_reason,
         } => encode_legacy_mcu(
             0xed,
             0x08,
@@ -3024,7 +3076,7 @@ pub fn encode_passive_mcu_command(
                 *bandwidth,
                 *center_channel2,
                 *antenna_mask,
-                9,
+                *switch_reason as u8,
                 true,
             )?,
             sequence,
@@ -6185,6 +6237,25 @@ pub fn encode_client_post_assoc_beacon_timing_command(
     Ok(encode_uni_mcu(2, &body, sequence))
 }
 
+/// Linux `mt7921_mcu_uni_bss_ps` (`UNI_BSS_INFO_PS`, tag 21): `ps_state` 0 keeps
+/// the device awake, 2 is firmware dynamic power saving (mac80211's default
+/// `vif->cfg.ps`). Our host has no power-save policy, so the associated BSS is
+/// pinned awake like Linux with `power_save off`.
+pub fn encode_client_post_assoc_power_state_command(
+    sequence: u8,
+    bss_index: u8,
+    ps_state: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || ps_state > 4 {
+        return Err("post-association power state is invalid".into());
+    }
+    let mut body = vec![0u8; 12];
+    body[0] = bss_index;
+    body[4..8].copy_from_slice(&[21, 0, 8, 0]);
+    body[8] = ps_state;
+    Ok(encode_uni_mcu(2, &body, sequence))
+}
+
 /// Linux `mt7921_mcu_set_rxfilter(..., BIT_SET,
 /// MT_WF_RFCR_DROP_OTHER_BEACON)`. CE SET_RX_FILTER has no firmware ACK;
 /// successful publication means transport DMA ownership was consumed.
@@ -6989,9 +7060,16 @@ pub fn encode_client_data_txwi(
         if !protected {
             return Err("normal client data requires PTK protection".into());
         }
+        // Linux mt7921 advertises SUPPORTS_TX_ENCAP_OFFLOAD, so associated
+        // data reaches the firmware as an 802.3 frame and
+        // `mt76_connac2_mac_write_txwi_8023` describes it: HDR_FORMAT 802.3,
+        // ETH_802_3, the QoS TID, QoS-data type/subtype, hardware rate
+        // control (no FIX_RATE) and PROTECT_FRAME for the WTBL PTK.  The
+        // payload must therefore be the header-translated Ethernet frame from
+        // `client_data_mpdu_to_ethernet`, never the 802.11 MPDU.
         [
             0x0200_0000 | (payload_len as u32 + 32),
-            0x8000_8007,
+            0x8000_8007 | (u32::from(tid) << 20),
             0x0000_0028,
             0x0000_7802,
             0,
@@ -7007,6 +7085,43 @@ pub fn encode_client_data_txwi(
     bytes[40..44].copy_from_slice(&(payload_iova as u32).to_le_bytes());
     bytes[44..46].copy_from_slice(&((payload_len as u16) | 0x8000).to_le_bytes());
     Ok(bytes)
+}
+
+/// Reverse of the MLME's RFC 1042 encapsulation for hardware TX header
+/// translation.  Linux hands mt7921 802.3 frames for associated data
+/// (`SUPPORTS_TX_ENCAP_OFFLOAD`), and the firmware builds the 802.11 header,
+/// sequence number and CCMP header itself; a raw 802.11 MPDU submitted with an
+/// 802.3 TXD is transmitted as garbage and never acknowledged.  Only the
+/// station To-DS unicast/multicast shape is accepted: DA is addr3, SA is addr2.
+pub fn client_data_mpdu_to_ethernet(mpdu: &[u8]) -> Result<Vec<u8>, String> {
+    let fc = mpdu
+        .get(..2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .ok_or("client data MPDU omitted frame control")?;
+    if fc & 0x000c != 0x0008 || fc & 0x0300 != 0x0100 || fc & 0x8000 != 0 {
+        return Err(
+            "client data header translation requires a To-DS data MPDU without HTC".into(),
+        );
+    }
+    if fc & 0x0040 != 0 {
+        return Err("client data header translation requires a non-null data subtype".into());
+    }
+    let header_len = if fc & 0x0080 != 0 { 26 } else { 24 };
+    let snap = mpdu
+        .get(header_len..header_len + 8)
+        .ok_or("client data MPDU omitted LLC/SNAP")?;
+    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0] {
+        return Err("client data MPDU is not RFC 1042 encapsulated".into());
+    }
+    if u16::from_be_bytes([snap[6], snap[7]]) < 0x0600 {
+        return Err("client data MPDU carries a non-Ethernet II type".into());
+    }
+    let mut frame = Vec::with_capacity(mpdu.len() - header_len - 8 + 14);
+    frame.extend_from_slice(&mpdu[16..22]);
+    frame.extend_from_slice(&mpdu[10..16]);
+    frame.extend_from_slice(&snap[6..8]);
+    frame.extend_from_slice(&mpdu[header_len + 8..]);
+    Ok(frame)
 }
 
 pub fn set_client_txwi_wcid(txwi: &mut [u8; 64], wcid: ClientWcid) {
@@ -7276,6 +7391,16 @@ impl ClientFirmwareEffectsState {
         )?;
         submit_uni(2, &beacon)?;
         self.post_assoc_beacon_timing_programmed = true;
+        // Linux bss_info_changed(BSS_CHANGED_PS) -> mt7921_mcu_uni_bss_ps. The
+        // host runs no power-save policy, so pin the BSS awake (ps_state 0);
+        // without an explicit state the firmware was observed dozing
+        // (MCU_EVENT_LP_INFO) and missing the AP's unicast frames.
+        let power = encode_client_post_assoc_power_state_command(
+            self.next_sequence(),
+            association.bss_index,
+            0,
+        )?;
+        submit_uni(2, &power)?;
         let rx_filter = encode_client_post_assoc_rx_filter_command(self.next_sequence())?;
         submit_ce_no_ack(&rx_filter)?;
         self.post_assoc_rx_filter_published = true;
@@ -9240,6 +9365,53 @@ mod active_authority {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_data_header_translation_matches_linux_encap_offload() {
+        // To-DS QoS data, protected, TID 0, RFC 1042 IPv4 payload.
+        let mut mpdu = vec![0x88, 0x41, 0, 0];
+        mpdu.extend_from_slice(&[0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]); // addr1 BSSID
+        mpdu.extend_from_slice(&[0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]); // addr2 SA
+        mpdu.extend_from_slice(&[0xff; 6]); // addr3 DA
+        mpdu.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]); // seq, qos tid 0
+        mpdu.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+        mpdu.extend_from_slice(&[0x45, 0, 0, 20, 1, 2, 3]);
+        let ethernet = super::client_data_mpdu_to_ethernet(&mpdu).unwrap();
+        assert_eq!(&ethernet[..6], &[0xff; 6]);
+        assert_eq!(&ethernet[6..12], &[0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]);
+        assert_eq!(&ethernet[12..14], &[0x08, 0x00]);
+        assert_eq!(&ethernet[14..], &[0x45, 0, 0, 20, 1, 2, 3]);
+        assert_eq!(ethernet.len(), mpdu.len() - 26 - 8 + 14);
+
+        // Non-QoS data uses the 24-byte header.
+        let mut plain = mpdu.clone();
+        plain[0] = 0x08;
+        plain.drain(24..26);
+        assert_eq!(super::client_data_mpdu_to_ethernet(&plain).unwrap(), ethernet);
+
+        // QoS-null, From-DS, HTC and raw LLC shapes are refused.
+        let mut null = mpdu.clone();
+        null[0] = 0xc8;
+        assert!(super::client_data_mpdu_to_ethernet(&null).is_err());
+        let mut from_ds = mpdu.clone();
+        from_ds[1] = 0x42;
+        assert!(super::client_data_mpdu_to_ethernet(&from_ds).is_err());
+        let mut htc = mpdu.clone();
+        htc[1] = 0xc1;
+        assert!(super::client_data_mpdu_to_ethernet(&htc).is_err());
+        let mut llc = mpdu.clone();
+        llc[26] = 0x42;
+        assert!(super::client_data_mpdu_to_ethernet(&llc).is_err());
+
+        // The 802.3 TXD carries the TID and PROTECT_FRAME, no fixed rate.
+        let txwi = super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
+            .unwrap();
+        let dw = |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
+        assert_eq!(dw(1), 0x8060_8007);
+        assert_eq!(dw(2), 0x28);
+        assert_eq!(dw(3) & 0x8000_0002, 0x2);
+        assert_eq!(dw(6), 0);
+    }
+
     extern crate std;
 
     use super::*;
@@ -9264,6 +9436,13 @@ mod tests {
         assert_eq!(beacon.len(), 60);
         assert_eq!(&beacon[34..36], &[2, 0]);
         assert_eq!(&beacon[48..], &[0, 0, 0, 0, 22, 0, 8, 0, 100, 0, 2, 0]);
+        let power = encode_client_post_assoc_power_state_command(7, 0, 0).unwrap();
+        assert_eq!(power.len(), 60);
+        assert_eq!(&power[34..36], &[2, 0]);
+        assert_eq!(&power[48..], &[0, 0, 0, 0, 21, 0, 8, 0, 0, 0, 0, 0]);
+        assert_eq!(power[39], 7);
+        assert!(encode_client_post_assoc_power_state_command(7, 0, 5).is_err());
+        assert!(encode_client_post_assoc_power_state_command(0, 0, 0).is_err());
         assert_eq!(rx_filter.len(), 132);
         assert_eq!(&rx_filter[34..44], &[0, 0x80, 0x0a, 0xa0, 1, 7, 0, 0, 0, 0]);
         let mut expected_rx_payload = [0u8; 68];
@@ -13851,12 +14030,27 @@ mod tests {
                 bandwidth: 0,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             3,
         )
         .unwrap();
         assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 3, 0, 8, 0, 1]);
         assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
+        let connected = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel,
+                center_channel: channel.number as u8,
+                bandwidth: 0,
+                center_channel2: 0,
+                antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::Normal,
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(&connected[64..70], &[1, 1, 0, 2, 2, 0]);
+        assert_eq!(&connected[..64], &switch[..64]);
         let channel36 = CandidateChannel {
             band: PhysicalBand::Ghz5,
             number: 36,
@@ -13869,6 +14063,7 @@ mod tests {
                 bandwidth: 1,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             3,
         )
@@ -13911,6 +14106,7 @@ mod tests {
                 bandwidth: 0,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             4,
         )

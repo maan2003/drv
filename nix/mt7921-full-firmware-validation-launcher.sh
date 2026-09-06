@@ -75,7 +75,7 @@ case "$#:${1-}" in
       exec @env@ -i \
         DRV_PASSIVE_M1_OBSERVATION=1 \
         DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
-        DRV_SAE_CHANNEL=36 \
+        DRV_SAE_CHANNEL=149 \
         DRV_SAE_SSID=ph1 \
         DRV_SAE_CLIENT_MAC=@session_client_mac@ \
         DRV_SAE_CREDENTIAL_FD=3 \
@@ -93,7 +93,7 @@ case "$#:${1-}" in
       DRV_LAB_SAFETY_STATE="$DRV_LAB_SAFETY_STATE" \
       DRV_PASSIVE_M1_OBSERVATION=1 \
       DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
-      DRV_SAE_CHANNEL=36 \
+      DRV_SAE_CHANNEL=149 \
       DRV_SAE_SSID=ph1 \
       DRV_SAE_CLIENT_MAC=@session_client_mac@ \
       DRV_SAE_CREDENTIAL_FD=3 \

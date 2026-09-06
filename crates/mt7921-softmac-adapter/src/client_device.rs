@@ -372,6 +372,12 @@ pub trait Mt7921ClientIo {
     ) -> Result<u32, zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn establish_client_channel(
+        &mut self,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn join_roc_active(&mut self, _: u64) -> bool {
         false
     }
@@ -729,6 +735,12 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
         self.with_transport_mut(|transport| {
             transport.acquire_client_join_roc(channel, generation, duration_ms)
         })
+    }
+    fn establish_client_channel(
+        &mut self,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        self.with_transport_mut(|transport| transport.establish_client_channel(channel))
     }
     fn join_roc_active(&mut self, generation: u64) -> bool {
         self.with_transport_mut(|transport| transport.client_join_roc_active(generation))
@@ -1096,6 +1108,15 @@ where
                         );
                     }
                     let eapol_ind = matches!(&event, fidl_mlme::MlmeEvent::EapolInd { .. });
+                    if let fidl_mlme::MlmeEvent::EapolConf { resp } = &event {
+                        // MLME never propagates a failed EAPOL send as an
+                        // error; it only reports it here. Surface it so a
+                        // rejected M2 cannot hide behind a successful request.
+                        println!(
+                            "client_eapol_stage=mlme_eapol_confirm result={:?}",
+                            resp.result_code
+                        );
+                    }
                     if eapol_ind {
                         println!(
                             "client_eapol_stage=mlme_indication_forwarded_to_sme controlled_port_closed_allowed=true"
@@ -1428,9 +1449,18 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
     fn send_wlan_frame(
         &mut self,
         buffer: ArenaStaticBox<[u8]>,
-        tx_flags: fidl_softmac::WlanTxInfoFlags,
+        mut tx_flags: fidl_softmac::WlanTxInfoFlags,
         _async_id: Option<fuchsia_trace::Id>,
     ) -> Result<(), zx::Status> {
+        // The Fuchsia `Device` wrapper (mlme device.rs `send_wlan_frame`) sets
+        // PROTECTED from the frame control Protected bit before handing the
+        // frame to the softmac; the MLME itself only passes FAVOR_RELIABILITY
+        // for EAPOL. This host device implements `DeviceOps` directly, so it
+        // has to derive the flag the same way or every encrypted data frame
+        // reaches the transport with empty flags.
+        if buffer.get(1).is_some_and(|byte| byte & 0x40 != 0) {
+            tx_flags |= fidl_softmac::WlanTxInfoFlags::PROTECTED;
+        }
         let mut backend = self.backend.lock().unwrap();
         if !backend.authorization.permits_tx() {
             return Err(zx::Status::ACCESS_DENIED);
@@ -2310,6 +2340,53 @@ mod tests {
     }
 
     #[test]
+    fn derives_protected_tx_flag_from_frame_control_like_fuchsia_device() {
+        // mlme device.rs `Device::send_wlan_frame` ORs PROTECTED into the TX
+        // flags whenever the frame control Protected bit is set; the MLME
+        // passes empty flags for ordinary data. Mirror that here.
+        futures::executor::block_on(async {
+            let mut device =
+                Mt7921ClientDevice::new_offline_fake(FakeEffects::default(), support());
+            device
+                .set_channel(channel(36), fidl_ieee80211::ChannelBandwidth::Cbw20, channel(0))
+                .await
+                .unwrap();
+            let join = fidl_driver::JoinBssRequest {
+                bssid: Some(BSSID),
+                beacon_period: Some(100),
+                ..Default::default()
+            };
+            device.join_bss(&join).await.unwrap();
+            // QoS data, To DS, Protected: fc = 0x4188 little-endian.
+            let mut protected = vec![0x88, 0x41, 0, 0];
+            protected.extend_from_slice(&BSSID);
+            protected.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+            protected.extend_from_slice(&[0xff; 6]);
+            protected.extend_from_slice(&[0, 0, 0, 0, 0xaa, 0xbb]);
+            device
+                .send_wlan_frame(
+                    protected.clone().into(),
+                    fidl_softmac::WlanTxInfoFlags::empty(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                device.backend().effects.flags,
+                Some(fidl_softmac::WlanTxInfoFlags::PROTECTED)
+            );
+            let mut plain = protected.clone();
+            plain[1] = 0x01;
+            device
+                .send_wlan_frame(plain.into(), fidl_softmac::WlanTxInfoFlags::FAVOR_RELIABILITY, None)
+                .unwrap();
+            assert_eq!(
+                device.backend().effects.flags,
+                Some(fidl_softmac::WlanTxInfoFlags::FAVOR_RELIABILITY)
+            );
+        });
+    }
+
+    #[test]
     fn forwards_failure_status_without_retry_or_later_effect() {
         futures::executor::block_on(async {
             let effects = FakeEffects {
@@ -2543,7 +2620,9 @@ mod tests {
                 .windows(2)
                 .position(|bytes| bytes == [48, 20])
                 .unwrap();
-            assert_eq!(&frame[rsn + 20..rsn + 22], &[0x80, 0]);
+            // The SME RSNE must reach the air verbatim so that hostapd's
+            // 2/4 comparison against the association request succeeds.
+            assert_eq!(&frame[rsn + 20..rsn + 22], &[0xcc, 0]);
             let ids = {
                 let mut ids = Vec::new();
                 let mut offset = 28;

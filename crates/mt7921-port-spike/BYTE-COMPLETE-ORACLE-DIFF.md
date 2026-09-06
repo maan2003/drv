@@ -761,3 +761,330 @@ three controlled attempts. Therefore stale AP/per-station state tied only to
 the native MAC is not sufficient to explain the missing M1 in these runs. This
 does not distinguish AP non-transmission from a firmware drop before host DMA,
 and it does not exclude state keyed by something other than the station MAC.
+
+## AP-side ACK witness resolves the M1 ambiguity (2026-09-07)
+
+The earlier sections could not distinguish "AP did not send M1" from "frame
+rejected before RX DMA". The redwood lab AP's hostapd debug journal
+(`journalctl -u drvlab-ap.service`, epoch-prefixed) is an independent
+over-air witness and resolves it: the AP sends M1 and our chip does not ACK it.
+
+Client under test: production identity `8a:fd:2a:8b:70:5a` (the same stable
+per-network MAC iwd uses for `ph1`, so the native precondition connect and the
+userspace attempt appear under one MAC; they are separated by time and by the
+native reason-3 deauth at the VFIO handoff).
+
+| Run (UTC) | AP config | AP→us frames ACKed by our chip | AP→us EAPOL M1 | Result |
+|---|---|---|---|---|
+| 21:14:22 (epoch 1788729262) | VHT80 ch149 | auth ×3, assoc-resp ×2: `ack=1` | ×4 `ack=0` "did not Ack" | reason 15 deauth |
+| 03:52:51 (epoch 1788753171), join ROC held 5000 ms through M1 | VHT80 ch149 | mgmt `ack=1` | ×3 `ack=0` | reason 15 deauth |
+| 04:23:51 (epoch 1788755031) | legacy-only 20 MHz, no HT/VHT | mgmt `ack=1` | ×4 `ack=0` | reason 15 deauth |
+
+The native client on the identical MAC completes the 4-way handshake against
+the same AP immediately before each attempt (`AP-STA-CONNECTED`), so AP,
+channel, credentials and MAC identity are not the cause.
+
+Refuted by these runs:
+
+1. TX completion. Control-port EAPOL `tx_free` without a TXS is now retired
+   as terminal success (peer wcid); the earlier M2 "attempts=15 dropped=1"
+   false failure is fixed but was never the M1 cause: the AP had received
+   that M2.
+2. Channel dwell. Holding the join ROC (firmware granted the full 5000 ms,
+   `join_roc_lifecycle ... abort=held_through_handshake before_m1`) changed
+   nothing; zero data frames reached the host RX ring
+   (no `client_data_candidate`). The ROC hold has been reverted.
+3. PHY format. Against a legacy-only 20 MHz AP, M1 must be plain OFDM and it
+   is still not ACKed.
+
+Surviving evidence: our chip hardware-ACKs unicast *management* frames to
+this MAC (receiver-address match works) but not unicast *data* from the AP.
+The single data frame ever delivered (21:14 run) carried the AP as
+transmitter yet was tagged `wcid=19` with `lookup_match=false`, i.e. the
+hardware transmitter-address search does not resolve the AP's MAC to the
+peer entry wcid 1, although WTBL DW0/DW1 for wcid 1 hold `72:a6:c7:7d:56:93`.
+A data-frame ACK that requires a peer lookup hit explains the management-vs-
+data split exactly. The prior MMIO audit states registers not captured on
+both sides are not claimed equal; the RMAC address-search / MUAR / BSSID
+match tables were not captured. Next discriminator: read those tables in the
+native-associated and userspace-associated states and diff them.
+
+Wrapper note: `lab/us-active-run.wrapper.sh` is the recovery-gap wrapper
+(watchdog heartbeat through VFIO restore; disarm only after confirmed
+network, retrying ~30 s and accepting the redwood LAN gateway 10.77.0.1).
+
+## RMAC own-MAC table: the ACK failure is an interface-identity split (2026-09-07)
+
+Measured with the stock mt76 debugfs register window on the natively associated
+chip (`/sys/kernel/debug/ieee80211/phy0/mt76/regidx` + `regval`) and with the
+userspace `fw_state region=rmac0` snapshot at `post_assoc_before_first_eapol`.
+
+RMAC band-0 block `0x820e5000..0x820e57fc` layout learned from the native dump
+(native on the hotspot, interface MAC `da:61:40:51:27:e8`, BSSID
+`02:d3:b9:dd:c3:d0`):
+
+| offset | native value | meaning |
+|---|---|---|
+| `0x038/0x03c` | `ddb9d302 0000d0c3` | BSSID register (bytes little-endian) |
+| `0x180/0x184` | `7dc7a672 a0009356` | last ph1 BSSID, stale, plus flags |
+| `0x200/0x204` | `ddb9d302 0003d0c3` | address-table entry 0 = BSSID, flags `0x0003` |
+| `0x208/0x20c` | `514061da 0001e827` | address-table entry 1 = **own interface MAC**, flags `0x0001` |
+| `0x210` | `8000486c` | table control word |
+
+Userspace at the same offsets (runs `20260906T211320Z` and `20260907T042333Z`,
+session identity `8a:fd:2a:8b:70:5a`):
+
+| offset | userspace value | meaning |
+|---|---|---|
+| `0x038/0x03c` | `00000000 00000000` | BSSID register empty |
+| `0x200/0x204` | `7dc7a672 00019356` | entry 0 = ph1 BSSID, flags `0x0001` |
+| `0x208/0x20c` | `f6655a50 000189f9` | entry 1 = **`50:5a:65:f6:f9:89`**, the EEPROM MAC (`/sys/class/ieee80211/phy0/macaddress`), not the session identity |
+
+So hardware never matches unicast RA `8a:fd:2a:8b:70:5a`. Every unicast the AP
+sent after the immediate auth/assoc replies was not ACKed: SA-Query action ×4 in
+the status-30 window of run `1788753171`, M1 ×4 in every run, and the AP's own
+deauth (`did not acknowledge deauth`). The replies that were ACKed all arrived
+within a few ms of our own TX, so they come from a transmit-response path, not
+from address matching. Broadcast and beacons were received normally, including a
+multicast data frame on data ring 2 with `wcid=19`.
+
+Cause in the driver report: two `DEV_INFO_ACTIVE` enables for OMAC 0 with no
+disable between them. The passive-scan preflight
+(`SourceExactPassiveTransport`, `AddDevice { mac: self.mac }`) carried the
+NIC-capability MAC `50:5a:65:f6:f9:89`; `program_client_interface` later sent
+`DEV_INFO_ACTIVE` with `8a:fd:2a:8b:70:5a` and was ACKed
+(`client_dev_info_active_acked omac=0 identity_match=true`), but firmware kept
+the first address in the RMAC table. Linux never does this: `mt7921_add_interface`
+sends `mt76_connac_mcu_uni_add_dev(enable)` once per interface-up with
+`bss_conf->addr`, and a MAC change goes through interface down (BSS disable, DEV
+disable) and up. The per-command byte audit could not see this because each
+command individually matched Linux; the divergence is the identity handed to the
+first one.
+
+Fix: `SourceExactPassiveTransport::with_interface_mac` applied with the session
+identity in the SAE/power-setup path, logged as
+`preflight_dev_info_identity source=session_client mac=...`.
+
+Refuted along the way (kept for the record): TX-completion retirement, ROC dwell
+(held 5000 ms through M1), PHY format (legacy-only 20 MHz AP), host register
+writes after init (all 21 `passive_mac_rmw` are init-time), data-ring DMA (ring
+2 delivered a multicast frame), IOMMU faults (none in the boot's kernel log),
+firmware power save (`UNI_BSS_INFO_PS`, `SET_PS_PROFILE` never sent by native
+either; `KeepFullPwr 0` sent by both).
+
+### Outcome (2026-09-07 05:19Z, build rnczsml8, run 20260907T051855Z)
+
+Confirmed. With the session identity in the preflight `AddDevice`, the RMAC
+own-MAC entry reads `0x208=8b2afd8a 0x20c=00015a70` (8a:fd:2a:8b:70:5a) and
+the AP's first M1 is acknowledged: `EAPOL-Key TX status ... ack=1` at
+1788758351.182, followed by retransmissions every second. The M1 is delivered
+on WFDMA0 ring 2 as a QoS data frame (`client_rx_descriptor ring=2`,
+`ether_type=34958`), admitted, and forwarded to the SME, which issues an
+EAPOL (M2) request. Our own EAPOL-Start unicast in the same run was also
+acknowledged (`management_tx_terminal ... txs_acked=true`), so the data TX
+path itself is live.
+
+## M2 never left the host: MLME emits non-QoS EAPOL, driver required QoS (2026-09-07)
+
+Every SME M2 request completed (`client_eapol_stage=mlme_tx_request_complete`)
+without a `client_data_tx_public` record. Fuchsia's MLME builds EAPOL as a
+non-QoS data frame on purpose (`bound.rs send_eapol_frame`: "don't use QoS"),
+and reports a failed send only through `EapolConf { TransmissionFailure }`,
+never as a request error. `LiveClientEffects::send_wlan_frame` rejected the
+frame with `BAD_STATE` because `qos != association.negotiated_qos`, so the
+M2 vanished silently and the AP deauthenticated after four M1s.
+
+Linux is the oracle: mac80211 sends control-port EAPOL as QoS data with TID 7
+(VO) on a WME association. Fix: promote a non-QoS EAPOL MPDU from the MLME
+to a QoS data frame with TID 7 before submission
+(`client_eapol_qos_promotion`), and record every rejection in that path
+(`client_data_tx_blocked reason=...`) plus the MLME's EapolConf result
+(`client_eapol_stage=mlme_eapol_confirm`).
+
+## Lab note: stale MFP association on the AP breaks the native precondition
+
+After a native iwd session on ph1 ends without the AP seeing a deauth (VFIO
+unbind, or an ssh-severed manual test), hostapd keeps 8a:fd:2a as
+`[AUTH][ASSOC][AUTHORIZED][MFP]`. The next association gets status 30 plus
+SA Query comeback and the wrapper's iwd precondition fails. The launch helper
+`lab/launch-active-run.sh` now deauthenticates the session client on the AP
+and waits for an empty station table before starting a run.
+
+## M2 rejected: association RSNE was rewritten to iwd's value (2026-09-07 05:31Z)
+
+Run 20260907T053044Z (build zv8m9din): the promoted QoS M2 was transmitted,
+acknowledged (`management_tx_terminal ... txs_acked=true`) and confirmed to
+the SME (`mlme_eapol_confirm result=Success`). hostapd verified the MIC and
+derived the PTK, then disconnected with reason 2:
+`WPA IE from (Re)AssocReq did not match with msg 2/4` — association request
+RSN capabilities `80 00` (MFPC only, iwd's value) versus `cc 00` in 2/4
+(MFPC|MFPR, 16 PTKSA replay counters, the Fuchsia supplicant's value).
+
+The mismatch was self-inflicted: `finalize_association_request` in
+softmac-port rewrote the RSN capabilities with an iwd-shaped
+`RsnStationPolicy` so the association request could be compared against the
+Linux oracle. IEEE 802.11-2020 12.7.6.3 requires the RSNE in 2/4 to be
+bit-identical to the one in the association request, and the supplicant
+authors 2/4, so the driver must not restate the RSNE. Fix: the policy is now
+optional and `None` in production (SME RSNE verbatim); only the pinned Linux
+6.18.40 oracle fixture keeps the rewrite so its 204-byte hash remains
+comparable.
+
+## M2 rejected again: RSNXE present in association, absent from 2/4 (2026-09-07 05:45Z)
+
+Run 20260907T054446Z (build c0p1rdrf, verbatim SME RSNE): hostapd accepted the
+RSNE in 2/4 and failed the next comparison, `RSNXE from (Re)AssocReq did not
+match the one in EAPOL-Key msg 2/4`, then deauthenticated with reason 2. The
+host wlan-mlme patch copies the AP's single-octet RSNXE (H2E) into the SAE
+association request, which hostapd requires when the SAE exchange used H2E;
+the Fuchsia supplicant had no notion of an RSNXE and put only the RSNE in
+the 2/4 Key Data. IEEE Std 802.11-2020 12.7.6.3 requires 2/4 to repeat the
+association RSNXE.
+
+Fix (two host patches, `wlan-rsn-rsnxe-m2-host.patch` and
+`wlan-sme-rsnxe-m2-host.patch`): the four-way `Config` carries the raw
+association RSNXE, `create_message_2` appends it after the RSNE, and the SME
+derives it from the selected BSS with the same rule the MLME uses.
+
+## Lab note: np hard reset during the RSNXE build (2026-09-07 05:47Z)
+
+While `nix build .#mt7921-full-firmware-validation` was compiling the RSNXE
+supplicant patches, no-plastic stopped answering ssh and came back ~13 min
+later on ph1 (10.77.0.20) with a fresh boot. The boot-time journal of the
+crashed boot was not persisted, but the cause is visible in the running
+system: the kernel command line reserves `hugepagesz=1G hugepages=11`, so
+only ~3 GB of the 15 GB RAM was available to userspace. The wlan-stack build
+thrashed into zram swap, the box stopped feeding the 30 s SP5100 TCO
+hardware watchdog, and it reset. Writes from the last ~minute (the rsync of
+the two RSNXE patches, the build log) were lost.
+
+Mitigation used (runtime only, restored on reboot): the 1 GB pages were all
+free and unused (`/dev/hugepages-1G` empty), so
+`echo 0 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages` released
+them before rebuilding (MemAvailable 3.0 GB -> 14.6 GB). After a reboot the
+reservation would come back, so it was removed from np's NixOS config as well
+(`/data/persist/src/nixos/hosts/no-plastic.nix`, `nixos-rebuild switch`; the
+old file is kept at `/data/persist/drvlab/no-plastic.nix.bak-hugepages`).
+`lab/np-ssh.sh` reaches np over tailscale or, when np
+fell back to ph1, through a redwood jump to its LAN address.
+
+## Outcome (2026-09-07 09:11Z): WPA3 4-way handshake completes; first protected data frame rejected
+
+Run `active-run-20260907T091054Z` (store `mhz6c36z…`, RSNXE patches): the
+AP accepted 2/4 and 4/4 for the driver's session (`EAPOL-4WAY-HS-COMPLETED`,
+`AP-STA-CONNECTED`, no SA Query comeback thanks to the launch helper's AP
+guard), the supplicant delivered PTK, GTK and IGTK
+(`traffic_key_{ptk,gtk,igtk}_installed=true`), and the controlled port opened
+(`pinned_sme_connected association=true key_install=true controlled_port=true`).
+
+The run then failed on the first DHCP Discover: `client_data_tx_public
+fc=0x4188 protected=true …` followed directly by cleanup and "DHCP proof
+failed: associated data TX failed". Cause: Fuchsia's `Device::send_wlan_frame`
+(mlme device.rs) ORs `WlanTxInfoFlags::PROTECTED` into the TX flags when the
+frame control Protected bit is set, while `BoundClient::send_data_frame` only
+passes FAVOR_RELIABILITY/empty. Our host `Mt7921ClientDevice` implements
+`DeviceOps` directly and forwarded the empty flags, so
+`LiveClientEffects::send_wlan_frame` returned ACCESS_DENIED (and the physical
+transport would have returned INVALID_ARGS) without a report line. Fix: derive
+PROTECTED from the frame control in the host device (adapter
+`client_device.rs`, test `derives_protected_tx_flag_from_frame_control_like_fuchsia_device`),
+plus report lines on both formerly silent rejections and the underlying error
+in the Ethernet pump (`client_data_tx_error stage=ethernet_pump`).
+
+Lab: the iwd precondition "connect-failed, status: 1" with no auth on air is a
+stale kernel BSS cache (cfg80211 expires scan entries after 30 s); the wrapper
+now runs `iw dev <dev> scan ssid ph1` right before each connect and retries up
+to four times. The AP guard in `lab/launch-active-run.sh` deauths the client
+on redwood the moment np stops answering ping after the native session.
+
+## Root cause (2026-09-07 09:45Z): associated data was DMA'd as an 802.11 MPDU under an 802.3 TXD
+
+`encode_client_data_txwi`'s normal-data shape was transcribed from Linux, and
+Linux mt7921 sets `SUPPORTS_TX_ENCAP_OFFLOAD` (`mt792x_core.c`), so its data
+TXD is `mt76_connac2_mac_write_txwi_8023`: DW1 `LONG_FORMAT | ETH_802_3 |
+HDR_FORMAT=802.3 | TID`, DW2/DW7 type data / subtype QoS, DW3 `PROTECT_FRAME`,
+DW6 zero (hardware rate control). The firmware then performs TX header
+translation: it builds the 802.11 header, QoS control, sequence number and the
+CCMP header/PN from the WTBL. Our driver kept that TXD but handed the firmware
+the Fuchsia MLME's fully formed 802.11 QoS MPDU (fc `0x4188`), so the "Ethernet
+frame" the firmware translated was garbage (DA = first six bytes of the 802.11
+header). Every DHCP Discover therefore ended in TX_FREE `dropped=true
+attempts=15 status=1` with no ACK, exactly like the old E2E87 peer-WCID-1 probe.
+EAPOL was unaffected because it uses the raw 802.11 `linux_qos_eapol_control_port_reference`
+shape (HDR_FORMAT 802.11, fixed OFDM6).
+
+Fix: `client_data_mpdu_to_ethernet` (mt7921-core) reverses the MLME's RFC 1042
+encapsulation (DA = addr3, SA = addr2, EtherType from SNAP) and
+`transmit_one_sae_auth` rewrites the DMA arena with that frame before
+describing it; the 802.3 TXD now also carries the QoS TID in DW1. Linux does
+not set `IEEE80211_KEY_FLAG_GENERATE_IV` for mt7921, confirming the CCMP header
+is firmware-generated on this path. Logged as `client_data_tx_encap
+format=802.3 hdr_trans=hardware ...`.
+
+Iteration loop: `lab/fast-iterate.sh` rsyncs the workspace to np and runs
+`lab/fast-build.sh` there (out-of-nix incremental cargo build in the
+`.#mt7921` dev shell against the nix-materialized patched reference tree):
+84 s cold, 14 s end-to-end incremental. The nix package remains the commit gate.
+
+## 2026-09-07 10:0xZ: Discover reaches dnsmasq; Offer lost before the host RX ring
+
+With the 802.3 translation in place, tcpdump on redwood `ap0` shows every
+Discover intact (`udp sum ok`), and after allowing UDP 67 through redwood's
+NixOS firewall (`nft add rule inet nixos-fw input-allow iifname ap0 ... th dport
+{53, 67} accept`, now re-applied by `lab/launch-active-run.sh`) dnsmasq answers
+`DHCPOFFER 10.77.0.21`. Run 095718Z: AP `tx packets 98, tx failed 42` towards
+the session MAC, i.e. our card ACKed ~56 unicast data frames, yet only four
+data frames reached `next_client_rx` and none was the Offer. The data RX ring
+(WFDMA ring 2) was the eight-entry MCU-response shape while Linux sizes
+`MT_RXQ_MAIN` at 1536, and `transmit_one_sae_auth` blocks for the TX terminal
+before the next RX drain, so the ring fills and the firmware drops frames it
+already acknowledged. Change: `MT7921_DATA_RX_RING_COUNT = 64` (128 KB buffer
+arena at IOVA 0x0110_0000), provenance ring sized to match, unit-test fixtures
+keep eight entries. Idle `next_client_rx` polls now log once per 1024.
+
+Lab: redwood's kernel (7.2.0, `pkgs.linux-redwood`) has `CONFIG_NFT_NAT`
+unset and no iptables, so `/var/lib/drvlab/nat.nft` cannot load ("type nat hook
+postrouting": ENOENT). DHCP/DNS via the AP work without it; the internet proofs
+need a redwood kernel with NFT_NAT.
+
+Lab note: np's 09:48Z reboot was the wrapper's own recovery, not a crash.
+`last -x` shows a clean shutdown at 15:18 IST; `us-active-run.sh` leaves the
+120 s watchdog lease armed when it cannot confirm network reachability after
+`return-net`, and np's tailscale path over the ajay hotspot was flapping at the
+time (relay "blr", "offline, last seen" toggling). Stale ssh ControlMaster
+sockets then made every new session fail with "Connection to UNKNOWN port
+65535"; `ssh -O exit np` clears it.
+
+## 2026-09-07 11:0xZ: only 6 Mbit/s frames decode; the client channel was never switched with CH_SWITCH_NORMAL
+
+The 64-entry ring did not change the picture (run 104739Z: 76 Offers and 14
+pings sent by the AP, one ping and no Offer received, AP `tx failed 50/102`).
+Per-frame RX rate logging (`client_rx_rxv`, PRXV word 0: TX_MODE bits 27:24,
+TX_RATE bits 6:0, run 110031Z) shows every received data/EAPOL/action frame at
+OFDM 6 Mbit/s (`rate_code 0xb`) plus a single VHT MCS5 frame, with RCPI ~0x70
+(-52 dBm), while the ath11k AP reports `tx bitrate 48.0 MBit/s` towards us.
+The two 362-byte Offers that did arrive in 110031Z were 6 Mbit/s retries. Our
+own Discovers also needed 3-5 attempts per ACK at -52 dBm.
+
+Cause: the client path never issues Linux `mt7921_set_channel`. The radio sits
+on channel 149 only through the scan-time `CHANNEL_SWITCH` whose
+`switch_reason` was hard-coded to `CH_SWITCH_SCAN_BYPASS_DPD` (9), then the
+JOIN ROC (`mgd_prepare_tx` equivalent). Linux programs the association chandef
+with `CH_SWITCH_NORMAL` (0) before the ROC, which is also where the per-channel
+calibration runs. Change: `ChannelSwitchReason { Normal = 0, ScanBypassDpd = 9 }`
+on `PassiveMcuCommand::ChannelSwitch` / `PhysicalChannelContext`;
+`Mt7921PassiveTransport::establish_client_channel` issues the normal-reason
+switch on the association chandef, and `acquire_join_roc` calls it once per
+channel lease before the ROC (`client_channel_switch reason=normal ...`).
+
+Also in 110031Z: after the Offer was delivered, every 329-byte data TX
+(the DHCP Request) failed before submission (`management_tx_pre_submit
+result=error category=pre_submit_io`); the error text is now logged
+(`error=...`). The ethernet pump no longer aborts the proof on a rejected or
+dropped frame; it drops the frame and lets the netstack retransmit
+(`client_data_tx_error ... dropped_total=N`).
+
+Lab: `us-active-run.sh` created the heartbeat marker after starting the
+heartbeat loop; when the loop won the race it exited at once and the 120 s
+lease rebooted np during `return-net` (110031Z, 16:32 IST). The marker is now
+created first and a failed heartbeat is retried.

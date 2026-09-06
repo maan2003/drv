@@ -136,7 +136,7 @@ case $connected_frequency in
     ;;
 esac
 if [[ $connected_bssid != 72:a6:c7:7d:56:93 \
-   || $connected_channel != 36 \
+   || $connected_channel != 149 \
    || $connected_client_mac != "$native_client_mac" ]]; then
   echo "connected Wi-Fi target drifted from fixed ph1 validation policy" >&2
   exit 1

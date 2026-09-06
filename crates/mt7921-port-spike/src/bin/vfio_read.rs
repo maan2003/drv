@@ -32,12 +32,14 @@ use mt7921_port_spike::{
     ClientWcid, LegacyWmeAssociation, NicCapability, NicPhyCapability, PassiveMacMmioOperation,
     PassiveMcuCommand, PassiveRxError, PhysicalBand, RateTxPowerAuthorizer, RateTxPowerTransport,
     RegulatoryRatePowerSnapshot, candidate_channels, classify_preassociation_sae_auth,
-    connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi,
+    MT7921_DATA_RX_RING_COUNT, MT7921_MCU_RX_BUFFER_BYTES, client_data_mpdu_to_ethernet,
+    connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi, prepare_data_rx_ring,
     encode_client_early_edca_command, encode_client_edca_command,
     encode_client_interface_bss_command, encode_client_interface_commands,
     encode_client_interface_dev_command, encode_client_join_roc_abort,
     encode_client_join_roc_acquire, encode_client_management_tx,
     encode_client_post_assoc_beacon_timing_command,
+    encode_client_post_assoc_power_state_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
     encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
     encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
@@ -830,7 +832,13 @@ fn acquire_active_vfio_resources(
     #[cfg(feature = "fuchsia-passive")]
     {
         map_dma!(data_rx_ring, 0x0101_0000, PAGE);
-        map_dma!(data_rx_buffers, 0x0101_1000, 4 * PAGE);
+        // 128 KB; the 0x0102_0000..0x0105_0000 window holds the management
+        // TX arenas, so the buffer arena lives above them.
+        map_dma!(
+            data_rx_buffers,
+            0x0110_0000,
+            MT7921_DATA_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES
+        );
     }
 
     let tx_guard = resources.tx_guard.as_mut().expect("mapped");
@@ -864,7 +872,7 @@ fn acquire_active_vfio_resources(
             .data_rx_buffers
             .as_mut()
             .expect("mapped")
-            .zero_bytes(4 * PAGE)?;
+            .zero_bytes(MT7921_DATA_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES)?;
     }
     let prepared_rx = prepare_mcu_rx_ring(mcu_rx_ring.iova, mcu_rx_buffers.iova)
         .map_err(|error| format!("prepare MCU RX descriptors: {error:?}"))?;
@@ -880,9 +888,9 @@ fn acquire_active_vfio_resources(
     {
         let data_rx_ring = resources.data_rx_ring.as_mut().expect("mapped");
         let data_rx_buffers = resources.data_rx_buffers.as_ref().expect("mapped");
-        let prepared_data = prepare_mcu_rx_ring(data_rx_ring.iova, data_rx_buffers.iova)
+        let prepared_data = prepare_data_rx_ring(data_rx_ring.iova, data_rx_buffers.iova)
             .map_err(|error| format!("prepare data RX descriptors: {error:?}"))?;
-        for (index, descriptor) in prepared_data.descriptors.into_iter().enumerate() {
+        for (index, descriptor) in prepared_data.into_iter().enumerate() {
             data_rx_ring.write_descriptor_at(index, descriptor);
         }
     }
@@ -1024,8 +1032,8 @@ fn run_contained_dma_resource_round_trip(
             wfdma.write_rx_ring_slot(
                 2,
                 active.data_rx_ring.as_ref().expect("mapped").iova as u32,
-                8,
-                7,
+                MT7921_DATA_RX_RING_COUNT as u32,
+                MT7921_DATA_RX_RING_COUNT as u32 - 1,
                 0,
             )?;
             wfdma.write_rx_ring_slot(
@@ -1221,6 +1229,7 @@ fn run_contained_dma_resource_round_trip(
                                 RunPhase::FirmwareReady,
                             )?;
                         let mechanics = VfioPassiveMechanics {
+            idle_rx_polls: 0,
                             loader,
                             ledger: capsule
                                 .containment
@@ -1230,9 +1239,9 @@ fn run_contained_dma_resource_round_trip(
                                 rx_ring: active.data_rx_ring.as_mut().expect("mapped"),
                                 rx_buffers: active.data_rx_buffers.as_ref().expect("mapped"),
                                 rx_tail: 0,
-                                rx_head: 7,
+                                rx_head: MT7921_DATA_RX_RING_COUNT - 1,
                                 rx_ring_index: 2,
-                                rx_count: 8,
+                                rx_count: MT7921_DATA_RX_RING_COUNT,
                                 completed_total: 0,
                                 rx_error_total: 0,
                                 client_frame_total: 0,
@@ -1257,6 +1266,7 @@ fn run_contained_dma_resource_round_trip(
                             associated_edca_programmed: false,
                             e2e93_probe: false,
                             e2e94_probe: false,
+                            active_client: false,
                             validation_tx_gate: None,
                             authoritative_rate_power: None,
                             mgmt_txwi: &mut active.mgmt_txwi,
@@ -2471,7 +2481,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
     let expected_beacon = encode_client_post_assoc_beacon_timing_command(8, 0, 100, 2)
         .map_err(|error| format!("self-test association beacon fixture: {error}"))?;
-    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(9)
+    let expected_power = encode_client_post_assoc_power_state_command(9, 0, 0)
+        .map_err(|error| format!("self-test association power-state fixture: {error}"))?;
+    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(10)
         .map_err(|error| format!("self-test association RX-filter fixture: {error}"))?;
     let expected_rlm = encode_client_post_assoc_rlm_command(4, 0, rx_channel.channel)
         .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
@@ -2493,6 +2505,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             (3, expected_peer),
             (3, expected_interface),
             (2, expected_beacon),
+            (2, expected_power),
             (0x0a, expected_rx_filter),
         ]
         || !wtbl_structure
@@ -2515,7 +2528,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,RLM,peer_associated,EDCA,interface_wcid19,BCNFT,SET_RXFILTER cid_order=3,2,2,3,legacy29,3,2,legacy10 ack_order=RLM,interface,BCNFT no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,RLM,peer_associated,EDCA,interface_wcid19,BCNFT,PS,SET_RXFILTER cid_order=3,2,2,3,legacy29,3,2,2,legacy10 ack_order=RLM,interface,BCNFT,PS no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
         peer_wcid.get()
     );
     // Source-exact discriminator: ieee80211_send_nullfunc only requests the
@@ -3268,6 +3281,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         firmware: ClientFirmwareEffectsState::default(),
         peer_wcid: None,
         join_roc_generation: None,
+            established_channel: None,
         join_roc_deadline: None,
         post_association_data_wait: None,
         eapol_start_deadline: None,
@@ -3676,14 +3690,14 @@ fn run_production_validation_self_test() -> Result<(), String> {
     let policy = ProductionValidationPolicy::bind(
         b"ph1",
         [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-        36,
+        149,
         fixed_validation_client(),
         0,
         source,
     )?;
     policy.validate_association(
         [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-        36,
+        149,
         fixed_validation_client(),
     )?;
     let target = [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
@@ -3938,7 +3952,7 @@ fn run() -> Result<(), String> {
             ) = if cfg!(feature = "fresh-laa-diagnostic") {
                 (
                     "mt7921-supported-subset-v2",
-                    "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4",
+                    "f721e2fbfb2d66c7a4a9dc94a03a387ceee11f6b7c85b2d540064292a0ac6e6e",
                     "input-dependent",
                     "firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2",
                     "device+pinned-regdb-authoritative-association-v2",
@@ -3956,7 +3970,7 @@ fn run() -> Result<(), String> {
             } else {
                 (
                     "mt7921-supported-subset-v2",
-                    "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4",
+                    "f721e2fbfb2d66c7a4a9dc94a03a387ceee11f6b7c85b2d540064292a0ac6e6e",
                     "input-dependent",
                     "firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2",
                     "device+pinned-regdb-authoritative-association-v2",
@@ -4367,7 +4381,14 @@ fn run() -> Result<(), String> {
                     (244, 1),
                     (221, 7),
                 ]
-            || runtime_rsn.1[18..20] != [0x80, 0]
+            // The RSNE must leave the boundary exactly as the SME authored it:
+            // hostapd compares it bit-for-bit against EAPOL-Key 2/4, which the
+            // supplicant builds from the same RSNE.
+            || Some(&runtime_rsn.1)
+                != parse_ies(&raw_runtime)?
+                    .iter()
+                    .find(|(id, _)| *id == 48)
+                    .map(|(_, body)| body)
             || runtime_ht.1.as_slice() != authoritative_profile.ht_capabilities.as_ref().unwrap()
             || runtime_vht.1.as_slice() != authoritative_profile.vht_capabilities.as_ref().unwrap()
         {
@@ -4382,7 +4403,14 @@ fn run() -> Result<(), String> {
         normalized_canonical[10..16].copy_from_slice(&NATIVE_VALIDATION_CLIENT);
         normalized_canonical[22..24].fill(0);
         let canonical_sha256 = sha256_hex(&normalized_canonical);
-        if canonical_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"
+        // f721e2fb...: SME RSNE carried verbatim (RSN capabilities 0x00cc),
+        // required so hostapd's EAPOL 2/4 RSNE comparison succeeds.
+        // 5449fa5a...: the previous frame with the RSNE rewritten to iwd's
+        // 0x0080, which hostapd rejected with "WPA IE from (Re)AssocReq did
+        // not match with msg 2/4"; kept only as a rejected value.
+        if canonical_sha256 != "f721e2fbfb2d66c7a4a9dc94a03a387ceee11f6b7c85b2d540064292a0ac6e6e"
+            || canonical_sha256
+                == "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"
             || canonical_sha256
                 == "8646ba36fe4d09133c784f4893e759e5d2e71de415a02642e5fa2a2adde89444"
             || canonical_sha256
@@ -4396,7 +4424,7 @@ fn run() -> Result<(), String> {
         normalized_runtime[10..16].copy_from_slice(&NATIVE_VALIDATION_CLIENT);
         normalized_runtime[22..24].fill(0);
         let runtime_sha256 = sha256_hex(&normalized_runtime);
-        if runtime_sha256 != "5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4" {
+        if runtime_sha256 != "f721e2fbfb2d66c7a4a9dc94a03a387ceee11f6b7c85b2d540064292a0ac6e6e" {
             return Err(format!(
                 "two-stream device-query association fixture drifted: {runtime_sha256}"
             ));
@@ -4484,7 +4512,7 @@ fn run() -> Result<(), String> {
             &credential,
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             fixed_validation_client(),
             &frozen,
         )?;
@@ -4492,7 +4520,7 @@ fn run() -> Result<(), String> {
             &credential,
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             fixed_validation_client(),
             &frozen,
         )?;
@@ -4500,7 +4528,7 @@ fn run() -> Result<(), String> {
         let policy = consumed_binding.into_policy();
         policy.validate_association(
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             fixed_validation_client(),
         )?;
         let page_evidence = validate_native_rate_power_snapshot(&frozen)?;
@@ -4663,6 +4691,7 @@ fn run() -> Result<(), String> {
     };
     let e2e94_probe = env::var("DRV_PASSIVE_M1_OBSERVATION").is_ok();
     let e2e93_probe = edca_probe_mode && !e2e94_probe;
+    let active_client = !e2e94_probe && env::var("DRV_ACTIVE_CLIENT").is_ok();
     let packaged_integration = match env::var("DRV_VALIDATION_BACKEND") {
         Err(env::VarError::NotPresent) => false,
         Ok(value) if value == "mock-packaged-integration" => true,
@@ -4670,7 +4699,7 @@ fn run() -> Result<(), String> {
         Err(error) => return Err(format!("read validation backend: {error}")),
     };
     #[cfg(feature = "fuchsia-passive")]
-    if operation == Operation::RunOneShotSaeAuth && !e2e94_probe {
+    if operation == Operation::RunOneShotSaeAuth && !e2e94_probe && !active_client {
         return Err("SAE validation requires fixed passive M1 observation mode".into());
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -6383,7 +6412,13 @@ fn run() -> Result<(), String> {
                     log_global_rx_ring_event,
                 )
                 .map_err(|error| format!("own global RX rings: {error:?}"))?;
-                wfdma.write_rx_ring_slot(2, data_rx_ring.iova as u32, 8, 7, 0)?;
+                wfdma.write_rx_ring_slot(
+                    2,
+                    data_rx_ring.iova as u32,
+                    MT7921_DATA_RX_RING_COUNT as u32,
+                    MT7921_DATA_RX_RING_COUNT as u32 - 1,
+                    0,
+                )?;
                 wfdma.write_rx_ring_slot(4, mcu_wa_rx_ring.iova as u32, 8, 7, 0)?;
             }
             observe_dmashdl_transition(
@@ -6619,6 +6654,7 @@ fn run() -> Result<(), String> {
                                 )?;
                             validate_production_prefix_sequence(e2e94_probe, loader.sequence)?;
                             let mut mechanics = VfioPassiveMechanics {
+            idle_rx_polls: 0,
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -6628,9 +6664,9 @@ fn run() -> Result<(), String> {
                                     rx_ring: &mut *data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
                                     rx_tail: 0,
-                                    rx_head: 7,
+                                    rx_head: MT7921_DATA_RX_RING_COUNT - 1,
                                     rx_ring_index: 2,
-                                    rx_count: 8,
+                                    rx_count: MT7921_DATA_RX_RING_COUNT,
                                     completed_total: 0,
                                     rx_error_total: 0,
                                     client_frame_total: 0,
@@ -6662,6 +6698,7 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                active_client,
                                 validation_tx_gate: None,
                                 authoritative_rate_power: rate_power_snapshot.as_ref().map(
                                     |frozen| {
@@ -6730,6 +6767,7 @@ fn run() -> Result<(), String> {
                                 )))
                             });
                             let mut mechanics = VfioPassiveMechanics {
+            idle_rx_polls: 0,
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -6739,9 +6777,9 @@ fn run() -> Result<(), String> {
                                     rx_ring: &mut *data_rx_ring,
                                     rx_buffers: &data_rx_buffers,
                                     rx_tail: 0,
-                                    rx_head: 7,
+                                    rx_head: MT7921_DATA_RX_RING_COUNT - 1,
                                     rx_ring_index: 2,
-                                    rx_count: 8,
+                                    rx_count: MT7921_DATA_RX_RING_COUNT,
                                     completed_total: 0,
                                     rx_error_total: 0,
                                     client_frame_total: 0,
@@ -6773,6 +6811,7 @@ fn run() -> Result<(), String> {
                                 associated_edca_programmed: false,
                                 e2e93_probe,
                                 e2e94_probe,
+                                active_client,
                                 validation_tx_gate: validation_tx_gate.clone(),
                                 authoritative_rate_power: rate_power_snapshot.as_ref().map(
                                     |frozen| {
@@ -6790,6 +6829,23 @@ fn run() -> Result<(), String> {
                                 SourceExactPassiveTransport::new(mechanics, report.nic_capability)
                                     .map_err(|error| error.to_string())?;
                             let candidates = candidate_channels(report.nic_capability);
+                            // Linux programs DEV_INFO_ACTIVE once per interface-up
+                            // with the interface address. Firmware keeps the first
+                            // address it saw in the RMAC own-MAC table, so the
+                            // preflight must already carry the session identity;
+                            // otherwise unicast to the client MAC is never matched
+                            // and the AP sees no ACK for M1.
+                            let transport = match power_target.as_ref() {
+                                Some(target) => {
+                                    let mac = target.3.bytes();
+                                    record_sae_stage(&format!(
+                                        "preflight_dev_info_identity source=session_client mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                                    ));
+                                    transport.with_interface_mac(mac)
+                                }
+                                None => transport,
+                            };
                             let channels_for = |band, numbers: &[u8]| {
                                 numbers
                                     .iter()
@@ -7104,6 +7160,7 @@ fn run() -> Result<(), String> {
                                         firmware: ClientFirmwareEffectsState::default(),
                                         peer_wcid: None,
                                         join_roc_generation: None,
+            established_channel: None,
                                         join_roc_deadline: None,
                                         post_association_data_wait: None,
                                         eapol_start_deadline: None,
@@ -9150,12 +9207,12 @@ impl DescriptorProvenance {
         // MAX is never returned by the allocator: reaching it makes
         // `fetch_update` fail. It is only a non-minting poisoned sentinel.
         let owner = owner.unwrap_or(NonZeroU64::MAX);
-        let ring = |route, ring| DescriptorRingProvenance {
+        let ring = |route, ring, count: usize| DescriptorRingProvenance {
             route,
             ring,
-            slots: (0..8)
+            slots: (0..count)
                 .map(|slot| {
-                    if slot < 7 {
+                    if slot < count - 1 {
                         DescriptorSlotState::Armed(1)
                     } else {
                         DescriptorSlotState::Vacant(0)
@@ -9178,9 +9235,9 @@ impl DescriptorProvenance {
             scan_epoch: 1,
             next_occurrence: 0,
             rings: vec![
-                ring(DescriptorOccurrenceRoute::McuNormalRx, 0),
-                ring(DescriptorOccurrenceRoute::McuNormalRx, 4),
-                ring(DescriptorOccurrenceRoute::DataRx, 2),
+                ring(DescriptorOccurrenceRoute::McuNormalRx, 0, 8),
+                ring(DescriptorOccurrenceRoute::McuNormalRx, 4, 8),
+                ring(DescriptorOccurrenceRoute::DataRx, 2, MT7921_DATA_RX_RING_COUNT),
             ],
             sealed: Vec::new(),
             revoked: exhausted,
@@ -10412,12 +10469,33 @@ fn merge_matching_response(
     Ok(())
 }
 
+/// Linux `mt7921_mcu_rx_event` routes these event ids (and anything with the
+/// UNI unsolicited option bit) to the unsolicited handler before sequence
+/// matching, so a firmware notification that happens to carry the awaited
+/// sequence number (run 111342Z: `MCU_EVENT_LP_INFO` with seq 5 during
+/// BSS_INFO) is never mistaken for the command response.
+fn is_unsolicited_mcu_event(event_id: u8, option: u8) -> bool {
+    option & (1 << 2) != 0
+        || matches!(
+            event_id,
+            0x07 // MCU_EVENT_LP_INFO
+                | 0x0f // MCU_EVENT_TX_DONE
+                | 0x11 // MCU_EVENT_BSS_ABSENCE
+                | 0x13 // MCU_EVENT_BSS_BEACON_LOSS
+                | 0x27 // MCU_EVENT_DBG_MSG
+                | 0x96 // MCU_EVENT_RSSI_NOTIFY
+                | 0xf0 // MCU_EVENT_COREDUMP
+        )
+}
+
 fn response_for_sequence(
     expected_sequence: Option<u8>,
     parsed: mt7921_port_spike::DownloadResponse,
     bytes: Vec<u8>,
 ) -> Option<ReceivedMcuResponse> {
-    (Some(parsed.sequence) == expected_sequence).then_some(ReceivedMcuResponse {
+    (Some(parsed.sequence) == expected_sequence
+        && !is_unsolicited_mcu_event(parsed.event_id, parsed.option))
+    .then_some(ReceivedMcuResponse {
         event_id: parsed.event_id,
         option: parsed.option,
         bytes,
@@ -12535,6 +12613,42 @@ fn drain_data_rx_queue(
                         rxd1 >> 21 & 0x03,
                         (rxd1 & 0x1e00_0000) | (rxd2 & 0x0380_0000),
                     ));
+                    // Group 3 (PRXV) follows RXD, group 4, group 1 and group 2 in that
+                    // order (mt7921_mac_fill_rx); its first word carries the RX rate
+                    // (mt76_connac2_mac_fill_rx_rate: MT_PRXV_TX_RATE/NSTS/FRAME_MODE/TX_MODE).
+                    if groups & 0x04 != 0 {
+                        let rxv_offset = 24
+                            + if groups & 0x08 != 0 { 16 } else { 0 }
+                            + if groups & 0x01 != 0 { 16 } else { 0 }
+                            + if groups & 0x02 != 0 { 8 } else { 0 };
+                        if let Some(rxv) = bytes.get(rxv_offset..rxv_offset + 8) {
+                            let v0 = u32::from_le_bytes(rxv[0..4].try_into().unwrap());
+                            let v1 = u32::from_le_bytes(rxv[4..8].try_into().unwrap());
+                            let tx_mode = (v0 >> 24) & 0x0f;
+                            let rate_code = v0 & 0x7f;
+                            let legacy_mbps = match (tx_mode, rate_code) {
+                                (0, 0) | (0, 4) => "1",
+                                (0, 1) | (0, 5) => "2",
+                                (0, 2) | (0, 6) => "5.5",
+                                (0, 3) | (0, 7) => "11",
+                                (1, 0xb) => "6",
+                                (1, 0xf) => "9",
+                                (1, 0xa) => "12",
+                                (1, 0xe) => "18",
+                                (1, 0x9) => "24",
+                                (1, 0xd) => "36",
+                                (1, 0x8) => "48",
+                                (1, 0xc) => "54",
+                                _ => "n/a",
+                            };
+                            record_sae_stage(&format!(
+                                "client_rx_rxv v0={v0:#010x} v1={v1:#010x} tx_mode={tx_mode} rate_code={rate_code:#x} nsts={} frame_mode={} legacy_mbps={legacy_mbps} rcpi={:#010x}",
+                                (v0 >> 7) & 0x7,
+                                (v0 >> 12) & 0x7,
+                                v1,
+                            ));
+                        }
+                    }
                 }
                 let packet_type = mt7921_packet_type(&bytes);
                 let completion = match packet_type {
@@ -12716,6 +12830,12 @@ enum MgmtTxCompletion {
     Status(Mt7921TxStatus),
 }
 
+/// WCID reserved for interface management frames (auth/assoc). Peer
+/// control-port EAPOL data frames reserve the peer's WCID instead, which is
+/// how a control-port completion is distinguished from an interface mgmt one.
+#[cfg(feature = "fuchsia-passive")]
+const INTERFACE_MGMT_WCID: u16 = 19;
+
 #[cfg(feature = "fuchsia-passive")]
 struct MgmtTxCompletionState {
     token: u16,
@@ -12759,6 +12879,22 @@ impl MgmtTxCompletionState {
     }
 
     fn terminal(&self) -> Option<MgmtTxTerminal> {
+        // A control-port / peer data frame (EAPOL M2/M4, reserved against the
+        // peer WCID rather than the interface mgmt WCID) never requires an L2
+        // ACK for connection success: the supplicant owns retransmission and
+        // the firmware delivers only a TX_FREE (with no TXS) on a fully-retried
+        // drop.  Treat any TX_FREE for such a frame as terminal SUCCESS so the
+        // handshake is not torn down and we do not wait for a TXS that will
+        // never arrive.
+        if self.expected_wcid != INTERFACE_MGMT_WCID {
+            let free = self.free?;
+            return Some(MgmtTxTerminal::Succeeded {
+                token: self.token,
+                pid: self.pid,
+                free,
+                status: self.status,
+            });
+        }
         // Linux mt7921 frees the token from TX_FREE even when no matching TXS
         // arrives.  Preserve that retry-exhausted/drop behavior, but use a
         // stricter success boundary for Fuchsia DeviceOps: positive TXS ACK
@@ -12777,7 +12913,7 @@ impl MgmtTxCompletionState {
                 token: self.token,
                 pid: self.pid,
                 free,
-                status,
+                status: Some(status),
             }
         } else {
             MgmtTxTerminal::Failed {
@@ -12797,7 +12933,7 @@ enum MgmtTxTerminal {
         token: u16,
         pid: u8,
         free: Mt7921TxFree,
-        status: Mt7921TxStatus,
+        status: Option<Mt7921TxStatus>,
     },
     Failed {
         token: u16,
@@ -12848,16 +12984,35 @@ impl MgmtTxOutstanding {
     }
 
     fn reserve_for_wcid(&mut self, expected_wcid: u16) -> Result<(u16, u8), String> {
-        if self.next_token >= 8192 {
+        if self.entries.len() >= 124 {
             return Err("management TX token space exhausted before teardown".into());
         }
         let token = self.next_token;
-        let pid = 3u8
-            .checked_add(self.next_pid)
-            .filter(|pid| *pid < 127)
-            .ok_or("management TX PID space exhausted before teardown")?;
-        self.next_token += 1;
-        self.next_pid += 1;
+        // Linux mt76 draws the TX-status PID from a per-WCID IDR that wraps
+        // within MT_PACKET_ID_FIRST..MT_PACKET_ID_MASK, reusing the ids of
+        // frames whose status has already been reported. Our management/data
+        // TX is synchronous (wait_mgmt_tx_terminal drains each frame's terminal
+        // completion before the next reserve), so cycle the pid through 3..=126
+        // and skip any still-outstanding value instead of exhausting at frame
+        // 124 (run 111812Z aborted DHCP here with 789 failures).
+        let mut pid = None;
+        for _ in 0..124u8 {
+            let candidate = 3 + self.next_pid;
+            self.next_pid = (self.next_pid + 1) % 124;
+            if !self.entries.iter().any(|entry| entry.pid == candidate) {
+                pid = Some(candidate);
+                break;
+            }
+        }
+        let pid = pid.ok_or("management TX PID space exhausted before teardown")?;
+        self.next_token = (self.next_token + 1) % 8192;
+        // Bound the retired history: only recent identities are needed to
+        // recognize a late duplicate completion, and a long association would
+        // otherwise grow it without limit.
+        if self.retired.len() > 256 {
+            let drop = self.retired.len() - 256;
+            self.retired.drain(0..drop);
+        }
         self.entries.push(MgmtTxCompletionState::new_for_wcid(
             token,
             pid,
@@ -13131,7 +13286,7 @@ impl ProductionValidationPolicy {
             parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
         if ssid != b"ph1"
             || bssid != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
-            || channel != 36
+            || channel != 149
             || client != fixed_validation_client()
             || regulatory_generation != 0
             || regulatory_source_sha256 != authoritative_source
@@ -13972,6 +14127,7 @@ struct LiveClientEffects {
     firmware: ClientFirmwareEffectsState,
     peer_wcid: Option<ClientWcid>,
     join_roc_generation: Option<u64>,
+    established_channel: Option<ClientPhysicalChannel>,
     join_roc_deadline: Option<Instant>,
     post_association_data_wait: Option<Instant>,
     eapol_start_deadline: Option<(Instant, u64)>,
@@ -14104,6 +14260,32 @@ impl LiveClientEffects {
         }
         if self.join_roc_generation.is_some() {
             return Err(zx::Status::BAD_STATE);
+        }
+        // Linux programs the association chandef with CHANNEL_SWITCH
+        // (mt7921_set_channel, CH_SWITCH_NORMAL) before mgd_prepare_tx's JOIN
+        // ROC. Without it the radio stays in the scan-time
+        // CH_SWITCH_SCAN_BYPASS_DPD form and only decodes basic-rate frames.
+        if self.established_channel != Some(channel.channel) {
+            match io.establish_client_channel(channel.channel) {
+                Ok(()) => {
+                    record_sae_stage(&format!(
+                        "client_channel_switch reason=normal band={} primary={} center={} bandwidth={} center2={}",
+                        channel.channel.band,
+                        channel.channel.primary,
+                        channel.channel.center,
+                        channel.channel.bandwidth,
+                        channel.channel.center2,
+                    ));
+                    self.established_channel = Some(channel.channel);
+                }
+                Err(zx::Status::NOT_SUPPORTED) => {
+                    record_sae_stage("client_channel_switch result=unsupported");
+                }
+                Err(status) => {
+                    record_sae_stage(&format!("client_channel_switch result=error status={status}"));
+                    return Err(status);
+                }
+            }
         }
         // Linux JOIN ROC is always a 20 MHz transaction on the selected
         // primary channel, independent of the wider association chandef.
@@ -14575,16 +14757,22 @@ impl Mt7921ClientEffects for LiveClientEffects {
         }
         drop(state);
         let eapol = is_anchored_eapol_data(bytes);
-        self.firmware
-            .tx_generation(eapol)
-            .map_err(|_| zx::Status::ACCESS_DENIED)?;
+        self.firmware.tx_generation(eapol).map_err(|reason| {
+            record_sae_stage(&format!(
+                "client_data_tx_blocked reason=tx_generation eapol={eapol} detail={reason}"
+            ));
+            zx::Status::ACCESS_DENIED
+        })?;
         let association = self
             .firmware
             .association
             .filter(|association| {
                 Some(association.peer_wcid) == self.peer_wcid && association.peer == self.target
             })
-            .ok_or(zx::Status::BAD_STATE)?;
+            .ok_or_else(|| {
+                record_sae_stage("client_data_tx_blocked reason=association_identity_mismatch");
+                zx::Status::BAD_STATE
+            })?;
         let to_ds = control & 0x0100 != 0;
         let from_ds = control & 0x0200 != 0;
         let qos = (control >> 4) & 8 != 0;
@@ -14597,9 +14785,40 @@ impl Mt7921ClientEffects for LiveClientEffects {
         } else {
             0
         };
-        if eapol && qos != association.negotiated_qos {
-            return Err(zx::Status::BAD_STATE);
-        }
+        let qos_frame;
+        let (bytes, control, qos, tid): (&[u8], u16, bool, u8) =
+            if eapol && !qos && association.negotiated_qos {
+                // The Fuchsia MLME deliberately emits EAPOL as a non-QoS data
+                // frame (bound.rs send_eapol_frame). Linux's mac80211 always
+                // builds control-port EAPOL as a QoS data frame with TID 7 on
+                // a WME association (ieee80211_build_hdr with skb priority 7),
+                // so promote the MPDU here to keep the on-air bytes equal to
+                // the oracle instead of rejecting the frame.
+                if to_ds && from_ds {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                let qos_control = control | 0x0080;
+                let mut frame = Vec::with_capacity(bytes.len() + 2);
+                frame.extend_from_slice(&qos_control.to_le_bytes());
+                frame.extend_from_slice(bytes.get(2..24).ok_or(zx::Status::INVALID_ARGS)?);
+                frame.extend_from_slice(&[7, 0]);
+                frame.extend_from_slice(bytes.get(24..).ok_or(zx::Status::INVALID_ARGS)?);
+                record_sae_stage(&format!(
+                    "client_eapol_qos_promotion source=mlme_non_qos_data result=qos_data_tid7 linux_reference=mac80211_control_port frame_len_before={} frame_len_after={}",
+                    bytes.len(),
+                    frame.len()
+                ));
+                qos_frame = frame;
+                (qos_frame.as_slice(), qos_control, true, 7)
+            } else if eapol && qos != association.negotiated_qos {
+                record_sae_stage(&format!(
+                    "client_data_tx_blocked reason=eapol_qos_mismatch qos={qos} negotiated_qos={}",
+                    association.negotiated_qos
+                ));
+                return Err(zx::Status::BAD_STATE);
+            } else {
+                (bytes, control, qos, tid)
+            };
         if qos && !self.firmware.qos_tx_ready() {
             record_sae_stage("client_data_tx_blocked reason=edca_not_programmed");
             return Err(zx::Status::BAD_STATE);
@@ -14675,6 +14894,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
             bytes.get(4).is_some_and(|byte| byte & 1 == 0),
         ));
         if !eapol && !flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
+            record_sae_stage(&format!(
+                "client_data_tx_blocked reason=unprotected_non_eapol_data fc=0x{control:04x} flags={flags:?}"
+            ));
             return Err(zx::Status::ACCESS_DENIED);
         }
         io.transmit_client(bytes, flags)
@@ -14836,7 +15058,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                         zx::Status::ACCESS_DENIED
                     })?;
                 record_sae_stage(
-                    "production_policy_validation result=pass ssid=ph1 bssid=true channel=36 client=true regulatory_generation=0 regulatory_source=true",
+                    "production_policy_validation result=pass ssid=ph1 bssid=true channel=149 client=true regulatory_generation=0 regulatory_source=true",
                 );
             }
             let band = match primary.band {
@@ -15890,6 +16112,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
 
 #[cfg(feature = "fuchsia-passive")]
 struct VfioPassiveMechanics<'a, 'b, 'c> {
+    idle_rx_polls: u64,
     loader: &'a mut VfioFirmwareLoader<'b>,
     ledger: &'c mut ContainmentLedger,
     data: ActiveMcuRx<'b>,
@@ -15910,6 +16133,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     associated_edca_programmed: bool,
     e2e93_probe: bool,
     e2e94_probe: bool,
+    active_client: bool,
     validation_tx_gate: Option<Arc<Mutex<ProductionValidationTxGate>>>,
     authoritative_rate_power: Option<(RegulatoryRatePowerSnapshot, [u8; 32])>,
     mgmt_txwi: &'c mut Option<DmaArena>,
@@ -16690,8 +16914,12 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     MgmtTxTerminal::Succeeded { free, status, .. } => {
                         let monotonic_ns = management_tx_monotonic_ns();
                         record_sae_stage(&format!(
-                            "management_tx_terminal monotonic_ns={monotonic_ns} outcome=success token={token} pid={pid} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} sme_callback=success",
-                            status.acked, free.dropped, free.status, free.attempts
+                            "management_tx_terminal monotonic_ns={monotonic_ns} outcome=success token={token} pid={pid} txs_present={} txs_acked={} tx_free_dropped={} tx_free_status={} tx_free_attempts={} sme_callback=success",
+                            status.is_some(),
+                            status.is_some_and(|status| status.acked),
+                            free.dropped,
+                            free.status,
+                            free.attempts
                         ));
                         Ok(())
                     }
@@ -16943,6 +17171,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                 } else {
                     0
                 };
+                let mut dma_len = frame.len();
                 let mut encoded = if control & 0x00f0 == 0x00c0 && qos {
                     let encoded = linux_qos_null_probe_reference_for_tid(
                         frame,
@@ -16972,8 +17201,28 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     ));
                     encoded
                 } else {
-                    encode_client_data_txwi(
+                    // Associated data uses hardware TX header translation like
+                    // Linux (SUPPORTS_TX_ENCAP_OFFLOAD): the firmware receives
+                    // the 802.3 frame and builds the 802.11/QoS/CCMP headers
+                    // from the WTBL.  Replace the MLME's 802.11 MPDU in the
+                    // DMA arena with its Ethernet form before describing it.
+                    let ethernet = client_data_mpdu_to_ethernet(frame)?;
+                    frame_arena.zero_bytes(PAGE).map_err(|error| {
+                        format!("REBOOT REQUIRED: pre-submit frame rewrite failed: {error}")
+                    })?;
+                    frame_arena.write_bytes(&ethernet)?;
+                    dma_len = ethernet.len();
+                    record_sae_stage(&format!(
+                        "client_data_tx_encap format=802.3 hdr_trans=hardware mpdu_len={} eth_len={} ethertype=0x{:04x} tid={tid} protected={} rate_control=normal mpdu_head={} eth_head={}",
                         frame.len(),
+                        ethernet.len(),
+                        u16::from_be_bytes([ethernet[12], ethernet[13]]),
+                        control & 0x4000 != 0,
+                        bytes_hex(&frame[..frame.len().min(40)]),
+                        bytes_hex(&ethernet[..ethernet.len().min(64)]),
+                    ));
+                    encode_client_data_txwi(
+                        ethernet.len(),
                         frame_arena.iova,
                         token,
                         pid,
@@ -16998,7 +17247,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     });
                 record_sae_stage(&format!(
                     "client_data_tx_descriptor txd={dwords:08x?} txp_len={} txp_token={} descriptor_hash=fnv1a64:{descriptor_hash:016x}",
-                    frame.len(),
+                    dma_len,
                     token
                 ));
                 let descriptor = mt7921_dma_tx(
@@ -17709,6 +17958,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .map(|control| u16::from_le_bytes([control[0], control[1]]) & 0x4000 != 0)
             .ok_or(zx::Status::INVALID_ARGS)?;
         if protected != flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED) {
+            record_sae_stage(&format!(
+                "client_tx_blocked reason=protected_bit_flag_mismatch fc_protected={protected} flags={flags:?}"
+            ));
             return Err(zx::Status::INVALID_ARGS);
         }
         if self.loader.dmashdl_watcher.is_some() {
@@ -17745,7 +17997,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "passive_m1_tx_boundary result=authorized phase=preassociation class={class} ownership=pinned_sme_mlme permit_consumed=true physical_submit_pending=true"
             ));
         }
-        let validation_trigger = !self.e2e94_probe && eapol && !self.e2e81_probe_done;
+        let validation_trigger = !self.e2e94_probe && eapol && !self.e2e81_probe_done && !self.active_client;
         if validation_trigger {
             // Same-session source-exact AC discriminator. Validation invokes
             // this only after the complete post-association firmware tail;
@@ -17862,11 +18114,20 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
             return Ok(());
         }
-        let management = bytes
+        let control = bytes
             .get(..2)
-            .is_some_and(|control| u16::from_le_bytes([control[0], control[1]]) & 0x000c == 0);
+            .map(|control| u16::from_le_bytes([control[0], control[1]]));
+        let management = control.is_some_and(|control| control & 0x000c == 0);
+        // Peer control-port data frames (EAPOL M2/M4) are submitted against the
+        // peer WCID, not the interface mgmt WCID.  They only ever receive a
+        // TX_FREE (no TXS on a fully-retried drop), so they must also be waited
+        // on synchronously: this consumes their terminal in the owning call and
+        // prevents it from orphaning onto the next submit's "not delivered to
+        // its synchronous owner" guard.
+        let control_port_data = control.is_some_and(|control| control & 0x000c == 0x0008);
+        let wait_terminal = management || control_port_data;
         let transmit = self.transmit_owned_client_frame(bytes).and_then(|()| {
-            if !management {
+            if !wait_terminal {
                 return Ok(());
             }
             let (token, pid) = self
@@ -17904,7 +18165,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "pre_submit_io"
             };
             record_sae_stage(&format!(
-                "management_tx_pre_submit result=error category={category}"
+                "management_tx_pre_submit result=error category={category} error={error:?}"
             ));
             if category == "terminal_frame_failure" {
                 zx::Status::UNAVAILABLE
@@ -17916,7 +18177,6 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
-        record_sae_stage("next_client_rx poll=begin");
         self.loader
             .mcu
             .handle_irq(None)
@@ -17937,7 +18197,14 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         self.retire_mgmt_tx_completions()
             .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
         let Some(frame) = self.loader.mcu.normal_rx_frames.pop_front() else {
-            record_sae_stage("next_client_rx result=empty");
+            // Idle polls are the bulk of the report; log every 1024th only.
+            self.idle_rx_polls = self.idle_rx_polls.wrapping_add(1);
+            if self.idle_rx_polls % 1024 == 1 {
+                record_sae_stage(&format!(
+                    "next_client_rx result=empty idle_polls={}",
+                    self.idle_rx_polls
+                ));
+            }
             return Ok(None);
         };
         if let Some(occurrence) = frame.occurrence.as_ref() {
@@ -18005,7 +18272,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             .map_err(PhysicalPassiveError)?;
         if self.data.rx_ring_index != 2
             || self.data.irq_bit != DATA_RX_IRQ_BIT
-            || self.data.rx_count != 8
+            || self.data.rx_count != MT7921_DATA_RX_RING_COUNT
             || self.loader.mcu.extra_irq_mask != 0
         {
             return Err(PhysicalPassiveError(
@@ -18025,7 +18292,13 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     .loader
                     .mcu
                     .wfdma
-                    .verify_rx_ring_slot(2, self.data.rx_ring.iova as u32, 8, 7, 0)
+                    .verify_rx_ring_slot(
+                        2,
+                        self.data.rx_ring.iova as u32,
+                        MT7921_DATA_RX_RING_COUNT as u32,
+                        MT7921_DATA_RX_RING_COUNT as u32 - 1,
+                        0,
+                    )
                     .map_err(PhysicalPassiveError)?,
                 PassivePrepareStep::AuthorizeDataIrq => self
                     .loader
@@ -18189,7 +18462,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 .verify_rx_ring_slot(
                     2,
                     self.data.rx_ring.iova as u32,
-                    8,
+                    self.data.rx_count as u32,
                     self.data.rx_head as u32,
                     self.data.rx_tail as u32,
                 )
@@ -19058,7 +19331,15 @@ impl ReadPage {
         Ok(())
     }
     fn write_rx_cpu_index(&self, index: usize, value: u32) -> Result<(), String> {
-        if self.bar_page != 0xd4000 || index >= 8 || value >= 8 {
+        // Ring 2 is MT_RXQ_MAIN (the associated-data ring) with
+        // MT7921_DATA_RX_RING_COUNT descriptors; the MCU rings hold 8. The
+        // producer (CPU) index must stay within the ring it belongs to.
+        let ring_count = if index == 2 {
+            MT7921_DATA_RX_RING_COUNT as u32
+        } else {
+            8
+        };
+        if self.bar_page != 0xd4000 || index >= 8 || value >= ring_count {
             return Err("RX producer write escaped slot allowlist".into());
         }
         let within = 0x500 + index * 0x10 + 8;
@@ -20086,7 +20367,7 @@ mod tests {
             ProductionValidationPolicy::bind(
                 b"ph1",
                 peer,
-                36,
+                149,
                 client,
                 0,
                 parse_sha256_hex(
@@ -20106,6 +20387,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -20736,7 +21018,7 @@ mod tests {
             &credential,
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
             &valid_frozen,
         )
@@ -20746,7 +21028,7 @@ mod tests {
                 &credential,
                 b"ph1",
                 [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                36,
+                149,
                 [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
                 &valid_frozen,
             )
@@ -20760,7 +21042,7 @@ mod tests {
             &credential,
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
             &valid_frozen,
         )
@@ -20772,7 +21054,7 @@ mod tests {
                     &wrong_credential,
                     b"ph1",
                     [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                    36,
+                    149,
                     [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
                     &valid_frozen,
                 )
@@ -21428,6 +21710,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -21575,6 +21858,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: Some((Instant::now(), 1)),
@@ -22015,6 +22299,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -22403,6 +22688,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -22475,6 +22761,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -22572,6 +22859,7 @@ mod tests {
             firmware: ClientFirmwareEffectsState::default(),
             peer_wcid: None,
             join_roc_generation: None,
+            established_channel: None,
             join_roc_deadline: None,
             post_association_data_wait: None,
             eapol_start_deadline: None,
@@ -24323,7 +24611,7 @@ mod tests {
         let policy = ProductionValidationPolicy::bind(
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
             0,
             source,
@@ -24332,7 +24620,7 @@ mod tests {
         policy
             .validate_association(
                 [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                36,
+                149,
                 [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
             )
             .unwrap();
@@ -24459,7 +24747,7 @@ mod tests {
             ProductionValidationPolicy::bind(
                 b"other",
                 [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                36,
+                149,
                 [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
                 0,
                 source,
@@ -24470,7 +24758,7 @@ mod tests {
             ProductionValidationPolicy::bind(
                 b"ph1",
                 [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                36,
+                149,
                 [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
                 1,
                 source,
@@ -24480,7 +24768,7 @@ mod tests {
         let mut policy = ProductionValidationPolicy::bind(
             b"ph1",
             [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-            36,
+            149,
             [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
             0,
             source,
@@ -24491,7 +24779,7 @@ mod tests {
             policy
                 .validate_association(
                     [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93],
-                    36,
+                    149,
                     [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a],
                 )
                 .is_err()
@@ -26599,6 +26887,7 @@ mod tests {
                 firmware: ClientFirmwareEffectsState::default(),
                 peer_wcid: None,
                 join_roc_generation: None,
+            established_channel: None,
                 join_roc_deadline: None,
                 post_association_data_wait: None,
                 eapol_start_deadline: None,
@@ -28428,6 +28717,78 @@ mod tests {
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
                     wcid: Some(19),
                     token: retry_token,
+                    dropped: false,
+                    attempts: 1,
+                    status: 0,
+                    pair_word: None,
+                    info_word: 0,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Terminal(MgmtTxTerminal::Succeeded { .. })
+        ));
+        assert!(outstanding.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn dropped_control_port_tx_free_is_terminal_success_without_a_txs() {
+        // A peer control-port EAPOL frame (reserved against the peer WCID, not
+        // the interface mgmt WCID) that the firmware fully retries and drops
+        // delivers only a TX_FREE and never a TXS. The supplicant owns
+        // retransmission, so this must retire as SUCCESS rather than tear the
+        // handshake down.
+        let mut outstanding = MgmtTxOutstanding::default();
+        let (token, pid) = outstanding.reserve_for_wcid(1).unwrap();
+        assert!(matches!(
+            outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(1),
+                    token,
+                    dropped: true,
+                    attempts: 15,
+                    status: 1,
+                    pair_word: None,
+                    info_word: 0,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Terminal(MgmtTxTerminal::Succeeded { .. })
+        ));
+        assert!(outstanding.is_empty());
+        // A late TXS for the already-retired frame is ignored, never re-opened.
+        assert_eq!(
+            outstanding
+                .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 1,
+                    pid,
+                    acked: false,
+                }))
+                .unwrap(),
+            MgmtTxObservation::IgnoredRetired
+        );
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn control_port_tx_free_retires_only_after_the_free_arrives() {
+        // A TXS alone is not terminal for a control-port frame; the TX_FREE that
+        // releases the token is what completes it.
+        let mut outstanding = MgmtTxOutstanding::default();
+        let (token, pid) = outstanding.reserve_for_wcid(1).unwrap();
+        assert_eq!(
+            outstanding
+                .observe(MgmtTxCompletion::Status(Mt7921TxStatus {
+                    wcid: 1,
+                    pid,
+                    acked: true,
+                }))
+                .unwrap(),
+            MgmtTxObservation::Pending
+        );
+        assert!(matches!(
+            outstanding
+                .observe(MgmtTxCompletion::Free(Mt7921TxFree {
+                    wcid: Some(1),
+                    token,
                     dropped: false,
                     attempts: 1,
                     status: 0,
