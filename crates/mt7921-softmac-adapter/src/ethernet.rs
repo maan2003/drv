@@ -110,6 +110,7 @@ pub struct BoundedNetstackProof {
     tx: Mt7921EthernetTx,
     config: NetstackProofConfig,
     now: Duration,
+    anchor: Option<std::time::Instant>,
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
     tx_dropped: u64,
@@ -141,6 +142,7 @@ impl BoundedNetstackProof {
             tx,
             config,
             now: Duration::ZERO,
+            anchor: None,
             resolved: None,
             socket: None,
             tx_dropped: 0,
@@ -155,6 +157,16 @@ impl BoundedNetstackProof {
         if std::time::Instant::now() >= deadline {
             return Err("Netstack proof deadline");
         }
+        // Advance the netstack's virtual clock at real wall-clock time. The old
+        // fixed +100ms-per-iteration bump raced seconds ahead within a few ms of
+        // busy-looping, so the DNS/TCP resolver's timers expired (in virtual time)
+        // long before the real internet response arrived over the phone's NAT
+        // (~50-200ms real). DHCP survived only because the phone answers locally
+        // within one iteration.
+        self.now = self
+            .anchor
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed();
         for _ in 0..8 {
             while let Some(event) = self.runner.device_mut().take_event() {
                 if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
@@ -197,7 +209,6 @@ impl BoundedNetstackProof {
             {}
             while self.runner.pump().received != 0 {}
         }
-        self.now += Duration::from_millis(100);
         Ok(())
     }
 

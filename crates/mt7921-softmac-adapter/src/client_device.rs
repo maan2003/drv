@@ -1065,6 +1065,10 @@ where
                         println!("client_eapol_stage=sme_tx_request");
                     }
                     let name = request.name();
+                    // Diagnostic: surface every MLME request the SME issues so the
+                    // post-4-way sequence (SetKeys GTK/IGTK, SetCtrlPort, Deauth) is
+                    // visible when the connect fails after PTK.
+                    println!("client_mlme_request name={name}");
                     wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
                         .await
                         .map_err(|error| {

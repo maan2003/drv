@@ -13284,8 +13284,12 @@ impl ProductionValidationPolicy {
     ) -> Result<Self, String> {
         let authoritative_source =
             parse_sha256_hex("2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b")?;
-        if ssid != b"ph1"
-            || bssid != [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]
+        // Two fixed validation targets are accepted, each pinning its own
+        // SSID<->BSSID pairing on channel 149: the redwood ph1 AP and the ajay
+        // phone hotspot (which does its own NAT to the internet).
+        let ph1 = ssid == b"ph1" && bssid == [0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93];
+        let ajay = ssid == b"ajay" && bssid == [0x02, 0xd3, 0xb9, 0xdd, 0xc3, 0xd0];
+        if !(ph1 || ajay)
             || channel != 149
             || client != fixed_validation_client()
             || regulatory_generation != 0
@@ -14629,6 +14633,16 @@ impl Mt7921ClientEffects for LiveClientEffects {
         let channel = *channel.as_ref().expect("authorized channel was checked");
         let channel_generation = channel.generation;
         if management {
+            // Diagnostic: identify management frames the SME emits, especially any
+            // deauth/disassoc (subtype 12/10) the SME sends to abort the connect
+            // after the 4-way handshake -- its reason code says *why* it gave up.
+            record_sae_stage(&format!(
+                "client_management_tx_intent subtype={} len={} sae={sae} associated={} reason_or_status={:?}",
+                (control >> 4) & 0xf,
+                bytes.len(),
+                self.firmware.association_generation.is_some(),
+                bytes.get(24..26).map(|b| u16::from_le_bytes([b[0], b[1]])),
+            ));
             if (sae && bytes.get(24..26) != Some(&[3, 0]))
                 || flags.contains(fidl_softmac::WlanTxInfoFlags::PROTECTED)
             {
@@ -14735,7 +14749,25 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 return Err(zx::Status::ALREADY_EXISTS);
             }
             let roc_duration_ms = if sae { 2_000 } else { 1_000 };
-            self.acquire_join_roc(io, channel, roc_duration_ms)?;
+            // JOIN ROC (Linux mgd_prepare_tx) is a pre-association primitive: it
+            // parks the radio on the target channel to exchange auth/assoc frames
+            // before we belong to the BSS. Once associated we are already parked on
+            // the operating channel (CH_SWITCH_NORMAL was programmed during the
+            // association-request ROC), and the firmware refuses a fresh JOIN ROC in
+            // the associated state -- the grant event never arrives and the acquire
+            // times out, which would abort the post-PTK handshake-tail management TX
+            // and stall the connect (controlled port never opens, no GTK). So only
+            // acquire a ROC while still pre-association; afterwards transmit directly
+            // on the already-established operating channel.
+            if self.firmware.association_generation.is_none() {
+                self.acquire_join_roc(io, channel, roc_duration_ms)?;
+            } else {
+                record_sae_stage(&format!(
+                    "join_roc_skipped reason=associated generation={:?} on_established_channel={} duration_ms={roc_duration_ms}",
+                    self.firmware.association_generation,
+                    self.established_channel == Some(channel.channel),
+                ));
+            }
             if let Err(status) = io.transmit_client(bytes, flags) {
                 let _ = self.abort_join_roc(io);
                 return Err(status);
@@ -14918,6 +14950,18 @@ impl Mt7921ClientEffects for LiveClientEffects {
             .ok_or(zx::Status::INVALID_ARGS)?;
         let key_id = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
         let key_type = configuration.key_type.ok_or(zx::Status::INVALID_ARGS)?;
+        // Diagnostic: log every SetKeys the SME issues, BEFORE the accept guards,
+        // so a GTK/IGTK rejected by key_id/cipher/peer bounds is visible (the
+        // guard-reject path returns before the *_installed log otherwise).
+        record_sae_stage(&format!(
+            "install_key_intent key_type={:?} key_id={key_id} cipher_type={:?} cipher_oui={:?} peer_broadcast={} rsc={:?} key_len={}",
+            key_type,
+            configuration.cipher_type,
+            configuration.cipher_oui,
+            configuration.peer_addr == Some([0xff; 6]),
+            configuration.rsc,
+            key.len(),
+        ));
         let io = std::cell::RefCell::new(&mut *io);
         let result = match key_type {
             fidl_ieee80211::KeyType::Pairwise
@@ -15462,6 +15506,16 @@ impl Mt7921ClientEffects for LiveClientEffects {
                         .negotiated_qos;
                     let start = eapol_start_frame(self.client, self.target, qos);
                     self.send_wlan_frame(&start, fidl_softmac::WlanTxInfoFlags::empty(), io)?;
+                    // The authenticator's M1 usually arrives right after our
+                    // EAPOL-Start. Some APs (notably phone hotspots) send the
+                    // first M1 ~1 s later than hostapd — past EAPOL_START_WAIT —
+                    // so this one-shot fires, and its associated ROC/TX churn can
+                    // leave the post-association RX-ready latch cleared. The
+                    // EAPOL-Start only emits once we have confirmed the live
+                    // association for `generation` above, so re-assert the latch
+                    // for that generation; otherwise the following M1 is dropped
+                    // as post_assoc_rx_not_ready and the 4-way handshake stalls.
+                    self.post_assoc_rx_ready_generation = Some(generation);
                     record_sae_stage("eapol_liveness type=start timer=expired one_shot=completed");
                 }
             }
@@ -15936,6 +15990,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 return Ok(None);
             }
             if eapol && !firmware_rx_ready {
+                record_sae_stage(&format!(
+                    "post_assoc_rx_ready_debug qos_tx_ready={} ready_generation={:?} association_generation={:?} eapol_start_emitted={}",
+                    self.firmware.qos_tx_ready(),
+                    self.post_assoc_rx_ready_generation,
+                    self.firmware.association_generation,
+                    self.eapol_start_emitted,
+                ));
                 drop("post_assoc_rx_not_ready");
                 return Ok(None);
             }

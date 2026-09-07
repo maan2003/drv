@@ -546,9 +546,9 @@
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'case "$#:''${1-}" in' "$launcher"
               grep -F 'DRV_PASSIVE_M1_OBSERVATION=1' "$launcher"
-              grep -F 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' "$launcher"
+              grep -F 'DRV_SAE_BSSID=02:d3:b9:dd:c3:d0' "$launcher"
               grep -F 'DRV_SAE_CHANNEL=149' "$launcher"
-              grep -F 'DRV_SAE_SSID=ph1' "$launcher"
+              grep -F 'DRV_SAE_SSID=ajay' "$launcher"
               grep -F 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$launcher"
               grep -F 'DRV_REGULATORY_SNAPSHOT_FD=4' "$launcher"
               grep -F 'DRV_REGULATORY_SNAPSHOT_LEN=' "$launcher"
@@ -823,9 +823,9 @@
                   work/launcher
                 grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
                 grep -Fx 'DRV_PASSIVE_M1_OBSERVATION=1' transcript
-                grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
+                grep -Fx 'DRV_SAE_BSSID=02:d3:b9:dd:c3:d0' transcript
                 grep -Fx 'DRV_SAE_CHANNEL=149' transcript
-                grep -Fx 'DRV_SAE_SSID=ph1' transcript
+                grep -Fx 'DRV_SAE_SSID=ajay' transcript
                 grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
                 grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
                 grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
@@ -1147,7 +1147,7 @@
                 --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
-              grep -F 'connected Wi-Fi target drifted from fixed ph1 validation policy' \
+              grep -F 'connected Wi-Fi target drifted from fixed ajay validation policy' \
                 "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -F 'bdf=%s timeout_seconds=300 watchdog_owner=' "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -Fx '"$wifi_driver_lab" "$bdf" 300 -- "$@" &' "$out/bin/mt7921-full-firmware-validation-supervisor"

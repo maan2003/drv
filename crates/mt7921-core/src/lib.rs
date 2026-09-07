@@ -7761,9 +7761,12 @@ impl ClientFirmwareEffectsState {
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("PTK install requires WCID ACK")?;
-        if rsc >> 48 != 0 {
-            return Err("PTK RSC exceeds 48 bits".into());
-        }
+        // The EAPOL Key RSC is 8 octets, but for CCMP only octets 0-5 carry the
+        // 48-bit PN; octets 6-7 are reserved. Some authenticators (notably phone
+        // hotspots) leave non-zero noise in those reserved octets, so mask down to
+        // the PN instead of rejecting -- otherwise a valid key install fails on
+        // reserved-octet garbage.
+        let rsc = rsc & 0x0000_ffff_ffff_ffff;
         let command = encode_ptk_command(
             self.next_sequence(),
             association.bss_index,
@@ -7795,9 +7798,12 @@ impl ClientFirmwareEffectsState {
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
-        if rsc >> 48 != 0 {
-            return Err("GTK RSC exceeds 48 bits".into());
-        }
+        // The EAPOL Key RSC is 8 octets, but for CCMP only octets 0-5 carry the
+        // 48-bit PN; octets 6-7 are reserved. Some authenticators (notably phone
+        // hotspots) leave non-zero noise in those reserved octets, so mask down to
+        // the PN instead of rejecting -- otherwise a valid GTK install fails on
+        // reserved-octet garbage and the connect stalls right after PTK.
+        let rsc = rsc & 0x0000_ffff_ffff_ffff;
         let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
         self.broadcast_keys_dirty = true;
         if let Err(error) = submit(3, command.as_bytes()) {
