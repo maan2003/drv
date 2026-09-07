@@ -340,8 +340,11 @@
             installPhase = ''
               runHook preInstall
               driver=$(find target -path '*/release/mt7921-passive-scan' -type f -print -quit)
+              netstack=$(find target -path '*/release/mt7921-netstack' -type f -print -quit)
               test -n "$driver"
+              test -n "$netstack"
               install -Dm0755 "$driver" "$out/libexec/mt7921-full-firmware-validation"
+              install -Dm0755 "$netstack" "$out/libexec/mt7921-netstack"
               mkdir -p "$out/share/mt7921-full-firmware-validation"
               "$out/libexec/mt7921-full-firmware-validation" --artifact-identity \
                 > "$out/share/mt7921-full-firmware-validation/artifact-identity.json"
@@ -353,6 +356,7 @@
                 "$out/bin/mt7921-full-firmware-validation" \
                 --subst-var-by shell ${pkgs.runtimeShell} \
                 --subst-var-by driver "$out/libexec/mt7921-full-firmware-validation" \
+                --subst-var-by netstack "$out/libexec/mt7921-netstack" \
                 --subst-var-by snapshot_generator "$out/libexec/mt7921-full-firmware-validation" \
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \

@@ -3,13 +3,24 @@
 ## Status
 
 Full real-internet connectivity is proven end to end through the userspace
-MT7921 driver: a single monolithic run associates to a WPA3-SAE hotspot,
-completes the 4-way handshake, and passes DHCP, DNS, TCP, and HTTP to the public
-Internet. The stack is currently one process (VFIO/DMA driver, Fuchsia MLME/SME,
-and Netstack3 co-linked); the process split, self-sandboxing, and SOCKS service
-described below are not yet built. Every connect bug found during bring-up lived
-in hand-written validation glue above the faithful hardware port, never in the
-port itself.
+MT7921 driver: it associates to a WPA3-SAE hotspot, completes the 4-way
+handshake, and passes DHCP, DNS, TCP, and HTTP to the public Internet. The
+current stack is split at the Ethernet seam: VFIO/DMA and Fuchsia MLME/SME stay
+in the driver process, while Netstack3 and the SOCKS service run in a second,
+self-sandboxed process reached only through a bounded Unix `SOCK_SEQPACKET`
+frame channel. The netstack process has an empty filesystem root, a private
+network namespace, no capabilities or device-backed mappings, and a seccomp
+allowlist; its run-state descriptors are only standard streams, the frame
+channel, the pre-bound SOCKS listener, and accepted clients. The separate DNS
+and policy processes in the mature topology below remain future work. The
+current MT7921 path deliberately leaves BCNFT disabled, retains
+`MT_WF_RFCR_DROP_OTHER_BEACON`, and keeps the MLME's host lost-BSS monitor
+active: firmware beacon-loss event `0x13` is recognized but not yet routed into
+MLME teardown. This temporarily diverges from current Linux mt7921, which
+enables BCNFT at association. The tracked destination is to complete the `0x13`
+event route, enable BCNFT and firmware connection-monitor offload, and suppress
+the host monitor as Linux `IEEE80211_HW_CONNECTION_MONITOR` does; those changes
+must land together.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)

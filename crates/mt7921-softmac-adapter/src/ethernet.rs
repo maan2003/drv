@@ -13,6 +13,7 @@ use std::fmt;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ pub struct EthernetPortProperties {
 pub enum EthernetPortConfigError {
     ZeroQueueCapacity,
     InvalidMacAddress,
+    SocketPair,
 }
 
 impl fmt::Display for EthernetPortConfigError {
@@ -74,24 +76,10 @@ pub trait EthernetFrameSeam {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InProcessFrameError {
+enum SeqpacketFrameError {
     Closed,
     Backpressure,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FrameSide {
-    Driver,
-    Netstack,
-}
-
-struct FramePipeState {
-    capacity: usize,
-    driver_open: bool,
-    netstack_open: bool,
-    driver_to_netstack: VecDeque<EthernetFrame>,
-    netstack_to_driver: VecDeque<EthernetFrame>,
-    netstack_events: VecDeque<EthernetDeviceEvent>,
+    InvalidFrame(usize),
 }
 
 struct PortLifecycleState {
@@ -100,103 +88,171 @@ struct PortLifecycleState {
     events: VecDeque<EthernetDeviceEvent>,
 }
 
-struct InProcessFrameEndpoint {
-    state: Arc<Mutex<FramePipeState>>,
-    side: FrameSide,
+struct SeqpacketFrameEndpoint {
+    fd: Option<OwnedFd>,
+    receive_notified: bool,
+    transmit_blocked: bool,
 }
 
-impl InProcessFrameEndpoint {
+impl SeqpacketFrameEndpoint {
     fn discard_frames(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        zeroize_frames(&mut state.driver_to_netstack);
-        zeroize_frames(&mut state.netstack_to_driver);
-        state.netstack_events.retain(|event| {
-            !matches!(
-                event,
-                EthernetDeviceEvent::ReceiveReady | EthernetDeviceEvent::TransmitReady
-            )
-        });
+        let mut bytes = [0u8; 1515];
+        while unsafe { recv(self.raw_fd(), bytes.as_mut_ptr(), bytes.len(), MSG_DONTWAIT) } > 0 {}
+        bytes.fill(0);
+        self.receive_notified = false;
+        self.transmit_blocked = false;
     }
 
     fn close(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        match self.side {
-            FrameSide::Driver => state.driver_open = false,
-            FrameSide::Netstack => state.netstack_open = false,
-        }
-        zeroize_frames(&mut state.driver_to_netstack);
-        zeroize_frames(&mut state.netstack_to_driver);
-        state.netstack_events.clear();
+        self.fd.take();
     }
 
     fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
-        self.state.lock().unwrap().netstack_events.pop_front()
+        let mut descriptor = PollFd {
+            fd: self.raw_fd(),
+            events: POLLIN | if self.transmit_blocked { POLLOUT } else { 0 },
+            revents: 0,
+        };
+        if unsafe { poll(&mut descriptor, 1, 0) } <= 0 {
+            return None;
+        }
+        if descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+            return Some(EthernetDeviceEvent::LinkStateChanged(false));
+        }
+        if descriptor.revents & POLLIN != 0 && !self.receive_notified {
+            self.receive_notified = true;
+            return Some(EthernetDeviceEvent::ReceiveReady);
+        }
+        if descriptor.revents & POLLOUT != 0 && self.transmit_blocked {
+            self.transmit_blocked = false;
+            return Some(EthernetDeviceEvent::TransmitReady);
+        }
+        None
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+    }
+
+    fn take_fd(&mut self) -> OwnedFd {
+        self.fd.take().expect("frame endpoint is open")
     }
 }
 
-impl Drop for InProcessFrameEndpoint {
+impl Drop for SeqpacketFrameEndpoint {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl EthernetFrameSeam for InProcessFrameEndpoint {
-    type Error = InProcessFrameError;
+impl EthernetFrameSeam for SeqpacketFrameEndpoint {
+    type Error = SeqpacketFrameError;
 
     /// Attempt to send exactly one whole frame without blocking.
     fn try_send_frame(&mut self, frame: EthernetFrame) -> Result<(), (Self::Error, EthernetFrame)> {
-        let mut state = self.state.lock().unwrap();
-        let capacity = state.capacity;
-        let (peer_open, queue) = match self.side {
-            FrameSide::Driver => (state.netstack_open, &mut state.driver_to_netstack),
-            FrameSide::Netstack => (state.driver_open, &mut state.netstack_to_driver),
+        let sent = unsafe {
+            send(
+                self.raw_fd(),
+                frame.as_bytes().as_ptr(),
+                frame.as_bytes().len(),
+                MSG_DONTWAIT | MSG_NOSIGNAL,
+            )
         };
-        if !peer_open {
-            return Err((InProcessFrameError::Closed, frame));
+        if sent == frame.as_bytes().len() as isize {
+            return Ok(());
         }
-        if queue.len() == capacity {
-            return Err((InProcessFrameError::Backpressure, frame));
-        }
-        queue.push_back(frame);
-        if self.side == FrameSide::Driver {
-            push_event(
-                &mut state.netstack_events,
-                EthernetDeviceEvent::ReceiveReady,
-            );
-        }
-        Ok(())
+        let error = std::io::Error::last_os_error();
+        let kind = if error.kind() == ErrorKind::WouldBlock {
+            self.transmit_blocked = true;
+            SeqpacketFrameError::Backpressure
+        } else {
+            SeqpacketFrameError::Closed
+        };
+        Err((kind, frame))
     }
 
     fn try_receive_frame(&mut self) -> Result<Option<EthernetFrame>, Self::Error> {
-        let mut state = self.state.lock().unwrap();
-        let (peer_open, queue) = match self.side {
-            FrameSide::Driver => (state.netstack_open, &mut state.netstack_to_driver),
-            FrameSide::Netstack => (state.driver_open, &mut state.driver_to_netstack),
+        let mut bytes = [0u8; 1514];
+        let received = unsafe {
+            recv(
+                self.raw_fd(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                MSG_DONTWAIT | MSG_TRUNC,
+            )
         };
-        if !peer_open {
-            return Err(InProcessFrameError::Closed);
+        if received == 0 {
+            return Err(SeqpacketFrameError::Closed);
         }
-        let frame = queue.pop_front();
-        if frame.is_some() && self.side == FrameSide::Driver {
-            push_event(
-                &mut state.netstack_events,
-                EthernetDeviceEvent::TransmitReady,
-            );
+        if received < 0 {
+            return match std::io::Error::last_os_error().kind() {
+                ErrorKind::WouldBlock => {
+                    self.receive_notified = false;
+                    Ok(None)
+                }
+                _ => Err(SeqpacketFrameError::Closed),
+            };
         }
-        Ok(frame)
+        let received = received as usize;
+        if received > 1514 {
+            return Err(SeqpacketFrameError::InvalidFrame(received));
+        }
+        EthernetFrame::copy_from_slice(&bytes[..received])
+            .map(Some)
+            .map_err(|_| SeqpacketFrameError::InvalidFrame(received))
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const AF_UNIX: i32 = 1;
+const SOCK_SEQPACKET: i32 = 5;
+const SOCK_NONBLOCK: i32 = 0x800;
+const SOCK_CLOEXEC: i32 = 0x80000;
+const MSG_DONTWAIT: i32 = 0x40;
+const MSG_TRUNC: i32 = 0x20;
+const MSG_NOSIGNAL: i32 = 0x4000;
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+unsafe extern "C" {
+    fn socketpair(domain: i32, socket_type: i32, protocol: i32, sockets: *mut i32) -> i32;
+    fn send(fd: i32, bytes: *const u8, len: usize, flags: i32) -> isize;
+    fn recv(fd: i32, bytes: *mut u8, len: usize, flags: i32) -> isize;
+    fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+}
+
+fn set_nonblocking(fd: RawFd) -> Result<(), ()> {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: i32 = 0x800;
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 || unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        Err(())
+    } else {
+        Ok(())
     }
 }
 
 /// Netstack3-facing half of the port.
 pub struct Mt7921EthernetDevice {
-    seam: InProcessFrameEndpoint,
+    seam: SeqpacketFrameEndpoint,
     lifecycle: Arc<Mutex<PortLifecycleState>>,
 }
 
 /// Driver-side endpoint retained by `Mt7921ClientDevice`. The controlled-port
 /// gate is deliberately outside [`EthernetFrameSeam`].
 pub(crate) struct DriverEthernetPort {
-    seam: InProcessFrameEndpoint,
+    seam: SeqpacketFrameEndpoint,
     lifecycle: Arc<Mutex<PortLifecycleState>>,
 }
 
@@ -233,7 +289,6 @@ pub struct BoundedNetstackProof {
     anchor: Option<std::time::Instant>,
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
-    tx_dropped: u64,
 }
 
 const MAX_SOCKS5_CLIENTS: usize = 24;
@@ -310,24 +365,13 @@ impl BoundedNetstackProof {
             anchor: None,
             resolved: None,
             socket: None,
-            tx_dropped: 0,
         })
     }
 
-    fn drive<T: AssociatedDataPump>(
-        &mut self,
-        target: &mut T,
-        deadline: std::time::Instant,
-    ) -> Result<(), &'static str> {
+    fn drive(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         if std::time::Instant::now() >= deadline {
             return Err("Netstack proof deadline");
         }
-        // Advance the netstack's virtual clock at real wall-clock time. The old
-        // fixed +100ms-per-iteration bump raced seconds ahead within a few ms of
-        // busy-looping, so the DNS/TCP resolver's timers expired (in virtual time)
-        // long before the real internet response arrived over the phone's NAT
-        // (~50-200ms real). DHCP survived only because the phone answers locally
-        // within one iteration.
         self.now = self
             .anchor
             .get_or_insert_with(std::time::Instant::now)
@@ -338,61 +382,26 @@ impl BoundedNetstackProof {
                     self.runner.discard_pending();
                     self.resolved = None;
                     self.socket = None;
+                    return Err("Ethernet frame seam closed");
                 }
                 self.runner.stack_mut().on_device_event(event);
             }
             self.runner.stack_mut().poll_at(self.now, 64);
             while self.runner.pump().transmitted != 0 {}
-            loop {
-                match target.pump_transmit() {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(EthernetTxPumpError::Target(_)) => {
-                        // The MAC could not deliver this frame (for example fifteen
-                        // unacknowledged attempts); it is dropped like on any NIC and
-                        // the netstack retransmits at its own cadence.
-                        self.tx_dropped += 1;
-                        println!(
-                            "client_data_tx_error stage=ethernet_pump kind=target_rejected dropped_total={}",
-                            self.tx_dropped
-                        );
-                    }
-                    Err(error) => {
-                        let kind = match error {
-                            EthernetTxPumpError::Closed => "closed",
-                            EthernetTxPumpError::LinkDown => "link_down",
-                            EthernetTxPumpError::Target(_) => "target_rejected",
-                        };
-                        println!("client_data_tx_error stage=ethernet_pump kind={kind}");
-                        return Err("associated data TX failed");
-                    }
-                }
-            }
-            while target
-                .pump_receive(deadline)
-                .map_err(|_| "associated data RX failed")?
-            {}
             while self.runner.pump().received != 0 {}
         }
+        std::thread::sleep(Duration::from_millis(1));
         Ok(())
     }
 
-    pub fn prove_dhcp<T: AssociatedDataPump>(
-        &mut self,
-        target: &mut T,
-        deadline: std::time::Instant,
-    ) -> Result<(), &'static str> {
+    pub fn prove_dhcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         while self.runner.stack().status() != DhcpStatus::Bound {
-            self.drive(target, deadline)?;
+            self.drive(deadline)?;
         }
         Ok(())
     }
 
-    pub fn prove_dns<T: AssociatedDataPump>(
-        &mut self,
-        target: &mut T,
-        deadline: std::time::Instant,
-    ) -> Result<(), &'static str> {
+    pub fn prove_dns(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         if self.runner.stack().status() != DhcpStatus::Bound {
             return Err("DNS requires DHCP");
         }
@@ -402,7 +411,7 @@ impl BoundedNetstackProof {
             .lookup_ip(self.config.dns_name.clone())
             .map_err(|_| "DNS start failed")?;
         loop {
-            self.drive(target, deadline)?;
+            self.drive(deadline)?;
             if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
                 let addresses = result.map_err(|_| "DNS lookup failed")?;
                 self.resolved = addresses.into_iter().find_map(|address| match address {
@@ -417,11 +426,7 @@ impl BoundedNetstackProof {
         }
     }
 
-    pub fn prove_tcp<T: AssociatedDataPump>(
-        &mut self,
-        target: &mut T,
-        deadline: std::time::Instant,
-    ) -> Result<(), &'static str> {
+    pub fn prove_tcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         let address = self.resolved.ok_or("TCP requires DNS")?;
         let mut provider = self.runner.stack().socket_provider();
         let client =
@@ -440,7 +445,7 @@ impl BoundedNetstackProof {
             )
             .map_err(|_| "TCP connect failed")?;
         loop {
-            self.drive(target, deadline)?;
+            self.drive(deadline)?;
             let ready = RemoteSocketProvider::readiness(&mut provider, socket)
                 .map_err(|_| "TCP readiness failed")?;
             if ready.writable {
@@ -450,11 +455,7 @@ impl BoundedNetstackProof {
         }
     }
 
-    pub fn prove_http<T: AssociatedDataPump>(
-        &mut self,
-        target: &mut T,
-        deadline: std::time::Instant,
-    ) -> Result<(), &'static str> {
+    pub fn prove_http(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         let socket = self.socket.ok_or("HTTP requires TCP")?;
         let mut provider = self.runner.stack().socket_provider();
         let written = provider
@@ -465,7 +466,7 @@ impl BoundedNetstackProof {
         }
         let mut response = vec![0; 4096];
         loop {
-            self.drive(target, deadline)?;
+            self.drive(deadline)?;
             match provider.tcp_read(socket, &mut response) {
                 Ok(read) if read != 0 => {
                     return response[..read]
@@ -483,30 +484,39 @@ impl BoundedNetstackProof {
     /// by the bounded bring-up proof. The host listener is only a byte-stream
     /// handoff: all remote DNS and TCP traffic goes through Netstack3 and the
     /// associated SoftMAC data pump.
-    pub fn serve_socks5<T, F>(
+    pub fn serve_socks5<F>(
         &mut self,
-        target: &mut T,
         listen: SocketAddr,
         deadline: std::time::Instant,
-        mut stop_requested: F,
+        stop_requested: F,
     ) -> Result<(), &'static str>
     where
-        T: AssociatedDataPump,
         F: FnMut() -> bool,
     {
         if self.runner.stack().status() != DhcpStatus::Bound {
             return Err("SOCKS5 requires DHCP");
         }
         let listener = TcpListener::bind(listen).map_err(|_| "SOCKS5 bind failed")?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "SOCKS5 nonblocking setup failed")?;
+        set_nonblocking(listener.as_raw_fd()).map_err(|_| "SOCKS5 nonblocking setup failed")?;
+        self.serve_socks5_listener(listener, listen, deadline, stop_requested)
+    }
+
+    pub fn serve_socks5_listener<F>(
+        &mut self,
+        listener: TcpListener,
+        listen: SocketAddr,
+        deadline: std::time::Instant,
+        mut stop_requested: F,
+    ) -> Result<(), &'static str>
+    where
+        F: FnMut() -> bool,
+    {
         let mut clients = Vec::new();
         println!("internet_proxy_ready=true listen={listen}");
         while !stop_requested() && std::time::Instant::now() < deadline {
             // Exactly one shared Netstack3 drive precedes a bounded amount of
             // work for every client. No client-specific wait can delay another.
-            if let Err(error) = self.drive(target, deadline) {
+            if let Err(error) = self.drive(deadline) {
                 for client in &mut clients {
                     self.close_socks5_client(client);
                 }
@@ -515,7 +525,7 @@ impl BoundedNetstackProof {
             for _ in 0..32 {
                 match listener.accept() {
                     Ok((stream, peer)) if clients.len() < MAX_SOCKS5_CLIENTS => {
-                        if stream.set_nonblocking(true).is_err() {
+                        if set_nonblocking(stream.as_raw_fd()).is_err() {
                             println!(
                                 "internet_proxy_client_error=SOCKS5 client nonblocking setup failed peer={peer}"
                             );
@@ -875,14 +885,20 @@ pub(crate) fn ethernet_port(
     if mac_address == [0; 6] || mac_address[0] & 1 != 0 {
         return Err(EthernetPortConfigError::InvalidMacAddress);
     }
-    let pipe = Arc::new(Mutex::new(FramePipeState {
-        capacity: queue_capacity,
-        driver_open: true,
-        netstack_open: true,
-        driver_to_netstack: VecDeque::with_capacity(queue_capacity),
-        netstack_to_driver: VecDeque::with_capacity(queue_capacity),
-        netstack_events: VecDeque::with_capacity(queue_capacity.saturating_mul(2)),
-    }));
+    let mut sockets = [-1; 2];
+    if unsafe {
+        socketpair(
+            AF_UNIX,
+            SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(EthernetPortConfigError::SocketPair);
+    }
+    let driver_fd = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+    let netstack_fd = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
     let lifecycle = Arc::new(Mutex::new(PortLifecycleState {
         properties: Some(EthernetPortProperties {
             mac_address,
@@ -893,16 +909,18 @@ pub(crate) fn ethernet_port(
     }));
     Ok((
         Mt7921EthernetDevice {
-            seam: InProcessFrameEndpoint {
-                state: pipe.clone(),
-                side: FrameSide::Netstack,
+            seam: SeqpacketFrameEndpoint {
+                fd: Some(netstack_fd),
+                receive_notified: false,
+                transmit_blocked: false,
             },
             lifecycle: lifecycle.clone(),
         },
         DriverEthernetPort {
-            seam: InProcessFrameEndpoint {
-                state: pipe,
-                side: FrameSide::Driver,
+            seam: SeqpacketFrameEndpoint {
+                fd: Some(driver_fd),
+                receive_notified: false,
+                transmit_blocked: false,
             },
             lifecycle,
         },
@@ -912,6 +930,30 @@ pub(crate) fn ethernet_port(
 impl Mt7921EthernetDevice {
     pub fn properties(&self) -> Option<EthernetPortProperties> {
         self.lifecycle.lock().unwrap().properties
+    }
+
+    pub fn into_frame_fd(mut self) -> OwnedFd {
+        self.seam.take_fd()
+    }
+
+    /// Reconstruct the netstack side from the sole frame capability passed by
+    /// the trusted launcher.
+    pub unsafe fn from_frame_fd(fd: OwnedFd, mac_address: [u8; 6]) -> Self {
+        Self {
+            seam: SeqpacketFrameEndpoint {
+                fd: Some(fd),
+                receive_notified: false,
+                transmit_blocked: false,
+            },
+            lifecycle: Arc::new(Mutex::new(PortLifecycleState {
+                properties: Some(EthernetPortProperties {
+                    mac_address,
+                    mtu: MT7921_ETHERNET_MTU,
+                }),
+                link_up: true,
+                events: VecDeque::from([EthernetDeviceEvent::LinkStateChanged(true)]),
+            })),
+        }
     }
 }
 
@@ -935,12 +977,13 @@ impl EthernetDevice for Mt7921EthernetDevice {
 
 impl EthernetEventSource for Mt7921EthernetDevice {
     fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
-        self.lifecycle
-            .lock()
-            .unwrap()
-            .events
-            .pop_front()
-            .or_else(|| self.seam.take_event())
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        let event = lifecycle.events.pop_front();
+        if event.is_some() || !lifecycle.link_up || lifecycle.properties.is_none() {
+            return event;
+        }
+        drop(lifecycle);
+        self.seam.take_event()
     }
 }
 
@@ -1054,8 +1097,15 @@ impl DriverEthernetPort {
         self.seam
             .try_send_frame(frame)
             .map_err(|(error, _)| match error {
-                InProcessFrameError::Closed => EthernetIngressError::Closed,
-                InProcessFrameError::Backpressure => EthernetIngressError::Backpressure,
+                SeqpacketFrameError::Closed => EthernetIngressError::Closed,
+                SeqpacketFrameError::Backpressure => EthernetIngressError::Backpressure,
+                SeqpacketFrameError::InvalidFrame(len) => {
+                    EthernetIngressError::InvalidFrame(if len < 14 {
+                        FrameSizeError::TooShort { len }
+                    } else {
+                        FrameSizeError::TooLong { len }
+                    })
+                }
             })
     }
 
@@ -1068,8 +1118,15 @@ impl DriverEthernetPort {
             return Err(EthernetIngressError::LinkDown);
         }
         self.seam.try_receive_frame().map_err(|error| match error {
-            InProcessFrameError::Closed => EthernetIngressError::Closed,
-            InProcessFrameError::Backpressure => unreachable!(),
+            SeqpacketFrameError::Closed => EthernetIngressError::Closed,
+            SeqpacketFrameError::Backpressure => unreachable!(),
+            SeqpacketFrameError::InvalidFrame(len) => {
+                EthernetIngressError::InvalidFrame(if len < 14 {
+                    FrameSizeError::TooShort { len }
+                } else {
+                    FrameSizeError::TooLong { len }
+                })
+            }
         })
     }
 
@@ -1079,6 +1136,7 @@ impl DriverEthernetPort {
             state.link_up = up;
             if !up {
                 self.seam.discard_frames();
+                self.seam.close();
                 state.events.retain(|event| {
                     !matches!(
                         event,
@@ -1111,13 +1169,6 @@ impl DriverEthernetPort {
 impl Drop for DriverEthernetPort {
     fn drop(&mut self) {
         self.teardown();
-    }
-}
-
-fn zeroize_frames(frames: &mut VecDeque<EthernetFrame>) {
-    for frame in frames.drain(..) {
-        let mut bytes = frame.into_vec();
-        bytes.fill(0);
     }
 }
 
@@ -1225,15 +1276,23 @@ mod tests {
         sink.set_link(true);
         device.transmit(arp.clone()).unwrap();
         let data = frame([0x08, 0x00], 2);
-        assert_eq!(device.transmit(data.clone()), Err(data));
+        let mut queued = 1;
+        loop {
+            match device.transmit(data.clone()) {
+                Ok(()) => queued += 1,
+                Err(frame) => {
+                    assert_eq!(frame, data);
+                    break;
+                }
+            }
+        }
+        assert!(queued > 1);
         let mut target = TxTarget {
             blocked: true,
             ..Default::default()
         };
         let frame = sink.take_transmit().unwrap().unwrap();
         assert_eq!(target.transmit_ethernet(frame.as_bytes()), Err(()));
-        target.blocked = false;
-        assert_eq!(sink.take_transmit(), Ok(None));
         sink.teardown();
         assert_eq!(device.properties(), None);
         assert_eq!(device.receive(), None);

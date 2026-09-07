@@ -7099,9 +7099,7 @@ pub fn client_data_mpdu_to_ethernet(mpdu: &[u8]) -> Result<Vec<u8>, String> {
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .ok_or("client data MPDU omitted frame control")?;
     if fc & 0x000c != 0x0008 || fc & 0x0300 != 0x0100 || fc & 0x8000 != 0 {
-        return Err(
-            "client data header translation requires a To-DS data MPDU without HTC".into(),
-        );
+        return Err("client data header translation requires a To-DS data MPDU without HTC".into());
     }
     if fc & 0x0040 != 0 {
         return Err("client data header translation requires a non-null data subtype".into());
@@ -7252,16 +7250,21 @@ pub fn encode_client_management_tx(
         .get(..2)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .ok_or("management frame omitted control")?;
-    if control & 0x000c != 0 || frame.len() < 30 {
+    if control & 0x000c != 0 || !(24..=0x0fff).contains(&frame.len()) {
         return Err("client management TX requires one complete management MPDU".into());
     }
     // The existing golden encoder owns the complete Linux TXWI/TXP envelope.
-    // Management subtypes differ only in TXD2's frame-subtype nibble.
+    // Pad short valid management subtypes (for example a 26-byte deauth) only
+    // while obtaining that envelope; the published DMA length remains exact.
     let mut auth_shape = frame.to_vec();
+    auth_shape.resize(30, 0);
     auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
     let mut encoded =
         encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, token, pid, 19)
             .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
+    let mut txd0 = u32::from_le_bytes(encoded.txwi[0..4].try_into().unwrap());
+    txd0 = (txd0 & !0xffff) | ((frame.len() as u32 + 32) & 0xffff);
+    encoded.txwi[0..4].copy_from_slice(&txd0.to_le_bytes());
     let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
     txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
     encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
@@ -7281,7 +7284,7 @@ pub struct ClientFirmwareEffectsState {
     pub association: Option<LegacyWmeAssociation>,
     pub edca_programmed: Option<ClientEdcaParameters>,
     pub post_assoc_interface_programmed: bool,
-    pub post_assoc_beacon_timing_programmed: bool,
+    pub post_assoc_beacon_policy_selected: bool,
     pub post_assoc_rx_filter_published: bool,
     pub post_assoc_rlm_programmed: bool,
     pub sequence: u8,
@@ -7346,7 +7349,7 @@ impl ClientFirmwareEffectsState {
     pub fn qos_tx_ready(&self) -> bool {
         self.bss_programmed
             && self.post_assoc_interface_programmed
-            && self.post_assoc_beacon_timing_programmed
+            && self.post_assoc_beacon_policy_selected
             && self.post_assoc_rx_filter_published
             && self.post_assoc_rlm_programmed
             && (self
@@ -7367,7 +7370,7 @@ impl ClientFirmwareEffectsState {
             .joined
             .ok_or("post-association interface update requires joined BSS")?;
         if self.post_assoc_interface_programmed
-            || self.post_assoc_beacon_timing_programmed
+            || self.post_assoc_beacon_policy_selected
             || self.post_assoc_rx_filter_published
             || !self.post_assoc_rlm_programmed
             || self.firmware_uncertain
@@ -7383,14 +7386,11 @@ impl ClientFirmwareEffectsState {
         self.firmware_uncertain = true;
         submit_uni(3, &command)?;
         self.post_assoc_interface_programmed = true;
-        let beacon = encode_client_post_assoc_beacon_timing_command(
-            self.next_sequence(),
-            association.bss_index,
-            joined.beacon_interval,
-            joined.dtim_period,
-        )?;
-        submit_uni(2, &beacon)?;
-        self.post_assoc_beacon_timing_programmed = true;
+        // Linux currently enables BCNFT unconditionally at association. This
+        // host port deliberately keeps it disabled until firmware beacon-loss
+        // event 0x13 is routed into MLME teardown; otherwise BCNFT suppresses
+        // the beacons required by the only complete liveness monitor.
+        self.post_assoc_beacon_policy_selected = true;
         // Linux bss_info_changed(BSS_CHANGED_PS) -> mt7921_mcu_uni_bss_ps. The
         // host runs no power-save policy, so pin the BSS awake (ps_state 0);
         // without an explicit state the firmware was observed dozing
@@ -8003,7 +8003,7 @@ impl ClientFirmwareEffectsState {
         self.controlled_port_open = false;
         self.edca_programmed = None;
         self.post_assoc_interface_programmed = false;
-        self.post_assoc_beacon_timing_programmed = false;
+        self.post_assoc_beacon_policy_selected = false;
         self.post_assoc_rlm_programmed = false;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
@@ -9392,7 +9392,10 @@ mod tests {
         let mut plain = mpdu.clone();
         plain[0] = 0x08;
         plain.drain(24..26);
-        assert_eq!(super::client_data_mpdu_to_ethernet(&plain).unwrap(), ethernet);
+        assert_eq!(
+            super::client_data_mpdu_to_ethernet(&plain).unwrap(),
+            ethernet
+        );
 
         // QoS-null, From-DS, HTC and raw LLC shapes are refused.
         let mut null = mpdu.clone();
@@ -9409,9 +9412,11 @@ mod tests {
         assert!(super::client_data_mpdu_to_ethernet(&llc).is_err());
 
         // The 802.3 TXD carries the TID and PROTECT_FRAME, no fixed rate.
-        let txwi = super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
-            .unwrap();
-        let dw = |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
+        let txwi =
+            super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
+                .unwrap();
+        let dw =
+            |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
         assert_eq!(dw(1), 0x8060_8007);
         assert_eq!(dw(2), 0x28);
         assert_eq!(dw(3) & 0x8000_0002, 0x2);
@@ -9925,21 +9930,25 @@ mod tests {
             .unwrap();
         let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 13);
-        assert_eq!(
-            transcript
+        let command_ids = transcript
+            .iter()
+            .map(|command| {
+                let cid = u16::from_le_bytes([command[34], command[35]]);
+                if cid == 0x8000 {
+                    u16::from(command[36])
+                } else {
+                    cid
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(command_ids, [3, 2, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]);
+        assert!(
+            !transcript
                 .iter()
-                .map(|command| {
-                    let cid = u16::from_le_bytes([command[34], command[35]]);
-                    if cid == 0x8000 {
-                        u16::from(command[36])
-                    } else {
-                        cid
-                    }
-                })
-                .collect::<Vec<_>>(),
-            [3, 2, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]
+                .any(|command| command.get(52..56) == Some(&[22, 0, 8, 0])),
+            "non-PS association must not enable BCNFT"
         );
+        assert_eq!(&transcript[9][76..80], &(1u32 << 11).to_le_bytes());
         assert_eq!(transcript[9][80], 1);
         assert_eq!(transcript[10][80], 2);
         assert!(!state.post_assoc_rx_filter_published);

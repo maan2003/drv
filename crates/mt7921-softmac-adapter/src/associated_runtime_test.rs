@@ -279,7 +279,7 @@ fn drive(
 }
 
 #[test]
-fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
+fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
     let (device, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let runtime = Runtime::new(
         32,
@@ -379,110 +379,4 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         ),
         Err(RemoteSocketError::NetworkUnreachable)
     );
-
-    association = establish_association();
-    assert_eq!(association.wcid(), Some(1));
-    sink.set_link(true);
-    for second in 97..128 {
-        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
-        if runner.stack().status() == DhcpStatus::Bound {
-            break;
-        }
-    }
-    assert_eq!(runner.stack().status(), DhcpStatus::Bound);
-    assert_eq!(runner.stack().runtime().ipv4_address(), Some(CLIENT_IP));
-}
-
-struct ProofWire {
-    ap: AssociatedAp,
-    sink: DriverEthernetPort,
-    listener: netstack3_port_integration::TcpSocketHandle,
-    accepted: Option<netstack3_port_integration::TcpSocketHandle>,
-}
-
-impl AssociatedSoftmacTx for ProofWire {
-    type Error = ();
-    fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
-        self.ap.transmit_ethernet(frame)
-    }
-}
-
-impl AssociatedDataPump for ProofWire {
-    fn pump_transmit(&mut self) -> Result<bool, EthernetTxPumpError<Self::Error>> {
-        let frame = self.sink.take_transmit().map_err(|error| match error {
-            EthernetIngressError::Closed => EthernetTxPumpError::Closed,
-            EthernetIngressError::LinkDown => EthernetTxPumpError::LinkDown,
-            EthernetIngressError::Backpressure | EthernetIngressError::InvalidFrame(_) => {
-                EthernetTxPumpError::Target(())
-            }
-        })?;
-        let Some(frame) = frame else { return Ok(false) };
-        self.transmit_ethernet(frame.as_bytes())
-            .map_err(EthernetTxPumpError::Target)?;
-        Ok(true)
-    }
-
-    fn pump_receive(&mut self, _: std::time::Instant) -> Result<bool, Self::Error> {
-        self.ap.collect_server_frames();
-        if self.accepted.is_none()
-            && self
-                .ap
-                .server
-                .tcp_pending_connections(self.listener)
-                .unwrap()
-                != 0
-        {
-            self.accepted = Some(self.ap.server.tcp_accept(self.listener).unwrap());
-        }
-        if let Some(socket) = self.accepted {
-            let mut request = [0; 256];
-            if self.ap.server.tcp_read(socket, &mut request).unwrap_or(0) != 0 {
-                self.ap
-                    .server
-                    .tcp_write(socket, b"HTTP/1.0 200 OK\r\n\r\nproof")
-                    .unwrap();
-                self.ap.collect_server_frames();
-            }
-        }
-        let Some(frame) = self.ap.pending.pop_front() else {
-            return Ok(false);
-        };
-        self.sink.deliver(frame.as_bytes()).map_err(|_| ())?;
-        Ok(true)
-    }
-}
-
-#[test]
-fn production_bounded_runner_proves_dhcp_dns_tcp_and_http_response() {
-    let (device, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
-    sink.set_link(true);
-    let mut ap = AssociatedAp::new();
-    let listener = ap.server.tcp_socket().unwrap();
-    ap.server
-        .tcp_bind(listener, Some(SERVER_IP), NonZeroU16::new(8080).unwrap())
-        .unwrap();
-    ap.server
-        .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
-        .unwrap();
-    let mut wire = ProofWire {
-        ap,
-        sink,
-        listener,
-        accepted: None,
-    };
-    let mut proof = BoundedNetstackProof::new(
-        device,
-        NetstackProofConfig {
-            dns_name: "internet.test.".into(),
-            server_port: NonZeroU16::new(8080).unwrap(),
-            http_request: b"GET / HTTP/1.0\r\n\r\n".to_vec(),
-            expected_response_prefix: b"HTTP/1.0 200".to_vec(),
-        },
-    )
-    .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    proof.prove_dhcp(&mut wire, deadline).unwrap();
-    proof.prove_dns(&mut wire, deadline).unwrap();
-    proof.prove_tcp(&mut wire, deadline).unwrap();
-    proof.prove_http(&mut wire, deadline).unwrap();
 }

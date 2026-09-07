@@ -41,18 +41,19 @@ use mt7921_port_spike::{
     encode_client_post_assoc_beacon_timing_command,
     encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_power_state_command,
     encode_client_post_assoc_rlm_command, encode_client_post_assoc_rx_filter_clear_command,
-    encode_client_post_assoc_rx_filter_command, encode_conservative_rate_tx_power_commands,
-    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
-    encode_legacy_wme_add_wcid_command, encode_passive_mcu_command, encode_ptk_command,
-    encode_regulatory_rate_tx_power_commands, encode_remove_wcid_command,
-    linux_legacy_rate_context_reference, linux_preauth_rate_context_reference,
-    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
-    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
-    narrow_regulatory_rate_power_snapshot, parse_client_join_roc_grant, parse_connac2_rx_frame,
-    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
-    passive_mac_mmio_plan, passive_mac_source_rmw_value, prepare_data_rx_ring,
-    regulatory_rate_power_channel_skeleton, regulatory_rate_power_snapshot_from_regdb_v20,
-    set_client_txwi_wcid, validate_passive_mac_bar_read,
+    encode_client_post_assoc_rx_filter_command, encode_client_preauth_bss_command,
+    encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
+    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
+    encode_passive_mcu_command, encode_ptk_command, encode_regulatory_rate_tx_power_commands,
+    encode_remove_wcid_command, linux_legacy_rate_context_reference,
+    linux_preauth_rate_context_reference, linux_qos_eapol_control_port_reference,
+    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
+    load_mt7921_firmware_with_passive_boundary, narrow_regulatory_rate_power_snapshot,
+    parse_client_join_roc_grant, parse_connac2_rx_frame, parse_passive_advertisement,
+    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
+    passive_mac_source_rmw_value, prepare_data_rx_ring, regulatory_rate_power_channel_skeleton,
+    regulatory_rate_power_snapshot_from_regdb_v20, set_client_txwi_wcid,
+    validate_passive_mac_bar_read,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -83,10 +84,9 @@ use mt7921_port_spike::{
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
     ClientChannelEnsure, ClientRxFrame, ClientRxSecurity, ClientSupport, Mt7921ClientDevice,
-    Mt7921ClientEffects, PassiveM1SnapshotPoint, PinnedClientRuntime,
+    Mt7921ClientEffects, PassiveM1SnapshotPoint, PinnedClientRuntime, PinnedConnectError,
+    PinnedDriverError,
 };
-#[cfg(feature = "fuchsia-passive")]
-use mt7921_softmac_adapter::ethernet::{BoundedNetstackProof, NetstackProofConfig};
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
     LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
@@ -106,9 +106,12 @@ use std::{
     env,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    net::{SocketAddr, TcpListener},
     num::{NonZeroU16, NonZeroU64},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    process::{Command, Stdio},
+    os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
+    process::{Child, Command, Stdio},
     ptr::NonNull,
     sync::{
         Arc, Mutex,
@@ -422,6 +425,8 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn dup2(old_fd: i32, new_fd: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
     #[link_name = "write"]
     fn write_fd(fd: i32, buffer: *const u8, count: usize) -> isize;
@@ -472,6 +477,241 @@ impl Drop for ActiveSignalGuard {
         }
         STOP_REQUESTED.store(false, Ordering::Release);
     }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct NetstackChildGuard {
+    child: Child,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl NetstackChildGuard {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child
+            .try_wait()
+            .map_err(|error| format!("wait for netstack child: {error}"))
+    }
+
+    fn wait_after_seam_closed(&mut self) -> Result<std::process::ExitStatus, String> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                self.terminate();
+                return Err("netstack closed the frame seam without exiting".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl Drop for NetstackChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 10) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate netstack capability: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn spawn_netstack_child(
+    device: mt7921_softmac_adapter::ethernet::Mt7921EthernetDevice,
+    listener: TcpListener,
+    listen: SocketAddr,
+    seconds: u64,
+) -> Result<NetstackChildGuard, String> {
+    let binary = env::var("DRV_NETSTACK_BINARY").map_err(|_| "DRV_NETSTACK_BINARY is required")?;
+    let frame = device.into_frame_fd();
+    let (mut bootstrap_parent, bootstrap_child) =
+        UnixStream::pair().map_err(|error| format!("create netstack bootstrap pair: {error}"))?;
+    let frame_pass = duplicate_capability(frame.as_raw_fd())?;
+    let listener_pass = duplicate_capability(listener.as_raw_fd())?;
+    let bootstrap_pass = duplicate_capability(bootstrap_child.as_raw_fd())?;
+    let frame_fd = frame_pass.as_raw_fd();
+    let listener_fd = listener_pass.as_raw_fd();
+    let bootstrap_fd = bootstrap_pass.as_raw_fd();
+    let mut command = Command::new(binary);
+    command
+        .env_clear()
+        .env(
+            "DRV_SAE_CLIENT_MAC",
+            env::var("DRV_SAE_CLIENT_MAC").map_err(|_| "missing client MAC")?,
+        )
+        .env("DRV_SOCKS5_LISTEN", listen.to_string())
+        .env("DRV_DAEMON_MAX_SECONDS", seconds.to_string())
+        .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in [(frame_fd, 3), (listener_fd, 4), (bootstrap_fd, 5)] {
+                if dup2(source, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("spawn netstack child: {error}"))?;
+    let child = NetstackChildGuard { child };
+    drop((
+        frame,
+        listener,
+        frame_pass,
+        listener_pass,
+        bootstrap_pass,
+        bootstrap_child,
+    ));
+    let mut ready = [0u8; 5];
+    bootstrap_parent
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    bootstrap_parent
+        .read_exact(&mut ready)
+        .map_err(|error| format!("netstack READY: {error}"))?;
+    if &ready != b"READY" {
+        return Err("invalid netstack READY".into());
+    }
+    let pid = child.child.id();
+    let fd_dir = format!("/proc/{pid}/fd");
+    let mut descriptors = Vec::new();
+    for entry in
+        std::fs::read_dir(&fd_dir).map_err(|error| format!("inspect netstack fds: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let target = std::fs::read_link(entry.path())
+            .map_err(|error| error.to_string())?
+            .display()
+            .to_string();
+        descriptors.push((name, target));
+    }
+    descriptors.sort();
+    if descriptors
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        != ["0", "1", "2", "3", "4", "5"]
+    {
+        return Err(format!(
+            "netstack inherited unexpected descriptors: {descriptors:?}"
+        ));
+    }
+    if descriptors.iter().any(|(_, target)| {
+        target.contains("/dev/vfio")
+            || target.contains("/dev/iommu")
+            || target.contains("/sys/bus/pci")
+            || target.contains("anon_inode:[eventfd]")
+    }) {
+        return Err(format!(
+            "netstack inherited forbidden capability: {descriptors:?}"
+        ));
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|error| error.to_string())?;
+    let maps =
+        std::fs::read_to_string(format!("/proc/{pid}/maps")).map_err(|error| error.to_string())?;
+    if maps.lines().any(|line| {
+        line.contains("/dev/vfio") || line.contains("/dev/iommu") || line.contains("/sys/bus/pci")
+    }) {
+        return Err("netstack inherited a device-backed mapping".into());
+    }
+    for required in [
+        "Uid:\t65534\t65534\t65534\t65534",
+        "Gid:\t65534\t65534\t65534\t65534",
+        "NoNewPrivs:\t1",
+        "Seccomp:\t2",
+        "CapInh:\t0000000000000000",
+        "CapPrm:\t0000000000000000",
+        "CapEff:\t0000000000000000",
+        "CapBnd:\t0000000000000000",
+        "CapAmb:\t0000000000000000",
+    ] {
+        if !status.contains(required) {
+            return Err(format!("netstack sandbox status missing {required:?}"));
+        }
+    }
+    let child_mnt =
+        std::fs::read_link(format!("/proc/{pid}/ns/mnt")).map_err(|error| error.to_string())?;
+    let child_net =
+        std::fs::read_link(format!("/proc/{pid}/ns/net")).map_err(|error| error.to_string())?;
+    let self_mnt = std::fs::read_link("/proc/self/ns/mnt").map_err(|error| error.to_string())?;
+    let self_net = std::fs::read_link("/proc/self/ns/net").map_err(|error| error.to_string())?;
+    if child_mnt == self_mnt || child_net == self_net {
+        return Err("netstack namespaces were not isolated".into());
+    }
+    println!(
+        "netstack_sandbox_fds=true pid={pid} descriptors={descriptors:?} no_device_fds=true no_device_mappings=true"
+    );
+    println!(
+        "netstack_sandbox_namespaces=true pid={pid} mount={} net={}",
+        child_mnt.display(),
+        child_net.display()
+    );
+    bootstrap_parent
+        .write_all(b"GO")
+        .map_err(|error| format!("netstack GO: {error}"))?;
+    bootstrap_parent
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| format!("netstack GO shutdown: {error}"))?;
+    let mut close_ack = Vec::new();
+    bootstrap_parent
+        .read_to_end(&mut close_ack)
+        .map_err(|error| format!("netstack bootstrap close acknowledgment: {error}"))?;
+    if !close_ack.is_empty() {
+        return Err("netstack bootstrap emitted data after READY".into());
+    }
+    drop(bootstrap_parent);
+    let mut runtime_descriptors = Vec::new();
+    for entry in std::fs::read_dir(&fd_dir)
+        .map_err(|error| format!("inspect running netstack fds: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        runtime_descriptors.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            std::fs::read_link(entry.path())
+                .map_err(|error| error.to_string())?
+                .display()
+                .to_string(),
+        ));
+    }
+    runtime_descriptors.sort();
+    if runtime_descriptors
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        != ["0", "1", "2", "3", "4"]
+    {
+        return Err(format!(
+            "running netstack has unexpected descriptors: {runtime_descriptors:?}"
+        ));
+    }
+    println!(
+        "netstack_runtime_fds=true pid={pid} descriptors={runtime_descriptors:?} bootstrap_closed=true"
+    );
+    Ok(child)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2434,8 +2674,12 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let expected_initial =
         mt7921_port_spike::encode_initial_peer_wcid_command(1, 0, peer_wcid.get(), peer)
             .map_err(|error| format!("self-test initial peer fixture: {error}"))?;
+    let expected_preauth_bss = encode_client_preauth_bss_command(2, 0, peer, 36, 100)
+        .map_err(|error| format!("self-test preauth BSS fixture: {error}"))?;
+    let expected_preauth_rlm = encode_client_post_assoc_rlm_command(3, 0, rx_channel.channel)
+        .map_err(|error| format!("self-test preauth RLM fixture: {error}"))?;
     let expected_preauth = mt7921_port_spike::encode_preauth_peer_wcid_command(
-        2,
+        4,
         0,
         peer_wcid.get(),
         peer,
@@ -2444,10 +2688,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         association.legacy_rates,
     )
     .map_err(|error| format!("self-test preauth peer fixture: {error}"))?;
-    let expected_bss = encode_client_bss_command(3, 0, peer, 36, 100, 2, true, true)
+    let expected_bss = encode_client_bss_command(5, 0, peer, 36, 100, 2, true, true)
         .map_err(|error| format!("self-test association BSS fixture: {error}"))?;
     let expected_peer = encode_legacy_wme_add_wcid_command(
-        5,
+        7,
         0,
         peer_wcid.get(),
         42,
@@ -2460,15 +2704,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         0,
     )
     .map_err(|error| format!("self-test association peer fixture: {error}"))?;
-    let expected_interface = encode_client_post_assoc_interface_wcid_command(7, 0, peer)
+    let expected_interface = encode_client_post_assoc_interface_wcid_command(9, 0, peer)
         .map_err(|error| format!("self-test association interface fixture: {error}"))?;
-    let expected_beacon = encode_client_post_assoc_beacon_timing_command(8, 0, 100, 2)
-        .map_err(|error| format!("self-test association beacon fixture: {error}"))?;
-    let expected_power = encode_client_post_assoc_power_state_command(9, 0, 0)
+    let expected_power = encode_client_post_assoc_power_state_command(10, 0, 0)
         .map_err(|error| format!("self-test association power-state fixture: {error}"))?;
-    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(10)
+    let expected_rx_filter = encode_client_post_assoc_rx_filter_command(11)
         .map_err(|error| format!("self-test association RX-filter fixture: {error}"))?;
-    let expected_rlm = encode_client_post_assoc_rlm_command(4, 0, rx_channel.channel)
+    let expected_rlm = encode_client_post_assoc_rlm_command(6, 0, rx_channel.channel)
         .map_err(|error| format!("self-test association RLM fixture: {error}"))?;
     let wtbl_structure = expected_peer[120] == peer_wcid.get()
         && expected_peer[121] == 1
@@ -2482,12 +2724,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     if activation_commands
         != [
             (3, expected_initial),
+            (2, expected_preauth_bss),
+            (2, expected_preauth_rlm),
             (3, expected_preauth),
             (2, expected_bss),
             (2, expected_rlm),
             (3, expected_peer),
             (3, expected_interface),
-            (2, expected_beacon),
             (2, expected_power),
             (0x0a, expected_rx_filter),
         ]
@@ -2511,7 +2754,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         );
     }
     println!(
-        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,RLM,peer_associated,EDCA,interface_wcid19,BCNFT,PS,SET_RXFILTER cid_order=3,2,2,3,legacy29,3,2,2,legacy10 ack_order=RLM,interface,BCNFT,PS no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
+        "self_test_association_activation result=pass transcript=DEV,BSS,peer_preauth,SAE,assoc_response,BSS,RLM,peer_associated,EDCA,interface_wcid19,BCNFT-disabled,PS,SET_RXFILTER cid_order=3,2,2,3,legacy29,3,2,legacy10 ack_order=RLM,interface,PS no_ack_publish=SET_RXFILTER preauth_peer_wcid={} preauth_aid=0 associated_aid=42 peer_wtbl_reset_set=true interface_wtbl_reset_set=true data_tx_before_bss_updates=blocked data_tx_after_rlm=enabled nested_generic_peer_match=true rx_lookup=true no_rx_trans=true diagnostic_readback_nonfatal=true readback_categories=unavailable,all_ones bss_active=true association_generation=true controlled_port_open=false eapol_ready=true",
         peer_wcid.get()
     );
     // Source-exact discriminator: ieee80211_send_nullfunc only requests the
@@ -6574,63 +6817,80 @@ fn run() -> Result<(), String> {
                                     record_sae_stage(
                                         "pinned_sme_connected association=true key_install=true controlled_port=true",
                                     );
-                                    let mut proof = BoundedNetstackProof::new(
+                                    let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
+                                        .map_err(|_| "DRV_SOCKS5_LISTEN is required")?
+                                        .parse()
+                                        .map_err(|_| "DRV_SOCKS5_LISTEN is not a socket address")?;
+                                    if !listen.ip().is_loopback() {
+                                        return Err("DRV_SOCKS5_LISTEN must be loopback".into());
+                                    }
+                                    let seconds = env::var("DRV_DAEMON_MAX_SECONDS")
+                                        .map_or(Ok(360), |value| value.parse::<u64>())
+                                        .map_err(|_| "DRV_DAEMON_MAX_SECONDS is not an integer")?;
+                                    if !(30..=3600).contains(&seconds) {
+                                        return Err(
+                                            "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into()
+                                        );
+                                    }
+                                    let listener = TcpListener::bind(listen)
+                                        .map_err(|error| format!("bind SOCKS listener: {error}"))?;
+                                    listener.set_nonblocking(true).map_err(|error| {
+                                        format!("make SOCKS listener nonblocking: {error}")
+                                    })?;
+                                    let mut netstack = spawn_netstack_child(
                                         ethernet_device,
-                                        NetstackProofConfig {
-                                            dns_name: "example.com.".into(),
-                                            server_port: NonZeroU16::new(80).unwrap(),
-                                            http_request: b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"
-                                                .to_vec(),
-                                            expected_response_prefix: b"HTTP/1.".to_vec(),
-                                        },
-                                    )
-                                    .map_err(|error| format!("construct Netstack proof: {error}"))?;
-                                    let mut pump = runtime.associated_data_pump();
-                                    proof
-                                        .prove_dhcp(&mut pump, deadline)
-                                        .map_err(|error| format!("DHCP proof failed: {error}"))?;
-                                    record_sae_stage("internet_proof_dhcp=true");
-                                    proof
-                                        .prove_dns(&mut pump, deadline)
-                                        .map_err(|error| format!("DNS proof failed: {error}"))?;
-                                    record_sae_stage("internet_proof_dns=true");
-                                    proof
-                                        .prove_tcp(&mut pump, deadline)
-                                        .map_err(|error| format!("TCP proof failed: {error}"))?;
-                                    record_sae_stage("internet_proof_tcp=true");
-                                    proof
-                                        .prove_http(&mut pump, deadline)
-                                        .map_err(|error| format!("HTTP proof failed: {error}"))?;
-                                    record_sae_stage("internet_proof_http=true");
-                                    if let Ok(listen) = env::var("DRV_SOCKS5_LISTEN") {
-                                        let listen = listen.parse().map_err(
-                                            |_| "DRV_SOCKS5_LISTEN is not a socket address",
-                                        )?;
-                                        let seconds = env::var("DRV_DAEMON_MAX_SECONDS")
-                                            .map_or(Ok(360), |value| value.parse::<u64>())
-                                            .map_err(
-                                                |_| "DRV_DAEMON_MAX_SECONDS is not an integer",
-                                            )?;
-                                        if !(30..=3600).contains(&seconds) {
-                                            return Err(
-                                                "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into()
-                                            );
+                                        listener,
+                                        listen,
+                                        seconds,
+                                    )?;
+                                    record_sae_stage(&format!(
+                                        "internet_proxy_starting=true listen={listen} max_seconds={seconds} process_split=true"
+                                    ));
+                                    let service_deadline = Instant::now()
+                                        + std::time::Duration::from_secs(seconds + 35);
+                                    loop {
+                                        if STOP_REQUESTED.load(Ordering::Acquire) {
+                                            netstack.terminate();
+                                            record_sae_stage("internet_proxy_stopped=true");
+                                            break;
                                         }
-                                        record_sae_stage(&format!(
-                                            "internet_proxy_starting=true listen={listen} max_seconds={seconds}"
-                                        ));
-                                        proof
-                                            .serve_socks5(
-                                                &mut pump,
-                                                listen,
-                                                Instant::now()
-                                                    + std::time::Duration::from_secs(seconds),
-                                                || STOP_REQUESTED.load(Ordering::Acquire),
-                                            )
-                                            .map_err(|error| {
-                                                format!("SOCKS5 daemon failed: {error}")
-                                            })?;
-                                        record_sae_stage("internet_proxy_stopped=true");
+                                        if Instant::now() >= service_deadline {
+                                            return Err("netstack child deadline".into());
+                                        }
+                                        if let Some(status) = netstack.try_wait()? {
+                                            if !status.success() {
+                                                return Err(format!(
+                                                    "netstack child failed: {status}"
+                                                ));
+                                            }
+                                            record_sae_stage("internet_proxy_stopped=true");
+                                            break;
+                                        }
+                                        let progressed = match futures::executor::block_on(
+                                            runtime.pump_associated_once(),
+                                        ) {
+                                            Ok(progressed) => progressed,
+                                            Err(PinnedConnectError::Driver(
+                                                PinnedDriverError::Ethernet(zx::Status::CANCELED),
+                                            )) => {
+                                                let status = netstack.wait_after_seam_closed()?;
+                                                if !status.success() {
+                                                    return Err(format!(
+                                                        "netstack child failed: {status}"
+                                                    ));
+                                                }
+                                                record_sae_stage("internet_proxy_stopped=true");
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                return Err(format!(
+                                                    "post-association driver pump failed: {error:?}"
+                                                ));
+                                            }
+                                        };
+                                        if !progressed {
+                                            std::thread::sleep(std::time::Duration::from_millis(1));
+                                        }
                                     }
                                     return Ok(());
                                 }
@@ -13734,7 +13994,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 "post_assoc_interface_wcid result=complete wcid=19 operation=reset_and_set tlvs=generic,rx,hdr_trans linux_order=after_edca before_beacon_filter data_tx_gate=closed",
             );
             record_sae_stage(&format!(
-                "post_assoc_bss_updates result=complete order=RLM-before-M1-pump-and-STA,BCNFT,SET_RXFILTER beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux channel={} center={} bandwidth={} data_tx_gate=open",
+                "post_assoc_bss_updates result=complete order=RLM-before-M1-pump-and-STA,BCNFT-disabled,SET_RXFILTER beacon_interval={} dtim={} rx_filter=drop_other_beacon rx_filter_ack=not_requested_linux connection_monitor=host firmware_beacon_loss_route=unimplemented channel={} center={} bandwidth={} data_tx_gate=open",
                 self.firmware.joined.expect("join retained").beacon_interval,
                 self.dtim_period,
                 channel.channel.primary,
@@ -16373,7 +16633,9 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "pre_submit_io"
             };
             record_sae_stage(&format!(
-                "management_tx_pre_submit result=error category={category} error={error:?}"
+                "management_tx_pre_submit result=error category={category} frame_len={} frame_control={:#06x} error={error:?}",
+                bytes.len(),
+                control.unwrap_or_default(),
             ));
             if category == "terminal_frame_failure" {
                 zx::Status::UNAVAILABLE
@@ -19803,6 +20065,22 @@ mod tests {
             u32::from_le_bytes(encoded.txwi[20..24].try_into().unwrap()) & 0xff,
             11
         );
+        let mut deauthentication = vec![0u8; 26];
+        deauthentication[0..2].copy_from_slice(&0x00c0u16.to_le_bytes());
+        let encoded =
+            encode_client_management_tx(&deauthentication, 0x1000, 0x2000, 8, 10).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(encoded.txwi[0..4].try_into().unwrap()) & 0xffff,
+            26 + 32
+        );
+        assert_eq!(
+            u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap()) & 0xf,
+            12
+        );
+        assert_eq!(
+            u16::from_le_bytes(encoded.txwi[44..46].try_into().unwrap()),
+            0x801a
+        );
         association[0..2].copy_from_slice(&0x0008u16.to_le_bytes());
         assert!(encode_client_management_tx(&association, 0x1000, 0x2000, 0, 3).is_err());
         assert!(encode_client_management_tx(&association[..20], 0x1000, 0x2000, 0, 3).is_err());
@@ -21575,42 +21853,47 @@ mod tests {
     }
 
     #[test]
-    fn live_wpa3_path_uses_one_pinned_owner_through_http() {
+    fn live_wpa3_path_keeps_driver_owner_while_netstack_runs_out_of_process() {
         let source = include_str!("vfio_read.rs");
-        let exchange = source
-            .split("if operation == Operation::RunOneShotSaeAuth {")
-            .find(|segment| segment.contains("PinnedClientRuntime::new"))
-            .unwrap()
-            .split("let transport = adapter.into_transport();")
-            .next()
+        let start = source
+            .find("let (mut device, runner, ethernet_device) =")
             .unwrap();
+        let end = source[start..]
+            .find("let transport = adapter.into_transport();")
+            .unwrap();
+        let exchange = &source[start..start + end];
         for required in [
             "Mt7921ClientDevice::new_with_ethernet",
             "fidl_internal::Protocol::Wpa3Personal",
             ".into_passphrase()",
             "PinnedClientRuntime::new",
             "runtime.connect(request, deadline)",
-            "runtime.associated_data_pump()",
-            ".prove_dhcp(&mut pump, deadline)",
-            ".prove_dns(&mut pump, deadline)",
-            ".prove_tcp(&mut pump, deadline)",
-            ".prove_http(&mut pump, deadline)",
+            "spawn_netstack_child",
+            "runtime.pump_associated_once()",
         ] {
             assert!(exchange.contains(required), "{required}");
         }
         let connect = exchange.find("runtime.connect(request, deadline)").unwrap();
-        let dhcp = exchange.find(".prove_dhcp(&mut pump, deadline)").unwrap();
-        let dns = exchange.find(".prove_dns(&mut pump, deadline)").unwrap();
-        let tcp = exchange.find(".prove_tcp(&mut pump, deadline)").unwrap();
-        let http = exchange.find(".prove_http(&mut pump, deadline)").unwrap();
-        assert!(connect < dhcp && dhcp < dns && dns < tcp && tcp < http);
+        let spawn = exchange.find("spawn_netstack_child").unwrap();
+        let pump = exchange.find("runtime.pump_associated_once()").unwrap();
+        assert!(connect < spawn && spawn < pump);
         for forbidden in [
+            "BoundedNetstackProof::new",
+            "runtime.associated_data_pump()",
             "SaeHandshake::new",
             "receive_one_sae_auth(",
             "association=false",
         ] {
             assert!(!exchange.contains(forbidden), "{forbidden}");
         }
+
+        let child = include_str!("../../../mt7921-passive-scan/src/netstack_child.rs");
+        let dhcp = child.find("proof.prove_dhcp(initial_deadline)").unwrap();
+        let dns = child.find("proof.prove_dns(initial_deadline)").unwrap();
+        let tcp = child.find("proof.prove_tcp(initial_deadline)").unwrap();
+        let http = child.find("proof.prove_http(initial_deadline)").unwrap();
+        let socks = child.find(".serve_socks5_listener(").unwrap();
+        assert!(dhcp < dns && dns < tcp && tcp < http && http < socks);
     }
 
     #[test]

@@ -567,6 +567,10 @@ pub enum ClientRuntimeScanState {
 }
 
 trait Mt7921ClientScan: Mt7921ClientIo {
+    fn connection_monitor_offload(&self) -> bool {
+        false
+    }
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -631,6 +635,12 @@ impl Mt7921ClientScan for NoClientScan {
 }
 
 impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter<T> {
+    fn connection_monitor_offload(&self) -> bool {
+        // MCU_EVENT_BSS_BEACON_LOSS is not yet routed into MLME teardown, so
+        // the host lost-BSS monitor remains the sole complete liveness path.
+        false
+    }
+
     fn set_channel(
         &mut self,
         primary: fidl_ieee80211::ChannelNumber,
@@ -912,6 +922,7 @@ pub enum PinnedConnectError {
 pub enum PinnedDriverError {
     MlmeRequest { name: &'static str, detail: String },
     ClientRx(zx::Status),
+    Ethernet(zx::Status),
     RequestStreamClosed,
     EventStreamClosed,
 }
@@ -1143,6 +1154,29 @@ where
         Ok(progressed)
     }
 
+    /// Advance post-association SME/MLME control, timers, hardware RX, and one
+    /// driver-bound Ethernet frame. No backend lock is held across MLME TX.
+    pub async fn pump_associated_once(&mut self) -> Result<bool, PinnedConnectError> {
+        let mut progressed = self.pump_once().await?;
+        let frame = self.runner.take_ethernet_transmit().map_err(|status| {
+            println!("client_data_seam_error direction=netstack_to_driver status={status}");
+            PinnedConnectError::Driver(PinnedDriverError::Ethernet(status))
+        })?;
+        if let Some(frame) = frame {
+            if let Err(error) = wlan_mlme::MlmeImpl::handle_eth_frame_tx(
+                &mut self.mlme,
+                frame.as_bytes(),
+                fuchsia_trace::Id::new(),
+            ) {
+                println!(
+                    "client_data_tx_error stage=ethernet_pump kind=target_rejected error={error}"
+                );
+            }
+            progressed = true;
+        }
+        Ok(progressed)
+    }
+
     pub async fn connect(
         &mut self,
         request: fidl_sme::ConnectRequest,
@@ -1324,6 +1358,10 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientIo> Mt7921ClientDevice<E, S> {
 }
 
 impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevice<E, S> {
+    fn connection_monitor_offload(&self) -> bool {
+        self.backend.lock().unwrap().scan.connection_monitor_offload()
+    }
+
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {

@@ -72,7 +72,9 @@ offline=--offline; [ -d "$CARGO_HOME/registry" ] || offline=
 cargo build --release $offline --no-default-features --features fuchsia-passive,full-firmware-production 2>&1 \
   | grep -vE "^\s*(Compiling|Finished|warning: unused|Fresh)" | grep -E "error|warning: .*never|Finished|panicked" || true
 driver=$CARGO_TARGET_DIR/release/mt7921-passive-scan
+netstack=$CARGO_TARGET_DIR/release/mt7921-netstack
 [ -x "$driver" ] || { echo "build failed: no $driver"; exit 1; }
+[ -x "$netstack" ] || { echo "build failed: no $netstack"; exit 1; }
 step "binary ready"
 
 # 6. package like the nix output; reuse the last nix launcher with paths rewritten
@@ -80,12 +82,14 @@ last=$(readlink -f "$REPO/result" 2>/dev/null || true)
 [ -n "$last" ] && [ -x "$last/bin/mt7921-full-firmware-validation" ] || { echo "need a prior nix result at $REPO/result for the launcher template"; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/libexec" "$OUT/share/mt7921-full-firmware-validation"
 install -m0755 "$driver" "$OUT/libexec/mt7921-full-firmware-validation"
+install -m0755 "$netstack" "$OUT/libexec/mt7921-netstack"
 "$OUT/libexec/mt7921-full-firmware-validation" --artifact-identity > "$OUT/share/mt7921-full-firmware-validation/artifact-identity.json"
 cp "$last"/share/mt7921-full-firmware-validation/mock-ph1.psk "$OUT/share/mt7921-full-firmware-validation/"
 sed "s|$last|$OUT|g" "$last/bin/mt7921-full-firmware-validation" \
-  | awk '{ print; if ($0 ~ /DRV_LAB_SAFETY_STATE="\$DRV_LAB_SAFETY_STATE"/) { \
+  | awk -v out="$OUT" '{ print; if ($0 ~ /DRV_LAB_SAFETY_STATE="\$DRV_LAB_SAFETY_STATE"/) { \
       print "      DRV_SOCKS5_LISTEN=\"${DRV_SOCKS5_LISTEN-127.0.0.1:1080}\" \\"; \
-      print "      DRV_DAEMON_MAX_SECONDS=\"${DRV_DAEMON_MAX_SECONDS-360}\" \\" } }' \
+      print "      DRV_DAEMON_MAX_SECONDS=\"${DRV_DAEMON_MAX_SECONDS-360}\" \\"; \
+      print "      DRV_NETSTACK_BINARY=\"" out "/libexec/mt7921-netstack\" \\" } }' \
   > "$OUT/bin/mt7921-full-firmware-validation"
 chmod +x "$OUT/bin/mt7921-full-firmware-validation"
 ln -s ../libexec/mt7921-full-firmware-validation "$OUT/bin/mt7921-full-firmware-validation-driver"
