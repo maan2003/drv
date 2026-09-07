@@ -82,7 +82,11 @@ rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/libexec" "$OUT/share/mt7921-full-firmwa
 install -m0755 "$driver" "$OUT/libexec/mt7921-full-firmware-validation"
 "$OUT/libexec/mt7921-full-firmware-validation" --artifact-identity > "$OUT/share/mt7921-full-firmware-validation/artifact-identity.json"
 cp "$last"/share/mt7921-full-firmware-validation/mock-ph1.psk "$OUT/share/mt7921-full-firmware-validation/"
-sed "s|$last|$OUT|g" "$last/bin/mt7921-full-firmware-validation" > "$OUT/bin/mt7921-full-firmware-validation"
+sed "s|$last|$OUT|g" "$last/bin/mt7921-full-firmware-validation" \
+  | awk '{ print; if ($0 ~ /DRV_LAB_SAFETY_STATE="\$DRV_LAB_SAFETY_STATE"/) { \
+      print "      DRV_SOCKS5_LISTEN=\"${DRV_SOCKS5_LISTEN-127.0.0.1:1080}\" \\"; \
+      print "      DRV_DAEMON_MAX_SECONDS=\"${DRV_DAEMON_MAX_SECONDS-360}\" \\" } }' \
+  > "$OUT/bin/mt7921-full-firmware-validation"
 chmod +x "$OUT/bin/mt7921-full-firmware-validation"
 ln -s ../libexec/mt7921-full-firmware-validation "$OUT/bin/mt7921-full-firmware-validation-driver"
 echo "$(sha256sum "$driver" | cut -c1-16) $(date -u +%FT%TZ)" > "$OUT/BUILD"

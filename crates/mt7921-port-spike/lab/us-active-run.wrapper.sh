@@ -12,6 +12,10 @@ ret=/data/persist/drvlab/return-net.sh
 ap_ssid=ajay
 ap_bssid=02:d3:b9:dd:c3:d0
 out=/data/persist/drvlab/active-run-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$out"; cd "$out"
+export DRV_DAEMON_MAX_SECONDS=${DRV_DAEMON_MAX_SECONDS:-360}
+proof_after=${DRV_SOCKS5_PROOF_AFTER:-310}
+lab_seconds=$((DRV_DAEMON_MAX_SECONDS + 60))
+((lab_seconds <= 420)) || lab_seconds=420
 exec > run.log 2>&1
 echo "start $(date -u +%FT%TZ) bdf=$bdf target=$ap_ssid/$ap_bssid"
 wdev(){ for d in /sys/class/net/wl*; do [ -e "$d/wireless" ] && { basename "$d"; return 0; }; done; return 1; }
@@ -54,7 +58,16 @@ dn=$(wdev); iwctl station "$dn" disconnect >/dev/null 2>&1
 sleep 1; echo "native disconnected $(date -u +%T.%N)"
 sleep 2
 echo "run lab $(date -u +%T.%N)"
-sudo -n $lab $bdf 300 -- $launcher > lab.out 2>&1; echo "lab rc=$? $(date -u +%T.%N)"
+proof=/data/persist/src/drv/crates/mt7921-port-spike/lab/persistent-socks-proof.sh
+if [ -x "$proof" ]; then "$proof" "$out" "$proof_after" > socks-proof.log 2>&1 & proof_pid=$!; else proof_pid=; fi
+# The daemon self-stops at 360s; the lab remains an independent 420s hard
+# bound. Both leave enough margin for native recovery before the 480s return.
+sudo -n $lab $bdf "$lab_seconds" -- $launcher > lab.out 2>&1; lab_rc=$?
+echo "lab rc=$lab_rc $(date -u +%T.%N)"
+if [ -n "$proof_pid" ]; then
+  if [ "$lab_rc" != 0 ] && kill -0 "$proof_pid" 2>/dev/null; then kill "$proof_pid" 2>/dev/null; fi
+  wait "$proof_pid" || echo "SOCKS proof failed"
+fi
 sleep 3
 R=$(sudo -n bash -c "ls -t /var/lib/wifi-driver-lab/reports/*.log 2>/dev/null | head -1")
 echo "report=$R"; sudo -n cp "$R" "$out/report.log" 2>/dev/null; sudo -n chmod a+r "$out/report.log" 2>/dev/null

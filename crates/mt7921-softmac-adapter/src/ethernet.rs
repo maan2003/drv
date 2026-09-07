@@ -10,7 +10,8 @@ use netstack3_port_spike::{
 };
 use std::collections::VecDeque;
 use std::fmt;
-use std::net::IpAddr;
+use std::io::{ErrorKind, Read as _, Write as _};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -314,6 +315,301 @@ impl BoundedNetstackProof {
             }
         }
     }
+
+    /// Serve SOCKS5 CONNECT requests through the same Netstack3 instance used
+    /// by the bounded bring-up proof. The host listener is only a byte-stream
+    /// handoff: all remote DNS and TCP traffic goes through Netstack3 and the
+    /// associated SoftMAC data pump.
+    pub fn serve_socks5<T, F>(
+        &mut self,
+        target: &mut T,
+        listen: SocketAddr,
+        deadline: std::time::Instant,
+        mut stop_requested: F,
+    ) -> Result<(), &'static str>
+    where
+        T: AssociatedDataPump,
+        F: FnMut() -> bool,
+    {
+        if self.runner.stack().status() != DhcpStatus::Bound {
+            return Err("SOCKS5 requires DHCP");
+        }
+        let listener = TcpListener::bind(listen).map_err(|_| "SOCKS5 bind failed")?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "SOCKS5 nonblocking setup failed")?;
+        println!("internet_proxy_ready=true listen={listen}");
+        while !stop_requested() && std::time::Instant::now() < deadline {
+            self.drive(target, deadline)?;
+            match listener.accept() {
+                Ok((mut stream, peer)) => {
+                    stream
+                        .set_nonblocking(true)
+                        .map_err(|_| "SOCKS5 client nonblocking setup failed")?;
+                    println!("internet_proxy_client=true peer={peer}");
+                    if let Err(error) =
+                        self.serve_socks5_client(target, &mut stream, deadline, &mut stop_requested)
+                    {
+                        println!("internet_proxy_client_error={error}");
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err("SOCKS5 accept failed"),
+            }
+        }
+        println!("internet_proxy_stopped=true");
+        Ok(())
+    }
+
+    fn serve_socks5_client<T, F>(
+        &mut self,
+        target: &mut T,
+        stream: &mut TcpStream,
+        deadline: std::time::Instant,
+        stop_requested: &mut F,
+    ) -> Result<(), &'static str>
+    where
+        T: AssociatedDataPump,
+        F: FnMut() -> bool,
+    {
+        let greeting = self.read_host_exact(target, stream, 2, deadline, stop_requested)?;
+        if greeting[0] != 5 {
+            return Err("SOCKS5 invalid version");
+        }
+        let methods = self.read_host_exact(
+            target,
+            stream,
+            usize::from(greeting[1]),
+            deadline,
+            stop_requested,
+        )?;
+        if !methods.contains(&0) {
+            self.write_host_all(target, stream, &[5, 0xff], deadline, stop_requested)?;
+            return Err("SOCKS5 no supported authentication method");
+        }
+        self.write_host_all(target, stream, &[5, 0], deadline, stop_requested)?;
+        let request = self.read_host_exact(target, stream, 4, deadline, stop_requested)?;
+        if request[..3] != [5, 1, 0] {
+            return Err("SOCKS5 only CONNECT is supported");
+        }
+        let address = match request[3] {
+            1 => {
+                let bytes = self.read_host_exact(target, stream, 4, deadline, stop_requested)?;
+                [bytes[0], bytes[1], bytes[2], bytes[3]]
+            }
+            3 => {
+                let length = self.read_host_exact(target, stream, 1, deadline, stop_requested)?[0];
+                let bytes = self.read_host_exact(
+                    target,
+                    stream,
+                    usize::from(length),
+                    deadline,
+                    stop_requested,
+                )?;
+                let mut name = String::from_utf8(bytes).map_err(|_| "SOCKS5 invalid domain")?;
+                if !name.ends_with('.') {
+                    name.push('.');
+                }
+                let lookup = self
+                    .runner
+                    .stack_mut()
+                    .lookup_ip(name)
+                    .map_err(|_| "SOCKS5 DNS start failed")?;
+                loop {
+                    self.check_running(deadline, stop_requested)?;
+                    self.drive(target, deadline)?;
+                    if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
+                        break result
+                            .map_err(|_| "SOCKS5 DNS lookup failed")?
+                            .into_iter()
+                            .find_map(|address| match address {
+                                IpAddr::V4(address) => Some(address.octets()),
+                                IpAddr::V6(_) => None,
+                            })
+                            .ok_or("SOCKS5 DNS returned no IPv4 address")?;
+                    }
+                }
+            }
+            _ => return Err("SOCKS5 address type is unsupported"),
+        };
+        let port = self.read_host_exact(target, stream, 2, deadline, stop_requested)?;
+        let port =
+            NonZeroU16::new(u16::from_be_bytes([port[0], port[1]])).ok_or("SOCKS5 zero port")?;
+        let mut provider = self.runner.stack().socket_provider();
+        let client = provider
+            .open_client(NonZeroUsize::new(1).unwrap())
+            .map_err(|_| "SOCKS5 socket client failed")?;
+        let socket = provider
+            .tcp_socket(client, RemoteIpVersion::V4)
+            .map_err(|_| "SOCKS5 TCP socket failed")?;
+        provider
+            .tcp_connect(
+                socket,
+                RemoteSocketAddress {
+                    address: RemoteIpAddress::V4(address),
+                    port,
+                },
+            )
+            .map_err(|_| "SOCKS5 TCP connect failed")?;
+        loop {
+            self.check_running(deadline, stop_requested)?;
+            self.drive(target, deadline)?;
+            let ready = provider
+                .readiness(socket)
+                .map_err(|_| "SOCKS5 TCP readiness failed")?;
+            if ready.writable {
+                break;
+            }
+        }
+        self.write_host_all(
+            target,
+            stream,
+            &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+            deadline,
+            stop_requested,
+        )?;
+        println!(
+            "internet_proxy_connect=true remote={}:{}",
+            Ipv4Addr::from(address),
+            port
+        );
+
+        let mut host_to_remote = VecDeque::new();
+        let mut remote_to_host = VecDeque::new();
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            self.check_running(deadline, stop_requested)?;
+            self.drive(target, deadline)?;
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => host_to_remote.extend(&buffer[..read]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => return Err("SOCKS5 host read failed"),
+            }
+            if !host_to_remote.is_empty() {
+                let written = provider
+                    .tcp_write(socket, host_to_remote.make_contiguous())
+                    .or_else(|error| {
+                        (error == netstack3_port_spike::RemoteSocketError::WouldBlock)
+                            .then_some(0)
+                            .ok_or(error)
+                    })
+                    .map_err(|_| "SOCKS5 remote write failed")?;
+                host_to_remote.drain(..written);
+            }
+            let ready = provider
+                .readiness(socket)
+                .map_err(|_| "SOCKS5 relay readiness failed")?;
+            if ready.readable {
+                let read = provider
+                    .tcp_read(socket, &mut buffer)
+                    .map_err(|_| "SOCKS5 remote read failed")?;
+                if read == 0 {
+                    while !remote_to_host.is_empty() {
+                        self.write_host_pending(
+                            target,
+                            stream,
+                            &mut remote_to_host,
+                            deadline,
+                            stop_requested,
+                        )?;
+                    }
+                    break;
+                }
+                remote_to_host.extend(&buffer[..read]);
+            }
+            self.write_host_pending(
+                target,
+                stream,
+                &mut remote_to_host,
+                deadline,
+                stop_requested,
+            )?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = provider.close(socket);
+        let _ = provider.close_client(client);
+        println!("internet_proxy_transfer_complete=true");
+        Ok(())
+    }
+
+    fn check_running<F: FnMut() -> bool>(
+        &self,
+        deadline: std::time::Instant,
+        stop_requested: &mut F,
+    ) -> Result<(), &'static str> {
+        if stop_requested() || std::time::Instant::now() >= deadline {
+            Err("SOCKS5 daemon stopping")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_host_exact<T: AssociatedDataPump, F: FnMut() -> bool>(
+        &mut self,
+        target: &mut T,
+        stream: &mut TcpStream,
+        length: usize,
+        deadline: std::time::Instant,
+        stop_requested: &mut F,
+    ) -> Result<Vec<u8>, &'static str> {
+        let mut bytes = vec![0; length];
+        let mut offset = 0;
+        while offset != length {
+            self.check_running(deadline, stop_requested)?;
+            self.drive(target, deadline)?;
+            match stream.read(&mut bytes[offset..]) {
+                Ok(0) => return Err("SOCKS5 host closed during handshake"),
+                Ok(read) => offset += read,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err("SOCKS5 host read failed"),
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn write_host_all<T: AssociatedDataPump, F: FnMut() -> bool>(
+        &mut self,
+        target: &mut T,
+        stream: &mut TcpStream,
+        bytes: &[u8],
+        deadline: std::time::Instant,
+        stop_requested: &mut F,
+    ) -> Result<(), &'static str> {
+        let mut pending = VecDeque::from(bytes.to_vec());
+        while !pending.is_empty() {
+            self.write_host_pending(target, stream, &mut pending, deadline, stop_requested)?;
+        }
+        Ok(())
+    }
+
+    fn write_host_pending<T: AssociatedDataPump, F: FnMut() -> bool>(
+        &mut self,
+        target: &mut T,
+        stream: &mut TcpStream,
+        pending: &mut VecDeque<u8>,
+        deadline: std::time::Instant,
+        stop_requested: &mut F,
+    ) -> Result<(), &'static str> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.check_running(deadline, stop_requested)?;
+        self.drive(target, deadline)?;
+        match stream.write(pending.make_contiguous()) {
+            Ok(0) => Err("SOCKS5 host closed during write"),
+            Ok(written) => {
+                pending.drain(..written);
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(_) => Err("SOCKS5 host write failed"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,7 +701,10 @@ impl Mt7921EthernetTx {
             // frame forever would wedge the egress queue behind one undeliverable
             // packet, whereas dropping it lets the netstack's own retransmission
             // timers decide what to send next.
-            push_event(&mut self.state.lock().unwrap(), EthernetDeviceEvent::TransmitReady);
+            push_event(
+                &mut self.state.lock().unwrap(),
+                EthernetDeviceEvent::TransmitReady,
+            );
             return Err(EthernetTxPumpError::Target(error));
         }
         push_event(

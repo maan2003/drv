@@ -7383,6 +7383,36 @@ fn run() -> Result<(), String> {
                                         .prove_http(&mut pump, deadline)
                                         .map_err(|error| format!("HTTP proof failed: {error}"))?;
                                     record_sae_stage("internet_proof_http=true");
+                                    if let Ok(listen) = env::var("DRV_SOCKS5_LISTEN") {
+                                        let listen = listen.parse().map_err(|_| {
+                                            "DRV_SOCKS5_LISTEN is not a socket address"
+                                        })?;
+                                        let seconds = env::var("DRV_DAEMON_MAX_SECONDS")
+                                            .map_or(Ok(360), |value| value.parse::<u64>())
+                                            .map_err(|_| {
+                                                "DRV_DAEMON_MAX_SECONDS is not an integer"
+                                            })?;
+                                        if !(30..=3600).contains(&seconds) {
+                                            return Err(
+                                                "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into(),
+                                            );
+                                        }
+                                        record_sae_stage(&format!(
+                                            "internet_proxy_starting=true listen={listen} max_seconds={seconds}"
+                                        ));
+                                        proof
+                                            .serve_socks5(
+                                                &mut pump,
+                                                listen,
+                                                Instant::now()
+                                                    + std::time::Duration::from_secs(seconds),
+                                                || STOP_REQUESTED.load(Ordering::Acquire),
+                                            )
+                                            .map_err(|error| {
+                                                format!("SOCKS5 daemon failed: {error}")
+                                            })?;
+                                        record_sae_stage("internet_proxy_stopped=true");
+                                    }
                                     return Ok(());
                                 }
                                 let transport = adapter.into_transport();
@@ -24010,7 +24040,7 @@ mod tests {
             .find("export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel")
             .unwrap();
         let handoff = supervisor
-            .find("\"$wifi_driver_lab\" \"$bdf\" 300")
+            .find("\"$wifi_driver_lab\" \"$bdf\" 420")
             .unwrap();
         assert!(derive < iw && iw < address && address < export && export < handoff);
         assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));

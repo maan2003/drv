@@ -54,7 +54,7 @@ if $plan; then
     echo "durable report directory is not writable by root" >&2
     exit 77
   }
-  printf 'PLAN mode=inert hardware_handoff=false identity_mode=%s native_identity_restore_required=true uid=0 privilege_contract=sudo_-n durable_report_dir=%s durable_report_writable=true supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=300 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
+  printf 'PLAN mode=inert hardware_handoff=false identity_mode=%s native_identity_restore_required=true uid=0 privilege_contract=sudo_-n durable_report_dir=%s durable_report_writable=true supervisor=%s supervisor_sha256=%s wifi_driver_lab=%s wifi_driver_lab_sha256=%s wifi_lab_watchdog=%s wifi_lab_watchdog_sha256=%s bdf=%s timeout_seconds=420 watchdog_owner=selector-write-recovery-supervisor_external_arm_heartbeat_recovery_exact_token_disarm launcher=%s launcher_sha256=%s argv=' \
     "$identity_mode" \
     "$root" \
     "$(readlink -f "$0")" "$(sha256sum "$(readlink -f "$0")" | cut -d ' ' -f1)" \
@@ -150,7 +150,7 @@ printf 'TARGET bssid=%s channel=%s frequency=%s native_client_mac=%s session_cli
   "$connected_client_mac" "$session_client_mac" "$identity_mode" >> "$timeline"
 sync -f "$timeline"
 
-"$wifi_driver_lab" "$bdf" 300 -- "$@" &
+"$wifi_driver_lab" "$bdf" 420 -- "$@" &
 experiment_pid=$!
 while kill -0 "$experiment_pid" 2>/dev/null; do
   if ! "$wifi_lab_watchdog" heartbeat "$token"; then
