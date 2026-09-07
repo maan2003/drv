@@ -19,12 +19,11 @@ if [ "${1-}" = --plan ] && [ "$#" -eq 1 ]; then
   cat <<EOF
 INERT_PROOF_PLAN schema=$schema hardware_handoff=false active_validation=false
 IDENTITY project_core_source_sha256=@project_core@ composite_artifact_source_sha256=@composite_source@ bss_wire_contract=connac2-bss-wire-v1 basic_tlv_len=32 initial_payload_len=36 initial_command_len=84 associated_payload_len=44 associated_command_len=92 qbss_payload_offset=36 dtim_source=selected-beacon-shared-basic-bcnft
-PASSIVE_M1_TELEMETRY contract=linux-6.18.40-passive-m1-rx-v11 safe_read_registers=0xd4208,0xd4508,0xd450c,0xd4528,0xd452c,0xd4548,0xd454c,0x820d8108,0x820e5000,0x820e5004 consuming_mib_reads=false snapshot_boundaries=before-associated-bss,after-associated-bss-rlm-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms positive_result=target_m1_observed_at_rx_dma negative_result=no_m1_at_rx_dma_ambiguous target_scope=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1 behavior=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged attribution_limit=independent-ap-or-over-air-witness-required
 CAPTURE hostname; boot_id; pci_driver; pci_power_state; pci_runtime_status; NetworkManager_state; ip_link; ipv4_addresses; ipv4_routes; iw_dev; iw_link; watchdog_status
 NORMALIZE drop_rx_tx_signal_bitrate; normalize_queue_length; normalize_address_lifetimes
 WATCHDOG arm=wifi-lab-watchdog_arm disarm=wifi-lab-watchdog_disarm_exact_token trap_safe=true
 PREFLIGHT argv=$launcher --full-firmware-preflight canonical_fd3_fd4=true
-ASSERT credential_eof=true snapshot_eof=true credential_policy_binding=validated-and-consumed-before-device-open regulatory_domain=00 regulatory_generation=0 device_opened=false vfio_opened=false lab_state_created=false
+ASSERT credential_eof=true snapshot_eof=true credential_boundary=read-before-device-open regulatory_domain=00 regulatory_generation=0 device_opened=false vfio_opened=false lab_state_created=false
 COMPARE exact_cmp=true durable_sha256=true
 EOF
   exit 0
@@ -160,7 +159,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cp "$expected_hashes" "$out/closure.expected.tsv"
 cp "$closure_roots" "$out/closure.roots"
-printf 'SCHEMA=%s\nSOURCE_IDENTITY_SHA256=%s\nPROJECT_CORE_SOURCE_SHA256=%s\nCOMPOSITE_ARTIFACT_SOURCE_SHA256=%s\nBSS_WIRE_CONTRACT=connac2-bss-wire-v1\nPASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v11\nASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2\nCANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4\nRUNTIME_ASSOCIATION_HASH_POLICY=input-dependent\nASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2\nASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2\nORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1\nORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755\nEARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1\nEARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment\nSAFE_READ_REGISTERS=0xd4208,0xd4508,0xd450c,0xd4528,0xd452c,0xd4548,0xd454c,0x820d8108,0x820e5000,0x820e5004\nCONSUMING_MIB_READS=false\nSNAPSHOT_BOUNDARIES=before-associated-bss,after-associated-bss-rlm-before-sta-pump-15ms,after-post-association-tail,m1-observation-timeout-5000ms\nPOSITIVE_RESULT=target_m1_observed_at_rx_dma\nNEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous\nTARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1\nTELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged\nATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required\nTARGET_BEACON_TIM_CONTRACT=linux-ieee80211-check-tim-v1\nTIM_TRUE_RESULT=ap-queued-unicast-for-normalized-aid-not-traffic-type\nTIM_NEVER_TRUE_RESULT=inconclusive\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
+printf 'SCHEMA=%s\nSOURCE_IDENTITY_SHA256=%s\nPROJECT_CORE_SOURCE_SHA256=%s\nCOMPOSITE_ARTIFACT_SOURCE_SHA256=%s\nBSS_WIRE_CONTRACT=connac2-bss-wire-v1\nTOOL=%s\nCLOSURE_MANIFEST_SHA256=%s\n' \
   "$schema" @source_identity@ @project_core@ @composite_source@ "$0" "$closure_manifest_sha256" >"$out/IDENTITY"
 
 cat >"$out/COMMANDS" <<EOF
@@ -169,7 +168,7 @@ SNAPSHOT=hostname;cat_/proc/sys/kernel/random/boot_id;readlink_pci_driver;cat_pc
 NORMALIZE=sed_drop_RX_TX_signal_bitrate;queue_length_to_empty;address_lifetimes_to_DYNAMIC
 PREFLIGHT=env_-i_launcher_--full-firmware-preflight
 CLOSURE=nix-store_--verify-path_then_registered_hash_compare
-SELFTEST=driver_--self-test-rate-power-delivery;driver_--self-test-production-validation
+SELFTEST=driver_--self-test-rate-power-delivery
 ROOT_PLAN=root-entry_--plan
 WATCHDOG=arm;exact-token-disarm;status_must_equal_disarmed
 COMPARE=cmp_before_after;diff_on_failure
@@ -184,12 +183,7 @@ test "$(@sha256sum@ "$out/closure.expected.tsv" | @cut@ -d' ' -f1)" = "$closure_
 phase=self-tests
 @sha256sum@ "$launcher" "$driver" "$supervisor/bin/mt7921-full-firmware-validation-supervisor" "$manifest" "$root_entry/bin/mt7921-full-firmware-validation-root" "$0" >"$out/artifact-hashes.txt"
 env -i "$driver" --self-test-rate-power-delivery >"$out/selftest-rate.jsonl"
-env -i "$driver" --self-test-production-validation >"$out/selftest-production.jsonl"
 grep -F '"rate_power_self_test":"passed"' "$out/selftest-rate.jsonl" >/dev/null
-grep -F '"production_validation_self_test":"passed"' "$out/selftest-production.jsonl" >/dev/null
-grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$out/selftest-production.jsonl" >/dev/null
-grep -F '"associated_bss_command_len":92' "$out/selftest-production.jsonl" >/dev/null
-grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' "$out/selftest-production.jsonl" >/dev/null
 "$root_entry/bin/mt7921-full-firmware-validation-root" --plan >"$out/root-plan.txt"
 grep -F hardware_handoff=false "$out/root-plan.txt" >/dev/null
 
@@ -202,7 +196,7 @@ phase=watchdog-disarm
 "$runtime/wifi-lab-watchdog" disarm "$token" >"$out/watchdog-disarm.txt"
 token=
 phase=preflight-assertions
-for marker in '"full_firmware_preflight":"passed"' '"artifact_flavor":"full-firmware-production"' '"enabled_operation":"run-one-shot-sae-auth"' '"active_capable":true' '"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof"' '"credential_eof":true' '"credential_policy_binding":"validated-and-consumed-before-device-open"' '"snapshot_eof":true' '"regulatory_domain":"00"' '"regulatory_generation":0' '"device_opened":false' '"vfio_opened":false' '"lab_state_created":false'; do
+for marker in '"full_firmware_preflight":"passed"' '"artifact_flavor":"full-firmware-production"' '"enabled_operation":"run-one-shot-sae-auth"' '"active_capable":true' '"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof"' '"credential_eof":true' '"credential_boundary":"read-before-device-open"' '"snapshot_eof":true' '"regulatory_domain":"00"' '"regulatory_generation":0' '"device_opened":false' '"vfio_opened":false' '"lab_state_created":false'; do
   grep -F "$marker" "$out/full-firmware-preflight.jsonl" >/dev/null
 done
 test "$($runtime/wifi-lab-watchdog status)" = disarmed

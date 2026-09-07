@@ -15,7 +15,6 @@ use fidl_fuchsia_wlan_sme as fidl_sme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use futures::channel::mpsc;
 use futures::{FutureExt, Stream, StreamExt};
-use sha2::{Digest, Sha256};
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::MutexGuard;
@@ -180,7 +179,6 @@ fn association_ht_vht(frame: &[u8]) -> Result<([u8; 26], [u8; 12]), zx::Status> 
 fn prepare_association_wlan_frame_with_evidence(
     frame: &[u8],
     profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
-    contract: AssociationRequestContract,
 ) -> Result<Option<(Vec<u8>, AssociationCapabilityTransformation)>, zx::Status> {
     if frame.len() < 28 || u16::from_le_bytes([frame[0], frame[1]]) & 0x00fc != 0 {
         return Ok(None);
@@ -189,18 +187,10 @@ fn prepare_association_wlan_frame_with_evidence(
     let authoritative_ht = profile.ht_capabilities.ok_or(zx::Status::BAD_STATE)?;
     let authoritative_vht = profile.vht_capabilities.ok_or(zx::Status::BAD_STATE)?;
     let (base_ht, base_vht) = association_ht_vht(frame)?;
-    if contract == AssociationRequestContract::NativeOracle204Diagnostic
-        && profile != &fuchsia_softmac_port::linux_61840_oracle_profile()
-    {
-        return Err(zx::Status::IO_DATA_INTEGRITY);
-    }
     let final_frame = apply_production_association_profile(frame, profile)?;
     let (final_ht, final_vht) = association_ht_vht(&final_frame)?;
     if final_ht != authoritative_ht || final_vht != authoritative_vht {
         return Err(zx::Status::IO_DATA_INTEGRITY);
-    }
-    if contract == AssociationRequestContract::NativeOracle204Diagnostic {
-        validate_native_oracle_204_frame(&final_frame)?;
     }
     Ok(Some((
         final_frame,
@@ -219,11 +209,7 @@ fn prepare_production_wlan_frame_with_evidence(
     frame: &[u8],
     profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
 ) -> Result<Option<(Vec<u8>, AssociationCapabilityTransformation)>, zx::Status> {
-    prepare_association_wlan_frame_with_evidence(
-        frame,
-        profile,
-        AssociationRequestContract::ProductionSubsetV2,
-    )
+    prepare_association_wlan_frame_with_evidence(frame, profile)
 }
 
 /// Prepare a frame at the production `DeviceOps` effect boundary. Only an
@@ -235,35 +221,6 @@ pub fn prepare_production_wlan_frame(
 ) -> Result<Option<Vec<u8>>, zx::Status> {
     prepare_production_wlan_frame_with_evidence(frame, profile)
         .map(|prepared| prepared.map(|(frame, _)| frame))
-}
-
-pub const NATIVE_ORACLE_204_NORMALIZED_SHA256: [u8; 32] = [
-    0x6a, 0x80, 0xb1, 0xb8, 0x63, 0x1d, 0x70, 0x44, 0x7f, 0x20, 0xb1, 0xbe, 0x45, 0xa3, 0x55, 0x64,
-    0xa8, 0x06, 0xbc, 0x89, 0x13, 0x84, 0x8d, 0x9f, 0xdb, 0x51, 0xc3, 0x40, 0x4d, 0xdf, 0x47, 0x55,
-];
-
-pub fn validate_native_oracle_204_frame(frame: &[u8]) -> Result<(), zx::Status> {
-    if frame.len() != 204 {
-        return Err(zx::Status::IO_DATA_INTEGRITY);
-    }
-    let mut normalized = frame.to_vec();
-    normalized[22..24].fill(0);
-    if Sha256::digest(&normalized).as_slice() != NATIVE_ORACLE_204_NORMALIZED_SHA256 {
-        return Err(zx::Status::IO_DATA_INTEGRITY);
-    }
-    Ok(())
-}
-
-pub fn prepare_native_oracle_204_diagnostic_frame(
-    frame: &[u8],
-    profile: Option<&fuchsia_softmac_port::AssociationRequestProfile>,
-) -> Result<Option<Vec<u8>>, zx::Status> {
-    prepare_association_wlan_frame_with_evidence(
-        frame,
-        profile,
-        AssociationRequestContract::NativeOracle204Diagnostic,
-    )
-    .map(|prepared| prepared.map(|(frame, _)| frame))
 }
 
 #[derive(Clone, Copy)]
@@ -300,13 +257,6 @@ fn safe_sae_group(frame: &fidl_mlme::SaeFrame) -> Option<u16> {
         .then(|| u16::from_le_bytes([frame.sae_fields[0], frame.sae_fields[1]]))
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum AssociationRequestContract {
-    #[default]
-    ProductionSubsetV2,
-    NativeOracle204Diagnostic,
-}
-
 /// Immutable values reported through the pinned `DeviceOps` query seams.
 #[derive(Clone)]
 pub struct ClientSupport {
@@ -319,7 +269,6 @@ pub struct ClientSupport {
     /// this exact production ClientMlme before it crosses the physical effect
     /// boundary.
     pub association: Option<fuchsia_softmac_port::AssociationRequestProfile>,
-    pub association_contract: AssociationRequestContract,
 }
 
 /// One received frame and the source-exact receive status delivered with it.
@@ -516,14 +465,6 @@ impl Mt7921AssociationState {
 /// unchanged and never retries them; production effects may consume their
 /// private bounded-validation completion sentinel before this boundary.
 pub trait Mt7921ClientEffects {
-    /// Reports that the bounded validation observation reached the SME.
-    fn validation_complete(&self) -> bool {
-        false
-    }
-
-    /// Confirms that an EAPOL indication was synchronously dispatched to SME.
-    fn eapol_ind_delivered_to_sme(&mut self) {}
-
     /// Observe the exact production association transformation immediately
     /// before the resulting bytes cross the physical effect boundary.
     fn association_capability_transformation(
@@ -782,20 +723,7 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 }
 
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
-    pub fn validation_complete(&self) -> bool {
-        self.backend.lock().unwrap().effects.validation_complete()
-    }
-
-    fn eapol_ind_delivered_to_sme(&self) {
-        self.backend
-            .lock()
-            .unwrap()
-            .effects
-            .eapol_ind_delivered_to_sme();
-    }
-
-    /// Borrow the already-connected pinned MLME as the only associated data
-    /// plane. The returned pump cannot outlive either the MLME or this runner.
+    /// Borrow the already-connected pinned MLME as the associated data plane.
     pub fn associated_data_pump<'a>(
         &'a self,
         mlme: &'a mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
@@ -1079,9 +1007,6 @@ where
                                 detail: error.to_string(),
                             })
                         })?;
-                    if self.runner.validation_complete() {
-                        return Ok((true, true));
-                    }
                     if sae_frame_tx {
                         println!(
                             "client_sae_stage=mlme_request_complete state={}",
@@ -1127,9 +1052,6 @@ where
                         );
                     }
                     Station::on_mlme_event(&mut self.sme, event);
-                    if eapol_ind {
-                        self.runner.eapol_ind_delivered_to_sme();
-                    }
                     progressed = true;
                     cycle_progressed = true;
                 }
@@ -1151,10 +1073,6 @@ where
         const CONTROL_BUDGET: usize = 64;
 
         let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
-        if self.runner.validation_complete() {
-            return Ok(progressed);
-        }
-
         if let Some(action) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
             self.sme_timers.as_mut().next().now_or_never().flatten()
@@ -1180,9 +1098,6 @@ where
             let (control_progressed, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
             progressed |= control_progressed;
             control_quiescent = quiescent;
-            if self.runner.validation_complete() {
-                return Ok(progressed);
-            }
         }
         if !control_quiescent {
             println!(
@@ -1199,9 +1114,6 @@ where
         {
             progressed = true;
             let (_, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
-            if self.runner.validation_complete() {
-                return Ok(progressed);
-            }
             if !quiescent {
                 println!(
                     "client_runtime_control stage=post_rx_budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
@@ -1236,9 +1148,6 @@ where
                 return Err(PinnedConnectError::Timeout);
             }
             let progressed = self.pump_once().await?;
-            if self.runner.validation_complete() {
-                return Ok(());
-            }
             loop {
                 match transaction.try_recv() {
                     Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
@@ -1476,7 +1385,6 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
         let association = prepare_association_wlan_frame_with_evidence(
             &buffer,
             self.support.association.as_ref(),
-            self.support.association_contract,
         )?;
         if let Some((frame, evidence)) = association.as_ref() {
             effects.association_capability_transformation(evidence, frame);
@@ -1807,92 +1715,6 @@ mod tests {
         request
     }
 
-    fn wpa2_connect_request() -> fidl_sme::ConnectRequest {
-        let mut request = open_connect_request();
-        request.bss_description.capability_info = 0x11;
-        request.bss_description.ies = vec![
-            0, 4, b't', b'e', b's', b't', 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
-            0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
-        ];
-        request.authentication = fidl_fuchsia_wlan_internal::Authentication {
-            protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa2Personal,
-            credentials: Some(Box::new(fidl_fuchsia_wlan_internal::Credentials::Wpa(
-                fidl_fuchsia_wlan_internal::WpaCredentials::Psk([1; 32]),
-            ))),
-        };
-        request
-    }
-
-    fn wpa2_message_1() -> ClientRxFrame {
-        let mut bytes = vec![0x08, 0x02, 0, 0];
-        bytes.extend_from_slice(&nic().mac_address.unwrap());
-        bytes.extend_from_slice(&BSSID);
-        bytes.extend_from_slice(&BSSID);
-        bytes.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        bytes.extend_from_slice(&[1, 3, 0, 95, 2, 0, 0x8a, 0, 16]);
-        bytes.extend_from_slice(&1u64.to_be_bytes());
-        bytes.extend_from_slice(&[0x11; 32]);
-        bytes.extend_from_slice(&[0; 16 + 8 + 8 + 16]);
-        bytes.extend_from_slice(&[0, 0]);
-        ClientRxFrame {
-            bytes,
-            status: rx_status(-30),
-            security: None,
-        }
-    }
-
-    fn wpa2_association_response() -> ClientRxFrame {
-        open_response(
-            0x01,
-            &[
-                1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f,
-                0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
-            ],
-        )
-    }
-
-    fn open_response(subtype: u8, body: &[u8]) -> ClientRxFrame {
-        let mut bytes = vec![0u8; 24];
-        bytes[0] = subtype << 4;
-        bytes[4..10].copy_from_slice(&nic().mac_address.unwrap());
-        bytes[10..16].copy_from_slice(&BSSID);
-        bytes[16..22].copy_from_slice(&BSSID);
-        bytes.extend_from_slice(body);
-        ClientRxFrame {
-            bytes,
-            status: rx_status(-30),
-            security: None,
-        }
-    }
-
-    fn source_exact_140_byte_open_response(subtype: u8, body: &[u8]) -> ClientRxFrame {
-        let metadata_len = 24 + 16 + 16 + 8 + 8 + 2;
-        let reported_len = metadata_len + 24 + body.len();
-        let mut envelope = vec![0xcc; 140];
-        envelope[0..4].copy_from_slice(&((2u32 << 27) | reported_len as u32).to_le_bytes());
-        envelope[4..8]
-            .copy_from_slice(&((1u32 << 14) | (1 << 11) | (1 << 12) | (1 << 13)).to_le_bytes());
-        envelope[8..12].copy_from_slice(&(1u32 << 14).to_le_bytes());
-        envelope[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
-        envelope[24..40].fill(0xa5);
-        envelope[40..46].copy_from_slice(&[6, 5, 4, 3, 2, 1]);
-        envelope[68..72].copy_from_slice(&0x7878u32.to_le_bytes());
-        let frame = &mut envelope[metadata_len..reported_len];
-        frame.fill(0);
-        frame[0] = subtype << 4;
-        frame[4..10].copy_from_slice(&nic().mac_address.unwrap());
-        frame[10..16].copy_from_slice(&BSSID);
-        frame[16..22].copy_from_slice(&BSSID);
-        frame[24..].copy_from_slice(body);
-        let parsed = mt7921_port_spike::parse_connac2_rx_frame(&envelope).unwrap();
-        assert_eq!(parsed.pn, Some([1, 2, 3, 4, 5, 6]));
-        ClientRxFrame {
-            bytes: parsed.bytes,
-            status: rx_status(parsed.rssi_dbm),
-            security: None,
-        }
-    }
-
     fn runtime_device_info() -> fidl_mlme::DeviceInfo {
         fidl_mlme::DeviceInfo {
             sta_addr: nic().mac_address.unwrap(),
@@ -1930,8 +1752,6 @@ mod tests {
         rx_dequeued: usize,
         fail_on: Option<&'static str>,
         reuse_channel: bool,
-        complete_on_association: bool,
-        validation_complete: bool,
     }
 
     // Deliberately redacted: frames and keys may contain SAE/RSN material.
@@ -1963,10 +1783,6 @@ mod tests {
     }
 
     impl Mt7921ClientEffects for FakeEffects {
-        fn validation_complete(&self) -> bool {
-            self.validation_complete
-        }
-
         fn revoke_scan(&mut self) {}
 
         fn revoke_lifecycle(&mut self) {}
@@ -2033,7 +1849,6 @@ mod tests {
         ) -> Result<(), zx::Status> {
             self.hit("association")?;
             self.association = Some(configuration.clone());
-            self.validation_complete = self.complete_on_association;
             Ok(())
         }
 
@@ -2203,7 +2018,6 @@ mod tests {
             },
             spectrum_management: Default::default(),
             association: None,
-            association_contract: AssociationRequestContract::ProductionSubsetV2,
         }
     }
 
@@ -2352,7 +2166,11 @@ mod tests {
             let mut device =
                 Mt7921ClientDevice::new_offline_fake(FakeEffects::default(), support());
             device
-                .set_channel(channel(36), fidl_ieee80211::ChannelBandwidth::Cbw20, channel(0))
+                .set_channel(
+                    channel(36),
+                    fidl_ieee80211::ChannelBandwidth::Cbw20,
+                    channel(0),
+                )
                 .await
                 .unwrap();
             let join = fidl_driver::JoinBssRequest {
@@ -2381,7 +2199,11 @@ mod tests {
             let mut plain = protected.clone();
             plain[1] = 0x01;
             device
-                .send_wlan_frame(plain.into(), fidl_softmac::WlanTxInfoFlags::FAVOR_RELIABILITY, None)
+                .send_wlan_frame(
+                    plain.into(),
+                    fidl_softmac::WlanTxInfoFlags::FAVOR_RELIABILITY,
+                    None,
+                )
                 .unwrap();
             assert_eq!(
                 device.backend().effects.flags,
@@ -2479,42 +2301,6 @@ mod tests {
         assert_eq!(
             prepare_production_wlan_frame(&authentication, Some(&Default::default())).unwrap(),
             None
-        );
-    }
-
-    #[test]
-    fn native_oracle_diagnostic_requires_exact_204_at_effect_boundary() {
-        let raw = wlan_mlme::host_fixture::raw_sae_h2e_association_request_fixture().unwrap();
-        let profile = fuchsia_softmac_port::linux_61840_oracle_profile();
-        let native = prepare_native_oracle_204_diagnostic_frame(&raw, Some(&profile))
-            .unwrap()
-            .unwrap();
-        assert_eq!(native.len(), 204);
-        validate_native_oracle_204_frame(&native).unwrap();
-
-        let mut normalized = native.clone();
-        normalized[22..24].fill(0);
-        assert_eq!(
-            Sha256::digest(normalized).as_slice(),
-            NATIVE_ORACLE_204_NORMALIZED_SHA256
-        );
-
-        let mut corrupt = native.clone();
-        corrupt[24] ^= 1;
-        assert_eq!(
-            validate_native_oracle_204_frame(&corrupt),
-            Err(zx::Status::IO_DATA_INTEGRITY)
-        );
-        assert_eq!(
-            validate_native_oracle_204_frame(&raw),
-            Err(zx::Status::IO_DATA_INTEGRITY)
-        );
-
-        let mut unsupported_profile = profile.clone();
-        unsupported_profile.station.rm_enabled = None;
-        assert_eq!(
-            prepare_native_oracle_204_diagnostic_frame(&raw, Some(&unsupported_profile)),
-            Err(zx::Status::IO_DATA_INTEGRITY)
         );
     }
 
@@ -2688,40 +2474,6 @@ mod tests {
             assert!(!ids.iter().any(|(id, _)| matches!(id, 70 | 127 | 255)));
             assert_ne!(&frame[24..26], &[0x11, 0x02]);
             drop(locked);
-
-            let response = open_response(1, &[0x11, 0x01, 0, 0, 7, 0, 1, 2, 0x8c, 0x12]);
-            wlan_mlme::MlmeImpl::handle_mac_frame_rx(
-                &mut mlme,
-                &response.bytes,
-                response.status,
-                fuchsia_trace::Id::new(),
-            )
-            .await;
-            let association = backend
-                .lock()
-                .unwrap()
-                .effects
-                .association
-                .clone()
-                .expect("successful association response reaches DeviceOps");
-            assert_eq!(
-                association.ht_cap.unwrap().bytes,
-                [
-                    0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0,
-                ]
-            );
-            assert_eq!(
-                association.vht_cap.unwrap().bytes,
-                [
-                    0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
-                ]
-            );
-            assert_ne!(&association.ht_cap.unwrap().bytes[..2], &[0xf3, 0x09]);
-            assert_ne!(
-                &association.vht_cap.unwrap().bytes[..4],
-                &[0xb2, 0x71, 0x90, 0x33]
-            );
         });
     }
 
@@ -2850,514 +2602,6 @@ mod tests {
                     .unwrap()
                     .authorization
                     .is_live()
-            );
-        });
-    }
-
-    #[test]
-    fn pinned_runtime_owns_open_association_authorization_and_timeout_containment() {
-        futures::executor::block_on(async {
-            let mut effects = FakeEffects::default();
-            effects
-                .rx
-                .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
-            effects.rx.push_back(source_exact_140_byte_open_response(
-                0x01,
-                &[1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84],
-            ));
-            let capability = nic();
-            let passive = Mt7921SoftmacAdapter::new(
-                FakePassiveTransport::default(),
-                capability,
-                mt7921_port_spike::candidate_channels(capability),
-                vec![channel(36)],
-            )
-            .unwrap();
-            let mut device_support = support();
-            device_support.query.sta_addr = nic().mac_address;
-            device_support.query.factory_addr = nic().mac_address;
-            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
-            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
-                basic_rates: Some(vec![0x82, 0x84]),
-                primary_channels: Some(vec![channel(36)]),
-                ..Default::default()
-            }]);
-            let (device, runner, mut ethernet, _tx) =
-                Mt7921ClientDevice::new_with_ethernet(effects, passive, device_support, 8).unwrap();
-            runner
-                .backend
-                .lock()
-                .unwrap()
-                .authorization
-                .authorize_scan();
-            let support_info = support();
-            let inspector = fuchsia_inspect::Inspector::default();
-            let mut runtime = PinnedClientRuntime::new(
-                device,
-                runner,
-                wlan_sme::client::ClientConfig::default(),
-                runtime_device_info(),
-                support_info.security,
-                support_info.spectrum_management,
-                inspector,
-            )
-            .await
-            .unwrap();
-            runtime
-                .connect(
-                    open_connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
-                .await
-                .unwrap();
-            assert!(runtime.sme().status().is_connected());
-            assert_eq!(
-                runtime.runner.backend.lock().unwrap().effects.link_up,
-                Some(true)
-            );
-            assert!(
-                runtime
-                    .runner
-                    .backend
-                    .lock()
-                    .unwrap()
-                    .effects
-                    .association
-                    .is_some()
-            );
-
-            {
-                use crate::ethernet::AssociatedSoftmacTx;
-                let mut pump = runtime.associated_data_pump();
-                let mut ethernet_tx = vec![0x0a, 2, 3, 4, 5, 6];
-                ethernet_tx.extend_from_slice(&nic().mac_address.unwrap());
-                ethernet_tx.extend_from_slice(&[0x08, 0x00, 1, 2, 3, 4]);
-                pump.transmit_ethernet(&ethernet_tx).unwrap();
-            }
-            let transmitted = runtime
-                .runner
-                .backend
-                .lock()
-                .unwrap()
-                .effects
-                .frame
-                .clone()
-                .unwrap();
-            assert_eq!(
-                u16::from_le_bytes([transmitted[0], transmitted[1]]) & 0x000c,
-                0x0008
-            );
-
-            let mut data = vec![0x08, 0x02, 0, 0];
-            data.extend_from_slice(&nic().mac_address.unwrap());
-            data.extend_from_slice(&BSSID);
-            data.extend_from_slice(&[0x0a, 2, 3, 4, 5, 6]);
-            data.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 9, 8, 7]);
-            runtime
-                .runner
-                .backend
-                .lock()
-                .unwrap()
-                .effects
-                .rx
-                .push_back(ClientRxFrame {
-                    bytes: data,
-                    status: rx_status(-30),
-                    security: None,
-                });
-            assert!(
-                runtime
-                    .runner
-                    .pump_client_rx(&mut runtime.mlme)
-                    .await
-                    .unwrap()
-            );
-            use netstack3_port_spike::EthernetDevice as _;
-            let delivered = ethernet.receive().expect("pinned MLME Ethernet delivery");
-            assert_eq!(&delivered.as_bytes()[..6], &nic().mac_address.unwrap());
-            assert_eq!(&delivered.as_bytes()[6..12], &[0x0a, 2, 3, 4, 5, 6]);
-
-            runtime
-                .runner
-                .backend
-                .lock()
-                .unwrap()
-                .effects
-                .rx
-                .push_back(open_response(0x0c, &3u16.to_le_bytes()));
-            for _ in 0..4 {
-                runtime.pump_once().await.unwrap();
-            }
-            assert!(!runtime.sme().status().is_connected());
-            assert!(
-                runtime
-                    .runner
-                    .backend
-                    .lock()
-                    .unwrap()
-                    .effects
-                    .clear
-                    .is_some()
-            );
-
-            {
-                let mut backend = runtime.runner.backend.lock().unwrap();
-                backend
-                    .effects
-                    .rx
-                    .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
-                backend
-                    .effects
-                    .rx
-                    .push_back(open_response(0x01, &[1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84]));
-            }
-            runtime
-                .connect(
-                    open_connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
-                .await
-                .unwrap();
-            assert!(runtime.sme().status().is_connected());
-
-            // A second runtime with no peer responses must contain lifecycle
-            // authority at its caller-owned deadline.
-            let capability = nic();
-            let passive = Mt7921SoftmacAdapter::new(
-                FakePassiveTransport::default(),
-                capability,
-                mt7921_port_spike::candidate_channels(capability),
-                vec![channel(36)],
-            )
-            .unwrap();
-            let (device, runner) =
-                Mt7921ClientDevice::new(FakeEffects::default(), passive, support());
-            runner
-                .backend
-                .lock()
-                .unwrap()
-                .authorization
-                .authorize_scan();
-            let support_info = support();
-            let inspector = fuchsia_inspect::Inspector::default();
-            let mut timed = PinnedClientRuntime::new(
-                device,
-                runner,
-                wlan_sme::client::ClientConfig::default(),
-                runtime_device_info(),
-                support_info.security,
-                support_info.spectrum_management,
-                inspector,
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                timed
-                    .connect(open_connect_request(), std::time::Instant::now())
-                    .await,
-                Err(PinnedConnectError::Timeout)
-            );
-            assert!(!timed.runner.backend.lock().unwrap().authorization.is_live());
-        });
-    }
-
-    #[test]
-    fn pinned_runtime_quiesces_association_before_queued_eapol_rx() {
-        futures::executor::block_on(async {
-            let capability = nic();
-            let make_runtime = |effects| async move {
-                let passive = Mt7921SoftmacAdapter::new(
-                    FakePassiveTransport::default(),
-                    capability,
-                    mt7921_port_spike::candidate_channels(capability),
-                    vec![channel(36)],
-                )
-                .unwrap();
-                let mut device_support = support();
-                device_support.query.sta_addr = nic().mac_address;
-                device_support.query.factory_addr = nic().mac_address;
-                device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
-                device_support.query.band_caps =
-                    Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                        band: Some(fidl_ieee80211::WlanBand::FiveGhz),
-                        basic_rates: Some(vec![0x82, 0x84]),
-                        primary_channels: Some(vec![channel(36)]),
-                        ..Default::default()
-                    }]);
-                let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-                runner
-                    .backend
-                    .lock()
-                    .unwrap()
-                    .authorization
-                    .authorize_scan();
-                let support_info = support();
-                PinnedClientRuntime::new(
-                    device,
-                    runner,
-                    wlan_sme::client::ClientConfig::default(),
-                    runtime_device_info(),
-                    support_info.security,
-                    support_info.spectrum_management,
-                    fuchsia_inspect::Inspector::default(),
-                )
-                .await
-                .unwrap()
-            };
-
-            let mut effects = FakeEffects::default();
-            effects.rx.extend([
-                open_response(0x0b, &[0, 0, 2, 0, 0, 0]),
-                wpa2_association_response(),
-                wpa2_message_1(),
-            ]);
-            let mut runtime = make_runtime(effects).await;
-            let _transaction = runtime.sme.on_connect_command(wpa2_connect_request());
-            for _ in 0..16 {
-                runtime.pump_once().await.unwrap();
-                let backend = runtime.runner.backend.lock().unwrap();
-                if backend.effects.rx_dequeued == 3 && backend.effects.frames.len() >= 3 {
-                    break;
-                }
-            }
-            let backend = runtime.runner.backend.lock().unwrap();
-            assert_eq!(backend.effects.rx_dequeued, 3);
-            assert!(
-                backend.effects.association.is_some(),
-                "effects={:?}",
-                backend.effects
-            );
-            let association = backend
-                .effects
-                .order
-                .iter()
-                .position(|effect| *effect == "association")
-                .unwrap();
-            let third_rx = backend
-                .effects
-                .order
-                .iter()
-                .enumerate()
-                .filter(|(_, effect)| **effect == "rx")
-                .nth(2)
-                .unwrap()
-                .0;
-            assert!(
-                association < third_rx,
-                "M1 dequeued before association activation"
-            );
-            assert!(backend.effects.frames.iter().any(|frame| {
-                frame
-                    .get(..2)
-                    .is_some_and(|fc| u16::from_le_bytes([fc[0], fc[1]]) & 0x000c == 0x0008)
-                    && frame
-                        .windows(8)
-                        .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
-            }));
-            drop(backend);
-
-            let mut effects = FakeEffects {
-                fail_on: Some("association"),
-                ..Default::default()
-            };
-            effects.rx.extend([
-                open_response(0x0b, &[0, 0, 2, 0, 0, 0]),
-                wpa2_association_response(),
-                wpa2_message_1(),
-            ]);
-            let mut failed = make_runtime(effects).await;
-            let failure = failed
-                .connect(
-                    wpa2_connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
-                .await;
-            assert!(
-                failure.is_err(),
-                "association activation failure must be terminal"
-            );
-            let backend = failed.runner.backend.lock().unwrap();
-            assert_eq!(backend.effects.rx_dequeued, 2);
-            assert_eq!(
-                backend.effects.rx.len(),
-                1,
-                "queued M1 carrier was consumed"
-            );
-            assert!(!backend.effects.frames.iter().any(|frame| {
-                frame
-                    .windows(8)
-                    .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
-            }));
-        });
-    }
-
-    #[test]
-    fn pinned_runtime_drives_comeback_timer_and_disconnect_cancels_it() {
-        futures::executor::block_on(async {
-            let mut effects = FakeEffects {
-                complete_on_association: true,
-                ..Default::default()
-            };
-            effects
-                .rx
-                .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
-            effects.rx.push_back(open_response(
-                0x01,
-                &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
-            ));
-            let capability = nic();
-            let passive = Mt7921SoftmacAdapter::new(
-                FakePassiveTransport::default(),
-                capability,
-                mt7921_port_spike::candidate_channels(capability),
-                vec![channel(36)],
-            )
-            .unwrap();
-            let mut device_support = support();
-            device_support.query.sta_addr = nic().mac_address;
-            device_support.query.factory_addr = nic().mac_address;
-            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
-            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
-                basic_rates: Some(vec![0x82, 0x84]),
-                primary_channels: Some(vec![channel(36)]),
-                ..Default::default()
-            }]);
-            let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-            runner
-                .backend
-                .lock()
-                .unwrap()
-                .authorization
-                .authorize_scan();
-            let backend = Arc::clone(&runner.backend);
-            let support_info = support();
-            let mut runtime = PinnedClientRuntime::new(
-                device,
-                runner,
-                wlan_sme::client::ClientConfig::default(),
-                runtime_device_info(),
-                support_info.security,
-                support_info.spectrum_management,
-                fuchsia_inspect::Inspector::default(),
-            )
-            .await
-            .unwrap();
-            let responder = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                loop {
-                    {
-                        let mut backend = backend.lock().unwrap();
-                        if backend.effects.frames.len() >= 3 {
-                            backend.effects.rx.push_back(open_response(
-                                0x01,
-                                &[1, 0, 0, 0, 0x2a, 0xc0, 1, 2, 0x82, 0x84],
-                            ));
-                            return;
-                        }
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "association retry not emitted"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            });
-            let started = std::time::Instant::now();
-            runtime
-                .connect(
-                    open_connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
-                .await
-                .unwrap();
-            responder.join().unwrap();
-            assert!(started.elapsed() >= std::time::Duration::from_millis(15));
-            let backend = runtime.runner.backend.lock().unwrap();
-            assert_eq!(backend.effects.frames.len(), 3);
-            assert_ne!(
-                &backend.effects.frames[1][22..24],
-                &backend.effects.frames[2][22..24]
-            );
-            assert_eq!(
-                &backend.effects.frames[1][24..],
-                &backend.effects.frames[2][24..]
-            );
-            assert_eq!(backend.effects.association.as_ref().unwrap().aid, Some(42));
-            assert!(backend.effects.validation_complete);
-            drop(backend);
-
-            let mut effects = FakeEffects::default();
-            effects
-                .rx
-                .push_back(open_response(0x0b, &[0, 0, 2, 0, 0, 0]));
-            effects.rx.push_back(open_response(
-                0x01,
-                &[1, 0, 30, 0, 1, 0, 56, 5, 3, 20, 0, 0, 0],
-            ));
-            let passive = Mt7921SoftmacAdapter::new(
-                FakePassiveTransport::default(),
-                capability,
-                mt7921_port_spike::candidate_channels(capability),
-                vec![channel(36)],
-            )
-            .unwrap();
-            let mut device_support = support();
-            device_support.query.sta_addr = nic().mac_address;
-            device_support.query.factory_addr = nic().mac_address;
-            device_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
-            device_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
-                basic_rates: Some(vec![0x82, 0x84]),
-                primary_channels: Some(vec![channel(36)]),
-                ..Default::default()
-            }]);
-            let (device, runner) = Mt7921ClientDevice::new(effects, passive, device_support);
-            runner
-                .backend
-                .lock()
-                .unwrap()
-                .authorization
-                .authorize_scan();
-            let support_info = support();
-            let mut canceled = PinnedClientRuntime::new(
-                device,
-                runner,
-                wlan_sme::client::ClientConfig::default(),
-                runtime_device_info(),
-                support_info.security,
-                support_info.spectrum_management,
-                fuchsia_inspect::Inspector::default(),
-            )
-            .await
-            .unwrap();
-            let _transaction = canceled.sme.on_connect_command(open_connect_request());
-            for _ in 0..8 {
-                canceled.pump_once().await.unwrap();
-                if canceled.runner.backend.lock().unwrap().effects.frames.len() == 2 {
-                    break;
-                }
-            }
-            assert_eq!(
-                canceled.runner.backend.lock().unwrap().effects.frames.len(),
-                2
-            );
-            canceled.sme.on_disconnect_command(
-                fidl_sme::UserDisconnectReason::WlanSmeUnitTesting,
-                Default::default(),
-            );
-            for _ in 0..4 {
-                canceled.pump_once().await.unwrap();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            for _ in 0..4 {
-                canceled.pump_once().await.unwrap();
-            }
-            assert_eq!(
-                canceled.runner.backend.lock().unwrap().effects.frames.len(),
-                2,
-                "disconnect must cancel the generation-bound comeback timer"
             );
         });
     }

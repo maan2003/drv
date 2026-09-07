@@ -6,7 +6,6 @@ snapshot_generator=@snapshot_generator@
 regulatory_db=@regulatory_db@
 regulatory_source_sha256=@regulatory_source_sha256@
 credential_file=@credential_file@
-mock_credential_file=@mock_credential_file@
 artifact_identity=@artifact_identity@
 
 actual_identity=$($driver --artifact-identity)
@@ -15,13 +14,6 @@ if [ "$actual_identity" != "$expected_identity" ]; then
   echo "installed validation ELF semantic identity mismatch" >&2
   exit 78
 fi
-
-integration_backend=${MT7921_PACKAGED_INTEGRATION_TEST-}
-case "$integration_backend" in
-  '') ;;
-  1) credential_file=$mock_credential_file ;;
-  *) echo "MT7921_PACKAGED_INTEGRATION_TEST must equal 1" >&2; exit 64 ;;
-esac
 
 prepare_snapshot() {
   umask 077
@@ -63,29 +55,12 @@ case "$#:${1-}" in
     printf '%s\n' "$expected_identity"
     ;;
   0:)
-    if [ -z "$integration_backend" ]; then
-      : "${DRV_PCI_BDF:?missing canonical PCI target}"
-      : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
-      : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
-      : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
-    fi
+    : "${DRV_PCI_BDF:?missing canonical PCI target}"
+    : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
+    : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
+    : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
     prepare_snapshot
     prepare_credential
-    if [ "$integration_backend" = 1 ]; then
-      exec @env@ -i \
-        DRV_PASSIVE_M1_OBSERVATION=1 \
-        DRV_SAE_BSSID=02:d3:b9:dd:c3:d0 \
-        DRV_SAE_CHANNEL=149 \
-        DRV_SAE_SSID=ajay \
-        DRV_SAE_CLIENT_MAC=@session_client_mac@ \
-        DRV_SAE_CREDENTIAL_FD=3 \
-        DRV_SAE_CREDENTIAL_LEN="$credential_len" \
-        DRV_REGULATORY_SNAPSHOT_FD=4 \
-        DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
-        DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
-        DRV_VALIDATION_BACKEND=mock-packaged-integration \
-        "$driver" --run-one-shot-sae-auth
-    fi
     exec @env@ -i \
       DRV_PCI_BDF="$DRV_PCI_BDF" \
       DRV_IOMMU_GROUP="$DRV_IOMMU_GROUP" \
@@ -93,7 +68,7 @@ case "$#:${1-}" in
       DRV_LAB_SAFETY_STATE="$DRV_LAB_SAFETY_STATE" \
       DRV_SOCKS5_LISTEN="${DRV_SOCKS5_LISTEN-127.0.0.1:1080}" \
       DRV_DAEMON_MAX_SECONDS="${DRV_DAEMON_MAX_SECONDS-360}" \
-      DRV_PASSIVE_M1_OBSERVATION=1 \
+      DRV_ACTIVE_CLIENT=1 \
       DRV_SAE_BSSID=02:d3:b9:dd:c3:d0 \
       DRV_SAE_CHANNEL=149 \
       DRV_SAE_SSID=ajay \
@@ -104,17 +79,6 @@ case "$#:${1-}" in
       DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
       DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
       "$driver" --run-one-shot-sae-auth
-    ;;
-  1:--self-test-production-association-request)
-    prepare_snapshot
-    prepare_credential
-    exec @env@ -i \
-      DRV_SAE_CREDENTIAL_FD=3 \
-      DRV_SAE_CREDENTIAL_LEN="$credential_len" \
-      DRV_REGULATORY_SNAPSHOT_FD=4 \
-      DRV_REGULATORY_SNAPSHOT_LEN="$snapshot_len" \
-      DRV_REGULATORY_SOURCE_SHA256="$regulatory_source_sha256" \
-      "$driver" --self-test-production-association-request
     ;;
   1:--full-firmware-preflight)
     prepare_snapshot
