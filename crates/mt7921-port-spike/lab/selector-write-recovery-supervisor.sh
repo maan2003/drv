@@ -135,10 +135,10 @@ case $connected_frequency in
     exit 1
     ;;
 esac
-if [[ $connected_bssid != 72:a6:c7:7d:56:93 \
+if [[ $connected_bssid != 02:d3:b9:dd:c3:d0 \
    || $connected_channel != 149 \
    || $connected_client_mac != "$native_client_mac" ]]; then
-  echo "connected Wi-Fi target drifted from fixed ph1 validation policy" >&2
+  echo "connected Wi-Fi target drifted from fixed ajay validation policy" >&2
   exit 1
 fi
 export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \

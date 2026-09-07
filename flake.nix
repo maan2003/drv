@@ -224,7 +224,7 @@
                 --subst-var-by snapshot_generator "$out/libexec/mt7921-rate-power-evidence" \
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
-                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by credential_file /var/lib/iwd/ajay.psk \
                 --subst-var-by artifact_identity "$out/share/mt7921-rate-power-evidence/artifact-identity.json" \
                 --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
@@ -359,7 +359,7 @@
                 --subst-var-by snapshot_generator "$out/libexec/mt7921-full-firmware-validation" \
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
-                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by credential_file /var/lib/iwd/ajay.psk \
                 --subst-var-by mock_credential_file "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" \
                 --subst-var-by artifact_identity "$out/share/mt7921-full-firmware-validation/artifact-identity.json" \
                 --subst-var-by session_client_mac "$session_client_mac" \

@@ -74,9 +74,9 @@ case "$#:${1-}" in
     if [ "$integration_backend" = 1 ]; then
       exec @env@ -i \
         DRV_PASSIVE_M1_OBSERVATION=1 \
-        DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
+        DRV_SAE_BSSID=02:d3:b9:dd:c3:d0 \
         DRV_SAE_CHANNEL=149 \
-        DRV_SAE_SSID=ph1 \
+        DRV_SAE_SSID=ajay \
         DRV_SAE_CLIENT_MAC=@session_client_mac@ \
         DRV_SAE_CREDENTIAL_FD=3 \
         DRV_SAE_CREDENTIAL_LEN="$credential_len" \
@@ -92,9 +92,9 @@ case "$#:${1-}" in
       DRV_VFIO_DEVICE="$DRV_VFIO_DEVICE" \
       DRV_LAB_SAFETY_STATE="$DRV_LAB_SAFETY_STATE" \
       DRV_PASSIVE_M1_OBSERVATION=1 \
-      DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
+      DRV_SAE_BSSID=02:d3:b9:dd:c3:d0 \
       DRV_SAE_CHANNEL=149 \
-      DRV_SAE_SSID=ph1 \
+      DRV_SAE_SSID=ajay \
       DRV_SAE_CLIENT_MAC=@session_client_mac@ \
       DRV_SAE_CREDENTIAL_FD=3 \
       DRV_SAE_CREDENTIAL_LEN="$credential_len" \

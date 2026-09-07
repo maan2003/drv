@@ -6,38 +6,39 @@ lab=/run/current-system/sw/bin/wifi-driver-lab
 wd=/run/current-system/sw/bin/wifi-lab-watchdog
 launcher=/data/persist/drvlab/active-launcher.sh
 ret=/data/persist/drvlab/return-net.sh
+# Target: ajay (the phone hotspot). It does its own NAT to the internet, so the
+# whole run only needs this host + the phone -- no redwood AP, NAT, firewall, or
+# hostapd deauth guard.
+ap_ssid=ajay
+ap_bssid=02:d3:b9:dd:c3:d0
 out=/data/persist/drvlab/active-run-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$out"; cd "$out"
 exec > run.log 2>&1
-echo "start $(date -u +%FT%TZ) bdf=$bdf"
+echo "start $(date -u +%FT%TZ) bdf=$bdf target=$ap_ssid/$ap_bssid"
 wdev(){ for d in /sys/class/net/wl*; do [ -e "$d/wireless" ] && { basename "$d"; return 0; }; done; return 1; }
 # safety net: userspace recovery fires at 480s regardless (dynamic dev, ajay->ph1 fallback)
 systemd-run --on-active=480 --unit=drvlab-active-return-$$ "$ret" >/dev/null 2>&1
 journalctl -f -o short-precise --no-tail _TRANSPORT=kernel + _SYSTEMD_UNIT=iwd.service > kernel-iwd-journal.log 2>&1 & jpid=$!
 sudo -n iw event -t -f > iw-event.log 2>&1 & iwpid=$!
-connect_ph1() {
+connect_ap() {
   local d a; d=$(wdev) || return 1
   iwctl station "$d" disconnect >/dev/null 2>&1; sleep 1
   for a in 1 2 3 4; do
-    # Refresh the kernel BSS cache right before connecting: cfg80211 expires
-    # scan entries after 30 s and CMD_AUTHENTICATE then fails immediately
-    # (iwd "connect-failed, status: 1" with no auth frame on air; seen when np
-    # had been sitting on ajay for a while: runs 1788757698/1788757875/1788763175).
-    # iwd only trusts its own scan results ("Invalid network name 'ph1'" with
-    # a raw iw scan seeing the BSS, run 1788777538), so ask iwd to scan and
-    # wait until ph1 shows up in get-networks.
+    # iwd only connects to networks in its OWN scan results ("Invalid network
+    # name" otherwise), and cfg80211 expires scan entries after 30 s, so scan
+    # and wait until ajay actually shows up in get-networks before connecting.
     iwctl station "$d" scan >/dev/null 2>&1
-    for i in $(seq 1 10); do sleep 1; iwctl station "$d" get-networks 2>/dev/null | grep -q " ph1 " && break; done
-    echo "scan ph1 dev=$d attempt=$a iwd_sees=$(iwctl station "$d" get-networks 2>/dev/null | grep -c " ph1 ") $(date -u +%T.%N)"
-    echo "connect ph1 dev=$d attempt=$a $(date -u +%T.%N)"
-    if iwctl station "$d" connect ph1; then
-      for i in $(seq 1 40); do sleep 1; iw dev "$d" link 2>/dev/null | grep -q "Connected to 72:a6:c7:7d:56:93" && return 0; done
+    for i in $(seq 1 12); do sleep 1; iwctl station "$d" get-networks 2>/dev/null \
+      | sed 's/\x1b\[[0-9;]*m//g' | grep -qE "[[:space:]]${ap_ssid}[[:space:]]" && break; done
+    echo "scan $ap_ssid dev=$d attempt=$a $(date -u +%T.%N)"
+    if iwctl station "$d" connect "$ap_ssid"; then
+      for i in $(seq 1 40); do sleep 1; iw dev "$d" link 2>/dev/null | grep -qi "Connected to $ap_bssid" && return 0; done
     fi
     sleep 3
   done
   return 1
 }
-if ! connect_ph1; then echo retry; connect_ph1 || { echo "native precondition failed"; "$ret" & kill $jpid; sudo -n kill $iwpid 2>/dev/null; exit 1; }; fi
-echo "native ph1 link ok $(date -u +%T.%N)"
+if ! connect_ap; then echo retry; connect_ap || { echo "native precondition failed"; "$ret" & kill $jpid; sudo -n kill $iwpid 2>/dev/null; exit 1; }; fi
+echo "native $ap_ssid link ok $(date -u +%T.%N)"
 sudo -n $wd status | grep -q disarmed || sudo -n $wd fire >/dev/null 2>&1 || true
 token=$(sudo -n $wd arm) || { echo "watchdog arm failed"; "$ret" & kill $jpid; sudo -n kill $iwpid 2>/dev/null; exit 1; }
 echo "watchdog armed"
@@ -48,35 +49,25 @@ echo "watchdog armed"
 touch "$out/.hb"
 ( while [ -f "$out/.hb" ]; do sudo -n $wd heartbeat "$token" >/dev/null 2>&1 || echo "heartbeat failed $(date -u +%T)"; sleep 20; done ) & hb=$!
 sudo -n $wd heartbeat "$token" >/dev/null 2>&1 || echo "initial heartbeat failed"
-# leave ph1 cleanly: the VFIO unbind sends no deauth, and a stale [MFP] entry
-# makes hostapd answer the driver's association with an SA Query comeback.
+# leave the AP cleanly before the VFIO unbind hands the radio to the driver.
 dn=$(wdev); iwctl station "$dn" disconnect >/dev/null 2>&1
-# Observed run 054446Z: this disconnect produced no deauth at the AP, so the
-# driver still met a status-30 SA Query comeback (~1 s) and then associated.
-# The launch helper (lab/launch-active-run.sh) deauths the client on the AP
-# beforehand so the native precondition itself is not hit by the comeback.
 sleep 1; echo "native disconnected $(date -u +%T.%N)"
-# give the launch helper's AP guard (deauth on redwood once np stops answering
-# ping) time to clear the stale entry before the driver's SAE starts.
 sleep 2
 echo "run lab $(date -u +%T.%N)"
 sudo -n $lab $bdf 300 -- $launcher > lab.out 2>&1; echo "lab rc=$? $(date -u +%T.%N)"
 sleep 3
 R=$(sudo -n bash -c "ls -t /var/lib/wifi-driver-lab/reports/*.log 2>/dev/null | head -1")
 echo "report=$R"; sudo -n cp "$R" "$out/report.log" 2>/dev/null; sudo -n chmod a+r "$out/report.log" 2>/dev/null
-# recover network with watchdog STILL armed; only disarm once internet OR ph1 LAN is confirmed
+# recover network with watchdog STILL armed; only disarm once the network is confirmed
 echo "return net $(date -u +%T.%N)"; "$ret"; rc=$?; echo "return rc=$rc"
-# confirm reachable state before disarming; if not reachable, leave watchdog to reboot
-# retry up to ~120s (the heartbeat keeps feeding the watchdog during this loop, so the
-# lease cannot expire here). ph1 fallback SAE+DHCP can take >30s after return-net returns.
-# Checks: internet ping, OR redwood LAN gw 10.77.0.1, OR a ph1 LAN address on the wifi dev,
-# OR iwctl reporting the station connected. No iw dependency.
+# confirm reachable state before disarming; if not reachable, leave watchdog to reboot.
+# retry up to ~120s (the heartbeat keeps feeding the watchdog during this loop).
+# Checks: internet ping (ajay NATs), OR ph1 LAN fallback address, OR iwctl connected.
 confirmed=0
 for i in $(seq 1 24); do
   d=$(wdev || echo wlan0)
   if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 \
-     || ping -c1 -W2 10.77.0.1 >/dev/null 2>&1 \
-     || ip -4 -o addr show dev "$d" 2>/dev/null | grep -q " 10\.77\.0\." \
+     || ip -4 -o addr show dev "$d" 2>/dev/null | grep -qE " (172\.20\.10|10\.77\.0)\." \
      || iwctl station "$d" show 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | grep -qiE "^ *State +connected"; then
     echo "network confirmed after $((i*5))s (dev=$d)"; confirmed=1; break; fi
   sleep 5
