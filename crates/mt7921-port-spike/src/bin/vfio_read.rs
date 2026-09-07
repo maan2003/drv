@@ -6456,7 +6456,7 @@ fn run() -> Result<(), String> {
                                     .map_err(|_| "convert SoftMAC device info failed")?;
                                     let security_support = support.security.clone();
                                     let spectrum_support = support.spectrum_management.clone();
-                                    let (mut device, runner, ethernet_device, ethernet_tx) =
+                                    let (mut device, runner, ethernet_device) =
                                         Mt7921ClientDevice::new_with_ethernet(
                                             effects, adapter, support, 32,
                                         )
@@ -6576,7 +6576,6 @@ fn run() -> Result<(), String> {
                                     );
                                     let mut proof = BoundedNetstackProof::new(
                                         ethernet_device,
-                                        ethernet_tx,
                                         NetstackProofConfig {
                                             dns_name: "example.com.".into(),
                                             server_port: NonZeroU16::new(80).unwrap(),

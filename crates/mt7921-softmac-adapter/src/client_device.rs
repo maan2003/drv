@@ -26,8 +26,8 @@ use wlan_softmac_class_support::{LifecycleAuthorization, PublicWlanIdentity};
 
 use crate::Mt7921SoftmacAdapter;
 use crate::ethernet::{
-    EthernetIngressError, EthernetPortConfigError, MlmeEthernetSink, Mt7921EthernetDevice,
-    Mt7921EthernetTx, ethernet_port,
+    DriverEthernetPort, EthernetIngressError, EthernetPortConfigError, Mt7921EthernetDevice,
+    ethernet_port,
 };
 use fuchsia_softmac_port::{HardwareScanEvent, SoftmacHardware};
 
@@ -731,6 +731,26 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         crate::ethernet::PinnedAssociatedDataPump::new(mlme, self)
     }
 
+    /// Take one driver-bound frame without retaining the backend lock across
+    /// the caller's MLME TX entry point.
+    pub(crate) fn take_ethernet_transmit(
+        &self,
+    ) -> Result<Option<netstack3_port_spike::EthernetFrame>, zx::Status> {
+        self.backend
+            .lock()
+            .unwrap()
+            .ethernet
+            .as_mut()
+            .ok_or(zx::Status::NOT_SUPPORTED)?
+            .take_transmit()
+            .map_err(|error| match error {
+                EthernetIngressError::Closed => zx::Status::CANCELED,
+                EthernetIngressError::LinkDown => zx::Status::BAD_STATE,
+                EthernetIngressError::Backpressure => zx::Status::SHOULD_WAIT,
+                EthernetIngressError::InvalidFrame(_) => zx::Status::IO_DATA_INTEGRITY,
+            })
+    }
+
     /// Run one short-lived physical operation without transferring the
     /// DeviceOps-owned backend or its revocation state.
     pub fn with_physical<R>(&self, operation: impl FnOnce(&mut Mt7921SoftmacAdapter<T>) -> R) -> R {
@@ -1195,7 +1215,7 @@ struct ComposedBackend<E, S> {
     active_scan_id: Option<u64>,
     authorization: LifecycleAuthorization,
     association_activation_failure: Option<zx::Status>,
-    ethernet: Option<MlmeEthernetSink>,
+    ethernet: Option<DriverEthernetPort>,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
@@ -1267,15 +1287,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
         scan: Mt7921SoftmacAdapter<T>,
         support: ClientSupport,
         queue_capacity: usize,
-    ) -> Result<
-        (
-            Self,
-            Mt7921ScanRunner<E, T>,
-            Mt7921EthernetDevice,
-            Mt7921EthernetTx,
-        ),
-        EthernetPortConfigError,
-    > {
+    ) -> Result<(Self, Mt7921ScanRunner<E, T>, Mt7921EthernetDevice), EthernetPortConfigError> {
         let mac = support
             .query
             .sta_addr
@@ -1283,7 +1295,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
         let mac = PublicWlanIdentity::new(mac)
             .map_err(|_| EthernetPortConfigError::InvalidMacAddress)?
             .bytes();
-        let (ethernet_device, ethernet_tx, ethernet_sink) = ethernet_port(mac, queue_capacity)?;
+        let (ethernet_device, ethernet_sink) = ethernet_port(mac, queue_capacity)?;
         let scan_state = effects.prepare_runtime_handoff();
         let backend = Arc::new(Mutex::new(ComposedBackend {
             effects,
@@ -1298,12 +1310,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
         };
-        Ok((
-            Self::from_parts(backend, support),
-            runner,
-            ethernet_device,
-            ethernet_tx,
-        ))
+        Ok((Self::from_parts(backend, support), runner, ethernet_device))
     }
 }
 

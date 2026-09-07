@@ -59,29 +59,145 @@ pub enum EthernetIngressError {
     InvalidFrame(FrameSizeError),
 }
 
-struct State {
-    properties: Option<EthernetPortProperties>,
+/// The entire contract between the associated driver and Netstack3.
+///
+/// Implementations carry Ethernet II frames in both directions. Link policy,
+/// association state, controlled-port state, and every other control verb stay
+/// on the driver side of this interface.
+pub trait EthernetFrameSeam {
+    type Error;
+
+    /// Attempt to send exactly one whole frame without blocking.
+    fn try_send_frame(&mut self, frame: EthernetFrame) -> Result<(), (Self::Error, EthernetFrame)>;
+    /// Attempt to receive exactly one whole frame without blocking.
+    fn try_receive_frame(&mut self) -> Result<Option<EthernetFrame>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InProcessFrameError {
+    Closed,
+    Backpressure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSide {
+    Driver,
+    Netstack,
+}
+
+struct FramePipeState {
     capacity: usize,
+    driver_open: bool,
+    netstack_open: bool,
+    driver_to_netstack: VecDeque<EthernetFrame>,
+    netstack_to_driver: VecDeque<EthernetFrame>,
+    netstack_events: VecDeque<EthernetDeviceEvent>,
+}
+
+struct PortLifecycleState {
+    properties: Option<EthernetPortProperties>,
     link_up: bool,
-    ingress: VecDeque<EthernetFrame>,
-    egress: VecDeque<EthernetFrame>,
     events: VecDeque<EthernetDeviceEvent>,
+}
+
+struct InProcessFrameEndpoint {
+    state: Arc<Mutex<FramePipeState>>,
+    side: FrameSide,
+}
+
+impl InProcessFrameEndpoint {
+    fn discard_frames(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        zeroize_frames(&mut state.driver_to_netstack);
+        zeroize_frames(&mut state.netstack_to_driver);
+        state.netstack_events.retain(|event| {
+            !matches!(
+                event,
+                EthernetDeviceEvent::ReceiveReady | EthernetDeviceEvent::TransmitReady
+            )
+        });
+    }
+
+    fn close(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        match self.side {
+            FrameSide::Driver => state.driver_open = false,
+            FrameSide::Netstack => state.netstack_open = false,
+        }
+        zeroize_frames(&mut state.driver_to_netstack);
+        zeroize_frames(&mut state.netstack_to_driver);
+        state.netstack_events.clear();
+    }
+
+    fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
+        self.state.lock().unwrap().netstack_events.pop_front()
+    }
+}
+
+impl Drop for InProcessFrameEndpoint {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl EthernetFrameSeam for InProcessFrameEndpoint {
+    type Error = InProcessFrameError;
+
+    /// Attempt to send exactly one whole frame without blocking.
+    fn try_send_frame(&mut self, frame: EthernetFrame) -> Result<(), (Self::Error, EthernetFrame)> {
+        let mut state = self.state.lock().unwrap();
+        let capacity = state.capacity;
+        let (peer_open, queue) = match self.side {
+            FrameSide::Driver => (state.netstack_open, &mut state.driver_to_netstack),
+            FrameSide::Netstack => (state.driver_open, &mut state.netstack_to_driver),
+        };
+        if !peer_open {
+            return Err((InProcessFrameError::Closed, frame));
+        }
+        if queue.len() == capacity {
+            return Err((InProcessFrameError::Backpressure, frame));
+        }
+        queue.push_back(frame);
+        if self.side == FrameSide::Driver {
+            push_event(
+                &mut state.netstack_events,
+                EthernetDeviceEvent::ReceiveReady,
+            );
+        }
+        Ok(())
+    }
+
+    fn try_receive_frame(&mut self) -> Result<Option<EthernetFrame>, Self::Error> {
+        let mut state = self.state.lock().unwrap();
+        let (peer_open, queue) = match self.side {
+            FrameSide::Driver => (state.netstack_open, &mut state.netstack_to_driver),
+            FrameSide::Netstack => (state.driver_open, &mut state.driver_to_netstack),
+        };
+        if !peer_open {
+            return Err(InProcessFrameError::Closed);
+        }
+        let frame = queue.pop_front();
+        if frame.is_some() && self.side == FrameSide::Driver {
+            push_event(
+                &mut state.netstack_events,
+                EthernetDeviceEvent::TransmitReady,
+            );
+        }
+        Ok(frame)
+    }
 }
 
 /// Netstack3-facing half of the port.
 pub struct Mt7921EthernetDevice {
-    state: Arc<Mutex<State>>,
+    seam: InProcessFrameEndpoint,
+    lifecycle: Arc<Mutex<PortLifecycleState>>,
 }
 
-/// MLME-facing outbound half. Its target is the pinned MLME's Ethernet TX
-/// entry point; the target remains responsible for 802.11 encapsulation.
-pub struct Mt7921EthernetTx {
-    state: Arc<Mutex<State>>,
-}
-
-/// Private device-side half retained by `Mt7921ClientDevice`.
-pub(crate) struct MlmeEthernetSink {
-    state: Arc<Mutex<State>>,
+/// Driver-side endpoint retained by `Mt7921ClientDevice`. The controlled-port
+/// gate is deliberately outside [`EthernetFrameSeam`].
+pub(crate) struct DriverEthernetPort {
+    seam: InProcessFrameEndpoint,
+    lifecycle: Arc<Mutex<PortLifecycleState>>,
 }
 
 pub trait AssociatedSoftmacTx {
@@ -96,6 +212,7 @@ pub trait AssociatedSoftmacTx {
 /// most one already-validated associated data frame into the MLME Ethernet
 /// sink; it must not wait beyond `deadline`.
 pub trait AssociatedDataPump: AssociatedSoftmacTx {
+    fn pump_transmit(&mut self) -> Result<bool, EthernetTxPumpError<Self::Error>>;
     fn pump_receive(&mut self, deadline: std::time::Instant) -> Result<bool, Self::Error>;
 }
 
@@ -111,7 +228,6 @@ pub struct NetstackProofConfig {
 /// port. This is a bounded driver, not a DHCP, DNS, TCP, or HTTP implementation.
 pub struct BoundedNetstackProof {
     runner: EthernetRunner<DhcpService, Mt7921EthernetDevice>,
-    tx: Mt7921EthernetTx,
     config: NetstackProofConfig,
     now: Duration,
     anchor: Option<std::time::Instant>,
@@ -170,7 +286,6 @@ impl Socks5Client {
 impl BoundedNetstackProof {
     pub fn new(
         device: Mt7921EthernetDevice,
-        tx: Mt7921EthernetTx,
         config: NetstackProofConfig,
     ) -> Result<Self, &'static str> {
         let mac = device
@@ -190,7 +305,6 @@ impl BoundedNetstackProof {
                 DhcpService::new(runtime, StdRng::seed_from_u64(7), mac),
                 device,
             ),
-            tx,
             config,
             now: Duration::ZERO,
             anchor: None,
@@ -230,7 +344,7 @@ impl BoundedNetstackProof {
             self.runner.stack_mut().poll_at(self.now, 64);
             while self.runner.pump().transmitted != 0 {}
             loop {
-                match self.tx.pump_one(target) {
+                match target.pump_transmit() {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(EthernetTxPumpError::Target(_)) => {
@@ -754,96 +868,79 @@ pub enum EthernetTxPumpError<E> {
 pub(crate) fn ethernet_port(
     mac_address: [u8; 6],
     queue_capacity: usize,
-) -> Result<(Mt7921EthernetDevice, Mt7921EthernetTx, MlmeEthernetSink), EthernetPortConfigError> {
+) -> Result<(Mt7921EthernetDevice, DriverEthernetPort), EthernetPortConfigError> {
     if queue_capacity == 0 {
         return Err(EthernetPortConfigError::ZeroQueueCapacity);
     }
     if mac_address == [0; 6] || mac_address[0] & 1 != 0 {
         return Err(EthernetPortConfigError::InvalidMacAddress);
     }
-    let state = Arc::new(Mutex::new(State {
+    let pipe = Arc::new(Mutex::new(FramePipeState {
+        capacity: queue_capacity,
+        driver_open: true,
+        netstack_open: true,
+        driver_to_netstack: VecDeque::with_capacity(queue_capacity),
+        netstack_to_driver: VecDeque::with_capacity(queue_capacity),
+        netstack_events: VecDeque::with_capacity(queue_capacity.saturating_mul(2)),
+    }));
+    let lifecycle = Arc::new(Mutex::new(PortLifecycleState {
         properties: Some(EthernetPortProperties {
             mac_address,
             mtu: MT7921_ETHERNET_MTU,
         }),
-        capacity: queue_capacity,
         link_up: false,
-        ingress: VecDeque::with_capacity(queue_capacity),
-        egress: VecDeque::with_capacity(queue_capacity),
         events: VecDeque::with_capacity(queue_capacity.saturating_mul(2).saturating_add(1)),
     }));
     Ok((
         Mt7921EthernetDevice {
-            state: state.clone(),
+            seam: InProcessFrameEndpoint {
+                state: pipe.clone(),
+                side: FrameSide::Netstack,
+            },
+            lifecycle: lifecycle.clone(),
         },
-        Mt7921EthernetTx {
-            state: state.clone(),
+        DriverEthernetPort {
+            seam: InProcessFrameEndpoint {
+                state: pipe,
+                side: FrameSide::Driver,
+            },
+            lifecycle,
         },
-        MlmeEthernetSink { state },
     ))
 }
 
 impl Mt7921EthernetDevice {
     pub fn properties(&self) -> Option<EthernetPortProperties> {
-        self.state.lock().unwrap().properties
+        self.lifecycle.lock().unwrap().properties
     }
 }
 
 impl EthernetDevice for Mt7921EthernetDevice {
     fn receive(&mut self) -> Option<EthernetFrame> {
-        self.state.lock().unwrap().ingress.pop_front()
+        let state = self.lifecycle.lock().unwrap();
+        if state.properties.is_none() || !state.link_up {
+            return None;
+        }
+        self.seam.try_receive_frame().ok().flatten()
     }
 
     fn transmit(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame> {
-        let mut state = self.state.lock().unwrap();
-        if state.properties.is_none() || !state.link_up || state.egress.len() == state.capacity {
+        let state = self.lifecycle.lock().unwrap();
+        if state.properties.is_none() || !state.link_up {
             return Err(frame);
         }
-        state.egress.push_back(frame);
-        Ok(())
+        self.seam.try_send_frame(frame).map_err(|(_, frame)| frame)
     }
 }
 
 impl EthernetEventSource for Mt7921EthernetDevice {
     fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
-        self.state.lock().unwrap().events.pop_front()
-    }
-}
-
-impl Mt7921EthernetTx {
-    /// Submit at most one queued frame. A rejected frame is restored at the
-    /// head of the queue, so transient MLME backpressure is lossless.
-    pub fn pump_one<T: AssociatedSoftmacTx>(
-        &mut self,
-        target: &mut T,
-    ) -> Result<bool, EthernetTxPumpError<T::Error>> {
-        let frame = {
-            let mut state = self.state.lock().unwrap();
-            if state.properties.is_none() {
-                return Err(EthernetTxPumpError::Closed);
-            }
-            if !state.link_up {
-                return Err(EthernetTxPumpError::LinkDown);
-            }
-            state.egress.pop_front()
-        };
-        let Some(frame) = frame else { return Ok(false) };
-        if let Err(error) = target.transmit_ethernet(frame.as_bytes()) {
-            // The frame is consumed even when the MAC rejects it: retrying the same
-            // frame forever would wedge the egress queue behind one undeliverable
-            // packet, whereas dropping it lets the netstack's own retransmission
-            // timers decide what to send next.
-            push_event(
-                &mut self.state.lock().unwrap(),
-                EthernetDeviceEvent::TransmitReady,
-            );
-            return Err(EthernetTxPumpError::Target(error));
-        }
-        push_event(
-            &mut self.state.lock().unwrap(),
-            EthernetDeviceEvent::TransmitReady,
-        );
-        Ok(true)
+        self.lifecycle
+            .lock()
+            .unwrap()
+            .events
+            .pop_front()
+            .or_else(|| self.seam.take_event())
     }
 }
 
@@ -917,6 +1014,23 @@ where
     E: crate::client_device::Mt7921ClientEffects,
     T: crate::Mt7921PassiveTransport,
 {
+    fn pump_transmit(&mut self) -> Result<bool, EthernetTxPumpError<Self::Error>> {
+        // Pop the owned frame under the backend lock, then release it before
+        // entering ClientMlme: DeviceOps TX re-enters that same backend.
+        let frame = self
+            .runner
+            .take_ethernet_transmit()
+            .map_err(|status| match status {
+                zx::Status::CANCELED => EthernetTxPumpError::Closed,
+                zx::Status::BAD_STATE => EthernetTxPumpError::LinkDown,
+                status => EthernetTxPumpError::Target(PinnedDataPumpError::Rx(status)),
+            })?;
+        let Some(frame) = frame else { return Ok(false) };
+        self.transmit_ethernet(frame.as_bytes())
+            .map_err(EthernetTxPumpError::Target)?;
+        Ok(true)
+    }
+
     fn pump_receive(&mut self, deadline: std::time::Instant) -> Result<bool, Self::Error> {
         if std::time::Instant::now() >= deadline {
             return Err(PinnedDataPumpError::Rx(zx::Status::TIMED_OUT));
@@ -926,32 +1040,45 @@ where
     }
 }
 
-impl MlmeEthernetSink {
+impl DriverEthernetPort {
     pub(crate) fn deliver(&mut self, bytes: &[u8]) -> Result<(), EthernetIngressError> {
         let frame =
             EthernetFrame::copy_from_slice(bytes).map_err(EthernetIngressError::InvalidFrame)?;
-        let mut state = self.state.lock().unwrap();
+        let state = self.lifecycle.lock().unwrap();
         if state.properties.is_none() {
             return Err(EthernetIngressError::Closed);
         }
         if !state.link_up {
             return Err(EthernetIngressError::LinkDown);
         }
-        if state.ingress.len() == state.capacity {
-            return Err(EthernetIngressError::Backpressure);
+        self.seam
+            .try_send_frame(frame)
+            .map_err(|(error, _)| match error {
+                InProcessFrameError::Closed => EthernetIngressError::Closed,
+                InProcessFrameError::Backpressure => EthernetIngressError::Backpressure,
+            })
+    }
+
+    pub(crate) fn take_transmit(&mut self) -> Result<Option<EthernetFrame>, EthernetIngressError> {
+        let state = self.lifecycle.lock().unwrap();
+        if state.properties.is_none() {
+            return Err(EthernetIngressError::Closed);
         }
-        state.ingress.push_back(frame);
-        push_event(&mut state, EthernetDeviceEvent::ReceiveReady);
-        Ok(())
+        if !state.link_up {
+            return Err(EthernetIngressError::LinkDown);
+        }
+        self.seam.try_receive_frame().map_err(|error| match error {
+            InProcessFrameError::Closed => EthernetIngressError::Closed,
+            InProcessFrameError::Backpressure => unreachable!(),
+        })
     }
 
     pub(crate) fn set_link(&mut self, up: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lifecycle.lock().unwrap();
         if state.properties.is_some() && state.link_up != up {
             state.link_up = up;
             if !up {
-                zeroize_frames(&mut state.ingress);
-                zeroize_frames(&mut state.egress);
+                self.seam.discard_frames();
                 state.events.retain(|event| {
                     !matches!(
                         event,
@@ -959,23 +1086,31 @@ impl MlmeEthernetSink {
                     )
                 });
             }
-            push_event(&mut state, EthernetDeviceEvent::LinkStateChanged(up));
+            push_event(&mut state.events, EthernetDeviceEvent::LinkStateChanged(up));
         }
     }
 
     pub(crate) fn teardown(&mut self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lifecycle.lock().unwrap();
         if state.properties.is_none() {
             return;
         }
         state.events.clear();
         if state.link_up {
-            push_event(&mut state, EthernetDeviceEvent::LinkStateChanged(false));
+            push_event(
+                &mut state.events,
+                EthernetDeviceEvent::LinkStateChanged(false),
+            );
         }
         state.link_up = false;
         state.properties = None;
-        zeroize_frames(&mut state.ingress);
-        zeroize_frames(&mut state.egress);
+        self.seam.close();
+    }
+}
+
+impl Drop for DriverEthernetPort {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -986,15 +1121,13 @@ fn zeroize_frames(frames: &mut VecDeque<EthernetFrame>) {
     }
 }
 
-fn push_event(state: &mut State, event: EthernetDeviceEvent) {
+fn push_event(events: &mut VecDeque<EthernetDeviceEvent>, event: EthernetDeviceEvent) {
     if let EthernetDeviceEvent::LinkStateChanged(_) = event {
-        state
-            .events
-            .retain(|queued| !matches!(queued, EthernetDeviceEvent::LinkStateChanged(_)));
-    } else if state.events.contains(&event) {
+        events.retain(|queued| !matches!(queued, EthernetDeviceEvent::LinkStateChanged(_)));
+    } else if events.contains(&event) {
         return;
     }
-    state.events.push_back(event);
+    events.push_back(event);
 }
 
 #[cfg(test)]
@@ -1045,7 +1178,7 @@ mod tests {
 
     #[test]
     fn mlme_rx_enters_existing_netstack_device_boundary() {
-        let (device, _, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 2).unwrap();
+        let (device, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 2).unwrap();
         let mut runner = EthernetRunner::new(StackEndpoint::default(), device);
         sink.set_link(true);
         let ipv4 = frame([0x08, 0x00], 7);
@@ -1064,7 +1197,7 @@ mod tests {
 
     #[test]
     fn arp_dhcp_and_data_leave_through_softmac_tx_facade() {
-        let (mut device, mut tx, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 3).unwrap();
+        let (mut device, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 3).unwrap();
         sink.set_link(true);
         let expected = [
             frame([0x08, 0x06], 1),
@@ -1076,15 +1209,16 @@ mod tests {
         }
         let mut target = TxTarget::default();
         for _ in 0..3 {
-            assert_eq!(tx.pump_one(&mut target), Ok(true));
+            let frame = sink.take_transmit().unwrap().unwrap();
+            target.transmit_ethernet(frame.as_bytes()).unwrap();
         }
-        assert_eq!(tx.pump_one(&mut target), Ok(false));
+        assert_eq!(sink.take_transmit(), Ok(None));
         assert_eq!(target.frames, expected.map(EthernetFrame::into_vec));
     }
 
     #[test]
     fn backpressure_link_lifecycle_and_teardown_are_bounded() {
-        let (mut device, mut tx, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let (mut device, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
         assert_eq!(device.properties().unwrap().mtu, 1500);
         let arp = frame([0x08, 0x06], 1);
         assert_eq!(device.transmit(arp.clone()), Err(arp.clone()));
@@ -1096,22 +1230,20 @@ mod tests {
             blocked: true,
             ..Default::default()
         };
-        assert_eq!(
-            tx.pump_one(&mut target),
-            Err(EthernetTxPumpError::Target(()))
-        );
+        let frame = sink.take_transmit().unwrap().unwrap();
+        assert_eq!(target.transmit_ethernet(frame.as_bytes()), Err(()));
         target.blocked = false;
-        assert_eq!(tx.pump_one(&mut target), Ok(true));
+        assert_eq!(sink.take_transmit(), Ok(None));
         sink.teardown();
         assert_eq!(device.properties(), None);
         assert_eq!(device.receive(), None);
         assert_eq!(device.transmit(arp.clone()), Err(arp));
-        assert_eq!(tx.pump_one(&mut target), Err(EthernetTxPumpError::Closed));
+        assert_eq!(sink.take_transmit(), Err(EthernetIngressError::Closed));
     }
 
     #[test]
     fn link_down_discards_frames_and_stale_readiness_from_old_association() {
-        let (mut device, mut tx, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 2).unwrap();
+        let (mut device, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 2).unwrap();
         sink.set_link(true);
         sink.deliver(frame([0x08, 0x00], 1).as_bytes()).unwrap();
         device.transmit(frame([0x08, 0x06], 2)).unwrap();
@@ -1124,10 +1256,7 @@ mod tests {
         );
         assert_eq!(device.take_event(), None);
         assert_eq!(device.receive(), None);
-        assert_eq!(
-            tx.pump_one(&mut TxTarget::default()),
-            Err(EthernetTxPumpError::LinkDown)
-        );
+        assert_eq!(sink.take_transmit(), Err(EthernetIngressError::LinkDown));
     }
 
     #[test]
@@ -1136,7 +1265,7 @@ mod tests {
             ethernet_port([0; 6], 1),
             Err(EthernetPortConfigError::InvalidMacAddress)
         ));
-        let (_, _, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let (_, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
         sink.set_link(true);
         assert_eq!(
             sink.deliver(&[0; 13]),
@@ -1150,6 +1279,31 @@ mod tests {
                 FrameSizeError::TooLong { len: 1515 }
             ))
         );
+    }
+
+    #[test]
+    fn dropping_netstack_endpoint_closes_driver_peer() {
+        let (device, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        driver.set_link(true);
+        drop(device);
+        assert_eq!(
+            driver.deliver(frame([0x08, 0x00], 1).as_bytes()),
+            Err(EthernetIngressError::Closed)
+        );
+    }
+
+    #[test]
+    fn dropping_driver_endpoint_tears_down_netstack_facade() {
+        let (mut device, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        driver.set_link(true);
+        drop(driver);
+        assert_eq!(device.properties(), None);
+        assert_eq!(
+            device.take_event(),
+            Some(EthernetDeviceEvent::LinkStateChanged(false))
+        );
+        let frame = frame([0x08, 0x00], 1);
+        assert_eq!(device.transmit(frame.clone()), Err(frame));
     }
 }
 
