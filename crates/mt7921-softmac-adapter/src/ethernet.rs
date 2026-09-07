@@ -18,11 +18,14 @@ use std::time::Duration;
 
 use netstack3_port_integration::{
     Runtime,
+    dns_bridge::DnsLookupHandle,
     service::{DhcpService, DhcpStatus},
 };
+use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2;
+use netstack3_port_spike::provider_transport_v2::{ProviderReadinessV2, ProviderSocketAddressV2};
 use netstack3_port_spike::{
     EthernetRunner, NetworkServiceEndpoint, RemoteIpAddress, RemoteIpVersion, RemoteSocketAddress,
-    RemoteSocketProvider,
+    RemoteSocketHandle, RemoteSocketProvider, SocketClientId,
 };
 use rand::{SeedableRng as _, rngs::StdRng};
 
@@ -115,6 +118,53 @@ pub struct BoundedNetstackProof {
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
     tx_dropped: u64,
+}
+
+const MAX_SOCKS5_CLIENTS: usize = 24;
+const MAX_SOCKS5_PENDING_BYTES: usize = 256 * 1024;
+
+struct Socks5Client {
+    stream: TcpStream,
+    peer: SocketAddr,
+    phase: Socks5Phase,
+    host_out: VecDeque<u8>,
+    host_to_remote: VecDeque<u8>,
+    remote_to_host: VecDeque<u8>,
+    socket_client: Option<SocketClientId>,
+    socket: Option<RemoteSocketHandle>,
+    idle_deadline: std::time::Instant,
+}
+
+enum Socks5Phase {
+    Greeting(Vec<u8>),
+    Request(Vec<u8>),
+    Dns {
+        lookup: DnsLookupHandle,
+        port: NonZeroU16,
+    },
+    Connecting {
+        address: [u8; 4],
+        port: NonZeroU16,
+    },
+    Reply,
+    Relay,
+    Closing,
+}
+
+impl Socks5Client {
+    fn new(stream: TcpStream, peer: SocketAddr) -> Self {
+        Self {
+            stream,
+            peer,
+            phase: Socks5Phase::Greeting(Vec::new()),
+            host_out: VecDeque::new(),
+            host_to_remote: VecDeque::new(),
+            remote_to_host: VecDeque::new(),
+            socket_client: None,
+            socket: None,
+            idle_deadline: std::time::Instant::now() + Duration::from_secs(30),
+        }
+    }
 }
 
 impl BoundedNetstackProof {
@@ -260,9 +310,9 @@ impl BoundedNetstackProof {
     ) -> Result<(), &'static str> {
         let address = self.resolved.ok_or("TCP requires DNS")?;
         let mut provider = self.runner.stack().socket_provider();
-        let client = provider
-            .open_client(NonZeroUsize::new(1).unwrap())
-            .map_err(|_| "socket client failed")?;
+        let client =
+            RemoteSocketProvider::open_client(&mut provider, NonZeroUsize::new(1).unwrap())
+                .map_err(|_| "socket client failed")?;
         let socket = provider
             .tcp_socket(client, RemoteIpVersion::V4)
             .map_err(|_| "TCP socket failed")?;
@@ -277,8 +327,7 @@ impl BoundedNetstackProof {
             .map_err(|_| "TCP connect failed")?;
         loop {
             self.drive(target, deadline)?;
-            let ready = provider
-                .readiness(socket)
+            let ready = RemoteSocketProvider::readiness(&mut provider, socket)
                 .map_err(|_| "TCP readiness failed")?;
             if ready.writable {
                 self.socket = Some(socket);
@@ -338,90 +387,161 @@ impl BoundedNetstackProof {
         listener
             .set_nonblocking(true)
             .map_err(|_| "SOCKS5 nonblocking setup failed")?;
+        let mut clients = Vec::new();
         println!("internet_proxy_ready=true listen={listen}");
         while !stop_requested() && std::time::Instant::now() < deadline {
-            self.drive(target, deadline)?;
-            match listener.accept() {
-                Ok((mut stream, peer)) => {
-                    stream
-                        .set_nonblocking(true)
-                        .map_err(|_| "SOCKS5 client nonblocking setup failed")?;
-                    println!("internet_proxy_client=true peer={peer}");
-                    if let Err(error) =
-                        self.serve_socks5_client(target, &mut stream, deadline, &mut stop_requested)
-                    {
-                        println!("internet_proxy_client_error={error}");
+            // Exactly one shared Netstack3 drive precedes a bounded amount of
+            // work for every client. No client-specific wait can delay another.
+            if let Err(error) = self.drive(target, deadline) {
+                for client in &mut clients {
+                    self.close_socks5_client(client);
+                }
+                return Err(error);
+            }
+            for _ in 0..32 {
+                match listener.accept() {
+                    Ok((stream, peer)) if clients.len() < MAX_SOCKS5_CLIENTS => {
+                        if stream.set_nonblocking(true).is_err() {
+                            println!(
+                                "internet_proxy_client_error=SOCKS5 client nonblocking setup failed peer={peer}"
+                            );
+                            continue;
+                        }
+                        println!("internet_proxy_client=true peer={peer}");
+                        clients.push(Socks5Client::new(stream, peer));
+                    }
+                    Ok((_stream, peer)) => {
+                        println!("internet_proxy_client_error=SOCKS5 client limit peer={peer}");
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        for client in &mut clients {
+                            self.close_socks5_client(client);
+                        }
+                        return Err("SOCKS5 accept failed");
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => return Err("SOCKS5 accept failed"),
             }
+
+            let mut index = 0;
+            while index < clients.len() {
+                match self.poll_socks5_client(&mut clients[index]) {
+                    Ok(false) => index += 1,
+                    Ok(true) => {
+                        let mut client = clients.swap_remove(index);
+                        self.close_socks5_client(&mut client);
+                        println!("internet_proxy_transfer_complete=true peer={}", client.peer);
+                    }
+                    Err(error) => {
+                        let mut client = clients.swap_remove(index);
+                        self.close_socks5_client(&mut client);
+                        println!("internet_proxy_client_error={error} peer={}", client.peer);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for client in &mut clients {
+            self.close_socks5_client(client);
         }
         println!("internet_proxy_stopped=true");
         Ok(())
     }
 
-    fn serve_socks5_client<T, F>(
-        &mut self,
-        target: &mut T,
-        stream: &mut TcpStream,
-        deadline: std::time::Instant,
-        stop_requested: &mut F,
-    ) -> Result<(), &'static str>
-    where
-        T: AssociatedDataPump,
-        F: FnMut() -> bool,
-    {
-        let greeting = self.read_host_exact(target, stream, 2, deadline, stop_requested)?;
-        if greeting[0] != 5 {
-            return Err("SOCKS5 invalid version");
+    fn poll_socks5_client(&mut self, client: &mut Socks5Client) -> Result<bool, &'static str> {
+        if std::time::Instant::now() >= client.idle_deadline {
+            return Err("SOCKS5 client idle timeout");
         }
-        let methods = self.read_host_exact(
-            target,
-            stream,
-            usize::from(greeting[1]),
-            deadline,
-            stop_requested,
-        )?;
-        if !methods.contains(&0) {
-            self.write_host_all(target, stream, &[5, 0xff], deadline, stop_requested)?;
-            return Err("SOCKS5 no supported authentication method");
-        }
-        self.write_host_all(target, stream, &[5, 0], deadline, stop_requested)?;
-        let request = self.read_host_exact(target, stream, 4, deadline, stop_requested)?;
-        if request[..3] != [5, 1, 0] {
-            return Err("SOCKS5 only CONNECT is supported");
-        }
-        let address = match request[3] {
-            1 => {
-                let bytes = self.read_host_exact(target, stream, 4, deadline, stop_requested)?;
-                [bytes[0], bytes[1], bytes[2], bytes[3]]
-            }
-            3 => {
-                let length = self.read_host_exact(target, stream, 1, deadline, stop_requested)?[0];
-                let bytes = self.read_host_exact(
-                    target,
-                    stream,
-                    usize::from(length),
-                    deadline,
-                    stop_requested,
-                )?;
-                let mut name = String::from_utf8(bytes).map_err(|_| "SOCKS5 invalid domain")?;
-                if !name.ends_with('.') {
-                    name.push('.');
+        Self::write_host_once(client)?;
+        let phase = std::mem::replace(&mut client.phase, Socks5Phase::Closing);
+        client.phase = match phase {
+            Socks5Phase::Greeting(mut bytes) => {
+                if Self::read_host_once(client, &mut bytes)? {
+                    return Ok(true);
                 }
-                let lookup = self
-                    .runner
-                    .stack_mut()
-                    .lookup_ip(name)
-                    .map_err(|_| "SOCKS5 DNS start failed")?;
-                loop {
-                    self.check_running(deadline, stop_requested)?;
-                    self.drive(target, deadline)?;
-                    if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
-                        break result
+                if bytes.len() < 2 {
+                    Socks5Phase::Greeting(bytes)
+                } else {
+                    let needed = 2 + usize::from(bytes[1]);
+                    if bytes[0] != 5 {
+                        return Err("SOCKS5 invalid version");
+                    }
+                    if bytes.len() < needed {
+                        Socks5Phase::Greeting(bytes)
+                    } else if !bytes[2..needed].contains(&0) {
+                        client.host_out.extend([5, 0xff]);
+                        Socks5Phase::Closing
+                    } else {
+                        client.host_out.extend([5, 0]);
+                        Socks5Phase::Request(bytes.split_off(needed))
+                    }
+                }
+            }
+            Socks5Phase::Request(mut bytes) => {
+                if bytes.len() < 4 && Self::read_host_once(client, &mut bytes)? {
+                    return Ok(true);
+                }
+                if bytes.len() < 4 {
+                    Socks5Phase::Request(bytes)
+                } else {
+                    if bytes[..3] != [5, 1, 0] {
+                        return Err("SOCKS5 only CONNECT is supported");
+                    }
+                    let needed = match bytes[3] {
+                        1 => 10,
+                        3 if bytes.len() >= 5 => 7 + usize::from(bytes[4]),
+                        3 => {
+                            client.phase = Socks5Phase::Request(bytes);
+                            return Ok(false);
+                        }
+                        _ => return Err("SOCKS5 address type is unsupported"),
+                    };
+                    if bytes.len() < needed {
+                        if Self::read_host_once(client, &mut bytes)? {
+                            return Ok(true);
+                        }
+                    }
+                    if bytes.len() < needed {
+                        Socks5Phase::Request(bytes)
+                    } else {
+                        let port_offset = needed - 2;
+                        let port = NonZeroU16::new(u16::from_be_bytes([
+                            bytes[port_offset],
+                            bytes[port_offset + 1],
+                        ]))
+                        .ok_or("SOCKS5 zero port")?;
+                        let pipelined = bytes.split_off(needed);
+                        client.host_to_remote.extend(pipelined);
+                        match bytes[3] {
+                            1 => Socks5Phase::Connecting {
+                                address: [bytes[4], bytes[5], bytes[6], bytes[7]],
+                                port,
+                            },
+                            3 => {
+                                let name_end = 5 + usize::from(bytes[4]);
+                                let mut name = String::from_utf8(bytes[5..name_end].to_vec())
+                                    .map_err(|_| "SOCKS5 invalid domain")?;
+                                if !name.ends_with('.') {
+                                    name.push('.');
+                                }
+                                let lookup = self
+                                    .runner
+                                    .stack_mut()
+                                    .lookup_ip(name)
+                                    .map_err(|_| "SOCKS5 DNS start failed")?;
+                                Socks5Phase::Dns { lookup, port }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            Socks5Phase::Dns { lookup, port } => {
+                match self.runner.stack_mut().take_lookup(lookup) {
+                    None => Socks5Phase::Dns { lookup, port },
+                    Some(result) => {
+                        client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                        let address = result
                             .map_err(|_| "SOCKS5 DNS lookup failed")?
                             .into_iter()
                             .find_map(|address| match address {
@@ -429,185 +549,197 @@ impl BoundedNetstackProof {
                                 IpAddr::V6(_) => None,
                             })
                             .ok_or("SOCKS5 DNS returned no IPv4 address")?;
+                        Socks5Phase::Connecting { address, port }
                     }
                 }
             }
-            _ => return Err("SOCKS5 address type is unsupported"),
-        };
-        let port = self.read_host_exact(target, stream, 2, deadline, stop_requested)?;
-        let port =
-            NonZeroU16::new(u16::from_be_bytes([port[0], port[1]])).ok_or("SOCKS5 zero port")?;
-        let mut provider = self.runner.stack().socket_provider();
-        let client = provider
-            .open_client(NonZeroUsize::new(1).unwrap())
-            .map_err(|_| "SOCKS5 socket client failed")?;
-        let socket = provider
-            .tcp_socket(client, RemoteIpVersion::V4)
-            .map_err(|_| "SOCKS5 TCP socket failed")?;
-        provider
-            .tcp_connect(
-                socket,
-                RemoteSocketAddress {
-                    address: RemoteIpAddress::V4(address),
-                    port,
-                },
-            )
-            .map_err(|_| "SOCKS5 TCP connect failed")?;
-        loop {
-            self.check_running(deadline, stop_requested)?;
-            self.drive(target, deadline)?;
-            let ready = provider
-                .readiness(socket)
+            Socks5Phase::Connecting { address, port } => {
+                if client.socket.is_none() {
+                    let mut provider = self.runner.stack().socket_provider();
+                    let socket_client = RemoteSocketProvider::open_client(
+                        &mut provider,
+                        NonZeroUsize::new(1).unwrap(),
+                    )
+                    .map_err(|_| "SOCKS5 socket client failed")?;
+                    let socket = provider
+                        .tcp_socket(socket_client, RemoteIpVersion::V4)
+                        .map_err(|_| "SOCKS5 TCP socket failed")?;
+                    match RemoteSocketProviderV2::connect(
+                        &mut provider,
+                        socket,
+                        ProviderSocketAddressV2 {
+                            address: RemoteIpAddress::V4(address),
+                            port: port.get(),
+                        },
+                    ) {
+                        Ok(()) | Err(netstack3_port_spike::RemoteSocketError::InProgress) => {}
+                        Err(_) => {
+                            let _ = RemoteSocketProviderV2::close(&mut provider, socket);
+                            let _ =
+                                RemoteSocketProvider::close_client(&mut provider, socket_client);
+                            return Err("SOCKS5 TCP connect failed");
+                        }
+                    }
+                    client.socket_client = Some(socket_client);
+                    client.socket = Some(socket);
+                    client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                }
+                let mut provider = self.runner.stack().socket_provider();
+                let ready = RemoteSocketProviderV2::readiness(
+                    &mut provider,
+                    client.socket.expect("socket was created"),
+                )
                 .map_err(|_| "SOCKS5 TCP readiness failed")?;
-            if ready.writable {
-                break;
+                if ready.readiness.0
+                    & (ProviderReadinessV2::CONNECT_FAILED | ProviderReadinessV2::ERROR)
+                    != 0
+                {
+                    return Err("SOCKS5 TCP connect failed");
+                }
+                if ready.readiness.0 & ProviderReadinessV2::CONNECTED != 0 {
+                    client.host_out.extend([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+                    println!(
+                        "internet_proxy_connect=true remote={}:{} peer={}",
+                        Ipv4Addr::from(address),
+                        port,
+                        client.peer
+                    );
+                    Socks5Phase::Reply
+                } else {
+                    Socks5Phase::Connecting { address, port }
+                }
             }
-        }
-        self.write_host_all(
-            target,
-            stream,
-            &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            deadline,
-            stop_requested,
-        )?;
-        println!(
-            "internet_proxy_connect=true remote={}:{}",
-            Ipv4Addr::from(address),
-            port
-        );
-
-        let mut host_to_remote = VecDeque::new();
-        let mut remote_to_host = VecDeque::new();
-        let mut buffer = [0; 16 * 1024];
-        loop {
-            self.check_running(deadline, stop_requested)?;
-            self.drive(target, deadline)?;
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => host_to_remote.extend(&buffer[..read]),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Err(_) => return Err("SOCKS5 host read failed"),
+            Socks5Phase::Reply => {
+                if client.host_out.is_empty() {
+                    Socks5Phase::Relay
+                } else {
+                    Socks5Phase::Reply
+                }
             }
-            if !host_to_remote.is_empty() {
-                let written = provider
-                    .tcp_write(socket, host_to_remote.make_contiguous())
+            Socks5Phase::Relay => {
+                let socket = client.socket.ok_or("SOCKS5 relay socket missing")?;
+                let mut buffer = [0; 16 * 1024];
+                if client.host_to_remote.len() < MAX_SOCKS5_PENDING_BYTES {
+                    match client.stream.read(&mut buffer) {
+                        Ok(0) => return Ok(true),
+                        Ok(read) => client.host_to_remote.extend(&buffer[..read]),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                        Err(_) => return Err("SOCKS5 host read failed"),
+                    }
+                }
+                let mut provider = self.runner.stack().socket_provider();
+                let ready = RemoteSocketProviderV2::readiness(&mut provider, socket)
+                    .map_err(|_| "SOCKS5 relay readiness failed")?;
+                if ready.readiness.0
+                    & (ProviderReadinessV2::CONNECT_FAILED | ProviderReadinessV2::ERROR)
+                    != 0
+                {
+                    return Err("SOCKS5 relay socket failed");
+                }
+                if ready.readiness.0 & ProviderReadinessV2::WRITABLE != 0
+                    && !client.host_to_remote.is_empty()
+                {
+                    let written = RemoteSocketProviderV2::send_msg(
+                        &mut provider,
+                        socket,
+                        0,
+                        None,
+                        client.host_to_remote.make_contiguous(),
+                    )
                     .or_else(|error| {
                         (error == netstack3_port_spike::RemoteSocketError::WouldBlock)
                             .then_some(0)
                             .ok_or(error)
                     })
                     .map_err(|_| "SOCKS5 remote write failed")?;
-                host_to_remote.drain(..written);
-            }
-            let ready = provider
-                .readiness(socket)
-                .map_err(|_| "SOCKS5 relay readiness failed")?;
-            if ready.readable {
-                let read = provider
-                    .tcp_read(socket, &mut buffer)
-                    .map_err(|_| "SOCKS5 remote read failed")?;
-                if read == 0 {
-                    while !remote_to_host.is_empty() {
-                        self.write_host_pending(
-                            target,
-                            stream,
-                            &mut remote_to_host,
-                            deadline,
-                            stop_requested,
-                        )?;
+                    client.host_to_remote.drain(..written);
+                    if written != 0 {
+                        client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                     }
-                    break;
                 }
-                remote_to_host.extend(&buffer[..read]);
+                if ready.readiness.0 & ProviderReadinessV2::READABLE != 0
+                    && client.remote_to_host.len() < MAX_SOCKS5_PENDING_BYTES
+                {
+                    match RemoteSocketProviderV2::recv_msg(
+                        &mut provider,
+                        socket,
+                        buffer.len() as u32,
+                        0,
+                    ) {
+                        Ok(message) if message.eof => Socks5Phase::Closing,
+                        Ok(message) => {
+                            if !message.data.is_empty() {
+                                client.idle_deadline =
+                                    std::time::Instant::now() + Duration::from_secs(30);
+                            }
+                            client.remote_to_host.extend(&message.data);
+                            Socks5Phase::Relay
+                        }
+                        Err(netstack3_port_spike::RemoteSocketError::WouldBlock) => {
+                            Socks5Phase::Relay
+                        }
+                        Err(_) => return Err("SOCKS5 remote read failed"),
+                    }
+                } else {
+                    Socks5Phase::Relay
+                }
             }
-            self.write_host_pending(
-                target,
-                stream,
-                &mut remote_to_host,
-                deadline,
-                stop_requested,
-            )?;
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let _ = provider.close(socket);
-        let _ = provider.close_client(client);
-        println!("internet_proxy_transfer_complete=true");
-        Ok(())
+            Socks5Phase::Closing => {
+                if client.host_out.is_empty() && client.remote_to_host.is_empty() {
+                    return Ok(true);
+                }
+                Socks5Phase::Closing
+            }
+        };
+        Self::write_host_once(client)?;
+        Ok(false)
     }
 
-    fn check_running<F: FnMut() -> bool>(
-        &self,
-        deadline: std::time::Instant,
-        stop_requested: &mut F,
-    ) -> Result<(), &'static str> {
-        if stop_requested() || std::time::Instant::now() >= deadline {
-            Err("SOCKS5 daemon stopping")
+    fn read_host_once(
+        client: &mut Socks5Client,
+        bytes: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        let mut buffer = [0; 16 * 1024];
+        match client.stream.read(&mut buffer) {
+            Ok(0) => Ok(true),
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                Ok(false)
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+            Err(_) => Err("SOCKS5 host read failed"),
+        }
+    }
+
+    fn write_host_once(client: &mut Socks5Client) -> Result<(), &'static str> {
+        let pending = if !client.host_out.is_empty() {
+            &mut client.host_out
         } else {
-            Ok(())
-        }
-    }
-
-    fn read_host_exact<T: AssociatedDataPump, F: FnMut() -> bool>(
-        &mut self,
-        target: &mut T,
-        stream: &mut TcpStream,
-        length: usize,
-        deadline: std::time::Instant,
-        stop_requested: &mut F,
-    ) -> Result<Vec<u8>, &'static str> {
-        let mut bytes = vec![0; length];
-        let mut offset = 0;
-        while offset != length {
-            self.check_running(deadline, stop_requested)?;
-            self.drive(target, deadline)?;
-            match stream.read(&mut bytes[offset..]) {
-                Ok(0) => return Err("SOCKS5 host closed during handshake"),
-                Ok(read) => offset += read,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => return Err("SOCKS5 host read failed"),
-            }
-        }
-        Ok(bytes)
-    }
-
-    fn write_host_all<T: AssociatedDataPump, F: FnMut() -> bool>(
-        &mut self,
-        target: &mut T,
-        stream: &mut TcpStream,
-        bytes: &[u8],
-        deadline: std::time::Instant,
-        stop_requested: &mut F,
-    ) -> Result<(), &'static str> {
-        let mut pending = VecDeque::from(bytes.to_vec());
-        while !pending.is_empty() {
-            self.write_host_pending(target, stream, &mut pending, deadline, stop_requested)?;
-        }
-        Ok(())
-    }
-
-    fn write_host_pending<T: AssociatedDataPump, F: FnMut() -> bool>(
-        &mut self,
-        target: &mut T,
-        stream: &mut TcpStream,
-        pending: &mut VecDeque<u8>,
-        deadline: std::time::Instant,
-        stop_requested: &mut F,
-    ) -> Result<(), &'static str> {
+            &mut client.remote_to_host
+        };
         if pending.is_empty() {
             return Ok(());
         }
-        self.check_running(deadline, stop_requested)?;
-        self.drive(target, deadline)?;
-        match stream.write(pending.make_contiguous()) {
+        match client.stream.write(pending.make_contiguous()) {
             Ok(0) => Err("SOCKS5 host closed during write"),
             Ok(written) => {
                 pending.drain(..written);
+                client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 Ok(())
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
             Err(_) => Err("SOCKS5 host write failed"),
+        }
+    }
+
+    fn close_socks5_client(&mut self, client: &mut Socks5Client) {
+        let mut provider = self.runner.stack().socket_provider();
+        if let Some(socket) = client.socket.take() {
+            let _ = RemoteSocketProviderV2::close(&mut provider, socket);
+        }
+        if let Some(socket_client) = client.socket_client.take() {
+            let _ = RemoteSocketProvider::close_client(&mut provider, socket_client);
         }
     }
 }

@@ -31,6 +31,41 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 test -f "$out/internet_proof_socks_initial"
+
+# Start every transfer before waiting for any of them. A serial proxy will
+# head-of-line block these independent CONNECT sessions; the cooperative client
+# table must progress all of them under the same Netstack3 poll loop.
+concurrent_clients=${DRV_SOCKS5_CONCURRENT_CLIENTS:-6}
+concurrent_started=$(date +%s)
+proxy_host=${proxy%:*}
+proxy_port=${proxy##*:}
+# Occupy one accepted connection without sending even a greeting. This makes
+# the proof fail against the old serial accept/serve implementation.
+bash -c 'exec 9<>/dev/tcp/"$1"/"$2"; sleep 60' _ "$proxy_host" "$proxy_port" &
+slow_pid=$!
+sleep 1
+pids=()
+for i in $(seq 1 "$concurrent_clients"); do
+  body="$out/socks_concurrent_$i.body"
+  log="$out/socks_concurrent_$i.curl.log"
+  curl --fail --silent --show-error --max-time 45 --socks5-hostname "$proxy" \
+    "$url" -o "$body" 2>"$log" &
+  pids+=("$!")
+done
+concurrent_ok=1
+for pid in "${pids[@]}"; do
+  wait "$pid" || concurrent_ok=0
+done
+kill "$slow_pid" 2>/dev/null || true
+wait "$slow_pid" 2>/dev/null || true
+for i in $(seq 1 "$concurrent_clients"); do
+  test -s "$out/socks_concurrent_$i.body" || concurrent_ok=0
+done
+test "$concurrent_ok" = 1
+concurrent_elapsed=$(($(date +%s) - concurrent_started))
+printf 'internet_proof_socks_concurrent=true clients=%s stalled_peer=true elapsed_seconds=%s url=%s\n' \
+  "$concurrent_clients" "$concurrent_elapsed" "$url" \
+  | tee "$out/internet_proof_socks_concurrent"
 # The phone hotspot drops an otherwise-idle station after about one minute.
 # Exercise a real proxied flow every 20s so the persistent association remains
 # useful rather than merely retaining driver state.
