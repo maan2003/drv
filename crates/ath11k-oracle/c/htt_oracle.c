@@ -15,7 +15,8 @@ struct oracle_htt_completion { u8 status, reinject_reason; s8 ack_rssi;
     u8 peer_valid; u16 peer_id; };
 struct oracle_qcn_rx { u8 first_msdu, last_msdu, l3_padding, msdu_done;
     u8 msdu_length_error, fcs_error, decrypt_error, tkip_mic_error;
-    u8 multicast_broadcast, decrypted; u16 msdu_length; u8 decap_type, ldpc, sgi, mcs;
+    u8 mpdu_errors, ip_checksum_failed, l4_checksum_failed;
+    u8 multicast_broadcast, decrypted; u16 msdu_length; u8 decap_type, mesh_control_present, ldpc, sgi, mcs;
     u8 bandwidth, packet_type, spatial_stream_bitmap, nss; u32 frequency;
     u8 tid; u16 peer; u8 sequence_valid, frame_valid; u16 sequence_number;
     u8 encryption_valid, encryption_type; u16 phy_ppdu_id; };
@@ -71,13 +72,24 @@ int oracle_qcn9074_rx_decode(const u8 *b, size_t len, struct oracle_qcn_rx *o) {
     memset(o, 0, sizeof(*o)); o->first_msdu = (end4 >> 12) & 1; o->last_msdu = (end4 >> 13) & 1;
     o->l3_padding = (end4 >> 10) & 3; o->msdu_done = a2 >> 31; o->msdu_length_error = (a1 >> 17) & 1;
     o->fcs_error = a1 >> 31; o->decrypt_error = (a1 >> 29) & 1; o->tkip_mic_error = (a1 >> 28) & 1;
+    o->mpdu_errors = o->fcs_error | (o->decrypt_error << 1) | (o->tkip_mic_error << 2) |
+        (((a1 >> 12) & 1) << 3) | (((a1 >> 16) & 1) << 4) |
+        (((a1 >> 17) & 1) << 5) | (((a1 >> 27) & 1) << 6);
+    o->ip_checksum_failed = (a1 >> 19) & 1; o->l4_checksum_failed = (a1 >> 18) & 1;
     o->multicast_broadcast = (a1 >> 2) & 1; o->decrypted = ((a2 >> 10) & 7) == 0;
-    o->msdu_length = m1 & 0x3fff; o->decap_type = (m2 >> 8) & 3; o->ldpc = (m2 >> 23) & 1;
+    o->msdu_length = m1 & 0x3fff; o->decap_type = (m2 >> 8) & 3;
+    o->mesh_control_present = (m2 >> 22) & 1; o->ldpc = (m2 >> 23) & 1;
     o->sgi = (m3 >> 13) & 3; o->mcs = (m3 >> 15) & 0xf; o->bandwidth = (m3 >> 19) & 3;
     o->packet_type = (m3 >> 8) & 0xf; o->spatial_stream_bitmap = m3 >> 24;
     o->nss = __builtin_popcount(o->spatial_stream_bitmap); o->frequency = get32(b + 120);
     o->tid = (mpdu9 >> 15) & 0xf; o->peer = get16(b + 182); o->sequence_valid = (mpdu11 >> 6) & 1;
     o->frame_valid = mpdu11 & 1; o->sequence_number = (mpdu11 >> 20) & 0xfff;
-    o->encryption_valid = (mpdu11 >> 9) & 1; o->encryption_type = (mpdu9 >> 2) & 0xf;
+    o->encryption_valid = (mpdu11 >> 9) & 1;
+    o->encryption_type = o->encryption_valid ? (mpdu9 >> 2) & 0xf : 7;
     o->phy_ppdu_id = get16(b + 178); return 0;
+}
+
+int oracle_reo_msdu_continuation(const u8 *b, size_t len) {
+    if (len < 64) return -22;
+    return (get32(b + 16) >> 2) & 1;
 }

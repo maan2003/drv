@@ -31,3 +31,14 @@ The pinned `ath11k_wmi_tlv_op_rx` has no cases for event IDs `0x16005`,
 `0xb00b`, `0x1d00a`, or `0x601a`. Their C-side semantic checks are
 FW-table-derived transcriptions layered on the pinned generic TLV iterator,
 rather than calls through the pinned Linux event dispatcher.
+
+## RX helper provenance
+
+Status: Open.
+
+The RX C oracle is a wire-level transcription of the QCN9074 descriptor
+accessors selected by `wcn6750_ops` and the small `dp_rx.c` attention helpers.
+It does not compile those helpers directly because they depend on kernel skb,
+mac80211, and hardware-operation-table infrastructure. The generated-input
+differential therefore proves agreement with the pinned bit and frame
+transformations, but not an independently linked invocation of those symbols.
