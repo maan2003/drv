@@ -1,7 +1,7 @@
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
-    Descriptor, HalError, ReoCommand, ReoCommandKind, ReoCommandParams, ReoResources, ReoStatus,
-    ReoStatusKind,
+    Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
+    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind,
 };
 use ath11k_oracle as _;
 use ath11k_platform_backend::{FromDevice, ToDevice};
@@ -138,6 +138,13 @@ unsafe extern "C" {
         status: *mut u8,
         timestamp: *mut u32,
     ) -> i32;
+    fn oracle_hal_reo_queue_descriptor(
+        out: *mut u8,
+        tid: u8,
+        ba_window: u32,
+        start_sequence: u32,
+        pn_type: u8,
+    ) -> u32;
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -286,6 +293,26 @@ proptest! {
                 prop_assert_eq!(c_tag, -1);
             }
         }
+    }
+
+    #[test]
+    fn reo_queue_descriptor_matches_pinned_c(
+        tid in 0u8..=16, ba_window in any::<u32>(),
+        start_sequence in any::<u32>(), pn_type in 0u8..=3,
+    ) {
+        let pn = match pn_type {
+            0 => PacketNumberType::None,
+            1 => PacketNumberType::Wpa,
+            2 => PacketNumberType::WapiEven,
+            _ => PacketNumberType::WapiUneven,
+        };
+        let rust = ReoQueueDescriptor::new(tid, ba_window, start_sequence, pn);
+        let mut c = [0; 512];
+        // SAFETY: exact output size and typed scalar arguments.
+        let c_length = unsafe { oracle_hal_reo_queue_descriptor(c.as_mut_ptr(), tid,
+            ba_window, start_sequence, pn_type) } as usize;
+        prop_assert_eq!(rust.bytes().len(), c_length);
+        prop_assert_eq!(rust.bytes(), &c[..c_length]);
     }
 
     #[test]
