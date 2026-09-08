@@ -1,6 +1,7 @@
 //! Data-driven native WMI transcript parsing and byte-exact verification.
 use crate::{Command, CommandId, Event, EventId, WmiError};
 use alloc::{string::String, vec::Vec};
+use core::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TranscriptKind {
@@ -36,6 +37,196 @@ pub struct ByteMismatch {
     pub actual: Option<u8>,
     pub expected_len: usize,
     pub actual_len: usize,
+}
+
+/// A command family recovered from a native trace record.
+///
+/// This intentionally models the wire request rather than borrowing the
+/// original bytes: each TLV is decoded into its tag, declared value, and
+/// canonical zero padding, then encoded again through [`EncodeCommand`].  It
+/// is useful for golden traces, where constructing a higher-level request is
+/// impossible after host state has gone away.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoldenCommandRequest {
+    pub family: &'static str,
+    tlvs: Vec<GoldenTlv>,
+    /// Host-only fields excluded from comparison for this command family.
+    pub masked_fields: &'static [&'static str],
+    /// Byte ranges in the complete command envelope corresponding to fields
+    /// present in this particular request.
+    pub masked_ranges: Vec<Range<usize>>,
+    id: CommandId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GoldenTlv {
+    tag: u16,
+    wire_len: u16,
+    value: Vec<u8>,
+}
+
+impl crate::cmd::EncodeCommand for GoldenCommandRequest {
+    fn encode_command(&self) -> Result<Command, WmiError> {
+        let mut bytes = Vec::new();
+        for tlv in &self.tlvs {
+            bytes.extend_from_slice(
+                &((u32::from(tlv.tag) << 16) | u32::from(tlv.wire_len)).to_le_bytes(),
+            );
+            bytes.extend_from_slice(&tlv.value);
+            if tlv.value.len() == usize::from(tlv.wire_len) {
+                bytes.resize(
+                    bytes.len() + (tlv.value.len().next_multiple_of(4) - tlv.value.len()),
+                    0,
+                );
+            }
+        }
+        Command::from_tlvs(self.id, bytes)
+    }
+}
+
+const NO_MASKS: &[&str] = &[];
+const INIT_MASKS: &[&str] = &["host_memory_chunks[].paddr"];
+const MGMT_TX_MASKS: &[&str] = &["paddr", "frame"];
+
+fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match id {
+        0x000001 => ("init", INIT_MASKS),
+        0x003001 => ("scan-start", NO_MASKS),
+        0x003003 => ("scan-channel-list", NO_MASKS),
+        0x003006 => ("scan-probe-request-oui", NO_MASKS),
+        0x004003 => ("pdev-set-param", NO_MASKS),
+        0x005001 => ("vdev-create", NO_MASKS),
+        0x005002 => ("vdev-delete", NO_MASKS),
+        0x005003 => ("vdev-start", NO_MASKS),
+        0x005005 => ("vdev-up", NO_MASKS),
+        0x005006 => ("vdev-stop", NO_MASKS),
+        0x005008 => ("vdev-set-param", NO_MASKS),
+        0x005009 => ("vdev-install-key", NO_MASKS),
+        0x00500d => ("vdev-wmm-update", NO_MASKS),
+        0x006001 => ("peer-create", NO_MASKS),
+        0x006002 => ("peer-delete", NO_MASKS),
+        0x006004 => ("peer-set-param", NO_MASKS),
+        0x006005 => ("peer-assoc", NO_MASKS),
+        0x006013 => ("peer-reorder-queue-setup", NO_MASKS),
+        0x007008 => ("mgmt-tx-send", MGMT_TX_MASKS),
+        0x00700c => ("bss-color-change-enable", NO_MASKS),
+        0x009001 => ("sta-powersave-mode", NO_MASKS),
+        0x009002 => ("sta-powersave-param", NO_MASKS),
+        0x00a005 => ("pdev-dfs-phyerr-offload-enable", NO_MASKS),
+        0x016001 => ("request-stats", NO_MASKS),
+        0x01d010 => ("pdev-lro-config", NO_MASKS),
+        0x02a003 => ("obss-color-collision-config", NO_MASKS),
+        0x03a001 => ("set-current-country", NO_MASKS),
+        0x03a002 => ("11d-scan-start", NO_MASKS),
+        0x03a003 => ("11d-scan-stop", NO_MASKS),
+        0x040001 => ("obss-spatial-reuse", NO_MASKS),
+        _ => return None,
+    })
+}
+
+/// Reverse maps a command captured by the pinned native ath11k tracepoint.
+/// Unknown command IDs are deliberately not guessed.
+pub fn reverse_map_command(
+    id: CommandId,
+    bytes: &[u8],
+) -> Result<Option<GoldenCommandRequest>, WmiError> {
+    let Some((family, masked_fields)) = command_family(id.0) else {
+        return Ok(None);
+    };
+    let mut tlvs = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let header = bytes.get(offset..offset + 4).ok_or(WmiError::Malformed)?;
+        let header = u32::from_le_bytes(header.try_into().map_err(|_| WmiError::Malformed)?);
+        let wire_len = (header & 0xffff) as u16;
+        let len = usize::from(wire_len);
+        // The pinned ath11k scan-channel-list encoder advertises the array as
+        // `nested_bytes - TLV_HDR_SIZE`; the production Rust encoder preserves
+        // this observable ABI quirk.  Consume the four bytes here rather than
+        // misreading the final channel word as a new top-level TLV.
+        let consumed_len = if id.0 == 0x003003 && offset != 0 {
+            len.checked_add(4).ok_or(WmiError::Malformed)?
+        } else {
+            len
+        };
+        let padded = consumed_len.next_multiple_of(4);
+        let value = bytes
+            .get(offset + 4..offset + 4 + consumed_len)
+            .ok_or(WmiError::Malformed)?;
+        let padding = bytes
+            .get(offset + 4 + consumed_len..offset + 4 + padded)
+            .ok_or(WmiError::Malformed)?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(WmiError::Malformed);
+        }
+        tlvs.push(GoldenTlv {
+            tag: (header >> 16) as u16,
+            wire_len,
+            value: value.to_vec(),
+        });
+        offset += 4 + padded;
+    }
+
+    let mut masked_ranges = Vec::new();
+    if id.0 == 0x007008 {
+        // Envelope (4), fixed TLV header (4), then vdev/desc/frequency (12).
+        masked_ranges.push(20..28);
+        // The byte-array TLV follows the 36-byte fixed TLV.  Its declared
+        // value is the downloaded prefix of the host management frame.
+        if let Some(frame) = tlvs.get(1) {
+            masked_ranges.push(48..48 + frame.value.len());
+        }
+    } else if id.0 == 0x000001 {
+        // A host-memory chunk is encoded as a 16-byte nested TLV whose first
+        // eight value bytes are the DMA address.  The redwood golden has no
+        // chunks, but keep the rule here so future captures cannot silently
+        // compare process-specific addresses.
+        let mut top = 4usize;
+        for tlv in &tlvs {
+            if tlv.tag == 0x12 {
+                let mut nested = 0usize;
+                while nested + 20 <= tlv.value.len() {
+                    let h = u32::from_le_bytes(
+                        tlv.value[nested..nested + 4]
+                            .try_into()
+                            .map_err(|_| WmiError::Malformed)?,
+                    );
+                    if (h >> 16) as u16 != 0x4c || (h & 0xffff) != 16 {
+                        return Err(WmiError::Malformed);
+                    }
+                    masked_ranges.push(top + 4 + nested + 4..top + 4 + nested + 12);
+                    nested += 20;
+                }
+            }
+            top += 4 + tlv.value.len().next_multiple_of(4);
+        }
+    }
+    Ok(Some(GoldenCommandRequest {
+        family,
+        tlvs,
+        masked_fields,
+        masked_ranges,
+        id,
+    }))
+}
+
+/// Compares command envelopes after applying the reverse mapper's documented
+/// host-state masks.
+pub fn compare_reencoded(
+    expected: &[u8],
+    actual: &[u8],
+    masks: &[Range<usize>],
+) -> Option<ByteMismatch> {
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    for range in masks {
+        let end = range.end.min(expected.len()).min(actual.len());
+        if range.start < end {
+            expected[range.start..end].fill(0);
+            actual[range.start..end].fill(0);
+        }
+    }
+    first_difference(&expected, &actual)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
