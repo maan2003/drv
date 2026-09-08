@@ -7,8 +7,10 @@ use ath11k_ce::{
     HtcPacketIo, HtcRouter, HtcTransport, ServiceId, WCN6750_SERVICE_TO_PIPE,
 };
 use ath11k_dp::{
+    HalDpRings,
     htt::request_target_version,
     transport::{HtcHttTransport, ath11k_dp_htt_connect_service},
+    tx::{ClientDataPath, ClientTxConfig},
 };
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma, Device, MmioRegion};
 use ath11k_qmi::{
@@ -72,6 +74,7 @@ type Router<B, W> = HtcRouter<PacketIo<B, W>>;
 type Endpoint<B, W> = BoundService<PacketIo<B, W>>;
 type RealWmi<B, W, S> = Wmi<TracingWmi<HtcWmiTransport<Endpoint<B, W>>, S>>;
 type RealHtt<B, W> = HtcHttTransport<Endpoint<B, W>>;
+type RealDp<B> = ClientDataPath<B, HalDpRings<B>>;
 
 /// Real subsystem owner. Every resource moves forward through an explicit
 /// option; no raw descriptor, DMA address, or backend handle crosses this seam.
@@ -98,6 +101,7 @@ where
     router: Option<Router<B, W>>,
     wmi: Option<RealWmi<B, W, S>>,
     htt: Option<RealHtt<B, W>>,
+    dp: Option<RealDp<B>>,
     trace: Option<S>,
     deadline: D,
     service_ready: Option<ath11k_wmi::event::ServiceReadyState>,
@@ -135,6 +139,7 @@ where
             router: None,
             wmi: None,
             htt: None,
+            dp: None,
             trace: Some(trace),
             deadline,
             service_ready: None,
@@ -143,6 +148,15 @@ where
 
     fn protocol<T>(value: Option<T>) -> Result<T, CoreError> {
         value.ok_or(CoreError::WrongState)
+    }
+
+    fn dp_error(error: ath11k_dp::DpError) -> CoreError {
+        match error {
+            ath11k_dp::DpError::WrongState => CoreError::WrongState,
+            ath11k_dp::DpError::NoResources => CoreError::NoResources,
+            ath11k_dp::DpError::DeviceFault => CoreError::DeviceFault,
+            _ => CoreError::Protocol,
+        }
     }
 
     fn receive_control(&mut self) -> Result<Vec<u8>, CoreError> {
@@ -537,19 +551,60 @@ where
                 self.dp_interrupts.disable();
                 Ok(())
             }
+            Operation::DpAllocate => {
+                let rings = HalDpRings::new(&self.device, &[]).map_err(Self::dp_error)?;
+                let dp = ClientDataPath::ath11k_dp_alloc(
+                    self.device.clone(),
+                    rings,
+                    ClientTxConfig::wcn6750_station(0),
+                )
+                .map_err(|error| {
+                    error
+                        .cleanup_error()
+                        .map(Self::dp_error)
+                        .unwrap_or_else(|| Self::dp_error(error.cause()))
+                })?;
+                self.dp = Some(dp);
+                Ok(())
+            }
+            Operation::DpPdevPreAllocate => Self::protocol(self.dp.as_mut())?
+                .ath11k_dp_pdev_pre_alloc()
+                .map_err(Self::dp_error),
+            Operation::DpReoSetup => Self::protocol(self.dp.as_mut())?
+                .ath11k_dp_pdev_reo_setup()
+                .map_err(Self::dp_error),
+            Operation::DpPdevAllocate => {
+                let dp = Self::protocol(self.dp.as_mut())?;
+                dp.ath11k_dp_pdev_alloc().map_err(Self::dp_error)?;
+                if let Err(error) = dp.configure_htt(Self::protocol(self.htt.as_mut())?) {
+                    if let Err(cleanup_error) = dp.ath11k_dp_pdev_free() {
+                        return Err(Self::dp_error(cleanup_error));
+                    }
+                    return Err(Self::dp_error(error));
+                }
+                Ok(())
+            }
+            Operation::DpPdevFree => Self::protocol(self.dp.as_mut())?
+                .ath11k_dp_pdev_free()
+                .map_err(Self::dp_error),
+            Operation::DpReoCleanup => Self::protocol(self.dp.as_mut())?
+                .ath11k_dp_pdev_reo_cleanup()
+                .map_err(Self::dp_error),
+            Operation::DpFree => {
+                Self::protocol(self.dp.as_mut())?
+                    .ath11k_dp_free()
+                    .map_err(Self::dp_error)?;
+                self.dp.take();
+                Ok(())
+            }
+            // The first client vdev is fixed at zero and was used to build
+            // the DP TX metadata when the aggregate was allocated.
+            Operation::DpVdevTxAttach { vdev } if vdev.0 == 0 => Ok(()),
             Operation::HifStop
-            | Operation::DpAllocate
-            | Operation::DpPdevPreAllocate
-            | Operation::DpReoSetup
-            | Operation::DpPdevAllocate
             | Operation::MacAllocate
             | Operation::MacRegister
-            | Operation::RadioStart
-            | Operation::DpVdevTxAttach { .. } => Ok(()),
-            Operation::DpFree
-            | Operation::DpReoCleanup
-            | Operation::DpPdevFree
-            | Operation::MacDestroy
+            | Operation::RadioStart => Ok(()),
+            Operation::MacDestroy
             | Operation::MacUnregister
             | Operation::RegFree
             | Operation::HifPowerDown => Ok(()),
