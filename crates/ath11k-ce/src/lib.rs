@@ -564,12 +564,14 @@ impl<B: Backend> CeTxBuffer<B> {
 /// range to the CPU before exposing payload bytes.
 pub struct CeRxBuffer<B: Backend> {
     dma: StreamingDma<B, FromDevice>,
+    cpu_owned: bool,
 }
 
 impl<B: Backend> CeRxBuffer<B> {
     pub fn allocate(device: &Device<B>, capacity: usize) -> Result<Self, CeError> {
         Ok(Self {
             dma: device.alloc_streaming(capacity, 4)?,
+            cpu_owned: false,
         })
     }
 
@@ -584,7 +586,13 @@ impl<B: Backend> CeRxBuffer<B> {
     }
 
     fn sync_for_cpu(&mut self) -> Result<(), CeError> {
-        self.dma.sync_for_cpu(0, self.dma.len()).map_err(Into::into)
+        if !self.cpu_owned {
+            self.dma.acquire_for_cpu(0, self.dma.len())?;
+            self.cpu_owned = true;
+        }
+        self.dma
+            .refresh_for_cpu(0, self.dma.len())
+            .map_err(Into::into)
     }
 
     fn read(&self, length: usize) -> Result<Vec<u8>, CeError> {
@@ -1343,6 +1351,7 @@ impl<B: Backend> CeAllocatedPipes<B> {
                 source_slots,
                 destination_slots,
                 destination_software_index: 0,
+                pending_receive: None,
                 rx_buffers_needed: if pipe.config.destination_entries == 0 {
                     0
                 } else {
@@ -1436,13 +1445,26 @@ struct InitializedPipe<B: Backend> {
     source_slots: Vec<Option<CeTxBuffer<B>>>,
     destination_slots: Vec<Option<CeRxBuffer<B>>>,
     destination_software_index: usize,
+    pending_receive: Option<PendingReceive>,
     rx_buffers_needed: u16,
     config: HostPipeConfig,
+}
+
+struct PendingReceive {
+    status_offset: usize,
+    payload: Vec<u8>,
+    cleared_word: [u8; 4],
+    len_cleared: bool,
 }
 
 pub struct CeServiceBatch<B: Backend> {
     pub transmitted: Vec<CeTxBuffer<B>>,
     pub received: Vec<Vec<u8>>,
+    /// A later completion failed after earlier entries were retained here.
+    pub completion_error: Option<CeError>,
+    /// Replenishment runs after completed packets are retained, matching C's
+    /// callback-before-repost ordering. A caller can schedule a later retry.
+    pub replenish_error: Option<CeError>,
 }
 
 /// Initialized WCN6750 CE pipes. It owns all coherent rings and streaming
@@ -1516,17 +1538,26 @@ impl<B: Backend> CePipes<B> {
     ) -> Result<(), CeError> {
         let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
         let ring = pipe.destination.as_mut().ok_or(CeError::DeviceFault)?;
+        let descriptor = buffer.descriptor()?;
         ring.access_begin_remote(remote_read_pointers)?;
+        let checkpoint = ring.checkpoint();
         let Some(offset) = ring.source_next() else {
             ring.access_end(mmio)?;
             return Err(CeError::NoCredits);
         };
-        let descriptor = buffer.descriptor()?;
-        ring.memory.dma.write(offset, descriptor.bytes())?;
         let slot = offset / ring.entry_size();
-        pipe.destination_slots[slot] = Some(buffer);
-        pipe.rx_buffers_needed -= 1;
-        ring.access_end(mmio).map_err(Into::into)
+        let result = (|| {
+            ring.memory.dma.write(offset, descriptor.bytes())?;
+            pipe.destination_slots[slot] = Some(buffer);
+            ring.access_end(mmio).map_err(CeError::from)
+        })();
+        if result.is_err() {
+            ring.restore(checkpoint);
+            pipe.destination_slots[slot].take();
+        } else {
+            pipe.rx_buffers_needed -= 1;
+        }
+        result
     }
 
     pub fn rx_post_buf(
@@ -1536,15 +1567,34 @@ impl<B: Backend> CePipes<B> {
         remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
     ) -> Result<(), CeError> {
         for pipe_number in 0..self.pipes.len() {
-            while self.pipes[pipe_number].rx_buffers_needed != 0 {
-                let size = self.pipes[pipe_number].config.source_size_max as usize;
-                let buffer = CeRxBuffer::allocate(device, size)?;
-                self.post_receive(mmio, remote_read_pointers, pipe_number, buffer)?;
-            }
+            self.rx_post_pipe(device, mmio, remote_read_pointers, pipe_number)?;
         }
         Ok(())
     }
 
+    fn rx_post_pipe(
+        &mut self,
+        device: &Device<B>,
+        mmio: &MmioRegion<B>,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+        pipe: usize,
+    ) -> Result<(), CeError> {
+        while self
+            .pipes
+            .get(pipe)
+            .ok_or(CeError::InvalidFrame)?
+            .rx_buffers_needed
+            != 0
+        {
+            let size = self.pipes[pipe].config.source_size_max as usize;
+            let buffer = CeRxBuffer::allocate(device, size)?;
+            self.post_receive(mmio, remote_read_pointers, pipe, buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Returns one completed payload. On `Err`, the status cursor, destination
+    /// slot/index, and replenish count are unchanged, so the completion can be retried.
     pub fn completed_recv_next(
         &mut self,
         mmio: &MmioRegion<B>,
@@ -1554,57 +1604,114 @@ impl<B: Backend> CePipes<B> {
         let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
         let status = pipe.status.as_mut().ok_or(CeError::DeviceFault)?;
         status.access_begin_remote(remote_read_pointers)?;
+        let checkpoint = status.checkpoint();
         let Some(offset) = status.destination_next() else {
             status.access_end(mmio)?;
             return Ok(None);
         };
-        let mut raw = [0; 16];
-        status.memory.dma.read(offset, &mut raw)?;
-        let mut descriptor =
-            CeDestinationStatusDescriptor::from_bytes(&raw).map_err(|_| CeError::InvalidFrame)?;
-        let length = descriptor.take_length() as usize;
-        status.memory.dma.write(offset, descriptor.as_bytes())?;
-        status.access_end(mmio)?;
         let slot = pipe.destination_software_index;
+        let result = (|| {
+            if let Some(pending) = &pipe.pending_receive {
+                if pending.status_offset != offset {
+                    return Err(CeError::DeviceFault);
+                }
+            } else {
+                let mut raw = [0; 16];
+                status.memory.dma.read(offset, &mut raw)?;
+                let mut descriptor = CeDestinationStatusDescriptor::from_bytes(&raw)
+                    .map_err(|_| CeError::InvalidFrame)?;
+                let length = descriptor.take_length() as usize;
+                let buffer = pipe.destination_slots[slot]
+                    .as_mut()
+                    .ok_or(CeError::DeviceFault)?;
+                if length == 0 || length > buffer.capacity() {
+                    return Err(CeError::InvalidFrame);
+                }
+                buffer.sync_for_cpu()?;
+                let payload = buffer.read(length)?;
+                let cleared_word = descriptor.as_bytes()[..4]
+                    .try_into()
+                    .map_err(|_| CeError::InvalidFrame)?;
+                pipe.pending_receive = Some(PendingReceive {
+                    status_offset: offset,
+                    payload,
+                    cleared_word,
+                    len_cleared: false,
+                });
+            }
+            let pending = pipe.pending_receive.as_mut().ok_or(CeError::DeviceFault)?;
+            if !pending.len_cleared {
+                status.memory.dma.write(offset, &pending.cleared_word)?;
+                pending.len_cleared = true;
+            }
+            status.access_end(mmio)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            status.restore(checkpoint);
+            return Err(error);
+        }
+        let payload = pipe
+            .pending_receive
+            .take()
+            .ok_or(CeError::DeviceFault)?
+            .payload;
         pipe.destination_software_index = (slot + 1) & (pipe.destination_slots.len() - 1);
         pipe.rx_buffers_needed += 1;
-        let mut buffer = pipe.destination_slots[slot]
+        pipe.destination_slots[slot]
             .take()
             .ok_or(CeError::DeviceFault)?;
-        buffer.sync_for_cpu()?;
-        if length == 0 || length > buffer.capacity() {
-            return Err(CeError::InvalidFrame);
-        }
-        buffer.read(length).map(Some)
+        Ok(Some(payload))
     }
 
+    /// Drain the source and destination completion rings, then replenish the
+    /// receive buffers consumed from this engine, as `ath11k_ce_per_engine_service` does.
     pub fn per_engine_service(
         &mut self,
+        device: &Device<B>,
         mmio: &MmioRegion<B>,
         remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
         pipe: usize,
     ) -> Result<CeServiceBatch<B>, CeError> {
+        self.pipes.get(pipe).ok_or(CeError::InvalidFrame)?;
         let mut transmitted = Vec::new();
-        if self
-            .pipes
-            .get(pipe)
-            .ok_or(CeError::InvalidFrame)?
-            .source
-            .is_some()
-        {
-            while let Some(buffer) = self.completed_send_next(remote_read_pointers, pipe)? {
-                transmitted.push(buffer);
+        let mut completion_error = None;
+        if self.pipes[pipe].source.is_some() {
+            loop {
+                match self.completed_send_next(remote_read_pointers, pipe) {
+                    Ok(Some(buffer)) => transmitted.push(buffer),
+                    Ok(None) => break,
+                    Err(error) => {
+                        completion_error = Some(error);
+                        break;
+                    }
+                }
             }
         }
         let mut received = Vec::new();
-        if self.pipes[pipe].status.is_some() {
-            while let Some(buffer) = self.completed_recv_next(mmio, remote_read_pointers, pipe)? {
-                received.push(buffer);
+        let replenish_error = if self.pipes[pipe].status.is_some() {
+            loop {
+                match self.completed_recv_next(mmio, remote_read_pointers, pipe) {
+                    Ok(Some(buffer)) => received.push(buffer),
+                    Ok(None) => break,
+                    Err(error) => {
+                        if completion_error.is_none() {
+                            completion_error = Some(error);
+                        }
+                        break;
+                    }
+                }
             }
-        }
+            self.rx_post_pipe(device, mmio, remote_read_pointers, pipe)
+                .err()
+        } else {
+            None
+        };
         Ok(CeServiceBatch {
             transmitted,
             received,
+            completion_error,
+            replenish_error,
         })
     }
 
@@ -1921,8 +2028,20 @@ mod tests {
     #[derive(Clone, Copy)]
     enum InjectedSendFailure {
         DescriptorWrite,
+        ReceivePostWrite,
         PacketSync,
         Publication,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum InjectedReceiveFailure {
+        StatusRead,
+        SecondStatusRead,
+        StatusClear,
+        PacketSync,
+        PayloadRead,
+        Publication,
+        InvalidLength,
     }
 
     #[derive(Default)]
@@ -1932,6 +2051,8 @@ mod tests {
         dmas: BTreeMap<u64, Vec<u8>>,
         operations: Vec<LargeOperation>,
         send_failure: Option<InjectedSendFailure>,
+        receive_failure: Option<InjectedReceiveFailure>,
+        status_reads: usize,
     }
 
     struct LargeModel {
@@ -1968,6 +2089,13 @@ mod tests {
             let mut state = self.state.borrow_mut();
             if matches!(state.send_failure, Some(InjectedSendFailure::Publication)) {
                 state.send_failure = None;
+                return Err(Error::DeviceFault);
+            }
+            if matches!(
+                state.receive_failure,
+                Some(InjectedReceiveFailure::Publication)
+            ) {
+                state.receive_failure = None;
                 return Err(Error::DeviceFault);
             }
             state.mmio.insert(offset, value);
@@ -2021,7 +2149,22 @@ mod tests {
             range: Range<usize>,
             out: &mut [u8],
         ) -> Result<(), Error> {
-            let state = self.state.borrow();
+            let mut state = self.state.borrow_mut();
+            if range.len() == 16 {
+                state.status_reads += 1;
+            }
+            let injected = match state.receive_failure {
+                Some(InjectedReceiveFailure::StatusRead) => range.len() == 16,
+                Some(InjectedReceiveFailure::SecondStatusRead) => {
+                    range.len() == 16 && state.status_reads == 2
+                }
+                Some(InjectedReceiveFailure::PayloadRead) => range.len() == 64,
+                _ => false,
+            };
+            if injected {
+                state.receive_failure = None;
+                return Err(Error::DeviceFault);
+            }
             out.copy_from_slice(
                 state
                     .dmas
@@ -2034,11 +2177,20 @@ mod tests {
         }
         fn dma_write(&mut self, dma: &u64, range: Range<usize>, bytes: &[u8]) -> Result<(), Error> {
             let mut state = self.state.borrow_mut();
-            if matches!(
-                state.send_failure,
-                Some(InjectedSendFailure::DescriptorWrite)
-            ) {
+            let injected_send = match state.send_failure {
+                Some(InjectedSendFailure::DescriptorWrite) => bytes.len() == 16,
+                Some(InjectedSendFailure::ReceivePostWrite) => bytes.len() == 8,
+                _ => false,
+            };
+            if injected_send {
                 state.send_failure = None;
+                return Err(Error::DeviceFault);
+            }
+            if matches!(
+                state.receive_failure,
+                Some(InjectedReceiveFailure::StatusClear)
+            ) {
+                state.receive_failure = None;
                 return Err(Error::DeviceFault);
             }
             state
@@ -2052,10 +2204,15 @@ mod tests {
             Ok(())
         }
         fn sync_for_cpu(&mut self, dma: &u64, range: Range<usize>) -> Result<(), Error> {
-            self.state
-                .borrow_mut()
-                .operations
-                .push(LargeOperation::SyncCpu(*dma, range));
+            let mut state = self.state.borrow_mut();
+            if matches!(
+                state.receive_failure,
+                Some(InjectedReceiveFailure::PacketSync)
+            ) {
+                state.receive_failure = None;
+                return Err(Error::DeviceFault);
+            }
+            state.operations.push(LargeOperation::SyncCpu(*dma, range));
             Ok(())
         }
         fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<(), Error> {
@@ -2161,6 +2318,228 @@ mod tests {
     #[test]
     fn publication_failure_does_not_advance_source_cursor() {
         assert_failed_send_is_retryable(InjectedSendFailure::Publication);
+    }
+
+    fn assert_failed_receive_is_retryable(failure: InjectedReceiveFailure) {
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let mut packet_io = initialized_large_packet_io(state.clone());
+        let rx = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
+        let rx_id = state.borrow().next_id;
+        packet_io
+            .pipes
+            .post_receive(&packet_io.mmio, &mut packet_io.remote_read_pointers, 1, rx)
+            .unwrap();
+        let needed = packet_io.pipes.pipes[1].rx_buffers_needed;
+        state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
+        let length = if failure == InjectedReceiveFailure::InvalidLength {
+            0
+        } else {
+            5
+        };
+        state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, length, 0]);
+        state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
+            .copy_from_slice(&4_u32.to_le_bytes());
+        state.borrow_mut().operations.clear();
+        state.borrow_mut().receive_failure = Some(failure);
+
+        let expected = if failure == InjectedReceiveFailure::InvalidLength {
+            CeError::InvalidFrame
+        } else {
+            CeError::DeviceFault
+        };
+        assert_eq!(
+            packet_io.pipes.completed_recv_next(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            ),
+            Err(expected)
+        );
+        assert!(packet_io.pipes.pipes[1].destination_slots[0].is_some());
+        assert_eq!(packet_io.pipes.pipes[1].destination_software_index, 0);
+        assert_eq!(packet_io.pipes.pipes[1].rx_buffers_needed, needed);
+        if failure == InjectedReceiveFailure::Publication {
+            assert_eq!(&state.borrow().dmas.get(&4).unwrap()[2..4], &[0, 0]);
+        }
+        if failure == InjectedReceiveFailure::InvalidLength {
+            state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
+        }
+
+        assert_eq!(
+            packet_io.pipes.completed_recv_next(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            ),
+            Ok(Some(b"hello".to_vec()))
+        );
+        assert!(packet_io.pipes.pipes[1].destination_slots[0].is_none());
+        assert_eq!(packet_io.pipes.pipes[1].destination_software_index, 1);
+        assert_eq!(packet_io.pipes.pipes[1].rx_buffers_needed, needed + 1);
+        assert_eq!(&state.borrow().dmas.get(&4).unwrap()[2..4], &[0, 0]);
+        assert_eq!(
+            state
+                .borrow()
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, LargeOperation::SyncCpu(_, _)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn status_read_failure_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::StatusRead);
+    }
+
+    #[test]
+    fn receive_sync_failure_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::PacketSync);
+    }
+
+    #[test]
+    fn status_clear_failure_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::StatusClear);
+    }
+
+    #[test]
+    fn receive_payload_read_failure_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::PayloadRead);
+    }
+
+    #[test]
+    fn receive_publication_failure_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::Publication);
+    }
+
+    #[test]
+    fn invalid_receive_length_does_not_consume_receive_buffer() {
+        assert_failed_receive_is_retryable(InjectedReceiveFailure::InvalidLength);
+    }
+
+    #[test]
+    fn per_engine_service_replenishes_consumed_receive_buffers() {
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let mut packet_io = initialized_large_packet_io(state.clone());
+        let rx = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
+        let rx_id = state.borrow().next_id;
+        packet_io
+            .pipes
+            .post_receive(&packet_io.mmio, &mut packet_io.remote_read_pointers, 1, rx)
+            .unwrap();
+        state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
+        state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
+        state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
+            .copy_from_slice(&4_u32.to_le_bytes());
+
+        let batch = packet_io
+            .pipes
+            .per_engine_service(
+                &packet_io.device,
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            )
+            .unwrap();
+        assert_eq!(batch.received, [b"hello".to_vec()]);
+        assert_eq!(batch.completion_error, None);
+        assert_eq!(batch.replenish_error, None);
+        assert_eq!(packet_io.pipes.pipes[1].rx_buffers_needed, 0);
+        let slots = &packet_io.pipes.pipes[1].destination_slots;
+        assert_eq!(
+            slots.iter().filter(|slot| slot.is_some()).count(),
+            slots.len() - 2
+        );
+    }
+
+    #[test]
+    fn per_engine_service_retains_batch_when_replenishment_fails() {
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let mut packet_io = initialized_large_packet_io(state.clone());
+        let rx = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
+        let rx_id = state.borrow().next_id;
+        packet_io
+            .pipes
+            .post_receive(&packet_io.mmio, &mut packet_io.remote_read_pointers, 1, rx)
+            .unwrap();
+        state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
+        state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
+        state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
+            .copy_from_slice(&4_u32.to_le_bytes());
+        state.borrow_mut().send_failure = Some(InjectedSendFailure::ReceivePostWrite);
+
+        let batch = packet_io
+            .pipes
+            .per_engine_service(
+                &packet_io.device,
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            )
+            .unwrap();
+        assert_eq!(batch.received, [b"hello".to_vec()]);
+        assert_eq!(batch.completion_error, None);
+        assert_eq!(batch.replenish_error, Some(CeError::DeviceFault));
+        assert_ne!(packet_io.pipes.pipes[1].rx_buffers_needed, 0);
+    }
+
+    #[test]
+    fn per_engine_service_retains_partial_batch_when_second_completion_fails() {
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let mut packet_io = initialized_large_packet_io(state.clone());
+        let first = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
+        let first_id = state.borrow().next_id;
+        packet_io
+            .pipes
+            .post_receive(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+                first,
+            )
+            .unwrap();
+        let second = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
+        let second_id = state.borrow().next_id;
+        packet_io
+            .pipes
+            .post_receive(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+                second,
+            )
+            .unwrap();
+        state.borrow_mut().dmas.get_mut(&first_id).unwrap()[..3].copy_from_slice(b"one");
+        state.borrow_mut().dmas.get_mut(&second_id).unwrap()[..3].copy_from_slice(b"two");
+        state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 3, 0]);
+        state.borrow_mut().dmas.get_mut(&4).unwrap()[16..20].copy_from_slice(&[0, 0, 3, 0]);
+        state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
+            .copy_from_slice(&8_u32.to_le_bytes());
+        state.borrow_mut().status_reads = 0;
+        state.borrow_mut().receive_failure = Some(InjectedReceiveFailure::SecondStatusRead);
+
+        let batch = packet_io
+            .pipes
+            .per_engine_service(
+                &packet_io.device,
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            )
+            .unwrap();
+        assert_eq!(batch.received, [b"one".to_vec()]);
+        assert_eq!(batch.completion_error, Some(CeError::DeviceFault));
+        assert_eq!(batch.replenish_error, None);
+        assert!(packet_io.pipes.pipes[1].destination_slots[1].is_some());
+        assert_eq!(
+            packet_io.pipes.completed_recv_next(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                1,
+            ),
+            Ok(Some(b"two".to_vec()))
+        );
     }
 
     #[test]

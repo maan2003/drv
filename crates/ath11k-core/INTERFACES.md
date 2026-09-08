@@ -64,7 +64,9 @@ Protocol crates never depend on core. HAL depends directly on the shared `drv-ha
   initialization, attachment/service, RX posting, send and free, plus HTC
   initialization, target-ready wait, service connection, setup-complete
   start/stop and TX completion. Core composes those seams; CE retains
-  streaming-DMA packet-buffer and endpoint-credit ownership.
+  streaming-DMA packet-buffer and endpoint-credit ownership. Completion service
+  retains a partial batch when a later drain or replenishment step fails and
+  reports those errors on the batch so callers can deliver progress and retry.
 - **QMI:** `MessageId`-bearing bounded `Request`/`Response`, checked
   `RawIndication`, and an event-driven `Transport` that starts/stops WLFW
   service discovery and sends/receives transaction-correlated responses plus

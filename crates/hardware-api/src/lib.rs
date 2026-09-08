@@ -737,21 +737,32 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
     }
 }
 impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
-    pub fn sync_for_cpu(&mut self, offset: usize, length: usize) -> Result<()> {
+    /// Transfer a streaming range to CPU ownership without copying it into the
+    /// CPU shadow. Callers that retry a later shadow refresh must not repeat
+    /// this transition until the range is returned to the device.
+    pub fn acquire_for_cpu(&mut self, offset: usize, length: usize) -> Result<()> {
+        let r = self.0.range(offset, length)?;
+        let backend_range = self.0.backend_range(r);
+        let mut b = self.0.allocation.shared.0.borrow_mut();
+        if !b.is_cache_coherent() {
+            b.sync_for_cpu(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
+        }
+        Ok(())
+    }
+    /// Refresh the CPU shadow for a range already acquired by the CPU.
+    pub fn refresh_for_cpu(&mut self, offset: usize, length: usize) -> Result<()> {
         let r = self.0.range(offset, length)?;
         let backend_range = self.0.backend_range(r.clone());
         let mut b = self.0.allocation.shared.0.borrow_mut();
-        if !b.is_cache_coherent() {
-            b.sync_for_cpu(
-                self.0.allocation.token.as_ref().unwrap(),
-                backend_range.clone(),
-            )?;
-        }
         b.dma_read(
             self.0.allocation.token.as_ref().unwrap(),
             backend_range,
             &mut self.0.bytes[r],
         )
+    }
+    pub fn sync_for_cpu(&mut self, offset: usize, length: usize) -> Result<()> {
+        self.acquire_for_cpu(offset, length)?;
+        self.refresh_for_cpu(offset, length)
     }
     pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<()> {
         let r = self.0.range(offset, out.len())?;
