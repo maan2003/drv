@@ -1,6 +1,6 @@
 //! Device-wide command encoders adjacent to WMI initialization in `wmi.c`.
 
-use super::{EncodeCommand, one};
+use super::{EncodeCommand, TlvWriter, one};
 use crate::tags::*;
 use crate::{Command, WmiError};
 
@@ -357,5 +357,41 @@ mod tests {
                 11,
             ])
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VdevChannelPower {
+    pub center_freq: u32,
+    pub tx_power: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VdevSetTpcPower {
+    pub vdev_id: u32,
+    pub psd_power: bool,
+    pub eirp_power: u32,
+    pub power_type_6ghz: u32,
+    pub channels: alloc::vec::Vec<VdevChannelPower>,
+}
+
+impl EncodeCommand for VdevSetTpcPower {
+    fn encode_command(&self) -> Result<Command, WmiError> {
+        let mut w = TlvWriter::default();
+        w.tlv(WMI_TAG_VDEV_SET_TPC_POWER_CMD, |w| {
+            w.u32(self.vdev_id);
+            w.u32(u32::from(self.psd_power));
+            w.u32(self.eirp_power);
+            w.u32(self.power_type_6ghz);
+        })?;
+        w.tlv(WMI_TAG_ARRAY_STRUCT, |w| {
+            for channel in &self.channels {
+                let _ = w.tlv(WMI_TAG_VDEV_CH_POWER_INFO, |w| {
+                    w.u32(channel.center_freq);
+                    w.u32(channel.tx_power);
+                });
+            }
+        })?;
+        w.finish(WMI_VDEV_SET_TPC_POWER_CMDID)
     }
 }
