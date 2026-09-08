@@ -68,3 +68,19 @@ remain device-visible.
 Both suites accept `ATH11K_STATEFUL_CASES` and `ATH11K_STATEFUL_STEPS` for long
 runs, with `PROPTEST_CASES` retained for this sensitivity measurement. The data
 path README documents an overnight configuration.
+
+## Open long-run finding
+
+A two-case, 4,096-step run found an existing REO same-key accounting
+discrepancy. A new setup can publish an active owner while an older delete is
+still pending; if the older invalidation later reports failure, its owner moves
+to `failed_delete` alongside the active owner for the same peer and TID. The
+driver fix is tracked separately; the generator remains unconstrained so this
+sequence continues to be exercised.
+
+Reproduce with:
+
+```sh
+ATH11K_STATEFUL_CASES=2 ATH11K_STATEFUL_STEPS=4096 \
+  cargo test -p ath11k-dp stateful_tests -- --nocapture
+```
