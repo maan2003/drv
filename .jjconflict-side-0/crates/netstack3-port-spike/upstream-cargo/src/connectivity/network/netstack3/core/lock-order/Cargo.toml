@@ -1,6 +1,0 @@
-[package]
-name = "lock_order"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-

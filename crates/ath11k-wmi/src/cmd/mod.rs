@@ -423,7 +423,11 @@ impl EncodeCommand for MgmtSend {
                 w.u32(v)
             }
         })?;
-        w.byte_array(&self.frame[..n])?;
+        // Unlike most byte arrays, wmi.c advertises the unpadded download
+        // length while reserving a word-aligned value area.
+        w.header(WMI_TAG_ARRAY_BYTE, n as u16);
+        w.bytes(&self.frame[..n]);
+        w.zeros(n.div_ceil(4) * 4 - n);
         if self.tx_params_valid {
             w.tlv(WMI_TAG_TX_SEND_PARAMS, |w| {
                 w.u32(0);
@@ -513,6 +517,24 @@ mod tests {
         };
         assert_eq!(r.encode_command(), Err(WmiError::Malformed))
     }
+    #[test]
+    fn management_frame_header_uses_unpadded_length() {
+        let request = MgmtSend {
+            vdev_id: 1,
+            desc_id: 2,
+            channel_freq: 0,
+            paddr: 0,
+            frame: vec![1, 2, 3, 4, 5],
+            tx_params_valid: false,
+        };
+        let command = request.encode_command().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(command.tlvs()[36..40].try_into().unwrap()),
+            (u32::from(WMI_TAG_ARRAY_BYTE.0) << 16) | 5
+        );
+        assert_eq!(&command.tlvs()[40..48], &[1, 2, 3, 4, 5, 0, 0, 0]);
+    }
+
     #[test]
     fn key_padding() {
         let r = VdevInstallKey {

@@ -1,9 +1,0 @@
-[package]
-name = "mt76-core"
-description = "Linux v7.1.5 mt76-shared hardware primitives"
-edition.workspace = true
-license = "GPL-2.0-only"
-version.workspace = true
-
-[lib]
-path = "src/lib.rs"
