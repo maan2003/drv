@@ -607,17 +607,16 @@ interrupt unmasking remains unavailable until that chosen vector is actually
 installed and exercised by the deterministic completion path.
 `IrqLifecycle` prevents the device source from being enabled before an
 eventfd-capable VFIO vector is installed, rejects a zero eventfd counter, and
-requires explicit disable after an observed completion. The native backend now
-has an unexposed `VfioIrq` owner which creates a nonblocking close-on-exec
-eventfd, installs exactly one selected vector with `VFIO_DEVICE_SET_IRQS`,
-drains 64-bit counters, explicitly disables the vector, and repeats disable in
-`Drop`. Its Linux UAPI layout is tested, but it cannot yet be invoked physically
-or unmask a device source.
+requires explicit disable after an observed completion. The native backend owns a nonblocking close-on-exec eventfd, installs exactly
+one selected vector, drains 64-bit counters with an acquiring timestamp, and
+disables the vector on release and reset.
 
-`--install-disable-vfio-irq` exposes only the source-disabled lifecycle check:
-select one eventfd-capable VFIO vector, install it, require its nonblocking
-counter to remain empty while the device mask is zero, explicitly disable it,
-and VFIO-reset. It never writes the device interrupt mask or enables DMA.
+`--install-disable-vfio-irq` now exercises that typed source-disabled lifecycle:
+it verifies WFDMA and its host mask are disabled, installs logical MSI vector 0
+before any MT7921 source, requires the counter to remain empty, releases it,
+and performs typed VFIO reset. It never writes a device interrupt mask or
+enables DMA. `--mask-ack-disabled-fwdl` also uses the typed BAR0 WFDMA slice;
+its mask/status/W1C sequence remains restricted to the firmware-download bit.
 
 `teardown_dma` makes reset ordering explicit for the future active path: mask
 and disable are attempted, TX busy is polled for at most 100 ms, every mapping

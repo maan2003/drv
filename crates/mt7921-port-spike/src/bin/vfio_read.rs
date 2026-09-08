@@ -4,8 +4,8 @@
 
 #[cfg(feature = "fuchsia-passive")]
 use driver_runtime::{PublicationState, TranscriptEvent};
-use drv_hardware::{Backend, Bidirectional, CoherentDma, Device, DmaConstraints, ToDevice};
-use drv_hardware_backends::LinuxVfio;
+use drv_hardware::{Backend, Bidirectional, CoherentDma, Device, DmaConstraints, MmioRegion, ToDevice};
+use drv_hardware_backends::{LinuxVfio, PciControl};
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_common as fidl_common;
 #[cfg(feature = "fuchsia-passive")]
@@ -2117,6 +2117,150 @@ fn verify_typed_disabled_firmware_state<B: Backend>(
         .map_err(|error| format!("read WFDMA interrupt enable: {error:?}"))?;
     validate_disabled_firmware_state(global, interrupt_enable)?;
     Ok((global, interrupt_enable))
+}
+
+struct TypedFwdlInterrupt<'a, B: Backend> {
+    wfdma: &'a MmioRegion<B>,
+}
+
+impl<B: Backend> DisabledFwdlInterruptTransport for TypedFwdlInterrupt<'_, B> {
+    type Error = String;
+
+    fn read_global_config(&mut self) -> Result<u32, Self::Error> {
+        self.wfdma
+            .read_u32(0x208)
+            .map_err(|error| format!("read WFDMA global config: {error:?}"))
+    }
+
+    fn read_interrupt_enable(&mut self) -> Result<u32, Self::Error> {
+        self.wfdma
+            .read_u32(0x204)
+            .map_err(|error| format!("read WFDMA interrupt enable: {error:?}"))
+    }
+
+    fn write_interrupt_enable(&mut self, value: u32) -> Result<(), Self::Error> {
+        if value != 0 {
+            return Err("interrupt-mask write escaped zero-only allowlist".into());
+        }
+        self.wfdma
+            .write_u32(0x204, value)
+            .map_err(|error| format!("write WFDMA interrupt enable: {error:?}"))
+    }
+
+    fn read_interrupt_status(&mut self) -> Result<u32, Self::Error> {
+        self.wfdma
+            .read_u32(0x200)
+            .map_err(|error| format!("read WFDMA interrupt status: {error:?}"))
+    }
+
+    fn acknowledge_interrupt_status(&mut self, value: u32) -> Result<(), Self::Error> {
+        if value & !(1 << 26) != 0 {
+            return Err("interrupt acknowledgement escaped FWDL-only allowlist".into());
+        }
+        self.wfdma
+            .write_u32(0x200, value)
+            .map_err(|error| format!("acknowledge WFDMA interrupt status: {error:?}"))
+    }
+}
+
+fn mask_ack_disabled_fwdl_on_device<B: Backend>(device: &Device<B>) -> Result<u32, String> {
+    let bar0 = device
+        .open_region(0)
+        .map_err(|error| format!("open BAR0: {error:?}"))?;
+    let wfdma = bar0
+        .slice(0xd4000, PAGE)
+        .map_err(|error| format!("slice WFDMA BAR page: {error:?}"))?;
+    let operation = {
+        let mut transport = TypedFwdlInterrupt { wfdma: &wfdma };
+        mask_ack_disabled_fwdl_interrupt(&mut transport, log_disabled_interrupt_event).map_err(
+            |error| match error {
+                DisabledInterruptError::DmaActive(raw) => {
+                    format!("refused active DMA state {raw:#010x}")
+                }
+                DisabledInterruptError::InterruptsEnabled(raw) => {
+                    format!("refused enabled interrupt mask {raw:#010x}")
+                }
+                DisabledInterruptError::Transport(error) => error,
+                DisabledInterruptError::MaskReadback(raw) => {
+                    format!("interrupt mask did not clear: {raw:#010x}")
+                }
+                DisabledInterruptError::AckDidNotClear(raw) => {
+                    format!("firmware-download interrupt did not clear: {raw:#010x}")
+                }
+                DisabledInterruptError::Restore(error) => {
+                    format!("restore interrupt mask: {error}")
+                }
+            },
+        )
+    };
+    drop(wfdma);
+    drop(bar0);
+    let reset = device
+        .reset()
+        .map_err(|error| format!("reset typed VFIO device: {error:?}"));
+    let status = operation?;
+    reset?;
+    Ok(status)
+}
+
+fn install_disable_msi0_on_device<B: Backend>(device: &Device<B>) -> Result<(), String> {
+    let operation = (|| -> Result<(), String> {
+        verify_typed_disabled_firmware_state(device)?;
+        // Logical vector zero resolves to the PCI backend's selected MSI
+        // capability. No MT7921 source is enabled anywhere in this operation.
+        let interrupt = device
+            .open_interrupt(0)
+            .map_err(|error| format!("install MSI vector 0: {error:?}"))?;
+        println!("{{\"vfio_irq_event\":\"eventfd_installed\"}}");
+        if interrupt
+            .wait_until(0)
+            .map_err(|error| format!("check MSI vector 0: {error:?}"))?
+            .is_some()
+        {
+            return Err("unexpected IRQ before device source enable".into());
+        }
+        drop(interrupt);
+        Ok(())
+    })();
+    let reset = device
+        .reset()
+        .map_err(|error| format!("reset typed VFIO device: {error:?}"));
+    operation?;
+    reset?;
+    Ok(())
+}
+
+fn open_typed_mt7921(
+    vfio: &str,
+    bdf: &str,
+) -> Result<(Device<LinuxVfio>, PciControl), String> {
+    let config = format!("/sys/bus/pci/devices/{bdf}/config");
+    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+        .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
+    let (backend, _pci, attached) = opened.into_parts();
+    if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
+        return Err(format!(
+            "attached PCI identity is {:04x}:{:04x}, expected 14c3:7961",
+            attached.vendor_id(),
+            attached.device_id()
+        ));
+    }
+    Ok((Device::from_backend(backend), _pci))
+}
+
+fn run_typed_mask_ack_disabled_fwdl(vfio: &str, bdf: &str) -> Result<(), String> {
+    let (device, _pci) = open_typed_mt7921(vfio, bdf)?;
+    mask_ack_disabled_fwdl_on_device(&device)?;
+    println!("{{\"fwdl_interrupt_event\":\"vfio_device_reset_completed\"}}");
+    Ok(())
+}
+
+fn run_typed_install_disable_msi0(vfio: &str, bdf: &str) -> Result<(), String> {
+    let (device, _pci) = open_typed_mt7921(vfio, bdf)?;
+    install_disable_msi0_on_device(&device)?;
+    println!("{{\"vfio_irq_event\":\"eventfd_empty_and_disabled\"}}");
+    println!("{{\"vfio_irq_event\":\"vfio_device_reset_completed\"}}");
+    Ok(())
 }
 
 fn run_typed_disabled_firmware_stage(vfio: &str, bdf: &str) -> Result<(), String> {
@@ -4945,6 +5089,12 @@ fn run() -> Result<(), String> {
     }
     if operation == Operation::StageDisabledFirmwareDescriptor {
         return run_typed_disabled_firmware_stage(&vfio, &bdf);
+    }
+    if operation == Operation::MaskAckDisabledFwdl {
+        return run_typed_mask_ack_disabled_fwdl(&vfio, &bdf);
+    }
+    if operation == Operation::InstallDisableVfioIrq {
+        return run_typed_install_disable_msi0(&vfio, &bdf);
     }
     let watchdog = operation
         .is_active_mcu()
@@ -19216,6 +19366,44 @@ mod tests {
         assert!(validate_disabled_firmware_state(0x1, 0).is_err());
         assert!(validate_disabled_firmware_state(0x4, 0).is_err());
         assert!(validate_disabled_firmware_state(0, 0x1).is_err());
+    }
+
+    #[test]
+    fn typed_disabled_fwdl_mask_status_w1c_is_exact_and_resets() {
+        let (device, operations) = drv_hardware_backends::DeterministicBackend::recording_device();
+        let generation = device.generation();
+        assert_eq!(mask_ack_disabled_fwdl_on_device(&device), Ok(0));
+        assert_eq!(device.generation(), generation + 1);
+        let accesses = operations
+            .borrow()
+            .iter()
+            .filter_map(|operation| match operation {
+                drv_hardware_backends::Operation::ReadU32 { offset, .. } => Some(("read", *offset, 0)),
+                drv_hardware_backends::Operation::WriteU32 { offset, value, .. } => Some(("write", *offset, *value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accesses, [
+            ("read", 0xd4208, 0),
+            ("read", 0xd4204, 0),
+            ("read", 0xd4200, 0),
+            ("write", 0xd4204, 0),
+            ("read", 0xd4204, 0),
+            ("write", 0xd4200, 0),
+            ("read", 0xd4200, 0),
+            ("write", 0xd4204, 0),
+        ]);
+    }
+
+    #[test]
+    fn typed_msi_zero_is_installed_source_disabled_then_reset() {
+        let (device, operations) = drv_hardware_backends::DeterministicBackend::recording_device();
+        let generation = device.generation();
+        install_disable_msi0_on_device(&device).unwrap();
+        assert_eq!(device.generation(), generation + 1);
+        assert!(operations.borrow().iter().all(|operation| matches!(operation,
+            drv_hardware_backends::Operation::ReadU32 { .. }
+        )));
     }
 
     #[cfg(feature = "fuchsia-passive")]
