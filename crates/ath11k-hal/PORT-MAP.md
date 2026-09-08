@@ -1,4 +1,4 @@
-<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, ported-corrected, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 # ath11k-hal port map
 
 This map tracks Rust counterparts of symbols in the pinned Linux ath11k oracle.
