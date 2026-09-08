@@ -69,7 +69,7 @@ struct Dma {
     iova: u64,
     direction: DmaDirection,
     coherent: bool,
-    ownership: DmaOwnership,
+    ownership: Vec<DmaOwnership>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DmaOwnership {
@@ -174,9 +174,14 @@ impl DeterministicBackend {
         }
         Ok(())
     }
-    fn device_accessible(&self, dma: u64) -> Result<()> {
+    fn device_accessible(&self, dma: u64, range: Range<usize>) -> Result<()> {
         let dma = self.dmas.get(&dma).ok_or(Error::StaleHandle)?;
-        if self.cache_coherent || dma.coherent || dma.ownership == DmaOwnership::Device {
+        if self.cache_coherent
+            || dma.coherent
+            || dma.ownership[range]
+                .iter()
+                .all(|owner| *owner == DmaOwnership::Device)
+        {
             Ok(())
         } else {
             Err(Error::DeviceFault)
@@ -248,7 +253,6 @@ impl Backend for DeterministicBackend {
             (0x98, value) if value & 1 != 0 => {
                 if value & 2 != 0 {
                     let destination = self.destination.ok_or(Error::Invalid)?;
-                    self.device_accessible(destination.0)?;
                     let end = destination
                         .1
                         .checked_add(self.count)
@@ -264,6 +268,7 @@ impl Backend for DeterministicBackend {
                     {
                         return Err(Error::OutOfBounds);
                     }
+                    self.device_accessible(destination.0, destination.1..end)?;
                     self.dmas
                         .get_mut(&destination.0)
                         .ok_or(Error::StaleHandle)?
@@ -275,12 +280,11 @@ impl Backend for DeterministicBackend {
                             .get_mut(&destination.0)
                             .ok_or(Error::StaleHandle)?;
                         if !dma.coherent {
-                            dma.ownership = DmaOwnership::DeviceDirty;
+                            dma.ownership[destination.1..end].fill(DmaOwnership::DeviceDirty);
                         }
                     }
                 } else {
                     let source = self.source.ok_or(Error::Invalid)?;
-                    self.device_accessible(source.0)?;
                     let end = source.1.checked_add(self.count).ok_or(Error::OutOfBounds)?;
                     if end
                         > self
@@ -293,6 +297,7 @@ impl Backend for DeterministicBackend {
                     {
                         return Err(Error::OutOfBounds);
                     }
+                    self.device_accessible(source.0, source.1..end)?;
                     self.edu_buffer[..self.count].copy_from_slice(
                         &self.dmas.get(&source.0).ok_or(Error::StaleHandle)?.bytes[source.1..end],
                     );
@@ -381,7 +386,7 @@ impl Backend for DeterministicBackend {
                 iova: self.next,
                 direction,
                 coherent,
-                ownership: DmaOwnership::Cpu,
+                ownership: vec![DmaOwnership::Cpu; size],
             },
         );
         self.next += size as u64;
@@ -416,7 +421,9 @@ impl Backend for DeterministicBackend {
         }
         if !self.cache_coherent
             && !d.coherent
-            && !matches!(d.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty)
+            && !d.ownership[r.clone()]
+                .iter()
+                .all(|owner| matches!(owner, DmaOwnership::Cpu | DmaOwnership::CpuDirty))
         {
             return Err(Error::DeviceFault);
         }
@@ -432,20 +439,22 @@ impl Backend for DeterministicBackend {
         d.bytes[r].copy_from_slice(bytes);
         Ok(())
     }
-    fn streaming_cpu_dirty(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+    fn streaming_cpu_dirty(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         if !self.cache_coherent {
             let dma = self.dma_mut(dma)?;
             if !dma.coherent {
-                dma.ownership = DmaOwnership::CpuDirty;
+                dma.ownership[range].fill(DmaOwnership::CpuDirty);
             }
         }
         Ok(())
     }
-    fn streaming_cpu_read(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+    fn streaming_cpu_read(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let dma = self.dma(dma)?;
         if !self.cache_coherent
             && !dma.coherent
-            && !matches!(dma.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty)
+            && !dma.ownership[range]
+                .iter()
+                .all(|owner| matches!(owner, DmaOwnership::Cpu | DmaOwnership::CpuDirty))
         {
             return Err(Error::DeviceFault);
         }
@@ -467,13 +476,13 @@ impl Backend for DeterministicBackend {
         if d.coherent || matches!(d.direction, DmaDirection::ToDevice) {
             Err(Error::Invalid)
         } else {
-            if !matches!(
-                d.ownership,
-                DmaOwnership::Device | DmaOwnership::DeviceDirty
-            ) {
+            if !d.ownership[range.clone()]
+                .iter()
+                .all(|owner| matches!(owner, DmaOwnership::Device | DmaOwnership::DeviceDirty))
+            {
                 return Err(Error::DeviceFault);
             }
-            d.ownership = DmaOwnership::Cpu;
+            d.ownership[range.clone()].fill(DmaOwnership::Cpu);
             if let Some(log) = &self.operations {
                 log.borrow_mut()
                     .push(Operation::SyncForCpu { dma: *dma, range });
@@ -486,10 +495,13 @@ impl Backend for DeterministicBackend {
         if d.coherent {
             Err(Error::Invalid)
         } else {
-            if !matches!(d.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty) {
+            if !d.ownership[range.clone()]
+                .iter()
+                .all(|owner| matches!(owner, DmaOwnership::Cpu | DmaOwnership::CpuDirty))
+            {
                 return Err(Error::DeviceFault);
             }
-            d.ownership = DmaOwnership::Device;
+            d.ownership[range.clone()].fill(DmaOwnership::Device);
             if let Some(log) = &self.operations {
                 log.borrow_mut()
                     .push(Operation::SyncForDevice { dma: *dma, range });

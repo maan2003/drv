@@ -221,4 +221,30 @@ mod tests {
         assert_eq!(bytes, [0; 64]);
         rx.prepare_for_device().unwrap();
     }
+
+    #[test]
+    fn sibling_rx_segments_keep_independent_noncoherent_ownership() {
+        let device = DeterministicBackend::noncoherent_device();
+        let bar = device.open_region(0).unwrap();
+        let pool = DmaPool::<_, FromDevice>::new(device.clone(), 128, 256, 128, 2).unwrap();
+        let mut completed = pool.allocate().unwrap();
+        let still_device_owned = pool.allocate().unwrap();
+
+        completed.sync_for_cpu(0, completed.len()).unwrap();
+        bar.write_u32(0x80, 0x40000).unwrap();
+        bar.write_u32(0x90, 1).unwrap();
+        bar.write_device_address(
+            0x88,
+            Some(0x8c),
+            still_device_owned.device_address(0).unwrap(),
+        )
+        .unwrap();
+        bar.write_u32(0x98, 1 | 2).unwrap();
+
+        bar.write_device_address(0x88, Some(0x8c), completed.device_address(0).unwrap())
+            .unwrap();
+        assert_eq!(bar.write_u32(0x98, 1 | 2), Err(Error::DeviceFault));
+        completed.prepare_for_device().unwrap();
+        bar.write_u32(0x98, 1 | 2).unwrap();
+    }
 }
