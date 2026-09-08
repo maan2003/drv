@@ -101,6 +101,12 @@ unsafe extern "C" {
         looping: u8,
     );
     fn oracle_hal_wbm_msdu_link(out: *mut u8, source: *const u8, action: u8);
+    fn oracle_hal_rx_msdu_link_info(
+        input: *const u8,
+        count: *mut u8,
+        cookies: *mut u32,
+        manager: *mut u8,
+    );
     fn oracle_hal_ce_source(out: *mut u8, address: u64, len: u32, id: u32, swap: u8);
     fn oracle_hal_ce_destination(out: *mut u8, address: u64);
     fn oracle_hal_ce_status_take_length(inout: *mut u8) -> u32;
@@ -477,6 +483,28 @@ proptest! {
         unsafe { oracle_hal_wbm_msdu_link(linked.as_mut_ptr(), c.as_ptr(), action) };
         let rust_linked = WbmReleaseRing::for_msdu_link(&rust, action);
         prop_assert_eq!(rust_linked.as_bytes(), &linked);
+    }
+
+    #[test]
+    fn rx_msdu_link_info_matches_pinned_c(
+        mut bytes in any::<[u8; 128]>(), stop in 0usize..=6,
+    ) {
+        for index in 0..stop {
+            bytes[32 + index * 16] |= 1;
+        }
+        if stop < 6 {
+            bytes[32 + stop * 16..36 + stop * 16].fill(0);
+        }
+        let rust = RxMsduLink::from_bytes(&bytes).unwrap().info();
+        let mut count = 0;
+        let mut cookies = [0; 6];
+        let mut manager = 0;
+        // SAFETY: exact input size and valid writable scalar/array outputs.
+        unsafe { oracle_hal_rx_msdu_link_info(bytes.as_ptr(), &mut count,
+            cookies.as_mut_ptr(), &mut manager) };
+        prop_assert_eq!(rust.count, count);
+        prop_assert_eq!(rust.cookies, cookies);
+        prop_assert_eq!(rust.return_buffer_manager, manager);
     }
 
     #[test]

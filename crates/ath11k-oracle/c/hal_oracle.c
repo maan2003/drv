@@ -75,6 +75,12 @@ static void put_u32(u8 *out, u32 word, u32 value) {
     memcpy(out + word * sizeof(value), &value, sizeof(value));
 }
 
+static u32 get_u32(const u8 *input) {
+    u32 value;
+    memcpy(&value, input, sizeof(value));
+    return value;
+}
+
 void oracle_hal_reo_queue_stats(u8 out[40], u16 number, u64 address, u32 flags) {
     struct reo_cmd d = {0};
     d.tlv = reo_tlv(306);
@@ -274,6 +280,21 @@ void oracle_hal_wbm_msdu_link(u8 out[32], const u8 source[32], u8 action) {
     d.addr = s.addr;
     d.info0 |= PREP(0x7, 4) | PREP(0x38, action) | PREP(0x1c0, 1);
     memcpy(out, &d, sizeof(d));
+}
+
+void oracle_hal_rx_msdu_link_info(const u8 input[128], u8 *count,
+                                  u32 cookies[6], u8 *manager) {
+    *count = 6;
+    memset(cookies, 0, 6 * sizeof(*cookies));
+    *manager = GET(RBM, get_u32(input + 36));
+    for (u8 i = 0; i < 6; i++) {
+        const u8 *address = input + 32 + i * 16;
+        if (get_u32(address) == 0) {
+            *count = i;
+            break;
+        }
+        cookies[i] = GET(COOKIE, get_u32(address + 4));
+    }
 }
 
 void oracle_hal_ce_source(u8 out[16], u64 address, u32 len, u32 id, u8 swap) {
