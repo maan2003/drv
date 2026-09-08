@@ -60,8 +60,12 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
   streaming-DMA packet-buffer and endpoint-credit ownership.
 - **QMI:** bounded `Request`, `Response`, `Transport`, `Handshake`, and
   `FirmwareReady`.
-- **WMI:** `CommandId`/`EventId`, word-aligned checked TLV envelopes,
-  `CommandEncoder`, `EventDecoder`, and `Transport`.
+- **WMI:** `CommandId`/`EventId`, word-aligned checked TLV envelopes, command
+  encoders, typed event decoders, and `Transport`. Its public
+  `event::EventStream` preserves unrelated events while exposing source-shaped
+  `wait_for_service_ready` and `wait_for_unified_ready` lifecycle waits. The
+  typed results carry firmware capabilities, radio counts, hardware-mode caps,
+  MAC addresses, ready status, and command-correlation identifiers.
 - **DP/HTT:** `HttHostMessage`/`HttTargetMessage`, `HttControl`,
   `DataRings`, typed packets/peer IDs, and `DataPath`.
 - **core:** `Lifecycle`, typed pdev/vdev IDs and `RadioControl`. The latter
