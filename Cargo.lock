@@ -841,6 +841,8 @@ name = "mt7921-port-spike"
 version = "0.1.0"
 dependencies = [
  "driver-runtime",
+ "drv-hardware",
+ "drv-hardware-backends",
  "mt7921-core",
  "userspace-vfio",
 ]
