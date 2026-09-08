@@ -367,12 +367,13 @@ impl BoundedNetstackProof {
                                 if !name.ends_with('.') {
                                     name.push('.');
                                 }
-                                let lookup = self
-                                    .runner
-                                    .stack_mut()
-                                    .lookup_ip(name)
-                                    .map_err(|_| "SOCKS5 DNS start failed")?;
-                                Socks5Phase::Dns { lookup, port }
+                                match self.runner.stack_mut().lookup_ip(name) {
+                                    Ok(lookup) => Socks5Phase::Dns { lookup, port },
+                                    Err(_) => Self::socks5_failure(
+                                        client,
+                                        netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                                    ),
+                                }
                             }
                             _ => unreachable!(),
                         }
@@ -382,17 +383,22 @@ impl BoundedNetstackProof {
             Socks5Phase::Dns { lookup, port } => {
                 match self.runner.stack_mut().take_lookup(lookup) {
                     None => Socks5Phase::Dns { lookup, port },
-                    Some(result) => {
+                    Some(Err(_)) => Self::socks5_failure(
+                        client,
+                        netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                    ),
+                    Some(Ok(addresses)) => {
                         client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
-                        let address = result
-                            .map_err(|_| "SOCKS5 DNS lookup failed")?
-                            .into_iter()
-                            .find_map(|address| match address {
-                                IpAddr::V4(address) => Some(address.octets()),
-                                IpAddr::V6(_) => None,
-                            })
-                            .ok_or("SOCKS5 DNS returned no IPv4 address")?;
-                        Socks5Phase::Connecting { address, port }
+                        match addresses.into_iter().find_map(|address| match address {
+                            IpAddr::V4(address) => Some(address.octets()),
+                            IpAddr::V6(_) => None,
+                        }) {
+                            Some(address) => Socks5Phase::Connecting { address, port },
+                            None => Self::socks5_failure(
+                                client,
+                                netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                            ),
+                        }
                     }
                 }
             }

@@ -53,6 +53,14 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
             5, 1, 0, 1, 192, 0, 2, 1, 0, 80, // CONNECT to TEST-NET-1 while offline
         ])
         .unwrap();
+    let mut domain_client = TcpStream::connect(listen).unwrap();
+    domain_client
+        .write_all(&[
+            5, 1, 0, // greeting
+            5, 1, 0, 3, 15, b'o', b'f', b'f', b'l', b'i', b'n', b'e', b'.', b'i', b'n', b'v', b'a',
+            b'l', b'i', b'd', 0, 80, // domain CONNECT while DNS is unavailable
+        ])
+        .unwrap();
 
     service
         .serve_socks5_listener(
@@ -69,6 +77,15 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
         [
             5, 0, // greeting accepted
             5, 3, 0, 1, 0, 0, 0, 0, 0, 0, // network unreachable
+        ]
+    );
+    let mut domain_response = [0; 12];
+    domain_client.read_exact(&mut domain_response).unwrap();
+    assert_eq!(
+        domain_response,
+        [
+            5, 0, // greeting accepted
+            5, 4, 0, 1, 0, 0, 0, 0, 0, 0, // host unreachable
         ]
     );
     assert!(!service.network_ready());
