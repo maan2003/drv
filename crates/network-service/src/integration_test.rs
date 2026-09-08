@@ -29,7 +29,7 @@ use std::{
 };
 
 #[test]
-fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
+fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
     let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let device = unsafe {
         ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
@@ -58,13 +58,19 @@ fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
         .serve_socks5_listener(
             listener,
             listen,
-            Some(std::time::Instant::now() + Duration::from_millis(5)),
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
             || false,
         )
         .unwrap();
-    let mut greeting = [0; 2];
-    client.read_exact(&mut greeting).unwrap();
-    assert_eq!(greeting, [5, 0]);
+    let mut response = [0; 12];
+    client.read_exact(&mut response).unwrap();
+    assert_eq!(
+        response,
+        [
+            5, 0, // greeting accepted
+            5, 3, 0, 1, 0, 0, 0, 0, 0, 0, // network unreachable
+        ]
+    );
     assert!(!service.network_ready());
 }
 

@@ -396,48 +396,55 @@ impl BoundedNetstackProof {
                     }
                 }
             }
-            Socks5Phase::Connecting { address, port } => {
+            Socks5Phase::Connecting { address, port } => 'connecting: {
+                let mut provider = self.runner.stack().socket_provider();
                 if client.socket.is_none() {
-                    let mut provider = self.runner.stack().socket_provider();
-                    let socket_client = RemoteSocketProvider::open_client(
+                    let socket_client = match RemoteSocketProvider::open_client(
                         &mut provider,
                         NonZeroUsize::new(1).unwrap(),
-                    )
-                    .map_err(|_| "SOCKS5 socket client failed")?;
-                    let socket = provider
-                        .tcp_socket(socket_client, RemoteIpVersion::V4)
-                        .map_err(|_| "SOCKS5 TCP socket failed")?;
-                    match RemoteSocketProviderV2::connect(
+                    ) {
+                        Ok(socket_client) => socket_client,
+                        Err(error) => break 'connecting Self::socks5_failure(client, error),
+                    };
+                    let socket = match provider.tcp_socket(socket_client, RemoteIpVersion::V4) {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            let _ =
+                                RemoteSocketProvider::close_client(&mut provider, socket_client);
+                            break 'connecting Self::socks5_failure(client, error);
+                        }
+                    };
+                    if let Err(error) = RemoteSocketProviderV2::connect(
                         &mut provider,
                         socket,
                         ProviderSocketAddressV2 {
                             address: RemoteIpAddress::V4(address),
                             port: port.get(),
                         },
-                    ) {
-                        Ok(()) | Err(netstack3_port_spike::RemoteSocketError::InProgress) => {}
-                        Err(_) => {
-                            let _ = RemoteSocketProviderV2::close(&mut provider, socket);
-                            let _ =
-                                RemoteSocketProvider::close_client(&mut provider, socket_client);
-                            return Err("SOCKS5 TCP connect failed");
-                        }
+                    ) && error != netstack3_port_spike::RemoteSocketError::InProgress
+                    {
+                        let _ = RemoteSocketProviderV2::close(&mut provider, socket);
+                        let _ = RemoteSocketProvider::close_client(&mut provider, socket_client);
+                        break 'connecting Self::socks5_failure(client, error);
                     }
                     client.socket_client = Some(socket_client);
                     client.socket = Some(socket);
                     client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 }
-                let mut provider = self.runner.stack().socket_provider();
-                let ready = RemoteSocketProviderV2::readiness(
-                    &mut provider,
-                    client.socket.expect("socket was created"),
-                )
-                .map_err(|_| "SOCKS5 TCP readiness failed")?;
+                let socket = client.socket.expect("socket was created");
+                let ready = match RemoteSocketProviderV2::readiness(&mut provider, socket) {
+                    Ok(ready) => ready,
+                    Err(error) => break 'connecting Self::socks5_failure(client, error),
+                };
                 if ready.readiness.0
                     & (ProviderReadinessV2::CONNECT_FAILED | ProviderReadinessV2::ERROR)
                     != 0
                 {
-                    return Err("SOCKS5 TCP connect failed");
+                    let error = RemoteSocketProviderV2::take_socket_error(&mut provider, socket)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(netstack3_port_spike::RemoteSocketError::InvalidState);
+                    break 'connecting Self::socks5_failure(client, error);
                 }
                 if ready.readiness.0 & ProviderReadinessV2::CONNECTED != 0 {
                     client.host_out.extend([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
@@ -447,10 +454,9 @@ impl BoundedNetstackProof {
                         port,
                         client.peer
                     );
-                    Socks5Phase::Reply
-                } else {
-                    Socks5Phase::Connecting { address, port }
+                    break 'connecting Socks5Phase::Reply;
                 }
+                Socks5Phase::Connecting { address, port }
             }
             Socks5Phase::Reply => {
                 if client.host_out.is_empty() {
@@ -584,5 +590,23 @@ impl BoundedNetstackProof {
         if let Some(socket_client) = client.socket_client.take() {
             let _ = RemoteSocketProvider::close_client(&mut provider, socket_client);
         }
+    }
+
+    fn socks5_failure(
+        client: &mut Socks5Client,
+        error: netstack3_port_spike::RemoteSocketError,
+    ) -> Socks5Phase {
+        let reply = match error {
+            netstack3_port_spike::RemoteSocketError::PermissionDenied => 2,
+            netstack3_port_spike::RemoteSocketError::NetworkUnreachable => 3,
+            netstack3_port_spike::RemoteSocketError::HostUnreachable => 4,
+            netstack3_port_spike::RemoteSocketError::ConnectionRefused => 5,
+            netstack3_port_spike::RemoteSocketError::TimedOut => 6,
+            netstack3_port_spike::RemoteSocketError::NotSupported
+            | netstack3_port_spike::RemoteSocketError::AddressFamilyMismatch => 8,
+            _ => 1,
+        };
+        client.host_out.extend([5, reply, 0, 1, 0, 0, 0, 0, 0, 0]);
+        Socks5Phase::Closing
     }
 }
