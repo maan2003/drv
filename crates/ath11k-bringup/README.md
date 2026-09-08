@@ -19,15 +19,19 @@ an IOAS, and uses the coherent mapping path selected for kernel #3's first
 hardware run. `--broker` explicitly selects the narrowed default-domain broker
 once that kernel patch exists. Use `--stop-after` to bound execution:
 
-Before any staged run, execute the inert fail-closed host preflight. It checks
-the VFIO cdev/sysfs identity, the 32 edge-rising SPI descriptions, `/dev/iommu`,
-and the Qualcomm watchdog device, driver, and live-FDT status. It does not open
-the VFIO or watchdog cdev, bind iommufd, or access device registers:
+Before any staged run, arm the initrd userspace watchdog, then execute the inert
+fail-closed host preflight. It checks the VFIO cdev/sysfs identity, the 32
+edge-rising SPI descriptions, `/dev/iommu`, and the watchdog's armed marker. It
+does not open the VFIO cdev, bind iommufd, or access device registers:
 
 ```sh
 cargo run -p ath11k-bringup -- preflight \
   --vfio-device /dev/vfio/devices/vfioN
 ```
+
+The real runner updates `/run/redwood-lab-watchdog/heartbeat` from an
+independent thread and leaves the watchdog armed when it exits. After the final
+stage, the operator must run `redwood-lab-watchdog stop` over USB SSH.
 
 The resources stage performs the necessarily state-changing iommufd bind under
 the armed watchdog, then fails closed unless VFIO reports the WCN6750 platform

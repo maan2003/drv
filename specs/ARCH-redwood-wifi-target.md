@@ -59,17 +59,18 @@ kernel:   VFIO platform ─▶ SMMU     AF_QIPCRTR┘
 
 ## Supervised transactional handoff
 
-Redwood's `wlan0` is its only live management uplink. `usb0` is configured
-as SSH-only ECM at 172.16.42.1/24, including initrd recovery, but the phone is
-not physically USB-connected, so it is not currently an out-of-band channel.
-No serial console is available. The current kernel has a Qualcomm watchdog
-module configured, but no `/dev/watchdog` was present during inventory; the
-hardware-watchdog reboot lease and post-reboot Wi-Fi return must be explicitly
-proven before any unbind or kexec.
+Redwood's `wlan0` is its only normal management uplink. `usb0` is configured
+as SSH-only ECM at 172.16.42.1/24, including initrd recovery, and the attached
+no-plastic host provides the out-of-band path. No serial console is available.
+The Qualcomm watchdog is hypervisor-reserved in the live FDT and Linux has no
+`/dev/watchdog`; it cannot provide the handoff's reboot lease. A small
+userspace watchdog started in the initrd substitutes for runner-process and
+USB-control-path loss during the lab transaction. It cannot recover a hung
+kernel, which remains an attended manual power-cycle by the user.
 
 A handoff must run under two independent bounds: a local systemd restore timer
-that unconditionally rebinds ath11k and restarts iwd, and the SoC hardware
-watchdog, whose expiry reboots the unchanged flashed known-good slot-B system.
+that unconditionally rebinds ath11k and restarts iwd, and the initrd userspace
+watchdog, whose fault path reboots the unchanged flashed known-good system.
 Reports are persisted under a root-owned local directory and uploaded only
 after wlan0 returns. Session loss follows the same restore path. The checked-in
 transaction script has a fake-backend failure test; this does not substitute

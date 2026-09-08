@@ -31,10 +31,7 @@ const REGDB_SHA256: [u8; 32] = [
 ];
 const EXPECTED_VFIO_DEVICE: &str = "17a10040.wifi";
 const EXPECTED_VFIO_DRIVER: &str = "vfio-platform";
-const EXPECTED_WATCHDOG_DRIVER: &str = "qcom_wdt";
-const WATCHDOG_DEVICE: &str = "/dev/watchdog";
-const WATCHDOG_CLASS: &str = "/sys/class/watchdog/watchdog0";
-const WATCHDOG_MISC_CLASS: &str = "/sys/class/misc/watchdog";
+pub const LAB_WATCHDOG_ARMED: &str = "/run/redwood-lab-watchdog/armed";
 const IOMMU_DEVICE: &str = "/dev/iommu";
 const IOMMU_CLASS: &str = "/sys/class/misc/iommu";
 const REMOTEPROC_CLASS: &str = "/sys/class/remoteproc";
@@ -326,10 +323,6 @@ fn interrupt_facts(bytes: &[u8]) -> Result<(usize, bool), Error> {
 struct PreflightIdentity<'a> {
     device_name: &'a str,
     driver: &'a str,
-    watchdog: &'a str,
-    watchdog_driver: &'a str,
-    watchdog_node: &'a str,
-    watchdog_status: &'a str,
     irq_count: usize,
     irqs_edge_rising: bool,
 }
@@ -347,30 +340,6 @@ fn validate_preflight_identity(facts: PreflightIdentity<'_>) -> Result<(), Error
             facts.driver
         )));
     }
-    if facts.watchdog != EXPECTED_WATCHDOG_DRIVER {
-        return Err(Error::Preflight(format!(
-            "expected watchdog driver {EXPECTED_WATCHDOG_DRIVER}, found {}",
-            facts.watchdog
-        )));
-    }
-    if facts.watchdog_driver != EXPECTED_WATCHDOG_DRIVER {
-        return Err(Error::Preflight(format!(
-            "expected watchdog platform driver {EXPECTED_WATCHDOG_DRIVER}, found {}",
-            facts.watchdog_driver
-        )));
-    }
-    if facts.watchdog_node != "watchdog@17c10000" {
-        return Err(Error::Preflight(format!(
-            "expected watchdog FDT node watchdog@17c10000, found {}",
-            facts.watchdog_node
-        )));
-    }
-    if facts.watchdog_status != "okay" && facts.watchdog_status != "ok" {
-        return Err(Error::Preflight(format!(
-            "watchdog FDT status is {:?}, not okay",
-            facts.watchdog_status
-        )));
-    }
     if facts.irq_count != 32 {
         return Err(Error::Preflight(format!(
             "expected 32 Wi-Fi SPI interrupts, found {}",
@@ -385,7 +354,7 @@ fn validate_preflight_identity(facts: PreflightIdentity<'_>) -> Result<(), Error
     Ok(())
 }
 
-/// Run the inert host-resource gate. This does not open the VFIO or watchdog
+/// Run the inert host-resource gate. This does not open the VFIO
 /// cdev and never binds, maps, resets, or accesses the Wi-Fi device.
 pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
     let path = config
@@ -437,36 +406,14 @@ pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
         ));
     }
 
-    require_mapped_char_device(
-        Path::new(WATCHDOG_DEVICE),
-        &Path::new(WATCHDOG_MISC_CLASS).join("dev"),
-    )?;
-    let watchdog_device =
-        fs::canonicalize(Path::new(WATCHDOG_CLASS).join("device")).map_err(|source| Error::Io {
-            action: "resolve watchdog0 platform device",
-            source,
-        })?;
-    let misc_watchdog_device = fs::canonicalize(Path::new(WATCHDOG_MISC_CLASS).join("device"))
-        .map_err(|source| Error::Io {
-            action: "resolve legacy watchdog platform device",
-            source,
-        })?;
-    if watchdog_device != misc_watchdog_device {
-        return Err(Error::Preflight(format!(
-            "{WATCHDOG_DEVICE} and watchdog0 do not map to the same device"
-        )));
+    if !Path::new(LAB_WATCHDOG_ARMED).is_file() {
+        return Err(Error::Preflight(
+            "Redwood userspace watchdog is not armed".into(),
+        ));
     }
-    let watchdog = trimmed_file(Path::new(WATCHDOG_CLASS).join("identity"))?;
-    let watchdog_driver = symlink_basename(watchdog_device.join("driver"))?;
-    let watchdog_node = symlink_basename(watchdog_device.join("of_node"))?;
-    let watchdog_status = trimmed_file(watchdog_device.join("of_node/status"))?;
     validate_preflight_identity(PreflightIdentity {
         device_name: &device_name,
         driver: &driver,
-        watchdog: &watchdog,
-        watchdog_driver: &watchdog_driver,
-        watchdog_node: &watchdog_node,
-        watchdog_status: &watchdog_status,
         irq_count,
         irqs_edge_rising,
     })?;
@@ -486,9 +433,7 @@ pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
         format!("wifi_spi_irqs={irq_count}"),
         format!("wifi_irqs_edge_rising={irqs_edge_rising}"),
         "iommu_open=true".into(),
-        format!("watchdog_device={WATCHDOG_DEVICE}"),
-        format!("watchdog_driver={watchdog}"),
-        format!("watchdog_fdt_status={watchdog_status}"),
+        "userspace_watchdog=armed".into(),
     ])
 }
 
@@ -1472,10 +1417,6 @@ mod tests {
         let valid = PreflightIdentity {
             device_name: EXPECTED_VFIO_DEVICE,
             driver: EXPECTED_VFIO_DRIVER,
-            watchdog: EXPECTED_WATCHDOG_DRIVER,
-            watchdog_driver: EXPECTED_WATCHDOG_DRIVER,
-            watchdog_node: "watchdog@17c10000",
-            watchdog_status: "okay",
             irq_count: 32,
             irqs_edge_rising: true,
         };
@@ -1487,22 +1428,6 @@ mod tests {
             },
             PreflightIdentity {
                 driver: "ath11k_ahb",
-                ..valid
-            },
-            PreflightIdentity {
-                watchdog: "softdog",
-                ..valid
-            },
-            PreflightIdentity {
-                watchdog_driver: "softdog",
-                ..valid
-            },
-            PreflightIdentity {
-                watchdog_node: "watchdog@wrong",
-                ..valid
-            },
-            PreflightIdentity {
-                watchdog_status: "reserved",
                 ..valid
             },
             PreflightIdentity {
