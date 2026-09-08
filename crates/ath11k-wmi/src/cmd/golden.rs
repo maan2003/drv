@@ -244,7 +244,13 @@ pub struct GoldenSemanticRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SemanticRequest {
+    BssColorChangeEnable(super::BssColorChangeEnable),
+    DfsPhyerrOffloadEnable(super::DfsPhyerrOffloadEnable),
     Init(super::Init),
+    MgmtSend(super::MgmtSend),
+    ObssColorCollisionConfig(super::ObssColorCollisionConfig),
+    ObssSpatialReuse(super::ObssSpatialReuse),
+    PdevLroConfig(super::PdevLroConfig),
     PeerAssoc(super::PeerAssoc),
     PeerCreate(super::PeerCreate),
     PeerDelete(super::PeerDelete),
@@ -252,10 +258,15 @@ enum SemanticRequest {
     PeerSetParam(super::PeerSetParam),
     PdevSetParam(super::PdevSetParam),
     ScanChannelList(super::ScanChannelList),
+    Scan11dStart(super::Scan11dStart),
+    Scan11dStop(super::Scan11dStop),
+    ScanProbeRequestOui(super::ScanProbeRequestOui),
     ScanStart(super::ScanStart),
     ScanStop(super::ScanStop),
     StaPowerSaveMode(super::StaPowerSaveMode),
     StaPowerSaveParameter(super::StaPowerSaveParameter),
+    StatsRequest(super::StatsRequest),
+    SetCurrentCountry(super::SetCurrentCountry),
     VdevInstallKey(super::VdevInstallKey),
     VdevSetParam(super::VdevSetParam),
     WmmUpdate(super::WmmUpdate),
@@ -269,7 +280,13 @@ enum SemanticRequest {
 impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
     fn encode_command(&self) -> Result<Command, WmiError> {
         match &self.request {
+            SemanticRequest::BssColorChangeEnable(request) => request.encode_command(),
+            SemanticRequest::DfsPhyerrOffloadEnable(request) => request.encode_command(),
             SemanticRequest::Init(request) => request.encode_command(),
+            SemanticRequest::MgmtSend(request) => request.encode_command(),
+            SemanticRequest::ObssColorCollisionConfig(request) => request.encode_command(),
+            SemanticRequest::ObssSpatialReuse(request) => request.encode_command(),
+            SemanticRequest::PdevLroConfig(request) => request.encode_command(),
             SemanticRequest::PeerAssoc(request) => request.encode_command(),
             SemanticRequest::PeerCreate(request) => request.encode_command(),
             SemanticRequest::PeerDelete(request) => request.encode_command(),
@@ -277,10 +294,15 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::PeerSetParam(request) => request.encode_command(),
             SemanticRequest::PdevSetParam(request) => request.encode_command(),
             SemanticRequest::ScanChannelList(request) => request.encode_command(),
+            SemanticRequest::Scan11dStart(request) => request.encode_command(),
+            SemanticRequest::Scan11dStop(request) => request.encode_command(),
+            SemanticRequest::ScanProbeRequestOui(request) => request.encode_command(),
             SemanticRequest::ScanStart(request) => request.encode_command(),
             SemanticRequest::ScanStop(request) => request.encode_command(),
             SemanticRequest::StaPowerSaveMode(request) => request.encode_command(),
             SemanticRequest::StaPowerSaveParameter(request) => request.encode_command(),
+            SemanticRequest::StatsRequest(request) => request.encode_command(),
+            SemanticRequest::SetCurrentCountry(request) => request.encode_command(),
             SemanticRequest::VdevInstallKey(request) => request.encode_command(),
             SemanticRequest::VdevSetParam(request) => request.encode_command(),
             SemanticRequest::WmmUpdate(request) => request.encode_command(),
@@ -898,18 +920,196 @@ pub fn reverse_map_semantic_command(
                 value: fixed[2],
             })
         }
+        0x003006 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_SCAN_PROB_REQ_OUI_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<1>(&tlvs[0].value)?[0];
+            if fixed & 0xff00_0000 != 0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::ScanProbeRequestOui(super::ScanProbeRequestOui {
+                mac_addr: [
+                    (fixed >> 16) as u8,
+                    (fixed >> 8) as u8,
+                    fixed as u8,
+                    0,
+                    0,
+                    0,
+                ],
+            })
+        }
+        0x007008 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if !(tlvs.len() == 2 || tlvs.len() == 3)
+                || tlvs[0].tag != crate::tags::WMI_TAG_MGMT_TX_SEND_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_BYTE.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<8>(&tlvs[0].value)?;
+            let frame_len = fixed[5] as usize;
+            let download_len = fixed[6] as usize;
+            let tx_params_valid = fixed[7] != 0;
+            if download_len != frame_len.min(64)
+                || tlvs[1].value.len() != download_len
+                || tx_params_valid != (tlvs.len() == 3)
+            {
+                return Err(WmiError::Malformed);
+            }
+            if let Some(params) = tlvs.get(2)
+                && (params.tag != crate::tags::WMI_TAG_TX_SEND_PARAMS.0
+                    || words::<2>(&params.value)? != [0, 1 << 21])
+            {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::MgmtSend(super::MgmtSend {
+                vdev_id: fixed[0],
+                desc_id: fixed[1],
+                channel_freq: fixed[2],
+                paddr: 0,
+                frame: alloc::vec![0; frame_len],
+                tx_params_valid,
+            })
+        }
+        0x00a005 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1
+                || tlvs[0].tag != crate::tags::WMI_TAG_PDEV_DFS_PHYERR_OFFLOAD_ENABLE_CMD.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::DfsPhyerrOffloadEnable(super::DfsPhyerrOffloadEnable {
+                pdev_id: words::<1>(&tlvs[0].value)?[0],
+            })
+        }
+        0x016001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_REQUEST_STATS_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<5>(&tlvs[0].value)?;
+            if fixed[2] != 0 || fixed[3] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::StatsRequest(super::StatsRequest {
+                stats_id: fixed[0],
+                vdev_id: fixed[1],
+                pdev_id: fixed[4],
+            })
+        }
+        0x01d010 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_LRO_INFO_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<19>(&tlvs[0].value)?;
+            if fixed[0] != 0 || fixed[1] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::PdevLroConfig(super::PdevLroConfig {
+                pdev_id: fixed[18],
+                ipv4_hash_seed: fixed[2..7].try_into().map_err(|_| WmiError::Malformed)?,
+                ipv6_hash_seed: fixed[7..18].try_into().map_err(|_| WmiError::Malformed)?,
+            })
+        }
+        0x02a003 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1
+                || tlvs[0].tag != crate::tags::WMI_TAG_OBSS_COLOR_COLLISION_DET_CONFIG.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<7>(&tlvs[0].value)?;
+            if fixed[1] != 0 || fixed[5] != 200 || fixed[6] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::ObssColorCollisionConfig(super::ObssColorCollisionConfig {
+                vdev_id: fixed[0],
+                enable: fixed[2] != 0,
+                bss_color: u8::try_from(fixed[3]).map_err(|_| WmiError::Malformed)?,
+                detection_period_ms: fixed[4],
+            })
+        }
+        0x03a001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_SET_CURRENT_COUNTRY_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<2>(&tlvs[0].value)?;
+            SemanticRequest::SetCurrentCountry(super::SetCurrentCountry {
+                pdev_id: fixed[0],
+                alpha2: [tlvs[0].value[4], tlvs[0].value[5], tlvs[0].value[6]],
+            })
+        }
+        0x03a002 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_11D_SCAN_START_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<3>(&tlvs[0].value)?;
+            SemanticRequest::Scan11dStart(super::Scan11dStart {
+                vdev_id: fixed[0],
+                scan_period_ms: fixed[1],
+                start_interval_ms: fixed[2],
+            })
+        }
+        0x03a003 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_11D_SCAN_STOP_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::Scan11dStop(super::Scan11dStop {
+                vdev_id: words::<1>(&tlvs[0].value)?[0],
+            })
+        }
+        0x00700c => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_BSS_COLOR_CHANGE_ENABLE.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<2>(&tlvs[0].value)?;
+            SemanticRequest::BssColorChangeEnable(super::BssColorChangeEnable {
+                vdev_id: fixed[0],
+                enable: fixed[1] != 0,
+            })
+        }
+        0x040001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_OBSS_SPATIAL_REUSE_SET_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<5>(&tlvs[0].value)?;
+            if fixed[0] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::ObssSpatialReuse(super::ObssSpatialReuse {
+                vdev_id: fixed[4],
+                enable: fixed[1] != 0,
+                min_offset: fixed[2] as i32,
+                max_offset: fixed[3] as i32,
+            })
+        }
         _ => return Ok(None),
     };
     let (family, masked_fields) = command_family(id.0).ok_or(WmiError::Malformed)?;
+    let masked_ranges = match id.0 {
+        0x006013 => core::iter::once(24..32).collect(),
+        0x007008 => {
+            let frame_len = match &request {
+                SemanticRequest::MgmtSend(r) => r.frame.len().min(64),
+                _ => 0,
+            };
+            Vec::from_iter([20..28, 44..44 + frame_len])
+        }
+        _ => Vec::new(),
+    };
     Ok(Some(GoldenSemanticRequest {
         family,
         request,
         masked_fields,
-        masked_ranges: if id.0 == 0x006013 {
-            core::iter::once(24..32).collect()
-        } else {
-            Vec::new()
-        },
+        masked_ranges,
     }))
 }
 
