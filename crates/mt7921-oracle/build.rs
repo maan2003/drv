@@ -289,7 +289,7 @@ struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
 #define MT_TXS6_MPDU_FAIL_CNT GENMASK(31, 23)
 #define MT_TXS7_MPDU_RETRY_BYTE GENMASK(22, 0)
 #define MT_TXS7_MPDU_RETRY_CNT GENMASK(31, 23)
-#define MT_TXS_PPDU_FMT 1
+#define MT_TXS_PPDU_FMT 2
 #define MT_PACKET_ID_FIRST 3
 #define MT792x_WTBL_SIZE 20
 #define MT_BAND1 1

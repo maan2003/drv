@@ -691,15 +691,17 @@ mod tests {
     }
 
     #[test]
-    fn valid_ppdu_txs_is_ignored_by_linux_but_reported_by_rust() {
+    fn valid_ppdu_txs_is_ignored_by_both_implementations() {
         let mut txs = [0u32; 8];
-        txs[0] = 1 << 23; // MT_TXS_PPDU_FMT
+        txs[0] = 2 << 23; // MT_TXS_PPDU_FMT
         txs[2] = 19 << 16;
         txs[3] = 3 << 24;
         let c = c_add_txs(txs, 1, 0, 0);
-        let rust = mt7921_core::parse_mt7921_tx_status(&txs_packet(txs)).unwrap();
         assert_eq!(c.skb_completed, 0);
-        assert_eq!((rust.wcid, rust.pid, rust.acked), (19, 3, true));
+        assert_eq!(
+            mt7921_core::parse_mt7921_tx_status(&txs_packet(txs)),
+            Err(mt7921_core::Mt7921TxCompletionError::InvalidFormat)
+        );
     }
 
     #[test]
