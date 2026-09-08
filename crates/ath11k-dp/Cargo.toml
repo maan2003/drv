@@ -7,6 +7,7 @@ license.workspace=true
 ath11k-hal={path="../ath11k-hal"}
 ath11k-ce={path="../ath11k-ce"}
 ath11k-platform-backend={path="../ath11k-platform-backend"}
+ath11k-wmi={path="../ath11k-wmi"}
 dma-pool={path="../dma-pool"}
 
 [dev-dependencies]

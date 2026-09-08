@@ -93,6 +93,8 @@ struct TracingWmi<T, S> {
     sink: S,
 }
 impl<T: WmiTransport, S: WmiTraceSink> WmiTransport for TracingWmi<T, S> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = T::SEND_ERROR_IS_NON_VISIBLE;
+
     fn send(&mut self, command: Command) -> Result<(), WmiError> {
         let mut bytes = Vec::with_capacity(4 + command.tlvs().len());
         bytes.extend_from_slice(&(command.id.0 & 0x00ff_ffff).to_le_bytes());

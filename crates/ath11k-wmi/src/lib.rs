@@ -53,6 +53,11 @@ pub enum WmiError {
     Transport,
 }
 pub trait Transport {
+    /// Whether `send` returning an error guarantees that firmware could not
+    /// observe the command. Callers may release DMA referenced by a rejected
+    /// command only when this is true.
+    const SEND_ERROR_IS_NON_VISIBLE: bool = false;
+
     fn send(&mut self, command: Command) -> Result<(), WmiError>;
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<Event>, WmiError>;
 }

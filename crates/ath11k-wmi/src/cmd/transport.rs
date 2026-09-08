@@ -24,6 +24,8 @@ impl<T> HtcWmiTransport<T> {
 }
 
 impl<T: HtcServiceTransport> Transport for HtcWmiTransport<T> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = true;
+
     fn send(&mut self, command: Command) -> Result<(), WmiError> {
         let mut payload = Vec::with_capacity(4 + command.tlvs().len());
         payload.extend_from_slice(&(command.id.0 & 0x00ff_ffff).to_le_bytes());
