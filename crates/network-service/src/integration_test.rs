@@ -363,6 +363,144 @@ fn drive(
 }
 
 #[test]
+fn socks_connect_relays_application_bytes_over_ethernet() {
+    let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let device = unsafe {
+        ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
+    };
+    let mut service = BoundedNetstackProof::new(
+        device,
+        NetstackProofConfig {
+            dns_name: "unused.invalid.".into(),
+            server_port: NonZeroU16::new(8080).unwrap(),
+        },
+    )
+    .unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ap_completed = completed.clone();
+    let ap_thread = std::thread::spawn(move || {
+        let mut ap = AssociatedAp::new();
+        let listener = ap.server.tcp_socket().unwrap();
+        ap.server
+            .tcp_bind(listener, Some(SERVER_IP), NonZeroU16::new(8080).unwrap())
+            .unwrap();
+        ap.server
+            .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        sink.set_link(true);
+        ready_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut accepted = None;
+        let mut request = Vec::new();
+        let mut response_sent = false;
+        loop {
+            while let Ok(Some(frame)) = sink.take_transmit() {
+                ap.transmit_ethernet(frame.as_bytes()).unwrap();
+            }
+            ap.collect_server_frames();
+            while let Some(frame) = ap.pending.pop_front() {
+                let _ = sink.deliver(frame.as_bytes());
+            }
+            if accepted.is_none() && ap.server.tcp_pending_connections(listener).unwrap() != 0 {
+                accepted = Some(ap.server.tcp_accept(listener).unwrap());
+            }
+            if let Some(socket) = accepted {
+                let mut bytes = [0; 64];
+                let read = ap.server.tcp_read(socket, &mut bytes).unwrap();
+                request.extend_from_slice(&bytes[..read]);
+                if request.len() >= 7 && !response_sent {
+                    request_tx.send(request.clone()).unwrap();
+                    assert_eq!(
+                        ap.server
+                            .tcp_write(socket, b"HTTP/1.0 200 OK\r\n\r\n")
+                            .unwrap(),
+                        19
+                    );
+                    response_sent = true;
+                }
+            }
+            if ap_completed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SOCKS test AP timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    ready_rx.recv().unwrap();
+    service
+        .prove_dhcp(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listen = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(listen).unwrap();
+    client
+        .write_all(&[
+            5,
+            1,
+            0, // greeting
+            5,
+            1,
+            0,
+            1,
+            SERVER_IP[0],
+            SERVER_IP[1],
+            SERVER_IP[2],
+            SERVER_IP[3],
+            0x1f,
+            0x90,
+            b'G',
+            b'E',
+            b'T',
+            b' ',
+            b'/',
+            b'\r',
+            b'\n', // pipelined application request
+        ])
+        .unwrap();
+    client.set_nonblocking(true).unwrap();
+    let mut response = Vec::new();
+    service
+        .serve_socks5_listener(
+            listener,
+            listen,
+            Some(std::time::Instant::now() + Duration::from_secs(2)),
+            || {
+                let mut bytes = [0; 64];
+                loop {
+                    match client.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(read) => response.extend_from_slice(&bytes[..read]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("SOCKS client read failed: {error}"),
+                    }
+                }
+                if response.len() >= 31 {
+                    completed.store(true, std::sync::atomic::Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        .unwrap();
+
+    assert_eq!(response.len(), 31);
+    assert_eq!(&response[..2], &[5, 0]);
+    assert_eq!(&response[2..12], &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&response[12..], b"HTTP/1.0 200 OK\r\n\r\n");
+    assert_eq!(request_rx.recv().unwrap(), b"GET /\r\n");
+    ap_thread.join().unwrap();
+}
+
+#[test]
 fn associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss() {
     let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let device = unsafe {
