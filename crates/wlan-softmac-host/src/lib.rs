@@ -43,6 +43,16 @@ pub trait WlanSoftmacLifecycle {
 pub trait ClientRuntimeDriver {
     fn drive(&mut self) -> Result<bool, zx::Status>;
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
+    /// Make a completed, unsuccessful connection attempt safe to retry.
+    ///
+    /// `Ok(())` guarantees that device-side attempt authority was revoked
+    /// first, association keys and data admission are cleared, and no callback
+    /// from the old attempt can be produced after this method returns. Drivers
+    /// that cannot establish all of those properties retain terminal reset
+    /// behavior.
+    fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn reset(&mut self) -> Result<(), zx::Status>;
 }
 

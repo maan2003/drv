@@ -111,6 +111,17 @@ fn revoke_and_drain(upcalls: &Mutex<UpcallQueue>) {
     state.raw_queued = 0;
 }
 
+fn drain_completed_attempt(upcalls: &Mutex<UpcallQueue>) -> bool {
+    let mut state = upcalls.lock().unwrap();
+    state.queue.clear();
+    state.raw_queued = 0;
+    !state.overflowed
+}
+
+fn sme_is_retry_quiescent(status: &wlan_sme::client::ClientSmeStatus) -> bool {
+    matches!(status, wlan_sme::client::ClientSmeStatus::Idle)
+}
+
 fn stop_device<D: WlanSoftmacLifecycle>(
     device: &Mutex<StartedDevice<D>>,
 ) -> Result<(), zx::Status> {
@@ -349,6 +360,9 @@ pub enum DriverError {
     Ethernet(zx::Status),
     RequestStreamClosed,
     EventStreamClosed,
+    ConnectTransactionClosed,
+    ConnectStateMismatch,
+    ControlBudgetExhausted,
     Stopped,
     UpcallOverflow,
 }
@@ -670,7 +684,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             println!(
                 "client_runtime_control stage=budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
             );
-            return Ok(progressed);
+            return Err(ConnectError::Driver(DriverError::ControlBudgetExhausted));
         }
 
         let device_progressed = self
@@ -688,6 +702,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 println!(
                     "client_runtime_control stage=post_rx_budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
                 );
+                return Err(ConnectError::Driver(DriverError::ControlBudgetExhausted));
             }
         }
         Ok(progressed)
@@ -735,6 +750,25 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
         let result = self.connect_inner(request, deadline).await;
+        if result == Err(ConnectError::Failed) && !self.revoked {
+            // A completed SME failure is retryable only when both owners can
+            // prove quiescence. Keep the data plane closed before asking the
+            // device to revoke and drain its attempt, then discard callbacks
+            // that raced with that device-side drain.
+            self.io.lock().unwrap().ethernet.set_link(false);
+            let sme_quiescent = sme_is_retry_quiescent(&self.sme.status());
+            let device_quiescent = sme_quiescent
+                && self
+                    .device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .finish_failed_connect_attempt()
+                    .is_ok();
+            if device_quiescent && drain_completed_attempt(&self.upcalls) {
+                return result;
+            }
+        }
         if result.is_err() && !self.revoked {
             self.revoked = true;
             revoke_and_drain(&self.upcalls);
@@ -770,11 +804,13 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                             .status()
                             .is_connected()
                             .then_some(())
-                            .ok_or(ConnectError::Failed);
+                            .ok_or(ConnectError::Driver(DriverError::ConnectStateMismatch));
                     }
                     Ok(_) => {}
                     Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Closed) => return Err(ConnectError::Failed),
+                    Err(mpsc::TryRecvError::Closed) => {
+                        return Err(ConnectError::Driver(DriverError::ConnectTransactionClosed));
+                    }
                 }
             }
             if !progressed {
@@ -820,6 +856,11 @@ mod tests {
         reset_failure: bool,
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
+        simulate_ap: bool,
+        reject_next_auth: bool,
+        pending_rx: VecDeque<Vec<u8>>,
+        retry_cleanup: bool,
+        stale_callback_during_cleanup: bool,
     }
 
     #[derive(Clone)]
@@ -857,9 +898,34 @@ mod tests {
 
     impl ClientRuntimeDriver for Fake {
         fn drive(&mut self) -> Result<bool, zx::Status> {
-            Ok(false)
+            let mut effects = self.0.lock().unwrap();
+            let Some(bytes) = effects.pending_rx.pop_front() else {
+                return Ok(false);
+            };
+            effects.upcalls.as_mut().unwrap().recv(bytes, rx_info());
+            Ok(true)
         }
         fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
+            Ok(())
+        }
+        fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
+            let mut effects = self.0.lock().unwrap();
+            effects.calls.push("finish_failed_connect_attempt");
+            if !effects.retry_cleanup {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            if effects.stale_callback_during_cleanup {
+                effects
+                    .upcalls
+                    .as_mut()
+                    .unwrap()
+                    .recv(auth_response(0), rx_info());
+                effects
+                    .upcalls
+                    .as_mut()
+                    .unwrap()
+                    .recv(stale_data_frame(), rx_info());
+            }
             Ok(())
         }
         fn reset(&mut self) -> Result<(), zx::Status> {
@@ -891,6 +957,15 @@ mod tests {
                 "query",
                 fidl_softmac::WlanSoftmacQueryResponse {
                     sta_addr: Some([2, 0, 0, 0, 0, 1]),
+                    factory_addr: Some([2, 0, 0, 0, 0, 1]),
+                    mac_role: Some(fidl_common::WlanMacRole::Client),
+                    hardware_capability: Some(0),
+                    band_caps: Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                        band: Some(fidl_ieee80211::WlanBand::TwoGhz),
+                        basic_rates: Some(vec![0x82, 0x84]),
+                        primary_channels: Some(vec![wlan_channel()]),
+                        ..Default::default()
+                    }]),
                     ..Default::default()
                 }
             )
@@ -966,9 +1041,27 @@ mod tests {
             bytes: &[u8],
             flags: fidl_softmac::WlanTxInfoFlags,
         ) -> Result<(), zx::Status> {
-            assert_eq!(bytes, [1, 0x40, 3]);
-            self.0.lock().unwrap().tx_flags.push(flags);
-            record!(self, "tx", ())
+            let mut effects = self.0.lock().unwrap();
+            if effects.simulate_ap {
+                match bytes.first().copied() {
+                    Some(0xb0) => {
+                        let status = if effects.reject_next_auth {
+                            effects.reject_next_auth = false;
+                            1
+                        } else {
+                            0
+                        };
+                        effects.pending_rx.push_back(auth_response(status));
+                    }
+                    Some(0x00) => effects.pending_rx.push_back(association_response()),
+                    _ => return Err(zx::Status::NOT_SUPPORTED),
+                }
+            } else {
+                assert_eq!(bytes, [1, 0x40, 3]);
+            }
+            effects.tx_flags.push(flags);
+            effects.calls.push("tx");
+            Ok(())
         }
     }
 
@@ -1006,6 +1099,38 @@ mod tests {
             rssi_dbm: 0,
             snr_dbh: 0,
         }
+    }
+
+    fn auth_response(status: u16) -> Vec<u8> {
+        let client = [2, 0, 0, 0, 0, 1];
+        let ap = [2, 0, 0, 0, 0, 2];
+        let mut bytes = vec![0xb0, 0, 0, 0];
+        bytes.extend_from_slice(&client);
+        bytes.extend_from_slice(&ap);
+        bytes.extend_from_slice(&ap);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 2, 0]);
+        bytes.extend_from_slice(&status.to_le_bytes());
+        bytes
+    }
+
+    fn association_response() -> Vec<u8> {
+        let client = [2, 0, 0, 0, 0, 1];
+        let ap = [2, 0, 0, 0, 0, 2];
+        let mut bytes = vec![0x10, 0, 0, 0];
+        bytes.extend_from_slice(&client);
+        bytes.extend_from_slice(&ap);
+        bytes.extend_from_slice(&ap);
+        bytes.extend_from_slice(&[0, 0, 1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84]);
+        bytes
+    }
+
+    fn stale_data_frame() -> Vec<u8> {
+        let mut bytes = vec![0x08, 0x02, 0, 0];
+        bytes.extend_from_slice(&[2, 0, 0, 0, 0, 1]);
+        bytes.extend_from_slice(&[2, 0, 0, 0, 0, 2]);
+        bytes.extend_from_slice(&[2, 0, 0, 0, 0, 3]);
+        bytes.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00, 1]);
+        bytes
     }
 
     fn tx_result() -> fidl_softmac::WlanTxResult {
@@ -1089,15 +1214,34 @@ mod tests {
     }
 
     fn runtime(fake: Fake) -> ClientRuntime<Fake> {
+        runtime_with_device_info(fake, device_info())
+    }
+
+    fn runtime_with_device_info(
+        fake: Fake,
+        device_info: fidl_mlme::DeviceInfo,
+    ) -> ClientRuntime<Fake> {
         futures::executor::block_on(ClientRuntime::new(
             fake,
             Default::default(),
-            device_info(),
+            device_info,
             Default::default(),
             Default::default(),
             Default::default(),
         ))
         .unwrap()
+    }
+
+    fn retry_device_info() -> fidl_mlme::DeviceInfo {
+        let mut info = device_info();
+        info.bands.push(fidl_mlme::BandCapability {
+            band: fidl_ieee80211::WlanBand::TwoGhz,
+            basic_rates: vec![0x82, 0x84],
+            ht_cap: None,
+            vht_cap: None,
+            primary_channels: vec![wlan_channel()],
+        });
+        info
     }
 
     fn device_info() -> fidl_mlme::DeviceInfo {
@@ -1297,6 +1441,87 @@ mod tests {
                 .notify_scan_complete(zx::Status::OK, 1);
             assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
         }
+    }
+
+    #[test]
+    fn completed_failure_drains_stale_callbacks_and_allows_successful_retry() {
+        let (fake, effects) = Fake::new(0);
+        {
+            let mut state = effects.lock().unwrap();
+            state.simulate_ap = true;
+            state.reject_next_auth = true;
+            state.retry_cleanup = true;
+            state.stale_callback_during_cleanup = true;
+        }
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        let ethernet = runtime.take_ethernet_device().unwrap();
+
+        assert_eq!(
+            futures::executor::block_on(runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )),
+            Err(ConnectError::Failed)
+        );
+        assert!(!runtime.revoked);
+        assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+        assert!(ethernet.properties().is_some());
+        assert_eq!(
+            runtime.io.lock().unwrap().ethernet.deliver(&[0; 14]),
+            Err(EthernetIngressError::LinkDown)
+        );
+        {
+            let state = effects.lock().unwrap();
+            assert_eq!(
+                state
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "finish_failed_connect_attempt")
+                    .count(),
+                1
+            );
+            assert!(!state.calls.contains(&"reset"));
+        }
+
+        futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert!(runtime.sme().status().is_connected());
+    }
+
+    #[test]
+    fn only_idle_sme_is_retry_quiescent() {
+        assert!(sme_is_retry_quiescent(
+            &wlan_sme::client::ClientSmeStatus::Idle
+        ));
+        assert!(!sme_is_retry_quiescent(
+            &wlan_sme::client::ClientSmeStatus::Roaming([1; 6].into())
+        ));
+    }
+
+    #[test]
+    fn completed_failure_without_retry_safe_driver_cleanup_is_terminal() {
+        let (fake, effects) = Fake::new(0);
+        {
+            let mut state = effects.lock().unwrap();
+            state.simulate_ap = true;
+            state.reject_next_auth = true;
+        }
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+
+        assert_eq!(
+            futures::executor::block_on(runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )),
+            Err(ConnectError::Failed)
+        );
+        assert!(runtime.revoked);
+        let state = effects.lock().unwrap();
+        assert!(state.calls.contains(&"finish_failed_connect_attempt"));
+        assert!(state.calls.contains(&"reset"));
     }
 
     #[test]
