@@ -125,9 +125,12 @@ impl PciControl {
         Ok(Self { config })
     }
 
-    #[cfg(test)]
     pub(crate) fn from_file(config: File) -> Self {
         Self { config }
+    }
+
+    pub(crate) fn into_file(self) -> File {
+        self.config
     }
 
     pub fn verify_dma_disabled(&mut self) -> Result<PciConfigSnapshot, PciControlError> {

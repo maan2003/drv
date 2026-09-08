@@ -55,10 +55,12 @@ pub struct OpenedPciCoherent {
 
 /// Inert, pre-opened authority needed to activate one coherent VFIO PCI device.
 ///
-/// [`LinuxVfioPciCapabilities::open`] is the pre-lockdown setup phase. On
-/// success it has issued only `openat` calls, and owns the endpoint's writable
-/// PCI configuration file, VFIO cdev, and `/dev/iommu`. It performs no ioctl,
-/// mmap, device access, or PCI configuration read/write/seek.
+/// [`LinuxVfioPciCapabilities::open`] is a path-based pre-lockdown setup
+/// convenience. A supervisor can instead pass inherited descriptors to
+/// [`LinuxVfioPciCapabilities::adopt`]. Adoption performs no ioctl, mmap,
+/// device access, or PCI configuration read/write/seek. The caller is
+/// responsible for validating descriptor provenance and access mode before
+/// adoption.
 ///
 /// Pass this value to [`LinuxVfio::activate_pci_coherent`] after lockdown. That
 /// consuming activation phase performs PCI configuration read/seek and
@@ -72,6 +74,20 @@ pub struct LinuxVfioPciCapabilities {
 }
 
 impl LinuxVfioPciCapabilities {
+    /// Adopt the three PCI/VFIO descriptors without inspecting or activating
+    /// them.
+    ///
+    /// The caller or supervising process must ensure that `pci_config` is the
+    /// intended endpoint's writable PCI configuration file, `device` is its
+    /// VFIO cdev, and `iommu` is a usable read/write iommufd.
+    pub fn adopt(pci_config: File, device: File, iommu: File) -> Self {
+        Self {
+            pci: PciControl::from_file(pci_config),
+            device: Arc::new(device),
+            iommu: Arc::new(iommu),
+        }
+    }
+
     /// Open and adopt the three PCI/VFIO descriptors without activating them.
     pub fn open(
         path: impl AsRef<Path>,
@@ -85,16 +101,16 @@ impl LinuxVfioPciCapabilities {
         pci_config_path: impl AsRef<Path>,
         iommu_path: impl AsRef<Path>,
     ) -> std::result::Result<Self, LinuxVfioError> {
-        let pci = PciControl::open(pci_config_path).map_err(LinuxVfioError::PciControl)?;
-        let device = Arc::new(open_device(path)?);
-        let iommu = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(iommu_path)
-                .map_err(LinuxVfioError::OpenIommufd)?,
-        );
-        Ok(Self { pci, device, iommu })
+        let pci_config = PciControl::open(pci_config_path)
+            .map_err(LinuxVfioError::PciControl)?
+            .into_file();
+        let device = open_device(path)?;
+        let iommu = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(iommu_path)
+            .map_err(LinuxVfioError::OpenIommufd)?;
+        Ok(Self::adopt(pci_config, device, iommu))
     }
 }
 
@@ -1326,12 +1342,16 @@ mod tests {
     fn pci_capability_adoption_is_inert_and_activation_consumes_it() {
         const MSE: u16 = 1 << 1;
         let (device, device_path) = fake_device();
-        drop(device);
         let (pci, config_observer, config_path) = fake_pci_control(MSE, 0);
-        drop(pci);
         drop(config_observer);
         let iommu_path = config_path.with_extension("iommu");
-        File::create(&iommu_path).unwrap();
+        let iommu = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&iommu_path)
+            .unwrap();
 
         let (capabilities, setup_records) = with_fake_pci_io(
             FakeIrq {
@@ -1343,12 +1363,11 @@ mod tests {
                 eventfd: true,
             },
             || {
-                LinuxVfioPciCapabilities::open_with_iommu_path(
-                    &device_path,
-                    &config_path,
-                    &iommu_path,
+                LinuxVfioPciCapabilities::adopt(
+                    pci.into_file(),
+                    Arc::try_unwrap(device).unwrap(),
+                    iommu,
                 )
-                .unwrap()
             },
         );
         assert!(setup_records.is_empty());
