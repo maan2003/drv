@@ -132,6 +132,17 @@ mod tests {
             remove: bool,
             output: *mut u8,
         ) -> i32;
+        fn oracle_post_assoc_interface_sta(bss_index: u8, bssid: *const u8, output: *mut u8)
+        -> i32;
+        fn oracle_rate_tx_power(
+            band: u8,
+            target: i8,
+            channels: *const u8,
+            channel_count: u8,
+            alpha2: *const u8,
+            last_message: bool,
+            output: *mut u8,
+        ) -> i32;
     }
 
     fn c_fill(payload: &[u8], command: i32, sequence: u8) -> Vec<u8> {
@@ -249,6 +260,44 @@ mod tests {
             0
         );
         c_fill(&payload, (1 << 17) | 3, sequence)
+    }
+
+    fn c_post_assoc_interface(bss_index: u8, bssid: [u8; 6], sequence: u8) -> Vec<u8> {
+        let mut payload = [0; 60];
+        // SAFETY: both arrays remain live and have the exact sizes required by C.
+        assert_eq!(
+            unsafe {
+                oracle_post_assoc_interface_sta(bss_index, bssid.as_ptr(), payload.as_mut_ptr())
+            },
+            0
+        );
+        c_fill(&payload, (1 << 17) | 3, sequence)
+    }
+
+    fn c_rate_tx_power(
+        band: u8,
+        target: i8,
+        channels: &[u8],
+        alpha2: [u8; 2],
+        last_message: bool,
+        sequence: u8,
+    ) -> Vec<u8> {
+        let mut payload = vec![0; 44 + channels.len() * 162];
+        // SAFETY: all slices remain live; the output length follows the pinned
+        // fixed header plus one 162-byte SKU record per channel.
+        let length = unsafe {
+            oracle_rate_tx_power(
+                band,
+                target,
+                channels.as_ptr(),
+                channels.len() as u8,
+                alpha2.as_ptr(),
+                last_message,
+                payload.as_mut_ptr(),
+            )
+        };
+        assert_eq!(length as usize, payload.len());
+        c_fill(&payload, (1 << 18) | 0x5d, sequence)
     }
 
     fn command_id(command: DownloadCommand) -> i32 {
@@ -776,6 +825,70 @@ mod tests {
         }
 
         #[test]
+        fn post_assoc_interface_sta_rec_matches_c_assignments(
+            sequence in 1u8..=15,
+            bssid: [u8; 6],
+        ) {
+            prop_assume!(bssid != [0; 6]);
+            let rust = mt7921_core::encode_client_post_assoc_interface_wcid_command(
+                sequence, 0, bssid,
+            ).unwrap();
+            prop_assert_eq!(rust, c_post_assoc_interface(0, bssid, sequence));
+        }
+
+        #[test]
+        fn conservative_rate_tx_power_batches_match_c_assignments(
+            first_sequence in 1u8..=8,
+            has_5ghz: bool,
+            max_reg_power_dbm in 0u8..=20,
+            sar_limit_half_dbm: i8,
+            external_safety_cap_half_dbm: i8,
+        ) {
+            let capability = mt7921_core::NicCapability {
+                element_count: 0,
+                mac_address: None,
+                phy: Some(mt7921_core::NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 15,
+                    he: true,
+                }),
+                has_6ghz: Some(false),
+                chip_capability: None,
+                unknown_elements: 0,
+            };
+            let limits = mt7921_core::ConservativePowerLimits {
+                alpha2: *b"00",
+                max_reg_power_dbm,
+                sar_limit_half_dbm: Some(sar_limit_half_dbm),
+                external_safety_cap_half_dbm: Some(external_safety_cap_half_dbm),
+            };
+            let target = (max_reg_power_dbm as i8 * 2)
+                .min(sar_limit_half_dbm)
+                .min(external_safety_cap_half_dbm);
+            let rust = mt7921_core::encode_conservative_rate_tx_power_commands(
+                capability, limits, first_sequence,
+            ).unwrap();
+            for (index, command) in rust.iter().enumerate() {
+                let request = &command[mt7921_core::CONNAC2_MCU_TXD_BYTES..];
+                let count = usize::from(request[4]);
+                let channels = request[44..]
+                    .chunks_exact(162)
+                    .take(count)
+                    .map(|entry| entry[0])
+                    .collect::<Vec<_>>();
+                let c = c_rate_tx_power(
+                    request[5], target, &channels, *b"00", request[6] != 0,
+                    first_sequence + index as u8,
+                );
+                prop_assert_eq!(command, &c);
+            }
+        }
+
+        #[test]
         fn connac2_mcu_reply_envelopes_match_c(
             sequence in 1u8..=15,
             event_id: u8,
@@ -850,5 +963,78 @@ mod tests {
             prop_assert_eq!(rust.valid, valid);
             prop_assert_eq!(rust.data, data);
         }
+    }
+
+    #[test]
+    fn eapol_and_four_way_key_install_mcu_order_matches_linux() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let ptk = [0x11; 16];
+        let gtk = [0x22; 16];
+        let mut state = mt7921_core::ClientFirmwareEffectsState::default();
+        let peer_wcid = state.allocate_peer_wcid().unwrap();
+        state.association = Some(mt7921_core::LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid,
+            aid: 1,
+            peer,
+            rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
+            negotiated_qos: true,
+            mfp_required: false,
+        });
+        state.association_generation = Some(1);
+
+        // Linux permits control-port EAPOL at association generation before
+        // installing either key, but does not open ordinary data at this point.
+        assert!(state.tx_generation(true).is_ok());
+        assert!(state.tx_generation(false).is_err());
+        assert!(state.set_controlled_port(true).is_err());
+
+        let transcript = std::cell::RefCell::new(Vec::new());
+        state
+            .install_ptk(
+                &ptk,
+                0,
+                |cid, command| {
+                    transcript.borrow_mut().push((cid, command.to_vec()));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(state.set_controlled_port(true).is_err());
+        state
+            .install_gtk(
+                1,
+                &gtk,
+                0,
+                |cid, command| {
+                    transcript.borrow_mut().push((cid, command.to_vec()));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state.set_controlled_port(true).unwrap();
+
+        let transcript = transcript.into_inner();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].0, 3);
+        assert_eq!(transcript[1].0, 3);
+        assert_eq!(
+            transcript[0].1,
+            c_key(0, peer_wcid.get(), 0, 0, ptk, None, false, 1)
+        );
+        assert_eq!(transcript[1].1, c_key(0, 19, 0x0e, 1, gtk, None, false, 2));
+        // Normalize the source branches to command, target WCID, TLV, and key ID.
+        let events = transcript
+            .iter()
+            .map(|(cid, command)| (*cid, command[49], command[56], command[66]))
+            .collect::<Vec<_>>();
+        assert_eq!(events, [(3, peer_wcid.get(), 17, 0), (3, 19, 17, 1)]);
     }
 }

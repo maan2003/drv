@@ -16,7 +16,9 @@ headers and payload boundaries, patch reply scalars, EEPROM replies, and
 one/two-segment DMA descriptors. It also differentially covers client data and
 management TXWI/TXP encoding, Connac2 normal/authentication RX descriptors,
 passive HW scan start/cancel, station BSS/initial STA_REC, and KEY_V2 install
-and disable requests.
+and disable requests. The remaining connect checkpoint covers pre-key EAPOL
+ordering through PTK/GTK STA_REC commands, the post-association interface
+STA_REC update, and uniform conservative SET_RATE_TX_POWER batches.
 
 The MAC TX/RX consumers are too coupled to mac80211, station/vif, PHY, and skb
 state to extract usefully. Their oracle wrappers therefore use the pinned
