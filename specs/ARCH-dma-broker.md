@@ -38,6 +38,13 @@ therefore the sole DMA-domain owner. The VFIO group still provides exclusive
 device ownership, and the existing VFIO device fd remains the sole authority
 for MMIO, IRQ, reset, and DMA broker operations.
 
+The kernel patch admits a tightly gated broker-capable/default-domain third
+path in `vfio_df_group_open` and a matching exception to the non-coherent
+IOMMU-backed rejection in `__vfio_register_dev`. This exception applies only
+to devices advertising broker mode. Such a group rejects both
+`SET_CONTAINER` and `BIND_IOMMUFD`, so it cannot later acquire a compat or
+userspace IOAS while broker handles or the device fd exist.
+
 The device fd advertises one out-of-tree `VFIO_DEVICE_FEATURE_DMA_BROKER`
 feature. Its `data[]` starts with `struct vfio_device_dma_broker`, whose
 `operation` selects `ALLOC_COHERENT`, `MAP_STREAMING`, `SYNC_CPU`,
