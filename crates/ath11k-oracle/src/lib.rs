@@ -129,6 +129,36 @@ impl Default for CWlanConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct CWlanIni { valid: u8, value: u8 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CHttSrng { pdev_id: u8, ring_id: u8, ring_type: u8, entry_words: u8,
+    base: u64, head: u64, tail: u64, msi: u64, size_words: u16, batch_words: u16,
+    timer: u16, low: u16, msi_data: u32, msi_swap: u8, host_swap: u8,
+    tlv_swap: u8, low_enable: u8 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CHttRxSelect { pdev_id: u8, ring_id: u8, status_swap: u8, packet_swap: u8,
+    buffer_size: u16, tlvs: u32, management_0: u32, management_1: u32, control: u32, data: u32 }
+#[repr(C)]
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct CHttEvent { kind: u8, major: u8, minor: u8, vdev_id: u8, peer_id: u16,
+    address: [u8; 6], ast_hash: u16, hardware_peer_id: u16, v2: u8 }
+#[repr(C)]
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct CHttCompletion { status: u8, reinject_reason: u8, ack_rssi: i8,
+    peer_valid: u8, peer_id: u16 }
+#[repr(C)]
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct CQcnRx { first_msdu: u8, last_msdu: u8, l3_padding: u8, msdu_done: u8,
+    msdu_length_error: u8, fcs_error: u8, decrypt_error: u8, tkip_mic_error: u8,
+    multicast_broadcast: u8, decrypted: u8, msdu_length: u16, decap_type: u8,
+    ldpc: u8, sgi: u8, mcs: u8, bandwidth: u8, packet_type: u8,
+    spatial_stream_bitmap: u8, nss: u8, frequency: u32, tid: u8, peer: u16,
+    sequence_valid: u8, frame_valid: u8, sequence_number: u16,
+    encryption_valid: u8, encryption_type: u8, phy_ppdu_id: u16 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -226,6 +256,15 @@ impl Default for CWmiInit {
 
 unsafe extern "C" {
     fn oracle_qmi_host_cap_encode(input: *const CHostCapability, out: *mut u8, capacity: usize) -> c_int;
+    fn oracle_htt_version(out: *mut u8);
+    fn oracle_htt_srng_encode(input: *const CHttSrng, out: *mut u8);
+    fn oracle_htt_rx_select_encode(input: *const CHttRxSelect, out: *mut u8);
+    #[cfg(test)]
+    fn oracle_htt_event_decode(bytes: *const u8, len: usize, out: *mut CHttEvent) -> c_int;
+    #[cfg(test)]
+    fn oracle_htt_completion_decode(bytes: *const u8, len: usize, out: *mut CHttCompletion) -> c_int;
+    #[cfg(test)]
+    fn oracle_qcn9074_rx_decode(bytes: *const u8, len: usize, out: *mut CQcnRx) -> c_int;
     fn oracle_qmi_ind_register_encode(input: *const CIndicationRegister, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_respond_memory_encode(input: *const CRespondMemory, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_bdf_download_encode(input: *const CBdfDownload, out: *mut u8, capacity: usize) -> c_int;
@@ -446,6 +485,60 @@ pub fn c_wmi_init(input: &ath11k_wmi::cmd::Init) -> Result<WmiCapture, i32> {
     })
 }
 
+pub fn c_htt_version() -> [u8; 4] {
+    let mut bytes = [0; 4];
+    // SAFETY: the output is writable for the fixed four-byte message.
+    unsafe { oracle_htt_version(bytes.as_mut_ptr()) };
+    bytes
+}
+pub fn c_htt_srng(input: ath11k_dp::htt::SrngSetup) -> [u8; 52] {
+    let flags = input.flags;
+    let c = CHttSrng { pdev_id: input.pdev_id, ring_id: input.ring_id as u8,
+        ring_type: input.ring_type as u8, entry_words: input.ring_entry_size_words,
+        base: input.ring_base_address, head: input.head_address, tail: input.tail_address,
+        msi: input.msi_address, size_words: input.ring_size_words,
+        batch_words: input.interrupt_batch_threshold_words, timer: input.interrupt_timer_threshold,
+        low: input.interrupt_low_threshold, msi_data: input.msi_data,
+        msi_swap: u8::from(flags.msi_swap), host_swap: u8::from(flags.host_firmware_swap),
+        tlv_swap: u8::from(flags.tlv_swap), low_enable: u8::from(flags.low_threshold_interrupt) };
+    let mut bytes = [0; 52];
+    // SAFETY: input/output are valid matching fixed-size C-layout objects.
+    unsafe { oracle_htt_srng_encode(&c, bytes.as_mut_ptr()) };
+    bytes
+}
+pub fn c_htt_rx_selection(input: ath11k_dp::htt::RxRingSelection) -> [u8; 28] {
+    let f = input.filter;
+    let c = CHttRxSelect { pdev_id: input.pdev_id, ring_id: input.ring_id as u8,
+        status_swap: u8::from(input.status_swap), packet_swap: u8::from(input.packet_swap),
+        buffer_size: input.buffer_size, tlvs: f.tlvs, management_0: f.management_0,
+        management_1: f.management_1, control: f.control, data: f.data };
+    let mut bytes = [0; 28];
+    // SAFETY: input/output are valid matching fixed-size C-layout objects.
+    unsafe { oracle_htt_rx_select_encode(&c, bytes.as_mut_ptr()) };
+    bytes
+}
+#[cfg(test)]
+fn c_htt_event(bytes: &[u8]) -> Result<CHttEvent, i32> {
+    let mut out = CHttEvent::default();
+    // SAFETY: input is readable for its length and output is a valid C object.
+    let result = unsafe { oracle_htt_event_decode(bytes.as_ptr(), bytes.len(), &mut out) };
+    if result < 0 { Err(result) } else { Ok(out) }
+}
+#[cfg(test)]
+fn c_htt_completion(bytes: &[u8]) -> Result<CHttCompletion, i32> {
+    let mut out = CHttCompletion::default();
+    // SAFETY: input is readable for its length and output is a valid C object.
+    let result = unsafe { oracle_htt_completion_decode(bytes.as_ptr(), bytes.len(), &mut out) };
+    if result < 0 { Err(result) } else { Ok(out) }
+}
+#[cfg(test)]
+fn c_qcn_rx(bytes: &[u8]) -> Result<CQcnRx, i32> {
+    let mut out = CQcnRx::default();
+    // SAFETY: input is readable for its length and output is a valid C object.
+    let result = unsafe { oracle_qcn9074_rx_decode(bytes.as_ptr(), bytes.len(), &mut out) };
+    if result < 0 { Err(result) } else { Ok(out) }
+}
+
 fn option<T: Copy + Default>(value: Option<T>) -> (u8, T) {
     (u8::from(value.is_some()), value.unwrap_or_default())
 }
@@ -626,6 +719,10 @@ mod tests {
         ServiceReadyDecoder, ServiceReadyExt2Decoder, ServiceReadyExtDecoder, VdevDeleteResponse,
         VdevStartResponse, VdevStopped,
     };
+    use ath11k_dp::htt::{HttEvent, RxRingFilter, RxRingSelection, SrngFlags, SrngRingId,
+        SrngRingType, SrngSetup, TxCompletion, version_request};
+    use ath11k_dp::{HttTargetMessage, PeerId};
+    use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event { Tlv { tag: u8, len: usize, offset: usize }, Field(String, u64), Branch(String) }
@@ -1054,6 +1151,101 @@ mod tests {
 
     proptest! {
         #[test]
+        fn htt_host_messages_match_c(pdev_id: u8, ring in 0_u8..8, kind in 0_u8..3,
+            base: u64, size_words: u16, entry_words: u8, head: u64, tail: u64,
+            msi: u64, msi_data: u32, batch: u16, timer: u16, low: u16,
+            msi_swap: bool, host_swap: bool, tlv_swap: bool, low_enable: bool,
+            buffer_size: u16, tlvs: u32, management_0: u32, management_1: u32,
+            control: u32, data: u32, status_swap: bool, packet_swap: bool) {
+            let ring_id = match ring { 0 => SrngRingId::RxdmaHostBuffer,
+                1 => SrngRingId::RxdmaMonitorStatus, 2 => SrngRingId::RxdmaMonitorBuffer,
+                3 => SrngRingId::RxdmaMonitorDescriptor, 4 => SrngRingId::RxdmaMonitorDestination,
+                5 => SrngRingId::Host1ToFirmwareRxBuffer, 6 => SrngRingId::Host2ToFirmwareRxBuffer,
+                _ => SrngRingId::RxdmaNonMonitorDestination };
+            let ring_type = match kind { 0 => SrngRingType::HardwareToSoftware,
+                1 => SrngRingType::SoftwareToHardware, _ => SrngRingType::SoftwareToSoftware };
+            let setup = SrngSetup { pdev_id, ring_id, ring_type, ring_base_address: base,
+                ring_size_words: size_words, ring_entry_size_words: entry_words,
+                head_address: head, tail_address: tail, msi_address: msi, msi_data,
+                interrupt_batch_threshold_words: batch, interrupt_timer_threshold: timer,
+                interrupt_low_threshold: low, flags: SrngFlags { msi_swap,
+                    host_firmware_swap: host_swap, tlv_swap, low_threshold_interrupt: low_enable } };
+            prop_assert_eq!(setup.encode().0, c_htt_srng(setup));
+            let selection = RxRingSelection { pdev_id, ring_id, status_swap, packet_swap,
+                buffer_size, filter: RxRingFilter { tlvs, management_0, management_1, control, data } };
+            prop_assert_eq!(selection.encode().0, c_htt_rx_selection(selection));
+            prop_assert_eq!(version_request().0, c_htt_version());
+        }
+
+        #[test]
+        fn htt_target_events_match_c(major: u8, minor: u8, vdev_id: u8, peer_id: u16,
+            address: [u8; 6], ast_hash: u16, hardware_peer_id: u16, v2: bool) {
+            let version = [0, minor, major, 0];
+            let c = c_htt_event(&version).unwrap();
+            prop_assert_eq!(HttTargetMessage(version.to_vec()).decode().unwrap(), HttEvent::VersionConfirm { major: c.major, minor: c.minor });
+            let mut map = vec![0; 16];
+            let type_: u8 = if v2 { 0x1e } else { 3 };
+            map[0..4].copy_from_slice(&(u32::from(type_) | (u32::from(vdev_id) << 8) | (u32::from(peer_id) << 16)).to_le_bytes());
+            map[4..8].copy_from_slice(&u32::from_le_bytes([address[0],address[1],address[2],address[3]]).to_le_bytes());
+            map[8..12].copy_from_slice(&(u32::from_le_bytes([address[4],address[5],0,0]) | (u32::from(hardware_peer_id) << 16)).to_le_bytes());
+            map[12..16].copy_from_slice(&u32::from(ast_hash).to_le_bytes());
+            let c = c_htt_event(&map).unwrap();
+            let HttEvent::PeerMap(rust) = HttTargetMessage(map).decode().unwrap() else { unreachable!() };
+            prop_assert_eq!((rust.vdev_id, rust.peer_id.0, rust.address, rust.ast_hash,
+                rust.hardware_peer_id, rust.v2), (c.vdev_id, c.peer_id, c.address, c.ast_hash,
+                c.hardware_peer_id, c.v2 != 0));
+            let mut unmap = vec![0; 12];
+            let type_: u8 = if v2 { 0x1f } else { 4 };
+            unmap[0..4].copy_from_slice(&(u32::from(type_) | (u32::from(peer_id) << 16)).to_le_bytes());
+            let c = c_htt_event(&unmap).unwrap();
+            prop_assert_eq!(HttTargetMessage(unmap).decode().unwrap(), HttEvent::PeerUnmap { peer_id: PeerId(c.peer_id), v2: c.v2 != 0 });
+        }
+
+        #[test]
+        fn htt_tx_completion_fields_match_c(status in 0_u8..16, reason in 0_u8..16,
+            ack_rssi: i8, peer in option::of(any::<u16>())) {
+            let mut bytes = vec![0; 24];
+            bytes[8..12].copy_from_slice(&((u32::from(status) << 9) | (u32::from(reason) << 13)).to_le_bytes());
+            bytes[12..16].copy_from_slice(&(u32::from(ack_rssi as u8) << 24).to_le_bytes());
+            bytes[16..20].copy_from_slice(&(u32::from(peer.unwrap_or(0)) | if peer.is_some() { 1 << 21 } else { 0 }).to_le_bytes());
+            let c = c_htt_completion(&bytes).unwrap();
+            let rust = TxCompletion::decode_wbm_release(&bytes).unwrap();
+            prop_assert_eq!((rust.status, rust.reinject_reason, rust.ack_rssi, rust.peer.map(|p|p.0)),
+                (c.status, c.reinject_reason, c.ack_rssi, if c.peer_valid != 0 { Some(c.peer_id) } else { None }));
+        }
+
+        #[test]
+        fn qcn9074_rx_ops_selected_by_wcn6750_match_c(end4: u16, attention1: u32,
+            attention2: u32, msdu1: u32, msdu2: u32, msdu3: u32, frequency: u32,
+            mpdu9: u32, phy_ppdu_id: u16, peer: u16, mpdu11: u32) {
+            let mut bytes = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
+            bytes[46..48].copy_from_slice(&end4.to_le_bytes());
+            for (offset, value) in [(80, attention1), (84, attention2), (96, msdu1),
+                (100, msdu2), (112, msdu3), (120, frequency), (168, mpdu9), (184, mpdu11)] {
+                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[178..180].copy_from_slice(&phy_ppdu_id.to_le_bytes());
+            bytes[182..184].copy_from_slice(&peer.to_le_bytes());
+            let rust = Wcn6750RxDescriptor::parse(&bytes).unwrap().status();
+            let c = c_qcn_rx(&bytes).unwrap();
+            prop_assert_eq!((rust.first_msdu, rust.last_msdu, rust.l3_padding, rust.msdu_done,
+                rust.msdu_length_error, rust.fcs_error, rust.decrypt_error, rust.tkip_mic_error),
+                (c.first_msdu != 0, c.last_msdu != 0, c.l3_padding, c.msdu_done != 0,
+                c.msdu_length_error != 0, c.fcs_error != 0, c.decrypt_error != 0, c.tkip_mic_error != 0));
+            prop_assert_eq!((rust.multicast_broadcast, rust.decrypted, rust.msdu_length,
+                rust.decap_type, rust.ldpc, rust.short_guard_interval, rust.mcs, rust.bandwidth),
+                (c.multicast_broadcast != 0, c.decrypted != 0, c.msdu_length,
+                c.decap_type, c.ldpc != 0, c.sgi, c.mcs, c.bandwidth));
+            prop_assert_eq!((rust.packet_type, rust.spatial_stream_bitmap, rust.nss,
+                rust.frequency, rust.tid, rust.peer.0),
+                (c.packet_type, c.spatial_stream_bitmap, c.nss, c.frequency, c.tid, c.peer));
+            prop_assert_eq!((rust.sequence_control_valid, rust.frame_control_valid,
+                rust.sequence_number, rust.encryption_info_valid, rust.encryption_type,
+                rust.phy_ppdu_id), (c.sequence_valid != 0, c.frame_valid != 0,
+                c.sequence_number, c.encryption_valid != 0, c.encryption_type, c.phy_ppdu_id));
+        }
+
+        #[test]
         fn host_capability_encode_matches_c(
             num_clients in option::of(any::<u32>()), wake_msi in option::of(any::<u32>()),
             gpios in option::of(vec(any::<u32>(), 0..=32)), nm_modem in option::of(any::<u8>()),
@@ -1254,6 +1446,24 @@ mod tests {
         command.encode_command_with_trace(&mut sink).unwrap();
         assert!(sink.0.contains(&WmiTraceEvent::Reject {
             reason: ath11k_wmi::trace::RejectReason::Truncated, offset: 332 }));
+    }
+
+    #[test]
+    fn wcn6750_htt_bringup_fixtures_match_c() {
+        assert_eq!(version_request().0, c_htt_version());
+        let setup = SrngSetup { pdev_id: 0, ring_id: SrngRingId::RxdmaHostBuffer,
+            ring_type: SrngRingType::SoftwareToHardware, ring_base_address: 0x8800_0000,
+            ring_size_words: 4096, ring_entry_size_words: 8, head_address: 0x8810_0000,
+            tail_address: 0x8810_0008, msi_address: 0x8820_0000, msi_data: 4,
+            interrupt_batch_threshold_words: 32, interrupt_timer_threshold: 8,
+            interrupt_low_threshold: 4, flags: SrngFlags { low_threshold_interrupt: true,
+                ..Default::default() } };
+        assert_eq!(setup.encode().0, c_htt_srng(setup));
+        let selection = RxRingSelection { pdev_id: 0, ring_id: SrngRingId::RxdmaHostBuffer,
+            status_swap: false, packet_swap: false, buffer_size: 2048,
+            filter: RxRingFilter { tlvs: 0x1f, management_0: u32::MAX,
+                management_1: u32::MAX, control: u32::MAX, data: u32::MAX } };
+        assert_eq!(selection.encode().0, c_htt_rx_selection(selection));
     }
 
     #[test]
