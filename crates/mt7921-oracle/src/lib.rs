@@ -65,6 +65,24 @@ mod tests {
         rx_head_cleared: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CTxsResult {
+        skb_completed: u8,
+        acked: u8,
+        ampdu_len: u8,
+        ampdu_ack_len: u8,
+        skb_rate_index: i32,
+        polled: u8,
+        rate_mcs: u8,
+        rate_nss: u8,
+        rate_flags: u8,
+        rate_bw: u8,
+        rate_he_gi: u8,
+        rate_he_dcm: u8,
+        rate_legacy: u16,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -169,6 +187,14 @@ mod tests {
             alpha2: *const u8,
             last_message: bool,
             output: *mut u8,
+        ) -> i32;
+        fn oracle_mt7921_add_txs(
+            txs: *const u32,
+            pending_skb: bool,
+            band: u8,
+            prior_rate_flags: u8,
+            prior_he_gi: u8,
+            output: *mut CTxsResult,
         ) -> i32;
     }
 
@@ -343,6 +369,34 @@ mod tests {
             DownloadCommand::PatchStart { .. } => 0x05,
             DownloadCommand::TargetAddressLength { .. } => 0x01,
         }
+    }
+
+    fn c_add_txs(txs: [u32; 8], band: u8, prior_rate_flags: u8, prior_he_gi: u8) -> CTxsResult {
+        let txs = txs.map(u32::to_le);
+        let mut output = CTxsResult::default();
+        // SAFETY: both fixed-size objects remain live for the call. `band` is
+        // constrained by callers to the three Linux nl80211 band values.
+        let result = unsafe {
+            oracle_mt7921_add_txs(
+                txs.as_ptr(),
+                true,
+                band,
+                prior_rate_flags,
+                prior_he_gi,
+                &mut output,
+            )
+        };
+        assert_eq!(result, 0);
+        output
+    }
+
+    fn txs_packet(txs: [u32; 8]) -> [u8; 40] {
+        let mut packet = [0; 40];
+        packet[0..4].copy_from_slice(&40u32.to_le_bytes());
+        for (index, word) in txs.into_iter().enumerate() {
+            packet[8 + index * 4..12 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        packet
     }
 
     fn c_mcu(command: DownloadCommand, sequence: u8) -> Vec<u8> {
@@ -633,6 +687,82 @@ mod tests {
             ctrl: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
             buf1: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             info: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn valid_ppdu_txs_is_ignored_by_linux_but_reported_by_rust() {
+        let mut txs = [0u32; 8];
+        txs[0] = 1 << 23; // MT_TXS_PPDU_FMT
+        txs[2] = 19 << 16;
+        txs[3] = 3 << 24;
+        let c = c_add_txs(txs, 1, 0, 0);
+        let rust = mt7921_core::parse_mt7921_tx_status(&txs_packet(txs)).unwrap();
+        assert_eq!(c.skb_completed, 0);
+        assert_eq!((rust.wcid, rust.pid, rust.acked), (19, 3, true));
+    }
+
+    #[test]
+    fn valid_reserved_pid_txs_is_ignored_by_linux_but_reported_by_rust() {
+        let mut txs = [0u32; 8];
+        txs[2] = 19 << 16;
+        txs[3] = 2 << 24; // below MT_PACKET_ID_FIRST
+        let c = c_add_txs(txs, 1, 0, 0);
+        let rust = mt7921_core::parse_mt7921_tx_status(&txs_packet(txs)).unwrap();
+        assert_eq!(c.skb_completed, 0);
+        assert_eq!((rust.wcid, rust.pid, rust.acked), (19, 2, true));
+    }
+
+    proptest! {
+        #[test]
+        fn reportable_mpdu_txs_status_and_rate_fields_match_linux(
+            pid in 3u8..=u8::MAX,
+            wcid in 0u16..20,
+            ack_error in 0u32..8,
+            mode in prop::sample::select(vec![0u32, 1, 2, 3, 4, 8, 9, 10, 11]),
+            mcs_seed in 0u8..64,
+            nss_minus_one in 0u32..8,
+            stbc: bool,
+            bw in 0u32..4,
+            short_gi: bool,
+            he_gi in 0u8..4,
+        ) {
+            let max_mcs = match mode { 2 | 3 => 31, 4 => 9, 8..=11 => 11, _ => 63 };
+            let mcs = u32::from(mcs_seed) % (max_mcs + 1);
+            let txrate = mcs | (mode << 6) | (nss_minus_one << 10)
+                | (u32::from(stbc) << 13);
+            let mut txs = [0u32; 8];
+            txs[0] = txrate | (ack_error << 16) | (bw << 29);
+            txs[2] = u32::from(wcid) << 16;
+            txs[3] = u32::from(pid) << 24;
+
+            let prior_flags = u8::from(short_gi) << 2;
+            let c = c_add_txs(txs, 1, prior_flags, he_gi);
+            let rust = mt7921_core::parse_mt7921_tx_status(&txs_packet(txs)).unwrap();
+            prop_assert_eq!(c.skb_completed, 1);
+            prop_assert_eq!(c.acked != 0, rust.acked);
+            prop_assert_eq!((rust.wcid, rust.pid), (wcid, pid));
+            prop_assert_eq!((c.ampdu_len, c.ampdu_ack_len, c.skb_rate_index),
+                (1, u8::from(rust.acked), -1));
+            prop_assert_eq!(c.polled, 1);
+            prop_assert_eq!(u32::from(c.rate_mcs), mcs);
+            let expected_nss = if stbc && nss_minus_one + 1 > 1 {
+                (nss_minus_one + 1) >> 1
+            } else {
+                nss_minus_one + 1
+            };
+            prop_assert_eq!(u32::from(c.rate_nss), expected_nss);
+            prop_assert_eq!(u32::from(c.rate_bw), bw);
+            let expected_flags = match mode {
+                2 | 3 => 1 | prior_flags,
+                4 => 2,
+                8..=11 => 8,
+                _ => 0,
+            };
+            prop_assert_eq!(c.rate_flags, expected_flags);
+            prop_assert_eq!(c.rate_legacy, if mode <= 1 { (mcs as u16 + 1) * 10 } else { 0 });
+            prop_assert_eq!(c.rate_he_gi, if mode >= 8 { he_gi } else { 0 });
+            prop_assert_eq!(c.rate_he_dcm, 0);
         }
     }
 
