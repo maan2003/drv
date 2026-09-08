@@ -466,6 +466,7 @@ fn map_hal(error: ath11k_hal::HalError) -> DpError {
         ath11k_hal::HalError::WrongDescriptorLength => DpError::MalformedDescriptor,
         ath11k_hal::HalError::NoResources => DpError::NoResources,
         ath11k_hal::HalError::DeviceFault => DpError::DeviceFault,
+        ath11k_hal::HalError::Unsupported => DpError::UnsupportedDescriptor,
     }
 }
 

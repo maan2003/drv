@@ -6,6 +6,7 @@ use ath11k_hal::RingId;
 
 pub mod dma;
 pub mod htt;
+pub mod reo;
 pub mod rx;
 pub mod transport;
 pub mod tx;
