@@ -109,14 +109,18 @@ by HTT setup; teardown must return or release every generation-tied resource.
 The MAC/IRQ side likewise needs concrete owners for the remaining lifecycle
 markers. Core needs `Wcn6750Mac::{allocate, register, start, suspend,
 unregister, destroy}` (with `start` and `suspend` issuing the required typed
-WMI pdev commands) and `Wcn6750Interrupts::{open, enable, disable,
-wait_and_service}`. The interrupt owner must open the published WCN6750 CE/DP
-routes, use one absolute-deadline `Interrupt::wait_any`, and dispatch ready CE
-vectors to CE service and ready DP vectors to `Wcn6750DataPath::service`; it
-must not expose raw descriptors or file descriptors. These calls map directly
-to the existing `Dp*`, `Mac*`, `RadioStart`, `PdevSuspend`, and `HifIrq*`
-operations so core can replace those no-op arms without changing lifecycle
-order.
+WMI pdev commands) and one `Wcn6750Interrupts` owner that consumes into
+`Wcn6750CeWaiter` and `Wcn6750DpInterrupts`. CE opens only enabled engines
+0,1,2,3,5,7,8 and implements `CeCompletionWait`; DP opens only nonempty
+WCN6750 ring-mask groups when enabled and drops those handles when disabled.
+Both use one absolute-deadline `Interrupt::wait_any` and return typed CE-engine
+or DP-group routes for direct service dispatch, without carrying NAPI policy
+or exposing descriptors/file descriptors. DP interrupt wakeups are optional:
+the first hardware run passes no DP MSI configuration and polls ring shadows,
+so data-path correctness must not depend on an eventfd. These calls map
+directly to the existing `Dp*`, `Mac*`, `RadioStart`, `PdevSuspend`, and
+`HifIrq*` operations so core can replace those no-op arms without changing
+lifecycle order.
 
 Bodies are scaffolding, not a fabricated implementation. Porters may add
 checked source-shaped types and methods but should propose changes before
