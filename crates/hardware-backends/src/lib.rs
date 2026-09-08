@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn noncoherent_backend_rejects_unsynchronized_device_and_cpu_access() {
-        let device = DeterministicBackend::noncoherent_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let bar = device.open_region(0).unwrap();
         let mut source = device
             .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
@@ -852,7 +852,7 @@ mod tests {
         bar.write_u32(0x98, 1).unwrap();
 
         let mut destination = device
-            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .alloc_streaming::<drv_hardware::FromDevice>(16, 4)
             .unwrap();
         bar.write_u32(0x80, 0x40000).unwrap();
         bar.write_device_address(0x88, Some(0x8c), destination.device_address(0).unwrap())
@@ -862,6 +862,19 @@ mod tests {
         assert_eq!(destination.read(0, &mut byte), Err(Error::DeviceFault));
         destination.sync_for_cpu(0, 1).unwrap();
         destination.read(0, &mut byte).unwrap();
+        assert_eq!(bar.write_u32(0x98, 1 | 2), Err(Error::DeviceFault));
+        destination.prepare_for_device(0, 1).unwrap();
+        bar.write_u32(0x98, 1 | 2).unwrap();
+        let operations = operations.borrow();
+        let cpu = operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::SyncForCpu { dma: 2, range } if range == &(0..1)))
+            .unwrap();
+        let device = operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::SyncForDevice { dma: 2, range } if range == &(0..1)))
+            .unwrap();
+        assert!(cpu < device);
     }
 
     #[test]

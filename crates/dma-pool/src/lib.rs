@@ -16,7 +16,8 @@ use alloc::{
 };
 use core::{cell::RefCell, marker::PhantomData};
 use drv_hardware::{
-    Backend, CpuRead, CpuWrite, Device, DeviceAddress, Direction, Error, Result, StreamingDma,
+    Backend, CpuRead, CpuWrite, Device, DeviceAddress, Direction, Error, FromDevice, Result,
+    StreamingDma,
 };
 
 struct Inner<B: Backend, D: Direction> {
@@ -151,6 +152,15 @@ impl<B: Backend, D: CpuRead> DmaSegment<B, D> {
     }
 }
 
+impl<B: Backend> DmaSegment<B, FromDevice> {
+    /// Return this RX segment to device ownership without copying its CPU
+    /// shadow, ready for republishing on a receive ring.
+    pub fn prepare_for_device(&mut self) -> Result<()> {
+        let len = self.len();
+        self.dma_mut().prepare_for_device(0, len)
+    }
+}
+
 impl<B: Backend, D: Direction> Drop for DmaSegment<B, D> {
     fn drop(&mut self) {
         let Some(dma) = self.dma.take() else { return };
@@ -198,7 +208,7 @@ mod tests {
 
     #[test]
     fn direction_is_static_and_configuration_is_checked() {
-        let device = DeterministicBackend::device();
+        let device = DeterministicBackend::noncoherent_device();
         assert!(matches!(
             DmaPool::<_, FromDevice>::new(device.clone(), 60, 256, 16, 1),
             Err(Error::Invalid)
@@ -209,5 +219,6 @@ mod tests {
         let mut bytes = [0xff; 64];
         rx.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, [0; 64]);
+        rx.prepare_for_device().unwrap();
     }
 }
