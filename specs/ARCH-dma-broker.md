@@ -7,6 +7,11 @@ but the broker UAPI is not implemented. Stage 2 will measure
 `IOMMU_CAP_CACHE_COHERENCY` and the exact iommufd bind result for WCN6750.
 Until that evidence exists, WCN6750 is treated as non-coherent.
 
+The first WCN6750 hardware run is polling-first and adds no kernel support for
+its interrupt doorbell. After that run, the parked broker patch is to be
+narrowed as described below; the broader DMA broker UAPI remains design
+background rather than an implementation target.
+
 Stock VFIO/iommufd cannot support non-coherent userspace DMA.
 `drivers/iommu/iommufd/device.c:iommufd_device_bind` rejects devices lacking
 `IOMMU_CAP_CACHE_COHERENCY` because iommufd always requests `IOMMU_CACHE`
@@ -140,6 +145,25 @@ caller.
 The backend's MMIO reads remain acquire operations and MMIO writes remain
 release operations as specified by `Backend`. Cache synchronization and
 MMIO ordering are separate obligations.
+
+## Narrowed doorbell broker
+
+The WCN6750 steady-state kernel delta maps exactly one device-derived resource
+page: the message-SPI doorbell identified from that device's own register
+resource 0. It owns a balanced map/unmap lifecycle and returns only the DMA
+address and interrupt data needed to program a ring. It accepts no physical or
+userspace address, allocation request, arbitrary file, or cache-sync request.
+
+The device remains exclusively in its default IOMMU domain; the VFIO mode must
+continue to reject `SET_CONTAINER` and `BIND_IOMMUFD`. The broader allocation,
+streaming-map, synchronization, and general handle operations are removed from
+the patch. No kernel work begins until the polling-only run has executed on
+hardware.
+
+The portable API reserves this as a future optional, non-forgeable
+`MsiDoorbell` capability derived from the device and revoked on reset or drop.
+It must not be added to `drv-hardware` until a backend can honor it, and DP
+correctness must continue not to depend on its presence.
 
 ## Alternatives
 
