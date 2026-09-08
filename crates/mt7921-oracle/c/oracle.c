@@ -4,6 +4,118 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+/* Checkpoint-six request layouts.  build.rs pins each assignment below to the
+ * corresponding v7.1.5 body before this translation unit is compiled. */
+struct oracle_ba_result {
+    uint8_t wtbl[48];
+    uint8_t sta_rec[20];
+    uint8_t amsdu_disabled;
+};
+
+int oracle_block_ack(uint8_t bss_idx, uint8_t wcid, uint8_t muar_idx,
+                     const uint8_t peer[6], uint8_t tid, uint16_t ssn,
+                     uint16_t winsize, bool amsdu, bool enable, bool tx,
+                     struct oracle_ba_result *out)
+{
+    uint8_t *w, *s;
+
+    if (!peer || !out || tid > 7 || !winsize)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    w = out->wtbl;
+    w[0] = bss_idx; w[1] = wcid; w[2] = 1; w[4] = 1; w[5] = muar_idx;
+    w[8] = 13; w[10] = 40;                 /* STA_REC_WTBL */
+    w[12] = wcid; w[13] = 2; w[14] = 1;    /* WTBL_SET, one TLV */
+    w[20] = 8; w[22] = 28; w[24] = tid;    /* WTBL_BA */
+    if (tx) {
+        w[25] = 1;                          /* originator */
+        if (enable) {
+            memcpy(w + 28, &ssn, sizeof(ssn));
+            w[30] = 1;
+            memcpy(w + 32, &winsize, sizeof(winsize));
+        }
+    } else {
+        w[25] = 2;                          /* recipient */
+        if (enable)
+            memcpy(w + 32, &winsize, sizeof(winsize));
+        memcpy(w + 34, peer, 6);
+        w[40] = tid; w[41] = 0; w[42] = 1;
+    }
+
+    s = out->sta_rec;
+    s[0] = bss_idx; s[1] = wcid; s[2] = 1; s[4] = 1; s[5] = muar_idx;
+    s[8] = 6; s[10] = 12; s[12] = tid; s[13] = tx ? 1 : 2;
+    s[14] = amsdu; s[15] = enable ? (uint8_t)(1U << tid) : 0;
+    memcpy(s + 16, &ssn, sizeof(ssn));
+    memcpy(s + 18, &winsize, sizeof(winsize));
+    out->amsdu_disabled = tx && enable && !amsdu;
+    return 0;
+}
+
+/* kind: 0 BSS PS, 1 beacon timing, 2 RX filter set, 3 RX filter clear,
+ * 4 BSS abort, 5 deep sleep, 6 sniffer enable. Returns the MCU command. */
+int oracle_checkpoint6_power(uint8_t kind, uint8_t bss_idx, uint16_t value,
+                             uint8_t extra, bool enable, uint8_t *output,
+                             size_t *length, bool *wait)
+{
+    static const char full_power[] = "KeepFullPwr 1";
+    static const char deep_sleep[] = "KeepFullPwr 0";
+
+    if (!output || !length || !wait)
+        return -1;
+    memset(output, 0, 328);
+    *wait = true;
+    switch (kind) {
+    case 0: /* mt7921_mcu_uni_bss_ps */
+        output[0] = bss_idx; output[4] = 21; output[6] = 8;
+        output[8] = enable ? 2 : 0; *length = 12;
+        return (1 << 17) | 2;
+    case 1: /* mt7921_mcu_uni_bss_bcnft */
+        output[0] = bss_idx; output[4] = 22; output[6] = 8;
+        memcpy(output + 8, &value, sizeof(value)); output[10] = extra;
+        *length = 12; return (1 << 17) | 2;
+    case 2:
+    case 3: /* mt7921_mcu_set_rxfilter */
+        output[4] = 2; output[13] = 1U << 3; output[16] = kind == 2 ? 1 : 2;
+        *length = 68; *wait = false; return (1 << 18) | 0x0a;
+    case 4: /* mt7921_mcu_set_bss_pm(..., false) */
+        output[0] = bss_idx; *length = 4; *wait = false;
+        return (1 << 18) | 0x17;
+    case 5: /* mt76_connac_mcu_set_deep_sleep */
+        memcpy(output + 8, enable ? deep_sleep : full_power,
+               sizeof(full_power));
+        *length = 328; *wait = false; return (1 << 18) | 0xca;
+    case 6: /* mt7921_mcu_set_sniffer */
+        output[0] = bss_idx; output[6] = 8; output[8] = enable;
+        *length = 12; return (1 << 17) | 0x24;
+    default:
+        return -1;
+    }
+}
+
+struct oracle_monitor_event { uint8_t kind, value; };
+
+int oracle_monitor_toggle(bool monitor, bool pm_user, bool ds_user,
+                          struct oracle_monitor_event events[6], size_t *count)
+{
+    bool pm = pm_user && !monitor;
+    bool ds = ds_user && !monitor;
+
+    if (!events || !count)
+        return -1;
+    events[0] = (struct oracle_monitor_event){ 1, monitor }; /* sniffer */
+    events[1] = (struct oracle_monitor_event){ 2, pm };      /* runtime PM */
+    events[2] = (struct oracle_monitor_event){ 3, ds };      /* deep sleep state */
+    events[3] = (struct oracle_monitor_event){ 4, ds };      /* deep sleep MCU */
+    *count = 4;
+    if (monitor) {
+        events[4] = (struct oracle_monitor_event){ 5, 0 };   /* BSS abort */
+        events[5] = (struct oracle_monitor_event){ 6, 0 };   /* filter clear */
+        *count = 6;
+    }
+    return 0;
+}
+
 /* Normalized register/branch operations from pinned mt7921e_mac_reset and
  * mt792x_wpdma_reset -> mt792x_dma_{disable,enable}.  build.rs independently
  * requires these operations in this order in the immutable v7.1.5 source.

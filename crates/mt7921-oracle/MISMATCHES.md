@@ -137,3 +137,47 @@ before firmware reload is not source-equivalent and can surrender the device
 at the point reset recovery still requires driver ownership. The round-trip
 helper remains correct for its documented reversible-probe purpose; a reset
 owner must not substitute it for a dedicated recovery transaction.
+
+## Block-ack session programming is absent from the Rust core
+
+For each TX or RX BA enable/disable, pinned Linux sends two acknowledged UNI
+`STA_REC_UPDATE` commands. The first carries `STA_REC_WTBL` with a nested
+`WTBL_BA`; the second carries `STA_REC_BA`. Together they publish TID, role,
+SSN, receive window, AMSDU policy, peer identity/reset selection, and the
+per-TID enable bitmap. TX enable with AMSDU disabled also clears the WCID's
+AMSDU capability. The oracle executes those assignments for valid AMPDU
+parameters and retains both exact command bodies.
+
+The public Rust core has no BA session command or AMPDU-action state model, so
+there is no Rust event or byte stream to compare with either Linux command.
+
+**Likely Rust port bug:** aggregation negotiation cannot install or remove the
+firmware/WTBL BA state required by Linux, and TX AMSDU policy cannot follow the
+negotiated AMPDU parameters.
+
+## Deep-sleep and monitor/sniffer transitions are absent from the Rust core
+
+Pinned Linux programs Connac2 deep sleep with the unacknowledged CE
+`CHIP_CONFIG` strings `KeepFullPwr 0` and `KeepFullPwr 1`. On a monitor toggle
+it then orders sniffer enable, runtime-PM suppression, deep-sleep suppression
+and its MCU command; monitor enable additionally tears down the beacon filter.
+The oracle executes the exact deep-sleep/sniffer request assignments and
+normalizes that ordered state transition.
+
+The public Rust core exposes neither command and has no monitor transition
+that couples them to runtime power management and beacon filtering.
+
+**Likely Rust port bug:** entering monitor mode cannot request firmware
+sniffer delivery or prevent runtime/deep sleep from suppressing captures.
+
+## Beacon-filter disable lacks Linux's BSS-abort command
+
+Beacon-filter enable is byte-equivalent: Rust exposes the same acknowledged
+`UNI_BSS_INFO_BCNFT` command followed by the same unacknowledged CE RX-filter
+bitmap set. Its RX-filter clear command also matches Linux. But Linux disable
+first sends an unacknowledged four-byte CE `SET_BSS_ABORT` request and only
+then clears the beacon-drop bit. No public Rust encoder or higher-level core
+operation emits that first command.
+
+**Likely Rust port bug:** disabling beacon filtering can leave firmware BSS
+power-management state active even after the receive filter is cleared.

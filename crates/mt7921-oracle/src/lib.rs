@@ -130,6 +130,31 @@ mod tests {
         value: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct CBaResult {
+        wtbl: [u8; 48],
+        sta_rec: [u8; 20],
+        amsdu_disabled: u8,
+    }
+
+    impl Default for CBaResult {
+        fn default() -> Self {
+            Self {
+                wtbl: [0; 48],
+                sta_rec: [0; 20],
+                amsdu_disabled: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CMonitorEvent {
+        kind: u8,
+        value: u8,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -311,6 +336,36 @@ mod tests {
             output: *mut u8,
             output_capacity: usize,
         ) -> i32;
+        fn oracle_block_ack(
+            bss_index: u8,
+            wcid: u8,
+            muar_index: u8,
+            peer: *const u8,
+            tid: u8,
+            ssn: u16,
+            winsize: u16,
+            amsdu: bool,
+            enable: bool,
+            tx: bool,
+            output: *mut CBaResult,
+        ) -> i32;
+        fn oracle_checkpoint6_power(
+            kind: u8,
+            bss_index: u8,
+            value: u16,
+            extra: u8,
+            enable: bool,
+            output: *mut u8,
+            length: *mut usize,
+            wait: *mut bool,
+        ) -> i32;
+        fn oracle_monitor_toggle(
+            monitor: bool,
+            pm_user: bool,
+            ds_user: bool,
+            events: *mut CMonitorEvent,
+            count: *mut usize,
+        ) -> i32;
     }
 
     fn c_fill(payload: &[u8], command: i32, sequence: u8) -> Vec<u8> {
@@ -331,6 +386,35 @@ mod tests {
         assert!(length >= 0);
         output.truncate(length as usize);
         output
+    }
+
+    fn c_checkpoint6_power(
+        kind: u8,
+        bss_index: u8,
+        value: u16,
+        extra: u8,
+        enable: bool,
+        sequence: u8,
+    ) -> (Vec<u8>, bool) {
+        let mut payload = [0; 328];
+        let mut length = 0;
+        let mut wait = false;
+        // SAFETY: the output allocation is the maximum request size and all
+        // scalar/result pointers remain live for the call.
+        let command = unsafe {
+            oracle_checkpoint6_power(
+                kind,
+                bss_index,
+                value,
+                extra,
+                enable,
+                payload.as_mut_ptr(),
+                &mut length,
+                &mut wait,
+            )
+        };
+        assert!(command >= 0);
+        (c_fill(&payload[..length], command, sequence), wait)
     }
 
     fn c_passive_scan(scan_sequence: u8, band: u8, channel: u8, sequence: u8) -> Vec<u8> {
@@ -2023,6 +2107,160 @@ mod tests {
             prop_assert_eq!(rust.valid, valid);
             prop_assert_eq!(rust.data, data);
         }
+    }
+
+    proptest! {
+        #[test]
+        fn block_ack_sta_rec_and_ampdu_assignments_match_pinned_linux(
+            wcid in 1u8..=19,
+            peer: [u8; 6],
+            tid in 0u8..=7,
+            ssn: u16,
+            winsize in 1u16..=1024,
+            amsdu: bool,
+            enable: bool,
+            tx: bool,
+            sequence in 1u8..=15,
+        ) {
+            let mut result = CBaResult::default();
+            // SAFETY: the fixed peer/result objects remain live for the call.
+            prop_assert_eq!(unsafe {
+                oracle_block_ack(
+                    0, wcid, 0, peer.as_ptr(), tid, ssn, winsize, amsdu,
+                    enable, tx, &mut result,
+                )
+            }, 0);
+
+            let wtbl = c_fill(&result.wtbl, (1 << 17) | 3, sequence);
+            let sta_rec = c_fill(&result.sta_rec, (1 << 17) | 3, sequence);
+            prop_assert_eq!(&wtbl[48..56], &[0, wcid, 1, 0, 1, 0, 0, 0]);
+            prop_assert_eq!(&wtbl[56..60], &[13, 0, 40, 0]);
+            prop_assert_eq!(&wtbl[68..72], &[8, 0, 28, 0]);
+            prop_assert_eq!(wtbl[72], tid);
+            prop_assert_eq!(wtbl[73], if tx { 1 } else { 2 });
+            prop_assert_eq!(
+                u16::from_le_bytes([wtbl[76], wtbl[77]]),
+                if tx && enable { ssn } else { 0 },
+            );
+            prop_assert_eq!(wtbl[78], u8::from(tx && enable));
+            prop_assert_eq!(
+                u16::from_le_bytes([wtbl[80], wtbl[81]]),
+                if enable { winsize } else { 0 },
+            );
+            if !tx {
+                prop_assert_eq!(&wtbl[82..88], &peer);
+                prop_assert_eq!(&wtbl[88..91], &[tid, 0, 1]);
+            }
+            prop_assert_eq!(&sta_rec[48..56], &[0, wcid, 1, 0, 1, 0, 0, 0]);
+            prop_assert_eq!(&sta_rec[56..60], &[6, 0, 12, 0]);
+            prop_assert_eq!(sta_rec[60], tid);
+            prop_assert_eq!(sta_rec[61], if tx { 1 } else { 2 });
+            prop_assert_eq!(sta_rec[62], u8::from(amsdu));
+            prop_assert_eq!(sta_rec[63], if enable { 1 << tid } else { 0 });
+            prop_assert_eq!(u16::from_le_bytes([sta_rec[64], sta_rec[65]]), ssn);
+            prop_assert_eq!(u16::from_le_bytes([sta_rec[66], sta_rec[67]]), winsize);
+            prop_assert_eq!(result.amsdu_disabled != 0, tx && enable && !amsdu);
+        }
+
+        #[test]
+        fn post_assoc_power_and_beacon_filter_commands_match_pinned_linux(
+            sequence in 1u8..=12,
+            power_save: bool,
+            beacon_interval in 1u16..=u16::MAX,
+            dtim_period in 1u8..=u8::MAX,
+        ) {
+            let (power, power_wait) = c_checkpoint6_power(
+                0, 0, 0, 0, power_save, sequence,
+            );
+            let rust_power = mt7921_core::encode_client_post_assoc_power_state_command(
+                sequence, 0, if power_save { 2 } else { 0 },
+            ).unwrap();
+            prop_assert_eq!(rust_power, power);
+            prop_assert!(power_wait);
+
+            let (timing, timing_wait) = c_checkpoint6_power(
+                1, 0, beacon_interval, dtim_period, true, sequence + 1,
+            );
+            let rust_timing = mt7921_core::encode_client_post_assoc_beacon_timing_command(
+                sequence + 1, 0, beacon_interval, dtim_period,
+            ).unwrap();
+            prop_assert_eq!(rust_timing, timing);
+            prop_assert!(timing_wait);
+
+            let (set, set_wait) = c_checkpoint6_power(2, 0, 0, 0, true, sequence + 2);
+            prop_assert_eq!(
+                mt7921_core::encode_client_post_assoc_rx_filter_command(sequence + 2).unwrap(),
+                set,
+            );
+            prop_assert!(!set_wait);
+            let (clear, clear_wait) = c_checkpoint6_power(3, 0, 0, 0, false, sequence + 3);
+            prop_assert_eq!(
+                mt7921_core::encode_client_post_assoc_rx_filter_clear_command(sequence + 3).unwrap(),
+                clear,
+            );
+            prop_assert!(!clear_wait);
+        }
+
+        #[test]
+        fn deep_sleep_sniffer_and_monitor_toggle_events_match_pinned_linux(
+            monitor: bool,
+            pm_user: bool,
+            ds_user: bool,
+            band_idx in 0u8..=1,
+            sequence in 1u8..=15,
+        ) {
+            let (deep_sleep, wait) = c_checkpoint6_power(
+                5, 0, 0, 0, ds_user, sequence,
+            );
+            prop_assert!(!wait);
+            prop_assert_eq!(&deep_sleep[72..85], if ds_user {
+                b"KeepFullPwr 0"
+            } else {
+                b"KeepFullPwr 1"
+            });
+            let (sniffer, wait) = c_checkpoint6_power(
+                6, band_idx, 0, 0, monitor, sequence,
+            );
+            prop_assert!(wait);
+            prop_assert_eq!(&sniffer[48..60], &[
+                band_idx, 0, 0, 0, 0, 0, 8, 0, u8::from(monitor), 0, 0, 0,
+            ]);
+
+            let mut events = [CMonitorEvent::default(); 6];
+            let mut count = 0;
+            // SAFETY: the event array and count remain live for the call.
+            prop_assert_eq!(unsafe {
+                oracle_monitor_toggle(monitor, pm_user, ds_user, events.as_mut_ptr(), &mut count)
+            }, 0);
+            let pm = pm_user && !monitor;
+            let ds = ds_user && !monitor;
+            let mut expected = vec![
+                CMonitorEvent { kind: 1, value: u8::from(monitor) },
+                CMonitorEvent { kind: 2, value: u8::from(pm) },
+                CMonitorEvent { kind: 3, value: u8::from(ds) },
+                CMonitorEvent { kind: 4, value: u8::from(ds) },
+            ];
+            if monitor {
+                expected.extend([
+                    CMonitorEvent { kind: 5, value: 0 },
+                    CMonitorEvent { kind: 6, value: 0 },
+                ]);
+            }
+            prop_assert_eq!(&events[..count], expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn beacon_filter_disable_starts_with_unmodeled_bss_abort() {
+        let (abort, wait) = c_checkpoint6_power(4, 0, 0, 0, false, 1);
+        assert!(!wait);
+        assert_eq!(abort.len(), 68);
+        assert_eq!(&abort[64..], &[0, 0, 0, 0]);
+        let (clear, _) = c_checkpoint6_power(3, 0, 0, 0, false, 2);
+        assert_eq!(
+            clear,
+            mt7921_core::encode_client_post_assoc_rx_filter_clear_command(2).unwrap()
+        );
     }
 
     #[test]
