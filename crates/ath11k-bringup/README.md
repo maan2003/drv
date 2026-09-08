@@ -36,19 +36,25 @@ bind is the stock-kernel cache-coherency admission check. Redwood's
 vfio-platform device has no reset handler, so that target additionally requires
 `--containment remoteproc:<sysfs-name>`; the stage verifies the named
 remoteproc is `running`, records its name/state/firmware, and records that
-VFIO reset is unavailable. This polling-only run stops on failure and relies on
-WPSS remoteproc restart plus the watchdog reboot, not a fabricated device
-reset. The runner does not stop or start remoteproc.
+VFIO reset is unavailable. Before DMA, the supervisor/operator must externally
+restart WPSS remoteproc; the runner only reads its resulting state and firmware
+identity and never stops or starts remoteproc. This polling-only run stops on
+failure, with the armed watchdog rebooting the phone if the run or external
+restart fails, rather than fabricating a device reset.
 
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
+  --containment remoteproc:remoteprocN \
   --stop-after resources
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
+  --containment remoteproc:remoteprocN \
   --stop-after qmi --wmi-log ath11k-wmi-run.jsonl
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
+  --containment remoteproc:remoteprocN \
   --stop-after scan-results --ssid example \
   --wmi-log ath11k-wmi-scan-results.jsonl
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
+  --containment remoteproc:remoteprocN \
   --stop-after dp-poll --wmi-log ath11k-wmi-dp-poll.jsonl
 ```
 

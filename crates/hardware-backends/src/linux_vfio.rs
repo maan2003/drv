@@ -123,7 +123,32 @@ impl LinuxVfio {
     pub fn validate_wcn6750_resources(
         &self,
     ) -> std::result::Result<userspace_vfio::PlatformDeviceInfo, LinuxVfioError> {
-        userspace_vfio::validate_wcn6750_platform_cdev(&self.device).map_err(LinuxVfioError::Setup)
+        let device = userspace_vfio::validate_wcn6750_platform_cdev(&self.device)
+            .map_err(LinuxVfioError::Setup)?;
+        self.probe_region_mapping(0)?;
+        Ok(device)
+    }
+
+    /// Prove that a VFIO region can be mapped and preserve all kernel-returned
+    /// facts in the diagnostic if the query, permission gate, or mmap fails.
+    pub fn probe_region_mapping(&self, index: u32) -> std::result::Result<(), LinuxVfioError> {
+        let info = userspace_vfio::region_info(&self.device, index).map_err(|error| {
+            LinuxVfioError::Setup(format!(
+                "VFIO region {index} GET_REGION_INFO failed: {error}"
+            ))
+        })?;
+        let facts = format!(
+            "VFIO region {index} flags={:#x} size={:#x} offset={:#x}",
+            info.flags, info.size, info.offset
+        );
+        let len = usize::try_from(info.size)
+            .map_err(|_| LinuxVfioError::Setup(format!("{facts}: size exceeds usize")))?;
+        if len == 0 {
+            return Err(LinuxVfioError::Setup(format!("{facts}: region is empty")));
+        }
+        RegionMapping::map(&self.device, &info, 0, len, true)
+            .map_err(|error| LinuxVfioError::Setup(format!("{facts}: {error}")))?;
+        Ok(())
     }
 
     pub fn open_pci_coherent(
@@ -902,6 +927,7 @@ mod tests {
         ];
         expected.extend((0..32).map(Record::QueryIrq));
         expected.extend([
+            Record::QueryRegion(0),
             Record::Map {
                 iova: FIRST_IOVA,
                 length: PAGE as u64,
