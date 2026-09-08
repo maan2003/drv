@@ -1,6 +1,6 @@
 use ath11k_wmi::cmd::golden::{
     TranscriptKind, Verification, compare_reencoded, parse_jsonl, reverse_map_command_envelope,
-    verify_transcript,
+    reverse_map_semantic_command, verify_transcript,
 };
 use ath11k_wmi::cmd::{EncodeCommand, VdevDelete};
 use ath11k_wmi::{CommandId, WmiError};
@@ -30,6 +30,50 @@ fn ingests_ordered_jsonl_and_reports_each_message() {
         }
     );
     assert!(matches!(reports[1], Verification::EventDecoded { .. }));
+}
+
+#[test]
+fn concrete_init_and_vdev_encoders_match_native_commands() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl"
+    );
+    let Ok(input) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let records = parse_jsonl(&input).expect("native WMI JSONL schema");
+    let mut families = BTreeMap::<&'static str, usize>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.kind == TranscriptKind::Command)
+    {
+        let (_, tlvs) = record.envelope_parts().expect("validated envelope");
+        let Some(request) = reverse_map_semantic_command(CommandId(record.id), tlvs)
+            .unwrap_or_else(|error| panic!("seq {} id {:#x}: {error:?}", record.seq, record.id))
+        else {
+            continue;
+        };
+        let command = request.encode_command().expect("encode concrete request");
+        let mut actual = (command.id.0 & 0x00ff_ffff).to_le_bytes().to_vec();
+        actual.extend_from_slice(command.tlvs());
+        assert_eq!(
+            record.bytes, actual,
+            "{} seq {}",
+            request.family, record.seq
+        );
+        *families.entry(request.family).or_default() += 1;
+    }
+    assert_eq!(
+        families,
+        BTreeMap::from([
+            ("init", 1),
+            ("vdev-create", 4),
+            ("vdev-delete", 3),
+            ("vdev-start", 6),
+            ("vdev-stop", 1),
+            ("vdev-up", 3),
+        ])
+    );
 }
 
 #[test]

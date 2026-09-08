@@ -229,6 +229,210 @@ pub fn compare_reencoded(
     first_difference(&expected, &actual)
 }
 
+/// A native command decoded into the existing high-level request type for its
+/// family. Unlike [`GoldenCommandEnvelope`], encoding this value exercises the
+/// production family encoder and all of its field-to-wire transformations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoldenSemanticRequest {
+    pub family: &'static str,
+    request: SemanticRequest,
+    pub masked_fields: &'static [&'static str],
+    pub masked_ranges: Vec<Range<usize>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SemanticRequest {
+    Init(super::Init),
+    VdevCreate(super::VdevCreate),
+    VdevDelete(super::VdevDelete),
+    VdevStart(super::VdevStart),
+    VdevStop(super::VdevStop),
+    VdevUp(super::VdevUp),
+}
+
+impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
+    fn encode_command(&self) -> Result<Command, WmiError> {
+        match &self.request {
+            SemanticRequest::Init(request) => request.encode_command(),
+            SemanticRequest::VdevCreate(request) => request.encode_command(),
+            SemanticRequest::VdevDelete(request) => request.encode_command(),
+            SemanticRequest::VdevStart(request) => request.encode_command(),
+            SemanticRequest::VdevStop(request) => request.encode_command(),
+            SemanticRequest::VdevUp(request) => request.encode_command(),
+        }
+    }
+}
+
+fn words<const N: usize>(bytes: &[u8]) -> Result<[u32; N], WmiError> {
+    if bytes.len() != N * 4 {
+        return Err(WmiError::Malformed);
+    }
+    let mut out = [0; N];
+    for (word, bytes) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_le_bytes(bytes.try_into().map_err(|_| WmiError::Malformed)?);
+    }
+    Ok(out)
+}
+
+fn mac(bytes: &[u8]) -> Result<[u8; 6], WmiError> {
+    bytes.try_into().map_err(|_| WmiError::Malformed)
+}
+
+fn semantic_tlvs(id: CommandId, bytes: &[u8]) -> Result<Vec<GoldenTlv>, WmiError> {
+    reverse_map_command_envelope(id, bytes)?
+        .map(|request| request.tlvs)
+        .ok_or(WmiError::Malformed)
+}
+
+/// Decodes the native families currently covered by concrete reverse mapping.
+/// `Ok(None)` means that the known family has not yet acquired a semantic
+/// mapper; malformed bytes in a covered family are always an error.
+pub fn reverse_map_semantic_command(
+    id: CommandId,
+    bytes: &[u8],
+) -> Result<Option<GoldenSemanticRequest>, WmiError> {
+    let request = match id.0 {
+        0x000001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 3
+                || tlvs[0].tag != crate::tags::WMI_TAG_INIT_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_RESOURCE_CONFIG.0
+                || tlvs[2].tag != crate::tags::WMI_TAG_ARRAY_STRUCT.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let init = words::<7>(&tlvs[0].value)?;
+            if init[..6] != [0; 6] || init[6] != 0 || !tlvs[2].value.is_empty() {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::Init(super::Init {
+                resource_config: super::ResourceConfig::from_words(words::<72>(&tlvs[1].value)?),
+                memory_chunks: Vec::new(),
+                hardware_mode: None,
+                bands: Vec::new(),
+            })
+        }
+        0x005001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 2
+                || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_CREATE_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_STRUCT.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<9>(&tlvs[0].value)?;
+            let streams = &tlvs[1].value;
+            if fixed[5] != 2 || streams.len() != 32 {
+                return Err(WmiError::Malformed);
+            }
+            let band_2ghz = words::<3>(&streams[4..16])?;
+            let band_5ghz = words::<3>(&streams[20..32])?;
+            if band_2ghz[0] != 0 || band_5ghz[0] != 1 {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::VdevCreate(super::VdevCreate {
+                vdev_id: fixed[0],
+                vdev_type: fixed[1],
+                vdev_subtype: fixed[2],
+                mac_addr: mac(&tlvs[0].value[12..18])?,
+                pdev_id: fixed[6],
+                mbssid_flags: fixed[7],
+                mbssid_tx_vdev_id: fixed[8],
+                band_2ghz: super::TxRxStreams {
+                    tx: band_2ghz[1],
+                    rx: band_2ghz[2],
+                },
+                band_5ghz: super::TxRxStreams {
+                    tx: band_5ghz[1],
+                    rx: band_5ghz[2],
+                },
+            })
+        }
+        0x005002 | 0x005006 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<1>(&tlvs[0].value)?;
+            if id.0 == 0x005002 {
+                SemanticRequest::VdevDelete(super::VdevDelete { vdev_id: fixed[0] })
+            } else {
+                SemanticRequest::VdevStop(super::VdevStop { vdev_id: fixed[0] })
+            }
+        }
+        0x005003 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 3
+                || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_START_REQUEST_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_CHANNEL.0
+                || tlvs[2].tag != crate::tags::WMI_TAG_ARRAY_STRUCT.0
+                || !tlvs[2].value.is_empty()
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<26>(&tlvs[0].value)?;
+            let channel = words::<6>(&tlvs[1].value)?;
+            let ssid_len = usize::try_from(fixed[5]).map_err(|_| WmiError::Malformed)?;
+            if fixed[1] != 0 || ssid_len > 32 || fixed[15] != 0 || fixed[17] != 0 || fixed[23] != 0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let flags = fixed[4];
+            SemanticRequest::VdevStart(super::VdevStart {
+                restart: false,
+                vdev_id: fixed[0],
+                beacon_interval: fixed[2],
+                dtim_period: fixed[3],
+                hidden_ssid: flags & 1 != 0,
+                pmf_enabled: flags & 2 != 0,
+                hw_crypto_disabled: flags & (1 << 4) != 0,
+                ssid: (ssid_len != 0).then(|| tlvs[0].value[24..24 + ssid_len].to_vec()),
+                bcn_tx_rate: fixed[14],
+                num_noa_descriptors: fixed[16],
+                preferred_tx_streams: fixed[18],
+                preferred_rx_streams: fixed[19],
+                he_ops: fixed[20],
+                cac_duration_ms: fixed[21],
+                regdomain: fixed[22],
+                mbssid_flags: fixed[24],
+                mbssid_tx_vdev_id: fixed[25],
+                channel: super::Channel {
+                    mhz: channel[0],
+                    band_center_freq1: channel[1],
+                    band_center_freq2: channel[2],
+                    info: channel[3],
+                    reg_info_1: channel[4],
+                    reg_info_2: channel[5],
+                },
+            })
+        }
+        0x005005 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_UP_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<8>(&tlvs[0].value)?;
+            let tx = mac(&tlvs[0].value[16..22])?;
+            SemanticRequest::VdevUp(super::VdevUp {
+                vdev_id: fixed[0],
+                assoc_id: fixed[1],
+                bssid: mac(&tlvs[0].value[8..14])?,
+                tx_bssid: (tx != [0; 6]).then_some(tx),
+                nontx_profile_idx: fixed[6],
+                nontx_profile_cnt: fixed[7],
+            })
+        }
+        _ => return Ok(None),
+    };
+    let (family, masked_fields) = command_family(id.0).ok_or(WmiError::Malformed)?;
+    Ok(Some(GoldenSemanticRequest {
+        family,
+        request,
+        masked_fields,
+        masked_ranges: Vec::new(),
+    }))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verification {
     CommandExact {
