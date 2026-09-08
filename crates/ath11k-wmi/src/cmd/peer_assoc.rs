@@ -1,10 +1,13 @@
 //! Peer association command encoding.
 
-use super::{EncodeCommand, TlvWriter};
+#[cfg(feature = "proptest")]
+use super::CommandStrategy;
+use super::{EncodeCommand, TlvWriter, trace_branch, trace_field};
 use crate::tags::{
     WMI_PEER_ASSOC_CMDID, WMI_TAG_ARRAY_STRUCT, WMI_TAG_HE_RATE_SET,
     WMI_TAG_PEER_ASSOC_COMPLETE_CMD, WMI_TAG_VHT_RATE_SET,
 };
+use crate::trace::TraceSink;
 use crate::{Command, WmiError};
 use alloc::vec::Vec;
 
@@ -163,6 +166,141 @@ pub fn copy_peer_flags(param: &PeerAssocParams, hw_crypto_disabled: bool) -> u32
 }
 
 impl EncodeCommand for PeerAssoc {
+    fn trace_fields(&self, sink: &mut dyn TraceSink) {
+        let p = &self.params;
+        trace_field(sink, "PeerAssoc.params.vdev_id", p.vdev_id);
+        trace_field(sink, "PeerAssoc.params.peer_new_assoc", p.peer_new_assoc);
+        trace_field(sink, "PeerAssoc.params.peer_associd", p.peer_associd);
+        for value in p.peer_mac {
+            trace_field(sink, "PeerAssoc.params.peer_mac[]", value);
+        }
+        trace_field(sink, "PeerAssoc.params.peer_rate_caps", p.peer_rate_caps);
+        trace_field(sink, "PeerAssoc.params.peer_caps", p.peer_caps);
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_listen_intval",
+            p.peer_listen_intval,
+        );
+        trace_field(sink, "PeerAssoc.params.peer_ht_caps", p.peer_ht_caps);
+        trace_field(sink, "PeerAssoc.params.peer_max_mpdu", p.peer_max_mpdu);
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_mpdu_density",
+            p.peer_mpdu_density,
+        );
+        trace_field(sink, "PeerAssoc.params.peer_vht_caps", p.peer_vht_caps);
+        trace_field(sink, "PeerAssoc.params.peer_phymode", p.peer_phymode);
+        trace_field(sink, "PeerAssoc.params.peer_nss", p.peer_nss);
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_bw_rxnss_override",
+            p.peer_bw_rxnss_override,
+        );
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_legacy_rates.len",
+            p.peer_legacy_rates.len() as u64,
+        );
+        for &value in &p.peer_legacy_rates {
+            trace_field(sink, "PeerAssoc.params.peer_legacy_rates[]", value);
+        }
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_ht_rates.len",
+            p.peer_ht_rates.len() as u64,
+        );
+        for &value in &p.peer_ht_rates {
+            trace_field(sink, "PeerAssoc.params.peer_ht_rates[]", value);
+        }
+        trace_branch(sink, "PeerAssoc.params.vht_capable", p.vht_capable);
+        trace_field(sink, "PeerAssoc.params.rx_max_rate", p.rx_max_rate);
+        trace_field(sink, "PeerAssoc.params.rx_mcs_set", p.rx_mcs_set);
+        trace_field(sink, "PeerAssoc.params.tx_max_rate", p.tx_max_rate);
+        trace_field(sink, "PeerAssoc.params.tx_mcs_set", p.tx_mcs_set);
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_he_mcs.len",
+            p.peer_he_mcs.len() as u64,
+        );
+        for rate in &p.peer_he_mcs {
+            trace_field(
+                sink,
+                "PeerAssoc.params.peer_he_mcs[].rx_mcs_set",
+                rate.rx_mcs_set,
+            );
+            trace_field(
+                sink,
+                "PeerAssoc.params.peer_he_mcs[].tx_mcs_set",
+                rate.tx_mcs_set,
+            );
+        }
+        trace_field(sink, "PeerAssoc.params.min_data_rate", p.min_data_rate);
+        for value in p.peer_he_cap_macinfo {
+            trace_field(sink, "PeerAssoc.params.peer_he_cap_macinfo[]", value);
+        }
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_he_cap_macinfo_internal",
+            p.peer_he_cap_macinfo_internal,
+        );
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_he_caps_6ghz",
+            p.peer_he_caps_6ghz,
+        );
+        trace_field(sink, "PeerAssoc.params.peer_he_ops", p.peer_he_ops);
+        for value in p.peer_he_cap_phyinfo {
+            trace_field(sink, "PeerAssoc.params.peer_he_cap_phyinfo[]", value);
+        }
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_ppet.numss_m1",
+            p.peer_ppet.numss_m1,
+        );
+        trace_field(
+            sink,
+            "PeerAssoc.params.peer_ppet.ru_bit_mask",
+            p.peer_ppet.ru_bit_mask,
+        );
+        for value in p.peer_ppet.ppet16_ppet8_ru3_ru0 {
+            trace_field(
+                sink,
+                "PeerAssoc.params.peer_ppet.ppet16_ppet8_ru3_ru0[]",
+                value,
+            );
+        }
+        for (name, taken) in [
+            ("PeerAssoc.params.is_pmf_enabled", p.is_pmf_enabled),
+            ("PeerAssoc.params.is_wme_set", p.is_wme_set),
+            ("PeerAssoc.params.qos_flag", p.qos_flag),
+            ("PeerAssoc.params.apsd_flag", p.apsd_flag),
+            ("PeerAssoc.params.ht_flag", p.ht_flag),
+            ("PeerAssoc.params.bw_40", p.bw_40),
+            ("PeerAssoc.params.bw_80", p.bw_80),
+            ("PeerAssoc.params.bw_160", p.bw_160),
+            ("PeerAssoc.params.stbc_flag", p.stbc_flag),
+            ("PeerAssoc.params.ldpc_flag", p.ldpc_flag),
+            ("PeerAssoc.params.static_mimops_flag", p.static_mimops_flag),
+            (
+                "PeerAssoc.params.dynamic_mimops_flag",
+                p.dynamic_mimops_flag,
+            ),
+            ("PeerAssoc.params.spatial_mux_flag", p.spatial_mux_flag),
+            ("PeerAssoc.params.vht_flag", p.vht_flag),
+            ("PeerAssoc.params.he_flag", p.he_flag),
+            ("PeerAssoc.params.twt_requester", p.twt_requester),
+            ("PeerAssoc.params.twt_responder", p.twt_responder),
+            ("PeerAssoc.params.auth_flag", p.auth_flag),
+            ("PeerAssoc.params.need_ptk_4_way", p.need_ptk_4_way),
+            ("PeerAssoc.params.need_gtk_2_way", p.need_gtk_2_way),
+            ("PeerAssoc.params.safe_mode_enabled", p.safe_mode_enabled),
+            ("PeerAssoc.params.is_assoc", p.is_assoc),
+            ("PeerAssoc.hw_crypto_disabled", self.hw_crypto_disabled),
+        ] {
+            trace_branch(sink, name, taken);
+        }
+    }
+
     fn encode_command(&self) -> Result<Command, WmiError> {
         let p = &self.params;
         if p.peer_legacy_rates.len() > 128 || p.peer_ht_rates.len() > 128 || p.peer_he_mcs.len() > 3
@@ -238,10 +376,233 @@ impl EncodeCommand for PeerAssoc {
     }
 }
 
+#[cfg(feature = "proptest")]
+impl CommandStrategy for PeerAssoc {
+    fn strategy() -> proptest::strategy::BoxedStrategy<Self> {
+        use proptest::prelude::{Strategy, any};
+
+        let ppe = (any::<u32>(), any::<u32>(), any::<[u32; 8]>()).prop_map(
+            |(numss_m1, ru_bit_mask, ppet16_ppet8_ru3_ru0)| PeerPpeThreshold {
+                numss_m1,
+                ru_bit_mask,
+                ppet16_ppet8_ru3_ru0,
+            },
+        );
+        let he_rates = proptest::collection::vec(
+            (any::<u32>(), any::<u32>()).prop_map(|(rx_mcs_set, tx_mcs_set)| PeerHeRateSet {
+                rx_mcs_set,
+                tx_mcs_set,
+            }),
+            0..=3,
+        );
+
+        (
+            (
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<[u8; 6]>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+            ),
+            (
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+            ),
+            (
+                proptest::collection::vec(any::<u8>(), 0..=128),
+                proptest::collection::vec(any::<u8>(), 0..=128),
+                any::<bool>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                he_rates,
+            ),
+            (
+                any::<u8>(),
+                any::<[u32; 2]>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<[u32; 3]>(),
+                ppe,
+            ),
+            (
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            ),
+            (
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            ),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    (
+                        vdev_id,
+                        peer_new_assoc,
+                        peer_associd,
+                        peer_mac,
+                        peer_rate_caps,
+                        peer_caps,
+                        peer_listen_intval,
+                    ),
+                    (
+                        peer_ht_caps,
+                        peer_max_mpdu,
+                        peer_mpdu_density,
+                        peer_vht_caps,
+                        peer_phymode,
+                        peer_nss,
+                        peer_bw_rxnss_override,
+                    ),
+                    (
+                        peer_legacy_rates,
+                        peer_ht_rates,
+                        vht_capable,
+                        rx_max_rate,
+                        rx_mcs_set,
+                        tx_max_rate,
+                        tx_mcs_set,
+                        peer_he_mcs,
+                    ),
+                    (
+                        min_data_rate,
+                        peer_he_cap_macinfo,
+                        peer_he_cap_macinfo_internal,
+                        peer_he_caps_6ghz,
+                        peer_he_ops,
+                        peer_he_cap_phyinfo,
+                        peer_ppet,
+                    ),
+                    (
+                        is_pmf_enabled,
+                        is_wme_set,
+                        qos_flag,
+                        apsd_flag,
+                        ht_flag,
+                        bw_40,
+                        bw_80,
+                        bw_160,
+                        stbc_flag,
+                        ldpc_flag,
+                        static_mimops_flag,
+                    ),
+                    (
+                        dynamic_mimops_flag,
+                        spatial_mux_flag,
+                        vht_flag,
+                        he_flag,
+                        twt_requester,
+                        twt_responder,
+                        auth_flag,
+                        need_ptk_4_way,
+                        need_gtk_2_way,
+                        safe_mode_enabled,
+                        is_assoc,
+                    ),
+                    hw_crypto_disabled,
+                )| PeerAssoc {
+                    params: PeerAssocParams {
+                        vdev_id,
+                        peer_new_assoc,
+                        peer_associd,
+                        peer_mac,
+                        peer_rate_caps,
+                        peer_caps,
+                        peer_listen_intval,
+                        peer_ht_caps,
+                        peer_max_mpdu,
+                        peer_mpdu_density,
+                        peer_vht_caps,
+                        peer_phymode,
+                        peer_nss,
+                        peer_bw_rxnss_override,
+                        peer_legacy_rates,
+                        peer_ht_rates,
+                        vht_capable,
+                        rx_max_rate,
+                        rx_mcs_set,
+                        tx_max_rate,
+                        tx_mcs_set,
+                        peer_he_mcs,
+                        min_data_rate,
+                        peer_he_cap_macinfo,
+                        peer_he_cap_macinfo_internal,
+                        peer_he_caps_6ghz,
+                        peer_he_ops,
+                        peer_he_cap_phyinfo,
+                        peer_ppet,
+                        is_pmf_enabled,
+                        is_wme_set,
+                        qos_flag,
+                        apsd_flag,
+                        ht_flag,
+                        bw_40,
+                        bw_80,
+                        bw_160,
+                        stbc_flag,
+                        ldpc_flag,
+                        static_mimops_flag,
+                        dynamic_mimops_flag,
+                        spatial_mux_flag,
+                        vht_flag,
+                        he_flag,
+                        twt_requester,
+                        twt_responder,
+                        auth_flag,
+                        need_ptk_4_way,
+                        need_gtk_2_way,
+                        safe_mode_enabled,
+                        is_assoc,
+                    },
+                    hw_crypto_disabled,
+                },
+            )
+            .boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::{TraceEvent, TraceSink};
     use alloc::vec;
+
+    #[derive(Default)]
+    struct Trace(Vec<TraceEvent>);
+
+    impl TraceSink for Trace {
+        fn record(&mut self, event: TraceEvent) {
+            self.0.push(event);
+        }
+    }
 
     #[test]
     fn peer_flags_match_c_ordering_and_gates() {
@@ -456,6 +817,69 @@ mod tests {
                 .encode_command(),
                 Err(WmiError::Malformed)
             );
+        }
+    }
+
+    #[test]
+    fn differential_trace_covers_nested_values_and_branches() {
+        let command = PeerAssoc {
+            params: PeerAssocParams {
+                peer_mac: [1, 2, 3, 4, 5, 6],
+                peer_legacy_rates: vec![0x82],
+                peer_ht_rates: vec![0x91],
+                peer_he_mcs: vec![PeerHeRateSet {
+                    rx_mcs_set: 0x1234,
+                    tx_mcs_set: 0x5678,
+                }],
+                peer_ppet: PeerPpeThreshold {
+                    ppet16_ppet8_ru3_ru0: [9; 8],
+                    ..Default::default()
+                },
+                vht_capable: true,
+                auth_flag: true,
+                ..Default::default()
+            },
+            hw_crypto_disabled: true,
+        };
+        let mut trace = Trace::default();
+        command.encode_command_with_trace(&mut trace).unwrap();
+
+        assert!(trace.0.contains(&TraceEvent::Field {
+            name: "PeerAssoc.params.peer_mac[]",
+            value: 6,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Field {
+            name: "PeerAssoc.params.peer_legacy_rates[]",
+            value: 0x82,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Field {
+            name: "PeerAssoc.params.peer_he_mcs[].tx_mcs_set",
+            value: 0x5678,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Field {
+            name: "PeerAssoc.params.peer_ppet.ppet16_ppet8_ru3_ru0[]",
+            value: 9,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Branch {
+            name: "PeerAssoc.params.vht_capable",
+            taken: true,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Branch {
+            name: "PeerAssoc.hw_crypto_disabled",
+            taken: true,
+        }));
+    }
+
+    #[cfg(feature = "proptest")]
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+
+        #[test]
+        fn generated_peer_assoc_respects_source_capacities(command in PeerAssoc::strategy()) {
+            proptest::prop_assert!(command.params.peer_legacy_rates.len() <= 128);
+            proptest::prop_assert!(command.params.peer_ht_rates.len() <= 128);
+            proptest::prop_assert!(command.params.peer_he_mcs.len() <= 3);
+            proptest::prop_assert!(command.encode_command().is_ok());
         }
     }
 }

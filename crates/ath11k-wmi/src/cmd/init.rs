@@ -1,8 +1,14 @@
 use alloc::vec::Vec;
 
-use super::{EncodeCommand, TlvWriter};
+#[cfg(feature = "proptest")]
+use super::CommandStrategy;
+use super::{EncodeCommand, TlvWriter, trace_branch, trace_field};
 use crate::tags::*;
+use crate::trace::TraceSink;
 use crate::{Command, WmiError};
+
+#[cfg(feature = "proptest")]
+use proptest::prelude::*;
 
 /// Source-shaped `struct wmi_resource_config` payload.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -255,6 +261,132 @@ pub struct Init {
 }
 
 impl EncodeCommand for Init {
+    fn trace_fields(&self, sink: &mut dyn TraceSink) {
+        macro_rules! resource_fields {
+            ($($field:ident),+ $(,)?) => {
+                $(trace_field(
+                    sink,
+                    concat!("Init.resource_config.", stringify!($field)),
+                    self.resource_config.$field,
+                );)+
+            };
+        }
+        resource_fields!(
+            num_vdevs,
+            num_peers,
+            num_offload_peers,
+            num_offload_reorder_buffs,
+            num_peer_keys,
+            num_tids,
+            ast_skid_limit,
+            tx_chain_mask,
+            rx_chain_mask,
+        );
+        for (index, value) in self.resource_config.rx_timeout_pri.iter().enumerate() {
+            trace_field(
+                sink,
+                [
+                    "Init.resource_config.rx_timeout_pri[0]",
+                    "Init.resource_config.rx_timeout_pri[1]",
+                    "Init.resource_config.rx_timeout_pri[2]",
+                    "Init.resource_config.rx_timeout_pri[3]",
+                ][index],
+                *value,
+            );
+        }
+        resource_fields!(
+            rx_decap_mode,
+            scan_max_pending_req,
+            bmiss_offload_max_vdev,
+            roam_offload_max_vdev,
+            roam_offload_max_ap_profiles,
+            num_mcast_groups,
+            num_mcast_table_elems,
+            mcast2ucast_mode,
+            tx_dbg_log_size,
+            num_wds_entries,
+            dma_burst_size,
+            mac_aggr_delim,
+            rx_skip_defrag_timeout_dup_detection_check,
+            vow_config,
+            gtk_offload_max_vdev,
+            num_msdu_desc,
+            max_frag_entries,
+            num_tdls_vdevs,
+            num_tdls_conn_table_entries,
+            beacon_tx_offload_max_vdev,
+            num_multicast_filter_entries,
+            num_wow_filters,
+            num_keep_alive_pattern,
+            keep_alive_pattern_size,
+            max_tdls_concurrent_sleep_sta,
+            max_tdls_concurrent_buffer_sta,
+            wmi_send_separate,
+            num_ocb_vdevs,
+            num_ocb_channels,
+            num_ocb_schedules,
+            flag1,
+            smart_ant_cap,
+            bk_minfree,
+            be_minfree,
+            vi_minfree,
+            vo_minfree,
+            alloc_frag_desc_for_data_pkt,
+            num_ns_ext_tuples_cfg,
+            bpf_instruction_size,
+            max_bssid_rx_filters,
+            use_pdev_id,
+            max_num_dbs_scan_duty_cycle,
+            max_num_group_keys,
+            peer_map_unmap_v2_support,
+            sched_params,
+            twt_ap_pdev_count,
+            twt_ap_sta_count,
+            max_nlo_ssids,
+            num_pkt_filters,
+            num_max_sta_vdevs,
+            max_bssid_indicator,
+            ul_resp_config,
+            msdu_flow_override_config0,
+            msdu_flow_override_config1,
+            flags2,
+            host_service_flags,
+            max_rnr_neighbours,
+            ema_max_vap_cnt,
+            ema_max_profile_period,
+        );
+
+        trace_field(
+            sink,
+            "Init.memory_chunks.len",
+            self.memory_chunks.len() as u64,
+        );
+        for chunk in &self.memory_chunks {
+            trace_field(sink, "Init.memory_chunks[].request_id", chunk.request_id);
+            trace_field(
+                sink,
+                "Init.memory_chunks[].physical_address",
+                chunk.physical_address,
+            );
+            trace_field(sink, "Init.memory_chunks[].size", chunk.size);
+        }
+
+        trace_branch(
+            sink,
+            "Init.hardware_mode.is_some",
+            self.hardware_mode.is_some(),
+        );
+        if let Some(hardware_mode) = self.hardware_mode {
+            trace_field(sink, "Init.hardware_mode", hardware_mode);
+        }
+        trace_field(sink, "Init.bands.len", self.bands.len() as u64);
+        for band in &self.bands {
+            trace_field(sink, "Init.bands[].pdev_id", band.pdev_id);
+            trace_field(sink, "Init.bands[].start_freq", band.start_freq);
+            trace_field(sink, "Init.bands[].end_freq", band.end_freq);
+        }
+    }
+
     fn encode_command(&self) -> Result<Command, WmiError> {
         if self.memory_chunks.len() > 32 || self.bands.len() > 3 {
             return Err(WmiError::Malformed);
@@ -322,10 +454,61 @@ impl EncodeCommand for Init {
     }
 }
 
+#[cfg(feature = "proptest")]
+impl CommandStrategy for Init {
+    fn strategy() -> BoxedStrategy<Self> {
+        let resource_config = any::<[u32; 72]>().prop_map(ResourceConfig::from_words);
+        let memory_chunk = (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+            |(request_id, physical_address, size)| HostMemoryChunk {
+                request_id,
+                physical_address,
+                size,
+            },
+        );
+        let band = (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+            |(pdev_id, start_freq, end_freq)| BandToMac {
+                pdev_id,
+                start_freq,
+                end_freq,
+            },
+        );
+        let hardware = prop_oneof![
+            Just((None, Vec::new())),
+            (any::<u32>(), prop::collection::vec(band, 0..=3))
+                .prop_map(|(mode, bands)| (Some(mode), bands)),
+        ];
+
+        (
+            resource_config,
+            prop::collection::vec(memory_chunk, 0..=32),
+            hardware,
+        )
+            .prop_map(
+                |(resource_config, memory_chunks, (hardware_mode, bands))| Self {
+                    resource_config,
+                    memory_chunks,
+                    hardware_mode,
+                    bands,
+                },
+            )
+            .boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::TraceEvent;
     use alloc::vec;
+
+    #[derive(Default)]
+    struct Trace(Vec<TraceEvent>);
+
+    impl TraceSink for Trace {
+        fn record(&mut self, event: TraceEvent) {
+            self.0.push(event);
+        }
+    }
 
     #[test]
     fn resource_copy_zeroes_omitted_fields_and_forces_flags() {
@@ -397,5 +580,69 @@ mod tests {
             u32::from_le_bytes(command.tlvs()[304..308].try_into().unwrap()),
             1 << 9
         );
+    }
+
+    #[test]
+    fn trace_uses_stable_full_paths_for_nested_init_data() {
+        let init = Init {
+            resource_config: ResourceConfig {
+                num_vdevs: 7,
+                rx_timeout_pri: [11, 12, 13, 14],
+                ..ResourceConfig::default()
+            },
+            memory_chunks: vec![HostMemoryChunk {
+                request_id: 21,
+                physical_address: 22,
+                size: 23,
+            }],
+            hardware_mode: Some(31),
+            bands: vec![BandToMac {
+                pdev_id: 41,
+                start_freq: 42,
+                end_freq: 43,
+            }],
+        };
+        let mut trace = Trace::default();
+        init.encode_command_with_trace(&mut trace).unwrap();
+
+        for expected in [
+            TraceEvent::Field {
+                name: "Init.resource_config.num_vdevs",
+                value: 7,
+            },
+            TraceEvent::Field {
+                name: "Init.resource_config.rx_timeout_pri[2]",
+                value: 13,
+            },
+            TraceEvent::Field {
+                name: "Init.memory_chunks[].physical_address",
+                value: 22,
+            },
+            TraceEvent::Branch {
+                name: "Init.hardware_mode.is_some",
+                taken: true,
+            },
+            TraceEvent::Field {
+                name: "Init.hardware_mode",
+                value: 31,
+            },
+            TraceEvent::Field {
+                name: "Init.bands[].end_freq",
+                value: 43,
+            },
+        ] {
+            assert!(trace.0.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[cfg(feature = "proptest")]
+    proptest! {
+        #[test]
+        fn init_strategy_only_generates_encodable_shapes(init in Init::strategy()) {
+            prop_assert!(init.memory_chunks.len() <= 32);
+            prop_assert!(init.bands.len() <= 3);
+            prop_assert!(init.hardware_mode.is_some() || init.bands.is_empty());
+            prop_assert!(init.encode_command().is_ok());
+        }
     }
 }

@@ -1,7 +1,13 @@
-use super::{EncodeCommand, TlvWriter};
+use super::{EncodeCommand, TlvWriter, trace_branch, trace_field};
 use crate::tags::*;
+use crate::trace::TraceSink;
 use crate::{Command, WmiError};
 use alloc::vec::Vec;
+
+#[cfg(feature = "proptest")]
+use super::CommandStrategy;
+#[cfg(feature = "proptest")]
+use proptest::prelude::*;
 
 const MAX_SCAN_SSIDS: usize = 16;
 const MAX_SCAN_BSSIDS: usize = 4;
@@ -144,6 +150,226 @@ pub struct ScanStart {
 }
 
 impl EncodeCommand for ScanStart {
+    fn trace_fields(&self, sink: &mut dyn TraceSink) {
+        for (name, value) in [
+            ("ScanStart.scan_id", self.scan_id),
+            ("ScanStart.scan_requester_id", self.scan_requester_id),
+            ("ScanStart.vdev_id", self.vdev_id),
+            ("ScanStart.scan_priority", self.scan_priority),
+            ("ScanStart.notify_scan_events", self.notify_scan_events),
+            ("ScanStart.control_flags_ext", self.control_flags_ext),
+            ("ScanStart.dwell_time_active", self.dwell_time_active),
+            (
+                "ScanStart.dwell_time_active_2ghz",
+                self.dwell_time_active_2ghz,
+            ),
+            ("ScanStart.dwell_time_passive", self.dwell_time_passive),
+            (
+                "ScanStart.dwell_time_active_6ghz",
+                self.dwell_time_active_6ghz,
+            ),
+            (
+                "ScanStart.dwell_time_passive_6ghz",
+                self.dwell_time_passive_6ghz,
+            ),
+            ("ScanStart.min_rest_time", self.min_rest_time),
+            ("ScanStart.max_rest_time", self.max_rest_time),
+            ("ScanStart.repeat_probe_time", self.repeat_probe_time),
+            ("ScanStart.probe_spacing_time", self.probe_spacing_time),
+            ("ScanStart.idle_time", self.idle_time),
+            ("ScanStart.max_scan_time", self.max_scan_time),
+            ("ScanStart.probe_delay", self.probe_delay),
+            ("ScanStart.burst_duration", self.burst_duration),
+            ("ScanStart.n_probes", self.n_probes),
+        ] {
+            trace_field(sink, name, value);
+        }
+        for (name, taken) in [
+            ("ScanStart.event_flags.started", self.event_flags.started),
+            (
+                "ScanStart.event_flags.completed",
+                self.event_flags.completed,
+            ),
+            (
+                "ScanStart.event_flags.bss_channel",
+                self.event_flags.bss_channel,
+            ),
+            (
+                "ScanStart.event_flags.foreign_channel",
+                self.event_flags.foreign_channel,
+            ),
+            ("ScanStart.event_flags.dequeued", self.event_flags.dequeued),
+            (
+                "ScanStart.event_flags.preempted",
+                self.event_flags.preempted,
+            ),
+            (
+                "ScanStart.event_flags.start_failed",
+                self.event_flags.start_failed,
+            ),
+            (
+                "ScanStart.event_flags.restarted",
+                self.event_flags.restarted,
+            ),
+            (
+                "ScanStart.event_flags.foreign_channel_exit",
+                self.event_flags.foreign_channel_exit,
+            ),
+            (
+                "ScanStart.event_flags.suspended",
+                self.event_flags.suspended,
+            ),
+            ("ScanStart.event_flags.resumed", self.event_flags.resumed),
+            (
+                "ScanStart.control_flags.passive",
+                self.control_flags.passive,
+            ),
+            (
+                "ScanStart.control_flags.strict_passive",
+                self.control_flags.strict_passive,
+            ),
+            (
+                "ScanStart.control_flags.promiscuous",
+                self.control_flags.promiscuous,
+            ),
+            (
+                "ScanStart.control_flags.capture_phy_error",
+                self.control_flags.capture_phy_error,
+            ),
+            (
+                "ScanStart.control_flags.half_rate",
+                self.control_flags.half_rate,
+            ),
+            (
+                "ScanStart.control_flags.quarter_rate",
+                self.control_flags.quarter_rate,
+            ),
+            (
+                "ScanStart.control_flags.cck_rates",
+                self.control_flags.cck_rates,
+            ),
+            (
+                "ScanStart.control_flags.ofdm_rates",
+                self.control_flags.ofdm_rates,
+            ),
+            (
+                "ScanStart.control_flags.channel_stat_event",
+                self.control_flags.channel_stat_event,
+            ),
+            (
+                "ScanStart.control_flags.filter_probe_request",
+                self.control_flags.filter_probe_request,
+            ),
+            (
+                "ScanStart.control_flags.broadcast_probe",
+                self.control_flags.broadcast_probe,
+            ),
+            (
+                "ScanStart.control_flags.offchannel_mgmt_tx",
+                self.control_flags.offchannel_mgmt_tx,
+            ),
+            (
+                "ScanStart.control_flags.offchannel_data_tx",
+                self.control_flags.offchannel_data_tx,
+            ),
+            (
+                "ScanStart.control_flags.force_active_dfs",
+                self.control_flags.force_active_dfs,
+            ),
+            (
+                "ScanStart.control_flags.add_tpc_ie",
+                self.control_flags.add_tpc_ie,
+            ),
+            (
+                "ScanStart.control_flags.add_ds_ie",
+                self.control_flags.add_ds_ie,
+            ),
+            (
+                "ScanStart.control_flags.spoofed_mac",
+                self.control_flags.spoofed_mac,
+            ),
+            (
+                "ScanStart.control_flags.random_sequence",
+                self.control_flags.random_sequence,
+            ),
+            (
+                "ScanStart.control_flags.ie_whitelist",
+                self.control_flags.ie_whitelist,
+            ),
+        ] {
+            trace_branch(sink, name, taken);
+        }
+        trace_field(
+            sink,
+            "ScanStart.control_flags.adaptive_dwell_mode",
+            self.control_flags.adaptive_dwell_mode,
+        );
+
+        trace_field(sink, "ScanStart.mac_addr.len", self.mac_addr.len() as u64);
+        for value in self.mac_addr {
+            trace_field(sink, "ScanStart.mac_addr[]", value);
+        }
+        trace_field(sink, "ScanStart.mac_mask.len", self.mac_mask.len() as u64);
+        for value in self.mac_mask {
+            trace_field(sink, "ScanStart.mac_mask[]", value);
+        }
+        trace_field(sink, "ScanStart.channels.len", self.channels.len() as u64);
+        for &channel in &self.channels {
+            trace_field(sink, "ScanStart.channels[]", channel);
+        }
+        trace_field(sink, "ScanStart.ssids.len", self.ssids.len() as u64);
+        for ssid in &self.ssids {
+            trace_field(sink, "ScanStart.ssids[].len", ssid.len() as u64);
+            for &value in ssid {
+                trace_field(sink, "ScanStart.ssids[][]", value);
+            }
+        }
+        trace_field(sink, "ScanStart.bssids.len", self.bssids.len() as u64);
+        for bssid in &self.bssids {
+            trace_field(sink, "ScanStart.bssids[].len", bssid.len() as u64);
+            for &value in bssid {
+                trace_field(sink, "ScanStart.bssids[][]", value);
+            }
+        }
+        trace_field(sink, "ScanStart.extra_ie.len", self.extra_ie.len() as u64);
+        for &value in &self.extra_ie {
+            trace_field(sink, "ScanStart.extra_ie[]", value);
+        }
+        trace_field(
+            sink,
+            "ScanStart.short_ssid_hints.len",
+            self.short_ssid_hints.len() as u64,
+        );
+        for hint in &self.short_ssid_hints {
+            trace_field(
+                sink,
+                "ScanStart.short_ssid_hints[].freq_flags",
+                hint.freq_flags,
+            );
+            trace_field(
+                sink,
+                "ScanStart.short_ssid_hints[].short_ssid",
+                hint.short_ssid,
+            );
+        }
+        trace_field(
+            sink,
+            "ScanStart.bssid_hints.len",
+            self.bssid_hints.len() as u64,
+        );
+        for hint in &self.bssid_hints {
+            trace_field(sink, "ScanStart.bssid_hints[].freq_flags", hint.freq_flags);
+            trace_field(
+                sink,
+                "ScanStart.bssid_hints[].bssid.len",
+                hint.bssid.len() as u64,
+            );
+            for value in hint.bssid {
+                trace_field(sink, "ScanStart.bssid_hints[].bssid[]", value);
+            }
+        }
+    }
+
     fn encode_command(&self) -> Result<Command, WmiError> {
         if self.ssids.len() > MAX_SCAN_SSIDS
             || self.ssids.iter().any(|ssid| ssid.len() > MAX_SSID_LEN)
@@ -276,6 +502,74 @@ pub struct ScanChannelList {
 }
 
 impl EncodeCommand for ScanChannelList {
+    fn trace_fields(&self, sink: &mut dyn TraceSink) {
+        trace_field(sink, "ScanChannelList.pdev_id", self.pdev_id);
+        trace_branch(sink, "ScanChannelList.append", self.append);
+        trace_field(
+            sink,
+            "ScanChannelList.channels.len",
+            self.channels.len() as u64,
+        );
+        for channel in &self.channels {
+            trace_field(sink, "ScanChannelList.channels[].mhz", channel.mhz);
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].center_freq1",
+                channel.center_freq1,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].center_freq2",
+                channel.center_freq2,
+            );
+            for (name, taken) in [
+                ("ScanChannelList.channels[].passive", channel.passive),
+                ("ScanChannelList.channels[].allow_ht", channel.allow_ht),
+                ("ScanChannelList.channels[].allow_vht", channel.allow_vht),
+                ("ScanChannelList.channels[].allow_he", channel.allow_he),
+                ("ScanChannelList.channels[].half_rate", channel.half_rate),
+                (
+                    "ScanChannelList.channels[].quarter_rate",
+                    channel.quarter_rate,
+                ),
+                ("ScanChannelList.channels[].psc", channel.psc),
+                ("ScanChannelList.channels[].dfs", channel.dfs),
+            ] {
+                trace_branch(sink, name, taken);
+            }
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].phy_mode",
+                channel.phy_mode,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].min_power",
+                channel.min_power,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].max_power",
+                channel.max_power,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].max_reg_power",
+                channel.max_reg_power,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].antenna_max",
+                channel.antenna_max,
+            );
+            trace_field(
+                sink,
+                "ScanChannelList.channels[].reg_class_id",
+                channel.reg_class_id,
+            );
+        }
+    }
+
     fn encode_command(&self) -> Result<Command, WmiError> {
         if self.channels.is_empty() {
             return Err(WmiError::Malformed);
@@ -339,10 +633,193 @@ impl EncodeCommand for ScanChannelList {
     }
 }
 
+#[cfg(feature = "proptest")]
+fn scan_event_flags_strategy() -> BoxedStrategy<ScanEventFlags> {
+    any::<[bool; 11]>()
+        .prop_map(|flags| ScanEventFlags {
+            started: flags[0],
+            completed: flags[1],
+            bss_channel: flags[2],
+            foreign_channel: flags[3],
+            dequeued: flags[4],
+            preempted: flags[5],
+            start_failed: flags[6],
+            restarted: flags[7],
+            foreign_channel_exit: flags[8],
+            suspended: flags[9],
+            resumed: flags[10],
+        })
+        .boxed()
+}
+
+#[cfg(feature = "proptest")]
+fn scan_control_flags_strategy() -> BoxedStrategy<ScanControlFlags> {
+    any::<([bool; 19], u32)>()
+        .prop_map(|(flags, adaptive_dwell_mode)| ScanControlFlags {
+            passive: flags[0],
+            strict_passive: flags[1],
+            promiscuous: flags[2],
+            capture_phy_error: flags[3],
+            half_rate: flags[4],
+            quarter_rate: flags[5],
+            cck_rates: flags[6],
+            ofdm_rates: flags[7],
+            channel_stat_event: flags[8],
+            filter_probe_request: flags[9],
+            broadcast_probe: flags[10],
+            offchannel_mgmt_tx: flags[11],
+            offchannel_data_tx: flags[12],
+            force_active_dfs: flags[13],
+            add_tpc_ie: flags[14],
+            add_ds_ie: flags[15],
+            spoofed_mac: flags[16],
+            random_sequence: flags[17],
+            ie_whitelist: flags[18],
+            adaptive_dwell_mode,
+        })
+        .boxed()
+}
+
+#[cfg(feature = "proptest")]
+fn short_ssid_hint_strategy() -> BoxedStrategy<ScanShortSsidHint> {
+    any::<(u32, u32)>()
+        .prop_map(|(freq_flags, short_ssid)| ScanShortSsidHint {
+            freq_flags,
+            short_ssid,
+        })
+        .boxed()
+}
+
+#[cfg(feature = "proptest")]
+fn bssid_hint_strategy() -> BoxedStrategy<ScanBssidHint> {
+    any::<(u32, [u8; 6])>()
+        .prop_map(|(freq_flags, bssid)| ScanBssidHint { freq_flags, bssid })
+        .boxed()
+}
+
+#[cfg(feature = "proptest")]
+impl CommandStrategy for ScanStart {
+    fn strategy() -> BoxedStrategy<Self> {
+        (
+            (
+                any::<[u32; 5]>(),
+                scan_event_flags_strategy(),
+                scan_control_flags_strategy(),
+                any::<[u32; 15]>(),
+                any::<[u8; 6]>(),
+                any::<[u8; 6]>(),
+            ),
+            (
+                prop::collection::vec(any::<u32>(), 0..=64),
+                prop::collection::vec(
+                    prop::collection::vec(any::<u8>(), 0..=MAX_SSID_LEN),
+                    0..=MAX_SCAN_SSIDS,
+                ),
+                prop::collection::vec(any::<[u8; 6]>(), 0..=MAX_SCAN_BSSIDS),
+                prop::collection::vec(any::<u8>(), 0..=256),
+                prop::collection::vec(short_ssid_hint_strategy(), 0..=MAX_SCAN_HINTS),
+                prop::collection::vec(bssid_hint_strategy(), 0..=MAX_SCAN_HINTS),
+            ),
+        )
+            .prop_map(
+                |(
+                    (head, event_flags, control_flags, tail, mac_addr, mac_mask),
+                    (channels, ssids, bssids, extra_ie, short_ssid_hints, bssid_hints),
+                )| ScanStart {
+                    scan_id: head[0],
+                    scan_requester_id: head[1],
+                    vdev_id: head[2],
+                    scan_priority: head[3],
+                    notify_scan_events: head[4],
+                    event_flags,
+                    control_flags,
+                    control_flags_ext: tail[0],
+                    dwell_time_active: tail[1],
+                    dwell_time_active_2ghz: tail[2],
+                    dwell_time_passive: tail[3],
+                    dwell_time_active_6ghz: tail[4],
+                    dwell_time_passive_6ghz: tail[5],
+                    min_rest_time: tail[6],
+                    max_rest_time: tail[7],
+                    repeat_probe_time: tail[8],
+                    probe_spacing_time: tail[9],
+                    idle_time: tail[10],
+                    max_scan_time: tail[11],
+                    probe_delay: tail[12],
+                    burst_duration: tail[13],
+                    n_probes: tail[14],
+                    mac_addr,
+                    mac_mask,
+                    channels,
+                    ssids,
+                    bssids,
+                    extra_ie,
+                    short_ssid_hints,
+                    bssid_hints,
+                },
+            )
+            .boxed()
+    }
+}
+
+#[cfg(feature = "proptest")]
+fn scan_channel_strategy() -> BoxedStrategy<ScanChannel> {
+    any::<(u32, u32, u32, [bool; 8], u32, [u8; 5])>()
+        .prop_map(
+            |(mhz, center_freq1, center_freq2, flags, phy_mode, power)| ScanChannel {
+                mhz,
+                center_freq1,
+                center_freq2,
+                passive: flags[0],
+                allow_ht: flags[1],
+                allow_vht: flags[2],
+                allow_he: flags[3],
+                half_rate: flags[4],
+                quarter_rate: flags[5],
+                psc: flags[6],
+                dfs: flags[7],
+                phy_mode,
+                min_power: power[0],
+                max_power: power[1],
+                max_reg_power: power[2],
+                antenna_max: power[3],
+                reg_class_id: power[4],
+            },
+        )
+        .boxed()
+}
+
+#[cfg(feature = "proptest")]
+impl CommandStrategy for ScanChannelList {
+    fn strategy() -> BoxedStrategy<Self> {
+        (
+            any::<u32>(),
+            any::<bool>(),
+            prop::collection::vec(scan_channel_strategy(), 1..=64),
+        )
+            .prop_map(|(pdev_id, append, channels)| ScanChannelList {
+                pdev_id,
+                append,
+                channels,
+            })
+            .boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::TraceEvent;
     use alloc::vec;
+
+    #[derive(Default)]
+    struct RecordingTrace(Vec<TraceEvent>);
+
+    impl TraceSink for RecordingTrace {
+        fn record(&mut self, event: TraceEvent) {
+            self.0.push(event);
+        }
+    }
 
     fn bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
@@ -523,5 +1000,138 @@ mod tests {
         assert_eq!(request.encode_command(), Err(WmiError::Malformed));
         request.ssids = vec![vec![]; 17];
         assert_eq!(request.encode_command(), Err(WmiError::Malformed));
+    }
+
+    #[test]
+    fn scan_traces_use_stable_paths_and_preserve_sequence_order() {
+        let request = ScanStart {
+            scan_id: 1,
+            scan_requester_id: 2,
+            vdev_id: 3,
+            scan_priority: 4,
+            notify_scan_events: 5,
+            event_flags: ScanEventFlags {
+                completed: true,
+                ..Default::default()
+            },
+            control_flags: ScanControlFlags {
+                add_ds_ie: true,
+                ..Default::default()
+            },
+            control_flags_ext: 6,
+            dwell_time_active: 7,
+            dwell_time_active_2ghz: 8,
+            dwell_time_passive: 9,
+            dwell_time_active_6ghz: 10,
+            dwell_time_passive_6ghz: 11,
+            min_rest_time: 12,
+            max_rest_time: 13,
+            repeat_probe_time: 14,
+            probe_spacing_time: 15,
+            idle_time: 16,
+            max_scan_time: 17,
+            probe_delay: 18,
+            burst_duration: 19,
+            n_probes: 20,
+            mac_addr: [1, 2, 3, 4, 5, 6],
+            mac_mask: [0xff; 6],
+            channels: vec![2412, 5180],
+            ssids: vec![vec![b'a'], vec![b'b', b'c']],
+            bssids: vec![[6, 5, 4, 3, 2, 1]],
+            extra_ie: vec![0xdd, 1],
+            short_ssid_hints: vec![ScanShortSsidHint {
+                freq_flags: 21,
+                short_ssid: 22,
+            }],
+            bssid_hints: vec![ScanBssidHint {
+                freq_flags: 23,
+                bssid: [9; 6],
+            }],
+        };
+        let mut trace = RecordingTrace::default();
+        request.encode_command_with_trace(&mut trace).unwrap();
+
+        assert!(trace.0.contains(&TraceEvent::Branch {
+            name: "ScanStart.event_flags.completed",
+            taken: true,
+        }));
+        assert!(trace.0.contains(&TraceEvent::Branch {
+            name: "ScanStart.control_flags.add_ds_ie",
+            taken: true,
+        }));
+        let channels: Vec<_> = trace
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Field {
+                    name: "ScanStart.channels[]",
+                    value,
+                } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(channels, [2412, 5180]);
+        assert!(trace.0.contains(&TraceEvent::Field {
+            name: "ScanStart.bssid_hints[].bssid[]",
+            value: 9,
+        }));
+
+        let channel_list = ScanChannelList {
+            pdev_id: 24,
+            append: true,
+            channels: vec![
+                ScanChannel {
+                    allow_ht: true,
+                    ..Default::default()
+                },
+                ScanChannel::default(),
+            ],
+        };
+        let mut trace = RecordingTrace::default();
+        channel_list.encode_command_with_trace(&mut trace).unwrap();
+        let allow_ht: Vec<_> = trace
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Branch {
+                    name: "ScanChannelList.channels[].allow_ht",
+                    taken,
+                } => Some(*taken),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(allow_ht, [true, false]);
+        assert!(trace.0.contains(&TraceEvent::Branch {
+            name: "ScanChannelList.append",
+            taken: true,
+        }));
+    }
+
+    #[cfg(feature = "proptest")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn scan_start_strategy_only_generates_encodable_requests(
+            request in ScanStart::strategy()
+        ) {
+            prop_assert!(request.ssids.len() <= MAX_SCAN_SSIDS);
+            prop_assert!(request.ssids.iter().all(|ssid| ssid.len() <= MAX_SSID_LEN));
+            prop_assert!(request.bssids.len() <= MAX_SCAN_BSSIDS);
+            prop_assert!(request.short_ssid_hints.len() <= MAX_SCAN_HINTS);
+            prop_assert!(request.bssid_hints.len() <= MAX_SCAN_HINTS);
+            prop_assert!(request.channels.len() * 4 <= u16::MAX as usize);
+            prop_assert!(request.extra_ie.len().div_ceil(4) * 4 <= u16::MAX as usize);
+            prop_assert!(request.encode_command().is_ok());
+        }
+
+        #[test]
+        fn scan_channel_list_strategy_only_generates_encodable_requests(
+            request in ScanChannelList::strategy()
+        ) {
+            prop_assert!(!request.channels.is_empty());
+            prop_assert!(request.channels.len() * 28 - 4 <= u16::MAX as usize);
+            prop_assert!(request.encode_command().is_ok());
+        }
     }
 }
