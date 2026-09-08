@@ -67,6 +67,53 @@ fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
     assert_eq!(greeting, [5, 0]);
     assert!(!service.network_ready());
 }
+
+#[test]
+fn revoked_frame_generation_exits_and_replacement_starts() {
+    let make_service = || {
+        let (capability, driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
+        let device =
+            unsafe { ServiceEthernetDevice::from_frame_fd(capability.into_frame_fd(), CLIENT_MAC) };
+        let service = BoundedNetstackProof::new(
+            device,
+            NetstackProofConfig {
+                dns_name: "unused.invalid.".into(),
+                server_port: NonZeroU16::new(80).unwrap(),
+            },
+        )
+        .unwrap();
+        (service, driver)
+    };
+
+    let (mut revoked, old_driver) = make_service();
+    drop(old_driver);
+    let old_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    old_listener.set_nonblocking(true).unwrap();
+    let old_listen = old_listener.local_addr().unwrap();
+    assert_eq!(
+        revoked.serve_socks5_listener(
+            old_listener,
+            old_listen,
+            Some(std::time::Instant::now() + Duration::from_millis(20)),
+            || false,
+        ),
+        Err("Ethernet frame seam closed")
+    );
+
+    let (mut replacement, _new_driver) = make_service();
+    let new_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    new_listener.set_nonblocking(true).unwrap();
+    let new_listen = new_listener.local_addr().unwrap();
+    replacement
+        .serve_socks5_listener(
+            new_listener,
+            new_listen,
+            Some(std::time::Instant::now() + Duration::from_millis(5)),
+            || false,
+        )
+        .unwrap();
+    assert!(!replacement.network_ready());
+}
 use wlan_softmac_host::ethernet::{
     AssociatedSoftmacTx, DriverEthernetPort, EthernetIngressError, ethernet_port,
 };

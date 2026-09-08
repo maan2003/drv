@@ -387,6 +387,7 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
     )
     .map_err(str::to_string)?;
     if !lab_proof {
+        write_all_fd(5, b"STARTED", "bootstrap STARTED failed")?;
         unsafe {
             close(5);
         }
