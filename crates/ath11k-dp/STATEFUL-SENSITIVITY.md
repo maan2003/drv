@@ -1,24 +1,32 @@
-# Stateful suite sensitivity check
+# Stateful suite sensitivity measurement
 
-Each measurement restored one historical bookkeeping defect, ran the owning
-randomized suite with `PROPTEST_CASES=5000`, and then abandoned the scratch
-change. The source and test suites were restored before this report was made.
+Each measurement restored one historical accounting defect in a scratch change,
+ran the owning randomized stateful property test with `PROPTEST_CASES=5000`, and
+then abandoned the scratch change. The source and test suites were restored
+before this report was updated. “Cases to first finding” counts the failing case,
+so a run reporting zero preceding successes has a value of 1.
 
-| Defect | Mutation applied | Suite | Detected | Cases to first failure | Minimal sequence length |
-|---|---|---|---:|---:|---:|
-| RX refill prepare (`846b7b215a1b`) | Removed `entry.buffer.prepare_for_device()?` before dropping the completed RX buffer | `ath11k-dp` host/service | yes | 1 | 2 |
-| dma-pool return (`af20e71d8082`) | Removed the `!self.reusable` guard from `DmaSegment::drop` | `ath11k-dp` host/service | no | — (5,000 passed) | — |
-| RX cookie wrap (`e2a789c437a3`) | Restored blind masked-cursor allocation and wrap in `replenish_pool` | `ath11k-dp` host/service | no | — (5,000 passed) | — |
-| TX completion source (`7f0b919af404`) | Treated every release source other than firmware/HTT as a TQM completion | `ath11k-dp` host/service | no | — (5,000 passed) | — |
-| REO/TID same-key retained queue (`e1f52f10c403`) | Removed the setup gate over `uncertain_setup` and `failed_delete` | `ath11k-dp` REO status | no | — (5,000 passed) | — |
+| Defect | Scratch restoration | Suite | Detected | Cases to first finding | Minimal sequence length | Runtime |
+|---|---|---|---:|---:|---:|---:|
+| RX refill prepare (`846b7b215a1b`) | Removed `entry.buffer.prepare_for_device()?` before dropping the completed RX buffer | `ath11k-dp` host/service | yes | 1 | 2 | 1.76 s |
+| dma-pool return (`af20e71d8082`) | Removed the `!self.reusable` check from `DmaSegment::drop` | `ath11k-dp` host/service | yes | 3 | 1 | 2.27 s |
+| RX cookie wrap (`e2a789c437a3`) | Restored blind masked-cursor allocation and wrap in `replenish_pool` | `ath11k-dp` host/service | yes | 1 | 5 | 2.12 s |
+| TX completion source (`7f0b919af404`) | Treated unsupported release sources as TQM completions | `ath11k-dp` host/service | yes | 1 | 3 | 1.82 s |
+| REO/TID same-key retained queue (`e1f52f10c403`) | Removed the setup check over uncertain setup and failed delete owners | `ath11k-dp` REO status | yes | 1 | 2 | 1.64 s |
 
-The detected RX refill mutation failed with zero preceding successful cases and
-this two-command minimal sequence:
+The strengthened suites detected all 5 of 5 restored defects. The minimal
+sequences exercised these consistency checks:
 
-```text
-RxCompletion { owner: 0, shape: 0, push_reason: 0, length: 0 }
-Service { work: 1, receive: 1 }
-```
+- RX completion followed by service found the missing device-ownership prepare.
+- A generated failed prepare, drop, and replacement allocation found reuse of
+  the discarded DMA address.
+- Two RX replacement cycles crossed the test cursor's 18-bit boundary and found
+  a duplicate live cookie.
+- Submit, unsupported-source completion, and service found both the unexpected
+  callback and the missing live TX owner.
+- Uncertain WMI setup followed by successful same-key setup found two possibly
+  device-visible owners. The generator also covers failed REO invalidation and
+  a subsequent same-key setup.
 
 The host/service command was run as:
 
@@ -32,30 +40,31 @@ The REO command was run as:
 PROPTEST_CASES=5000 cargo test -p ath11k-dp reo::tests::stateful_tests::reo_command_sequences_keep_owner_accounting_consistent -- --exact --nocapture
 ```
 
-## Miss diagnoses and recommendations
+The timings include recompilation of each scratch defect restoration. Because a
+finding stops and shrinks the run, these are finding-and-shrink runtimes rather
+than runtimes for 5,000 successful cases.
 
-**dma-pool return.** The host/service generator only drops completed RX
-segments through the production path, and that path successfully prepares the
-segment first. It does not inject a failed prepare or directly drop a
-CPU-owned segment, so removing the pool's reusable-state guard stays dormant.
-Add a generated prepare failure followed by drop and allocation, and check that
-the returned address is not the discarded address.
+## Changes that increased sensitivity
 
-**RX cookie wrap.** A sequence has at most 64 commands and starts the cookie
-cursor at 1, far short of the 18-bit wrap point. The live-cookie distinctness
-check is useful once a collision occurs, but the generator cannot reach one.
-Add a test seam that starts the cursor at the last cookie, or generate a small
-model cookie space, while retaining the same allocation rule.
+**dma-pool return.** A generated command now performs a failed prepare followed
+by drop and replacement allocation. Its consistency check requires the new DMA
+address to differ from the discarded address.
 
-**TX completion source.** The generator covers release sources 0 through 7,
-but its checks derive callback counts from what the implementation did. They
-check that completed IDs are not still live, not that an unsupported source
-must leave its owner live and produce no callback. Track expected live TX IDs
-in the model and update them only for explicitly supported sources.
+**RX cookie wrap.** The host/service setup moves the production cookie cursor to
+the last 18-bit value while ordinary live cookies remain allocated. Generated
+RX replacement work reaches wrap without changing the production allocation
+rule.
 
-**REO/TID same-key retained queue.** The accounting check sums all ownership
-lists and limits duplicates only inside the active `tids` list. A second active
-descriptor alongside the same key in `failed_delete` or `uncertain_setup`
-therefore still satisfies the total. Check key uniqueness across every list
-that may remain device-visible, and add a WMI outcome that exercises uncertain
-setup as well as failed invalidation status.
+**TX completion source.** The command model tracks expected live TX IDs
+independently. Only supported completion sources update that accounting;
+unsupported sources require no callback and leave their expected owner live.
+
+**REO/TID same-key owner.** The test registers its peer before issuing commands,
+generates successful, known-non-visible-failure, and uncertain WMI outcomes,
+and generates failed invalidations. Its consistency check requires key
+uniqueness across active, uncertain-setup, and failed-delete owners that may
+remain device-visible.
+
+Both suites accept `ATH11K_STATEFUL_CASES` and `ATH11K_STATEFUL_STEPS` for long
+runs, with `PROPTEST_CASES` retained for this sensitivity measurement. The data
+path README documents an overnight configuration.
