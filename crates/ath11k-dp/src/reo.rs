@@ -74,6 +74,86 @@ const UPDATE_VALID: u32 = 1 << 9;
 const UPDATE_BA_WINDOW_SIZE: u32 = 1 << 18;
 const UPDATE_START_SEQUENCE: u32 = 1 << 26;
 const START_SEQUENCE_SHIFT: u32 = 11;
+const RX_FRAGMENT_TIMEOUT_MS: u64 = 2_000;
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a fragment link descriptor must be returned or retained exactly once"]
+pub struct FragmentLinkDescriptor(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FragmentEncryption {
+    Wep40 = 0,
+    Wep104 = 1,
+    TkipNoMic = 2,
+    Wep128 = 3,
+    TkipMic = 4,
+    Wapi = 5,
+    Ccmp128 = 6,
+    Open = 7,
+    Ccmp256 = 8,
+    Gcmp128 = 9,
+    AesGcmp256 = 10,
+    WapiGcmSm4 = 11,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FragmentInput {
+    pub vdev_id: u32,
+    pub peer_addr: [u8; 6],
+    pub tid: u8,
+    pub sequence: u16,
+    pub fragment_number: u8,
+    pub more_fragments: bool,
+    pub multicast_broadcast: bool,
+    pub sequence_control_valid: bool,
+    pub frame_control_valid: bool,
+    pub encryption: FragmentEncryption,
+    pub decrypted: bool,
+    pub packet_number: Option<u64>,
+    pub bytes: Vec<u8>,
+    pub link_descriptor: FragmentLinkDescriptor,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a completed fragment chain retains a link descriptor owner"]
+pub struct CompletedFragmentChain {
+    pub vdev_id: u32,
+    pub peer_addr: [u8; 6],
+    pub tid: u8,
+    pub sequence: u16,
+    pub fragments: Vec<FragmentPart>,
+    pub first_link_descriptor: FragmentLinkDescriptor,
+    /// Chains containing decrypted encrypted fragments still require the
+    /// source's IV/MIC/ICV normalization and TKIP MMIC boundary before
+    /// stage-2 reinjection.
+    pub needs_crypto_normalization: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FragmentPart {
+    pub fragment_number: u8,
+    pub encryption: FragmentEncryption,
+    pub decrypted: bool,
+    pub packet_number: Option<u64>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "fragment link dispositions must be consumed"]
+pub struct FragmentOutcome {
+    pub chain: Result<Option<CompletedFragmentChain>, DpError>,
+    pub return_links: Vec<FragmentLinkDescriptor>,
+}
+
+#[derive(Debug)]
+struct StoredFragment {
+    number: u8,
+    encryption: FragmentEncryption,
+    decrypted: bool,
+    packet_number: Option<u64>,
+    bytes: Vec<u8>,
+}
 
 struct PendingTid<B: Backend> {
     command_number: u16,
@@ -107,8 +187,15 @@ struct FragmentState {
     current_sequence: u16,
     last_fragment: u8,
     bitmap: u16,
-    frames: Vec<Vec<u8>>,
+    frames: Vec<StoredFragment>,
+    first_link: Option<FragmentLinkDescriptor>,
+    deadline_ms: u64,
     timer_armed: bool,
+}
+
+struct PendingFragmentLink {
+    key: PeerKey,
+    link: FragmentLinkDescriptor,
 }
 
 /// Global peer receive-reorder queue coordinator. Every peer's pending
@@ -123,6 +210,7 @@ pub struct PeerRxTids<B: Backend> {
     failed_delete: Vec<ActiveTid<B>>,
     tearing_down: Vec<PeerKey>,
     fragments: Vec<FragmentState>,
+    pending_fragment_links: Vec<PendingFragmentLink>,
     peers: Vec<PeerKey>,
 }
 
@@ -145,6 +233,7 @@ impl<B: Backend> PeerRxTids<B> {
             failed_delete: Vec::new(),
             tearing_down: Vec::new(),
             fragments: Vec::new(),
+            pending_fragment_links: Vec::new(),
             peers: Vec::new(),
         })
     }
@@ -372,8 +461,7 @@ impl<B: Backend> PeerRxTids<B> {
             {
                 first_error.get_or_insert(error);
             }
-            self.fragments
-                .retain(|state| state.key != key || state.tid != tid);
+            self.queue_fragment_cleanup(key, Some(tid));
         }
         self.try_retire_teardown(key);
         first_error.map_or(Ok(()), Err)
@@ -383,51 +471,224 @@ impl<B: Backend> PeerRxTids<B> {
     /// boundary. Full fragment reassembly remains outside this port.
     pub fn ath11k_peer_frags_flush(&mut self, vdev_id: u32, peer_addr: [u8; 6]) {
         let key = PeerKey { vdev_id, peer_addr };
-        self.fragments.retain(|state| state.key != key);
+        self.queue_fragment_cleanup(key, None);
     }
 
-    /// Minimal ownership seam for the fragment bookkeeping that cleanup must
-    /// purge; this deliberately does not perform fragment reassembly.
-    #[allow(clippy::too_many_arguments)]
-    pub fn track_fragment_state(
+    fn queue_fragment_cleanup(&mut self, key: PeerKey, tid: Option<u8>) {
+        let mut index = 0;
+        while index < self.fragments.len() {
+            if self.fragments[index].key == key
+                && tid.is_none_or(|tid| self.fragments[index].tid == tid)
+            {
+                if let Some(link) = self.fragments.swap_remove(index).first_link {
+                    self.pending_fragment_links
+                        .push(PendingFragmentLink { key, link });
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Transfers retained first-link descriptors to the stage-2 WBM release
+    /// owner. Until this is called, teardown admission remains closed.
+    pub fn take_pending_fragment_link_returns(
         &mut self,
         vdev_id: u32,
         peer_addr: [u8; 6],
-        tid: u8,
-        current_sequence: u16,
-        last_fragment: u8,
-        bitmap: u16,
-        frame: Vec<u8>,
-    ) -> Result<(), DpError> {
-        if tid > 16 {
-            return Err(DpError::WrongState);
-        }
+    ) -> Vec<FragmentLinkDescriptor> {
         let key = PeerKey { vdev_id, peer_addr };
-        if self.tearing_down.contains(&key) {
-            return Err(DpError::WrongState);
+        let mut links = Vec::new();
+        let mut index = 0;
+        while index < self.pending_fragment_links.len() {
+            if self.pending_fragment_links[index].key == key {
+                links.push(self.pending_fragment_links.swap_remove(index).link);
+            } else {
+                index += 1;
+            }
         }
-        if let Some(state) = self
-            .fragments
-            .iter_mut()
-            .find(|state| state.key == key && state.tid == tid)
+        self.try_retire_teardown(key);
+        links
+    }
+
+    /// Stage-1 port of `ath11k_dp_rx_frag_h_mpdu`: validate and accumulate a
+    /// keyed fragment sequence while making link-descriptor disposition
+    /// explicit. The completed chain remains owned by the caller until the
+    /// separately deferred hardware reinjection stage exists.
+    pub fn ath11k_dp_rx_frag_h_mpdu(
+        &mut self,
+        input: FragmentInput,
+        now_ms: u64,
+    ) -> FragmentOutcome {
+        let key = PeerKey {
+            vdev_id: input.vdev_id,
+            peer_addr: input.peer_addr,
+        };
+        let mut return_links = Vec::new();
+        if let Some(index) = self.fragments.iter().position(|state| {
+            state.key == key
+                && state.tid == input.tid
+                && state.timer_armed
+                && now_ms >= state.deadline_ms
+        }) {
+            return_links.extend(self.fragments.swap_remove(index).first_link);
+        }
+        if input.multicast_broadcast
+            || !input.sequence_control_valid
+            || !input.frame_control_valid
+            || input.tid > 16
+            || input.fragment_number > 15
+            || (input.fragment_number == 0 && !input.more_fragments)
+            || !self.peers.contains(&key)
+            || self.tearing_down.contains(&key)
         {
-            state.current_sequence = current_sequence;
-            state.last_fragment = last_fragment;
-            state.bitmap = bitmap;
-            state.frames.push(frame);
-            state.timer_armed = true;
-        } else {
-            self.fragments.push(FragmentState {
-                key,
-                tid,
-                current_sequence,
-                last_fragment,
-                bitmap,
-                frames: alloc::vec![frame],
-                timer_armed: true,
-            });
+            return_links.push(input.link_descriptor);
+            return FragmentOutcome {
+                chain: Err(DpError::InvalidFrame),
+                return_links,
+            };
         }
-        Ok(())
+
+        let replaced = self
+            .fragments
+            .iter()
+            .position(|state| state.key == key && state.tid == input.tid)
+            .filter(|&index| self.fragments[index].current_sequence != input.sequence);
+        if let Some(index) = replaced {
+            return_links.extend(self.fragments.swap_remove(index).first_link);
+        }
+
+        let state_index = self
+            .fragments
+            .iter()
+            .position(|state| state.key == key && state.tid == input.tid)
+            .unwrap_or_else(|| {
+                self.fragments.push(FragmentState {
+                    key,
+                    tid: input.tid,
+                    current_sequence: input.sequence,
+                    last_fragment: 0,
+                    bitmap: 0,
+                    frames: Vec::new(),
+                    first_link: None,
+                    deadline_ms: 0,
+                    timer_armed: false,
+                });
+                self.fragments.len() - 1
+            });
+        let state = &mut self.fragments[state_index];
+        let bit = 1u16 << input.fragment_number;
+        if state.bitmap & bit != 0 {
+            return_links.push(input.link_descriptor);
+            return FragmentOutcome {
+                chain: Err(DpError::InvalidFrame),
+                return_links,
+            };
+        }
+        let insert_at = state
+            .frames
+            .iter()
+            .position(|fragment| fragment.number > input.fragment_number)
+            .unwrap_or(state.frames.len());
+        state.frames.insert(
+            insert_at,
+            StoredFragment {
+                number: input.fragment_number,
+                encryption: input.encryption,
+                decrypted: input.decrypted,
+                packet_number: input.packet_number,
+                bytes: input.bytes,
+            },
+        );
+        state.bitmap |= bit;
+        if input.fragment_number == 0 {
+            state.first_link = Some(input.link_descriptor);
+        } else {
+            return_links.push(input.link_descriptor);
+        }
+        if !input.more_fragments {
+            state.last_fragment = input.fragment_number;
+        }
+        let complete_mask = if state.last_fragment == 15 {
+            u16::MAX
+        } else {
+            (1u16 << (state.last_fragment + 1)) - 1
+        };
+        if state.last_fragment == 0 || state.bitmap != complete_mask {
+            state.timer_armed = true;
+            state.deadline_ms = now_ms.saturating_add(RX_FRAGMENT_TIMEOUT_MS);
+            return FragmentOutcome {
+                chain: Ok(None),
+                return_links,
+            };
+        }
+
+        let state = self.fragments.swap_remove(state_index);
+        let Some(first_link_descriptor) = state.first_link else {
+            return FragmentOutcome {
+                chain: Err(DpError::InvalidFrame),
+                return_links,
+            };
+        };
+        let encryption = state.frames[0].encryption;
+        let needs_crypto_normalization = state
+            .frames
+            .iter()
+            .any(|fragment| fragment.decrypted && fragment.encryption != FragmentEncryption::Open);
+        if matches!(
+            encryption,
+            FragmentEncryption::Ccmp128
+                | FragmentEncryption::Ccmp256
+                | FragmentEncryption::Gcmp128
+                | FragmentEncryption::AesGcmp256
+        ) && !packet_numbers_are_consecutive(&state.frames)
+        {
+            return_links.push(first_link_descriptor);
+            return FragmentOutcome {
+                chain: Err(DpError::InvalidFrame),
+                return_links,
+            };
+        }
+        FragmentOutcome {
+            chain: Ok(Some(CompletedFragmentChain {
+                vdev_id: key.vdev_id,
+                peer_addr: key.peer_addr,
+                tid: state.tid,
+                sequence: state.current_sequence,
+                fragments: state
+                    .frames
+                    .into_iter()
+                    .map(|fragment| FragmentPart {
+                        fragment_number: fragment.number,
+                        encryption: fragment.encryption,
+                        decrypted: fragment.decrypted,
+                        packet_number: fragment.packet_number,
+                        bytes: fragment.bytes,
+                    })
+                    .collect(),
+                first_link_descriptor,
+                needs_crypto_normalization,
+            })),
+            return_links,
+        }
+    }
+
+    /// Manual polling seam for `ath11k_dp_rx_frag_timer`; returns retained
+    /// first-link owners which the caller must publish to the real WBM release
+    /// path in stage 2. No production scheduler is wired yet.
+    pub fn expire_incomplete_fragments(&mut self, now_ms: u64) -> Vec<FragmentLinkDescriptor> {
+        let mut links = Vec::new();
+        let mut index = 0;
+        while index < self.fragments.len() {
+            if self.fragments[index].timer_armed && now_ms >= self.fragments[index].deadline_ms {
+                if let Some(link) = self.fragments.swap_remove(index).first_link {
+                    links.push(link);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        links
     }
 
     /// Release all possibly device-visible peer state only after reset has
@@ -578,10 +839,23 @@ impl<B: Backend> PeerRxTids<B> {
             .chain(&self.failed_delete)
             .any(|entry| entry.vdev_id == key.vdev_id && entry.peer_addr == key.peer_addr);
         let fragments = self.fragments.iter().any(|entry| entry.key == key);
-        if !(active || pending || cached || quarantined || fragments) {
+        let fragment_links = self
+            .pending_fragment_links
+            .iter()
+            .any(|entry| entry.key == key);
+        if !(active || pending || cached || quarantined || fragments || fragment_links) {
             self.tearing_down.retain(|teardown| *teardown != key);
         }
     }
+}
+
+fn packet_numbers_are_consecutive(fragments: &[StoredFragment]) -> bool {
+    fragments.windows(2).all(|pair| {
+        pair[0]
+            .packet_number
+            .zip(pair[1].packet_number)
+            .is_some_and(|(previous, current)| previous.checked_add(1) == Some(current))
+    })
 }
 
 fn send_reorder_setup<B: Backend, T: Transport>(
@@ -793,6 +1067,32 @@ mod tests {
         let info = u32::from(command_number) | u32::from(execution_status) << 26;
         bytes[4..8].copy_from_slice(&info.to_le_bytes());
         Descriptor::new(bytes, 104).unwrap()
+    }
+
+    fn fragment(
+        address: [u8; 6],
+        sequence: u16,
+        number: u8,
+        more: bool,
+        pn: Option<u64>,
+        link: u64,
+    ) -> FragmentInput {
+        FragmentInput {
+            vdev_id: 9,
+            peer_addr: address,
+            tid: 3,
+            sequence,
+            fragment_number: number,
+            more_fragments: more,
+            multicast_broadcast: false,
+            sequence_control_valid: true,
+            frame_control_valid: true,
+            encryption: FragmentEncryption::Ccmp128,
+            decrypted: true,
+            packet_number: pn,
+            bytes: vec![number],
+            link_descriptor: FragmentLinkDescriptor(link),
+        }
     }
 
     #[test]
@@ -1205,12 +1505,30 @@ mod tests {
                 PacketNumberType::None,
             )
             .unwrap();
-        peers
-            .track_fragment_state(2, [0xaa; 6], 8, 4, 1, 3, vec![1, 2])
-            .unwrap();
-        peers
-            .track_fragment_state(2, [0xbb; 6], 8, 5, 1, 3, vec![3, 4])
-            .unwrap();
+        let first = peers.ath11k_dp_rx_frag_h_mpdu(
+            FragmentInput {
+                vdev_id: 2,
+                tid: 8,
+                encryption: FragmentEncryption::Open,
+                packet_number: None,
+                bytes: vec![1, 2],
+                ..fragment([0xaa; 6], 4, 0, true, None, 600)
+            },
+            0,
+        );
+        assert_eq!(first.chain, Ok(None));
+        let second = peers.ath11k_dp_rx_frag_h_mpdu(
+            FragmentInput {
+                vdev_id: 2,
+                tid: 8,
+                encryption: FragmentEncryption::Open,
+                packet_number: None,
+                bytes: vec![3, 4],
+                ..fragment([0xbb; 6], 5, 0, true, None, 601)
+            },
+            0,
+        );
+        assert_eq!(second.chain, Ok(None));
 
         peers
             .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 2, [0xaa; 6])
@@ -1238,10 +1556,19 @@ mod tests {
             ),
             Err(DpError::WrongState)
         );
-        assert_eq!(
-            peers.track_fragment_state(2, [0xaa; 6], 8, 6, 2, 7, vec![9]),
-            Err(DpError::WrongState)
+        let late = peers.ath11k_dp_rx_frag_h_mpdu(
+            FragmentInput {
+                vdev_id: 2,
+                tid: 8,
+                encryption: FragmentEncryption::Open,
+                packet_number: None,
+                bytes: vec![9],
+                ..fragment([0xaa; 6], 6, 0, true, None, 602)
+            },
+            0,
         );
+        assert_eq!(late.chain, Err(DpError::InvalidFrame));
+        assert_eq!(late.return_links, [FragmentLinkDescriptor(602)]);
         peers
             .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 2, [0xaa; 6])
             .unwrap();
@@ -1531,5 +1858,209 @@ mod tests {
             Err(DpError::WrongState)
         );
         assert!(peers.is_active(6, [0xe2; 6], 2));
+    }
+
+    #[test]
+    fn fragments_sort_complete_and_preserve_typed_link_dispositions() {
+        let address = [0xf1; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        let last = peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 7, 2, false, Some(12), 102), 0);
+        assert_eq!(last.chain, Ok(None));
+        assert_eq!(last.return_links, [FragmentLinkDescriptor(102)]);
+        let first = peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 7, 0, true, Some(10), 100), 1);
+        assert_eq!(first.chain, Ok(None));
+        assert!(first.return_links.is_empty());
+        let mut middle_input = fragment(address, 7, 1, true, Some(11), 101);
+        middle_input.decrypted = false;
+        let middle = peers.ath11k_dp_rx_frag_h_mpdu(middle_input, 2);
+        assert_eq!(middle.return_links, [FragmentLinkDescriptor(101)]);
+        let chain = middle.chain.unwrap().unwrap();
+        assert_eq!(chain.sequence, 7);
+        assert_eq!(chain.first_link_descriptor, FragmentLinkDescriptor(100));
+        assert_eq!(
+            chain
+                .fragments
+                .iter()
+                .map(|fragment| fragment.fragment_number)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(
+            chain
+                .fragments
+                .iter()
+                .all(|fragment| fragment.encryption == FragmentEncryption::Ccmp128)
+        );
+        assert_eq!(
+            chain
+                .fragments
+                .iter()
+                .map(|fragment| fragment.decrypted)
+                .collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        assert!(chain.needs_crypto_normalization);
+    }
+
+    #[test]
+    fn fragment_encryption_discriminants_match_pinned_hal() {
+        assert_eq!(
+            [
+                FragmentEncryption::Wep40 as u8,
+                FragmentEncryption::Wep104 as u8,
+                FragmentEncryption::TkipNoMic as u8,
+                FragmentEncryption::Wep128 as u8,
+                FragmentEncryption::TkipMic as u8,
+                FragmentEncryption::Wapi as u8,
+                FragmentEncryption::Ccmp128 as u8,
+                FragmentEncryption::Open as u8,
+                FragmentEncryption::Ccmp256 as u8,
+                FragmentEncryption::Gcmp128 as u8,
+                FragmentEncryption::AesGcmp256 as u8,
+                FragmentEncryption::WapiGcmSm4 as u8,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn duplicate_sequence_switch_and_bad_pn_return_every_link_owner() {
+        let address = [0xf2; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        let initial =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 1, 0, true, Some(20), 200), 0);
+        assert_eq!(initial.chain, Ok(None));
+        assert!(initial.return_links.is_empty());
+        let duplicate =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 1, 0, true, Some(20), 201), 1);
+        assert_eq!(duplicate.chain, Err(DpError::InvalidFrame));
+        assert_eq!(duplicate.return_links, [FragmentLinkDescriptor(201)]);
+        let switched =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 2, 0, true, Some(30), 202), 2);
+        assert_eq!(switched.return_links, [FragmentLinkDescriptor(200)]);
+        let bad = peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 2, 1, false, Some(32), 203), 3);
+        assert_eq!(bad.chain, Err(DpError::InvalidFrame));
+        assert_eq!(
+            bad.return_links,
+            [FragmentLinkDescriptor(203), FragmentLinkDescriptor(202)]
+        );
+    }
+
+    #[test]
+    fn incomplete_fragment_timeout_returns_retained_first_link() {
+        let address = [0xf3; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        let initial =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 3, 0, true, Some(1), 300), 100);
+        assert_eq!(initial.chain, Ok(None));
+        assert!(initial.return_links.is_empty());
+        assert!(peers.expire_incomplete_fragments(2_099).is_empty());
+        assert_eq!(
+            peers.expire_incomplete_fragments(2_100),
+            [FragmentLinkDescriptor(300)]
+        );
+    }
+
+    #[test]
+    fn keyed_ingress_expires_due_chain_before_accumulating() {
+        let address = [0xf6; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        let first = peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 8, 0, true, Some(10), 600), 0);
+        assert_eq!(first.chain, Ok(None));
+
+        let late = peers.ath11k_dp_rx_frag_h_mpdu(
+            fragment(address, 8, 1, false, Some(11), 601),
+            RX_FRAGMENT_TIMEOUT_MS + 1,
+        );
+        assert_eq!(late.chain, Ok(None));
+        assert_eq!(
+            late.return_links,
+            [FragmentLinkDescriptor(600), FragmentLinkDescriptor(601)]
+        );
+    }
+
+    #[test]
+    fn fragment_validation_rejects_without_retaining_current_link() {
+        let address = [0xf4; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        for invalid in [
+            FragmentInput {
+                multicast_broadcast: true,
+                ..fragment(address, 4, 0, true, Some(1), 401)
+            },
+            FragmentInput {
+                sequence_control_valid: false,
+                ..fragment(address, 4, 0, true, Some(1), 401)
+            },
+            FragmentInput {
+                frame_control_valid: false,
+                ..fragment(address, 4, 0, true, Some(1), 401)
+            },
+            FragmentInput {
+                fragment_number: 16,
+                ..fragment(address, 4, 0, true, Some(1), 401)
+            },
+            FragmentInput {
+                more_fragments: false,
+                ..fragment(address, 4, 0, true, Some(1), 401)
+            },
+        ] {
+            let outcome = peers.ath11k_dp_rx_frag_h_mpdu(invalid, 0);
+            assert_eq!(outcome.chain, Err(DpError::InvalidFrame));
+            assert_eq!(outcome.return_links, [FragmentLinkDescriptor(401)]);
+        }
+        assert!(peers.fragments.is_empty());
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        peers.tearing_down.push(PeerKey {
+            vdev_id: 9,
+            peer_addr: address,
+        });
+        let outcome =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 4, 0, true, Some(1), 400), 0);
+        assert_eq!(outcome.chain, Err(DpError::InvalidFrame));
+        assert_eq!(outcome.return_links, [FragmentLinkDescriptor(400)]);
+    }
+
+    #[test]
+    fn teardown_queues_first_link_and_retires_only_after_transfer() {
+        let address = [0xf5; 6];
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+        let initial =
+            peers.ath11k_dp_rx_frag_h_mpdu(fragment(address, 5, 0, true, Some(1), 500), 0);
+        assert_eq!(initial.chain, Ok(None));
+        assert!(initial.return_links.is_empty());
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        peers
+            .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 9, address)
+            .unwrap();
+        assert_eq!(
+            peers.register_peer_after_firmware_create(9, address),
+            Err(DpError::WrongState)
+        );
+        assert_eq!(
+            peers.take_pending_fragment_link_returns(9, address),
+            [FragmentLinkDescriptor(500)]
+        );
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
     }
 }
