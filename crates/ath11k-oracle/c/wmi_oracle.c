@@ -116,6 +116,54 @@ int oracle_wmi_scan_stop(u32 requester, u32 scan_id, u32 cancel_type,
     if (cancel_type > 2) return -22;
     return capture(out, 0x3002, cmd, sizeof(cmd));
 }
+int oracle_wmi_scan_start(const u32 *v, u32 event_flags, u32 control_inputs,
+                          u32 adaptive_dwell, const u8 *mac_addr, const u8 *mac_mask,
+                          const u32 *channels, size_t channel_len,
+                          const u8 *ssid_lengths, const u8 *ssids, size_t ssid_len,
+                          const u8 *bssids, size_t bssid_len,
+                          const u8 *extra_ie, size_t extra_ie_len,
+                          const u32 *short_hints, size_t short_hint_len,
+                          const u32 *bssid_hint_freqs, size_t bssid_hint_len,
+                          struct oracle_wmi_capture *out) {
+    u8 body[8192] = {0}; size_t p = 0;
+    size_t ie_pad = extra_ie_len <= 0xffff ? (extra_ie_len + 3) & ~(size_t)3 : 0;
+    static const u32 control_bits[] = { 1, 0x10000, 0x100, 0x8000, 0x20000,
+        0x40000, 4, 8, 0x10, 0x20, 2, 0x2000, 0x4000, 0x200, 0x400,
+        0x800, 0x1000, 0x80000, 0x100000 };
+    u32 control = (adaptive_dwell << 21) & 0xe00000;
+    for (size_t i = 0; i < sizeof(control_bits) / sizeof(control_bits[0]); i++)
+        if (control_inputs & (1u << i)) control |= control_bits[i];
+#define PUTSCAN32(value) do { u32 x_ = (value); memcpy(body + p, &x_, 4); p += 4; } while (0)
+    PUTSCAN32(((u32)0x4d << 16) | 156);
+    for (size_t i = 0; i < 4; i++) PUTSCAN32(v[i]);
+    PUTSCAN32(v[4] | event_flags);
+    for (size_t i = 5; i <= 13; i++) PUTSCAN32(v[i]);
+    PUTSCAN32(control); PUTSCAN32(v[14]); PUTSCAN32(channel_len);
+    PUTSCAN32(bssid_len); PUTSCAN32(ssid_len); PUTSCAN32(extra_ie_len); PUTSCAN32(v[15]);
+    memcpy(body + p, mac_addr, 6); p += 8; memcpy(body + p, mac_mask, 6); p += 8;
+    p += 32; PUTSCAN32(0); PUTSCAN32(v[16]); PUTSCAN32(v[17]);
+    PUTSCAN32(v[18]); PUTSCAN32(v[19]); PUTSCAN32(0);
+    PUTSCAN32(((u32)0x10 << 16) | (u16)(channel_len * 4));
+    for (size_t i = 0; i < channel_len; i++) PUTSCAN32(channels[i]);
+    PUTSCAN32(((u32)0x13 << 16) | (u16)(ssid_len * 36));
+    for (size_t i = 0; i < ssid_len; i++) {
+        PUTSCAN32(ssid_lengths[i]); memcpy(body + p, ssids + i * 32, ssid_lengths[i]); p += 32;
+    }
+    PUTSCAN32(((u32)0x13 << 16) | (u16)(bssid_len * 8));
+    for (size_t i = 0; i < bssid_len; i++) { memcpy(body + p, bssids + i * 6, 6); p += 8; }
+    PUTSCAN32(((u32)0x11 << 16) | (u16)ie_pad);
+    if (ie_pad) { memcpy(body + p, extra_ie, extra_ie_len); p += ie_pad; }
+    if (short_hint_len) {
+        PUTSCAN32(((u32)0x13 << 16) | (u16)(short_hint_len * 8));
+        for (size_t i = 0; i < short_hint_len * 2; i++) PUTSCAN32(short_hints[i]);
+    }
+    if (bssid_hint_len) {
+        PUTSCAN32(((u32)0x13 << 16) | (u16)(bssid_hint_len * 12));
+        for (size_t i = 0; i < bssid_hint_len; i++) { PUTSCAN32(bssid_hint_freqs[i]); p += 8; }
+    }
+#undef PUTSCAN32
+    return capture(out, 0x3001, body, p);
+}
 int oracle_wmi_install_key(u32 vdev_id, const u8 *address, u32 key_idx,
                            u32 key_flags, u32 cipher, u32 rsc_low, u32 rsc_high,
                            const u8 *key, size_t key_len, u32 txmic, u32 rxmic,
@@ -131,6 +179,64 @@ int oracle_wmi_install_key(u32 vdev_id, const u8 *address, u32 key_idx,
     PUTKEY32(((u32)0x11 << 16) | (u16)aligned); memcpy(body + p, key, key_len); p += aligned;
 #undef PUTKEY32
     return capture(out, 0x5009, body, p);
+}
+int oracle_wmi_peer_assoc(const u32 *v, const u8 *address, const u32 *ppet,
+                          const u8 *legacy, size_t legacy_len,
+                          const u8 *ht, size_t ht_len,
+                          const u32 *he, size_t he_len, u32 flags_in,
+                          struct oracle_wmi_capture *out) {
+    u8 body[1024] = {0}; size_t p = 0;
+    size_t legacy_pad = (legacy_len + 3) & ~(size_t)3;
+    size_t ht_pad = (ht_len + 3) & ~(size_t)3;
+    u32 peer_flags = 0;
+#define INPUT(bit) ((flags_in & (1u << (bit))) != 0)
+    if (INPUT(2)) {
+        static const u32 bits[] = { 2, 0x800, 0x1000, 0x2000, 0x4000000,
+            0x40000000, 0x8000, 0x10000, 0x40000, 0x20000, 0x200000,
+            0x2000000, 0x400, 0x400000, 0x800000 };
+        for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
+            if (INPUT(i + 3)) peer_flags |= bits[i];
+    }
+    if (INPUT(18)) peer_flags |= 1;
+    if (INPUT(19)) {
+        peer_flags |= 4;
+        if (!INPUT(23) && INPUT(22)) peer_flags &= ~1u;
+    }
+    if (INPUT(20)) peer_flags |= 0x10;
+    if (INPUT(21)) peer_flags &= ~(u32)(4 | 0x10);
+    if (INPUT(1)) peer_flags |= 0x8000000;
+    if (!ht_len) peer_flags &= ~0x1000u;
+#define PUTPA32(value) do { u32 x_ = (value); memcpy(body + p, &x_, 4); p += 4; } while (0)
+    PUTPA32(((u32)0x65 << 16) | 160);
+    memcpy(body + p, address, 6); p += 8;
+    for (size_t i = 0; i < 3; i++) PUTPA32(v[i]);
+    PUTPA32(peer_flags);
+    for (size_t i = 4; i <= 8; i++) PUTPA32(v[i]);
+    PUTPA32(v[3]); PUTPA32(v[11]); PUTPA32(v[9]); PUTPA32(v[10]);
+    PUTPA32(0); PUTPA32(0); PUTPA32(legacy_len); PUTPA32(ht_len); PUTPA32(v[12]);
+    PUTPA32(v[26]); PUTPA32(v[27]);
+    for (size_t i = 0; i < 8; i++) PUTPA32(ppet[i]);
+    PUTPA32(v[18]); PUTPA32(v[22]);
+    for (size_t i = 23; i <= 25; i++) PUTPA32(v[i]);
+    PUTPA32(he_len); PUTPA32(v[19]); PUTPA32(v[20]); PUTPA32(v[17]); PUTPA32(v[21]);
+    PUTPA32(((u32)0x11 << 16) | (u16)legacy_pad);
+    memcpy(body + p, legacy, legacy_len); p += legacy_pad;
+    PUTPA32(((u32)0x11 << 16) | (u16)ht_pad);
+    memcpy(body + p, ht, ht_len); p += ht_pad;
+    PUTPA32(((u32)0x66 << 16) | 20);
+    if (INPUT(0)) {
+        PUTPA32(v[15]); PUTPA32(v[16]); PUTPA32(v[13]); PUTPA32(v[14]);
+    } else {
+        p += 16;
+    }
+    PUTPA32(0);
+    PUTPA32(((u32)0x12 << 16) | (u16)(he_len * 12));
+    for (size_t i = 0; i < he_len; i++) {
+        PUTPA32(((u32)0x285 << 16) | 8); PUTPA32(he[i * 2]); PUTPA32(he[i * 2 + 1]);
+    }
+#undef PUTPA32
+#undef INPUT
+    return capture(out, 0x6005, body, p);
 }
 int oracle_wmi_mgmt_send(u32 vdev_id, u32 desc_id, u32 freq, u64 paddr,
                          const u8 *frame, size_t frame_len, u8 params_valid,
@@ -233,6 +339,8 @@ enum oracle_wmi_event_kind {
     ORACLE_SERVICE_AVAILABLE, ORACLE_READY, ORACLE_SCAN, ORACLE_VDEV_START,
     ORACLE_VDEV_STOPPED, ORACLE_VDEV_DELETE, ORACLE_PEER_ASSOC,
     ORACLE_PEER_DELETE, ORACLE_INSTALL_KEY, ORACLE_MGMT_RX, ORACLE_MGMT_TX,
+    ORACLE_FW_MEM_DUMP, ORACLE_ROAM_CAPABILITY, ORACLE_PEER_CREATE,
+    ORACLE_FREQ_AVOID,
 };
 
 /* Stable IDs are translated to the Rust TraceSink names by src/lib.rs. */
@@ -245,6 +353,7 @@ enum oracle_wmi_trace_name {
     TF_VSTART_CHAIN, TF_VSTART_SMPS, TF_VSTART_MAC, TF_VSTART_TX,
     TF_VSTART_RX, TF_VSTART_POWER, TF_VDEV_ID,
     TF_MTX_DESC, TF_MTX_STATUS, TF_MTX_PDEV, TF_MTX_PPDU, TF_MTX_ACK_RSSI,
+    TF_FW_DUMP_REQUEST, TF_FW_DUMP_COMPLETE, TF_ROAM_CAPABILITY,
 };
 
 static u32 get32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
@@ -279,7 +388,8 @@ static size_t event_min_len(u16 tag) {
     case 0x1c3: return 12; case 0x29: return 4; case 0x2c: return 68;
     case 0x1a7: return 20; case 0x24: return 28; case 0x2a: return 24;
     case 0x23: return 52; case 0x22f: return 20; case 0x1b2: return 12;
-    case 0x1c2: return 4; default: return 0;
+    case 0x1c2: case 0x385: case 0x47: return 4;
+    case 0x18d: return 8; case 0x364: return 16; default: return 0;
     }
 }
 
@@ -293,7 +403,7 @@ static int parse_event_table(const u8 *bytes, size_t length,
         if ((size_t)len > length - 4 || event_min_len(tag) > len) return -22;
         if (out->tlv_count == EVENT_TLV_MAX) return -28;
         out->tlvs[out->tlv_count++] = (struct oracle_wmi_tlv){ tag, len, offset };
-        if (tag < 0x2c0) { table[tag] = bytes + offset + 4; lengths[tag] = len; }
+        if (tag < 0x386) { table[tag] = bytes + offset + 4; lengths[tag] = len; }
         offset += 4 + len; length -= 4 + len;
     }
     return 0;
@@ -313,7 +423,7 @@ static int nested_count(const u8 *bytes, size_t length, u16 required_tag,
 
 int oracle_wmi_event_parse(u32 kind, const u8 *bytes, size_t length,
                            struct oracle_wmi_event_parse *out) {
-    const u8 *table[0x2c0] = {0}; u16 lengths[0x2c0] = {0};
+    const u8 *table[0x386] = {0}; u16 lengths[0x386] = {0};
     memset(out, 0, sizeof(*out));
     int ret = parse_event_table(bytes, length, table, lengths, out);
     if (ret) return ret;
@@ -396,6 +506,26 @@ int oracle_wmi_event_parse(u32 kind, const u8 *bytes, size_t length,
         return 0;
     }
     if (kind == ORACLE_MGMT_TX) { REQUIRE(0x1a7); return push_words(out, table[0x1a7], 5, TF_MTX_DESC); }
+    if (kind == ORACLE_FW_MEM_DUMP) {
+        REQUIRE(0x18d); return push_words(out, table[0x18d], 2, TF_FW_DUMP_REQUEST);
+    }
+    if (kind == ORACLE_ROAM_CAPABILITY) {
+        REQUIRE(0x385); return push_words(out, table[0x385], 1, TF_ROAM_CAPABILITY);
+    }
+    if (kind == ORACLE_PEER_CREATE) {
+        REQUIRE(0x364); const u8 *p = table[0x364];
+        FIELD(get32(p)); FIELD(getmac(p + 4)); FIELD(get32(p + 12)); return 0;
+    }
+    if (kind == ORACLE_FREQ_AVOID) {
+        REQUIRE(0x47); REQUIRE(0x12); size_t count = get32(table[0x47]), actual;
+        ret = nested_count(table[0x12], lengths[0x12], 0x48, 8, &actual);
+        if (ret || actual != count) return -22;
+        FIELD(count); const u8 *p = table[0x12];
+        for (size_t i = 0; i < count; i++) {
+            u16 len = get32(p); FIELD(get32(p + 4)); FIELD(get32(p + 8)); p += 4 + len;
+        }
+        return 0;
+    }
     return -22;
 #undef FIELD
 #undef REQUIRE
