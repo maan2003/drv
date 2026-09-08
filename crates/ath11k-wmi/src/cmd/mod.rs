@@ -463,9 +463,9 @@ impl EncodeCommand for ScanStop {
             w.u32(self.requester);
             w.u32(self.scan_id);
             w.u32(match self.cancel_type {
-                ScanCancelType::PdevAll => 1,
-                ScanCancelType::VdevAll => 2,
-                ScanCancelType::Single => 3,
+                ScanCancelType::PdevAll => 0x0400_0000,
+                ScanCancelType::VdevAll => 0x0100_0000,
+                ScanCancelType::Single => 0,
             });
             w.u32(self.vdev_id);
             w.u32(self.pdev_id)
@@ -525,6 +525,29 @@ mod tests {
         };
         assert_eq!(r.encode_command(), Err(WmiError::Malformed))
     }
+    #[test]
+    fn scan_stop_uses_sparse_wire_cancel_values() {
+        for (cancel_type, expected) in [
+            (ScanCancelType::Single, 0),
+            (ScanCancelType::VdevAll, 0x0100_0000),
+            (ScanCancelType::PdevAll, 0x0400_0000),
+        ] {
+            let command = ScanStop {
+                requester: 1,
+                scan_id: 2,
+                cancel_type,
+                vdev_id: 3,
+                pdev_id: 4,
+            }
+            .encode_command()
+            .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(command.tlvs()[12..16].try_into().unwrap()),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn management_frame_header_uses_unpadded_length() {
         let request = MgmtSend {
