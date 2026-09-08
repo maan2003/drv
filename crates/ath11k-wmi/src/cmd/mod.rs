@@ -3,10 +3,16 @@ use crate::tags::*;
 use crate::{Command, WmiError};
 use alloc::vec::Vec;
 
+mod control;
+mod device;
 mod peer_assoc;
 mod scan;
+mod wow;
+pub use control::*;
+pub use device::*;
 pub use peer_assoc::*;
 pub use scan::*;
+pub use wow::*;
 
 pub trait CommandEncoder {
     type Request;
@@ -467,8 +473,10 @@ impl EncodeCommand for ScanStop {
     }
 }
 
+mod ap;
 mod init;
 mod lifecycle;
+pub use ap::*;
 pub use init::*;
 pub use lifecycle::*;
 
