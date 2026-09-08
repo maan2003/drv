@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 mod control;
 mod device;
+pub mod golden;
 mod peer_assoc;
 mod scan;
 mod transport;

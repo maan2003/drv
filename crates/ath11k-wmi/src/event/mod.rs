@@ -533,6 +533,102 @@ pub struct OpaqueEvent {
 pub struct OpaqueEventDecoder {
     pub id: EventId,
 }
+
+/// Validate one receive message through the same typed decoder selected by
+/// `ath11k_wmi_tlv_op_rx`. This is intentionally type-erased for transcript
+/// harnesses; normal consumers should use the typed decoder directly.
+pub fn validate_known_event(event: Event) -> Result<&'static str, WmiError> {
+    macro_rules! fixed {
+        ($ty:ty, $name:literal) => {{
+            let id = event.id;
+            Decoder::<$ty>::new(id).decode(event)?;
+            Ok($name)
+        }};
+    }
+    match event.id {
+        tags::WMI_SERVICE_READY_EVENTID => {
+            ServiceReadyDecoder.decode(event)?;
+            Ok("ServiceReady")
+        }
+        tags::WMI_SERVICE_READY_EXT_EVENTID => {
+            ServiceReadyExtDecoder.decode(event)?;
+            Ok("ServiceReadyExt")
+        }
+        tags::WMI_SERVICE_READY_EXT2_EVENTID => {
+            ServiceReadyExt2Decoder.decode(event)?;
+            Ok("ServiceReadyExt2")
+        }
+        tags::WMI_REG_CHAN_LIST_CC_EVENTID => {
+            fixed!(RegulatoryChannelListLegacy, "RegulatoryChannelListLegacy")
+        }
+        tags::WMI_REG_CHAN_LIST_CC_EXT_EVENTID => fixed!(
+            RegulatoryChannelListExtended,
+            "RegulatoryChannelListExtended"
+        ),
+        tags::WMI_READY_EVENTID => {
+            ReadyDecoder.decode(event)?;
+            Ok("Ready")
+        }
+        tags::WMI_PEER_DELETE_RESP_EVENTID => fixed!(PeerDeleteResponse, "PeerDeleteResponse"),
+        tags::WMI_VDEV_START_RESP_EVENTID => fixed!(VdevStartResponse, "VdevStartResponse"),
+        tags::WMI_OFFLOAD_BCN_TX_STATUS_EVENTID => fixed!(BeaconTxStatus, "BeaconTxStatus"),
+        tags::WMI_VDEV_STOPPED_EVENTID => fixed!(VdevStopped, "VdevStopped"),
+        tags::WMI_MGMT_RX_EVENTID => fixed!(MgmtRx, "MgmtRx"),
+        tags::WMI_MGMT_TX_COMPLETION_EVENTID => fixed!(MgmtTxCompletion, "MgmtTxCompletion"),
+        tags::WMI_SCAN_EVENTID => fixed!(Scan, "Scan"),
+        tags::WMI_PEER_STA_KICKOUT_EVENTID => fixed!(PeerStaKickout, "PeerStaKickout"),
+        tags::WMI_ROAM_EVENTID => fixed!(Roam, "Roam"),
+        tags::WMI_CHAN_INFO_EVENTID => fixed!(ChannelInfo, "ChannelInfo"),
+        tags::WMI_PDEV_BSS_CHAN_INFO_EVENTID => fixed!(PdevBssChannelInfo, "PdevBssChannelInfo"),
+        tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID => {
+            fixed!(InstallKeyCompletion, "InstallKeyCompletion")
+        }
+        tags::WMI_SERVICE_AVAILABLE_EVENTID => fixed!(ServiceAvailable, "ServiceAvailable"),
+        tags::WMI_PEER_ASSOC_CONF_EVENTID => fixed!(PeerAssocConfirmation, "PeerAssocConfirmation"),
+        tags::WMI_UPDATE_STATS_EVENTID => fixed!(UpdateStats, "UpdateStats"),
+        tags::WMI_PDEV_CTL_FAILSAFE_CHECK_EVENTID => {
+            fixed!(PdevCtlFailsafeCheck, "PdevCtlFailsafeCheck")
+        }
+        tags::WMI_PDEV_CSA_SWITCH_COUNT_STATUS_EVENTID => {
+            fixed!(PdevCsaSwitchCount, "PdevCsaSwitchCount")
+        }
+        tags::WMI_PDEV_TEMPERATURE_EVENTID => fixed!(PdevTemperature, "PdevTemperature"),
+        tags::WMI_PDEV_DMA_RING_BUF_RELEASE_EVENTID => {
+            fixed!(DmaRingBufferRelease, "DmaRingBufferRelease")
+        }
+        tags::WMI_HOST_FILS_DISCOVERY_EVENTID => fixed!(FilsDiscovery, "FilsDiscovery"),
+        tags::WMI_OFFLOAD_PROB_RESP_TX_STATUS_EVENTID => {
+            fixed!(ProbeResponseTxStatus, "ProbeResponseTxStatus")
+        }
+        tags::WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID => {
+            fixed!(ObssColorCollision, "ObssColorCollision")
+        }
+        tags::WMI_TWT_ADD_DIALOG_EVENTID => fixed!(TwtAddDialog, "TwtAddDialog"),
+        tags::WMI_PDEV_DFS_RADAR_DETECTION_EVENTID => fixed!(PdevDfsRadar, "PdevDfsRadar"),
+        tags::WMI_VDEV_DELETE_RESP_EVENTID => fixed!(VdevDeleteResponse, "VdevDeleteResponse"),
+        tags::WMI_WOW_WAKEUP_HOST_EVENTID => fixed!(WowWakeupHost, "WowWakeupHost"),
+        tags::WMI_11D_NEW_COUNTRY_EVENTID => fixed!(NewCountry, "NewCountry"),
+        tags::WMI_PEER_STA_PS_STATECHG_EVENTID => {
+            fixed!(PeerStaPowerSaveStateChange, "PeerStaPowerSaveStateChange")
+        }
+        tags::WMI_GTK_OFFLOAD_STATUS_EVENTID => fixed!(GtkOffloadStatus, "GtkOffloadStatus"),
+        tags::WMI_P2P_NOA_EVENTID => fixed!(P2pNoa, "P2pNoa"),
+        tags::WMI_PEER_CFR_CAPTURE_EVENTID => {
+            PeerCfrCaptureDecoder { id: event.id }.decode(event)?;
+            Ok("PeerCfrCapture")
+        }
+        tags::WMI_PDEV_UTF_EVENTID | tags::WMI_DIAG_EVENTID => {
+            OpaqueEventDecoder { id: event.id }.decode(event)?;
+            Ok("OpaqueEvent")
+        }
+        _ => {
+            for tlv in TlvIter::new(event.tlvs()) {
+                tlv?;
+            }
+            Ok("opaque/unknown")
+        }
+    }
+}
 impl EventDecoder for OpaqueEventDecoder {
     type Output = OpaqueEvent;
     fn decode(&self, event: Event) -> Result<Self::Output, WmiError> {
@@ -914,5 +1010,18 @@ mod tests {
         assert_eq!(fixed.phy_capability, 0xaabb_ccdd);
         assert_eq!(fixed.max_supported_macs, 2);
         assert!(decoded.service_bitmap.is_some());
+    }
+
+    #[test]
+    fn known_event_validation_dispatches_typed_decoder() {
+        let value: Vec<_> = [0u32; 7].into_iter().flat_map(u32::to_le_bytes).collect();
+        let event = Event::from_tlvs(tags::WMI_SCAN_EVENTID, tlv(Scan::TAG, &value)).unwrap();
+        assert_eq!(validate_known_event(event), Ok("Scan"));
+    }
+
+    #[test]
+    fn unknown_event_still_requires_structural_tlvs() {
+        let event = Event::from_tlvs(EventId(u32::MAX), alloc::vec![8, 0, 1, 0]).unwrap();
+        assert_eq!(validate_known_event(event), Err(WmiError::Malformed));
     }
 }
