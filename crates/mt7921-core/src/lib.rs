@@ -6398,7 +6398,7 @@ pub fn encode_client_bss_command(
     }
     let mut payload = encode_client_bss_basic_payload(
         bss_index,
-        enable,
+        true,
         u8::from(!enable),
         bssid,
         beacon_interval,
@@ -6497,7 +6497,7 @@ pub fn encode_key_v2_command(
         bytes[61] = 2;
         bytes[64..68].copy_from_slice(&[5, 36, gtk_id, 16]);
         bytes[68..84].copy_from_slice(gtk);
-        bytes[100..104].copy_from_slice(&[10, 36, 0, 16]);
+        bytes[100..104].copy_from_slice(&[10, 36, key_id, 16]);
         bytes[104..120].copy_from_slice(key);
     } else {
         bytes[58..60].copy_from_slice(&44u16.to_le_bytes());
@@ -9708,8 +9708,12 @@ mod tests {
         assert_eq!(associated, associated_command);
         assert_eq!(associated.len(), 92);
         assert_eq!(&associated[52..56], &[0, 0, 32, 0]);
+        assert_eq!((associated[56], associated[64]), (1, 0));
         assert_eq!(&associated[82..84], &[0, 0]); // phymode_ext, link_idx
         assert_eq!(&associated[84..92], &[15, 0, 8, 0, 1, 0, 0, 0]);
+
+        let disabled = encode_client_bss_command(8, 0, peer, 36, 100, 2, true, false).unwrap();
+        assert_eq!((disabled[56], disabled[64]), (1, 1));
 
         let parse = |payload: &[u8]| -> Result<Vec<(u16, usize, usize)>, ()> {
             let mut offset = 4;
@@ -9740,6 +9744,34 @@ mod tests {
         stale_total48.extend_from_slice(&associated_payload[36..]);
         assert_eq!(stale_total48.len(), 48);
         assert!(parse(&stale_total48).is_err());
+    }
+
+    #[test]
+    fn retained_gtk_and_igtk_commands_preserve_management_key_id() {
+        let fixture = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let digit = |byte| match byte {
+                        b'0'..=b'9' => byte - b'0',
+                        b'a'..=b'f' => byte - b'a' + 10,
+                        _ => panic!("non-hex fixture"),
+                    };
+                    digit(pair[0]) << 4 | digit(pair[1])
+                })
+                .collect::<Vec<_>>()
+        };
+        let gtk = core::array::from_fn::<_, 16, _>(|index| 0x10 + index as u8);
+        let igtk = core::array::from_fn::<_, 16, _>(|index| 0xa0 + index as u8);
+        let expected = [
+            "88000041000001800000000000000000000000000000000000000000000000006800030000a00009000000070000000000130100010e0000110050000002000005240210101112131415161718191a1b1c1d1e1f000000000000000000000000000000000a240410a0a1a2a3a4a5a6a7a8a9aaabacadaeaf00000000000000000000000000000000",
+            "88000041000001800000000000000000000000000000000000000000000000006800030000a00009000000070000000000130100010e0000110050000002000005240210101112131415161718191a1b1c1d1e1f000000000000000000000000000000000a240510a0a1a2a3a4a5a6a7a8a9aaabacadaeaf00000000000000000000000000000000",
+        ];
+
+        for (igtk_id, expected) in (4..=5).zip(expected) {
+            let command = encode_igtk_command(9, 0, igtk_id, &igtk, 2, &gtk).unwrap();
+            assert_eq!(command.as_bytes(), fixture(expected));
+        }
     }
 
     #[test]
@@ -10010,7 +10042,7 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[12][56], 0);
+        assert_eq!(transcript[12][56], 1);
         assert_eq!(transcript[11][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
@@ -10067,7 +10099,7 @@ mod tests {
                 (2, 2, 92, 1),
                 (2, 3, 68, 36),
                 (3, 5, 88, 0),
-                (2, 6, 92, 0),
+                (2, 6, 92, 1),
             ]
         );
         assert!(state.preauth_peer.is_none());
@@ -10135,7 +10167,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(transcript, [(2, 1), (2, 0)]);
+        assert_eq!(transcript, [(2, 1), (2, 1)]);
         assert!(!rolled_back.bss_programmed);
         assert!(!rolled_back.firmware_uncertain);
 
@@ -10166,7 +10198,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(boundary_transcript, [(2, 1), (2, 36), (2, 0)]);
+        assert_eq!(boundary_transcript, [(2, 1), (2, 36), (2, 1)]);
         assert!(boundary_failure.association.is_none());
         assert!(!boundary_failure.bss_programmed);
         assert!(!boundary_failure.post_assoc_rlm_programmed);
@@ -10202,7 +10234,7 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-        assert_eq!(teardown, [(3, 0), (2, 0)]);
+        assert_eq!(teardown, [(3, 0), (2, 1)]);
         assert!(!dirty.bss_programmed);
         assert!(!dirty.firmware_uncertain);
         assert!(dirty.joined.is_none());
