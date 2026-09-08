@@ -53,7 +53,7 @@
           cargoRoot = "crates/wlan-softmac-host";
           buildAndTestSubdir = "crates/wlan-softmac-host";
           cargoLock.lockFile = ./crates/wlan-softmac-host/Cargo.lock;
-          nativeBuildInputs = [ pkgs.clippy ];
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
