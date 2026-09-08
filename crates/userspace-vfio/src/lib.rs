@@ -36,6 +36,7 @@ const VFIO_REGION_INFO_FLAG_READ: u32 = 1;
 const VFIO_REGION_INFO_FLAG_WRITE: u32 = 2;
 const VFIO_REGION_INFO_FLAG_MMAP: u32 = 4;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
+const VFIO_DEVICE_FLAGS_PCI: u32 = 1 << 1;
 const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
@@ -220,6 +221,18 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
     }
 }
 
+fn ioctl_none(fd: RawFd, request: u64, operation: &str) -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_support::dispatch(fd, request, std::ptr::null_mut()) {
+        return result.map_err(|error| format!("{operation}: fake errno {error}"));
+    }
+    if unsafe { ioctl(fd, request) } < 0 {
+        Err(format!("{operation}: {}", std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(feature = "test-support")]
 pub mod test_support {
     use super::*;
@@ -227,6 +240,7 @@ pub mod test_support {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum Record {
+        QueryDevice,
         Bind,
         AllocateIoas,
         AttachIoas(u32),
@@ -248,8 +262,22 @@ pub mod test_support {
         },
         QueryIrq(u32),
         InstallIrq(u32),
+        InstallIrqAt {
+            index: u32,
+            start: u32,
+        },
         UnmaskIrq(u32),
+        UnmaskIrqAt {
+            index: u32,
+            start: u32,
+        },
         DisableIrq(u32),
+        DisableIrqAt {
+            index: u32,
+            start: u32,
+        },
+        QueryRegion(u32),
+        Reset,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,6 +290,13 @@ pub mod test_support {
         broker_supported: bool,
         records: Rc<RefCell<Vec<Record>>>,
         fail_once: Option<Failure>,
+        pci_irqs: Option<[FakeIrq; 2]>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct FakeIrq {
+        pub count: u32,
+        pub eventfd: bool,
     }
     thread_local! {
         static FAKE: RefCell<Option<Fake>> = const { RefCell::new(None) };
@@ -285,6 +320,28 @@ pub mod test_support {
                 broker_supported,
                 records: Rc::clone(&records),
                 fail_once,
+                pci_irqs: None,
+            });
+        });
+        let result = run();
+        FAKE.with(|fake| *fake.borrow_mut() = None);
+        let recorded = records.borrow().clone();
+        (result, recorded)
+    }
+
+    pub fn with_fake_pci_io<T>(
+        msi: FakeIrq,
+        msix: FakeIrq,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<Record>) {
+        let records = Rc::new(RefCell::new(Vec::new()));
+        FAKE.with(|fake| {
+            assert!(fake.borrow().is_none(), "nested fake VFIO transport");
+            *fake.borrow_mut() = Some(Fake {
+                broker_supported: false,
+                records: Rc::clone(&records),
+                fail_once: None,
+                pci_irqs: Some([msi, msix]),
             });
         });
         let result = run();
@@ -302,6 +359,12 @@ pub mod test_support {
             let mut slot = slot.borrow_mut();
             let fake = slot.as_mut()?;
             let record = match request {
+                VFIO_DEVICE_GET_INFO => {
+                    // SAFETY: ioctl_mut supplies DeviceInfo for this request.
+                    let info = unsafe { value.cast::<DeviceInfo>().as_mut().unwrap() };
+                    info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI;
+                    Record::QueryDevice
+                }
                 VFIO_DEVICE_BIND_IOMMUFD => Record::Bind,
                 IOMMU_IOAS_ALLOC => {
                     // SAFETY: ioctl_mut supplies IoasAlloc for this request.
@@ -363,21 +426,66 @@ pub mod test_support {
                 VFIO_DEVICE_GET_IRQ_INFO => {
                     // SAFETY: ioctl_mut supplies IrqInfo for this request.
                     let info = unsafe { value.cast::<IrqInfo>().as_mut().unwrap() };
-                    info.count = 1;
-                    info.flags = 1 | (1 << 1) | (1 << 2);
+                    if let Some(irqs) = fake.pci_irqs
+                        && let Some(irq) =
+                            info.index.checked_sub(1).and_then(|i| irqs.get(i as usize))
+                    {
+                        info.count = irq.count;
+                        info.flags = u32::from(irq.eventfd);
+                    } else {
+                        info.count = 1;
+                        info.flags = 1 | (1 << 1) | (1 << 2);
+                    }
                     Record::QueryIrq(info.index)
+                }
+                VFIO_DEVICE_GET_REGION_INFO => {
+                    // SAFETY: ioctl_mut supplies RegionInfo for this request.
+                    let info = unsafe { value.cast::<RegionInfo>().as_mut().unwrap() };
+                    info.flags = VFIO_REGION_INFO_FLAG_READ
+                        | VFIO_REGION_INFO_FLAG_WRITE
+                        | VFIO_REGION_INFO_FLAG_MMAP;
+                    info.size = 4096;
+                    info.offset = u64::from(info.index) * 4096;
+                    Record::QueryRegion(info.index)
                 }
                 VFIO_DEVICE_SET_IRQS => {
                     // SAFETY: both IRQ payloads begin with IrqSetHeader.
                     let set = unsafe { value.cast::<IrqSetHeader>().as_ref().unwrap() };
                     if set.flags & VFIO_IRQ_SET_ACTION_UNMASK != 0 {
-                        Record::UnmaskIrq(set.index)
+                        if set.start == 0 {
+                            Record::UnmaskIrq(set.index)
+                        } else {
+                            Record::UnmaskIrqAt {
+                                index: set.index,
+                                start: set.start,
+                            }
+                        }
                     } else if set.count == 0 {
                         Record::DisableIrq(set.index)
                     } else {
-                        Record::InstallIrq(set.index)
+                        // SAFETY: DATA_EVENTFD payload extends the common header.
+                        let eventfd =
+                            unsafe { value.cast::<IrqSetEventfd>().as_ref().unwrap() }.eventfd;
+                        if eventfd == -1 {
+                            if set.start == 0 {
+                                Record::DisableIrq(set.index)
+                            } else {
+                                Record::DisableIrqAt {
+                                    index: set.index,
+                                    start: set.start,
+                                }
+                            }
+                        } else if set.start == 0 {
+                            Record::InstallIrq(set.index)
+                        } else {
+                            Record::InstallIrqAt {
+                                index: set.index,
+                                start: set.start,
+                            }
+                        }
                     }
                 }
+                VFIO_DEVICE_RESET => Record::Reset,
                 _ => return Some(Err(25)),
             };
             let fail = match (&record, fake.fail_once) {
@@ -995,6 +1103,7 @@ impl Drop for RegionMapping {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrqCapability {
     pub index: u32,
     pub count: u32,
@@ -1024,14 +1133,26 @@ pub struct VfioIrq {
     device: Arc<File>,
     event_fd: OwnedFd,
     index: u32,
+    start: u32,
     installed: bool,
     automasked: bool,
     pending_unmask: std::cell::Cell<bool>,
 }
 impl VfioIrq {
     pub fn install(device: &Arc<File>, capability: IrqCapability) -> Result<Self, String> {
+        Self::install_at(device, capability, 0)
+    }
+
+    pub fn install_at(
+        device: &Arc<File>,
+        capability: IrqCapability,
+        start: u32,
+    ) -> Result<Self, String> {
         if capability.count == 0 || !capability.eventfd {
             return Err("refused non-eventfd VFIO interrupt".into());
+        }
+        if start >= capability.count {
+            return Err("VFIO interrupt vector is out of range".into());
         }
         let raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
         if raw < 0 {
@@ -1046,7 +1167,7 @@ impl VfioIrq {
                 argsz: size::<IrqSetEventfd>(),
                 flags: VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
                 index: capability.index,
-                start: 0,
+                start,
                 count: 1,
             },
             eventfd: event_fd.as_raw_fd(),
@@ -1061,6 +1182,7 @@ impl VfioIrq {
             device: Arc::clone(device),
             event_fd,
             index: capability.index,
+            start,
             installed: true,
             automasked: capability.automasked,
             pending_unmask: std::cell::Cell::new(false),
@@ -1105,7 +1227,7 @@ impl VfioIrq {
             argsz: size::<IrqSetHeader>(),
             flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK,
             index: self.index,
-            start: 0,
+            start: self.start,
             count: 1,
         };
         if let Err(error) = ioctl_mut(
@@ -1130,7 +1252,22 @@ impl VfioIrq {
         // the unmasked state before trigger deassignment. Otherwise reopening
         // the vector can inherit the stale kernel mask.
         self.prepare_wait()?;
-        disable_irq(&self.device, self.index)?;
+        let mut set = IrqSetEventfd {
+            header: IrqSetHeader {
+                argsz: size::<IrqSetEventfd>(),
+                flags: VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                index: self.index,
+                start: self.start,
+                count: 1,
+            },
+            eventfd: -1,
+        };
+        ioctl_mut(
+            self.device.as_raw_fd(),
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "disable VFIO IRQ vector",
+        )?;
         self.installed = false;
         Ok(())
     }
@@ -1224,18 +1361,31 @@ pub fn reset_device_supported(device: &File) -> Result<(), String> {
     }
     Ok(())
 }
+pub fn pci_device_reset_supported(device: &File) -> Result<(), String> {
+    let mut info = DeviceInfo {
+        argsz: size::<DeviceInfo>(),
+        ..Default::default()
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_GET_INFO,
+        &mut info,
+        "query VFIO PCI/reset capability",
+    )?;
+    if info.flags & VFIO_DEVICE_FLAGS_PCI == 0 {
+        return Err("VFIO device does not advertise PCI support".into());
+    }
+    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+        return Err("VFIO device does not advertise reset support".into());
+    }
+    Ok(())
+}
 pub fn reset_device(device: &File) -> Result<(), String> {
     reset_device_supported(device)?;
     reset_device_unchecked(device)
 }
 pub fn reset_device_unchecked(device: &File) -> Result<(), String> {
-    if unsafe { ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET) } < 0 {
-        return Err(format!(
-            "VFIO device reset: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+    ioctl_none(device.as_raw_fd(), VFIO_DEVICE_RESET, "VFIO device reset")
 }
 
 #[cfg(test)]

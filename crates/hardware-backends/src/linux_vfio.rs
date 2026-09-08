@@ -13,8 +13,8 @@ use std::{
     },
 };
 use userspace_vfio::{
-    AnonymousMapping, DeviceMapping, DmaBrokerCommand, DmaMapping, Ioas, RegionMapping, VfioIrq,
-    dma_broker_uapi as broker,
+    AnonymousMapping, DeviceMapping, DmaBrokerCommand, DmaMapping, Ioas, IrqCapability,
+    RegionMapping, VfioIrq, dma_broker_uapi as broker,
 };
 
 const PAGE: usize = 4096;
@@ -47,6 +47,7 @@ impl std::error::Error for LinuxVfioError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flavor {
     Coherent,
+    PciCoherent,
     Broker,
 }
 
@@ -71,6 +72,7 @@ pub struct LinuxVfio {
     iommu: Option<Arc<File>>,
     ioas: Option<Ioas>,
     flavor: Flavor,
+    pci_irq: Option<IrqCapability>,
     generation: u64,
     next_id: u64,
     next_iova: u64,
@@ -103,13 +105,64 @@ impl LinuxVfio {
         Self::initialize_broker(device, userspace_vfio::probe_dma_broker)
     }
 
+    pub fn open_pci_coherent(path: impl AsRef<Path>) -> std::result::Result<Self, LinuxVfioError> {
+        let device = Arc::new(open_device(path)?);
+        let iommu = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/iommu")
+                .map_err(LinuxVfioError::OpenIommufd)?,
+        );
+        Self::initialize_pci_coherent(device, iommu, |device, iommu| {
+            userspace_vfio::bind_iommufd(device, iommu)?;
+            let ioas = userspace_vfio::allocate_ioas(iommu)?;
+            userspace_vfio::attach_ioas(device, ioas.id())?;
+            Ok(ioas)
+        })
+    }
+
     fn initialize_coherent(
         device: Arc<File>,
         iommu: Arc<File>,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         let ioas = setup(&device, &iommu).map_err(LinuxVfioError::Setup)?;
-        Ok(Self::new(device, Flavor::Coherent, Some(iommu), Some(ioas)))
+        Ok(Self::new(
+            device,
+            Flavor::Coherent,
+            Some(iommu),
+            Some(ioas),
+            None,
+        ))
+    }
+
+    fn initialize_pci_coherent(
+        device: Arc<File>,
+        iommu: Arc<File>,
+        setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let ioas = setup(&device, &iommu).map_err(LinuxVfioError::Setup)?;
+        userspace_vfio::pci_device_reset_supported(&device).map_err(LinuxVfioError::Setup)?;
+        let msix = userspace_vfio::irq_capability(&device, 2).map_err(LinuxVfioError::Setup)?;
+        let irq = if msix.eventfd && msix.count > 0 {
+            msix
+        } else {
+            let msi = userspace_vfio::irq_capability(&device, 1).map_err(LinuxVfioError::Setup)?;
+            if !msi.eventfd || msi.count == 0 {
+                return Err(LinuxVfioError::Setup(
+                    "VFIO PCI device provides neither eventfd MSI-X nor MSI".into(),
+                ));
+            }
+            msi
+        };
+        Ok(Self::new(
+            device,
+            Flavor::PciCoherent,
+            Some(iommu),
+            Some(ioas),
+            Some(irq),
+        ))
     }
 
     fn initialize_broker(
@@ -117,7 +170,7 @@ impl LinuxVfio {
         probe: impl FnOnce(&File) -> std::result::Result<(), String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         probe(&device).map_err(LinuxVfioError::DmaBrokerUnavailable)?;
-        Ok(Self::new(device, Flavor::Broker, None, None))
+        Ok(Self::new(device, Flavor::Broker, None, None, None))
     }
 
     fn new(
@@ -125,12 +178,14 @@ impl LinuxVfio {
         flavor: Flavor,
         iommu: Option<Arc<File>>,
         ioas: Option<Ioas>,
+        pci_irq: Option<IrqCapability>,
     ) -> Self {
         Self {
             device,
             iommu,
             ioas,
             flavor,
+            pci_irq,
             generation: 1,
             next_id: 1,
             next_iova: FIRST_IOVA,
@@ -279,6 +334,9 @@ impl Backend for LinuxVfio {
     }
 
     fn open_region(&mut self, index: u8) -> Result<u64> {
+        if self.flavor == Flavor::PciCoherent && index > 5 {
+            return Err(Error::Invalid);
+        }
         let info = userspace_vfio::region_info(&self.device, u32::from(index))
             .map_err(|_| Error::DeviceFault)?;
         let len = usize::try_from(info.size).map_err(|_| Error::Limit)?;
@@ -365,7 +423,7 @@ impl Backend for LinuxVfio {
         let mapped_len = checked_allocation(size, constraints)?;
         let id = self.id()?;
         let dma = match self.flavor {
-            Flavor::Coherent => {
+            Flavor::Coherent | Flavor::PciCoherent => {
                 let iova = aligned(self.next_iova, constraints.alignment)?;
                 let last = iova
                     .checked_add(mapped_len as u64 - 1)
@@ -548,10 +606,20 @@ impl Backend for LinuxVfio {
     }
 
     fn open_interrupt(&mut self, vector: u32) -> Result<u64> {
-        let capability =
-            userspace_vfio::irq_capability(&self.device, vector).map_err(|_| Error::DeviceFault)?;
+        let (capability, start) = if let Some(capability) = self.pci_irq {
+            if vector >= capability.count {
+                return Err(Error::Limit);
+            }
+            (capability, vector)
+        } else {
+            (
+                userspace_vfio::irq_capability(&self.device, vector)
+                    .map_err(|_| Error::DeviceFault)?,
+                0,
+            )
+        };
         let interrupt =
-            VfioIrq::install(&self.device, capability).map_err(|_| Error::DeviceFault)?;
+            VfioIrq::install_at(&self.device, capability, start).map_err(|_| Error::DeviceFault)?;
         let id = self.id()?;
         self.interrupts.insert(id, (vector, interrupt));
         Ok(id)
@@ -607,6 +675,7 @@ impl Backend for LinuxVfio {
         // must become stale even if cleanup or the reset ioctl later fails.
         self.generation = next_generation;
         self.revoke_interrupts()?;
+        self.regions.clear();
         if self.flavor == Flavor::Broker {
             userspace_vfio::reset_device_unchecked(&self.device).map_err(|_| Error::DeviceFault)?;
             // Successful broker reset revoked handles in-kernel; only now may
@@ -649,7 +718,8 @@ impl Drop for LinuxVfio {
 mod tests {
     use super::*;
     use userspace_vfio::test_support::{
-        Failure, Record, signal_eventfd, with_fake_io, with_fake_io_failure,
+        Failure, FakeIrq, Record, signal_eventfd, with_fake_io, with_fake_io_failure,
+        with_fake_pci_io,
     };
 
     fn fake_device() -> (Arc<File>, std::path::PathBuf) {
@@ -667,6 +737,17 @@ mod tests {
             .unwrap();
         file.set_len(64 * 1024).unwrap();
         (Arc::new(file), path)
+    }
+
+    fn fake_pci_backend(device: Arc<File>) -> LinuxVfio {
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        LinuxVfio::initialize_pci_coherent(device, iommu, |device, iommu| {
+            userspace_vfio::bind_iommufd(device, iommu)?;
+            let ioas = userspace_vfio::allocate_ioas(iommu)?;
+            userspace_vfio::attach_ioas(device, ioas.id())?;
+            Ok(ioas)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -882,6 +963,108 @@ mod tests {
                 Record::DisableIrq(4),
             ]
         );
+    }
+
+    #[test]
+    fn pci_prefers_msix_maps_logical_vectors_and_rejects_non_bar_regions() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_pci_io(
+            FakeIrq {
+                count: 8,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 4,
+                eventfd: true,
+            },
+            || {
+                let mut backend = fake_pci_backend(device);
+                let bar = backend.open_region(5).unwrap();
+                assert_eq!(backend.open_region(6), Err(Error::Invalid));
+                let interrupt = backend.open_interrupt(3).unwrap();
+                assert_eq!(backend.open_interrupt(4), Err(Error::Limit));
+                backend.release_interrupt(interrupt);
+                backend.release_region(bar);
+            },
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(records.contains(&Record::QueryDevice));
+        assert!(records.contains(&Record::QueryIrq(2)));
+        assert!(!records.contains(&Record::QueryIrq(1)));
+        assert!(records.contains(&Record::QueryRegion(5)));
+        assert!(!records.contains(&Record::QueryRegion(6)));
+        assert!(records.contains(&Record::InstallIrqAt { index: 2, start: 3 }));
+        assert!(records.contains(&Record::DisableIrqAt { index: 2, start: 3 }));
+    }
+
+    #[test]
+    fn pci_falls_back_to_single_vector_msi() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 0,
+                eventfd: true,
+            },
+            || {
+                let mut backend = fake_pci_backend(device);
+                let interrupt = backend.open_interrupt(0).unwrap();
+                assert_eq!(backend.open_interrupt(1), Err(Error::Limit));
+                backend.release_interrupt(interrupt);
+            },
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(records.contains(&Record::QueryIrq(2)));
+        assert!(records.contains(&Record::QueryIrq(1)));
+        assert!(records.contains(&Record::InstallIrq(1)));
+        assert!(records.contains(&Record::DisableIrq(1)));
+    }
+
+    #[test]
+    fn pci_reset_revokes_resources_before_device_reset() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 2,
+                eventfd: true,
+            },
+            || {
+                let mut backend = fake_pci_backend(device);
+                let region = backend.open_region(0).unwrap();
+                let dma = backend
+                    .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, true)
+                    .unwrap();
+                let interrupt = backend.open_interrupt(1).unwrap();
+                assert_eq!(backend.reset().unwrap(), 2);
+                assert_eq!(backend.region_len(&region), 0);
+                assert_eq!(backend.dma_device_address(&dma, 0), Err(Error::StaleHandle));
+                assert!(matches!(
+                    backend.wait_interrupt(&interrupt, 0),
+                    Err(Error::StaleHandle)
+                ));
+            },
+        );
+        std::fs::remove_file(path).unwrap();
+        let disable = records
+            .iter()
+            .position(|record| *record == Record::DisableIrqAt { index: 2, start: 1 })
+            .unwrap();
+        let unmap = records
+            .iter()
+            .position(|record| matches!(record, Record::Unmap { .. }))
+            .unwrap();
+        let reset = records
+            .iter()
+            .position(|record| *record == Record::Reset)
+            .unwrap();
+        assert!(disable < reset && unmap < reset);
     }
 
     #[test]
