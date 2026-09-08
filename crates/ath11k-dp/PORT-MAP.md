@@ -32,7 +32,7 @@ DMA snapshots are not yet available.
 | `dp_rx.c:ath11k_dp_rxbufs_replenish` RXDMA descriptor | `tx::ClientDataPath::ath11k_dp_rxbufs_replenish` | model-checked | HAL `RxdmaBufferRing::for_buffer` + streaming DMA |
 | `dp_rx.c:ath11k_dp_process_rx` MSDU-link processing | — | blocked | HAL parser exists; link-bank DMA lookup seam is not yet exposed |
 | `dp_rx.c:ath11k_peer_rx_tid_setup` and REO command family | — | blocked | requested typed REO command setup from HAL owner |
-| `dp_rx.c:ath11k_dp_rx_msdu_coalesce` | — | pending | client multi-buffer chaining |
+| `dp_rx.c:ath11k_dp_rx_msdu_coalesce` | `tx::parse_received_chain` | model-checked | two-buffer boundary/L3-pad fixture |
 | `dp_tx.c:ath11k_dp_tx_htt_h2t_ppdu_stats_req` | — | deferred | PPDU/pktlog telemetry, after client path |
 | `dp_tx.c:ath11k_dp_tx_htt_h2t_ext_stats_req` | — | deferred | debugfs extended statistics |
 | `dp_tx.c:ath11k_dp_tx_htt_monitor_mode_ring_config` | — | deferred | monitor mode |

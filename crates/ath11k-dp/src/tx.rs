@@ -12,7 +12,8 @@ use crate::htt::TxCompletion;
 use crate::rx::{RxDescriptorStatus, WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
 use crate::{DataPath, DataRings, DpError, RxPacket, TxPacket};
 
-const MAX_MSDU_ID: u32 = (1 << 17) - 1;
+// idr_alloc(..., 0, DP_TX_IDR_SIZE - 1) uses an exclusive upper bound.
+const MAX_MSDU_ID: u32 = 32_766;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -59,9 +60,18 @@ struct PendingRx<B: Backend> {
     buffer: RxBuffer<B>,
 }
 
+struct RxFragment {
+    bytes: Vec<u8>,
+    continuation: bool,
+    peer: crate::PeerId,
+    sequence_number: u16,
+    tid: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RxdmaConfig {
     pub ring: RingId,
+    pub pdev_id: u8,
     pub return_buffer_manager: u8,
     pub buffer_size: usize,
 }
@@ -89,6 +99,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     rxdma: Option<RxdmaConfig>,
     next_rx_cookie: u32,
     rx_buffers: Vec<PendingRx<B>>,
+    rx_chain: Vec<RxFragment>,
 }
 
 impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
@@ -102,8 +113,9 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
             next_msdu_id: 0,
             pending: Vec::new(),
             rxdma: None,
-            next_rx_cookie: 0,
+            next_rx_cookie: 1,
             rx_buffers: Vec::new(),
+            rx_chain: Vec::new(),
         }
     }
 
@@ -134,6 +146,7 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
 
     pub fn ath11k_dp_pdev_free(&mut self) {
         self.rx_buffers.clear();
+        self.rx_chain.clear();
         self.rxdma = None;
     }
 
@@ -158,7 +171,7 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
             let release = WbmReleaseRing::from_bytes(descriptor.bytes())
                 .map_err(|_| DpError::MalformedDescriptor)?;
             let cookie = release.buffer_address().software_cookie();
-            let msdu_id = (cookie >> 2) & MAX_MSDU_ID;
+            let msdu_id = (cookie >> 2) & 0x1_ffff;
             let position = self
                 .pending
                 .iter()
@@ -175,6 +188,11 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
                     peer: Some(crate::PeerId(release.peer_id())),
                 }
             };
+            // MEC notify (5) is WDS-only and unknown firmware statuses are
+            // only logged by Linux; neither owns/completes this MSDU.
+            if release.release_source() == 3 && htt.status >= 5 {
+                continue;
+            }
             // Removing drops the streaming mapping at the same point as the
             // C completion handler's dma_unmap_single.
             self.pending.swap_remove(position);
@@ -205,34 +223,54 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
     /// Interrupt-driven REO destination processing for direct MSDU buffers.
     pub fn receive_with_status(&mut self) -> Result<Option<ReceivedFrame>, DpError> {
         let reo_ring = self.data_rings.ok_or(DpError::NoResources)?.reo;
-        let descriptor = match self.rings.consume(reo_ring).map_err(map_hal)? {
-            Some(descriptor) => descriptor,
-            None => return Ok(None),
-        };
-        let destination = ReoDestinationRing::from_bytes(descriptor.bytes())
-            .map_err(|_| DpError::MalformedDescriptor)?;
-        if destination.buffer_type() != 0 {
-            return Err(DpError::UnsupportedDescriptor);
+        loop {
+            let descriptor = match self.rings.consume(reo_ring).map_err(map_hal)? {
+                Some(descriptor) => descriptor,
+                None => return Ok(None),
+            };
+            let destination = ReoDestinationRing::from_bytes(descriptor.bytes())
+                .map_err(|_| DpError::MalformedDescriptor)?;
+            let cookie = destination.buffer_address().software_cookie();
+            let position = self
+                .rx_buffers
+                .iter()
+                .position(|entry| entry.cookie == cookie)
+                .ok_or(DpError::MalformedDescriptor)?;
+            let mut entry = self.rx_buffers.swap_remove(position);
+            let bytes = entry.buffer.sync_and_read(entry.buffer.len())?;
+            // The C NAPI path replenishes every buffer reaped from the ring,
+            // including buffers dropped for a non-routing push reason.
+            self.replenish_one()?;
+            if destination.push_reason() != 1 {
+                continue;
+            }
+            let msdu = destination.msdu();
+            let mpdu = destination.mpdu();
+            self.rx_chain.push(RxFragment {
+                bytes,
+                continuation: msdu.continuation(),
+                peer: crate::PeerId(mpdu.peer_id()),
+                sequence_number: mpdu.sequence_number(),
+                tid: destination.rx_queue_number() as u8,
+            });
+            if msdu.continuation() {
+                continue;
+            }
+            let result = parse_received_chain(&self.rx_chain);
+            self.rx_chain.clear();
+            return result.map(Some);
         }
-        let cookie = destination.buffer_address().software_cookie();
-        let position = self
-            .rx_buffers
-            .iter()
-            .position(|entry| entry.cookie == cookie)
-            .ok_or(DpError::MalformedDescriptor)?;
-        let mut entry = self.rx_buffers.swap_remove(position);
-        let bytes = entry.buffer.sync_and_read(entry.buffer.len())?;
-        let result = parse_received_buffer(&bytes);
-        // The C NAPI path replenishes every buffer reaped from the ring,
-        // including buffers whose descriptors fail later validation.
-        self.replenish_one()?;
-        result.map(Some)
     }
 
     fn replenish_one(&mut self) -> Result<(), DpError> {
         let config = self.rxdma.ok_or(DpError::NoResources)?;
-        let cookie = self.next_rx_cookie & 0x1f_ffff;
-        self.next_rx_cookie = self.next_rx_cookie.wrapping_add(1);
+        let buffer_id = self.next_rx_cookie & 0x3_ffff;
+        let cookie = buffer_id | ((u32::from(config.pdev_id) & 7) << 18);
+        self.next_rx_cookie = if buffer_id == 0x3_ffff {
+            1
+        } else {
+            buffer_id + 1
+        };
         let buffer = RxBuffer::replenish(&self.device, config.buffer_size)?;
         let descriptor = RxdmaBufferRing::for_buffer(
             &buffer.device_address()?,
@@ -249,7 +287,11 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
     fn allocate_msdu_id(&mut self) -> Result<u32, DpError> {
         for _ in 0..=MAX_MSDU_ID {
             let candidate = self.next_msdu_id;
-            self.next_msdu_id = (self.next_msdu_id + 1) & MAX_MSDU_ID;
+            self.next_msdu_id = if candidate == MAX_MSDU_ID {
+                0
+            } else {
+                candidate + 1
+            };
             if !self.pending.iter().any(|entry| entry.msdu_id == candidate) {
                 return Ok(candidate);
             }
@@ -288,20 +330,69 @@ impl<B: Backend, R: Rings<B>> DataPath for ClientDataPath<B, R> {
     }
 }
 
+#[cfg(test)]
 fn parse_received_buffer(bytes: &[u8]) -> Result<ReceivedFrame, DpError> {
-    let descriptor = Wcn6750RxDescriptor::parse(bytes)?;
-    let status = descriptor.status();
+    parse_received_chain(&[RxFragment {
+        bytes: bytes.to_vec(),
+        continuation: false,
+        peer: crate::PeerId(0xffff),
+        sequence_number: 0,
+        tid: 0,
+    }])
+}
+
+fn parse_received_chain(fragments: &[RxFragment]) -> Result<ReceivedFrame, DpError> {
+    let first = fragments.first().ok_or(DpError::MalformedDescriptor)?;
+    let last = fragments.last().ok_or(DpError::MalformedDescriptor)?;
+    let descriptor = Wcn6750RxDescriptor::parse(&first.bytes)?;
+    let last_descriptor = Wcn6750RxDescriptor::parse(&last.bytes)?;
+    let mut status = descriptor.status();
+    let end_status = last_descriptor.status();
+    status.first_msdu = end_status.first_msdu;
+    status.last_msdu = end_status.last_msdu;
+    status.l3_padding = end_status.l3_padding;
+    status.msdu_done = end_status.msdu_done;
+    status.msdu_length_error = end_status.msdu_length_error;
+    status.fcs_error = end_status.fcs_error;
+    status.decrypt_error = end_status.decrypt_error;
+    status.tkip_mic_error = end_status.tkip_mic_error;
+    status.decrypted = end_status.decrypted;
+    if !status.multicast_broadcast && first.peer.0 != 0xffff {
+        status.peer = first.peer;
+        status.sequence_number = first.sequence_number;
+        status.tid = first.tid;
+    }
     if status.msdu_length_error || !status.msdu_done {
         return Err(DpError::MalformedDescriptor);
     }
-    let start = WCN6750_RX_DESCRIPTOR_BYTES + usize::from(status.l3_padding);
-    let end = start
-        .checked_add(usize::from(status.msdu_length))
-        .ok_or(DpError::MalformedDescriptor)?;
-    let payload = bytes
-        .get(start..end)
-        .ok_or(DpError::MalformedDescriptor)?
-        .to_vec();
+    let mut remaining = usize::from(status.msdu_length);
+    let mut payload = Vec::with_capacity(remaining);
+    for (index, fragment) in fragments.iter().enumerate() {
+        let start = WCN6750_RX_DESCRIPTOR_BYTES
+            + if index == 0 {
+                usize::from(status.l3_padding)
+            } else {
+                0
+            };
+        let capacity = fragment.bytes.len().saturating_sub(start);
+        let take = remaining.min(capacity);
+        payload.extend_from_slice(
+            fragment
+                .bytes
+                .get(start..start + take)
+                .ok_or(DpError::MalformedDescriptor)?,
+        );
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+        if !fragment.continuation {
+            return Err(DpError::MalformedDescriptor);
+        }
+    }
+    if remaining != 0 {
+        return Err(DpError::MalformedDescriptor);
+    }
     Ok(ReceivedFrame {
         packet: RxPacket {
             peer: Some(status.peer),
@@ -352,6 +443,9 @@ fn encap_native_wifi(frame: &mut Vec<u8>) -> Result<(), DpError> {
     let fc_bytes = frame.get(..2).ok_or(DpError::InvalidFrame)?;
     let mut frame_control = u16::from_le_bytes([fc_bytes[0], fc_bytes[1]]);
     let is_data = frame_control & 0x000c == 0x0008;
+    if !is_data {
+        return Err(DpError::InvalidFrame);
+    }
     let is_qos = is_data && frame_control & 0x0080 != 0;
     if !is_qos {
         return Ok(());
@@ -517,5 +611,104 @@ mod tests {
             parse_received_buffer(&bytes),
             Err(DpError::MalformedDescriptor)
         );
+    }
+
+    #[test]
+    fn multi_buffer_msdu_is_coalesced_at_descriptor_boundaries() {
+        let mut first = vec![0; 2048];
+        first[96..100].copy_from_slice(&1700_u32.to_le_bytes());
+        first[390..].fill(0xaa);
+        let mut last = vec![0; 2048];
+        last[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
+        last[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        last[388..430].fill(0xbb);
+        let fragments = [
+            RxFragment {
+                bytes: first,
+                continuation: true,
+                peer: crate::PeerId(12),
+                sequence_number: 33,
+                tid: 5,
+            },
+            RxFragment {
+                bytes: last,
+                continuation: false,
+                peer: crate::PeerId(12),
+                sequence_number: 33,
+                tid: 5,
+            },
+        ];
+        let received = parse_received_chain(&fragments).unwrap();
+        assert_eq!(received.packet.bytes.len(), 1700);
+        assert!(
+            received.packet.bytes[..1658]
+                .iter()
+                .all(|byte| *byte == 0xaa)
+        );
+        assert!(
+            received.packet.bytes[1658..]
+                .iter()
+                .all(|byte| *byte == 0xbb)
+        );
+        assert_eq!(received.packet.peer, Some(crate::PeerId(12)));
+        assert_eq!(
+            (received.status.sequence_number, received.status.tid),
+            (33, 5)
+        );
+    }
+
+    #[test]
+    fn model_reo_completion_syncs_before_rx_descriptor_parse() {
+        let (device, operations) = DeterministicBackend::recording_device();
+        let bar = device.open_region(0).unwrap();
+        let mut image = vec![0; 2048];
+        image[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
+        image[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        image[96..100].copy_from_slice(&4_u32.to_le_bytes());
+        image[182..184].copy_from_slice(&9_u16.to_le_bytes());
+        image[390..394].copy_from_slice(&[1, 2, 3, 4]);
+        let source = TxBuffer::map(&device, &image).unwrap();
+
+        let mut dp = ClientDataPath::ath11k_dp_alloc(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        dp.ath11k_dp_pdev_alloc(
+            RxdmaConfig {
+                ring: RingId(4),
+                pdev_id: 0,
+                return_buffer_manager: 3,
+                buffer_size: 2048,
+            },
+            1,
+        )
+        .unwrap();
+
+        bar.write_device_address(0x80, Some(0x84), source.device_address().unwrap())
+            .unwrap();
+        bar.write_u32(0x90, 2048).unwrap();
+        bar.write_u32(0x98, 1).unwrap();
+        bar.write_device_address(
+            0x88,
+            Some(0x8c),
+            dp.rx_buffers[0].buffer.device_address().unwrap(),
+        )
+        .unwrap();
+        bar.write_u32(0x98, 1 | 2).unwrap();
+
+        let refill = RxdmaBufferRing::from_bytes(dp.rings().published[0].1.bytes()).unwrap();
+        let mut reo = ReoDestinationRing::new();
+        reo.set_buffer_address(&refill);
+        reo.set_push_reason(1).unwrap();
+        dp.rings_mut().completions.push_back(reo.into_descriptor());
+        let received = dp.receive_with_status().unwrap().unwrap();
+        assert_eq!(received.packet.bytes, [1, 2, 3, 4]);
+        assert!(matches!(
+            operations.borrow().last(),
+            Some(Operation::SyncForCpu { range, .. }) if range == &(0..2048)
+        ));
     }
 }
