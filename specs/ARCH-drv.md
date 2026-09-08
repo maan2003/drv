@@ -50,6 +50,19 @@ proved Internet path: containment, dependable recovery and reconnect,
 suspend/resume, power efficiency, supported Wi-Fi behavior, sustained
 performance, and application integration. Connectivity alone is not acceptance.
 
+The product priority order is containment, recovery/everyday reliability,
+essential functionality, battery/performance, then wider hardware/features.
+Security wins over availability when safe containment cannot be established.
+Ordinary device faults should recover automatically; reboot is exceptional
+containment, not routine recovery. The production system uses our userspace
+stack only, with no native kernel-driver runtime fallback. A separate
+known-good boot configuration for rollback or lab recovery is distinct.
+
+Everyday acceptance includes browsing, video calls, streaming, downloads, VPN,
+captive portals, enterprise Wi-Fi, and roaming, alongside suspend/resume and
+reconnect. A successful Internet demonstration alone does not establish those
+workloads or production maturity.
+
 Redwood's current goal is physical testing that discovers driver-port bugs and
 reaches scan, association, DHCP, and proved Internet connectivity. Production
 hardening follows that milestone. Lab recovery and hardware safety constraints

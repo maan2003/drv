@@ -4,16 +4,16 @@
 
 Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
 association, DHCP, and proved Internet connectivity before production hardening.
-The latest reported physical run stopped in device probe with an empty WMI
-artifact. The live DT register resource is a zero-size doorbell placeholder;
-the merged QMI-first runner discovers the actual BAR through DeviceInfo before
-MMIO mapping. That corrected path is not yet physically validated. The empty
-WMI artifact alone establishes neither a firmware exchange nor a mapping error.
+The QMI-only discovery run reported BAR address `0x61e00000` and size
+`0x200000`, then stopped before MMIO/CE/HTC/WMI. The DT-assisted region-selection
+runner is merged but not physically validated. Automatic recovery for that
+no-reset VFIO experiment is being corrected; the old rebind-only transaction
+script is not a valid recovery path for it.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
-compatible `qcom,wcn6750-wifi`, currently bound through `ath11k_ahb`, and
-alone in SMMU IOMMU group 6. It is AHB, not PCIe.
+compatible `qcom,wcn6750-wifi`, normally driven by `ath11k_ahb`, and alone in
+SMMU IOMMU group 6. It is AHB, not PCIe.
 
 ## Minimal kernel substrate
 
@@ -43,16 +43,6 @@ pdev/vdev/peer operations. mac80211/cfg80211 glue does not move; the Fuchsia
 MLME drives the existing WlanSoftmac seam described by
 [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md).
 
-At the pinned source, the in-kernel ath11k directory is 82,878 lines (roughly
-the stated 100k-line driver surface once adjacent integration is included).
-The retained shared substrate measures about 5,899 SMMU, 9,581 Qualcomm
-remoteproc, 2,319 SMEM/SMP2P, 3,387 GLINK, and 2,722 QRTR lines, plus 1,780
-generic VFIO-platform lines. These are physical line counts, not trusted-code
-equivalence. The Wi-Fi-specific kernel target is zero lines if generic
-vfio-platform can express reset; otherwise only the smallest WCN6750 reset
-adapter remains. Shared SoC infrastructure must not be charged as a new
-Wi-Fi driver, but it remains privileged attack surface.
-
 ```text
 userspace: Fuchsia MLME ─WlanSoftmac─▶ ath11k core/WMI/DP/HAL/QMI
                                              │
@@ -60,38 +50,50 @@ kernel:   VFIO platform ─▶ SMMU     AF_QIPCRTR┘
           remoteproc/PIL ─▶ WPSS ─▶ SMEM/SMP2P/GLINK/QRTR
 ```
 
-## Supervised transactional handoff
+## Agile bring-up and recovery
 
-Redwood's `wlan0` is its only normal management uplink. `usb0` is configured
-as SSH-only ECM at 172.16.42.1/24, including initrd recovery, and the attached
-no-plastic host provides the out-of-band path. No serial console is available.
-The Qualcomm watchdog is hypervisor-reserved in the live FDT and Linux has no
-`/dev/watchdog`; it cannot provide the handoff's reboot lease. A small
-userspace watchdog started in the initrd substitutes for runner-process and
-USB-control-path loss during the lab transaction. It cannot recover a hung
-kernel, which remains an attended manual power-cycle by the user.
+Run the smallest useful experiment, inspect the first real failure, fix it,
+check proportionately, and rerun. The Redwood owner handles driver changes,
+builds, deployment, and testing end to end, without advisors. Exhaustive oracle
+coverage, production abstractions, and deferred interrupt/broker designs are
+not prerequisites for each polling experiment. Keep stage and native transcript
+evidence honest; source-derived fixtures are not physical captures.
 
-A handoff must run under two independent bounds: a local systemd restore timer
-that unconditionally rebinds ath11k and restarts iwd, and the initrd userspace
-watchdog, whose fault path reboots the unchanged flashed known-good system.
-Reports are persisted under a root-owned local directory and uploaded only
-after wlan0 returns. Session loss follows the same restore path. The checked-in
-transaction script has a fake-backend failure test; this does not substitute
-for the required physical watchdog proof.
+Before a stateful experiment, verify USB SSH through `usb0` at 172.16.42.1/24
+and coordinate exclusive hardware access through no-plastic (`np`). Wi-Fi loss
+is expected. Preserve reports locally and retrieve them over USB; restoring
+`wlan0` is not a prerequisite for recovery or evidence collection.
 
-New kernels are **kexec-only**. Never flash boot/vendor_boot, alter slot
-metadata, or touch LUKS keys. Every passed DTB must retain
-`qcom,board-id = <0x1000b 0>` and `xiaomi,board-id = <0xe 0>`. A hung or
-unlock-failing kexec kernel is recovered only by watchdog reboot into the
-unchanged flashed kernel; warm kexec into the embedded rescue image is known
-not to work from a real boot. Kernel builds occur directly on no-plastic, never
-via `nix copy`, and must be coordinated with its MT7921 hardware owner.
+Each experiment has a bounded duration and automatic recovery to a reachable,
+known state on ordinary runner failure, timeout, or control-session loss. Use
+the smallest mechanism that covers those failures. There is no requirement for
+a particular number of timers or for rebinding ath11k/iwd. For the current
+no-reset VFIO experiment, reboot to the unchanged known-good system is preferred
+to an unvalidated rebind sequence. A runner's successful exit is not recovery:
+do not disarm protection before the intended cleanup/recovery completes.
 
-## Measurement
+The current initrd userspace watchdog can recover process/control-path loss,
+not a hung kernel. An independently ticking runner heartbeat is not evidence
+that the device operation is progressing; the experiment deadline must still
+bound a stalled runner. Genuine kernel hangs may require a manual power-cycle:
+the project owner explicitly accepts that residual risk. Additional machinery
+to eliminate it is not required for bring-up. Tests should exercise the failure
+path being relied on; a fake test that omits VFIO ownership/reset/remoteproc
+cannot establish live recovery correctness.
 
-For WCN6750 record: per-crate source and Rust lines; reused portable hardware
-API, WlanSoftmac/MLME/SME/RSN, harness and transcript tooling; wall-clock time
-from foundation approval to first scan, association, DHCP and Internet; and
-every invented guard rejected at a seam. Compare byte-complete QMI/WMI/HTT and
-descriptor fixtures with native Linux. Track non-observable ring state
-separately rather than presenting source-derived fixtures as a captured oracle.
+IOMMU confinement, bounded DMA ownership, and device exclusivity remain required.
+New kernels and DTBs are **kexec-only**. Never flash boot/vendor_boot, modify
+partitions or slot metadata, or touch encryption keys. Every passed DTB retains
+`qcom,board-id = <0x1000b 0>` and `xiaomi,board-id = <0xe 0>`. Keep the unchanged
+known-good boot configuration for lab recovery; this is not a native-driver
+runtime fallback in the production stack. Warm kexec into the embedded rescue
+image is known not to work from a real boot and must not be assumed as recovery.
+
+## Build and configuration ownership
+
+Kernel builds run on **np over SSH, using plain `make` outside Nix**. Do not
+substitute a Nix kernel build or `nix copy` workflow. Coordinate np usage with
+the MT7921/substrate owner. The NixOS configuration repository is `~/src/nixos`
+(`/home/maan2003/src/nixos` in the coordinator's environment); it owns NixOS
+system configuration, not the plain-make experimental kernel build. Keep exact
+build/deployment commands with the runner rather than duplicating them here.

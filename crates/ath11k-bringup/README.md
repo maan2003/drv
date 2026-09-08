@@ -3,7 +3,31 @@
 Linux-only, unsafe-free staging CLI for the Redwood WCN6750 userspace driver.
 It is a deliberately narrow diagnostic runner, not a production network stack.
 
+## Bring-up workflow and build locations
+
+Optimize for the next useful real-device result: a small fix, targeted checks,
+and a bounded run. Redwood uses no advisors. Production hardening and exhaustive
+oracle coverage are not prerequisites for each experiment; IOMMU/DMA containment
+and the recovery contract in
+[ARCH-redwood-wifi-target](../../specs/ARCH-redwood-wifi-target.md) still apply.
+
+Build experimental kernels on **np over SSH with plain `make`, outside Nix**.
+NixOS system configuration lives in `~/src/nixos` (locally
+`/home/maan2003/src/nixos`), separate from that kernel build workflow. Coordinate
+np access with the MT7921/substrate owner. Kernel/DTB experiments are kexec-only:
+no flashing, partition/slot changes, or encryption-key changes.
+
 ## Safe use
+
+Verify USB control before a stateful run. The complete experiment must have a
+deadline and automatic recovery for runner failure, timeout, or session loss;
+Wi-Fi restoration is not required to collect logs or recover USB access. Manual
+power-cycle is an accepted exception for a genuine kernel hang, not ordinary
+runner failure. Use the smallest applicable recovery procedure, not a mandated
+number of timers. The existing rebind-only
+`scripts/redwood/redwood-wifi-transaction` is not valid unchanged for the
+no-reset VFIO experiment; its fake restore test does not model device ownership.
+The updated automatic recovery procedure must be established before that run.
 
 Start with the fully fake-backed path. It opens no VFIO/QRTR resources and
 does not read firmware. It writes a deterministic WMI command/event fixture to
@@ -30,8 +54,13 @@ cargo run -p ath11k-bringup -- preflight \
 ```
 
 The real runner updates `/run/redwood-lab-watchdog/heartbeat` from an
-independent thread and leaves the watchdog armed when it exits. After the final
-stage, the operator must run `redwood-lab-watchdog stop` over USB SSH.
+independent thread and leaves the watchdog armed when it exits. This heartbeat
+does not establish runner progress: a deadline must still terminate a stalled
+experiment. Runner success alone must not stop the watchdog; the experiment
+controller completes cleanup/recovery before disarming protection. For the
+current no-reset experiment, prefer automatic reboot to the known-good system
+over an unvalidated rebind. Do not require a manual watchdog-stop step for
+ordinary recovery.
 
 The resources stage performs the necessarily state-changing iommufd bind under
 the armed watchdog, then fails closed unless VFIO reports the WCN6750 platform
