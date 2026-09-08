@@ -570,6 +570,36 @@ impl Backend for LinuxVfio {
         }))
     }
 
+    fn wait_any(&mut self, interrupts: &[&u64], deadline_ns: u64) -> Result<Vec<IrqEvent>> {
+        if interrupts.is_empty() {
+            return Err(Error::Invalid);
+        }
+        let mut fds = Vec::with_capacity(interrupts.len());
+        for id in interrupts {
+            let (_, interrupt) = self.interrupts.get(*id).ok_or(Error::StaleHandle)?;
+            interrupt.prepare_wait().map_err(|_| Error::DeviceFault)?;
+            fds.push(interrupt.event_fd());
+        }
+        let ready = userspace_vfio::wait_eventfds_until(&fds, deadline_ns)
+            .map_err(|_| Error::DeviceFault)?;
+        let at_ns = userspace_vfio::monotonic_time_ns().map_err(|_| Error::DeviceFault)?;
+        let mut events = Vec::with_capacity(ready.len());
+        for index in ready {
+            let (vector, interrupt) = self
+                .interrupts
+                .get(interrupts[index])
+                .ok_or(Error::StaleHandle)?;
+            if let Some(count) = interrupt.try_read().map_err(|_| Error::DeviceFault)? {
+                events.push(IrqEvent {
+                    vector: *vector,
+                    count,
+                    at_ns,
+                });
+            }
+        }
+        Ok(events)
+    }
+
     fn reset(&mut self) -> Result<u64> {
         userspace_vfio::reset_device_supported(&self.device).map_err(|_| Error::DeviceFault)?;
         let next_generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
@@ -618,7 +648,9 @@ impl Drop for LinuxVfio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use userspace_vfio::test_support::{Record, signal_eventfd, with_fake_io};
+    use userspace_vfio::test_support::{
+        Failure, Record, signal_eventfd, with_fake_io, with_fake_io_failure,
+    };
 
     fn fake_device() -> (Arc<File>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
@@ -808,8 +840,71 @@ mod tests {
                 Record::QueryIrq(3),
                 Record::InstallIrq(3),
                 Record::UnmaskIrq(3),
+                Record::UnmaskIrq(3),
                 Record::DisableIrq(3),
             ]
+        );
+    }
+
+    #[test]
+    fn wait_any_returns_every_ready_fake_eventfd_in_one_batch() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_io(true, || {
+            let mut backend = LinuxVfio::initialize_broker(device, |_| Ok(())).unwrap();
+            let first = backend.open_interrupt(3).unwrap();
+            let second = backend.open_interrupt(4).unwrap();
+            signal_eventfd(backend.interrupts.get(&first).unwrap().1.event_fd(), 2).unwrap();
+            signal_eventfd(backend.interrupts.get(&second).unwrap().1.event_fd(), 5).unwrap();
+            let deadline = userspace_vfio::monotonic_time_ns().unwrap() + 1_000_000_000;
+            let events = backend.wait_any(&[&first, &second], deadline).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| (event.vector, event.count))
+                    .collect::<Vec<_>>(),
+                vec![(3, 2), (4, 5)]
+            );
+            backend.release_interrupt(first);
+            backend.release_interrupt(second);
+            drop(backend);
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Record::QueryIrq(3),
+                Record::InstallIrq(3),
+                Record::QueryIrq(4),
+                Record::InstallIrq(4),
+                Record::UnmaskIrq(3),
+                Record::DisableIrq(3),
+                Record::UnmaskIrq(4),
+                Record::DisableIrq(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_broker_unmap_quarantines_arena_until_retry_succeeds() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_io_failure(true, Some(Failure::Broker(broker::UNMAP)), || {
+            let mut backend = LinuxVfio::initialize_broker(device, |_| Ok(())).unwrap();
+            let dma = backend
+                .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
+                .unwrap();
+            backend.release_dma(dma);
+            assert_eq!(backend.quarantined_dmas.len(), 1);
+            backend.revoke_dmas().unwrap();
+            assert!(backend.quarantined_dmas.is_empty());
+            drop(backend);
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, Record::Broker { operation, .. } if *operation == broker::UNMAP))
+                .count(),
+            2
         );
     }
 

@@ -251,9 +251,16 @@ pub mod test_support {
         DisableIrq(u32),
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Failure {
+        IoasUnmap,
+        Broker(u32),
+    }
+
     struct Fake {
         broker_supported: bool,
         records: Rc<RefCell<Vec<Record>>>,
+        fail_once: Option<Failure>,
     }
     thread_local! {
         static FAKE: RefCell<Option<Fake>> = const { RefCell::new(None) };
@@ -262,12 +269,21 @@ pub mod test_support {
     /// Runs one host-side VFIO test with all ioctls intercepted. Anonymous and
     /// shared mmap still use the supplied real file descriptors.
     pub fn with_fake_io<T>(broker_supported: bool, run: impl FnOnce() -> T) -> (T, Vec<Record>) {
+        with_fake_io_failure(broker_supported, None, run)
+    }
+
+    pub fn with_fake_io_failure<T>(
+        broker_supported: bool,
+        fail_once: Option<Failure>,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<Record>) {
         let records = Rc::new(RefCell::new(Vec::new()));
         FAKE.with(|fake| {
             assert!(fake.borrow().is_none(), "nested fake VFIO transport");
             *fake.borrow_mut() = Some(Fake {
                 broker_supported,
                 records: Rc::clone(&records),
+                fail_once,
             });
         });
         let result = run();
@@ -363,8 +379,20 @@ pub mod test_support {
                 }
                 _ => return Some(Err(25)),
             };
+            let fail = match (&record, fake.fail_once) {
+                (Record::Unmap { .. }, Some(Failure::IoasUnmap)) => true,
+                (Record::Broker { operation, .. }, Some(Failure::Broker(failed_operation))) => {
+                    *operation == failed_operation
+                }
+                _ => false,
+            };
             fake.records.borrow_mut().push(record);
-            Some(Ok(()))
+            if fail {
+                fake.fail_once = None;
+                Some(Err(5))
+            } else {
+                Some(Ok(()))
+            }
         })
     }
 
@@ -1097,6 +1125,10 @@ impl VfioIrq {
         if !self.installed {
             return Ok(());
         }
+        // A level IRQ automatically masked after delivery must be returned to
+        // the unmasked state before trigger deassignment. Otherwise reopening
+        // the vector can inherit the stale kernel mask.
+        self.prepare_wait()?;
         disable_irq(&self.device, self.index)?;
         self.installed = false;
         Ok(())
@@ -1113,6 +1145,9 @@ pub fn wait_eventfds_until(event_fds: &[RawFd], deadline_ns: u64) -> Result<Vec<
         })
         .collect();
     loop {
+        for fd in &mut fds {
+            fd.revents = 0;
+        }
         let remaining = deadline_ns.saturating_sub(monotonic_time_ns()?);
         let timeout = Timespec {
             seconds: (remaining / 1_000_000_000) as i64,
