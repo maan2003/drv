@@ -42,11 +42,11 @@ const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 const EFD_CLOEXEC: i32 = 0x80000;
 const EFD_NONBLOCK: i32 = 0x800;
 
-const VFIO_DEVICE_FEATURE_SET: u32 = 1 << 16;
-const VFIO_DEVICE_FEATURE_PROBE: u32 = 1 << 18;
-
 /// Frozen out-of-tree VFIO platform DMA broker ABI constants.
 pub mod dma_broker_uapi {
+    pub const GET: u32 = 1 << 16;
+    pub const SET: u32 = 1 << 17;
+    pub const PROBE: u32 = 1 << 18;
     pub const FEATURE: u32 = 0xff00;
     pub const ALLOC_COHERENT: u32 = 1;
     pub const MAP_STREAMING: u32 = 2;
@@ -314,7 +314,7 @@ pub mod test_support {
                 VFIO_DEVICE_FEATURE => {
                     // SAFETY: both feature calls supply DmaBrokerFeature.
                     let feature = unsafe { value.cast::<DmaBrokerFeature>().as_mut().unwrap() };
-                    if feature.flags & VFIO_DEVICE_FEATURE_PROBE != 0 {
+                    if feature.flags & dma_broker_uapi::PROBE != 0 {
                         if !fake.broker_supported {
                             return Some(Err(25));
                         }
@@ -406,7 +406,7 @@ pub fn region_info(device: &File, index: u32) -> Result<RegionInfo, String> {
 pub fn probe_dma_broker(device: &File) -> Result<(), String> {
     let mut feature = DmaBrokerFeature {
         argsz: size::<DmaBrokerFeature>(),
-        flags: dma_broker_uapi::FEATURE | VFIO_DEVICE_FEATURE_PROBE,
+        flags: dma_broker_uapi::FEATURE | dma_broker_uapi::PROBE,
         ..Default::default()
     };
     ioctl_mut(
@@ -424,7 +424,7 @@ pub fn dma_broker_command(
     command.argsz = size::<DmaBrokerCommand>();
     let mut feature = DmaBrokerFeature {
         argsz: size::<DmaBrokerFeature>(),
-        flags: dma_broker_uapi::FEATURE | VFIO_DEVICE_FEATURE_SET,
+        flags: dma_broker_uapi::FEATURE | dma_broker_uapi::SET,
         command,
     };
     ioctl_mut(
@@ -1126,5 +1126,8 @@ mod tests {
         assert_eq!(size::<DmaBrokerCommand>(), 88);
         assert_eq!(size::<DmaBrokerFeature>(), 96);
         assert_eq!(dma_broker_uapi::FEATURE, 0xff00);
+        assert_eq!(dma_broker_uapi::GET, 1 << 16);
+        assert_eq!(dma_broker_uapi::SET, 1 << 17);
+        assert_eq!(dma_broker_uapi::PROBE, 1 << 18);
     }
 }
