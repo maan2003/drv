@@ -1,0 +1,21 @@
+[package]
+name = "mundane"
+workspace = "../../connectivity/network/netstack3"
+version = "0.1.0"
+edition = "2015"
+license = "BSD-2-Clause"
+
+[features]
+default = ["bytes", "insecure", "rsa-pkcs1v15", "experimental-sha512-ec", "kdf"]
+bytes = []
+experimental-sha512-ec = []
+insecure = []
+kdf = []
+rsa-pkcs1v15 = []
+rsa-test-generate-large-keys = []
+
+[dependencies]
+bssl-sys = { path = "../../../third_party/boringssl/rust/bssl-sys" }
+
+[lib]
+doctest = false

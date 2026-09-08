@@ -1,0 +1,5 @@
+[package]
+name = "netstack3-port-spike"
+edition.workspace = true
+license.workspace = true
+version.workspace = true

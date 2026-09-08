@@ -1,0 +1,10 @@
+[package]
+name = "packet"
+workspace = "../../../connectivity/network/netstack3"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[dependencies]
+arrayvec.workspace = true
+replace_with.workspace = true
+zerocopy.workspace = true

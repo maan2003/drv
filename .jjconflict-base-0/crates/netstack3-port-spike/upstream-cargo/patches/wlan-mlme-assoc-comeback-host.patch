@@ -1,0 +1,513 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
+@@ -46,6 +46,8 @@
+ pub enum TimedEvent {
+     /// Connecting to AP timed out.
+     Connecting,
++    /// The AP temporarily rejected association and its advertised comeback delay elapsed.
++    AssociationComeback { generation: u64 },
+     /// Timeout for reassociating after a disassociation.
+     Reassociating,
+     /// Association status update includes checking for auto deauthentication due to beacon loss
+@@ -60,6 +62,7 @@
+     fn class(&self) -> TimedEventClass {
+         match self {
+             Self::Connecting => TimedEventClass::Connecting,
++            Self::AssociationComeback { .. } => TimedEventClass::AssociationComeback,
+             Self::Reassociating => TimedEventClass::Reassociating,
+             Self::AssociationStatusCheck => TimedEventClass::AssociationStatusCheck,
+             Self::ChannelSwitch => TimedEventClass::ChannelSwitch,
+@@ -71,6 +74,7 @@
+ #[derive(Debug, PartialEq, Eq, Hash)]
+ pub enum TimedEventClass {
+     Connecting,
++    AssociationComeback,
+     Reassociating,
+     AssociationStatusCheck,
+     ChannelSwitch,
+@@ -89,6 +93,7 @@
+     device: D,
+     timer: Timer<TimedEvent>,
+     seq_mgr: SequenceManager,
++    next_association_comeback_generation: u64,
+ }
+ 
+ pub struct ClientMlme<D> {
+@@ -109,7 +114,13 @@
+         let iface_mac = device::try_query_iface_mac(&mut device).await?;
+         Ok(Self {
+             sta: None,
+-            ctx: Context { _config: config, device, timer, seq_mgr: SequenceManager::new() },
++            ctx: Context {
++                _config: config,
++                device,
++                timer,
++                seq_mgr: SequenceManager::new(),
++                next_association_comeback_generation: 1,
++            },
+             scanner: Scanner::new(iface_mac.into()),
+             channel_state: Default::default(),
+         })
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -277,15 +277,29 @@
+ 
+ /// Client has sent an association request frame to the AP.
+ /// At this point, client is waiting for an association response frame from the AP.
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ pub struct Associating {
+     /// This field is only populated when MLME is reconnecting after a disassociation.
+     reconnect_timeout: Option<EventHandle>,
++    association_attempts: u8,
++    comeback_timeout: Option<EventHandle>,
++    comeback_generation: Option<u64>,
++}
++
++impl Default for Associating {
++    fn default() -> Self {
++        Self {
++            reconnect_timeout: None,
++            association_attempts: 1,
++            comeback_timeout: None,
++            comeback_generation: None,
++        }
++    }
+ }
+ 
+ impl Associating {
+     fn new_with_reconnect_timeout(reconnect_timeout: EventHandle) -> Self {
+-        Self { reconnect_timeout: Some(reconnect_timeout) }
++        Self { reconnect_timeout: Some(reconnect_timeout), ..Default::default() }
+     }
+ 
+     /// Processes an inbound association response frame.
+@@ -297,16 +311,52 @@
+         &mut self,
+         sta: &mut BoundClient<'_, D>,
+         assoc_resp_frame: mac::AssocRespFrame<B>,
+-    ) -> Result<Association, ()> {
++    ) -> Result<Option<Association>, ()> {
+         wtrace::duration!("Associating::on_assoc_resp_frame");
+ 
++        let response_ies = assoc_resp_frame.elements.deref();
++        crate::sae_disposition(format_args!(
++            "association_response_ies {}",
++            association_response_ie_summary(response_ies)
++        ));
++
+         // TODO(https://fxbug.dev/42172907): All reserved values mapped to REFUSED_REASON_UNSPECIFIED.
+-        match Option::<fidl_ieee80211::StatusCode>::from(
++        let status_code = Option::<fidl_ieee80211::StatusCode>::from(
+             assoc_resp_frame.assoc_resp_hdr.status_code,
+         )
+-        .unwrap_or(fidl_ieee80211::StatusCode::RefusedReasonUnspecified)
+-        {
++        .unwrap_or(fidl_ieee80211::StatusCode::RefusedReasonUnspecified);
++        match status_code {
+             fidl_ieee80211::StatusCode::Success => (),
++            fidl_ieee80211::StatusCode::RefusedTemporarily => {
++                let Some(tu) = association_comeback_tu(response_ies) else {
++                    error!("temporary association rejection has no valid comeback interval");
++                    sta.send_connect_conf_failure(status_code);
++                    return Err(());
++                };
++                let Some(duration_nanos) = i64::from(tu).checked_mul(1_024_000) else {
++                    sta.send_connect_conf_failure(status_code);
++                    return Err(());
++                };
++                let ms = u64::from(tu) * 1024 / 1000;
++                let generation = sta.ctx.next_association_comeback_generation;
++                let Some(next_generation) = generation.checked_add(1) else {
++                    sta.send_connect_conf_failure(status_code);
++                    return Err(());
++                };
++                sta.ctx.next_association_comeback_generation = next_generation;
++                sta.sta.connect_timeout.take();
++                self.comeback_timeout.take();
++                self.comeback_generation = Some(generation);
++                self.comeback_timeout.replace(sta.ctx.timer.schedule_after(
++                    zx::MonotonicDuration::from_nanos(duration_nanos),
++                    TimedEvent::AssociationComeback { generation },
++                ));
++                crate::sae_disposition(format_args!(
++                    "association_comeback scheduled=true generation={generation} tu={tu} ms={ms} attempt={}",
++                    self.association_attempts
++                ));
++                return Ok(None);
++            }
+             status_code => {
+                 error!("association with BSS failed: {:?}", status_code);
+                 sta.send_connect_conf_failure(status_code);
+@@ -314,7 +364,9 @@
+             }
+         }
+ 
+-        let aid = assoc_resp_frame.assoc_resp_hdr.aid;
++        // IEEE 802.11 reserves the five most-significant AID bits; Linux/mac80211
++        // masks them before programming the station or reporting association.
++        let aid = assoc_resp_frame.assoc_resp_hdr.aid & 0x07ff;
+         let parsed_assoc_resp = ParsedAssociateResp::parse(&assoc_resp_frame);
+         let ap_capabilities = ApCapabilities(StaCapabilities {
+             capability_info: parsed_assoc_resp.capabilities,
+@@ -415,7 +467,7 @@
+         let status_check_timeout =
+             schedule_association_status_timeout(sta.sta.beacon_period(), &mut sta.ctx.timer);
+ 
+-        Ok(Association {
++        Ok(Some(Association {
+             aid,
+             assoc_resp_ies: assoc_resp_body.to_vec(),
+             controlled_port_open,
+@@ -426,7 +478,7 @@
+             status_check_timeout,
+             signal_strength_average: SignalStrengthAverage::new(),
+             block_ack_state: StateMachine::new(BlockAckState::from(State::new(Closed))),
+-        })
++        }))
+     }
+ 
+     /// Processes an inbound disassociation frame.
+@@ -470,6 +522,57 @@
+     }
+ }
+ 
++const TIMEOUT_INTERVAL_IE_ID: u8 = 56;
++const TIMEOUT_INTERVAL_ASSOCIATION_COMEBACK: u8 = 3;
++
++fn association_response_ie_summary(elements: &[u8]) -> String {
++    let mut summary = Vec::new();
++    let mut offset = 0usize;
++    while let Some(header) = elements.get(offset..offset.saturating_add(2)) {
++        let len = usize::from(header[1]);
++        let Some(next) = offset.checked_add(2 + len) else { break };
++        if next > elements.len() {
++            summary.push(format!("{}:{}(truncated)", header[0], len));
++            break;
++        }
++        summary.push(format!("{}:{}", header[0], len));
++        offset = next;
++    }
++    if offset < elements.len() && elements.len().saturating_sub(offset) < 2 {
++        summary.push("truncated_header".to_string());
++    }
++    format!("ids={}", summary.join(","))
++}
++
++/// IEEE Timeout Interval IE: one-byte timeout type followed by a little-endian
++/// 32-bit interval in TUs. Linux only accepts type 3 for status 30; malformed,
++/// duplicate, wrong-type, and zero intervals follow the ordinary failure path.
++fn association_comeback_tu(elements: &[u8]) -> Option<u32> {
++    let mut offset = 0usize;
++    let mut comeback = None;
++    while offset < elements.len() {
++        let header = elements.get(offset..offset.checked_add(2)?)?;
++        let len = usize::from(header[1]);
++        let next = offset.checked_add(2 + len)?;
++        let body = elements.get(offset + 2..next)?;
++        if header[0] == TIMEOUT_INTERVAL_IE_ID {
++            if comeback.is_some()
++                || body.len() != 5
++                || body[0] != TIMEOUT_INTERVAL_ASSOCIATION_COMEBACK
++            {
++                return None;
++            }
++            let tu = u32::from_le_bytes(body[1..5].try_into().ok()?);
++            if tu == 0 {
++                return None;
++            }
++            comeback = Some(tu);
++        }
++        offset = next;
++    }
++    comeback
++}
++
+ /// Extract HT Operation and VHT Operation IEs from the association response frame.
+ /// If either IE is of an incorrect length, it will be ignored.
+ fn extract_ht_vht_op<B: SplitByteSlice>(
+@@ -1146,7 +1249,10 @@
+             States::Associating(mut state) => match mgmt_body {
+                 mac::MgmtBody::AssociationResp(assoc_resp_frame) => {
+                     match state.on_assoc_resp_frame(sta, assoc_resp_frame).await {
+-                        Ok(association) => state.transition_to(Associated(association)).into(),
++                        Ok(Some(association)) => {
++                            state.transition_to(Associated(association)).into()
++                        }
++                        Ok(None) => state.into(),
+                         Err(()) => state.transition_to(Joined).into(),
+                     }
+                 }
+@@ -1241,6 +1347,48 @@
+         event: TimedEvent,
+     ) -> States {
+         match event {
++            TimedEvent::AssociationComeback { generation } => match self {
++                States::Associating(mut state)
++                    if state.comeback_generation == Some(generation) =>
++                {
++                    state.comeback_timeout.take();
++                    state.comeback_generation = None;
++                    if state.association_attempts >= 3 {
++                        crate::sae_disposition(format_args!(
++                            "association_comeback retry=false generation={generation} reason=max_attempts"
++                        ));
++                        sta.send_connect_conf_failure(
++                            fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
++                        );
++                        state.transition_to(Joined).into()
++                    } else if let Err(e) = sta.send_assoc_req_frame() {
++                        error!("error resending association request after comeback: {}", e);
++                        sta.send_connect_conf_failure(
++                            fidl_ieee80211::StatusCode::RefusedTemporarily,
++                        );
++                        state.transition_to(Joined).into()
++                    } else {
++                        state.association_attempts += 1;
++                        let duration = sta.sta.beacon_period()
++                            * sta.sta.connect_req.connect_failure_timeout;
++                        let timeout =
++                            sta.ctx.timer.schedule_after(duration, TimedEvent::Connecting);
++                        sta.sta.connect_timeout.replace(timeout);
++                        crate::sae_disposition(format_args!(
++                            "association_comeback retry=true generation={generation} attempt={}",
++                            state.association_attempts
++                        ));
++                        state.into()
++                    }
++                }
++                States::Associating(state) => {
++                    crate::sae_disposition(format_args!(
++                        "association_comeback retry=false generation={generation} reason=stale"
++                    ));
++                    state.into()
++                }
++                other => other,
++            },
+             TimedEvent::Connecting => {
+                 sta.sta.connect_timeout.take();
+                 sta.send_connect_conf_failure(fidl_ieee80211::StatusCode::RejectedSequenceTimeout);
+@@ -1619,6 +1767,7 @@
+                 device: self.fake_device.clone(),
+                 timer: self.timer.take().unwrap(),
+                 seq_mgr: SequenceManager::new(),
++                next_association_comeback_generation: 1,
+             }
+         }
+     }
+@@ -1888,7 +2037,8 @@
+                 },
+             )
+             .await
+-            .expect("failed processing association response frame");
++            .expect("failed processing association response frame")
++            .expect("successful response must complete association");
+         assert_eq!(aid, 42);
+         assert_eq!(true, controlled_port_open);
+ 
+@@ -1942,7 +2092,8 @@
+                 },
+             )
+             .await
+-            .expect("failed processing association response frame");
++            .expect("failed processing association response frame")
++            .expect("successful response must complete association");
+         assert_eq!(aid, 42);
+         assert_eq!(false, controlled_port_open);
+ 
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs
+@@ -1246,6 +1246,7 @@
+                 device: self.fake_device.clone(),
+                 timer: self.timer.take().unwrap(),
+                 seq_mgr: SequenceManager::new(),
++                next_association_comeback_generation: 1,
+             }
+         }
+     }
+--- a/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/host_tests/client_gate.rs
+@@ -137,6 +137,15 @@
+     bytes
+ }
+ 
++fn peer_open_auth_success() -> Vec<u8> {
++    let mut bytes = vec![0xb0, 0, 0, 0];
++    bytes.extend_from_slice(&CLIENT);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&[0, 0, 0, 0, 2, 0, 0, 0]);
++    bytes
++}
++
+ fn peer_beacon() -> Vec<u8> {
+     let bss = wpa3_bss();
+     let mut bytes = vec![0x80, 0, 0, 0];
+@@ -158,11 +167,34 @@
+     bytes.extend_from_slice(&AP);
+     bytes.extend_from_slice(&AP);
+     bytes.extend_from_slice(&[0, 0]);
+-    bytes.extend_from_slice(&[0x11, 0, 0, 0, 42, 0]);
++    bytes.extend_from_slice(&[0x11, 0, 0, 0, 0x2a, 0xc0]);
+     bytes.extend_from_slice(&[1, 4, 0x8c, 0x12, 0x98, 0x24]);
+     bytes
+ }
+ 
++fn peer_assoc_comeback(tu: u32) -> Vec<u8> {
++    let mut bytes = vec![0x10, 0, 0, 0];
++    bytes.extend_from_slice(&CLIENT);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&[0, 0]);
++    bytes.extend_from_slice(&[0x11, 0, 30, 0, 1, 0]);
++    bytes.extend_from_slice(&[56, 5, 3]);
++    bytes.extend_from_slice(&tu.to_le_bytes());
++    bytes
++}
++
++fn peer_assoc_status30_with_ies(ies: &[u8]) -> Vec<u8> {
++    let mut bytes = vec![0x10, 0, 0, 0];
++    bytes.extend_from_slice(&CLIENT);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&AP);
++    bytes.extend_from_slice(&[0, 0]);
++    bytes.extend_from_slice(&[0x11, 0, 30, 0, 1, 0]);
++    bytes.extend_from_slice(ies);
++    bytes
++}
++
+ fn peer_eapol(payload: &[u8]) -> Vec<u8> {
+     let mut bytes = vec![0x08, 0x02, 0, 0];
+     bytes.extend_from_slice(&CLIENT);
+@@ -398,6 +430,60 @@
+ }
+ 
+ #[test]
++fn production_status30_without_one_valid_comeback_ie_fails_without_retry() {
++    futures::executor::block_on(async {
++        for ies in [
++            vec![],
++            vec![56, 5, 2, 20, 0, 0, 0],
++            vec![56, 5, 3, 0, 0, 0, 0],
++            vec![56, 4, 3, 20, 0, 0],
++            vec![56, 5, 3, 20, 0, 0],
++            vec![56, 5, 3, 20, 0, 0, 0, 56, 5, 3, 20, 0, 0, 0],
++        ] {
++            let (device, effects) = FakeDeviceOps::new();
++            let (timer, mut timers) = wlan_mlme::common::timer::create_timer();
++            let mut mlme = ClientMlme::new(Default::default(), device, timer).await.unwrap();
++            let mut bss = wpa3_bss();
++            bss.capability_info = 1;
++            bss.ies.truncate(16);
++            mlme.handle_mlme_request(MlmeRequest::Connect(fidl_mlme::ConnectRequest {
++                selected_bss: bss,
++                connect_failure_timeout: 20,
++                auth_type: fidl_mlme::AuthenticationTypes::OpenSystem,
++                sae_password: vec![],
++                wep_key: None,
++                security_ie: vec![],
++                owe_public_key: None,
++            }))
++            .await
++            .unwrap();
++            mlme.handle_mac_frame_rx(&peer_open_auth_success(), rx_info(), 20.into()).await;
++            assert_eq!(effects.lock().unwrap().frames.len(), 2);
++            mlme.handle_mac_frame_rx(
++                &peer_assoc_status30_with_ies(&ies),
++                rx_info(),
++                21.into(),
++            )
++            .await;
++            let event = effects.lock().unwrap().events.remove(0);
++            assert!(matches!(
++                event,
++                fidl_mlme::MlmeEvent::ConnectConf { resp }
++                    if resp.result_code == fidl_ieee80211::StatusCode::RefusedTemporarily
++            ));
++            assert!(effects.lock().unwrap().associations.is_empty());
++            assert_eq!(effects.lock().unwrap().frames.len(), 2);
++            while let Ok(timer) = timers.try_recv() {
++                assert!(!matches!(
++                    timer.1.event,
++                    wlan_mlme::client::TimedEvent::AssociationComeback { .. }
++                ));
++            }
++        }
++    });
++}
++
++#[test]
+ fn observed_receive_uses_exact_constructed_scan_result_and_ordinary_sink_is_unchanged() {
+     futures::executor::block_on(async {
+         fn scan_request() -> fidl_mlme::ScanRequest {
+@@ -697,9 +783,59 @@
+             &[0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
+         );
+ 
+-        mlme.handle_mac_frame_rx(&peer_assoc_success(), rx_info(), 2.into()).await;
++        let frames_before_comeback = effects.lock().unwrap().frames.len();
++        mlme.handle_mac_frame_rx(&peer_assoc_comeback(20), rx_info(), 2.into()).await;
++        {
++            let effects = effects.lock().unwrap();
++            assert!(effects.associations.is_empty(), "status 30 must not configure firmware");
++            assert!(effects.events.is_empty(), "valid comeback must not fail the connect");
++        }
++
++        let mut stale_connect = None;
++        let mut comeback = None;
++        while let Ok(timer) = mlme_timers.try_recv() {
++            match timer.1.event {
++                wlan_mlme::client::TimedEvent::Connecting => stale_connect = Some(timer),
++                wlan_mlme::client::TimedEvent::AssociationComeback { .. } => {
++                    comeback = Some(timer)
++                }
++                _ => {}
++            }
++        }
++        let stale_connect = stale_connect.expect("pre-comeback connect timer");
++        let comeback = comeback.expect("association comeback timer");
++        let remaining = comeback.0 - zx::MonotonicInstant::get();
++        assert!(remaining.into_nanos() > 15_000_000 && remaining.into_nanos() <= 20_480_000);
++        let stale: Vec<_> = wlan_mlme::common::timer::make_async_timed_event_stream(
++            futures::stream::iter([stale_connect]),
++        )
++        .collect()
++        .await;
++        assert!(stale.is_empty(), "comeback must cancel the old connect deadline");
++        let generation = match comeback.1.event {
++            wlan_mlme::client::TimedEvent::AssociationComeback { generation } => generation,
++            _ => unreachable!(),
++        };
++        mlme.handle_timeout(wlan_mlme::client::TimedEvent::AssociationComeback {
++            generation: generation + 1,
++        })
++        .await;
++        assert_eq!(effects.lock().unwrap().frames.len(), frames_before_comeback);
++        mlme.handle_timeout(comeback.1.event).await;
++        let retried_request = effects.lock().unwrap().frames.last().unwrap().0.clone();
++        assert_eq!(effects.lock().unwrap().frames.len(), frames_before_comeback + 1);
++        assert_ne!(&retried_request[22..24], &association_request[22..24]);
++        assert_eq!(&retried_request[24..], &association_request[24..]);
++
++        mlme.handle_mac_frame_rx(&peer_assoc_success(), rx_info(), 3.into()).await;
+         let connect_conf = effects.lock().unwrap().events.remove(0);
+-        assert!(matches!(connect_conf, fidl_mlme::MlmeEvent::ConnectConf { .. }));
++        assert!(matches!(
++            connect_conf,
++            fidl_mlme::MlmeEvent::ConnectConf { ref resp }
++                if resp.result_code == fidl_ieee80211::StatusCode::Success
++                    && resp.association_id == 42
++        ));
++        assert_eq!(effects.lock().unwrap().associations[0].aid, Some(42));
+         Station::on_mlme_event(&mut sme, connect_conf);
+ 
+         let msg1 = peer_updates.into_iter().find_map(|update| match update {
+@@ -707,7 +843,7 @@
+             _ => None,
+         }).expect("authenticator EAPOL message 1");
+         peer.on_eapol_conf(&mut vec![], fidl_mlme::EapolResultCode::Success).unwrap();
+-        mlme.handle_mac_frame_rx(&peer_eapol(&msg1), rx_info(), 3.into()).await;
++        mlme.handle_mac_frame_rx(&peer_eapol(&msg1), rx_info(), 4.into()).await;
+         let eapol_ind = effects.lock().unwrap().events.remove(0);
+         assert!(matches!(eapol_ind, fidl_mlme::MlmeEvent::EapolInd { .. }));
+         Station::on_mlme_event(&mut sme, eapol_ind);
