@@ -61,6 +61,10 @@ static u32 reo_tlv(u32 tag) {
     return PREP(0x000003fe, tag) | PREP(0x03fffc00, 36);
 }
 
+static void put_u32(u8 *out, u32 word, u32 value) {
+    memcpy(out + word * sizeof(value), &value, sizeof(value));
+}
+
 void oracle_hal_reo_queue_stats(u8 out[40], u16 number, u64 address, u32 flags) {
     struct reo_cmd d = {0};
     d.tlv = reo_tlv(306);
@@ -135,6 +139,36 @@ int oracle_hal_reo_status(const u8 input[104], u16 *number, u16 *execution_time,
     *status = GET(0x0c000000, header);
     memcpy(timestamp, input + 8, sizeof(*timestamp));
     return GET(0x000003fe, tlv);
+}
+
+u32 oracle_hal_reo_queue_descriptor(u8 out[512], u8 tid, u32 ba_window,
+                                    u32 start_sequence, u8 pn_type) {
+    memset(out, 0, 512);
+    u32 ac = (tid == 0 || tid == 3) ? 0 :
+             (tid == 1 || tid == 2) ? 1 :
+             (tid == 4 || tid == 5) ? 2 : 3;
+    u32 info0 = 1 | 2 | PREP(0x60, ac);
+    put_u32(out, 0, 0xddbeef84);
+    put_u32(out, 1, tid);
+    if (ba_window < 1) ba_window = 1;
+    if (ba_window == 1 && tid != 16) ba_window++;
+    if (ba_window == 1) info0 |= 0x100;
+    info0 |= PREP(0x0007f800, ba_window - 1);
+    if (pn_type == 1) info0 |= 0x00080000 | PREP(0x01800000, 1);
+    info0 |= 0x02000000;
+    put_u32(out, 2, info0);
+    if (start_sequence <= 0xfff)
+        put_u32(out, 3, PREP(0x00001ffe, start_sequence));
+    if (tid == 16) {
+        if (ba_window <= 1) return 128;
+        if (ba_window <= 105) return 256;
+        if (ba_window <= 210) return 384;
+        return 512;
+    }
+    put_u32(out, 32, 0xadbeef94);
+    put_u32(out, 64, 0xbdbeef94);
+    put_u32(out, 96, 0xcdbeef94);
+    return 512;
 }
 
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
