@@ -69,14 +69,14 @@ Both suites accept `ATH11K_STATEFUL_CASES` and `ATH11K_STATEFUL_STEPS` for long
 runs, with `PROPTEST_CASES` retained for this sensitivity measurement. The data
 path README documents an overnight configuration.
 
-## Open long-run finding
+## Resolved long-run finding
 
-A two-case, 4,096-step run found an existing REO same-key accounting
-discrepancy. A new setup can publish an active owner while an older delete is
-still pending; if the older invalidation later reports failure, its owner moves
-to `failed_delete` alongside the active owner for the same peer and TID. The
-driver fix is tracked separately; the generator remains unconstrained so this
-sequence continues to be exercised.
+A two-case, 4,096-step run found a REO same-key accounting discrepancy: a new
+setup could publish an active owner while an older delete was still pending,
+then retain both owners if the older invalidation failed. Change `df3ae4b4`,
+merged by `af333a7a`, rejects same-key setup while deletion is pending. The
+documented two-case × 4,096-step run now passes, including the exact REO target;
+the generator remains unconstrained so the repaired sequence stays covered.
 
 Reproduce with:
 

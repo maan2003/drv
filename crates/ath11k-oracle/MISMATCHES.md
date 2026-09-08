@@ -48,3 +48,16 @@ of the differential suite.
 - disposition: retain the Rust behavior. The host seam has no separate skb
   priority; mac80211 derives that priority from the same QoS TID.
 - test status: generated encap coverage varies the frame TID directly
+
+## WMI-001: management-RX pdev ID width differs
+
+- C function: `ath11k_pull_mgmt_rx_params_tlv`, `wmi.c:5941-5988`
+- input: an otherwise valid management-RX event whose 32-bit wire `pdev_id`
+  is greater than 255
+- C result: truncates the value into `mgmt_rx_event_params::pdev_id` (`u8`)
+- Rust result: preserves the full wire value in `MgmtRx::pdev_id` (`u32`)
+- disposition: reported without changing `ath11k-wmi`; connection-path
+  generated equivalence constrains the semantic pdev ID to the C destination
+  range
+- test status: the generated valid-input differential covers all `u8` pdev
+  IDs; wider wire values are documented here rather than asserted equivalent

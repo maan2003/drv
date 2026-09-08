@@ -22,10 +22,12 @@ fn main() {
     assert_commit(&root);
     let generated = generate_qmi_oracle(&root, &manifest);
     let wmi_builders = generate_wmi_builders(&root);
+    let wmi_event_pulls = generate_wmi_event_pulls(&root);
     cc::Build::new()
         .file(codec)
         .file(generated)
         .file(wmi_builders)
+        .file(wmi_event_pulls)
         .file(manifest.join("c/wmi_oracle.c"))
         .file(manifest.join("c/htt_oracle.c"))
         .file(manifest.join("c/hal_oracle.c"))
@@ -52,6 +54,170 @@ fn main() {
         "cargo:rerun-if-changed={}",
         root.join("drivers/net/wireless/ath/ath11k/ce.c").display()
     );
+}
+
+fn generate_wmi_event_pulls(root: &Path) -> PathBuf {
+    let driver = root.join("drivers/net/wireless/ath/ath11k");
+    let header = std::fs::read_to_string(driver.join("wmi.h")).expect("read pinned wmi.h");
+    let source = std::fs::read_to_string(driver.join("wmi.c")).expect("read pinned wmi.c");
+    let types = [
+        "struct wmi_tlv",
+        "struct wmi_ppe_threshold",
+        "struct wmi_service_ready_ext_event",
+        "enum wmi_start_event_param",
+        "struct wmi_vdev_start_resp_event",
+        "struct wmi_mac_addr",
+        "struct wmi_peer_assoc_conf_event",
+        "struct wmi_peer_assoc_conf_arg",
+        "struct wmi_mgmt_rx_hdr",
+    ]
+    .map(|marker| c_item(&header, marker))
+    .join("\n\n");
+    let pulls = [
+        c_item(&source, "static int\nath11k_wmi_tlv_iter"),
+        c_item(&source, "static int ath11k_pull_svc_ready_ext"),
+        c_item(&source, "static int ath11k_pull_vdev_start_resp_tlv"),
+        c_item(&source, "static int ath11k_wmi_tlv_mgmt_rx_parse"),
+        c_item(&source, "static int ath11k_pull_mgmt_rx_params_tlv"),
+        c_item(&source, "static int ath11k_pull_peer_assoc_conf_ev"),
+    ]
+    .join("\n\n");
+    let generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("wmi_event_pulls.c");
+    let prelude = r#"#include <linux/types.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define __packed __attribute__((packed))
+#define PSOC_HOST_MAX_NUM_SS 8
+#define WMI_MAX_NUM_SS 8
+#define ATH_MAX_ANTENNA 4
+#ifndef EPROTO
+#define EPROTO 71
+#endif
+#define GFP_ATOMIC 0
+#define WMI_TAG_VDEV_START_RESPONSE_EVENT 0x28
+#define WMI_TAG_MGMT_RX_HDR 0x2c
+#define WMI_TAG_ARRAY_BYTE 0x11
+#define WMI_TAG_PEER_ASSOC_CONF_EVENT 0x1b2
+#define WMI_TAG_MAX 0x386
+#define WMI_TLV_LEN 0xffffu
+#define WMI_TLV_TAG 0xffff0000u
+#define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctz(mask))
+#define ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
+#define IS_ERR(value) ((value) == NULL)
+#define PTR_ERR(value) (-ENOMEM)
+#define ath11k_warn(...) ((void)0)
+#define ath11k_err(...) ((void)0)
+#define kfree(value) free(value)
+
+struct ath11k_base { int unused; };
+struct ath11k_pdev_wmi { int unused; };
+struct sk_buff { u8 *data; u32 len; };
+struct ath11k_ppe_threshold { u32 numss_m1, ru_bit_mask, ppet16_ppet8_ru3_ru0[8]; };
+struct ath11k_service_ext_param {
+    u32 default_conc_scan_config_bits, default_fw_config_bits;
+    struct ath11k_ppe_threshold ppet;
+    u32 he_cap_info, mpdu_density, max_bssid_rx_filters, num_hw_modes, num_phy;
+};
+struct mgmt_rx_event_params {
+    u32 chan_freq, channel, snr; u8 rssi_ctl[4]; u32 rate, phy_mode, buf_len;
+    int status; u32 flags; int rssi; u32 tsf_delta; u8 pdev_id;
+};
+struct wmi_tlv_mgmt_rx_parse { const struct wmi_mgmt_rx_hdr *fixed;
+    const u8 *frame_buf; bool frame_buf_done; };
+struct wmi_tlv_policy { size_t min_len; };
+static const struct wmi_tlv_policy wmi_tlv_policies[WMI_TAG_MAX] = {
+    [WMI_TAG_VDEV_START_RESPONSE_EVENT] = { .min_len = 40 },
+    [WMI_TAG_MGMT_RX_HDR] = { .min_len = 68 },
+    [WMI_TAG_PEER_ASSOC_CONF_EVENT] = { .min_len = 12 },
+};
+
+static u32 pull32(const u8 *p) { u32 value; memcpy(&value, p, 4); return value; }
+static int ath11k_wmi_tlv_iter(struct ath11k_base *, const void *, size_t,
+    int (*)(struct ath11k_base *, u16, u16, const void *, void *), void *);
+static int oracle_table_iter(struct ath11k_base *ab, u16 tag, u16 len,
+                             const void *ptr, void *data)
+{
+    const void **table = data; (void)ab; (void)len;
+    if (tag < WMI_TAG_MAX) table[tag] = ptr;
+    return 0;
+}
+static const void **ath11k_wmi_tlv_parse_alloc(struct ath11k_base *ab,
+                                                struct sk_buff *skb, int gfp)
+{
+    const void **table = calloc(WMI_TAG_MAX, sizeof(*table)); (void)ab; (void)gfp;
+    if (!table) return NULL;
+    if (ath11k_wmi_tlv_iter(ab, skb->data, skb->len, oracle_table_iter, table)) {
+        free(table); return NULL;
+    }
+    return table;
+}
+static void *skb_pull(struct sk_buff *skb, size_t len)
+{
+    if (len > skb->len) return NULL;
+    skb->data += len; skb->len -= len; return skb->data;
+}
+static void skb_trim(struct sk_buff *skb, size_t len) { skb->len = len; }
+static void *skb_put(struct sk_buff *skb, size_t len) { skb->len += len; return skb->data + skb->len - len; }
+static void ath11k_ce_byte_swap(void *data, u32 len) { (void)data; (void)len; }
+"#;
+    let wrappers = r#"
+struct oracle_connection_event { u64 fields[32]; size_t field_count; u8 frame[512]; size_t frame_len; };
+int oracle_wmi_connection_event(u32 kind, const u8 *bytes, size_t length,
+                                struct oracle_connection_event *out)
+{
+    struct ath11k_base ab = {0}; struct sk_buff skb = {(u8 *)bytes, length};
+    memset(out, 0, sizeof(*out));
+    if (kind == 0) {
+        const u8 *p = bytes; if (length < 4) return -EINVAL;
+        u16 len = pull32(p); if (len < sizeof(struct wmi_service_ready_ext_event) || len > length - 4) return -EINVAL;
+        struct ath11k_service_ext_param v = {0}; int ret = ath11k_pull_svc_ready_ext(NULL, p + 4, &v);
+        if (ret) return ret;
+        out->fields[out->field_count++] = v.default_conc_scan_config_bits;
+        out->fields[out->field_count++] = v.default_fw_config_bits;
+        out->fields[out->field_count++] = v.ppet.numss_m1;
+        out->fields[out->field_count++] = v.ppet.ru_bit_mask;
+        for (size_t i = 0; i < 8; i++) out->fields[out->field_count++] = v.ppet.ppet16_ppet8_ru3_ru0[i];
+        out->fields[out->field_count++] = v.he_cap_info;
+        out->fields[out->field_count++] = v.mpdu_density;
+        out->fields[out->field_count++] = v.max_bssid_rx_filters;
+        return 0;
+    }
+    if (kind == 1) {
+        struct wmi_peer_assoc_conf_arg v = {0}; int ret = ath11k_pull_peer_assoc_conf_ev(&ab, &skb, &v);
+        if (ret) return ret;
+        out->fields[out->field_count++] = v.vdev_id;
+        for (size_t i = 0; i < 6; i++) out->fields[out->field_count++] = v.macaddr[i];
+        return 0;
+    }
+    if (kind == 2) {
+        struct wmi_vdev_start_resp_event v; int ret = ath11k_pull_vdev_start_resp_tlv(&ab, &skb, &v);
+        if (ret) return ret;
+        u32 fields[] = {v.vdev_id, v.requestor_id, v.resp_type, v.status, v.chain_mask,
+            v.smps_mode, v.mac_id, v.cfgd_tx_streams, v.cfgd_rx_streams,
+            (u32)v.max_allowed_tx_power};
+        for (size_t i = 0; i < 10; i++) out->fields[out->field_count++] = fields[i];
+        return 0;
+    }
+    if (kind == 3) {
+        struct mgmt_rx_event_params v = {0}; int ret = ath11k_pull_mgmt_rx_params_tlv(&ab, &skb, &v);
+        if (ret) return ret;
+        u32 fields[] = {v.channel, v.snr, v.rate, v.phy_mode, (u32)v.status, v.flags,
+            (u32)v.rssi, v.tsf_delta, v.pdev_id, v.chan_freq};
+        for (size_t i = 0; i < 10; i++) out->fields[out->field_count++] = fields[i];
+        if (v.buf_len > sizeof(out->frame)) return -EINVAL;
+        memcpy(out->frame, skb.data, v.buf_len); out->frame_len = v.buf_len; return 0;
+    }
+    return -EINVAL;
+}
+"#;
+    std::fs::write(
+        &generated,
+        format!("{prelude}\n{types}\n\n{pulls}\n{wrappers}"),
+    )
+    .expect("write generated WMI event pull oracle translation unit");
+    generated
 }
 
 fn generate_wmi_builders(root: &Path) -> PathBuf {

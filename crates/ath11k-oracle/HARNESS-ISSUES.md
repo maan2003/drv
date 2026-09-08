@@ -36,6 +36,23 @@ The pinned `ath11k_wmi_tlv_op_rx` has no cases for event IDs `0x16005`,
 FW-table-derived transcriptions layered on the pinned generic TLV iterator,
 rather than calls through the pinned Linux event dispatcher.
 
+## Connection-event pull provenance
+
+Status: Partially fixed.
+
+Generated valid service-ready-ext, peer-association-confirmation, vdev-start
+response, and management-RX messages execute build-time extractions of the
+corresponding pinned `ath11k/wmi.c` pull bodies. Peer association, vdev start,
+and management RX also execute the extracted pinned `ath11k_wmi_tlv_iter`
+body. The harness supplies only the three relevant minimum-length policy
+entries plus the service-ready-ext fixed-length check, and replaces
+`ath11k_wmi_tlv_parse_alloc`'s allocation/table callback,
+kernel skb mutation helpers, logging, and the little-endian CE byte-swap
+boundary. It does not invoke the full WMI event dispatcher or its device-state
+effects. The service-ready-ext pull body consumes only the fixed event struct;
+the additional array-group parsing remains covered by the existing
+wire-level oracle.
+
 ## RX helper provenance
 
 Status: Open.
