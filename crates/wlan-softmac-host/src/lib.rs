@@ -1,25 +1,41 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Chip-generic synchronous downcalls for a client SoftMAC device.
+//! Chip-generic owner and synchronous contracts for a client SoftMAC device.
 //!
 //! The request and response values are the host bindings generated from the
-//! project's pinned Fuchsia FIDL schemas. The trait deliberately contains
-//! neither device lifecycle (`Start`/`Stop`) nor device-to-MLME upcalls. Those
-//! surfaces arrive together with extraction of the host owner so their
-//! lifetime and callback ordering cannot be specified independently.
+//! project's pinned Fuchsia FIDL schemas. The lifecycle and callback traits
+//! are paired by [`runtime::ClientRuntime`], the sole owner of a started
+//! device and its MLME/SME state.
+
+pub mod ethernet;
+pub mod netstack_child;
+pub mod runtime;
 
 pub use fidl_fuchsia_wlan_common::{
     MacSublayerSupport, SecuritySupport, SpectrumManagementSupport,
 };
 pub use fidl_fuchsia_wlan_driver::JoinBssRequest;
 pub use fidl_fuchsia_wlan_softmac::{
-    DiscoverySupport, WlanAssociationConfig, WlanKeyConfiguration,
+    DiscoverySupport, WlanAssociationConfig, WlanKeyConfiguration, WlanRxInfo,
     WlanSoftmacBaseCancelScanRequest, WlanSoftmacBaseClearAssociationRequest,
     WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartActiveScanResponse,
     WlanSoftmacBaseStartPassiveScanRequest, WlanSoftmacBaseStartPassiveScanResponse,
     WlanSoftmacBaseUpdateWmmParametersRequest, WlanSoftmacQueryResponse,
-    WlanSoftmacStartActiveScanRequest, WlanTxInfoFlags,
+    WlanSoftmacStartActiveScanRequest, WlanTxInfoFlags, WlanTxResult,
 };
+
+/// Device-to-host callbacks installed by [`WlanSoftmacLifecycle::start`].
+pub trait WlanSoftmacUpcalls: Send {
+    fn recv(&mut self, bytes: Vec<u8>, info: WlanRxInfo);
+    fn report_tx_result(&mut self, result: WlanTxResult);
+    fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64);
+}
+
+/// Run-scoped ownership paired with the synchronous SoftMAC downcalls.
+pub trait WlanSoftmacLifecycle {
+    fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status>;
+    fn stop(&mut self) -> Result<(), zx::Status>;
+}
 
 /// Synchronous client-only calls from the host MLME into a SoftMAC device.
 ///
@@ -70,6 +86,21 @@ mod tests {
     struct Fake {
         calls: Vec<&'static str>,
         tx: Option<(Vec<u8>, WlanTxInfoFlags)>,
+        upcalls: Option<Box<dyn WlanSoftmacUpcalls>>,
+    }
+
+    impl WlanSoftmacLifecycle for Fake {
+        fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status> {
+            self.calls.push("start");
+            self.upcalls = Some(upcalls);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), zx::Status> {
+            self.calls.push("stop");
+            self.upcalls = None;
+            Ok(())
+        }
     }
 
     impl WlanSoftmac for Fake {
