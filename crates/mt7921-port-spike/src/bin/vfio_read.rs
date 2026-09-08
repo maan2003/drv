@@ -91,9 +91,9 @@ use mt7921_softmac_adapter::client_device::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
-    LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
-    SourceExactPassiveMechanics, SourceExactPassiveTransport, query_from_capabilities,
-    set_channel_request,
+    LinuxChannelShape, Mt7921ProductionClient, Mt7921SoftmacAdapter, PassiveMechanicsEvent,
+    PassivePrerequisites, SourceExactPassiveMechanics, SourceExactPassiveTransport,
+    query_from_capabilities, set_channel_request,
 };
 #[cfg(feature = "fuchsia-passive")]
 use num_bigint::BigUint;
@@ -7388,13 +7388,10 @@ fn run() -> Result<(), String> {
                                         },
                                         deprecated_scan_type: fidl_common::ScanType::Passive,
                                     };
-                                    let mut sme_config = wlan_sme::client::ClientConfig::default();
-                                    sme_config.wpa3_supported = true;
                                     drop(runner);
-                                    let mut runtime =
-                                        futures::executor::block_on(PinnedClientRuntime::new_with_ethernet_capacity(
+                                    let mut client =
+                                        futures::executor::block_on(Mt7921ProductionClient::new(
                                             device,
-                                            sme_config,
                                             device_info,
                                             security_support,
                                             spectrum_support,
@@ -7402,18 +7399,18 @@ fn run() -> Result<(), String> {
                                             32,
                                         ))
                                         .map_err(|_| "construct pinned SME/MLME runtime failed")?;
-                                    let ethernet_device = runtime
-                                        .take_ethernet_device()
-                                        .ok_or("host Ethernet boundary was already taken")?;
                                     let deadline =
                                         Instant::now() + std::time::Duration::from_secs(25);
-                                    futures::executor::block_on(runtime.connect(request, deadline))
+                                    futures::executor::block_on(client.connect(request, deadline))
                                         .map_err(|error| {
                                             format!("pinned SME/MLME connect failed: {error:?}")
                                         })?;
                                     record_sae_stage(
                                         "pinned_sme_connected association=true key_install=true controlled_port=true",
                                     );
+                                    let ethernet_device = client
+                                        .take_ethernet_device()
+                                        .ok_or("controlled-port UP did not publish Ethernet capability")?;
                                     let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
                                         .map_err(|_| "DRV_SOCKS5_LISTEN is required")?
                                         .parse()
@@ -7461,7 +7458,7 @@ fn run() -> Result<(), String> {
                                         }
                                         netstack.poll_network_ready()?;
                                         let progressed = match futures::executor::block_on(
-                                            runtime.pump_associated_once(),
+                                            client.drive_once(),
                                         ) {
                                             Ok(progressed) => progressed,
                                             Err(PinnedConnectError::Driver(
@@ -22675,7 +22672,7 @@ mod tests {
     fn live_wpa3_path_keeps_driver_owner_while_netstack_runs_out_of_process() {
         let source = include_str!("vfio_read.rs");
         let runtime_constructor = source
-            .find("PinnedClientRuntime::new_with_ethernet_capacity")
+            .find("Mt7921ProductionClient::new")
             .unwrap();
         let start = source[..runtime_constructor]
             .rfind("let (mut device, runner) =")
@@ -22687,21 +22684,21 @@ mod tests {
         let exchange = &source[start..end];
         for required in [
             "Mt7921ClientDevice::new",
-            "PinnedClientRuntime::new_with_ethernet_capacity",
+            "Mt7921ProductionClient::new",
             ".take_ethernet_device()",
             "fidl_internal::Protocol::Wpa3Personal",
             ".into_passphrase()",
-            "PinnedClientRuntime::new",
-            "runtime.connect(request, deadline)",
+            "client.connect(request, deadline)",
             "spawn_netstack_child",
-            "runtime.pump_associated_once()",
+            "client.drive_once()",
         ] {
             assert!(exchange.contains(required), "{required}");
         }
-        let connect = exchange.find("runtime.connect(request, deadline)").unwrap();
+        let connect = exchange.find("client.connect(request, deadline)").unwrap();
+        let take = exchange.find(".take_ethernet_device()").unwrap();
         let spawn = exchange.find("spawn_netstack_child").unwrap();
-        let pump = exchange.find("runtime.pump_associated_once()").unwrap();
-        assert!(connect < spawn && spawn < pump);
+        let pump = exchange.find("client.drive_once()").unwrap();
+        assert!(connect < take && take < spawn && spawn < pump);
         let launcher = include_str!("vfio_read.rs");
         let process = launcher
             .find(r#".spawn()
@@ -23257,14 +23254,14 @@ mod tests {
 
         let sae = source
             .split("if operation == Operation::RunOneShotSaeAuth {")
-            .find(|segment| segment.contains("PinnedClientRuntime::new"))
+            .find(|segment| segment.contains("Mt7921ProductionClient::new"))
             .unwrap()
             .split("let transport = adapter.into_transport();")
             .next()
             .unwrap();
         let acquire = sae.find("acquire_sae_tx_resources").unwrap();
-        let runtime = sae.find("PinnedClientRuntime::new").unwrap();
-        let connect = sae.find("runtime.connect(request, deadline)").unwrap();
+        let runtime = sae.find("Mt7921ProductionClient::new").unwrap();
+        let connect = sae.find("client.connect(request, deadline)").unwrap();
         assert!(acquire < runtime && runtime < connect);
         assert!(!sae.contains("program_live_rate_power"));
         assert!(!sae.contains("transmit_one_sae_auth"));

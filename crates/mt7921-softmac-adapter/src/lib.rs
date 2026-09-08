@@ -7,6 +7,9 @@
 
 pub mod client_device;
 pub mod ethernet;
+mod production_client;
+
+pub use production_client::Mt7921ProductionClient;
 
 use fidl_fuchsia_wlan_ieee80211::{HtCapabilities, VhtCapabilities};
 use fuchsia_softmac_port::{
@@ -256,7 +259,11 @@ pub fn client_channel_candidate(
         0 if (1..=14).contains(&number) => Some(CandidateChannel {
             band: mt7921_port_spike::PhysicalBand::Ghz2,
             number,
-            frequency_mhz: if number == 14 { 2484 } else { 2407 + 5 * number },
+            frequency_mhz: if number == 14 {
+                2484
+            } else {
+                2407 + 5 * number
+            },
         }),
         1 if (36..=177).contains(&number) => Some(CandidateChannel {
             band: mt7921_port_spike::PhysicalBand::Ghz5,

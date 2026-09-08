@@ -33,6 +33,7 @@ struct StartedDevice<D> {
 
 struct HostIo {
     ethernet: DriverEthernetPort,
+    unpublished_ethernet_device: Option<HostEthernetDevice>,
     pending_ethernet_devices: VecDeque<HostEthernetDevice>,
     ethernet_mac_address: [u8; 6],
     ethernet_queue_capacity: usize,
@@ -222,12 +223,13 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         if status != LinkStatus::UP {
             let mut io = self.io.lock().unwrap();
             io.pending_ethernet_devices.clear();
+            io.unpublished_ethernet_device = None;
             io.ethernet.set_link(false);
             drop(io);
             return self.device.lock().unwrap().device.set_link_up(false);
         }
 
-        let replacement = {
+        let host = {
             let mut io = self.io.lock().unwrap();
             if io.ethernet.is_closed() {
                 io.pending_ethernet_devices.clear();
@@ -237,18 +239,19 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
                 io.ethernet = driver;
                 Some(host)
             } else {
-                None
+                io.unpublished_ethernet_device.take()
             }
         };
         if let Err(status) = self.device.lock().unwrap().device.set_link_up(true) {
             let mut io = self.io.lock().unwrap();
             io.pending_ethernet_devices.clear();
+            io.unpublished_ethernet_device = None;
             io.ethernet.teardown();
             return Err(status);
         }
         let mut io = self.io.lock().unwrap();
         io.ethernet.set_link(true);
-        if let Some(host) = replacement {
+        if let Some(host) = host {
             io.pending_ethernet_devices.clear();
             io.pending_ethernet_devices.push_back(host);
         }
@@ -423,8 +426,15 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         inspector: fuchsia_inspect::Inspector,
     ) -> Result<Self, anyhow::Error> {
         Self::new_with_ethernet_capacity(
-            device, sme_config, device_info, security, spectrum, inspector, ETHERNET_QUEUE_CAPACITY,
-        ).await
+            device,
+            sme_config,
+            device_info,
+            security,
+            spectrum,
+            inspector,
+            ETHERNET_QUEUE_CAPACITY,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -455,7 +465,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
-            pending_ethernet_devices: VecDeque::from([ethernet_device]),
+            unpublished_ethernet_device: Some(ethernet_device),
+            pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: device_info.sta_addr,
             ethernet_queue_capacity,
             minstrel: None,
@@ -804,7 +815,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             self.revoked = true;
             revoke_and_drain(&self.upcalls);
             self.io.lock().unwrap().ethernet.teardown();
-            self.device.lock().unwrap().device.reset().map_err(|_| ConnectError::Containment)?;
+            self.device
+                .lock()
+                .unwrap()
+                .device
+                .reset()
+                .map_err(|_| ConnectError::Containment)?;
         }
         result
     }
@@ -1125,6 +1141,7 @@ mod tests {
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
             ethernet_queue_capacity: 4,
@@ -1452,7 +1469,7 @@ mod tests {
             let (fake, effects) = Fake::new(0);
             effects.lock().unwrap().reset_failure = reset_failure;
             let mut runtime = runtime(fake);
-            let ethernet = runtime.take_ethernet_device().unwrap();
+            assert!(runtime.take_ethernet_device().is_none());
             effects
                 .lock()
                 .unwrap()
@@ -1475,7 +1492,7 @@ mod tests {
             );
             assert!(runtime.revoked);
             assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-            assert!(ethernet.properties().is_none());
+            assert!(runtime.take_ethernet_device().is_none());
             assert_eq!(
                 futures::executor::block_on(
                     runtime.connect(connect_request(), std::time::Instant::now()),
@@ -1508,7 +1525,7 @@ mod tests {
             state.stale_callback_during_cleanup = true;
         }
         let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        let ethernet = runtime.take_ethernet_device().unwrap();
+        assert!(runtime.take_ethernet_device().is_none());
 
         let failure = futures::executor::block_on(runtime.connect(
             connect_request(),
@@ -1525,7 +1542,6 @@ mod tests {
         ));
         assert!(!runtime.revoked);
         assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-        assert!(ethernet.properties().is_some());
         assert_eq!(
             runtime.io.lock().unwrap().ethernet.deliver(&[0; 14]),
             Err(EthernetIngressError::LinkDown)
@@ -1549,6 +1565,9 @@ mod tests {
         ))
         .unwrap();
         assert!(runtime.sme().status().is_connected());
+        let ethernet = runtime.take_ethernet_device().unwrap();
+        assert!(ethernet.properties().is_some());
+        assert!(runtime.take_ethernet_device().is_none());
     }
 
     #[test]
@@ -1573,6 +1592,7 @@ mod tests {
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: mac,
             ethernet_queue_capacity: capacity,
@@ -1605,6 +1625,52 @@ mod tests {
 
         futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
         assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
+    }
+
+    #[test]
+    fn link_down_revokes_unpublished_and_pending_ethernet_generations() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        let make_host = || {
+            let (host, ethernet) = ethernet_port(mac, 3).unwrap();
+            let (fake, _) = Fake::new(0);
+            let device = Arc::new(Mutex::new(StartedDevice {
+                device: fake,
+                stop_pending: false,
+            }));
+            let io = Arc::new(Mutex::new(HostIo {
+                ethernet,
+                unpublished_ethernet_device: Some(host),
+                pending_ethernet_devices: VecDeque::new(),
+                ethernet_mac_address: mac,
+                ethernet_queue_capacity: 3,
+                minstrel: None,
+            }));
+            (HostMlmeDevice::new(device, io.clone()), io)
+        };
+
+        let (mut before_up, before_up_io) = make_host();
+        futures::executor::block_on(before_up.set_ethernet_status(LinkStatus::DOWN)).unwrap();
+        let before_up_io = before_up_io.lock().unwrap();
+        assert!(before_up_io.unpublished_ethernet_device.is_none());
+        assert!(before_up_io.pending_ethernet_devices.is_empty());
+        assert!(before_up_io.ethernet.is_closed());
+        drop(before_up_io);
+
+        let (mut while_pending, while_pending_io) = make_host();
+        futures::executor::block_on(while_pending.set_ethernet_status(LinkStatus::UP)).unwrap();
+        assert_eq!(
+            while_pending_io
+                .lock()
+                .unwrap()
+                .pending_ethernet_devices
+                .len(),
+            1
+        );
+        futures::executor::block_on(while_pending.set_ethernet_status(LinkStatus::DOWN)).unwrap();
+        let while_pending_io = while_pending_io.lock().unwrap();
+        assert!(while_pending_io.unpublished_ethernet_device.is_none());
+        assert!(while_pending_io.pending_ethernet_devices.is_empty());
+        assert!(while_pending_io.ethernet.is_closed());
     }
 
     #[test]

@@ -1063,6 +1063,15 @@ impl<E, S> Mt7921ClientDevice<E, S> {
     fn backend(&self) -> MutexGuard<'_, ComposedBackend<E, S>> {
         self.backend.lock().unwrap()
     }
+
+    /// Consume the prepared device only when no scan/physical runner retains
+    /// a second handle to its effects and transport.
+    pub(crate) fn into_production_owner(self) -> Result<Self, zx::Status> {
+        if Arc::strong_count(&self.backend) != 1 {
+            return Err(zx::Status::BAD_STATE);
+        }
+        Ok(self)
+    }
 }
 
 impl<E> Mt7921ClientDevice<E, NoClientScan> {
@@ -2016,6 +2025,33 @@ mod tests {
         fn stop(&mut self) -> Result<(), zx::Status> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn production_handoff_requires_all_scan_runner_references_to_be_dropped() {
+        let make_device = || {
+            let capability = nic();
+            let passive = Mt7921SoftmacAdapter::new(
+                FakePassiveTransport::default(),
+                capability,
+                mt7921_port_spike::candidate_channels(capability),
+                vec![channel(36)],
+            )
+            .unwrap();
+            Mt7921ClientDevice::new(FakeEffects::default(), passive, support())
+        };
+
+        let (device, runner) = make_device();
+        let runner_clone = runner.clone();
+        assert!(device.into_production_owner().is_err());
+        drop(runner_clone);
+        drop(runner);
+
+        let (device, runner) = make_device();
+        let runner_clone = runner.clone();
+        drop(runner_clone);
+        drop(runner);
+        assert!(device.into_production_owner().is_ok());
     }
 
     #[test]
