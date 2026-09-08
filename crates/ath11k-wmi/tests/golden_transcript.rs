@@ -1,3 +1,4 @@
+use ath11k_wmi::cmd::comparison::{CommandAlignmentKind, compare_jsonl};
 use ath11k_wmi::cmd::golden::{
     TranscriptKind, Verification, compare_reencoded, parse_jsonl, reverse_map_command_envelope,
     reverse_map_semantic_command, verify_transcript,
@@ -213,4 +214,39 @@ fn validates_native_event_decoders_and_command_envelopes_when_present() {
             .sum::<usize>(),
         411
     );
+}
+
+#[test]
+fn native_transcript_aligns_with_itself_in_every_phase() {
+    let input =
+        include_str!("../../../artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl");
+    let report = compare_jsonl(input, input).expect("compare native transcript");
+    assert_eq!(report.phases.len(), 4);
+    assert_eq!(
+        report
+            .phases
+            .iter()
+            .map(|phase| phase.command_count(CommandAlignmentKind::Exact))
+            .sum::<usize>(),
+        411
+    );
+    assert_eq!(
+        report
+            .phases
+            .iter()
+            .map(|phase| phase.events.aligned)
+            .sum::<usize>(),
+        1_486
+    );
+    for phase in &report.phases {
+        assert_eq!(phase.command_count(CommandAlignmentKind::Masked), 0);
+        assert_eq!(phase.command_count(CommandAlignmentKind::Mismatched), 0);
+        assert_eq!(phase.command_count(CommandAlignmentKind::Missing), 0);
+        assert_eq!(phase.command_count(CommandAlignmentKind::Extra), 0);
+        assert_eq!(phase.command_count(CommandAlignmentKind::Reordered), 0);
+        assert!(phase.events.missing.is_empty());
+        assert!(phase.events.extra.is_empty());
+        assert!(phase.events.reordered.is_empty());
+    }
+    assert_eq!(report.deterministic_report(), report.deterministic_report());
 }
