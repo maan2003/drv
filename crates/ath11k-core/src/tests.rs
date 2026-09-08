@@ -563,6 +563,20 @@ fn qmi_memory_provider_uses_selected_exact_bar_window() {
 }
 
 #[test]
+fn qmi_memory_provider_can_discover_bar_without_mapping_doorbell_region() {
+    use ath11k_qmi::MemoryProvider;
+    use drv_hardware_backends::DeterministicBackend;
+
+    let mut provider = HardwareMemoryProvider::discover_device_bar(DeterministicBackend::device());
+    assert!(provider.map_device_bar(0x1234_0000, 0x20_0000).is_ok());
+    assert_eq!(
+        provider.device_bar_request(),
+        Some((0x1234_0000, 0x20_0000))
+    );
+    assert!(provider.device_bar().is_none());
+}
+
+#[test]
 fn wmi_events_cross_the_wlansoftmac_seam_without_policy() {
     let mgmt = ath11k_wmi::event::MgmtRx {
         channel: 36,

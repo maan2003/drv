@@ -35,8 +35,11 @@ stage, the operator must run `redwood-lab-watchdog stop` over USB SSH.
 
 The resources stage performs the necessarily state-changing iommufd bind under
 the armed watchdog, then fails closed unless VFIO reports the WCN6750 platform
-flags, one region, and 32 single-vector edge-triggered eventfd IRQs. Successful
-bind is the stock-kernel cache-coherency admission check. Redwood's
+flags and 32 single-vector edge-triggered eventfd IRQs. It records every
+enumerated region's index, flags, size, and offset without opening region 0:
+on the stock DT that zero-length resource is the GIC doorbell address, not the
+hybrid-bus register aperture. Successful bind is the stock-kernel
+cache-coherency admission check. Redwood's
 vfio-platform device has no reset handler, so that target additionally requires
 `--containment remoteproc:<sysfs-name>`; the stage verifies the named
 remoteproc is `running`, records its name/state/firmware, and records that
@@ -45,6 +48,14 @@ restart WPSS remoteproc; the runner only reads its resulting state and firmware
 identity and never stops or starts remoteproc. This polling-only run stops on
 failure, with the armed watchdog rebooting the phone if the run or external
 restart fails, rather than fabricating a device reset.
+
+The first physical `qmi` run is deliberately BAR-discovery-only. It waits for
+the QRTR server, completes indication registration, host capability, target
+capability, QMI DeviceInfo and fixed-memory BDF download in pinned source
+order, then prints `bar_addr` and `bar_size`. If no enumerated VFIO region has
+that exact size, it exits successfully before MMIO, CE, HTC, or WMI. A later
+DT-assisted run must expose the QMI-selected 2 MiB aperture as a distinct VFIO
+region and select it explicitly; region 0 is never a fallback.
 
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \

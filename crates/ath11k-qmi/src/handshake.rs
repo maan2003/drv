@@ -137,6 +137,10 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
         &mut self.memory
     }
 
+    pub fn memory(&self) -> &M {
+        &self.memory
+    }
+
     /// Portable replacement for `ath11k_qmi_init_service`.
     pub fn init_service(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
         transport.start_service(wire::SERVICE_VERSION, wire::WCN6750_SERVICE_INSTANCE)
@@ -182,6 +186,22 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
                 _ => {}
             }
         }
+    }
+
+    /// Wait for the server and complete only the exchanges needed to discover
+    /// the hybrid-bus BAR. This stops after DeviceInfo, before BDF download or
+    /// any firmware-ready indication.
+    pub fn discover_device_bar(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
+        loop {
+            match transport.receive(self.config.timeout_ns)? {
+                Incoming::ServerArrived => break,
+                Incoming::ServerExited => return Err(QmiError::Transport),
+                Incoming::Indication(indication) => self.pending.push(indication),
+                Incoming::Response(_) => return Err(QmiError::Malformed),
+            }
+        }
+        self.register_host(transport)?;
+        self.capabilities(transport)
     }
 
     /// Portable replacement for `ath11k_qmi_deinit_service`.
@@ -271,7 +291,7 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
         Ok(())
     }
 
-    fn server_arrived(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
+    fn register_host(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
         self.exchange(
             transport,
             IndicationRegisterRequest {
@@ -294,6 +314,11 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
             }
             .encode()?,
         )?;
+        Ok(())
+    }
+
+    fn server_arrived(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
+        self.register_host(transport)?;
         if self.config.fixed_firmware_memory {
             self.load_bdf(transport, false)?;
         }
@@ -690,6 +715,51 @@ mod tests {
         drop(handshake);
         assert_eq!(memory.mapped, Some((0x10000000, DEVICE_BAR_SIZE)));
         let _ = QmiString::new(b"WIN".to_vec(), 16).unwrap();
+    }
+
+    #[test]
+    fn hybrid_bar_discovery_stops_before_bdf_download() {
+        let cap = vec![2, 4, 0, 0, 0, 0, 0];
+        let device = vec![
+            2, 4, 0, 0, 0, 0, 0, 0x10, 8, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0x11, 4, 0, 0, 0, 0x20, 0,
+        ];
+        let mut transport = MockTransport {
+            incoming: VecDeque::from(vec![
+                Incoming::ServerArrived,
+                success(1, MessageId::IndicationRegister),
+                success(2, MessageId::HostCapability),
+                Incoming::Response(
+                    Response::checked(crate::TransactionId::new(3), MessageId::Capability, cap)
+                        .unwrap(),
+                ),
+                Incoming::Response(
+                    Response::checked(crate::TransactionId::new(4), MessageId::DeviceInfo, device)
+                        .unwrap(),
+                ),
+            ]),
+            sent: Vec::new(),
+            service: None,
+            next_transaction: 0,
+            received_timeouts: Vec::new(),
+        };
+        let mut handshake =
+            Wcn6750Handshake::new(HandshakeConfig::default(), Assets, Memory::default());
+        handshake.init_service(&mut transport).unwrap();
+        handshake.discover_device_bar(&mut transport).unwrap();
+
+        assert_eq!(
+            transport.sent,
+            [
+                MessageId::IndicationRegister,
+                MessageId::HostCapability,
+                MessageId::Capability,
+                MessageId::DeviceInfo,
+            ]
+        );
+        assert_eq!(
+            handshake.memory().mapped,
+            Some((0x10000000, DEVICE_BAR_SIZE))
+        );
     }
 
     #[test]

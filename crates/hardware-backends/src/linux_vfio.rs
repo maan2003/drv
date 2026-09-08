@@ -137,6 +137,15 @@ impl LinuxVfio {
         Ok(device)
     }
 
+    /// Validate the platform/IRQ contract and enumerate regions without
+    /// assuming that the hybrid-bus register BAR is present yet. WCN6750
+    /// learns that BAR from QMI DeviceInfo before a later DT exposes it.
+    pub fn inspect_wcn6750_resources(
+        &self,
+    ) -> std::result::Result<userspace_vfio::PlatformDeviceInfo, LinuxVfioError> {
+        userspace_vfio::validate_wcn6750_platform_cdev(&self.device).map_err(LinuxVfioError::Setup)
+    }
+
     /// Query one enumerated region while preserving the ioctl's exact error.
     pub fn region_info(
         &self,
