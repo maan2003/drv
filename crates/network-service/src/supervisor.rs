@@ -63,8 +63,13 @@ pub struct NetworkServiceProcessExit {
 }
 
 struct RunningProcess {
-    generation: u64,
     child: Child,
+}
+
+struct InstalledGeneration {
+    generation: u64,
+    frame: OwnedFd,
+    running: Option<RunningProcess>,
 }
 
 /// Trusted launcher for independently replaceable network-service generations.
@@ -78,11 +83,13 @@ pub struct NetworkServiceSupervisor {
     listen: SocketAddr,
     mac_address: [u8; 6],
     next_generation: u64,
-    running: Option<RunningProcess>,
+    installed: Option<InstalledGeneration>,
     #[cfg(test)]
     arguments: Vec<OsString>,
     #[cfg(test)]
     fixture: bool,
+    #[cfg(test)]
+    fixture_exit_after_start: bool,
 }
 
 impl NetworkServiceSupervisor {
@@ -109,11 +116,13 @@ impl NetworkServiceSupervisor {
             listen,
             mac_address,
             next_generation: 1,
-            running: None,
+            installed: None,
             #[cfg(test)]
             arguments: Vec::new(),
             #[cfg(test)]
             fixture: false,
+            #[cfg(test)]
+            fixture_exit_after_start: false,
         })
     }
 
@@ -123,8 +132,45 @@ impl NetworkServiceSupervisor {
             .checked_add(1)
             .ok_or("network-service generation exhausted")?;
         self.terminate()?;
+        self.installed = Some(InstalledGeneration {
+            generation,
+            frame,
+            running: None,
+        });
+        self.next_generation = next_generation;
+        self.start_installed()?;
+        Ok(generation)
+    }
+
+    /// Restarts the process for the currently installed Ethernet generation.
+    ///
+    /// The caller must first observe the preceding process exit with
+    /// [`Self::poll_exit`]. A restart retains the generation number because no
+    /// new Ethernet capability has crossed the Wi-Fi service boundary.
+    pub fn restart_generation(&mut self) -> Result<u64, String> {
+        let generation = self
+            .installed
+            .as_ref()
+            .ok_or("no network-service generation installed")?
+            .generation;
+        if self
+            .installed
+            .as_ref()
+            .is_some_and(|installed| installed.running.is_some())
+        {
+            return Err("network-service generation is still running".into());
+        }
+        self.start_installed()?;
+        Ok(generation)
+    }
+
+    fn start_installed(&mut self) -> Result<(), String> {
+        let installed = self
+            .installed
+            .as_ref()
+            .ok_or("no network-service generation installed")?;
         let listener = duplicate_capability(self.listener.as_raw_fd())?;
-        let frame = duplicate_capability(frame.as_raw_fd())?;
+        let frame = duplicate_capability(installed.frame.as_raw_fd())?;
         let (mut bootstrap_parent, bootstrap_child) = std::os::unix::net::UnixStream::pair()
             .map_err(|error| format!("create network-service bootstrap: {error}"))?;
         let bootstrap_pass = duplicate_capability(bootstrap_child.as_raw_fd())?;
@@ -151,6 +197,9 @@ impl NetworkServiceSupervisor {
             if self.fixture {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE", "1");
             }
+            if self.fixture_exit_after_start {
+                command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT", "1");
+            }
         }
         unsafe {
             command.pre_exec(move || {
@@ -170,19 +219,21 @@ impl NetworkServiceSupervisor {
             .spawn()
             .map_err(|error| format!("spawn network service: {error}"))?;
         drop((frame, listener, bootstrap_pass, bootstrap_child));
-        self.running = Some(RunningProcess { generation, child });
+        self.installed.as_mut().unwrap().running = Some(RunningProcess { child });
         if let Err(error) = bootstrap(&mut bootstrap_parent) {
-            return match self.terminate() {
+            return match self.terminate_process() {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
             };
         }
-        self.next_generation = next_generation;
-        Ok(generation)
+        Ok(())
     }
 
     pub fn poll_exit(&mut self) -> Result<Option<NetworkServiceProcessExit>, String> {
-        let Some(running) = self.running.as_mut() else {
+        let Some(installed) = self.installed.as_mut() else {
+            return Ok(None);
+        };
+        let Some(running) = installed.running.as_mut() else {
             return Ok(None);
         };
         let Some(status) = running
@@ -193,33 +244,42 @@ impl NetworkServiceSupervisor {
             return Ok(None);
         };
         let exit = NetworkServiceProcessExit {
-            generation: running.generation,
+            generation: installed.generation,
             success: status.success(),
         };
-        self.running = None;
+        installed.running = None;
         Ok(Some(exit))
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
-        let Some(mut running) = self.running.take() else {
+        self.terminate_process()?;
+        self.installed = None;
+        Ok(())
+    }
+
+    fn terminate_process(&mut self) -> Result<(), String> {
+        let Some(installed) = self.installed.as_mut() else {
+            return Ok(());
+        };
+        let Some(mut running) = installed.running.take() else {
             return Ok(());
         };
         match running.child.try_wait() {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) => {
-                self.running = Some(running);
+                installed.running = Some(running);
                 return Err(format!("poll network service before termination: {error}"));
             }
         }
         if let Err(error) = running.child.kill() {
-            self.running = Some(running);
+            installed.running = Some(running);
             return Err(format!("terminate network service: {error}"));
         }
         match running.child.wait() {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.running = Some(running);
+                installed.running = Some(running);
                 Err(format!("reap network service: {error}"))
             }
         }
@@ -238,7 +298,25 @@ mod tests {
     use std::fs::File;
     use std::io::ErrorKind;
     use std::os::unix::net::UnixStream;
-    use wlan_softmac_host::ethernet::ethernet_port;
+    use wlan_softmac_host::ethernet::{EthernetIngressError, ethernet_port};
+
+    unsafe extern "C" {
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+
+    fn wait_for_exit(supervisor: &mut NetworkServiceSupervisor) -> NetworkServiceProcessExit {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(exit) = supervisor.poll_exit().unwrap() {
+                return exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "network-service fixture did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn supervisor_fixture_child() {
@@ -259,6 +337,9 @@ mod tests {
         assert_eq!(&go, b"GO");
         bootstrap.write_all(b"STARTED").unwrap();
         drop(bootstrap);
+        if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT").is_some() {
+            return;
+        }
 
         let mut frame = unsafe { File::from_raw_fd(FRAME_FD) };
         let mut byte = [0];
@@ -349,26 +430,72 @@ mod tests {
         .into();
         supervisor.fixture = true;
 
-        let (first, first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        let (first, mut first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        first_driver.set_link(true);
         assert_eq!(supervisor.install_generation(first.into_frame_fd()), Ok(1));
-        drop(first_driver);
-        let exit = loop {
-            if let Some(exit) = supervisor.poll_exit().unwrap() {
-                break exit;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
+        let first_pid = supervisor
+            .installed
+            .as_ref()
+            .unwrap()
+            .running
+            .as_ref()
+            .unwrap()
+            .child
+            .id() as i32;
+
+        let (second, second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
+        let waited = unsafe { waitpid(first_pid, std::ptr::null_mut(), 1) };
         assert_eq!(
-            exit,
-            NetworkServiceProcessExit {
-                generation: 1,
-                success: true
-            }
+            waited, -1,
+            "replaced child remained waitable instead of being reaped"
+        );
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10));
+        assert_eq!(
+            first_driver.deliver(&[0; 14]),
+            Err(EthernetIngressError::Closed),
+            "old Ethernet generation remained open after replacement"
         );
 
-        let (second, _second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
-        assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
+        drop(second_driver);
+        assert_eq!(wait_for_exit(&mut supervisor).generation, 2);
         supervisor.terminate().unwrap();
         assert_eq!(supervisor.poll_exit(), Ok(None));
+    }
+
+    #[test]
+    fn supervisor_restarts_exited_process_with_retained_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new(
+            std::env::current_exe().unwrap(),
+            listener,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+        supervisor.fixture_exit_after_start = true;
+
+        let (capability, driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        assert_eq!(
+            supervisor.install_generation(capability.into_frame_fd()),
+            Ok(1)
+        );
+        let first_exit = wait_for_exit(&mut supervisor);
+        assert_eq!(first_exit.generation, 1);
+
+        supervisor.fixture_exit_after_start = false;
+        assert_eq!(supervisor.restart_generation(), Ok(1));
+        drop(driver);
+        let restarted_exit = wait_for_exit(&mut supervisor);
+        assert_eq!(restarted_exit.generation, 1);
+        assert!(restarted_exit.success);
+        supervisor.terminate().unwrap();
     }
 }

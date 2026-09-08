@@ -32,6 +32,7 @@ pub(crate) struct ServiceEthernetDevice {
     mac_address: [u8; 6],
     initial_link_event: bool,
     link_closed: bool,
+    link_close_notified: bool,
     receive_notified: bool,
     transmit_blocked: bool,
 }
@@ -49,6 +50,7 @@ impl ServiceEthernetDevice {
             mac_address,
             initial_link_event: true,
             link_closed: false,
+            link_close_notified: false,
             receive_notified: false,
             transmit_blocked: false,
         }
@@ -111,7 +113,11 @@ impl EthernetEventSource for ServiceEthernetDevice {
             return Some(EthernetDeviceEvent::LinkStateChanged(true));
         }
         if self.link_closed {
-            return None;
+            if self.link_close_notified {
+                return None;
+            }
+            self.link_close_notified = true;
+            return Some(EthernetDeviceEvent::LinkStateChanged(false));
         }
         let mut descriptor = PollFd {
             fd: self.fd.as_raw_fd(),
@@ -123,6 +129,7 @@ impl EthernetEventSource for ServiceEthernetDevice {
         }
         if descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
             self.link_closed = true;
+            self.link_close_notified = true;
             return Some(EthernetDeviceEvent::LinkStateChanged(false));
         }
         if descriptor.revents & POLLIN != 0 && !self.receive_notified {

@@ -122,10 +122,13 @@ const CLIENT_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const CLIENT_IP: [u8; 4] = [192, 0, 2, 10];
 const SERVER_IP: [u8; 4] = [192, 0, 2, 1];
+const RENEWED_DNS_IP: [u8; 4] = [192, 0, 2, 53];
 
 struct AssociatedAp {
     server: Runtime,
     dns: netstack3_port_integration::UdpSocketHandle,
+    advertised_dns: [u8; 4],
+    renewal_requests: usize,
     pending: VecDeque<EthernetFrame>,
 }
 
@@ -147,6 +150,8 @@ impl AssociatedAp {
         Self {
             server,
             dns,
+            advertised_dns: SERVER_IP,
+            renewal_requests: 0,
             pending: VecDeque::new(),
         }
     }
@@ -165,6 +170,14 @@ impl AssociatedAp {
     }
 
     fn queue_dhcp_reply(&mut self, request: DhcpMessage) {
+        if request.ciaddr.octets() == CLIENT_IP {
+            self.renewal_requests += 1;
+        }
+        let destination = if request.ciaddr.is_unspecified() {
+            [255, 255, 255, 255]
+        } else {
+            request.ciaddr.octets()
+        };
         let kind = match request.get_dhcp_type().unwrap() {
             MessageType::DHCPDISCOVER => MessageType::DHCPOFFER,
             MessageType::DHCPREQUEST => MessageType::DHCPACK,
@@ -185,14 +198,14 @@ impl AssociatedAp {
             options: vec![
                 DhcpOption::DhcpMessageType(kind),
                 DhcpOption::ServerIdentifier(Ipv4Addr::from(SERVER_IP)),
-                DhcpOption::IpAddressLeaseTime(600),
+                DhcpOption::IpAddressLeaseTime(120),
                 DhcpOption::SubnetMask(PrefixLength::<Ipv4>::new(24).unwrap()),
                 DhcpOption::Router([Ipv4Addr::from(SERVER_IP)].into()),
-                DhcpOption::DomainNameServer([Ipv4Addr::from(SERVER_IP)].into()),
+                DhcpOption::DomainNameServer([Ipv4Addr::from(self.advertised_dns)].into()),
             ],
         };
         let src = NetIpv4Addr::new(SERVER_IP);
-        let dst = NetIpv4Addr::new([255, 255, 255, 255]);
+        let dst = NetIpv4Addr::new(destination);
         let bytes = Buf::new(reply.serialize(), ..)
             .wrap_in(UdpPacketBuilder::new(
                 src,
@@ -327,7 +340,7 @@ fn drive(
 }
 
 #[test]
-fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
+fn associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss() {
     let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let device = unsafe {
         ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
@@ -402,6 +415,10 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
             .unwrap(),
         18
     );
+    // The upstream DHCP client renews at half the lease lifetime. Change the
+    // advertised DNS server before advancing past that deadline.
+    assert_eq!(ap.renewal_requests, 0);
+    ap.advertised_dns = RENEWED_DNS_IP;
     for second in 80..96 {
         drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
     }
@@ -409,8 +426,28 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
     let read = ap.server.tcp_read(accepted, &mut request).unwrap();
     assert_eq!(&request[..read], b"GET / HTTP/1.0\r\n\r\n");
 
+    assert_eq!(
+        runner.stack().runtime().dns_servers(),
+        [Some(Ipv4Addr::from(RENEWED_DNS_IP)), None]
+    );
+    assert_eq!(ap.renewal_requests, 1);
+    // Prove the established application socket remains usable through the
+    // renewal rather than merely retaining its provider handle.
+    assert_eq!(
+        ap.server
+            .tcp_write(accepted, b"HTTP/1.0 200 OK\r\n\r\n")
+            .unwrap(),
+        19
+    );
+    for second in 96..112 {
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
+    }
+    let mut response = [0; 64];
+    let read = provider.tcp_read(socket, &mut response).unwrap();
+    assert_eq!(&response[..read], b"HTTP/1.0 200 OK\r\n\r\n");
+
     sink.set_link(false);
-    drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(96));
+    drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(112));
     assert_eq!(runner.stack().runtime().ipv4_address(), None);
     assert_eq!(runner.stack().runtime().dns_servers(), [None, None]);
     let blocked = provider.tcp_socket(client, RemoteIpVersion::V4).unwrap();
