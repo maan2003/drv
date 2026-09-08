@@ -8,6 +8,291 @@
 
 extern crate alloc;
 
+mod mcu_rx {
+    use alloc::vec::Vec;
+
+    use crate::{
+        DownloadResponse, Mt7921TxFree, Mt7921TxStatus, parse_download_response,
+        parse_mt7921_tx_free, parse_mt7921_tx_status,
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxParserKind {
+        NotEndOfPacket,
+        DescriptorLength,
+        BufferTruncated,
+        TxFree,
+        TxStatus,
+        Firmware,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct McuRxRouteError {
+        pub ring: u8,
+        pub slot: u16,
+        pub control: u32,
+        pub length: u16,
+        pub parser: McuRxParserKind,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct FirmwareRx {
+        pub response: DownloadResponse,
+        pub bytes: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum McuRxRoute {
+        Normal(Vec<u8>),
+        TxFree(Mt7921TxFree),
+        TxStatus(Mt7921TxStatus),
+        Firmware(FirmwareRx),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum FirmwareRxDisposition {
+        Matched,
+        Unsolicited,
+        Unrelated,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DuplicateFirmwareResponse;
+
+    fn error(ring: u8, slot: u16, control: u32, parser: McuRxParserKind) -> McuRxRouteError {
+        McuRxRouteError {
+            ring,
+            slot,
+            control,
+            length: ((control >> 16) & 0x3fff) as u16,
+            parser,
+        }
+    }
+
+    /// Classify one completed MT7921 MCU RX descriptor without owning its DMA.
+    ///
+    /// The caller must rearm and advance the physical ring before surfacing either
+    /// this function's route or error.
+    pub fn route_mcu_rx_descriptor(
+        ring: u8,
+        slot: u16,
+        control: u32,
+        bytes: &[u8],
+    ) -> Result<McuRxRoute, McuRxRouteError> {
+        if control & (1 << 30) == 0 {
+            return Err(error(ring, slot, control, McuRxParserKind::NotEndOfPacket));
+        }
+        let length = ((control >> 16) & 0x3fff) as usize;
+        if !(12..=2048).contains(&length) {
+            return Err(error(
+                ring,
+                slot,
+                control,
+                McuRxParserKind::DescriptorLength,
+            ));
+        }
+        let bytes = bytes
+            .get(..length)
+            .ok_or_else(|| error(ring, slot, control, McuRxParserKind::BufferTruncated))?;
+        let rxd0 = u32::from_le_bytes(bytes[0..4].try_into().expect("minimum descriptor length"));
+        let packet_type = (rxd0 >> 27) & 0x1f;
+        let packet_flag = (rxd0 >> 16) & 0x0f;
+        if packet_type == 6 {
+            return parse_mt7921_tx_free(bytes)
+                .map(McuRxRoute::TxFree)
+                .map_err(|_| error(ring, slot, control, McuRxParserKind::TxFree));
+        }
+        if packet_type == 0 && length >= 40 && (rxd0 & 0xffff) as usize == length {
+            return parse_mt7921_tx_status(bytes)
+                .map(McuRxRoute::TxStatus)
+                .map_err(|_| error(ring, slot, control, McuRxParserKind::TxStatus));
+        }
+        if length < 36 {
+            return Err(error(
+                ring,
+                slot,
+                control,
+                McuRxParserKind::DescriptorLength,
+            ));
+        }
+        if packet_type == 7 && packet_flag == 1 {
+            return Ok(McuRxRoute::Normal(bytes.to_vec()));
+        }
+        let sequence = bytes[29];
+        parse_download_response(bytes, sequence)
+            .map(|response| {
+                McuRxRoute::Firmware(FirmwareRx {
+                    response,
+                    bytes: bytes.to_vec(),
+                })
+            })
+            .map_err(|_| error(ring, slot, control, McuRxParserKind::Firmware))
+    }
+
+    pub const fn is_unsolicited_mcu_event(event_id: u8, option: u8) -> bool {
+        option & (1 << 2) != 0 || matches!(event_id, 0x07 | 0x0f | 0x11 | 0x13 | 0x27 | 0x96 | 0xf0)
+    }
+
+    pub fn classify_firmware_rx(
+        expected_sequence: Option<u8>,
+        response: &DownloadResponse,
+    ) -> FirmwareRxDisposition {
+        if is_unsolicited_mcu_event(response.event_id, response.option) {
+            FirmwareRxDisposition::Unsolicited
+        } else if Some(response.sequence) == expected_sequence {
+            FirmwareRxDisposition::Matched
+        } else {
+            FirmwareRxDisposition::Unrelated
+        }
+    }
+
+    /// Preserve the existing lab backlog contract: only sequence-zero
+    /// nonmatches are retained for later asynchronous-event handling.
+    pub const fn retain_nonmatching_firmware_response(response: &DownloadResponse) -> bool {
+        response.sequence == 0
+    }
+
+    pub fn merge_matching_firmware_response<T>(
+        matched: &mut Option<T>,
+        candidate: Option<T>,
+    ) -> Result<(), DuplicateFirmwareResponse> {
+        if let Some(candidate) = candidate {
+            if matched.is_some() {
+                drop(candidate);
+                return Err(DuplicateFirmwareResponse);
+            }
+            *matched = Some(candidate);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use alloc::vec;
+
+        fn control(length: usize) -> u32 {
+            (1 << 31) | (1 << 30) | ((length as u32) << 16)
+        }
+
+        #[test]
+        fn descriptor_bounds_and_eop_fail_with_bounded_metadata() {
+            for (ctrl, parser) in [
+                ((1 << 31) | (36 << 16), McuRxParserKind::NotEndOfPacket),
+                (control(11), McuRxParserKind::DescriptorLength),
+                (control(2049), McuRxParserKind::DescriptorLength),
+                (control(36), McuRxParserKind::BufferTruncated),
+            ] {
+                let error = route_mcu_rx_descriptor(4, 7, ctrl, &[]).unwrap_err();
+                assert_eq!(
+                    (error.ring, error.slot, error.control, error.parser),
+                    (4, 7, ctrl, parser)
+                );
+            }
+        }
+
+        #[test]
+        fn normal_and_firmware_routes_are_distinct() {
+            let mut normal = vec![0; 40];
+            normal[..4].copy_from_slice(&((7u32 << 27) | (1 << 16)).to_le_bytes());
+            assert_eq!(
+                route_mcu_rx_descriptor(0, 0, control(40), &normal),
+                Ok(McuRxRoute::Normal(normal))
+            );
+
+            let mut firmware = vec![0; 36];
+            firmware[24..26].copy_from_slice(&12u16.to_le_bytes());
+            firmware[28] = 1;
+            firmware[29] = 5;
+            let McuRxRoute::Firmware(routed) =
+                route_mcu_rx_descriptor(0, 1, control(36), &firmware).unwrap()
+            else {
+                panic!("firmware response was not routed")
+            };
+            assert_eq!(routed.response.sequence, 5);
+        }
+
+        #[test]
+        fn tx_status_and_tx_free_are_routed_before_firmware_parsing() {
+            let txs = [
+                0x28, 0x00, 0x01, 0x00, 0x00, 0x00, 0x36, 0x00, 0x4b, 0x80, 0x00, 0x80, 0x00, 0x03,
+                0x0b, 0x00, 0x09, 0x00, 0x13, 0x04, 0x00, 0x00, 0x00, 0x03, 0xf7, 0x07, 0x1c, 0x00,
+                0xfd, 0xe7, 0x00, 0x82, 0xff, 0xff, 0xff, 0xff, 0x63, 0x62, 0xff, 0xff,
+            ];
+            assert!(matches!(
+                route_mcu_rx_descriptor(4, 0, control(txs.len()), &txs),
+                Ok(McuRxRoute::TxStatus(_))
+            ));
+
+            let mut tx_free = [0u8; 16];
+            tx_free[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 16).to_le_bytes());
+            tx_free[8..12].copy_from_slice(&((1u32 << 31) | (19 << 14)).to_le_bytes());
+            tx_free[12..16].copy_from_slice(&1u32.to_le_bytes());
+            assert!(matches!(
+                route_mcu_rx_descriptor(4, 1, control(tx_free.len()), &tx_free),
+                Ok(McuRxRoute::TxFree(_))
+            ));
+        }
+
+        #[test]
+        fn malformed_firmware_header_reports_parser_kind_without_payload() {
+            let mut bytes = vec![0; 36];
+            bytes[24..26].copy_from_slice(&13u16.to_le_bytes());
+            let error = route_mcu_rx_descriptor(0, 2, control(bytes.len()), &bytes).unwrap_err();
+            assert_eq!(error.parser, McuRxParserKind::Firmware);
+            assert_eq!((error.ring, error.slot, error.length), (0, 2, 36));
+        }
+
+        #[test]
+        fn unsolicited_precedes_matching_sequence_and_duplicates_are_rejected() {
+            let response = DownloadResponse {
+                length: 12,
+                packet_type: 0,
+                event_id: 0x07,
+                sequence: 5,
+                option: 0,
+                extended_event_id: 0,
+            };
+            assert_eq!(
+                classify_firmware_rx(Some(5), &response),
+                FirmwareRxDisposition::Unsolicited
+            );
+            assert!(!retain_nonmatching_firmware_response(&response));
+            let unrelated = DownloadResponse {
+                event_id: 1,
+                sequence: 3,
+                ..response
+            };
+            assert_eq!(
+                classify_firmware_rx(Some(5), &unrelated),
+                FirmwareRxDisposition::Unrelated
+            );
+            assert!(!retain_nonmatching_firmware_response(&unrelated));
+            let sequence_zero = DownloadResponse {
+                sequence: 0,
+                ..unrelated
+            };
+            assert_eq!(
+                classify_firmware_rx(Some(5), &sequence_zero),
+                FirmwareRxDisposition::Unrelated
+            );
+            assert!(retain_nonmatching_firmware_response(&sequence_zero));
+            let firmware = FirmwareRx {
+                response,
+                bytes: vec![0; 36],
+            };
+            let original = firmware.clone();
+            let mut matched = Some(firmware.clone());
+            assert_eq!(
+                merge_matching_firmware_response(&mut matched, Some(firmware)),
+                Err(DuplicateFirmwareResponse)
+            );
+            assert_eq!(matched, Some(original));
+        }
+    }
+}
+pub use mcu_rx::*;
+
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};

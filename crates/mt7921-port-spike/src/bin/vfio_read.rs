@@ -65,22 +65,25 @@ use mt7921_port_spike::{
     DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
     DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
     FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, FirmwareOwnershipEvent,
-    GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport, IrqLifecycle, IrqResetCleanupStep,
+    FirmwareRxDisposition, GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport,
+    IrqLifecycle, IrqResetCleanupStep,
     IrqResetEvent, IrqResetTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
-    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxRegisters,
+    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxParserKind,
+    McuRxRegisters, McuRxRoute,
     Mt7921TxFree, Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
     OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
     PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
+    classify_firmware_rx, encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
     load_mt7921_firmware, load_mt7921_firmware_bootstrap,
     load_mt7921_firmware_through_channel_domain, load_mt7921_patch_bootstrap,
-    mask_ack_disabled_fwdl_interrupt, mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx,
+    mask_ack_disabled_fwdl_interrupt, merge_matching_firmware_response, mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx,
     mt7921_packet_type, parse_clc_set_response, parse_download_response, parse_eeprom_block,
     parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings,
     prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, reset_wfsys, round_trip_driver_ownership, select_vfio_irq,
+    read_dynamic_identity_status, reset_wfsys, retain_nonmatching_firmware_response,
+    round_trip_driver_ownership, route_mcu_rx_descriptor, select_vfio_irq,
     stage_disabled_firmware_chunk,
 };
 #[cfg(feature = "fuchsia-passive")]
@@ -10492,52 +10495,6 @@ const fn firmware_bootstrap_rx_irq_mask() -> u32 {
     WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
 }
 
-fn merge_matching_response(
-    matched: &mut Option<ReceivedMcuResponse>,
-    candidate: Option<ReceivedMcuResponse>,
-) -> Result<(), String> {
-    if candidate.is_some() && matched.is_some() {
-        return Err("matching MCU sequence appeared on both receive rings".into());
-    }
-    if matched.is_none() {
-        *matched = candidate;
-    }
-    Ok(())
-}
-
-/// Linux `mt7921_mcu_rx_event` routes these event ids (and anything with the
-/// UNI unsolicited option bit) to the unsolicited handler before sequence
-/// matching, so a firmware notification that happens to carry the awaited
-/// sequence number (run 111342Z: `MCU_EVENT_LP_INFO` with seq 5 during
-/// BSS_INFO) is never mistaken for the command response.
-fn is_unsolicited_mcu_event(event_id: u8, option: u8) -> bool {
-    option & (1 << 2) != 0
-        || matches!(
-            event_id,
-            0x07 // MCU_EVENT_LP_INFO
-                | 0x0f // MCU_EVENT_TX_DONE
-                | 0x11 // MCU_EVENT_BSS_ABSENCE
-                | 0x13 // MCU_EVENT_BSS_BEACON_LOSS
-                | 0x27 // MCU_EVENT_DBG_MSG
-                | 0x96 // MCU_EVENT_RSSI_NOTIFY
-                | 0xf0 // MCU_EVENT_COREDUMP
-        )
-}
-
-fn response_for_sequence(
-    expected_sequence: Option<u8>,
-    parsed: mt7921_port_spike::DownloadResponse,
-    bytes: Vec<u8>,
-) -> Option<ReceivedMcuResponse> {
-    (Some(parsed.sequence) == expected_sequence
-        && !is_unsolicited_mcu_event(parsed.event_id, parsed.option))
-    .then_some(ReceivedMcuResponse {
-        event_id: parsed.event_id,
-        option: parsed.option,
-        bytes,
-    })
-}
-
 const fn rx_irq_acknowledge(status: u32, mask: u32) -> u32 {
     status & mask
 }
@@ -10803,7 +10760,7 @@ fn publish_current_rearm_or_revoke<T>(
 enum DrainedMcuRx {
     Normal(PrivateRawFrameCarrier),
     Response(Option<mt7921_port_spike::DownloadResponse>, Vec<u8>),
-    Completion(MgmtTxCompletion),
+    Completion(MgmtTxCompletion, Vec<u8>),
 }
 
 fn drain_rx_queue(
@@ -10826,113 +10783,75 @@ fn drain_rx_queue(
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             let completed_index = queue.rx_tail;
             let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
-            let parsed = if descriptor.ctrl & (1 << 30) == 0 {
-                provenance.consume_without_mint(
-                    DescriptorOccurrenceRoute::McuNormalRx,
-                    queue.rx_ring_index,
-                    completed_index,
-                );
-                Err("fragmented MCU RX descriptor is unsupported".into())
-            } else if !(12..=2048).contains(&response_len) {
-                provenance.consume_without_mint(
-                    DescriptorOccurrenceRoute::McuNormalRx,
-                    queue.rx_ring_index,
-                    completed_index,
-                );
-                Err(format!(
-                    "invalid MCU response descriptor length {response_len}"
-                ))
+            let response = if descriptor.ctrl & (1 << 30) != 0
+                && (12..=2048).contains(&response_len)
+            {
+                queue.rx_buffers.read_bytes(completed_index * 2048, response_len)?
             } else {
-                let response = queue
-                    .rx_buffers
-                    .read_bytes(completed_index * 2048, response_len)?;
-                let rxd0 = u32::from_le_bytes(response[0..4].try_into().expect("bounded response"));
-                let packet_type = (rxd0 >> 27) & 0x1f;
-                let packet_flag = (rxd0 >> 16) & 0x0f;
-                let completion = match packet_type {
-                    6 => {
-                        let parsed = parse_mt7921_tx_free(&response)
-                            .map(MgmtTxCompletion::Free)
-                            .map_err(|error| format!("parse TX_FREE: {error:?}"));
-                        if let Ok(completion) = &parsed {
-                            record_management_completion_received(
-                                "mcu_normal",
-                                &response,
-                                *completion,
-                            );
-                        }
-                        Some(parsed)
-                    }
-                    0 if response_len >= 40 && (rxd0 & 0xffff) as usize == response_len => {
-                        let parsed = parse_mt7921_tx_status(&response)
-                            .map(MgmtTxCompletion::Status)
-                            .map_err(|error| format!("parse TXS: {error:?}"));
-                        if let Ok(completion) = &parsed {
-                            record_management_completion_received(
-                                "mcu_normal",
-                                &response,
-                                *completion,
-                            );
-                        }
-                        Some(parsed)
-                    }
-                    _ => None,
-                };
-                if let Some(completion) = completion {
+                Vec::new()
+            };
+            let routed = route_mcu_rx_descriptor(
+                queue.rx_ring_index as u8,
+                completed_index as u16,
+                descriptor.ctrl,
+                &response,
+            );
+            let parsed = match routed {
+                Ok(McuRxRoute::Normal(bytes)) => match provenance.seal_frame(
+                    DescriptorOccurrenceRoute::McuNormalRx,
+                    queue.rx_ring_index,
+                    completed_index,
+                    bytes,
+                )? {
+                    PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
+                    PrivateFrameSeal::Uncovered(bytes) => Ok(DrainedMcuRx::Normal(
+                        PrivateRawFrameCarrier { bytes, occurrence: None },
+                    )),
+                },
+                Ok(McuRxRoute::TxFree(completion)) => {
                     provenance.consume_without_mint(
                         DescriptorOccurrenceRoute::McuNormalRx,
                         queue.rx_ring_index,
                         completed_index,
                     );
-                    completion.map(DrainedMcuRx::Completion)
-                } else if response_len < 36 {
+                    let completion = MgmtTxCompletion::Free(completion);
+                    Ok(DrainedMcuRx::Completion(completion, response))
+                }
+                Ok(McuRxRoute::TxStatus(completion)) => {
                     provenance.consume_without_mint(
                         DescriptorOccurrenceRoute::McuNormalRx,
                         queue.rx_ring_index,
                         completed_index,
                     );
+                    let completion = MgmtTxCompletion::Status(completion);
+                    Ok(DrainedMcuRx::Completion(completion, response))
+                }
+                Ok(McuRxRoute::Firmware(firmware)) => {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    Ok(DrainedMcuRx::Response(Some(firmware.response), firmware.bytes))
+                }
+                Err(error) => {
+                    provenance.consume_without_mint(
+                        DescriptorOccurrenceRoute::McuNormalRx,
+                        queue.rx_ring_index,
+                        completed_index,
+                    );
+                    let reason = match error.parser {
+                        McuRxParserKind::NotEndOfPacket => "fragmented MCU RX descriptor is unsupported",
+                        McuRxParserKind::DescriptorLength => "invalid MCU response descriptor length",
+                        McuRxParserKind::BufferTruncated => "truncated MCU RX buffer",
+                        McuRxParserKind::TxFree => "parse TX_FREE",
+                        McuRxParserKind::TxStatus => "parse TXS",
+                        McuRxParserKind::Firmware => "parse MCU response",
+                    };
                     Err(format!(
-                        "invalid MCU response descriptor length {response_len}"
+                        "{reason}: rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={}",
+                        error.ring, error.slot, error.control, error.length
                     ))
-                } else if packet_type == 7 && packet_flag == 1 {
-                    match provenance.seal_frame(
-                        DescriptorOccurrenceRoute::McuNormalRx,
-                        queue.rx_ring_index,
-                        completed_index,
-                        response,
-                    )? {
-                        PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
-                        PrivateFrameSeal::Uncovered(bytes) => {
-                            Ok(DrainedMcuRx::Normal(PrivateRawFrameCarrier {
-                                bytes,
-                                occurrence: None,
-                            }))
-                        }
-                    }
-                } else {
-                    let actual_sequence = response[29];
-                    let header_length = response
-                        .get(24..26)
-                        .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("fixed field")));
-                    provenance.consume_without_mint(
-                        DescriptorOccurrenceRoute::McuNormalRx,
-                        queue.rx_ring_index,
-                        completed_index,
-                    );
-                    match parse_download_response(&response, actual_sequence) {
-                        Ok(parsed) => Ok(DrainedMcuRx::Response(Some(parsed), response)),
-                        Err(error) => {
-                            let prefix = response
-                                .iter()
-                                .take(64)
-                                .map(|byte| format!("{byte:02x}"))
-                                .collect::<String>();
-                            Err(format!(
-                                "parse MCU response: {error:?}; rx_ring={} descriptor={} ctrl={:#010x} descriptor_length={} header_length={header_length:?} prefix={prefix}",
-                                queue.rx_ring_index, completed_index, descriptor.ctrl, response_len
-                            ))
-                        }
-                    }
                 }
             };
 
@@ -10968,7 +10887,8 @@ fn drain_rx_queue(
                     continue;
                 }
                 DrainedMcuRx::Response(parsed, response) => (parsed, response),
-                DrainedMcuRx::Completion(completion) => {
+                DrainedMcuRx::Completion(completion, response) => {
+                    record_management_completion_received("mcu_normal", &response, completion);
                     record_sae_stage(&format!(
                         "management_tx_completion_routed rx_ring={} completion={completion:?}",
                         queue.rx_ring_index
@@ -10980,26 +10900,22 @@ fn drain_rx_queue(
             let Some(parsed) = parsed else {
                 continue;
             };
-            let candidate = response_for_sequence(expected_sequence, parsed, response.clone());
-            if candidate.is_some() {
-                if matched.is_some() {
-                    return Err(format!(
-                        "duplicate MCU sequence {} on RX ring {}",
-                        parsed.sequence, queue.rx_ring_index
-                    ));
-                }
+            let routed = ReceivedMcuResponse {
+                event_id: parsed.event_id,
+                option: parsed.option,
+                bytes: response,
+            };
+            if classify_firmware_rx(expected_sequence, &parsed) == FirmwareRxDisposition::Matched {
+                merge_matching_firmware_response(&mut matched, Some(routed)).map_err(|_| {
+                    format!("duplicate MCU sequence {} on RX ring {}", parsed.sequence, queue.rx_ring_index)
+                })?;
                 println!(
                     "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
                     parsed.sequence, parsed.event_id, parsed.length, queue.rx_ring_index
                 );
-                matched = candidate;
             } else {
-                if parsed.sequence == 0 {
-                    unsolicited.push(ReceivedMcuResponse {
-                        event_id: parsed.event_id,
-                        option: parsed.option,
-                        bytes: response.clone(),
-                    });
+                if retain_nonmatching_firmware_response(&parsed) {
+                    unsolicited.push(routed);
                 }
                 println!(
                     "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}",
@@ -11087,7 +11003,8 @@ impl ActiveMcuIo<'_> {
                     &mut self.tx_completions,
                     &mut self.descriptor_provenance,
                 )?;
-                merge_matching_response(&mut matched, wm2_match)?;
+                merge_matching_firmware_response(&mut matched, wm2_match)
+                    .map_err(|_| "matching MCU sequence appeared on both receive rings".to_string())?;
             }
             self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
             Ok(matched)
@@ -22271,6 +22188,8 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("invalid MCU response descriptor length"));
+        assert_eq!((queue.rx_tail, queue.rx_head), (2, 1));
+        assert_eq!(queue.rx_ring.read_descriptor_at(0).buf0, buffers.iova as u32);
         assert!(normal.is_empty());
         assert!(provenance.sealed.is_empty());
         assert!(!lease.current.load(Ordering::Acquire));
@@ -23326,12 +23245,17 @@ mod tests {
             option: 0,
             extended_event_id: 0,
         };
-        let unrelated_wm = response_for_sequence(Some(7), envelope(3, 1), vec![3]);
-        let matching_wm2 = response_for_sequence(Some(7), envelope(7, 0x80), vec![7]);
-        assert!(unrelated_wm.is_none());
+        assert_eq!(
+            classify_firmware_rx(Some(7), &envelope(3, 1)),
+            FirmwareRxDisposition::Unrelated
+        );
+        let matching_wm2 = Some(ReceivedMcuResponse {
+            event_id: 0x80,
+            option: 0,
+            bytes: vec![7],
+        });
         let mut matched = None;
-        merge_matching_response(&mut matched, unrelated_wm).unwrap();
-        merge_matching_response(&mut matched, matching_wm2).unwrap();
+        merge_matching_firmware_response(&mut matched, matching_wm2).unwrap();
         assert_eq!(matched.unwrap().event_id, 0x80);
 
         let mut duplicate = Some(ReceivedMcuResponse {
@@ -23340,7 +23264,7 @@ mod tests {
             bytes: vec![],
         });
         assert!(
-            merge_matching_response(
+            merge_matching_firmware_response(
                 &mut duplicate,
                 Some(ReceivedMcuResponse {
                     event_id: 0x80,
