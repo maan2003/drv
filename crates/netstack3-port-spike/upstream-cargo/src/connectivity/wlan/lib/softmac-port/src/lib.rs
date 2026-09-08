@@ -220,7 +220,7 @@ impl BeaconHintAuthorizer {
     }
 
     /// Port the narrow `regulatory_hint_found_beacon` case used here: direct
-    /// ESS beacon, world roaming domain, exact non-radar channel 36, and the
+    /// ESS beacon, world roaming domain, exact non-radar channel 149, and the
     /// configured BSSID/SSID. Probe responses and AP Country IEs cannot mint
     /// this authorization.
     pub fn observe(
@@ -230,7 +230,7 @@ impl BeaconHintAuthorizer {
     ) -> Option<BeaconHintAuthorization> {
         let channel = ChannelNumber {
             band: WlanBand::FiveGhz,
-            number: 36,
+            number: 149,
         };
         if self.alpha2 != *b"00"
             || self.channel != Some(channel)
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn direct_target_beacon_mints_only_run_scoped_channel_36_authorization() {
         let target = [6; 6];
-        let channel = channel_5ghz(36);
+        let channel = channel_5ghz(149);
         let observation = ScanObservation {
             kind: AdvertisementKind::Beacon,
             timestamp_nanos: 42,

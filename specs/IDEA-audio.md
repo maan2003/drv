@@ -2,10 +2,10 @@
 
 ## Status
 
-This is an unfinalized direction for discussion. It refines the possible
-implementation of application compatibility in
-[REQ-application-compatibility](REQ-application-compatibility.md) without making
-the audio service part of the current hardware spike.
+The broad media-service direction remains exploratory. The real-time executor,
+process boundary, speaker containment, and kernel-PCM transition are now owned
+by [ARCH-audio-runtime](ARCH-audio-runtime.md). This record retains the wider
+Fuchsia-derived media direction that is not yet committed architecture.
 
 ## Idea
 

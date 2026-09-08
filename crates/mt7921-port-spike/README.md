@@ -2805,86 +2805,31 @@ containment and restoration. Any mismatch or timeout is failure and also
 stops. No retry, EAPOL publication, VO publication, second probe, or other
 traffic is authorized.
 
-### Passive M1 RX diagnostic boundary
+### Read-only RX diagnostic snapshots
 
-Linux 6.18.40 exposes a smaller MT7921 observation boundary than the desired
-RMAC-drop taxonomy. `mt7921/regs.h` names `MT_RX_DATA_RING_BASE` as
-`MT_WFDMA0(0x520)`; the common `mt76_queue_regs` layout places the ordinary
-CPU and DMA indices at `+0x8` and `+0xc`, and `MT_DMA_CTL_DMA_DONE` is
-RX-descriptor bit 31. `MT_WFDMA0_GLO_CFG` bit 2 is the named RX-DMA enable
-state. These CSR and host descriptor-memory reads have no read-clear or
-write side effect.
+The hardware backend can capture non-consuming RX-DMA, ring-index, descriptor,
+and receive-filter snapshots around association. These observations are
+telemetry only: they do not gate or replace the `WlanSoftmac`/Client MLME
+association and EAPOL state machines.
 
-The other requested signals are not available as safe MT792x counters in the
-pinned source. `MT_MDP_RCFR1_RX_DROPPED_UCAST` bits 28:27 are a routing
-selector paired with `MT_MDP_TO_HIF`/`MT_MDP_TO_WM`, not a counter. Linux
-6.18.40 gives MT792x no named RMAC unicast-to-me/filter-drop counter, WTBL
-lookup hit/miss counter, or PLE/PSE RX enqueue/drop counter; the named PLE
-registers are TX queue/AMSDU state. MT7915-only counter names and raw offsets
-are not inferred for MT7921.
+### Fresh-LAA M1 attribution result
 
-`MT_MIB_SDR3(0)` names FCS errors in bits 31:16 and `MT_MIB_SDR5(0)` names
-aggregate RX MPDUs, but `mt792x_mac_update_mib_stats()` consumes their reads
-into software totals. Linux also reads SDR9/36/37 when resetting survey
-counters. The strict passive diagnostic therefore reads no MIB register.
+A dedicated `fresh-laa-diagnostic` artifact used one fixed locally administered
+unicast address as the single typed identity across DEV_INFO/MUAR, BSS OMAC,
+SoftMAC/SME and SAE, management TX, M1 matching, and RX classification. It
+rejects the native/AP/zero/multicast identities, leaves normal production
+unchanged, and requires restoration of the native address before watchdog
+disarm. Its package, production regression, cross-layer identity test,
+supervisor, manifest, root, inert plan, remote closure, and exact local/remote
+hash checks passed.
 
-Production takes two bounded snapshots: immediately before the unchanged
-post-association interface/BCNFT/RXFILTER/RLM tail and when the unchanged
-five-second first-data deadline expires. Each records RX-DMA enable, a stable
-DIDX/descriptor-control snapshot, software RX head/tail, and monotonic
-completion/error/client/EAPOL/authenticator-M1 counters incremented before
-rearm. The target M1 counter is scoped to the pinned AP-to-client address tuple and
-proves only target M1 RX-DMA ingress. Other RX completions are reported
-orthogonally as `rx_dma_activity=present`. Any zero target-M1 result is always
-`no_m1_at_rx_dma_ambiguous`; target telemetry never claims either AP-no-send
-or firmware/pre-DMA drop. Definitive attribution requires an independent
-AP-control-plane or over-air witness.
-
-The failed production report `20260814T050759Z-0000_05_00.0.log` (SHA-256
-`7819a1c68e3caa03d3c171823716973885a21afeb1c913c7885642301db772e5`)
-recorded data-ring CIDX 7/DIDX 0 at associated setup, no later data descriptor,
-and no M1. Earlier native inventories contain only one post-association
-snapshot, and the native association fixture proves a later EAPOL-Key TX but
-contains no timestamp. There is no equivalent native two-point delta or
-Linux/iwd M1 latency measurement. The prior one-second series therefore kept the
-original deadline. This telemetry-only variant tests a five-second observation
-deadline. The caller's 25-second deadline encloses it, but the pinned SME's
-initial 4000 ms RSNA response timer did not: it ended the first five-second
-series before the observer boundary. Passive validation now selects a 6000 ms
-initial response timer and terminates at its own 5000 ms boundary; normal SME
-timers remain unchanged.
-
-The telemetry-only five-second variant binds this observation boundary as
-`linux-6.18.40-passive-m1-rx-v5`. It enumerates the only safe register reads
-(`0xd4208,0xd4528,0xd452c`), both snapshot boundaries, the exact pinned
-AP-to-client M1 scope, positive and ambiguous-negative results, best-effort
-read-only behavior, the observer-owned 5000 ms deadline, the validation-only
-6000 ms initial RSNA response timer, unchanged normal-mode timers, and the
-independent AP/over-air attribution requirement. Launcher, supervisor, root, and inert
-artifacts compare against that installed ELF identity; stale identities are
-rejected before privileged dispatch.
-
-Post-association target beacons now add a read-only AP-side clue without changing
-power state or transmitting a poll.  For beacons whose transmitter and BSSID
-both equal the pinned AP, production validates the 12-byte beacon fixed body,
-walks the existing IE stream, and decodes TIM exactly as Linux
-`ieee80211_check_tim`: the normalized association AID selects `aid / 8` and
-`1 << (aid & 7)`, while bitmap-control bits 7:1 select the even partial-bitmap
-byte offset and bit 0 remains the multicast indication.  Telemetry records
-monotonic time since association, target-beacon and TIM counts, DTIM count and
-period, bitmap control/offset and partial bitmap, buffered-state transitions,
-and buffered-true count.  A true AID bit proves only that the AP queued unicast
-for this AID; it does not identify EAPOL or M1.  No observed true bit is
-inconclusive.  Malformed/truncated TIMs are reported and the beacon's normal
-receive delivery is preserved.
-
-An offline power-state audit found no hidden sleep transition in this
-validation path.  The extracted Fuchsia client emits the Linux-compatible
-association listen interval of five beacons, but that field alone does not put
-the station to sleep.  The port's post-association closure emits neither a
-PM-bit data/Null frame nor `SET_PS_PROFILE`/`UNI_BSS_INFO_PS`, U-APSD is absent,
-and it installs no firmware listen/doze profile.  This agrees with the pinned
-Linux post-ASSOC `cfg.ps=false` path already mapped in `mt7921-core/SOURCE-MAP.md`:
-beacon filtering is an RX optimization and awake mode emits no peer TX-PS
-mutation.  The audit is descriptive only; this change adds no power-save,
-Null/poll, monitor, or sniffer command.
+The pinned root was invoked exactly three times with that same fresh identity,
+with no fourth run. All three completed SAE status 0 and status-0 association
+without an association retry (normalized AIDs 6, 2, and 10), but no configured
+RX route observed EAPOL or authenticator M1. The timeout ring 0/2/4 completion
+deltas were 0/0/18, 0/0/18, and 0/5/17. Every run restored with `failed=0`;
+authoritative final recovery is idle, non-quarantined, native-ready, PCI D0,
+iwd active, watchdog disarmed/inactive, default route present, and HTTPS
+working. Thus stale AP state keyed only by the native station MAC is not
+sufficient for these observations; AP non-transmission versus a pre-host-DMA
+firmware drop remains unresolved.

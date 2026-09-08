@@ -1,0 +1,8 @@
+[package]
+name="ath11k-wmi"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+
+[dependencies]
+ath11k-ce={path="../ath11k-ce"}

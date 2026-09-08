@@ -1,5 +1,33 @@
 # AMD HDA built-in speaker spike
 
+## Phase 1A real-time daemon contract
+
+`amd-hda-rt-daemon` now contains the hardware-disabled Phase 1A fixed executor
+and continuous eight-entry BDL model. Its stereo S16LE/48 kHz quantum is 480
+frames (10 ms); all audio and scratch cells are preallocated, and the only DMA
+input type is produced by the mandatory DC-blocking and peak-limiting stage.
+The physical runner below remains the old bounded spike and is not connected to
+this executor until the Phase 1B safety gate opens.
+
+Run the complete non-hardware gate with:
+
+```sh
+./crates/amd-hda-spike/check-phase1a
+```
+
+The gate also smoke-tests the persistent, hardware-disabled process-liveness
+harness exposed as `amd-hda-rt-daemon --virtual-daemon`; it never opens VFIO or
+an audio device. Its timer emulates the future HDA completion wait and is not
+part of the zero-syscall executor audit. Readiness logging runs on the main
+thread, not the executor thread.
+
+The gate covers BDL wrap and progress accounting, missing IOC/LPIB and stream
+faults, starvation/XRUN accounting, watchdog mute/park ordering, exact Fuchsia
+gain and timeline results, 10,000 allocation-audited executor quanta, forbidden
+Rust RT surfaces, and disassembly/import audits of the C++ processing and
+timeline FFI. The 44.1 kHz resampler remains allocating and is deliberately
+absent from the single-clock Phase 1 graph.
+
 This explicit no-plastic spike dynamically discovers exactly one PCI audio-class function with AMD
 `1022:15e3` subsystem `1043:1513`, isolated IOMMU group 27, and the ALC256
 codec `10ec:0256` at address 0. It is not a general VFIO or public audio API.

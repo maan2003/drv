@@ -76,6 +76,7 @@ fn run() -> Result<(), String> {
             encapsulated_calibration: false,
         },
         19,
+        0,
     )
     .map_err(|error| format!("CLC rule fixture: {error:?}"))?;
     for (rule, command) in rules.iter().enumerate() {

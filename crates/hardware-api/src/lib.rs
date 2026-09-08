@@ -87,8 +87,13 @@ pub trait Backend {
     fn generation(&self) -> u64;
     fn open_region(&mut self, index: u8) -> Result<Self::Region>;
     fn region_len(&self, region: &Self::Region) -> usize;
+    /// MMIO load with acquire ordering: subsequent CPU reads from coherent
+    /// DMA observe device writes completed before the register became visible.
     fn read_u32(&mut self, region: &Self::Region, offset: usize) -> Result<u32>;
+    /// MMIO store with release ordering relative to preceding CPU writes to
+    /// coherent DMA and preceding `sync_for_device` operations.
     fn write_u32(&mut self, region: &Self::Region, offset: usize, value: u32) -> Result<()>;
+    /// DMA-address store with the same release ordering as `write_u32`.
     fn write_dma_address(
         &mut self,
         region: &Self::Region,
@@ -97,6 +102,9 @@ pub trait Backend {
         dma: &Self::Dma,
         offset: usize,
     ) -> Result<()>;
+    /// Return the IOMMU-visible address for a checked offset in this backend's
+    /// own allocation. Callers cannot construct or register an address.
+    fn dma_device_address(&self, dma: &Self::Dma, offset: usize) -> Result<u64>;
     fn alloc_dma(
         &mut self,
         size: usize,
@@ -129,6 +137,13 @@ pub trait Backend {
         interrupt: &Self::Interrupt,
         deadline_ns: u64,
     ) -> Result<Option<IrqEvent>>;
+    /// Wait for any of several interrupts with one absolute monotonic
+    /// deadline. Implementations must not serialize blocking waits.
+    fn wait_any(
+        &mut self,
+        interrupts: &[&Self::Interrupt],
+        deadline_ns: u64,
+    ) -> Result<Vec<IrqEvent>>;
     fn reset(&mut self) -> Result<u64>;
     fn release_region(&mut self, region: Self::Region);
     fn release_dma(&mut self, dma: Self::Dma);
@@ -144,6 +159,13 @@ impl<B: Backend> Clone for Shared<B> {
 
 pub struct Device<B: Backend> {
     shared: Shared<B>,
+}
+impl<B: Backend> Clone for Device<B> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
 }
 impl<B: Backend> Device<B> {
     #[doc(hidden)]
@@ -361,6 +383,19 @@ impl<B: Backend, D: Direction> Drop for DmaBuffer<B, D> {
 pub struct DeviceAddress<'a, B: Backend, D: Direction> {
     dma: &'a DmaBuffer<B, D>,
     offset: usize,
+    bits: u64,
+}
+impl<B: Backend, D: Direction> DeviceAddress<'_, B, D> {
+    /// The non-forgeable allocation-derived IOMMU-visible address.
+    pub fn bits(&self) -> u64 {
+        self.bits
+    }
+    pub fn lo32(&self) -> u32 {
+        self.bits as u32
+    }
+    pub fn hi32(&self) -> u32 {
+        (self.bits >> 32) as u32
+    }
 }
 pub struct CoherentDma<B: Backend, D: Direction>(DmaBuffer<B, D>);
 impl<B: Backend, D: Direction> CoherentDma<B, D> {
@@ -370,12 +405,24 @@ impl<B: Backend, D: Direction> CoherentDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
-    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
-        self.0.range(offset, 0)?;
+    pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        if offset >= self.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let bits = self
+            .0
+            .shared
+            .0
+            .borrow()
+            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
         Ok(DeviceAddress {
             dma: &self.0,
             offset,
+            bits,
         })
+    }
+    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        self.device_address_at(offset)
     }
 }
 impl<B: Backend, D: CpuWrite> CoherentDma<B, D> {
@@ -410,12 +457,24 @@ impl<B: Backend, D: Direction> StreamingDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
-    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
-        self.0.range(offset, 0)?;
+    pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        if offset >= self.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let bits = self
+            .0
+            .shared
+            .0
+            .borrow()
+            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
         Ok(DeviceAddress {
             dma: &self.0,
             offset,
+            bits,
         })
+    }
+    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        self.device_address_at(offset)
     }
 }
 impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
@@ -456,6 +515,18 @@ pub struct IrqEvent {
     pub count: u64,
     pub at_ns: u64,
 }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InterruptSet {
+    events: Vec<IrqEvent>,
+}
+impl InterruptSet {
+    pub fn events(&self) -> &[IrqEvent] {
+        &self.events
+    }
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
 pub struct Interrupt<B: Backend> {
     shared: Shared<B>,
     token: Option<B::Interrupt>,
@@ -468,6 +539,21 @@ impl<B: Backend> Interrupt<B> {
             .0
             .borrow_mut()
             .wait_interrupt(self.token.as_ref().unwrap(), deadline_ns)
+    }
+    pub fn wait_any(interrupts: &[&Self], deadline_ns: u64) -> Result<InterruptSet> {
+        let first = interrupts.first().ok_or(Error::Invalid)?;
+        for interrupt in interrupts {
+            if !Rc::ptr_eq(&first.shared.0, &interrupt.shared.0) {
+                return Err(Error::Invalid);
+            }
+            current(&interrupt.shared, interrupt.generation)?;
+        }
+        let tokens = interrupts
+            .iter()
+            .map(|interrupt| interrupt.token.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        let events = first.shared.0.borrow_mut().wait_any(&tokens, deadline_ns)?;
+        Ok(InterruptSet { events })
     }
 }
 impl<B: Backend> Drop for Interrupt<B> {

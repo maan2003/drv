@@ -1620,6 +1620,12 @@ pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
 pub const MT7921_MCU_RX_RING_COUNT: usize = 8;
 pub const MT7921_MCU_RX_BUFFER_BYTES: usize = 2048;
 pub const MT7921_RX_RING_SLOTS: usize = 8;
+/// Associated-client data RX ring (WFDMA RX ring 2).  Linux sizes
+/// `MT_RXQ_MAIN` at 1536 entries; eight entries (the pre-firmware MCU
+/// response shape) overflowed as soon as the AP answered DHCP while the host
+/// was waiting synchronously on a TX completion, and the firmware silently
+/// dropped frames it had already acknowledged on air.
+pub const MT7921_DATA_RX_RING_COUNT: usize = 64;
 pub const MT7921_RESET_ALL_TX_INDICES: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1662,6 +1668,38 @@ pub fn prepare_mcu_rx_ring(
         descriptors,
         producer_index: (MT7921_MCU_RX_RING_COUNT - 1) as u32,
     })
+}
+
+/// Data RX ring descriptors: the MCU ring layout (2048-byte buffers, one
+/// vacant slot so producer and consumer never alias full) at
+/// `MT7921_DATA_RX_RING_COUNT` entries.
+pub fn prepare_data_rx_ring(
+    ring_iova: u64,
+    buffers_iova: u64,
+) -> Result<Vec<DmaDescriptor>, DescriptorError> {
+    let count = MT7921_DATA_RX_RING_COUNT;
+    let ring_bytes = (count * 16).next_multiple_of(4096) as u64;
+    let buffers_bytes = (count * MT7921_MCU_RX_BUFFER_BYTES) as u64;
+    if !ring_iova.is_multiple_of(4096)
+        || !buffers_iova.is_multiple_of(4096)
+        || ring_iova
+            .checked_add(ring_bytes - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || buffers_iova
+            .checked_add(buffers_bytes - 1)
+            .is_none_or(|end| end > u64::from(u32::MAX))
+        || (ring_iova < buffers_iova + buffers_bytes && buffers_iova < ring_iova + ring_bytes)
+    {
+        return Err(DescriptorError::InvalidArena);
+    }
+    let mut descriptors = vec![DmaDescriptor::reset(); count];
+    for (index, descriptor) in descriptors.iter_mut().enumerate().take(count - 1) {
+        *descriptor = mt7921_dma_rx(DmaSegment {
+            iova: buffers_iova + (index * MT7921_MCU_RX_BUFFER_BYTES) as u64,
+            len: MT7921_MCU_RX_BUFFER_BYTES as u16,
+        })?;
+    }
+    Ok(descriptors)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2095,6 +2133,9 @@ pub enum DownloadCommand {
     ReadEepromBlock {
         address: u32,
     },
+    FirmwareLogToHost,
+    EepromBufferMode,
+    ProtectControl,
     PatchSemaphoreGet,
     PatchSemaphoreRelease,
     PatchFinish,
@@ -2440,6 +2481,17 @@ pub fn encode_download_command(
             payload[..4].copy_from_slice(&address.to_le_bytes());
             (0xed, 0, 0x01, 1, payload)
         }
+        // mt7921_run_firmware() enables firmware-to-host logging after CLC
+        // calibration and before the later hardware initialization commands.
+        DownloadCommand::FirmwareLogToHost => (0xc5, 1, 0, 0, vec![1, 0, 0, 0]),
+        DownloadCommand::EepromBufferMode => (0xed, 1, 0x21, 1, vec![1, 0, 0, 0]),
+        DownloadCommand::ProtectControl => (
+            0xed,
+            1,
+            0x3e,
+            1,
+            vec![1, 0, 0, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0],
+        ),
         DownloadCommand::PatchSemaphoreGet => (0x10, 3, 0, 0, 1u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchSemaphoreRelease => (0x10, 3, 0, 0, 0u32.to_le_bytes().to_vec()),
         DownloadCommand::PatchFinish => (0x07, 3, 0, 0, vec![0; 4]),
@@ -2613,11 +2665,26 @@ pub fn encode_channel_domain_command(
     Ok(bytes)
 }
 
+/// `switch_reason` of Linux `mt7921_mcu_set_chan_info`.
+///
+/// `CH_SWITCH_SCAN_BYPASS_DPD` (9) is the off-channel/scan form; the connected
+/// chandef is programmed by `mt7921_set_channel` with `CH_SWITCH_NORMAL` (0),
+/// which is also what runs the per-channel calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ChannelSwitchReason {
+    Normal = 0,
+    ScanBypassDpd = 9,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PassiveMcuCommand {
     EepromBufferMode,
     ProtectCtrl,
+    /// Initial runtime-power policy installed by mt7921 registration.
+    KeepFullPower,
     MacEnable,
+    SetChannelDomain(ChannelDomainCommand),
     SetRxPath {
         channel: CandidateChannel,
         antenna_mask: u8,
@@ -2628,12 +2695,17 @@ pub enum PassiveMcuCommand {
         bandwidth: u8,
         center_channel2: u8,
         antenna_mask: u8,
+        switch_reason: ChannelSwitchReason,
     },
     AddDevice {
         mac: [u8; 6],
     },
     AddBss,
+    InitialEdca,
     SetPassiveRxFilter,
+    RadioLedCtrl {
+        value: u8,
+    },
     StartScan {
         scan_sequence: u8,
         channel: CandidateChannel,
@@ -2707,6 +2779,110 @@ fn encode_uni_mcu(cid: u16, payload: &[u8], sequence: u8) -> Vec<u8> {
     bytes
 }
 
+/// Source-exact MT7921 JOIN remain-on-channel acquisition (UNI ROC, CID 0x27).
+///
+/// This is the firmware transaction used by Linux's `mgd_prepare_tx`; it is
+/// distinct from the host-side channel authorization lease.
+pub fn encode_client_join_roc_acquire(
+    sequence: u8,
+    bss_index: u8,
+    token: u8,
+    channel: ClientPhysicalChannel,
+    duration_ms: u32,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bss_index != 0
+        || token == 0
+        || duration_ms == 0
+        || channel.primary == 0
+        || channel.primary > u16::from(u8::MAX)
+        || channel.center == 0
+        || channel.center > u16::from(u8::MAX)
+        || channel.center2 != 0
+        || channel.bandwidth != 0
+        || channel.band > 1
+    {
+        return Err("JOIN ROC acquisition identity is invalid".into());
+    }
+    let primary = channel.primary as u8;
+    let center = channel.center as u8;
+    let mut body = [0u8; 28];
+    body[4..8].copy_from_slice(&[0, 0, 24, 0]); // UNI_ROC_ACQUIRE
+    body[8] = bss_index;
+    body[9] = token;
+    body[10] = primary;
+    body[11] = match primary.cmp(&center) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Greater => 3,
+        core::cmp::Ordering::Equal => 0,
+    };
+    body[12] = if channel.band == 1 { 2 } else { 1 };
+    body[13] = 0; // CMD_CBW_20MHZ
+    body[14] = center;
+    body[15] = 0;
+    body[16] = 0; // CMD_CBW_20MHZ from AP
+    body[17] = center;
+    body[18] = 0;
+    body[19] = 0; // MT7921_ROC_REQ_JOIN
+    body[20..24].copy_from_slice(&duration_ms.to_le_bytes());
+    body[24] = 0xff;
+    Ok(encode_uni_mcu(0x27, &body, sequence))
+}
+
+/// Source-exact MT7921 JOIN remain-on-channel abort (UNI ROC, CID 0x27).
+pub fn encode_client_join_roc_abort(
+    sequence: u8,
+    bss_index: u8,
+    token: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || token == 0 {
+        return Err("JOIN ROC abort identity is invalid".into());
+    }
+    let mut body = [0u8; 16];
+    body[4..8].copy_from_slice(&[1, 0, 12, 0]); // UNI_ROC_ABORT
+    body[8] = bss_index;
+    body[9] = token;
+    body[10] = 0xff;
+    Ok(encode_uni_mcu(0x27, &body, sequence))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientJoinRocGrant {
+    pub bss_index: u8,
+    pub token: u8,
+    pub status: u8,
+    pub primary_channel: u8,
+    pub band: u8,
+    pub bandwidth: u8,
+    pub center_channel: u8,
+    pub request_type: u8,
+    pub max_interval_ms: u32,
+}
+
+/// Parse the unsolicited UNI ROC grant event (EID 0x27). The first four event
+/// body bytes are the UNI event header; Linux likewise advances past them.
+pub fn parse_client_join_roc_grant(bytes: &[u8]) -> Result<ClientJoinRocGrant, String> {
+    let response = parse_download_response(bytes, 0).map_err(|_| "truncated JOIN ROC event")?;
+    if response.event_id != 0x27 || response.sequence != 0 || response.option & (1 << 2) == 0 {
+        return Err("wrong JOIN ROC event identity".into());
+    }
+    let grant = bytes.get(40..60).ok_or("truncated JOIN ROC grant")?;
+    if grant[0..4] != [0, 0, 20, 0] {
+        return Err("invalid JOIN ROC grant TLV".into());
+    }
+    Ok(ClientJoinRocGrant {
+        bss_index: grant[4],
+        token: grant[5],
+        status: grant[6],
+        primary_channel: grant[7],
+        band: grant[9],
+        bandwidth: grant[10],
+        center_channel: grant[11],
+        request_type: grant[13],
+        max_interval_ms: u32::from_le_bytes(grant[16..20].try_into().expect("fixed field")),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_client_bss_basic_payload(
     bss_index: u8,
@@ -2759,6 +2935,20 @@ pub fn encode_client_interface_commands(
     {
         return Err("client interface identity or sequence is invalid".into());
     }
+    let dev = encode_client_interface_dev_command(client, enable, dev_sequence)?;
+    let bss = encode_client_interface_bss_command(enable, bss_sequence)?;
+    Ok(if enable { [dev, bss] } else { [bss, dev] })
+}
+
+/// Encode the DEV_INFO_ACTIVE half of client interface setup or teardown.
+pub fn encode_client_interface_dev_command(
+    client: [u8; 6],
+    enable: bool,
+    sequence: u8,
+) -> Result<Vec<u8>, String> {
+    if client == [0; 6] || client[0] & 3 != 2 || !(1..=15).contains(&sequence) {
+        return Err("client interface DEV identity or sequence is invalid".into());
+    }
     let mut dev = vec![0; 16];
     // omac_idx=0, band_idx=0, DEV_INFO_ACTIVE, link_idx=0.
     dev[4..8].copy_from_slice(&[0, 0, 12, 0]);
@@ -2766,11 +2956,16 @@ pub fn encode_client_interface_commands(
     dev[10..16].copy_from_slice(&client);
 
     // bss_idx=0, UNI_BSS_INFO_BASIC, first station VIF/WMM/band/OMAC.
-    let bss = encode_client_bss_basic_payload(0, enable, 1, [0; 6], 0, 0, 0, 0, 0, 0);
+    Ok(encode_uni_mcu(1, &dev, sequence))
+}
 
-    let dev = encode_uni_mcu(1, &dev, dev_sequence);
-    let bss = encode_uni_mcu(2, &bss, bss_sequence);
-    Ok(if enable { [dev, bss] } else { [bss, dev] })
+/// Encode the BSS_INFO_BASIC half of client interface setup or teardown.
+pub fn encode_client_interface_bss_command(enable: bool, sequence: u8) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) {
+        return Err("client interface BSS sequence is invalid".into());
+    }
+    let bss = encode_client_bss_basic_payload(0, enable, 1, [0; 6], 0, 0, 0, 0, 0, 0);
+    Ok(encode_uni_mcu(2, &bss, sequence))
 }
 
 /// Encode only the pinned Linux commands required by the conservative passive
@@ -2832,15 +3027,22 @@ pub fn encode_passive_mcu_command(
         PassiveMcuCommand::EepromBufferMode => {
             encode_legacy_mcu(0xed, 0x21, &[1, 0, 0, 0], sequence)
         }
-        // mt7921_mac_init -> mt76_connac_mcu_set_rts_thresh(0x92b, band 0).
-        // This closes the source init transcript; it is not claimed causal.
         PassiveMcuCommand::ProtectCtrl => encode_legacy_mcu(
             0xed,
             0x3e,
             &[1, 0, 0, 0, 0x2b, 0x09, 0, 0, 2, 0, 0, 0],
             sequence,
         ),
+        PassiveMcuCommand::KeepFullPower => {
+            let mut payload = vec![0; 328];
+            payload[8..22].copy_from_slice(b"KeepFullPwr 0\0");
+            encode_legacy_mcu(0xca, 0, &payload, sequence)
+        }
         PassiveMcuCommand::MacEnable => encode_legacy_mcu(0xed, 0x46, &[1, 0, 0, 0], sequence),
+        PassiveMcuCommand::SetChannelDomain(command) => {
+            return encode_channel_domain_command(command, sequence)
+                .map_err(|_| PassiveMcuCommandError::UnsupportedChannel);
+        }
         PassiveMcuCommand::SetRxPath {
             channel,
             antenna_mask,
@@ -2864,6 +3066,7 @@ pub fn encode_passive_mcu_command(
             bandwidth,
             center_channel2,
             antenna_mask,
+            switch_reason,
         } => encode_legacy_mcu(
             0xed,
             0x08,
@@ -2873,7 +3076,7 @@ pub fn encode_passive_mcu_command(
                 *bandwidth,
                 *center_channel2,
                 *antenna_mask,
-                9,
+                *switch_reason as u8,
                 true,
             )?,
             sequence,
@@ -2895,11 +3098,20 @@ pub fn encode_passive_mcu_command(
             payload[30..32].copy_from_slice(&19u16.to_le_bytes());
             encode_uni_mcu(2, &payload, sequence)
         }
+        // add_interface -> mt7921_mcu_set_tx before mac80211 has supplied
+        // per-AC parameters: the packed 44-byte request is zero initialized.
+        PassiveMcuCommand::InitialEdca => encode_legacy_mcu(0x1d, 0, &[0; 44], sequence),
         PassiveMcuCommand::SetPassiveRxFilter => {
             let mut payload = vec![0; 68];
             payload[4] = 1;
             payload[8..12].copy_from_slice(&0x8000_0040u32.to_le_bytes());
             encode_legacy_mcu(0x0a, 0, &payload, sequence)
+        }
+        PassiveMcuCommand::RadioLedCtrl { value } => {
+            if !matches!(value, 1..=3) {
+                return Err(PassiveMcuCommandError::UnsupportedChannel);
+            }
+            encode_legacy_mcu(0xed, 0x05, &[*value, 0, 0, 0], sequence)
         }
         PassiveMcuCommand::StartScan {
             scan_sequence,
@@ -3821,6 +4033,29 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             )
             .map_err(FirmwareLoaderFailure::Clc)?;
             *state = FirmwareLoaderState::ClcConfigured;
+            for command in &commands {
+                if let Some(response) = loader_set_clc(transport, command)? {
+                    report.special_unii_mask = response.special_unii_mask;
+                }
+                report.clc_rules_applied = report
+                    .clc_rules_applied
+                    .checked_add(1)
+                    .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
+            }
+            let firmware_log = DownloadCommand::FirmwareLogToHost;
+            let completion = loader_command(transport, firmware_log)?;
+            expect_loader_completion(
+                firmware_log,
+                completion,
+                FirmwareCommandCompletion::NoResponse,
+            )?;
+            for command in [
+                DownloadCommand::EepromBufferMode,
+                DownloadCommand::ProtectControl,
+            ] {
+                let completion = loader_command(transport, command)?;
+                expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+            }
             for command in &commands {
                 if let Some(response) = loader_set_clc(transport, command)? {
                     report.special_unii_mask = response.special_unii_mask;
@@ -5854,15 +6089,67 @@ fn encode_legacy_wme_wcid_command(
     Ok(expanded)
 }
 
+/// Linux's first `mt7921_mac_sta_add` command for a newly allocated peer.
+///
+/// This publishes only `STA_REC_BASIC` plus an empty reset-and-set WTBL
+/// request.  The later preauthentication station update adds PHY/RA/state and
+/// the nested WTBL TLVs; they are two distinct firmware transitions.
+pub fn encode_initial_peer_wcid_command(
+    sequence: u8,
+    bss_index: u8,
+    wcid: u8,
+    peer: [u8; 6],
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || wcid == 0 || peer == [0; 6] {
+        return Err("initial peer WCID identity is invalid".into());
+    }
+    let mut body = vec![0; 40];
+    body[0..8].copy_from_slice(&[bss_index, wcid, 2, 0, 1, 0, 0, 0]);
+    body[8..12].copy_from_slice(&[0, 0, 20, 0]);
+    body[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
+    body[16] = 0;
+    body[17] = 0;
+    body[18..20].copy_from_slice(&0u16.to_le_bytes());
+    body[20..26].copy_from_slice(&peer);
+    body[26..28].copy_from_slice(&1u16.to_le_bytes());
+    body[28..32].copy_from_slice(&[13, 0, 12, 0]);
+    body[32..40].copy_from_slice(&[wcid, 1, 0, 0, 0, 0, 0, 0]);
+
+    let total = 48 + body.len();
+    let mut bytes = vec![0; total];
+    bytes[0..4].copy_from_slice(&((total as u32) | (2 << 23) | (0x20 << 25)).to_le_bytes());
+    bytes[4..8].copy_from_slice(&((1u32 << 31) | (1 << 16)).to_le_bytes());
+    bytes[32..34].copy_from_slice(&((total - 32) as u16).to_le_bytes());
+    bytes[34..36].copy_from_slice(&3u16.to_le_bytes());
+    bytes[37] = 0xa0;
+    bytes[39] = sequence;
+    bytes[43] = 0x07;
+    bytes[48..].copy_from_slice(&body);
+    Ok(bytes)
+}
+
 pub fn encode_preauth_peer_wcid_command(
     sequence: u8,
     bss_index: u8,
     wcid: u8,
     peer: [u8; 6],
     rcpi: u8,
+    basic_rates: u16,
+    legacy_rates: u16,
 ) -> Result<Vec<u8>, String> {
     encode_legacy_wme_wcid_command(
-        sequence, bss_index, wcid, 0, peer, rcpi, 1, 0x40, None, None, 0, false,
+        sequence,
+        bss_index,
+        wcid,
+        0,
+        peer,
+        rcpi,
+        basic_rates,
+        legacy_rates,
+        None,
+        None,
+        0,
+        false,
     )
 }
 
@@ -5947,6 +6234,25 @@ pub fn encode_client_post_assoc_beacon_timing_command(
     body[4..8].copy_from_slice(&[22, 0, 8, 0]);
     body[8..10].copy_from_slice(&beacon_interval.to_le_bytes());
     body[10] = dtim_period;
+    Ok(encode_uni_mcu(2, &body, sequence))
+}
+
+/// Linux `mt7921_mcu_uni_bss_ps` (`UNI_BSS_INFO_PS`, tag 21): `ps_state` 0 keeps
+/// the device awake, 2 is firmware dynamic power saving (mac80211's default
+/// `vif->cfg.ps`). Our host has no power-save policy, so the associated BSS is
+/// pinned awake like Linux with `power_save off`.
+pub fn encode_client_post_assoc_power_state_command(
+    sequence: u8,
+    bss_index: u8,
+    ps_state: u8,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 || ps_state > 4 {
+        return Err("post-association power state is invalid".into());
+    }
+    let mut body = vec![0u8; 12];
+    body[0] = bss_index;
+    body[4..8].copy_from_slice(&[21, 0, 8, 0]);
+    body[8] = ps_state;
     Ok(encode_uni_mcu(2, &body, sequence))
 }
 
@@ -6050,6 +6356,25 @@ pub fn linux_legacy_rate_context_reference(
     Ok((basic, legacy))
 }
 
+/// Build Linux's preauthentication PHY/RA rate context from the selected
+/// local band and the peer's Supported/Extended Supported Rates IEs.
+pub fn linux_preauth_rate_context_reference(
+    band: u8,
+    local_encoded_rates: &[u8],
+    peer_encoded_rates: &[u8],
+) -> Result<(u16, u16), String> {
+    let mut negotiated = Vec::new();
+    for peer in peer_encoded_rates {
+        if local_encoded_rates
+            .iter()
+            .any(|local| local & 0x7f == peer & 0x7f)
+        {
+            negotiated.push(*peer);
+        }
+    }
+    linux_legacy_rate_context_reference(band, &negotiated)
+}
+
 /// Linux v7.1 `mt76_connac_mcu_uni_add_bss` station BASIC+QBSS request.
 /// The BSS is programmed immediately before the associated WCID, matching
 /// `mt7921_mac_sta_event(MT76_STA_EVENT_ASSOC)`.
@@ -6086,6 +6411,38 @@ pub fn encode_client_bss_command(
     // mt76_connac_get_phy_mode_v2(..., link_sta=NULL) uses the local
     // MT7921 band capabilities, not the single legacy rate selected for TX.
     payload.extend_from_slice(&[15, 0, 8, 0, u8::from(qos), 0, 0, 0]);
+    Ok(encode_uni_mcu(2, &payload, sequence))
+}
+
+/// Linux's preauthentication BSS BASIC+QBSS update immediately before the
+/// full peer STA_REC. At this boundary DTIM is deliberately not active yet.
+pub fn encode_client_preauth_bss_command(
+    sequence: u8,
+    bss_index: u8,
+    bssid: [u8; 6],
+    channel: u16,
+    beacon_interval: u16,
+) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence)
+        || bssid == [0; 6]
+        || beacon_interval == 0
+        || !(1..=177).contains(&channel)
+    {
+        return Err("preauth BSS update escaped station BASIC bounds".into());
+    }
+    let mut payload = encode_client_bss_basic_payload(
+        bss_index,
+        true,
+        1,
+        bssid,
+        beacon_interval,
+        0,
+        if channel <= 14 { 0x4e } else { 0xb1 },
+        19,
+        19,
+        if channel <= 14 { 0x53 } else { 0x78 },
+    );
+    payload.extend_from_slice(&[15, 0, 8, 0, 0, 0, 0, 0]);
     Ok(encode_uni_mcu(2, &payload, sequence))
 }
 
@@ -6703,9 +7060,16 @@ pub fn encode_client_data_txwi(
         if !protected {
             return Err("normal client data requires PTK protection".into());
         }
+        // Linux mt7921 advertises SUPPORTS_TX_ENCAP_OFFLOAD, so associated
+        // data reaches the firmware as an 802.3 frame and
+        // `mt76_connac2_mac_write_txwi_8023` describes it: HDR_FORMAT 802.3,
+        // ETH_802_3, the QoS TID, QoS-data type/subtype, hardware rate
+        // control (no FIX_RATE) and PROTECT_FRAME for the WTBL PTK.  The
+        // payload must therefore be the header-translated Ethernet frame from
+        // `client_data_mpdu_to_ethernet`, never the 802.11 MPDU.
         [
             0x0200_0000 | (payload_len as u32 + 32),
-            0x8000_8007,
+            0x8000_8007 | (u32::from(tid) << 20),
             0x0000_0028,
             0x0000_7802,
             0,
@@ -6721,6 +7085,41 @@ pub fn encode_client_data_txwi(
     bytes[40..44].copy_from_slice(&(payload_iova as u32).to_le_bytes());
     bytes[44..46].copy_from_slice(&((payload_len as u16) | 0x8000).to_le_bytes());
     Ok(bytes)
+}
+
+/// Reverse of the MLME's RFC 1042 encapsulation for hardware TX header
+/// translation.  Linux hands mt7921 802.3 frames for associated data
+/// (`SUPPORTS_TX_ENCAP_OFFLOAD`), and the firmware builds the 802.11 header,
+/// sequence number and CCMP header itself; a raw 802.11 MPDU submitted with an
+/// 802.3 TXD is transmitted as garbage and never acknowledged.  Only the
+/// station To-DS unicast/multicast shape is accepted: DA is addr3, SA is addr2.
+pub fn client_data_mpdu_to_ethernet(mpdu: &[u8]) -> Result<Vec<u8>, String> {
+    let fc = mpdu
+        .get(..2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .ok_or("client data MPDU omitted frame control")?;
+    if fc & 0x000c != 0x0008 || fc & 0x0300 != 0x0100 || fc & 0x8000 != 0 {
+        return Err("client data header translation requires a To-DS data MPDU without HTC".into());
+    }
+    if fc & 0x0040 != 0 {
+        return Err("client data header translation requires a non-null data subtype".into());
+    }
+    let header_len = if fc & 0x0080 != 0 { 26 } else { 24 };
+    let snap = mpdu
+        .get(header_len..header_len + 8)
+        .ok_or("client data MPDU omitted LLC/SNAP")?;
+    if snap[..6] != [0xaa, 0xaa, 3, 0, 0, 0] {
+        return Err("client data MPDU is not RFC 1042 encapsulated".into());
+    }
+    if u16::from_be_bytes([snap[6], snap[7]]) < 0x0600 {
+        return Err("client data MPDU carries a non-Ethernet II type".into());
+    }
+    let mut frame = Vec::with_capacity(mpdu.len() - header_len - 8 + 14);
+    frame.extend_from_slice(&mpdu[16..22]);
+    frame.extend_from_slice(&mpdu[10..16]);
+    frame.extend_from_slice(&snap[6..8]);
+    frame.extend_from_slice(&mpdu[header_len + 8..]);
+    Ok(frame)
 }
 
 pub fn set_client_txwi_wcid(txwi: &mut [u8; 64], wcid: ClientWcid) {
@@ -6851,16 +7250,21 @@ pub fn encode_client_management_tx(
         .get(..2)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .ok_or("management frame omitted control")?;
-    if control & 0x000c != 0 || frame.len() < 30 {
+    if control & 0x000c != 0 || !(24..=0x0fff).contains(&frame.len()) {
         return Err("client management TX requires one complete management MPDU".into());
     }
     // The existing golden encoder owns the complete Linux TXWI/TXP envelope.
-    // Management subtypes differ only in TXD2's frame-subtype nibble.
+    // Pad short valid management subtypes (for example a 26-byte deauth) only
+    // while obtaining that envelope; the published DMA length remains exact.
     let mut auth_shape = frame.to_vec();
+    auth_shape.resize(30, 0);
     auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
     let mut encoded =
         encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, token, pid, 19)
             .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
+    let mut txd0 = u32::from_le_bytes(encoded.txwi[0..4].try_into().unwrap());
+    txd0 = (txd0 & !0xffff) | ((frame.len() as u32 + 32) & 0xffff);
+    encoded.txwi[0..4].copy_from_slice(&txd0.to_le_bytes());
     let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
     txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
     encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
@@ -6880,7 +7284,7 @@ pub struct ClientFirmwareEffectsState {
     pub association: Option<LegacyWmeAssociation>,
     pub edca_programmed: Option<ClientEdcaParameters>,
     pub post_assoc_interface_programmed: bool,
-    pub post_assoc_beacon_timing_programmed: bool,
+    pub post_assoc_beacon_policy_selected: bool,
     pub post_assoc_rx_filter_published: bool,
     pub post_assoc_rlm_programmed: bool,
     pub sequence: u8,
@@ -6945,7 +7349,7 @@ impl ClientFirmwareEffectsState {
     pub fn qos_tx_ready(&self) -> bool {
         self.bss_programmed
             && self.post_assoc_interface_programmed
-            && self.post_assoc_beacon_timing_programmed
+            && self.post_assoc_beacon_policy_selected
             && self.post_assoc_rx_filter_published
             && self.post_assoc_rlm_programmed
             && (self
@@ -6956,7 +7360,6 @@ impl ClientFirmwareEffectsState {
 
     pub fn complete_post_assoc_interface(
         &mut self,
-        channel: ClientPhysicalChannel,
         mut submit_uni: impl FnMut(u8, &[u8]) -> Result<(), String>,
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
@@ -6967,9 +7370,9 @@ impl ClientFirmwareEffectsState {
             .joined
             .ok_or("post-association interface update requires joined BSS")?;
         if self.post_assoc_interface_programmed
-            || self.post_assoc_beacon_timing_programmed
+            || self.post_assoc_beacon_policy_selected
             || self.post_assoc_rx_filter_published
-            || self.post_assoc_rlm_programmed
+            || !self.post_assoc_rlm_programmed
             || self.firmware_uncertain
             || (association.negotiated_qos && self.edca_programmed.is_none())
         {
@@ -6983,24 +7386,24 @@ impl ClientFirmwareEffectsState {
         self.firmware_uncertain = true;
         submit_uni(3, &command)?;
         self.post_assoc_interface_programmed = true;
-        let beacon = encode_client_post_assoc_beacon_timing_command(
+        // Linux currently enables BCNFT unconditionally at association. This
+        // host port deliberately keeps it disabled until firmware beacon-loss
+        // event 0x13 is routed into MLME teardown; otherwise BCNFT suppresses
+        // the beacons required by the only complete liveness monitor.
+        self.post_assoc_beacon_policy_selected = true;
+        // Linux bss_info_changed(BSS_CHANGED_PS) -> mt7921_mcu_uni_bss_ps. The
+        // host runs no power-save policy, so pin the BSS awake (ps_state 0);
+        // without an explicit state the firmware was observed dozing
+        // (MCU_EVENT_LP_INFO) and missing the AP's unicast frames.
+        let power = encode_client_post_assoc_power_state_command(
             self.next_sequence(),
             association.bss_index,
-            joined.beacon_interval,
-            joined.dtim_period,
+            0,
         )?;
-        submit_uni(2, &beacon)?;
-        self.post_assoc_beacon_timing_programmed = true;
+        submit_uni(2, &power)?;
         let rx_filter = encode_client_post_assoc_rx_filter_command(self.next_sequence())?;
         submit_ce_no_ack(&rx_filter)?;
         self.post_assoc_rx_filter_published = true;
-        let rlm = encode_client_post_assoc_rlm_command(
-            self.next_sequence(),
-            association.bss_index,
-            channel,
-        )?;
-        submit_uni(2, &rlm)?;
-        self.post_assoc_rlm_programmed = true;
         self.firmware_uncertain = false;
         Ok(())
     }
@@ -7065,6 +7468,10 @@ impl ClientFirmwareEffectsState {
         self.sequence
     }
 
+    pub fn reserve_mcu_sequence(&mut self) -> u8 {
+        self.next_sequence()
+    }
+
     pub fn prepare_preauth_peer(
         &mut self,
         peer: LegacyWmeAssociation,
@@ -7095,15 +7502,43 @@ impl ClientFirmwareEffectsState {
                 Err("preauth peer changed without teardown".into())
             };
         }
+        let initial = encode_initial_peer_wcid_command(
+            self.next_sequence(),
+            peer.bss_index,
+            peer.peer_wcid.get(),
+            peer.peer,
+        )?;
+        let bss = encode_client_preauth_bss_command(
+            self.next_sequence(),
+            peer.bss_index,
+            joined.bssid,
+            joined.channel,
+            joined.beacon_interval,
+        )?;
+        let rlm = encode_client_post_assoc_rlm_command(
+            self.next_sequence(),
+            peer.bss_index,
+            channel.channel,
+        )?;
         let command = encode_preauth_peer_wcid_command(
             self.next_sequence(),
             peer.bss_index,
             peer.peer_wcid.get(),
             peer.peer,
             peer.rcpi,
+            peer.basic_rates,
+            peer.legacy_rates,
         )?;
         self.firmware_uncertain = true;
-        if let Err(error) = submit(3, &command) {
+        let result = submit(3, &initial)
+            .and_then(|()| submit(2, &bss))
+            .map(|()| {
+                self.bss_programmed = true;
+                self.bss_binding = Some((peer.bss_index, false));
+            })
+            .and_then(|()| submit(2, &rlm))
+            .and_then(|()| submit(3, &command));
+        if let Err(error) = result {
             let rollback = encode_remove_wcid_command(
                 self.next_sequence(),
                 peer.bss_index,
@@ -7113,12 +7548,29 @@ impl ClientFirmwareEffectsState {
                 false,
             )
             .and_then(|command| submit(3, &command));
-            self.firmware_uncertain = rollback.is_err();
-            if rollback.is_ok() {
+            let rollback_bss = if self.bss_programmed {
+                encode_client_bss_command(
+                    self.next_sequence(),
+                    peer.bss_index,
+                    joined.bssid,
+                    joined.channel,
+                    joined.beacon_interval,
+                    joined.dtim_period,
+                    false,
+                    false,
+                )
+                .and_then(|command| submit(2, &command))
+            } else {
+                Ok(())
+            };
+            self.firmware_uncertain = rollback.is_err() || rollback_bss.is_err();
+            if rollback.is_ok() && rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
                 self.release_allocated_peer(peer.peer_wcid)?;
             }
             return Err(format!(
-                "preauth WCID add failed: {error}; rollback_wcid={rollback:?}"
+                "preauth WCID add failed: {error}; rollback_wcid={rollback:?}; rollback_bss={rollback_bss:?}"
             ));
         }
         self.preauth_peer = Some(peer);
@@ -7131,6 +7583,7 @@ impl ClientFirmwareEffectsState {
         association: LegacyWmeAssociation,
         channel: ClientChannelLease,
         mut submit: impl FnMut(u8, &[u8]) -> Result<(), String>,
+        mut after_bss: impl FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
         let joined = self
             .joined
@@ -7150,7 +7603,11 @@ impl ClientFirmwareEffectsState {
                     && preauth.aid == 0
             })
             .ok_or("association requires an ACKed preauth peer WCID")?;
-        if self.association.is_some() || self.bss_programmed || self.firmware_uncertain {
+        if self.association.is_some()
+            || !self.bss_programmed
+            || self.bss_binding != Some((association.bss_index, false))
+            || self.firmware_uncertain
+        {
             return Err("client firmware association state is not clean".into());
         }
         let bss = encode_client_bss_command(
@@ -7190,6 +7647,57 @@ impl ClientFirmwareEffectsState {
             ));
         }
         self.firmware_uncertain = false;
+        let rlm = encode_client_post_assoc_rlm_command(
+            self.next_sequence(),
+            association.bss_index,
+            channel.channel,
+        )?;
+        self.firmware_uncertain = true;
+        if let Err(error) = submit(2, &rlm) {
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                joined.dtim_period,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            if rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
+            }
+            self.firmware_uncertain = rollback_bss.is_err();
+            return Err(format!(
+                "post-BSS RLM failed: {error}; rollback_bss={rollback_bss:?}"
+            ));
+        }
+        self.post_assoc_rlm_programmed = true;
+        self.firmware_uncertain = false;
+        if let Err(error) = after_bss() {
+            let rollback_bss = encode_client_bss_command(
+                self.next_sequence(),
+                association.bss_index,
+                joined.bssid,
+                joined.channel,
+                joined.beacon_interval,
+                joined.dtim_period,
+                association.negotiated_qos,
+                false,
+            )
+            .and_then(|command| submit(2, &command));
+            if rollback_bss.is_ok() {
+                self.bss_programmed = false;
+                self.bss_binding = None;
+                self.post_assoc_rlm_programmed = false;
+            }
+            self.firmware_uncertain = rollback_bss.is_err();
+            return Err(format!(
+                "post-BSS/pre-STA boundary failed: {error}; rollback_bss={rollback_bss:?}"
+            ));
+        }
         let command = encode_legacy_wme_add_wcid_command(
             self.next_sequence(),
             association.bss_index,
@@ -7228,6 +7736,7 @@ impl ClientFirmwareEffectsState {
             self.bss_programmed = rollback_bss.is_err();
             if rollback_bss.is_ok() {
                 self.bss_binding = None;
+                self.post_assoc_rlm_programmed = false;
             }
             if rollback_wcid.is_ok() {
                 self.preauth_peer = None;
@@ -7252,9 +7761,12 @@ impl ClientFirmwareEffectsState {
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("PTK install requires WCID ACK")?;
-        if rsc >> 48 != 0 {
-            return Err("PTK RSC exceeds 48 bits".into());
-        }
+        // The EAPOL Key RSC is 8 octets, but for CCMP only octets 0-5 carry the
+        // 48-bit PN; octets 6-7 are reserved. Some authenticators (notably phone
+        // hotspots) leave non-zero noise in those reserved octets, so mask down to
+        // the PN instead of rejecting -- otherwise a valid key install fails on
+        // reserved-octet garbage.
+        let rsc = rsc & 0x0000_ffff_ffff_ffff;
         let command = encode_ptk_command(
             self.next_sequence(),
             association.bss_index,
@@ -7286,9 +7798,12 @@ impl ClientFirmwareEffectsState {
         mut submit_ce_no_ack: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         let association = self.association.ok_or("GTK install requires WCID ACK")?;
-        if rsc >> 48 != 0 {
-            return Err("GTK RSC exceeds 48 bits".into());
-        }
+        // The EAPOL Key RSC is 8 octets, but for CCMP only octets 0-5 carry the
+        // 48-bit PN; octets 6-7 are reserved. Some authenticators (notably phone
+        // hotspots) leave non-zero noise in those reserved octets, so mask down to
+        // the PN instead of rejecting -- otherwise a valid GTK install fails on
+        // reserved-octet garbage and the connect stalls right after PTK.
+        let rsc = rsc & 0x0000_ffff_ffff_ffff;
         let command = encode_gtk_command(self.next_sequence(), association.bss_index, key_id, key)?;
         self.broadcast_keys_dirty = true;
         if let Err(error) = submit(3, command.as_bytes()) {
@@ -7436,7 +7951,10 @@ impl ClientFirmwareEffectsState {
             &mut self.ptk_rx_pn.as_mut().ok_or("unicast RX lacks PTK ACK")?[usize::from(rx.tid)]
         };
         if pn <= *retained {
-            return Err("client RX replayed PN".into());
+            return Err(format!(
+                "client RX replayed PN tid={} pn={} retained={} group={}",
+                rx.tid, pn, *retained, rx.group
+            ));
         }
         *retained = pn;
         Ok(())
@@ -7488,7 +8006,7 @@ impl ClientFirmwareEffectsState {
         self.controlled_port_open = false;
         self.edca_programmed = None;
         self.post_assoc_interface_programmed = false;
-        self.post_assoc_beacon_timing_programmed = false;
+        self.post_assoc_beacon_policy_selected = false;
         self.post_assoc_rlm_programmed = false;
         self.authorized_generation = None;
         if !self.outstanding_tx.is_empty() {
@@ -8856,6 +9374,58 @@ mod active_authority {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_data_header_translation_matches_linux_encap_offload() {
+        // To-DS QoS data, protected, TID 0, RFC 1042 IPv4 payload.
+        let mut mpdu = vec![0x88, 0x41, 0, 0];
+        mpdu.extend_from_slice(&[0x72, 0xa6, 0xc7, 0x7d, 0x56, 0x93]); // addr1 BSSID
+        mpdu.extend_from_slice(&[0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]); // addr2 SA
+        mpdu.extend_from_slice(&[0xff; 6]); // addr3 DA
+        mpdu.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]); // seq, qos tid 0
+        mpdu.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+        mpdu.extend_from_slice(&[0x45, 0, 0, 20, 1, 2, 3]);
+        let ethernet = super::client_data_mpdu_to_ethernet(&mpdu).unwrap();
+        assert_eq!(&ethernet[..6], &[0xff; 6]);
+        assert_eq!(&ethernet[6..12], &[0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a]);
+        assert_eq!(&ethernet[12..14], &[0x08, 0x00]);
+        assert_eq!(&ethernet[14..], &[0x45, 0, 0, 20, 1, 2, 3]);
+        assert_eq!(ethernet.len(), mpdu.len() - 26 - 8 + 14);
+
+        // Non-QoS data uses the 24-byte header.
+        let mut plain = mpdu.clone();
+        plain[0] = 0x08;
+        plain.drain(24..26);
+        assert_eq!(
+            super::client_data_mpdu_to_ethernet(&plain).unwrap(),
+            ethernet
+        );
+
+        // QoS-null, From-DS, HTC and raw LLC shapes are refused.
+        let mut null = mpdu.clone();
+        null[0] = 0xc8;
+        assert!(super::client_data_mpdu_to_ethernet(&null).is_err());
+        let mut from_ds = mpdu.clone();
+        from_ds[1] = 0x42;
+        assert!(super::client_data_mpdu_to_ethernet(&from_ds).is_err());
+        let mut htc = mpdu.clone();
+        htc[1] = 0xc1;
+        assert!(super::client_data_mpdu_to_ethernet(&htc).is_err());
+        let mut llc = mpdu.clone();
+        llc[26] = 0x42;
+        assert!(super::client_data_mpdu_to_ethernet(&llc).is_err());
+
+        // The 802.3 TXD carries the TID and PROTECT_FRAME, no fixed rate.
+        let txwi =
+            super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
+                .unwrap();
+        let dw =
+            |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
+        assert_eq!(dw(1), 0x8060_8007);
+        assert_eq!(dw(2), 0x28);
+        assert_eq!(dw(3) & 0x8000_0002, 0x2);
+        assert_eq!(dw(6), 0);
+    }
+
     extern crate std;
 
     use super::*;
@@ -8880,6 +9450,13 @@ mod tests {
         assert_eq!(beacon.len(), 60);
         assert_eq!(&beacon[34..36], &[2, 0]);
         assert_eq!(&beacon[48..], &[0, 0, 0, 0, 22, 0, 8, 0, 100, 0, 2, 0]);
+        let power = encode_client_post_assoc_power_state_command(7, 0, 0).unwrap();
+        assert_eq!(power.len(), 60);
+        assert_eq!(&power[34..36], &[2, 0]);
+        assert_eq!(&power[48..], &[0, 0, 0, 0, 21, 0, 8, 0, 0, 0, 0, 0]);
+        assert_eq!(power[39], 7);
+        assert!(encode_client_post_assoc_power_state_command(7, 0, 5).is_err());
+        assert!(encode_client_post_assoc_power_state_command(0, 0, 0).is_err());
         assert_eq!(rx_filter.len(), 132);
         assert_eq!(&rx_filter[34..44], &[0, 0x80, 0x0a, 0xa0, 1, 7, 0, 0, 0, 0]);
         let mut expected_rx_payload = [0u8; 68];
@@ -9223,17 +9800,48 @@ mod tests {
                         generation: lease.generation + 1,
                         ..lease
                     },
-                    |_, _| Ok(())
+                    |_, _| Ok(()),
+                    || Ok(()),
                 )
                 .is_err()
         );
 
+        let post_bss_boundary_seen = std::cell::Cell::new(false);
+        let association_command_count = std::cell::Cell::new(0usize);
         state
-            .associate(association, lease, |_, command| {
-                transcript.push(command.to_vec());
-                Ok(())
-            })
+            .associate(
+                association,
+                lease,
+                |_, command| {
+                    if association_command_count.get() == 2 {
+                        assert!(post_bss_boundary_seen.get());
+                    }
+                    transcript.push(command.to_vec());
+                    association_command_count.set(association_command_count.get() + 1);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(
+                        association_command_count.get(),
+                        2,
+                        "exactly associated BSS and RLM must precede the boundary"
+                    );
+                    post_bss_boundary_seen.set(true);
+                    Ok(())
+                },
+            )
             .unwrap();
+        assert!(post_bss_boundary_seen.get());
+        assert_eq!(transcript.len(), 7);
+        assert_eq!(
+            transcript[..4]
+                .iter()
+                .map(|command| command[39])
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(&transcript[5][48..52], &[0, 0, 0, 0]);
+        assert_eq!(&transcript[5][52..56], &[2, 0, 16, 0]);
         assert!(!state.qos_tx_ready());
         let edca = ClientEdcaParameters {
             ac: [
@@ -9299,13 +9907,6 @@ mod tests {
         let transcript = std::cell::RefCell::new(transcript);
         state
             .complete_post_assoc_interface(
-                ClientPhysicalChannel {
-                    band: 1,
-                    primary: 36,
-                    center: 42,
-                    bandwidth: 2,
-                    center2: 0,
-                },
                 |_, command| {
                     transcript.borrow_mut().push(command.to_vec());
                     Ok(())
@@ -9332,25 +9933,53 @@ mod tests {
             .unwrap();
         let transcript = transcript.into_inner();
 
-        assert_eq!(transcript.len(), 10);
-        assert_eq!(
-            transcript
+        let command_ids = transcript
+            .iter()
+            .map(|command| {
+                let cid = u16::from_le_bytes([command[34], command[35]]);
+                if cid == 0x8000 {
+                    u16::from(command[36])
+                } else {
+                    cid
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(command_ids, [3, 2, 2, 3, 2, 2, 3, 3, 2, 0x0a, 0x0a, 3, 2]);
+        assert!(
+            !transcript
                 .iter()
-                .map(|command| {
-                    let cid = u16::from_le_bytes([command[34], command[35]]);
-                    if cid == 0x8000 {
-                        u16::from(command[36])
-                    } else {
-                        cid
-                    }
-                })
-                .collect::<Vec<_>>(),
-            [3, 2, 3, 3, 2, 0x0a, 2, 0x0a, 3, 2]
+                .any(|command| command.get(52..56) == Some(&[22, 0, 8, 0])),
+            "non-PS association must not enable BCNFT"
         );
-        assert_eq!(transcript[5][80], 1);
-        assert_eq!(transcript[7][80], 2);
+        assert_eq!(&transcript[9][76..80], &(1u32 << 11).to_le_bytes());
+        assert_eq!(transcript[9][80], 1);
+        assert_eq!(transcript[10][80], 2);
         assert!(!state.post_assoc_rx_filter_published);
-        let preauth_add = &transcript[0];
+        let initial_add = &transcript[0];
+        assert_eq!(initial_add.len(), 88);
+        assert_eq!(
+            &initial_add[48..],
+            &encode_initial_peer_wcid_command(1, 0, 1, peer).unwrap()[48..]
+        );
+        let preauth_bss = &transcript[1];
+        assert_eq!(preauth_bss.len(), 92);
+        assert_eq!(&preauth_bss[48..52], &[0, 0, 0, 0]);
+        assert_eq!(&preauth_bss[52..56], &[0, 0, 32, 0]);
+        assert_eq!(preauth_bss[56], 1);
+        assert_eq!(preauth_bss[64], 1);
+        assert_eq!(&preauth_bss[66..72], &peer);
+        assert_eq!(&preauth_bss[72..80], &[19, 0, 100, 0, 0, 0xb1, 19, 0]);
+        assert_eq!(&preauth_bss[80..84], &[0x78, 0, 0, 0]);
+        assert_eq!(&preauth_bss[84..92], &[15, 0, 8, 0, 0, 0, 0, 0]);
+        let preauth_rlm = &transcript[2];
+        assert_eq!(preauth_rlm.len(), 68);
+        assert_eq!(
+            &preauth_rlm[48..],
+            &[
+                0, 0, 0, 0, 2, 0, 16, 0, 36, 36, 0, 0, 2, 3, 1, 4, 0, 1, 0, 0
+            ]
+        );
+        let preauth_add = &transcript[3];
         assert_eq!(preauth_add[49], 1);
         assert_eq!(preauth_add[112], 0);
         assert_eq!(&preauth_add[68..74], &peer);
@@ -9358,12 +9987,12 @@ mod tests {
             u16::from_le_bytes(preauth_add[66..68].try_into().unwrap()),
             0
         );
-        let bss_add = &transcript[1];
+        let bss_add = &transcript[4];
         assert_eq!(&bss_add[66..72], &peer);
         assert_eq!(bss_add[56], 1);
         assert_eq!(bss_add[88], 1);
-        assert_eq!(transcript[2][112], 2);
-        let interface_assoc = &transcript[3];
+        assert_eq!(transcript[6][112], 2);
+        let interface_assoc = &transcript[7];
         assert_eq!(interface_assoc.len(), 108);
         assert_eq!(&interface_assoc[48..56], &[0, 19, 1, 0, 0, 0, 0, 0]);
         assert_eq!(
@@ -9377,11 +10006,70 @@ mod tests {
             &[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         );
         assert_eq!(&interface_assoc[100..108], &[6, 0, 8, 0, 1, 0, 1, 0]);
-        assert_eq!(transcript[9][56], 0);
-        assert_eq!(transcript[8][49], 1);
+        assert_eq!(transcript[12][56], 0);
+        assert_eq!(transcript[11][49], 1);
         assert!(state.joined.is_none());
         assert!(!state.bss_programmed);
         assert_eq!(state.allocate_peer_wcid().unwrap().get(), 1);
+    }
+
+    #[test]
+    fn preauth_rlm_failure_rolls_back_wcid_and_bss_with_reserved_sequences() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let lease = ClientChannelLease {
+            channel: ClientPhysicalChannel {
+                band: 1,
+                primary: 36,
+                center: 42,
+                bandwidth: 2,
+                center2: 0,
+            },
+            generation: 1,
+        };
+        let mut state = ClientFirmwareEffectsState::default();
+        let peer_wcid = state.allocate_peer_wcid().unwrap();
+        state.bind_join(peer, lease, 100, 2).unwrap();
+        let association = LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid,
+            aid: 0,
+            peer,
+            rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
+            negotiated_qos: false,
+            mfp_required: false,
+        };
+        let mut transcript = Vec::new();
+        assert!(
+            state
+                .prepare_preauth_peer(association, lease, |cid, command| {
+                    transcript.push((cid, command[39], command.len(), command[56]));
+                    if transcript.len() == 3 {
+                        Err("ambiguous preauth RLM".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(
+            transcript,
+            [
+                (3, 1, 88, 0),
+                (2, 2, 92, 1),
+                (2, 3, 68, 36),
+                (3, 5, 88, 0),
+                (2, 6, 92, 0),
+            ]
+        );
+        assert!(state.preauth_peer.is_none());
+        assert!(!state.bss_programmed);
+        assert!(!state.firmware_uncertain);
+        assert_eq!(state.allocate_peer_wcid().unwrap(), peer_wcid);
     }
 
     #[test]
@@ -9428,19 +10116,57 @@ mod tests {
         let mut transcript = Vec::new();
         assert!(
             rolled_back
-                .associate(association, lease, |cid, command| {
-                    transcript.push((cid, command[56]));
-                    if transcript.len() == 1 {
-                        Err("ambiguous BSS add".into())
-                    } else {
-                        Ok(())
-                    }
-                })
+                .associate(
+                    association,
+                    lease,
+                    |cid, command| {
+                        transcript.push((cid, command[56]));
+                        if transcript.len() == 1 {
+                            Err("ambiguous BSS add".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || Ok(()),
+                )
                 .is_err()
         );
         assert_eq!(transcript, [(2, 1), (2, 0)]);
         assert!(!rolled_back.bss_programmed);
         assert!(!rolled_back.firmware_uncertain);
+
+        let mut boundary_failure = ClientFirmwareEffectsState::default();
+        boundary_failure.bind_join(peer, lease, 100, 2).unwrap();
+        boundary_failure
+            .prepare_preauth_peer(
+                LegacyWmeAssociation {
+                    aid: 0,
+                    negotiated_qos: false,
+                    ..association
+                },
+                lease,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let mut boundary_transcript = Vec::new();
+        assert!(
+            boundary_failure
+                .associate(
+                    association,
+                    lease,
+                    |cid, command| {
+                        boundary_transcript.push((cid, command[56]));
+                        Ok(())
+                    },
+                    || Err("RX pump failed".into()),
+                )
+                .is_err()
+        );
+        assert_eq!(boundary_transcript, [(2, 1), (2, 36), (2, 0)]);
+        assert!(boundary_failure.association.is_none());
+        assert!(!boundary_failure.bss_programmed);
+        assert!(!boundary_failure.post_assoc_rlm_programmed);
+        assert!(!boundary_failure.firmware_uncertain);
 
         let mut dirty = ClientFirmwareEffectsState::default();
         dirty.bind_join(peer, lease, 100, 2).unwrap();
@@ -9457,7 +10183,7 @@ mod tests {
             .unwrap();
         assert!(
             dirty
-                .associate(association, lease, |_, _| Err("no ACK".into()))
+                .associate(association, lease, |_, _| Err("no ACK".into()), || Ok(()),)
                 .is_err()
         );
         assert!(dirty.bss_programmed);
@@ -10321,29 +11047,41 @@ mod tests {
 
     #[test]
     fn independent_linux_five_ghz_rate_context_exposes_legacy_fixture_divergence() {
-        let rates = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
-        let (basic, legacy) = linux_legacy_rate_context_reference(1, &rates).unwrap();
+        let local = [0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+        let peer = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
+        let (basic, legacy) = linux_preauth_rate_context_reference(1, &local, &peer).unwrap();
         assert_eq!(basic, 0x15);
         assert_eq!(legacy, 0x3fc0);
 
-        let encoded = encode_legacy_wme_add_wcid_command(
+        let encoded = encode_preauth_peer_wcid_command(
             9,
             0,
             7,
-            42,
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
             100,
             basic,
             legacy,
-            None,
-            None,
-            0,
         )
         .unwrap();
+        // STA_REC_PHY tag 0x0015 and phy_type OFDM (0x08) never diverged;
+        // the little-endian basic bitmap and RA legacy bitmap did.
+        assert_eq!(
+            &encoded[76..100],
+            &[
+                0x15, 0, 0x0c, 0, 0x15, 0, 0x08, 0, 0, 100, 0, 0, 0x01, 0, 0x10, 0, 0xc0, 0x3f, 0,
+                0, 0, 0, 0, 0,
+            ]
+        );
         assert_eq!(&encoded[80..82], &[0x15, 0]);
+        assert_eq!(encoded[82], 0x08);
         assert_eq!(&encoded[92..94], &[0xc0, 0x3f]);
         assert_ne!(&encoded[80..82], &[1, 0]);
         assert_ne!(&encoded[92..94], &[0x40, 0]);
+
+        let local_without_9_mbps = [0x0c, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
+        let (_, filtered) =
+            linux_preauth_rate_context_reference(1, &local_without_9_mbps, &peer).unwrap();
+        assert_eq!(filtered, 0x3f40);
     }
 
     #[test]
@@ -12499,6 +13237,11 @@ mod tests {
         assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 0, 5, 0, 1, 0, 1]);
         assert_eq!(&eeprom[64..68], &MT7921_EEPROM_HW_TYPE_BLOCK.to_le_bytes());
         assert_eq!(&eeprom[68..], &[0; 20]);
+        let firmware_log = encode_download_command(DownloadCommand::FirmwareLogToHost, 6).unwrap();
+        assert_eq!(firmware_log.len(), CONNAC2_MCU_TXD_BYTES + 4);
+        assert_eq!(&firmware_log[36..40], &[0xc5, 0xa0, 1, 6]);
+        assert_eq!(&firmware_log[40..64], &[0; 24]);
+        assert_eq!(&firmware_log[64..68], &[1, 0, 0, 0]);
         assert_eq!(
             encode_download_command(DownloadCommand::ReadEepromBlock { address: 0x551 }, 5),
             Err(DownloadCommandError::InvalidEepromAddress)
@@ -12596,6 +13339,71 @@ mod tests {
             firmware_download_mode(0, true),
             DL_MODE_NEED_RESPONSE | DL_MODE_WORKING_PDA_CR4
         );
+    }
+
+    #[test]
+    fn join_roc_commands_match_linux_packed_payloads() {
+        let channel = ClientPhysicalChannel {
+            band: 1,
+            primary: 36,
+            center: 36,
+            bandwidth: 0,
+            center2: 0,
+        };
+        let acquire = encode_client_join_roc_acquire(7, 0, 9, channel, 2_000).unwrap();
+        assert_eq!(acquire.len(), 76);
+        assert_eq!(&acquire[34..36], &0x27u16.to_le_bytes());
+        assert_eq!(
+            &acquire[48..],
+            &[
+                0, 0, 0, 0, 0, 0, 24, 0, 0, 9, 36, 0, 2, 0, 36, 0, 0, 36, 0, 0, 0xd0, 0x07, 0, 0,
+                0xff, 0, 0, 0,
+            ]
+        );
+        let abort = encode_client_join_roc_abort(8, 0, 9).unwrap();
+        assert_eq!(abort.len(), 64);
+        assert_eq!(
+            &abort[48..],
+            &[0, 0, 0, 0, 1, 0, 12, 0, 0, 9, 0xff, 0, 0, 0, 0, 0]
+        );
+        assert!(encode_client_join_roc_abort(8, 0, 0).is_err());
+    }
+
+    #[test]
+    fn join_roc_grant_parser_preserves_fields_without_requiring_echoes() {
+        let mut bytes = [0u8; 60];
+        bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        bytes[28] = 0x27;
+        bytes[29] = 0;
+        bytes[30] = 1 << 2;
+        bytes[40..44].copy_from_slice(&[0, 0, 20, 0]);
+        bytes[44..56].copy_from_slice(&[0, 9, 0, 36, 0, 2, 0, 36, 0, 0, 0xff, 0]);
+        bytes[56..60].copy_from_slice(&2_000u32.to_le_bytes());
+        assert_eq!(
+            parse_client_join_roc_grant(&bytes).unwrap(),
+            ClientJoinRocGrant {
+                bss_index: 0,
+                token: 9,
+                status: 0,
+                primary_channel: 36,
+                band: 2,
+                bandwidth: 0,
+                center_channel: 36,
+                request_type: 0,
+                max_interval_ms: 2_000,
+            }
+        );
+        bytes[44..56].copy_from_slice(&[1, 3, 7, 44, 2, 1, 4, 42, 155, 1, 0, 0]);
+        let non_echoing = parse_client_join_roc_grant(&bytes).unwrap();
+        assert_eq!(non_echoing.bss_index, 1);
+        assert_eq!(non_echoing.token, 3);
+        assert_eq!(non_echoing.status, 7);
+        assert_eq!(non_echoing.primary_channel, 44);
+        assert_eq!(non_echoing.band, 1);
+        assert_eq!(non_echoing.bandwidth, 4);
+        assert_eq!(non_echoing.center_channel, 42);
+        assert_eq!(non_echoing.request_type, 1);
     }
 
     #[test]
@@ -13211,6 +14019,18 @@ mod tests {
         let eeprom = encode_passive_mcu_command(&PassiveMcuCommand::EepromBufferMode, 1).unwrap();
         assert_eq!(&eeprom[36..44], &[0xed, 0xa0, 1, 1, 0, 0x21, 0, 1]);
         assert_eq!(&eeprom[64..], &[1, 0, 0, 0]);
+        let full_power = encode_passive_mcu_command(&PassiveMcuCommand::KeepFullPower, 4).unwrap();
+        assert_eq!(&full_power[36..40], &[0xca, 0xa0, 1, 4]);
+        assert_eq!(full_power.len(), 392);
+        assert_eq!(&full_power[64..72], &[0; 8]);
+        assert_eq!(&full_power[72..86], b"KeepFullPwr 0\0");
+        assert!(full_power[86..].iter().all(|byte| *byte == 0));
+        assert!(!PassiveMcuCommand::KeepFullPower.expects_response());
+        let led =
+            encode_passive_mcu_command(&PassiveMcuCommand::RadioLedCtrl { value: 2 }, 5).unwrap();
+        assert_eq!(&led[36..44], &[0xed, 0xa0, 1, 5, 0, 5, 0, 1]);
+        assert_eq!(&led[64..], &[2, 0, 0, 0]);
+        assert!(!PassiveMcuCommand::RadioLedCtrl { value: 2 }.expects_response());
         let rx_path = encode_passive_mcu_command(
             &PassiveMcuCommand::SetRxPath {
                 channel,
@@ -13228,12 +14048,27 @@ mod tests {
                 bandwidth: 0,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             3,
         )
         .unwrap();
         assert_eq!(&switch[36..44], &[0xed, 0xa0, 1, 3, 0, 8, 0, 1]);
         assert_eq!(&switch[64..70], &[1, 1, 0, 2, 2, 9]);
+        let connected = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel,
+                center_channel: channel.number as u8,
+                bandwidth: 0,
+                center_channel2: 0,
+                antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::Normal,
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(&connected[64..70], &[1, 1, 0, 2, 2, 0]);
+        assert_eq!(&connected[..64], &switch[..64]);
         let channel36 = CandidateChannel {
             band: PhysicalBand::Ghz5,
             number: 36,
@@ -13246,6 +14081,7 @@ mod tests {
                 bandwidth: 1,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             3,
         )
@@ -13288,6 +14124,7 @@ mod tests {
                 bandwidth: 0,
                 center_channel2: 0,
                 antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::ScanBypassDpd,
             },
             4,
         )
@@ -13753,7 +14590,12 @@ mod tests {
                 return Ok(completion);
             }
             Ok(match command {
-                DownloadCommand::NicPowerControl => FirmwareCommandCompletion::NoResponse,
+                DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost => {
+                    FirmwareCommandCompletion::NoResponse
+                }
+                DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl => {
+                    FirmwareCommandCompletion::Ack
+                }
                 DownloadCommand::GetNicCapability => {
                     FirmwareCommandCompletion::NicCapability(nic_capability_fixture().1)
                 }
@@ -13944,7 +14786,7 @@ mod tests {
                     unique_country_codes: 1,
                     world_domain_available: true,
                 },
-                clc_rules_applied: 1,
+                clc_rules_applied: 2,
                 special_unii_mask: 0x1f,
             }
         );
@@ -14009,6 +14851,10 @@ mod tests {
                     14,
                 ),
                 LoaderTrace::SetClc(0, 15),
+                LoaderTrace::Command(DownloadCommand::FirmwareLogToHost, 1),
+                LoaderTrace::Command(DownloadCommand::EepromBufferMode, 2),
+                LoaderTrace::Command(DownloadCommand::ProtectControl, 3),
+                LoaderTrace::SetClc(0, 4),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready),
             ]
         );
@@ -14088,7 +14934,7 @@ mod tests {
         assert!(matches!(
             &transport.trace[transport.trace.len() - 2..],
             [
-                LoaderTrace::SetChannelDomain(39, 1),
+                LoaderTrace::SetChannelDomain(39, 5),
                 LoaderTrace::Cleanup(FirmwareLoaderState::Ready)
             ]
         ));

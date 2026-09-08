@@ -1,0 +1,163 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareLayout {
+    pub directory: &'static str,
+    pub board_size: u32,
+    pub calibration_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareParams {
+    pub name: &'static str,
+    pub firmware: FirmwareLayout,
+    pub max_radios: u8,
+    pub bdf_address: u32,
+    pub qmi_service_instance: u8,
+    pub ce_count: u8,
+    pub target_ce_count: u8,
+    pub service_to_ce_map_len: u8,
+    pub num_rxdma_per_pdev: u8,
+    pub num_vdevs: u8,
+    pub num_peers: u16,
+    pub firmware_memory_mode: u8,
+    pub rx_descriptor_size: u16,
+    pub tx_ring_size: u16,
+    pub interface_station: bool,
+    pub interface_ap: bool,
+    pub single_pdev_only: bool,
+    pub internal_sleep_clock: bool,
+    pub rxdma1_enable: bool,
+    pub rx_mac_buffer_ring: bool,
+    pub vdev_start_delay: bool,
+    pub htt_peer_map_v2: bool,
+    pub supports_monitor: bool,
+    pub supports_shadow_registers: bool,
+    pub idle_power_save: bool,
+    pub station_power_save: bool,
+    pub coldboot_calibration_memory: bool,
+    pub coldboot_calibration_ftm: bool,
+    pub coldboot_calibration_restarts_firmware: bool,
+    pub supports_suspend: bool,
+    pub supports_regdb: bool,
+    pub fix_l1ss: bool,
+    pub credit_flow: bool,
+    pub supports_dynamic_smps_6ghz: bool,
+    pub alloc_cacheable_memory: bool,
+    pub supports_rssi_stats: bool,
+    pub firmware_wmi_diag_event: bool,
+    pub current_country_support: bool,
+    pub dbr_debug_support: bool,
+    pub global_reset: bool,
+    pub m3_firmware_support: bool,
+    pub fixed_bdf_address: bool,
+    pub fixed_memory_region: bool,
+    pub static_window_map: bool,
+    pub hybrid_bus: bool,
+    pub fixed_firmware_memory: bool,
+    pub supports_off_channel_tx: bool,
+    pub supports_multi_bssid: bool,
+    pub tcl_ring_retry: bool,
+    pub smp2p_wow_exit: bool,
+    pub supports_firmware_mac_sequence: bool,
+    pub supports_dual_stations: bool,
+    pub pdev_suspend: bool,
+    pub cfr_support: bool,
+    pub cfr_num_stream_buffers: u16,
+    pub cfr_stream_buffer_size: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingMask {
+    pub tx: [u8; 11],
+    pub rx_mon_status: [u8; 11],
+    pub rx: [u8; 11],
+    pub rx_err: [u8; 11],
+    pub rx_wbm_release: [u8; 11],
+    pub reo_status: [u8; 11],
+    pub rxdma_to_host: [u8; 11],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Wcn6750;
+pub const WCN6750: Wcn6750 = Wcn6750;
+
+impl Wcn6750 {
+    pub const fn params(self) -> &'static HardwareParams {
+        &WCN6750_PARAMS
+    }
+    pub const fn ring_mask(self) -> &'static RingMask {
+        &WCN6750_RING_MASK
+    }
+}
+
+pub const WCN6750_PARAMS: HardwareParams = HardwareParams {
+    name: "wcn6750 hw1.0",
+    firmware: FirmwareLayout {
+        directory: "WCN6750/hw1.0",
+        board_size: 256 * 1024,
+        calibration_offset: 128 * 1024,
+    },
+    max_radios: 1,
+    bdf_address: 0x4b0c_0000,
+    qmi_service_instance: 3,
+    ce_count: 9,
+    target_ce_count: 9,
+    service_to_ce_map_len: 14,
+    num_rxdma_per_pdev: 1,
+    num_vdevs: 3,
+    num_peers: 512,
+    firmware_memory_mode: 0,
+    rx_descriptor_size: 388,
+    tx_ring_size: 2048,
+    interface_station: true,
+    interface_ap: true,
+    single_pdev_only: true,
+    internal_sleep_clock: false,
+    rxdma1_enable: false,
+    rx_mac_buffer_ring: true,
+    vdev_start_delay: true,
+    htt_peer_map_v2: false,
+    supports_monitor: false,
+    supports_shadow_registers: true,
+    idle_power_save: true,
+    station_power_save: true,
+    coldboot_calibration_memory: true,
+    coldboot_calibration_ftm: true,
+    coldboot_calibration_restarts_firmware: false,
+    supports_suspend: false,
+    supports_regdb: true,
+    fix_l1ss: false,
+    credit_flow: true,
+    supports_dynamic_smps_6ghz: false,
+    alloc_cacheable_memory: false,
+    supports_rssi_stats: true,
+    firmware_wmi_diag_event: true,
+    current_country_support: true,
+    dbr_debug_support: false,
+    global_reset: false,
+    m3_firmware_support: false,
+    fixed_bdf_address: false,
+    fixed_memory_region: false,
+    static_window_map: true,
+    hybrid_bus: true,
+    fixed_firmware_memory: true,
+    supports_off_channel_tx: true,
+    supports_multi_bssid: true,
+    tcl_ring_retry: false,
+    smp2p_wow_exit: true,
+    supports_firmware_mac_sequence: true,
+    supports_dual_stations: false,
+    pdev_suspend: true,
+    cfr_support: false,
+    cfr_num_stream_buffers: 0,
+    cfr_stream_buffer_size: 0,
+};
+
+pub const WCN6750_RING_MASK: RingMask = RingMask {
+    tx: [1, 0, 4, 0, 16, 0, 0, 0, 0, 0, 0],
+    rx_mon_status: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+    rx: [0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8],
+    rx_err: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rx_wbm_release: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    reo_status: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    rxdma_to_host: [1, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0],
+};

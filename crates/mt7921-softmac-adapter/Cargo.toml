@@ -25,6 +25,7 @@ mt7921-port-spike = { path = "../mt7921-port-spike" }
 netstack3-port-spike = { path = "../netstack3-port-spike" }
 netstack3-port-integration = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration" }
 rand = "=0.9.4"
+sha2 = "=0.11.0"
 tokio = { version = "=1.52.3", features = ["rt", "time"] }
 fuchsia-softmac-port = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/softmac-port" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }

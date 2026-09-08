@@ -1,0 +1,488 @@
+#![no_std]
+#![forbid(unsafe_code)]
+//! WCN6750 composition, lifecycle, and the hardware-effects half of ath11k.
+//!
+//! Linux's mac80211 policy is deliberately not represented here.  [`RadioControl`]
+//! and [`ClientRadioControl`] are the effects used by the WlanSoftmac seam.
+
+extern crate alloc;
+
+mod ahb;
+mod events;
+mod hw;
+mod operation;
+mod qmi;
+
+pub use ahb::{
+    InterruptRoute, MsiUser, RegisterWindow, WCN6750_INTERRUPT_ROUTES, service_ce_interrupt,
+    service_dp_external_group,
+};
+pub use events::{EventSink, WlanEvent};
+pub use hw::{FirmwareLayout, HardwareParams, RingMask, WCN6750, Wcn6750};
+pub use operation::{
+    Channel, Cipher, KeyConfig, KeyKind, ManagementFrame, ModelSubsystems, Operation,
+    OperationTarget, RegulatoryChannel, RegulatoryDomain, ScanConfig, ScanId, Subsystems,
+};
+pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
+
+use alloc::vec::Vec;
+use ath11k_qmi::FirmwareReady;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VdevId(pub u8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdevId(pub u8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreError {
+    WrongState,
+    Protocol,
+    DeviceFault,
+    NoResources,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceState {
+    Allocated,
+    Probed,
+    Ready,
+    Recovering,
+    Stopped,
+    Wedged,
+}
+
+pub trait Lifecycle {
+    fn probe(&mut self) -> Result<(), CoreError>;
+    fn attach_firmware(&mut self) -> Result<FirmwareReady, CoreError>;
+    fn start_radio(&mut self) -> Result<(), CoreError>;
+    fn stop(&mut self) -> Result<(), CoreError>;
+}
+
+/// The frozen, minimal hardware-effects interface.
+pub trait RadioControl {
+    fn create_client_vdev(&mut self, mac: [u8; 6]) -> Result<VdevId, CoreError>;
+    fn start_vdev(&mut self, vdev: VdevId, frequency_mhz: u16) -> Result<(), CoreError>;
+    fn create_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+    fn delete_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+}
+
+/// Remaining client-mode WlanSoftmac effects.  Methods are operations rather
+/// than policy decisions and retain the WMI call order in the pinned mac.c.
+pub trait ClientRadioControl {
+    fn up_vdev(&mut self, vdev: VdevId, bssid: [u8; 6], aid: u16) -> Result<(), CoreError>;
+    fn down_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
+    fn stop_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
+    fn delete_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
+    fn associate_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+    fn install_key(&mut self, key: KeyConfig) -> Result<(), CoreError>;
+    fn authorize_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+    fn start_scan(&mut self, scan: ScanConfig) -> Result<(), CoreError>;
+    fn stop_scan(&mut self, vdev: VdevId, scan: ScanId) -> Result<(), CoreError>;
+    fn transmit_management(&mut self, frame: ManagementFrame) -> Result<(), CoreError>;
+    fn set_tx_power(&mut self, dbm: i8) -> Result<(), CoreError>;
+    fn set_regulatory_domain(&mut self, domain: RegulatoryDomain) -> Result<(), CoreError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Vdev {
+    id: VdevId,
+    mac: [u8; 6],
+    started: bool,
+    up: bool,
+}
+
+/// Runtime owner of the post-substrate ath11k device.
+pub struct Device<B: Subsystems> {
+    backend: B,
+    state: DeviceState,
+    firmware: Option<FirmwareReady>,
+    vdevs: Vec<Vdev>,
+    peers: Vec<(VdevId, [u8; 6])>,
+    crash_count: u32,
+}
+
+impl Wcn6750 {
+    pub fn device<B: Subsystems>(self, backend: B) -> Device<B> {
+        Device {
+            backend,
+            state: DeviceState::Allocated,
+            firmware: None,
+            vdevs: Vec::new(),
+            peers: Vec::new(),
+            crash_count: 0,
+        }
+    }
+}
+
+impl<B: Subsystems> Device<B> {
+    pub fn state(&self) -> DeviceState {
+        self.state
+    }
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
+    pub fn firmware(&self) -> Option<FirmwareReady> {
+        self.firmware
+    }
+    pub fn firmware_crash_count(&self) -> u32 {
+        self.crash_count
+    }
+
+    fn op(&mut self, operation: Operation) -> Result<(), CoreError> {
+        self.backend.execute(operation)
+    }
+
+    fn has_vdev(&self, id: VdevId) -> bool {
+        self.vdevs.iter().any(|v| v.id == id)
+    }
+
+    fn core_start(&mut self) -> Result<(), CoreError> {
+        const OPS: &[Operation] = &[
+            Operation::WmiAttach,
+            Operation::HtcInit,
+            Operation::HifStart,
+            Operation::HtcWaitTarget,
+            Operation::DpHttConnect,
+            Operation::WmiConnect,
+            Operation::HtcStart,
+            Operation::WmiWaitServiceReady,
+            Operation::MacAllocate,
+            Operation::DpPdevPreAllocate,
+            Operation::DpReoSetup,
+            Operation::WmiCommandInit,
+            Operation::WmiWaitUnifiedReady,
+            Operation::DpHttVersionRequest,
+        ];
+        for (index, operation) in OPS.iter().cloned().enumerate() {
+            if let Err(error) = self.op(operation) {
+                // These labels exactly mirror core.c's fall-through unwind.
+                if index >= 10 {
+                    let _ = self.op(Operation::DpReoCleanup);
+                }
+                if index >= 9 {
+                    let _ = self.op(Operation::MacDestroy);
+                }
+                if index >= 3 {
+                    let _ = self.op(Operation::HifStop);
+                }
+                let _ = self.op(Operation::WmiDetach);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn core_stop(&mut self, crash_flush: bool) {
+        if !crash_flush {
+            let _ = self.op(Operation::QmiFirmwareStop);
+        }
+        let _ = self.op(Operation::HifStop);
+        let _ = self.op(Operation::WmiDetach);
+        let _ = self.op(Operation::DpReoCleanup);
+    }
+
+    pub fn firmware_crashed(&mut self) -> Result<(), CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        self.crash_count = self.crash_count.saturating_add(1);
+        self.state = DeviceState::Recovering;
+        let _ = self.op(Operation::RecoveryQuiesce);
+        self.core_stop(true);
+        self.op(Operation::RecoveryRestart)?;
+        Ok(())
+    }
+
+    pub fn complete_recovery(&mut self) -> Result<FirmwareReady, CoreError> {
+        if self.state != DeviceState::Recovering {
+            return Err(CoreError::WrongState);
+        }
+        self.state = DeviceState::Probed;
+        self.vdevs.clear();
+        self.peers.clear();
+        self.attach_firmware()
+    }
+}
+
+impl<B: Subsystems> Lifecycle for Device<B> {
+    fn probe(&mut self) -> Result<(), CoreError> {
+        if self.state != DeviceState::Allocated {
+            return Err(CoreError::WrongState);
+        }
+        self.op(Operation::QmiInitService)?;
+        if let Err(error) = self.op(Operation::HifPowerUp) {
+            let _ = self.op(Operation::QmiDeinitService);
+            return Err(error);
+        }
+        self.state = DeviceState::Probed;
+        Ok(())
+    }
+
+    fn attach_firmware(&mut self) -> Result<FirmwareReady, CoreError> {
+        if self.state != DeviceState::Probed {
+            return Err(CoreError::WrongState);
+        }
+        let ready = self.backend.wait_for_firmware_ready()?;
+        self.op(Operation::QmiFirmwareStart)?;
+        if let Err(error) = self.op(Operation::CeInitPipes) {
+            let _ = self.op(Operation::QmiFirmwareStop);
+            return Err(error);
+        }
+        if let Err(error) = self.op(Operation::DpAllocate) {
+            let _ = self.op(Operation::QmiFirmwareStop);
+            return Err(error);
+        }
+        if let Err(error) = self.core_start() {
+            let _ = self.op(Operation::DpFree);
+            let _ = self.op(Operation::QmiFirmwareStop);
+            return Err(error);
+        }
+        if let Err(error) = self.op(Operation::DpPdevAllocate) {
+            self.core_stop(false);
+            let _ = self.op(Operation::MacDestroy);
+            let _ = self.op(Operation::DpFree);
+            let _ = self.op(Operation::QmiFirmwareStop);
+            return Err(error);
+        }
+        if let Err(error) = self.op(Operation::MacRegister) {
+            let _ = self.op(Operation::DpPdevFree);
+            self.core_stop(false);
+            let _ = self.op(Operation::MacDestroy);
+            let _ = self.op(Operation::DpFree);
+            let _ = self.op(Operation::QmiFirmwareStop);
+            return Err(error);
+        }
+        let _ = self.op(Operation::HifIrqEnable);
+        self.firmware = Some(ready);
+        self.state = DeviceState::Ready;
+        Ok(ready)
+    }
+
+    fn start_radio(&mut self) -> Result<(), CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        self.op(Operation::RadioStart)
+    }
+
+    fn stop(&mut self) -> Result<(), CoreError> {
+        if !matches!(self.state, DeviceState::Ready | DeviceState::Recovering) {
+            return Err(CoreError::WrongState);
+        }
+        let _ = self.op(Operation::MacUnregister);
+        let _ = self.op(Operation::PdevSuspend);
+        let _ = self.op(Operation::HifIrqDisable);
+        let _ = self.op(Operation::DpPdevFree);
+        self.core_stop(self.state == DeviceState::Recovering);
+        let _ = self.op(Operation::HifPowerDown);
+        let _ = self.op(Operation::MacDestroy);
+        let _ = self.op(Operation::DpFree);
+        let _ = self.op(Operation::RegFree);
+        let _ = self.op(Operation::QmiDeinitService);
+        self.vdevs.clear();
+        self.peers.clear();
+        self.state = DeviceState::Stopped;
+        Ok(())
+    }
+}
+
+impl<B: Subsystems> RadioControl for Device<B> {
+    fn create_client_vdev(&mut self, mac: [u8; 6]) -> Result<VdevId, CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        if self.vdevs.len() >= WCN6750.params().num_vdevs as usize {
+            return Err(CoreError::NoResources);
+        }
+        let id = VdevId(
+            (0..WCN6750.params().num_vdevs)
+                .find(|id| !self.has_vdev(VdevId(*id)))
+                .ok_or(CoreError::NoResources)?,
+        );
+        self.op(Operation::WmiVdevCreate { vdev: id, mac })?;
+        let configuration = [
+            Operation::WmiVdevSetNss { vdev: id, nss: 1 },
+            Operation::WmiStaPsRxWake { vdev: id },
+            Operation::WmiStaPsTxWake { vdev: id },
+            Operation::WmiStaPsPollCount { vdev: id },
+            Operation::WmiStaPsDisable { vdev: id },
+        ];
+        for operation in configuration {
+            if let Err(error) = self.op(operation) {
+                let _ = self.op(Operation::WmiVdevDelete { vdev: id });
+                let _ = self.op(Operation::WaitVdevDeleted { vdev: id });
+                return Err(error);
+            }
+        }
+        // mac.c warns but deliberately retains the vdev if RTS setup fails.
+        self.op(Operation::WmiVdevSetRtsThreshold {
+            vdev: id,
+            threshold: u32::MAX,
+        })
+        .ok();
+        let _ = self.op(Operation::DpVdevTxAttach { vdev: id });
+        self.vdevs.push(Vdev {
+            id,
+            mac,
+            started: false,
+            up: false,
+        });
+        Ok(id)
+    }
+
+    fn start_vdev(&mut self, vdev: VdevId, frequency_mhz: u16) -> Result<(), CoreError> {
+        if self.state != DeviceState::Ready || !self.has_vdev(vdev) {
+            return Err(CoreError::WrongState);
+        }
+        let channel = Channel::from_primary_frequency(frequency_mhz);
+        self.op(Operation::WmiVdevStart { vdev, channel })?;
+        self.op(Operation::WaitVdevSetup { vdev })?;
+        if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
+            item.started = true;
+        }
+        Ok(())
+    }
+
+    fn create_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+        if !self.has_vdev(vdev) {
+            return Err(CoreError::WrongState);
+        }
+        if self.peers.len() >= WCN6750.params().num_peers as usize {
+            return Err(CoreError::NoResources);
+        }
+        if self.peers.contains(&(vdev, address)) {
+            return Err(CoreError::Protocol);
+        }
+        self.op(Operation::WmiPeerCreate { vdev, address })?;
+        self.op(Operation::WaitPeerCreated { vdev, address })?;
+        self.peers.push((vdev, address));
+        Ok(())
+    }
+
+    fn delete_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+        let index = self
+            .peers
+            .iter()
+            .position(|peer| *peer == (vdev, address))
+            .ok_or(CoreError::NotFound)?;
+        self.op(Operation::WmiPeerDelete { vdev, address })?;
+        self.op(Operation::WaitPeerDeleted { vdev, address })?;
+        self.peers.remove(index);
+        Ok(())
+    }
+}
+
+impl<B: Subsystems> ClientRadioControl for Device<B> {
+    fn up_vdev(&mut self, vdev: VdevId, bssid: [u8; 6], aid: u16) -> Result<(), CoreError> {
+        self.op(Operation::WmiVdevUp { vdev, bssid, aid })?;
+        // ath11k_bss_assoc continues with best-effort OBSS and DTIM setup.
+        self.op(Operation::WmiObssSpatialReuse { vdev }).ok();
+        self.op(Operation::WmiDtimPolicyStick { vdev }).ok();
+        if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
+            item.up = true;
+        }
+        Ok(())
+    }
+    fn down_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError> {
+        self.op(Operation::WmiVdevDown { vdev })?;
+        if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
+            item.up = false;
+        }
+        Ok(())
+    }
+    fn stop_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError> {
+        self.op(Operation::WmiVdevStop { vdev })?;
+        self.op(Operation::WaitVdevSetup { vdev })?;
+        if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
+            item.started = false;
+        }
+        Ok(())
+    }
+    fn delete_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError> {
+        let index = self
+            .vdevs
+            .iter()
+            .position(|item| item.id == vdev)
+            .ok_or(CoreError::NotFound)?;
+        self.op(Operation::WmiVdevDelete { vdev })?;
+        self.op(Operation::WaitVdevDeleted { vdev })?;
+        self.vdevs.remove(index);
+        self.peers.retain(|peer| peer.0 != vdev);
+        Ok(())
+    }
+    fn associate_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+        if !self.peers.contains(&(vdev, address)) {
+            return Err(CoreError::NotFound);
+        }
+        self.op(Operation::WmiPeerAssociate { vdev, address })?;
+        self.op(Operation::WaitPeerAssociated { vdev, address })?;
+        self.op(Operation::WmiPeerSetSmps { vdev, address })
+    }
+    fn install_key(&mut self, key: KeyConfig) -> Result<(), CoreError> {
+        if !self.has_vdev(key.vdev) {
+            return Err(CoreError::NotFound);
+        }
+        if matches!(
+            key.cipher,
+            Cipher::BipCmac128 | Cipher::BipGmac128 | Cipher::BipGmac256
+        ) {
+            return Err(CoreError::Protocol);
+        }
+        self.op(Operation::WmiInstallKey(key.clone()))?;
+        self.op(Operation::WaitKeyInstalled {
+            vdev: key.vdev,
+            key_index: key.index,
+        })
+    }
+    fn authorize_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+        if !self.peers.contains(&(vdev, address)) {
+            return Err(CoreError::NotFound);
+        }
+        self.op(Operation::WmiPeerAuthorize { vdev, address })
+    }
+    fn start_scan(&mut self, scan: ScanConfig) -> Result<(), CoreError> {
+        if !self.has_vdev(scan.vdev) {
+            return Err(CoreError::NotFound);
+        }
+        self.op(Operation::WmiScanStart(scan))
+    }
+    fn stop_scan(&mut self, vdev: VdevId, scan: ScanId) -> Result<(), CoreError> {
+        self.op(Operation::WmiScanStop { vdev, scan })
+    }
+    fn transmit_management(&mut self, frame: ManagementFrame) -> Result<(), CoreError> {
+        if !self.has_vdev(frame.vdev) {
+            return Err(CoreError::NotFound);
+        }
+        self.op(Operation::WmiMgmtTx(frame))
+    }
+    fn set_tx_power(&mut self, dbm: i8) -> Result<(), CoreError> {
+        self.op(Operation::WmiPdevSetTxPower {
+            pdev: PdevId(0),
+            half_dbm: i16::from(dbm) * 2,
+        })
+    }
+    fn set_regulatory_domain(&mut self, domain: RegulatoryDomain) -> Result<(), CoreError> {
+        if domain.channels.is_empty() {
+            return Err(CoreError::Protocol);
+        }
+        self.op(Operation::WmiSetCurrentCountry {
+            alpha2: domain.alpha2,
+        })?;
+        self.op(Operation::WmiScanChannelList {
+            pdev: PdevId(0),
+            channels: domain.channels,
+        })?;
+        self.op(Operation::WaitRegulatoryUpdate { pdev: PdevId(0) })
+    }
+}
+
+#[cfg(test)]
+mod tests;

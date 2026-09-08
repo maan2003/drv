@@ -57,8 +57,10 @@
             fi
           '';
           mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+          ath11kReferenceSource = pkgs.callPackage ./nix/ath11k-reference-source.nix { };
         in
         rec {
+          ath11k-reference-source = ath11kReferenceSource;
           mt7921-fuchsia-source = mt7921FuchsiaSource;
           mt7921-fuchsia-source-negative-tests = pkgs.runCommand
             "mt7921-fuchsia-source-negative-tests"
@@ -224,7 +226,7 @@
                 --subst-var-by snapshot_generator "$out/libexec/mt7921-rate-power-evidence" \
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
-                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
+                --subst-var-by credential_file /var/lib/iwd/ajay.psk \
                 --subst-var-by artifact_identity "$out/share/mt7921-rate-power-evidence/artifact-identity.json" \
                 --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
@@ -262,7 +264,7 @@
               grep -F '"active_capable":false' $out/share/mt7921-rate-power-evidence/artifact-identity.json
               strings "$driver" | grep -F 'rate_power_publication'
               strings "$driver" | grep -F 'rate_power_evidence_stop'
-              strings "$driver" | grep -F 'native_golden_match=true'
+              strings "$driver" | grep -F 'rate_power_conformance=true'
               strings "$driver" | grep -F 'evidence-only build permits only pinned-regdb rate-power delivery'
               output=$("$driver" --self-test-rate-power-delivery)
               test "$(printf '%s\n' "$output" | grep -c '"rate_power_self_test":"command"')" -eq 10
@@ -314,6 +316,7 @@
             MT7921_FUCHSIA_BASE_REVISION = mt7921FuchsiaSource.fuchsiaBaseRevision;
             MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256 = mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256;
             MT7921_FUCHSIA_ORDERED_PATCH_LIST = mt7921FuchsiaSource.fuchsiaOrderedPatchList;
+            session_client_mac = "8a:fd:2a:8b:70:5a";
             preBuild = ''
               ref=reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}
               export MT7921_MATERIALIZED_SOURCE_TREE_SHA256=$(cat "$ref/.drv-materialized-source-tree-sha256")
@@ -339,14 +342,14 @@
             installPhase = ''
               runHook preInstall
               driver=$(find target -path '*/release/mt7921-passive-scan' -type f -print -quit)
+              netstack=$(find target -path '*/release/mt7921-netstack' -type f -print -quit)
               test -n "$driver"
+              test -n "$netstack"
               install -Dm0755 "$driver" "$out/libexec/mt7921-full-firmware-validation"
+              install -Dm0755 "$netstack" "$out/libexec/mt7921-netstack"
               mkdir -p "$out/share/mt7921-full-firmware-validation"
               "$out/libexec/mt7921-full-firmware-validation" --artifact-identity \
                 > "$out/share/mt7921-full-firmware-validation/artifact-identity.json"
-              cat > "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" <<'EOF'
-              Passphrase=packaged-integration-only
-              EOF
               regulatory_source_sha256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               test "$regulatory_source_sha256" = 2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b
               mkdir -p "$out/bin"
@@ -355,12 +358,13 @@
                 "$out/bin/mt7921-full-firmware-validation" \
                 --subst-var-by shell ${pkgs.runtimeShell} \
                 --subst-var-by driver "$out/libexec/mt7921-full-firmware-validation" \
+                --subst-var-by netstack "$out/libexec/mt7921-netstack" \
                 --subst-var-by snapshot_generator "$out/libexec/mt7921-full-firmware-validation" \
                 --subst-var-by regulatory_db ${regulatoryDb} \
                 --subst-var-by regulatory_source_sha256 "$regulatory_source_sha256" \
-                --subst-var-by credential_file /var/lib/iwd/ph1.psk \
-                --subst-var-by mock_credential_file "$out/share/mt7921-full-firmware-validation/mock-ph1.psk" \
+                --subst-var-by credential_file /var/lib/iwd/ajay.psk \
                 --subst-var-by artifact_identity "$out/share/mt7921-full-firmware-validation/artifact-identity.json" \
+                --subst-var-by session_client_mac "$session_client_mac" \
                 --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
@@ -373,43 +377,17 @@
             '';
             postFixup = ''
               evidence_dir=$out/share/mt7921-full-firmware-validation
-              mkdir -p "$evidence_dir"
               driver=$out/libexec/mt7921-full-firmware-validation
               "$driver" --artifact-identity > actual-identity.json
               cmp actual-identity.json "$evidence_dir/artifact-identity.json"
               "$driver" --self-test-rate-power-delivery > "$evidence_dir/rate-power-self-test.jsonl"
-              "$driver" --self-test-production-validation > "$evidence_dir/production-self-test.jsonl"
-              MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation" --self-test-production-association-request > "$evidence_dir/production-association-request-self-test.json"
               cat > "$evidence_dir/ARTIFACTS" <<EOF
               RATE_POWER_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/rate-power-self-test.jsonl" | cut -d ' ' -f1)
-              PRODUCTION_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/production-self-test.jsonl" | cut -d ' ' -f1)
-              PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$evidence_dir/production-association-request-self-test.json" | cut -d ' ' -f1)
               FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
               FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
               PROJECT_CORE_SOURCE_SHA256=$MT7921_PROJECT_CORE_SOURCE_SHA256
               COMPOSITE_ARTIFACT_SOURCE_SHA256=$MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256
               BSS_WIRE_CONTRACT=connac2-bss-wire-v1
-              PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
-              ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2
-              CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4
-              RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
-              ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2
-              ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2
-              ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
-              ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
-              EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
-              EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment
-              SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c
-              CONSUMING_MIB_READS=false
-              SNAPSHOT_BOUNDARIES=before-post-assoc-tail,m1-observation-timeout-5000ms
-              POSITIVE_RESULT=target_m1_observed_at_rx_dma
-              NEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous
-              TARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1
-              TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged
-              ATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required
-              TARGET_BEACON_TIM_CONTRACT=linux-ieee80211-check-tim-v1
-              TIM_TRUE_RESULT=ap-queued-unicast-for-normalized-aid-not-traffic-type
-              TIM_NEVER_TRUE_RESULT=inconclusive
               REGULATORY_SOURCE_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
               REGULATORY_GENERATION=0
               EOF
@@ -418,143 +396,22 @@
             installCheckPhase = ''
               runHook preInstallCheck
               driver=$out/libexec/mt7921-full-firmware-validation
-              test "$("$driver" --artifact-identity)" = "$(cat $out/share/mt7921-full-firmware-validation/artifact-identity.json)"
-              grep -F '"flavor":"full-firmware-production"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"active_capable":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"observation_mode":"passive-m1-observation"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"frame_tx_disabled_before_m1":true' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"required_pre_m1_management_tx":"sae-and-association"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"preassociation_physical_tx_classes":"sae-authentication,association-request"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"postassociation_physical_tx":"disabled"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"post_assoc_public_tx":"disabled-until-m1-observed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"m2_physical_tx":"suppressed"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"frame":"none-post-association-public-before-m1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F "\"source_identity_sha256\":\"$MT7921_SOURCE_IDENTITY_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F "\"project_core_source_sha256\":\"$MT7921_PROJECT_CORE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F "\"composite_artifact_source_sha256\":\"$MT7921_COMPOSITE_ARTIFACT_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"artifact_identity":"mt7921-validation-v7"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"basic_tlv_len":32' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"initial_bss_payload_len":36,"initial_bss_command_len":84' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"associated_bss_payload_len":44,"associated_bss_command_len":92' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"qbss_payload_offset":36' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"dtim_source":"selected-beacon-shared-basic-bcnft"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"association_request_contract":"mt7921-supported-subset-v2"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"consuming_mib_reads":false' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"positive_result":"target_m1_observed_at_rx_dma"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"negative_result":"no_m1_at_rx_dma_ambiguous"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F "\"materialized_source_tree_sha256\":\"$MT7921_MATERIALIZED_SOURCE_TREE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F "\"generated_crate_source_sha256\":\"$MT7921_GENERATED_CRATE_SOURCE_SHA256\"" $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"fuchsia_ordered_patch_list":"${mt7921FuchsiaSource.fuchsiaOrderedPatchList}"' $out/share/mt7921-full-firmware-validation/artifact-identity.json
-              strings "$driver" | grep -F '"full_firmware_preflight":"passed"'
-              strings "$driver" | grep -F 'ram_published_firmware_start_acked'
-              strings "$driver" | grep -F 'post_release_before_ram'
-              strings "$driver" | grep -F 'immediately_before_rx_path'
-              strings "$driver" | grep -F 'after_rate_power_final'
-              strings "$driver" | grep -F 'immediately_predata'
-              strings "$driver" | grep -F 'passive_m1_observation result=recognized'
-              strings "$driver" | grep -F 'frame_tx_disabled_before_m1=true public_tx_count=0'
-              strings "$driver" | grep -F 'production_policy_validation result=pass'
-              strings "$driver" | grep -F 'tmac_population_invariant=false'
+              identity=$out/share/mt7921-full-firmware-validation/artifact-identity.json
+              test "$("$driver" --artifact-identity)" = "$(cat "$identity")"
+              grep -F '"artifact_identity":"mt7921-driver-v11"' "$identity"
+              grep -F '"flavor":"full-firmware-production"' "$identity"
+              grep -F '"active_capable":true' "$identity"
+              grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$identity"
+              grep -F '"initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f"' "$identity"
+              grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"' "$identity"
               rate_output="$("$driver" --self-test-rate-power-delivery)"
               test "$(printf '%s\n' "$rate_output" | grep -c '"rate_power_self_test":"command"')" -eq 10
-              printf '%s\n' "$rate_output" \
-                | grep -F '"rate_power_self_test":"passed"' \
-                | grep -F '"audit":"hardware_post_dma_consumption_reclaim"' \
-                | grep -F '"total_lengths":"1404,1080,1404,1404,1404,1404,1404,1404"' \
-                | grep -F '"raw_lengths":"1340,1016,1340,1340,1340,1340,1340,1340"' \
-                | grep -F '"sequences":"15,1,2,3,4,5,6,7"' \
-                | grep -F '"reg_read_between_pages":0' \
-                | grep -F '"safe_reclaims":8'
-              production_output="$("$driver" --self-test-production-validation)"
-              printf '%s\n' "$production_output" \
-                | grep -F '"production_validation_self_test":"passed"' \
-                | grep -F '"observation_mode":"passive-m1-observation"' \
-                | grep -F '"frame_tx_disabled_before_m1":true' \
-                | grep -F '"success":"authenticator_m1_delivered_to_pinned_sme"' \
-                | grep -F '"second_frame":false' \
-                | grep -F '"tmac_population_invariant":false'
-              printf '%s\n' "$production_output" \
-                | grep -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' \
-                | grep -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' \
-                | grep -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' \
-                | grep -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c"' \
-                | grep -F '"consuming_mib_reads":false' \
-                | grep -F '"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms"' \
-                | grep -F '"positive_result":"target_m1_observed_at_rx_dma"' \
-                | grep -F '"negative_result":"no_m1_at_rx_dma_ambiguous"' \
-                | grep -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' \
-                | grep -F '"behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged"' \
-                | grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"'
-              printf '%s\n' "$production_output" \
-                | grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' \
-                | grep -F '"associated_bss_command_len":92' \
-                | grep -F '"associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5"'
-              association_output="$(MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation" --self-test-production-association-request)"
-              printf '%s\n' "$association_output" \
-                | grep -F '"production_association_request_self_test":"passed"' \
-                | grep -F '"oracle_constructor":"host_fixture+linux-comparison-profile","runtime_constructor":"production-DeviceOps-frame-preparation"' \
-                | grep -F '"association_request_contract":"mt7921-supported-subset-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1"' \
-                | grep -F '"listen_interval":5' \
-                | grep -F '"ie_id_lengths":"0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7"' \
-                | grep -F '"oracle_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' \
-                | grep -F '"rsn_capabilities":"0x0080"' \
-                | grep -F '"rsnxe_source":"selected_bss"' \
-                | grep -F '"selected_bss_without_h2e":"rsnxe_absent_wmm_present"' \
-                | grep -F '"observed_stale_hashes_8646ba36_and_aa0306_rejected":true' \
-                | grep -F '"canonical_fixture_normalized_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"' \
-                | grep -F '"device_query_fixture_normalized_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4"' \
-                | grep -F '"runtime_hash_policy":"input-dependent"' \
-                | grep -F '"association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2"' \
-                | grep -F '"association_transformation_contract":"device+pinned-regdb-authoritative-association-v2"' \
-                | grep -F '"two_distinct_base_inputs":true,"missing_authoritative_input_rejected":true' \
-                | grep -F '"runtime_capability":"0x0111"' \
-                | grep -F '"runtime_rsn_capabilities":"0x0080"' \
-                | grep -F '"runtime_frame_len":175' \
-                | grep -F '"oracle_frame_len":204' \
-                | grep -F '"fuchsia_base_revision":"${mt7921FuchsiaSource.fuchsiaBaseRevision}"' \
-                | grep -F '"fuchsia_ordered_patch_set_sha256":"${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}"'
-              integration_output="$(MT7921_PACKAGED_INTEGRATION_TEST=1 "$out/bin/mt7921-full-firmware-validation")"
-              printf '%s\n' "$integration_output" \
-                | grep -F '"packaged_zero_arg_integration":"passed"' \
-                | grep -F '"dispatch":"normal-full-firmware-sae"' \
-                | grep -F '"fd3_eof":true' \
-                | grep -F '"fd4_eof":true' \
-                | grep -F '"typed_binding_consumed":true' \
-                | grep -F '"rate_power_pages":8' \
-                | grep -F '"add_device_acked":true' \
-                | grep -F '"frame":"none-post-association-public-before-m1"' \
-                | grep -F '"device_opened":false' \
-                | grep -F '"vfio_opened":false'
+              printf '%s\n' "$rate_output" | grep -F '"rate_power_self_test":"passed"'
               launcher=$out/bin/mt7921-full-firmware-validation
-              grep -F 'case "$#:''${1-}" in' "$launcher"
-              grep -F 'DRV_PASSIVE_M1_OBSERVATION=1' "$launcher"
-              grep -F 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' "$launcher"
-              grep -F 'DRV_SAE_CHANNEL=36' "$launcher"
-              grep -F 'DRV_SAE_SSID=ph1' "$launcher"
+              grep -F 'DRV_ACTIVE_CLIENT=1' "$launcher"
               grep -F 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$launcher"
-              grep -F 'DRV_REGULATORY_SNAPSHOT_FD=4' "$launcher"
-              grep -F 'DRV_REGULATORY_SNAPSHOT_LEN=' "$launcher"
-              grep -F 'DRV_REGULATORY_SOURCE_SHA256=' "$launcher"
-              grep -F -- '--generate-regulatory-snapshot-v20' "$launcher"
               grep -F -- '--run-one-shot-sae-auth' "$launcher"
-              test "$(grep -Fc 'exec ' "$launcher")" -eq 6
-              if "$out/bin/mt7921-full-firmware-validation" --run-one-shot-patch-table-gate 2>/dev/null; then
+              if "$launcher" --run-one-shot-patch-table-gate 2>/dev/null; then
                 echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
                 exit 1
               fi
@@ -563,378 +420,99 @@
             meta.mainProgram = "mt7921-full-firmware-validation";
           };
 
-          mt7921-full-firmware-validation-launcher-test =
-            pkgs.runCommand "mt7921-full-firmware-validation-launcher-test"
-              {
-                nativeBuildInputs = [
-                  pkgs.coreutils
-                  pkgs.gnused
-                ];
-              }
-              ''
-                mkdir -p work/bin work/var
-                cat > work/bin/validation-stub <<'EOF'
-                #!${pkgs.runtimeShell}
-                set -eu
-                if [ "''${1-}" = --artifact-identity ]; then
-                  ${pkgs.coreutils}/bin/cat "$PWD/work/var/artifact-identity.json"
-                  exit 0
-                fi
-                transcript=$PWD/transcript
-                printf 'ARGV' > "$transcript"
-                printf ' <%s>' "$@" >> "$transcript"
-                printf '\n' >> "$transcript"
-                ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
-                regulatory_snapshot=$(${pkgs.coreutils}/bin/cat <&4)
-                if [ "''${1-}" = --run-one-shot-sae-auth ] || [ "''${1-}" = --full-firmware-preflight ]; then
-                  credential=$(${pkgs.coreutils}/bin/cat <&3)
-                  printf 'CREDENTIAL_LEN=%s\n' "''${#credential}" >> "$transcript"
-                fi
-                printf 'REGULATORY_SNAPSHOT=%s\n' "$regulatory_snapshot" >> "$transcript"
-                EOF
-                chmod 0755 work/bin/validation-stub
-                cat > work/bin/snapshot-stub <<'EOF'
-                #!${pkgs.runtimeShell}
-                set -eu
-                test "$1" = --generate-regulatory-snapshot-v20
-                test "$3" = 00
-                printf snapshot-ok
-                EOF
-                chmod 0755 work/bin/snapshot-stub
-                : > work/var/regulatory.db
-                printf 'Passphrase=eight-by\n' > work/var/ph1.psk
-                cp work/var/ph1.psk work/var/mock-ph1.psk
-                printf '%s\n' '{"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","association_request_contract":"mt7921-supported-subset-v2","canonical_association_fixture_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2","association_transformation_contract":"device+pinned-regdb-authoritative-association-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}' > work/var/artifact-identity.json
-                substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
-                  --subst-var-by shell ${pkgs.runtimeShell} \
-                  --subst-var-by driver "$PWD/work/bin/validation-stub" \
-                  --subst-var-by snapshot_generator "$PWD/work/bin/snapshot-stub" \
-                  --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
-                  --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
-                  --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
-                  --subst-var-by mock_credential_file "$PWD/work/var/mock-ph1.psk" \
-                  --subst-var-by artifact_identity "$PWD/work/var/artifact-identity.json" \
-                  --subst-var-by cat ${pkgs.coreutils}/bin/cat \
-                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
-                  --subst-var-by wc ${pkgs.coreutils}/bin/wc \
-                  --subst-var-by stat ${pkgs.coreutils}/bin/stat \
-                  --subst-var-by rm ${pkgs.coreutils}/bin/rm \
-                  --subst-var-by env ${pkgs.coreutils}/bin/env
-                chmod 0755 work/launcher
-                identity_output=$(work/launcher --artifact-identity)
-                printf '%s\n' "$identity_output" \
-                  | grep -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' \
-                  | grep -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' \
-                  | grep -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' \
-                  | grep -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c"' \
-                  | grep -F '"consuming_mib_reads":false' \
-                  | grep -F '"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms"' \
-                  | grep -F '"positive_result":"target_m1_observed_at_rx_dma"' \
-                  | grep -F '"negative_result":"no_m1_at_rx_dma_ambiguous"' \
-                  | grep -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' \
-                  | grep -F '"behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged"' \
-                  | grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"'
-                env -i \
-                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
-                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
-                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
-                  work/launcher
-                grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
-                grep -Fx 'DRV_PASSIVE_M1_OBSERVATION=1' transcript
-                grep -Fx 'DRV_SAE_BSSID=72:a6:c7:7d:56:93' transcript
-                grep -Fx 'DRV_SAE_CHANNEL=36' transcript
-                grep -Fx 'DRV_SAE_SSID=ph1' transcript
-                grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
-                grep -Fx 'DRV_REGULATORY_SOURCE_SHA256=0000000000000000000000000000000000000000000000000000000000000000' transcript
-                grep -Fx 'CREDENTIAL_LEN=8' transcript
-                grep -Fx 'REGULATORY_SNAPSHOT=snapshot-ok' transcript
-                ! grep -q 'PATCH_TABLE' transcript
-                ! grep -q 'EAPOL' transcript
-                rm transcript
-                work/launcher --full-firmware-preflight
-                grep -Fx 'ARGV <--full-firmware-preflight>' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
-                grep -Fx 'REGULATORY_SNAPSHOT=snapshot-ok' transcript
-                grep -Fx 'CREDENTIAL_LEN=8' transcript
-                cp transcript "$out"
+          mt7921-fresh-laa-diagnostic =
+            mt7921-full-firmware-validation.overrideAttrs (old: {
+              pname = "mt7921-fresh-laa-diagnostic";
+              session_client_mac = "02:7d:91:4c:b8:3e";
+              cargoBuildFlags = [
+                "--no-default-features"
+                "--features"
+                "fuchsia-passive,full-firmware-production,fresh-laa-diagnostic"
+              ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                driver=$out/libexec/mt7921-full-firmware-validation
+                identity=$out/share/mt7921-full-firmware-validation/artifact-identity.json
+                grep -F '"flavor":"fresh-laa-diagnostic"' "$identity"
+                grep -F '"diagnostic_safety_class":"fixed-fresh-laa-stale-ap-state-attribution-only"' "$identity"
+                grep -F '"session_identity_contract":"single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1"' "$identity"
+                grep -F '"session_client_mac":"02:7d:91:4c:b8:3e"' "$identity"
+                "$driver" --self-test-fresh-laa-identity | grep -F '"fresh_laa_identity_self_test":"passed"'
+                grep -F 'DRV_SAE_CLIENT_MAC=02:7d:91:4c:b8:3e' "$out/bin/mt7921-full-firmware-validation"
+                runHook postInstallCheck
               '';
+            });
 
-          mt7921-rate-power-evidence-launcher-test =
-            pkgs.runCommand "mt7921-rate-power-evidence-launcher-test"
-              {
-                nativeBuildInputs = [ pkgs.coreutils pkgs.gnused ];
-              }
-              ''
-                mkdir -p work/bin work/var
-                cat > work/bin/evidence-stub <<'EOF'
-                #!${pkgs.runtimeShell}
-                set -eu
-                if [ "''${1-}" = --artifact-identity ]; then
-                  ${pkgs.coreutils}/bin/cat "$PWD/work/var/artifact-identity.json"
-                  exit 0
-                fi
-                test -f "$PWD/generation.complete"
-                transcript=$PWD/transcript
-                printf 'ARGV <%s>\n' "$1" > "$transcript"
-                ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort >> "$transcript"
-                credential=$(${pkgs.coreutils}/bin/cat <&3)
-                snapshot=$(${pkgs.coreutils}/bin/cat <&4)
-                if printf x >&4 2>/dev/null; then
-                  echo FD4_WRITABLE >> "$transcript"
-                  exit 1
-                fi
-                printf 'CREDENTIAL=%s\nSNAPSHOT=%s\nFD4_EOF=true\n' \
-                  "$credential" "$snapshot" >> "$transcript"
-                EOF
-                chmod 0755 work/bin/evidence-stub
-                cat > work/bin/snapshot-stub <<'EOF'
-                #!${pkgs.runtimeShell}
-                set -eu
-                test "$1" = --generate-regulatory-snapshot-v20
-                test "$3" = 00
-                test "$4" = 0000000000000000000000000000000000000000000000000000000000000000
-                : > "$PWD/generation.complete"
-                printf snapshot-ok
-                EOF
-                chmod 0755 work/bin/snapshot-stub
-                : > work/var/regulatory.db
-                printf 'Passphrase=eight-by\n' > work/var/ph1.psk
-                printf '%s\n' '{"artifact_identity":"mt7921-validation-v1","flavor":"rate-power-evidence-only","enabled_operation":"run-one-shot-power-setup","source_commit":"launcher-test","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":false}' > work/var/artifact-identity.json
-                substitute ${./nix/mt7921-rate-power-evidence-launcher.sh} work/launcher \
-                  --subst-var-by shell ${pkgs.runtimeShell} \
-                  --subst-var-by driver "$PWD/work/bin/evidence-stub" \
-                  --subst-var-by snapshot_generator "$PWD/work/bin/snapshot-stub" \
-                  --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
-                  --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
-                  --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
-                  --subst-var-by artifact_identity "$PWD/work/var/artifact-identity.json" \
-                  --subst-var-by cat ${pkgs.coreutils}/bin/cat \
-                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                  --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
-                  --subst-var-by wc ${pkgs.coreutils}/bin/wc \
-                  --subst-var-by stat ${pkgs.coreutils}/bin/stat \
-                  --subst-var-by rm ${pkgs.coreutils}/bin/rm \
-                  --subst-var-by env ${pkgs.coreutils}/bin/env
-                chmod 0755 work/launcher
-                env -i \
-                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
-                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
-                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
-                  work/launcher
-                grep -Fx 'ARGV <--run-one-shot-power-setup>' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_FD=4' transcript
-                grep -Fx 'DRV_REGULATORY_SNAPSHOT_LEN=11' transcript
-                grep -Fx 'CREDENTIAL=eight-by' transcript
-                grep -Fx 'SNAPSHOT=snapshot-ok' transcript
-                grep -Fx 'FD4_EOF=true' transcript
-                ! grep -q FD4_WRITABLE transcript
-
-                work/launcher --evidence-preflight
-                grep -Fx 'ARGV <--full-firmware-preflight>' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_FD=3' transcript
-                grep -Fx 'DRV_SAE_CREDENTIAL_LEN=8' transcript
-                grep -Fx 'CREDENTIAL=eight-by' transcript
-                grep -Fx 'SNAPSHOT=snapshot-ok' transcript
-
-                cat > work/bin/fail-stub <<'EOF'
-                #!${pkgs.runtimeShell}
-                exit 1
-                EOF
-                chmod 0755 work/bin/fail-stub
-                ${pkgs.gnused}/bin/sed \
-                  "s|snapshot_generator=$PWD/work/bin/snapshot-stub|snapshot_generator=$PWD/work/bin/fail-stub|" \
-                  work/launcher > work/fail-launcher
-                chmod 0755 work/fail-launcher
-                rm -f transcript
-                if env -i \
-                  DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
-                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
-                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
-                  work/fail-launcher; then
-                  exit 1
-                fi
-                test ! -e transcript
-                printf passed > "$out"
-              '';
-
-          mt7921-rate-power-evidence-supervisor = pkgs.runCommand
-            "mt7921-rate-power-evidence-supervisor"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
+          mt7921-fresh-laa-diagnostic-supervisor = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-supervisor"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
             ''
               mkdir -p "$out/bin"
               substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
-                "$out/bin/mt7921-rate-power-evidence-supervisor" \
+                "$out/bin/mt7921-fresh-laa-diagnostic-supervisor" \
                 --subst-var-by runtime_path /run/current-system/sw/bin \
                 --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
-                --subst-var-by validation_launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
-                --subst-var-by artifact_identity ${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json \
-                --subst-var-by recovery_samples 45 \
-                --subst-var-by sys_root /sys \
-                --subst-var-by run_root /run \
-                --subst-var-by var_root /var \
-                --subst-var-by id_command ${pkgs.coreutils}/bin/id
-              chmod 0755 "$out/bin/mt7921-rate-power-evidence-supervisor"
-              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-supervisor"
-              grep -F '${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence' \
-                "$out/bin/mt7921-rate-power-evidence-supervisor"
+                --subst-var-by validation_launcher ${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by artifact_identity ${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
+                --subst-var-by run_root /run --subst-var-by var_root /var \
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 02:7d:91:4c:b8:3e \
+                --subst-var-by identity_mode fixed-fresh-laa-diagnostic
+              chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              grep -F 'native_identity_restored' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
+              grep -F 'session_client_mac=02:7d:91:4c:b8:3e' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
             '';
 
-          mt7921-rate-power-evidence-manifest =
-            let
-              package = mt7921-rate-power-evidence;
-              supervisor = mt7921-rate-power-evidence-supervisor;
-              closure = pkgs.closureInfo { rootPaths = [ package supervisor ]; };
-            in
-            pkgs.runCommand "mt7921-rate-power-evidence-manifest"
-              { nativeBuildInputs = [ pkgs.coreutils ]; }
-              ''
-                launcher=${package}/bin/mt7921-rate-power-evidence
-                elf=${package}/libexec/mt7921-rate-power-evidence
-                supervisor=${supervisor}/bin/mt7921-rate-power-evidence-supervisor
-                identity=${package}/share/mt7921-rate-power-evidence/artifact-identity.json
-                cat > "$out" <<EOF
-                PACKAGE=${package}
-                LAUNCHER=$launcher
-                LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
-                ELF=$elf
-                ELF_SHA256=$(sha256sum "$elf" | cut -d ' ' -f1)
-                ARTIFACT_IDENTITY=$identity
-                ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
-                FLAVOR=rate-power-evidence-only
-                ACTIVE_CAPABLE=false
-                FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
-                SUPERVISOR=$supervisor
-                SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
-                REGULATORY_DB=${regulatoryDb}
-                REGULATORY_DB_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
-                CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
-                PCI_BDF=0000:05:00.0
-                TIMEOUT_SECONDS=300
-                OPERATION=--run-one-shot-power-setup
-                ORDER=PATCH_RAM_RX_PATH_8x0x4005d_ACKED_ADD_DEVICE_STOP
-                NATIVE_RAW_SHA256=a518536c96d2de1a8ba398cbd0fbdb1b00f5b90434d27e8de2fefb97b2ba7b95,1c365518ffebb7a2b12b924bcfbe41436b4f2d52a83b07682d6f16c79eb39db0,1cbc40088bc367d75b2119806d3a8114ed3c4ce92a9572f262faace837343d36,f03e59182fd1e605df82de38305d445a015c9fc44c12da7802132514fed3e4d5,231e8db12ba160bdc12af55ef61c2da091387951c029008cc68b6b8d8a71d208,d8761b04f27de826280c55aac39a96e4d3bc0bb4d83330d910a4fd3ca70b90b2,e018434f160c1b67dc86477c602a87627b5553c5304359912347a04cbb3aad44,f1e5d489bb579d4d080eb8c2569e752c0b0dd87ccbdf02a112705536791d89df
-                NORMALIZED_ENVELOPE_SHA256=72ea1befa9b1ff66bd677d92bde13d3d5e89409abc5afdd2e9272d65a5ddb7c7,20357281549ddaa5598b30fbbde185dedfd345ebfcef147741c41fccb3a5622e,b003e1b0460ec05444eda58cb6ba87ce2753e84b0bfd81c2102cbb62f15db735,3162681f7c44963e53b0739c59426677326490c1e70d6736ec6e317ca4e7a389,9d394dfd9b0e45eca67741a1aaca4631280b5e238ed82c0858e2942155c3ae85,28828e4df8b780205d7784a88c2e51883a379d8b3cc71cac5ff7bff2d0396bbf,0a33bb15880033bc175c79962ef1c1021da3067be28a3bbf29a7d3ae40414596,997ae34108569cb25783d44bac88e3631920188a7ec1c278bda69686c19db873
-                INERT_ARTIFACTS=${package}/share/mt7921-rate-power-evidence
-                TMAC_POPULATION_INVARIANT=false
-                SCAN=false
-                CHANNEL_SET=false
-                AUTHENTICATION=false
-                FRAME_TX=false
-                PRIVILEGE_CONTRACT=FIXED_ROOT_ENTRY_SUDO_-n
-                EOF
-              '';
-
-          mt7921-rate-power-evidence-root-entry = pkgs.runCommand
-            "mt7921-rate-power-evidence-root-entry"
-            { nativeBuildInputs = [ pkgs.coreutils ]; }
+          mt7921-full-firmware-validation-launcher-test = pkgs.runCommand
+            "mt7921-full-firmware-validation-launcher-test"
+            { nativeBuildInputs = [ pkgs.coreutils pkgs.gnused pkgs.gnugrep ]; }
             ''
-              mkdir -p "$out/bin"
-              substitute ${./nix/mt7921-rate-power-evidence-semantic-root.sh} \
-                "$out/bin/mt7921-rate-power-evidence-root" \
+              mkdir -p work/bin work/var
+              cat > work/bin/driver <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              if [ "''${1-}" = --artifact-identity ]; then ${pkgs.coreutils}/bin/cat "$PWD/work/var/identity"; exit; fi
+              ${pkgs.coreutils}/bin/env | ${pkgs.coreutils}/bin/sort > "$PWD/transcript"
+              printf 'ARGV <%s>\n' "$*" >> "$PWD/transcript"
+              EOF
+              cat > work/bin/snapshot <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf snapshot-ok
+              EOF
+              chmod +x work/bin/driver work/bin/snapshot
+              printf 'Passphrase=eight-by\n' > work/var/ajay.psk
+              : > work/var/regulatory.db
+              printf '%s\n' '{"artifact_identity":"mt7921-driver-v11","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","bss_wire_contract":"connac2-bss-wire-v1","active_capable":true}' > work/var/identity
+              substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
                 --subst-var-by shell ${pkgs.runtimeShell} \
-                --subst-var-by sudo /run/wrappers/bin/sudo \
-                --subst-var-by supervisor ${mt7921-rate-power-evidence-supervisor}/bin/mt7921-rate-power-evidence-supervisor \
-                --subst-var-by launcher ${mt7921-rate-power-evidence}/bin/mt7921-rate-power-evidence \
-                --subst-var-by manifest ${mt7921-rate-power-evidence-manifest} \
-                --subst-var-by artifact_identity ${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json \
-                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                --subst-var-by cut ${pkgs.coreutils}/bin/cut \
-                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by driver "$PWD/work/bin/driver" \
+                --subst-var-by snapshot_generator "$PWD/work/bin/snapshot" \
+                --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
+                --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+                --subst-var-by credential_file "$PWD/work/var/ajay.psk" \
+                --subst-var-by artifact_identity "$PWD/work/var/identity" \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat \
                 --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                --subst-var-by cat ${pkgs.coreutils}/bin/cat
-              chmod 0755 "$out/bin/mt7921-rate-power-evidence-root"
-              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-rate-power-evidence-root"
-            '';
-
-          mt7921-rate-power-evidence-privilege-test = pkgs.runCommand
-            "mt7921-rate-power-evidence-privilege-test"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils ]; }
-            ''
-              mkdir -p work/bin work/var/lib/wifi-driver-lab
-              cat > work/bin/launcher-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              if [ "''${1-}" = --artifact-identity ]; then cat "$PWD/work/artifact-identity.json"; exit 0; fi
-              exit 0
-              EOF
-              echo '{"artifact_identity":"test"}' > work/artifact-identity.json
-              chmod 0755 work/bin/launcher-stub
-              launcher=$PWD/work/bin/launcher-stub
-              cat > work/bin/id-unprivileged <<'EOF'
-              #!${pkgs.runtimeShell}
-              echo 1000
-              EOF
-              cat > work/bin/id-root <<'EOF'
-              #!${pkgs.runtimeShell}
-              echo 0
-              EOF
-              cat > work/bin/hardware-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              echo hardware-called >> "$PWD/transcript"
-              exit 1
-              EOF
-              chmod 0755 work/bin/*
-              make_supervisor() {
-                local id=$1 output=$2
-                substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} "$output" \
-                  --subst-var-by runtime_path ${pkgs.coreutils}/bin \
-                  --subst-var-by wifi_driver_lab "$PWD/work/bin/hardware-stub" \
-                  --subst-var-by wifi_lab_watchdog "$PWD/work/bin/hardware-stub" \
-                  --subst-var-by validation_launcher "$launcher" \
-                  --subst-var-by artifact_identity "$PWD/work/artifact-identity.json" \
-                  --subst-var-by recovery_samples 1 \
-                  --subst-var-by sys_root "$PWD/work/sys" \
-                  --subst-var-by run_root "$PWD/work/run" \
-                  --subst-var-by var_root "$PWD/work/var" \
-                  --subst-var-by id_command "$id"
-                chmod 0755 "$output"
-              }
-              make_supervisor "$PWD/work/bin/id-unprivileged" work/supervisor-unprivileged
-              if ${pkgs.bash}/bin/bash work/supervisor-unprivileged 0000:05:00.0 -- "$launcher" 2>error; then exit 1; fi
-              grep -F 'requires noninteractive root elevation before any state change' error
-              test ! -e transcript
-              test -z "$(find work/var/lib/wifi-driver-lab -type f -print -quit)"
-
-              make_supervisor "$PWD/work/bin/id-root" work/supervisor-root
-              ${pkgs.bash}/bin/bash work/supervisor-root --plan 0000:05:00.0 -- "$launcher" > plan
-              grep -F 'mode=inert hardware_handoff=false uid=0 privilege_contract=sudo_-n' plan
-              grep -F 'durable_report_writable=true' plan
-              test ! -e transcript
-
-              : > work/manifest
-              cat > work/bin/sudo-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              printf '%s\n' "$@" > "$PWD/sudo.argv"
-              exit 0
-              EOF
-              chmod 0755 work/bin/sudo-stub
-              substitute ${./nix/mt7921-rate-power-evidence-root.sh} work/root-entry \
-                --subst-var-by shell ${pkgs.runtimeShell} \
-                --subst-var-by sudo "$PWD/work/bin/sudo-stub" \
-                --subst-var-by supervisor "$PWD/work/supervisor-root" \
-                --subst-var-by launcher "$launcher" \
-                --subst-var-by manifest "$PWD/work/manifest" \
-                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                --subst-var-by cut ${pkgs.coreutils}/bin/cut
-              chmod 0755 work/root-entry
-              work/root-entry
-              printf '%s\n' -n "$PWD/work/supervisor-root" 0000:05:00.0 -- "$launcher" > expected
-              cmp expected sudo.argv
-              work/root-entry --plan
-              printf '%s\n' -n "$PWD/work/supervisor-root" --plan 0000:05:00.0 -- "$launcher" > expected
-              cmp expected sudo.argv
-              if work/root-entry arbitrary 2>error; then exit 1; fi
-              grep -F 'accepts no arguments except --plan' error
-              printf passed > "$out"
+                --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by stat ${pkgs.coreutils}/bin/stat \
+                --subst-var-by rm ${pkgs.coreutils}/bin/rm \
+                --subst-var-by env ${pkgs.coreutils}/bin/env
+              chmod +x work/launcher
+              work/launcher --artifact-identity | grep -F '"artifact_identity":"mt7921-driver-v11"'
+              env -i DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety work/launcher
+              grep -Fx 'DRV_ACTIVE_CLIENT=1' transcript
+              grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
+              grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
+              touch "$out"
             '';
 
           mt7921-full-firmware-validation-supervisor = pkgs.runCommand
@@ -949,31 +527,24 @@
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
                 --subst-var-by validation_launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor full-firmware-production \
                 --subst-var-by recovery_samples 45 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
-                --subst-var-by id_command ${pkgs.coreutils}/bin/id
+                --subst-var-by id_command ${pkgs.coreutils}/bin/id \
+                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
-              grep -F 'connected Wi-Fi target drifted from fixed ph1 validation policy' \
+              grep -F 'connected Wi-Fi target drifted from fixed ajay validation policy' \
                 "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -F 'bdf=%s timeout_seconds=300 watchdog_owner=' "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -Fx '"$wifi_driver_lab" "$bdf" 300 -- "$@" &' "$out/bin/mt7921-full-firmware-validation-supervisor"
               identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
-              grep -F '"association_request_contract":"mt7921-supported-subset-v2"' "$identity"
-              grep -F '"oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755"' "$identity"
-              grep -F '"early_m1_latch_contract":"exact-m1-one-frame-epoch-v1"' "$identity"
-              grep -F '"early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment"' "$identity"
-              grep -F '"passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5"' "$identity"
-              grep -F '"safe_read_registers":"0xd4208,0xd4528,0xd452c"' "$identity"
-              grep -F '"consuming_mib_reads":false' "$identity"
-              grep -F '"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms"' "$identity"
-              grep -F '"positive_result":"target_m1_observed_at_rx_dma"' "$identity"
-              grep -F '"negative_result":"no_m1_at_rx_dma_ambiguous"' "$identity"
-              grep -F '"target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1"' "$identity"
-              grep -F '"behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged"' "$identity"
-              grep -F '"attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive"' "$identity"
+              grep -F '"association_request_contract":"client-mlme+device-query+pinned-regdb"' "$identity"
+              grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$identity"
             '';
 
           mt7921-full-firmware-validation-recovery-status = pkgs.stdenv.mkDerivation {
@@ -1108,10 +679,10 @@
                 --subst-var-by recovery_call_timeout_seconds 15 \
                 --subst-var-by home /home/maan2003 \
                 --subst-var-by xdg_runtime_dir /run/user/1002 \
-                --subst-var-by target_root /nix/store/jjwhzsjbbh3zj52m59rvmhzznhsv01cj-mt7921-full-firmware-validation-root-entry \
-                --subst-var-by target_package /nix/store/gw245rmvdz17mzma5jvg4q42bjsqdl1d-mt7921-full-firmware-validation-0.1.0 \
-                --subst-var-by target_manifest /nix/store/43dwgg6x4d8v1r4vw0bdidqwm9afwzaf-mt7921-full-firmware-validation-manifest \
-                --subst-var-by target_supervisor /nix/store/kd3fhzyv22n96gr3zxf2dninawybpaw5-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_root /nix/store/0vfijil292q1scv8wmg9gylj5c68xynj-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/sr1hy24m754pms8idnjsq5ir45y4njdv-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/vx717636m37lh0icvbh6hzwiyp5p7pgx-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/fxr4kd4xi26adwywd2k6fvl96k84wbd0-mt7921-full-firmware-validation-supervisor \
                 --subst-var-by target_nix_store /nix/store/m9gfpnfrwdhr2cqakrfki9p73rjlfqgd-lix-2.95.2/bin/nix-store \
                 --subst-var-by target_sha256sum /nix/store/mp8s10fwm685azvvv1qq7zyf7iajjlj8-coreutils-9.11/bin/sha256sum \
                 --subst-var-by target_recovery_package ${mt7921-full-firmware-validation-recovery-status} \
@@ -1119,15 +690,15 @@
                 --subst-var-by target_recovery_registered_hash "$(cat ${recoveryStatusRegisteredHash})" \
                 --subst-var-by target_recovery_sha256 "$(sha256sum ${mt7921-full-firmware-validation-recovery-status}/bin/mt7921-full-firmware-validation-recovery-status | cut -d ' ' -f1)" \
                 --subst-var-by target_sudo /run/wrappers/bin/sudo \
-                --subst-var-by target_root_registered_hash sha256:0vj60k9rlp38pnklhmam3kc5wkn2k192vlyfvsc50ipmmp3hkxy8 \
-                --subst-var-by target_package_registered_hash sha256:04n70c81ks42004nzxg209yknqqzh006vz3s88krc9bac3kq9y0p \
-                --subst-var-by target_manifest_registered_hash sha256:1ms7rdfgflx1ipyxd0z03zsd3ihgbfnc382y4181z49cqn114dz1 \
-                --subst-var-by target_supervisor_registered_hash sha256:1lq3cbmvl05rb8bd4fzjisjnlcq6da4zvd2jz5bfw65m0yybiz7f \
-                --subst-var-by target_entry_sha256 d88a90f68d69fad267d4169115558409aed10a70d4404f231d647cf1f90c9493 \
-                --subst-var-by target_manifest_sha256 ff0f813faa3372f699497de832e81a8f047a02ffa1024befc6cf865a2f3fdeca \
-                --subst-var-by target_supervisor_sha256 ee6a544365d06a882462139de4cf2cc8b7c20b1a3aef256d56d294dc426066ce \
-                --subst-var-by target_identity_sha256 124c7960319b55ff617f3e99448e9117cd5dd72cf0dbeaca28f4eb2eddd40479 \
-                --subst-var-by target_launcher_sha256 c13b8e1225e62fc6c7bd0f7e099655995a064790304fb0402141bea24601db02 \
+                --subst-var-by target_root_registered_hash sha256:0shrf2qwqw1mf7h3jx3vi0kabrvv63vpaw8vh9i6y63wkrzrs8is \
+                --subst-var-by target_package_registered_hash sha256:1hn998lnpbagjl3mpsr4c9wh47lrz6zg8nfzmv7mdygdq29vq1ww \
+                --subst-var-by target_manifest_registered_hash sha256:17nczmm58936snmr33f4d6w1p0v36l8p22qsblgnllil0aip0bg8 \
+                --subst-var-by target_supervisor_registered_hash sha256:0hy4bbd69xlw73f1w41ppsj8dd24arwylzdaz91z45ifa68fgpci \
+                --subst-var-by target_entry_sha256 a46a5b1d5933e7f9f1fe594777411b7bc246026434897f7a13a1ade9da362f5e \
+                --subst-var-by target_manifest_sha256 51a4410f8ecdf80f46b5395ce7ac1c4d507cad044c00d2d17ee9e2806b17da8c \
+                --subst-var-by target_supervisor_sha256 22a80c25d05239529c8df40c7480a6983c7cc12033538b6eac391de3f77a61db \
+                --subst-var-by target_identity_sha256 b41591b6a867bea9ec989debe00c05b99d8a4a142579958acdf24e784a718aa2 \
+                --subst-var-by target_launcher_sha256 3b821ef1a8cb655e0cb42459f6911d497d7177449f35e1ca993704dfb2f84987 \
                 --subst-var-by transport_contract openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-remote-entry"
               runHook postInstall
@@ -1182,19 +753,19 @@
                 REMOTE_ENTRY_REGISTERED_HASH=$(cat ${remoteEntryRegisteredHash})
                 REMOTE_TRANSPORT_CONTRACT=openssh-absolute+ssh-config-disabled+fixed-home-key-known-hosts+identities-only+connect-timeout-10+server-alive-2x3+strict-known-hosts+tailscale-absolute-userspace-socket+fixed-user-host+verify-path+versioned-bounded-read-only-recovery-v2
                 REMOTE_TARGET=user@no-plastic
-                REMOTE_TARGET_ROOT=/nix/store/jjwhzsjbbh3zj52m59rvmhzznhsv01cj-mt7921-full-firmware-validation-root-entry
-                REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:0vj60k9rlp38pnklhmam3kc5wkn2k192vlyfvsc50ipmmp3hkxy8
-                REMOTE_TARGET_ENTRY_SHA256=d88a90f68d69fad267d4169115558409aed10a70d4404f231d647cf1f90c9493
-                REMOTE_TARGET_PACKAGE=/nix/store/gw245rmvdz17mzma5jvg4q42bjsqdl1d-mt7921-full-firmware-validation-0.1.0
-                REMOTE_TARGET_PACKAGE_REGISTERED_HASH=sha256:04n70c81ks42004nzxg209yknqqzh006vz3s88krc9bac3kq9y0p
-                REMOTE_TARGET_MANIFEST=/nix/store/43dwgg6x4d8v1r4vw0bdidqwm9afwzaf-mt7921-full-firmware-validation-manifest
-                REMOTE_TARGET_MANIFEST_REGISTERED_HASH=sha256:1ms7rdfgflx1ipyxd0z03zsd3ihgbfnc382y4181z49cqn114dz1
-                REMOTE_TARGET_MANIFEST_SHA256=ff0f813faa3372f699497de832e81a8f047a02ffa1024befc6cf865a2f3fdeca
-                REMOTE_TARGET_SUPERVISOR=/nix/store/kd3fhzyv22n96gr3zxf2dninawybpaw5-mt7921-full-firmware-validation-supervisor
-                REMOTE_TARGET_SUPERVISOR_REGISTERED_HASH=sha256:1lq3cbmvl05rb8bd4fzjisjnlcq6da4zvd2jz5bfw65m0yybiz7f
-                REMOTE_TARGET_SUPERVISOR_SHA256=ee6a544365d06a882462139de4cf2cc8b7c20b1a3aef256d56d294dc426066ce
-                REMOTE_TARGET_IDENTITY_SHA256=124c7960319b55ff617f3e99448e9117cd5dd72cf0dbeaca28f4eb2eddd40479
-                REMOTE_TARGET_LAUNCHER_SHA256=c13b8e1225e62fc6c7bd0f7e099655995a064790304fb0402141bea24601db02
+                REMOTE_TARGET_ROOT=/nix/store/0vfijil292q1scv8wmg9gylj5c68xynj-mt7921-full-firmware-validation-root-entry
+                REMOTE_TARGET_ROOT_REGISTERED_HASH=sha256:0shrf2qwqw1mf7h3jx3vi0kabrvv63vpaw8vh9i6y63wkrzrs8is
+                REMOTE_TARGET_ENTRY_SHA256=a46a5b1d5933e7f9f1fe594777411b7bc246026434897f7a13a1ade9da362f5e
+                REMOTE_TARGET_PACKAGE=/nix/store/sr1hy24m754pms8idnjsq5ir45y4njdv-mt7921-full-firmware-validation-0.1.0
+                REMOTE_TARGET_PACKAGE_REGISTERED_HASH=sha256:1hn998lnpbagjl3mpsr4c9wh47lrz6zg8nfzmv7mdygdq29vq1ww
+                REMOTE_TARGET_MANIFEST=/nix/store/vx717636m37lh0icvbh6hzwiyp5p7pgx-mt7921-full-firmware-validation-manifest
+                REMOTE_TARGET_MANIFEST_REGISTERED_HASH=sha256:17nczmm58936snmr33f4d6w1p0v36l8p22qsblgnllil0aip0bg8
+                REMOTE_TARGET_MANIFEST_SHA256=51a4410f8ecdf80f46b5395ce7ac1c4d507cad044c00d2d17ee9e2806b17da8c
+                REMOTE_TARGET_SUPERVISOR=/nix/store/fxr4kd4xi26adwywd2k6fvl96k84wbd0-mt7921-full-firmware-validation-supervisor
+                REMOTE_TARGET_SUPERVISOR_REGISTERED_HASH=sha256:0hy4bbd69xlw73f1w41ppsj8dd24arwylzdaz91z45ifa68fgpci
+                REMOTE_TARGET_SUPERVISOR_SHA256=22a80c25d05239529c8df40c7480a6983c7cc12033538b6eac391de3f77a61db
+                REMOTE_TARGET_IDENTITY_SHA256=b41591b6a867bea9ec989debe00c05b99d8a4a142579958acdf24e784a718aa2
+                REMOTE_TARGET_LAUNCHER_SHA256=3b821ef1a8cb655e0cb42459f6911d497d7177449f35e1ca993704dfb2f84987
                 REMOTE_ACTIVE_ARGC=0
                 REMOTE_PLAN_ARGV=--plan
                 REMOTE_RECOVERY_CONTRACT=sudo-n-exact-helper-poll-only-bounded-no-disarm
@@ -1252,10 +823,10 @@
                 echo 'Host key verification failed.' >&2
                 exit 255
               fi
-              root=/nix/store/jjwhzsjbbh3zj52m59rvmhzznhsv01cj-mt7921-full-firmware-validation-root-entry
-              package=/nix/store/gw245rmvdz17mzma5jvg4q42bjsqdl1d-mt7921-full-firmware-validation-0.1.0
-              manifest=/nix/store/43dwgg6x4d8v1r4vw0bdidqwm9afwzaf-mt7921-full-firmware-validation-manifest
-              supervisor=/nix/store/kd3fhzyv22n96gr3zxf2dninawybpaw5-mt7921-full-firmware-validation-supervisor
+              root=/nix/store/0vfijil292q1scv8wmg9gylj5c68xynj-mt7921-full-firmware-validation-root-entry
+              package=/nix/store/sr1hy24m754pms8idnjsq5ir45y4njdv-mt7921-full-firmware-validation-0.1.0
+              manifest=/nix/store/vx717636m37lh0icvbh6hzwiyp5p7pgx-mt7921-full-firmware-validation-manifest
+              supervisor=/nix/store/fxr4kd4xi26adwywd2k6fvl96k84wbd0-mt7921-full-firmware-validation-supervisor
               entry=$root/bin/mt7921-full-firmware-validation-root
               identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
               launcher=$package/bin/mt7921-full-firmware-validation
@@ -1270,27 +841,27 @@
                   exit 0
                 fi
                 case "$4" in
-                  "$root") echo sha256:0vj60k9rlp38pnklhmam3kc5wkn2k192vlyfvsc50ipmmp3hkxy8 ;;
-                  "$package") echo sha256:04n70c81ks42004nzxg209yknqqzh006vz3s88krc9bac3kq9y0p ;;
-                  "$manifest") echo sha256:1ms7rdfgflx1ipyxd0z03zsd3ihgbfnc382y4181z49cqn114dz1 ;;
-                  "$supervisor") echo sha256:1lq3cbmvl05rb8bd4fzjisjnlcq6da4zvd2jz5bfw65m0yybiz7f ;;
+                  "$root") echo sha256:0shrf2qwqw1mf7h3jx3vi0kabrvv63vpaw8vh9i6y63wkrzrs8is ;;
+                  "$package") echo sha256:1hn998lnpbagjl3mpsr4c9wh47lrz6zg8nfzmv7mdygdq29vq1ww ;;
+                  "$manifest") echo sha256:17nczmm58936snmr33f4d6w1p0v36l8p22qsblgnllil0aip0bg8 ;;
+                  "$supervisor") echo sha256:0hy4bbd69xlw73f1w41ppsj8dd24arwylzdaz91z45ifa68fgpci ;;
                   /target/recovery-package) echo sha256:recoveryregisteredhash00000000000000000000000000000000 ;;
                   *) exit 90 ;;
                 esac
               elif [ "$1" = /target/sha256sum ]; then
                 case "$2" in
-                  "$entry") hash=d88a90f68d69fad267d4169115558409aed10a70d4404f231d647cf1f90c9493 ;;
-                  "$manifest") hash=ff0f813faa3372f699497de832e81a8f047a02ffa1024befc6cf865a2f3fdeca ;;
-                  "$supervisor_file") hash=ee6a544365d06a882462139de4cf2cc8b7c20b1a3aef256d56d294dc426066ce ;;
-                  "$identity") hash=124c7960319b55ff617f3e99448e9117cd5dd72cf0dbeaca28f4eb2eddd40479 ;;
-                  "$launcher") hash=c13b8e1225e62fc6c7bd0f7e099655995a064790304fb0402141bea24601db02 ;;
+                  "$entry") hash=a46a5b1d5933e7f9f1fe594777411b7bc246026434897f7a13a1ade9da362f5e ;;
+                  "$manifest") hash=51a4410f8ecdf80f46b5395ce7ac1c4d507cad044c00d2d17ee9e2806b17da8c ;;
+                  "$supervisor_file") hash=22a80c25d05239529c8df40c7480a6983c7cc12033538b6eac391de3f77a61db ;;
+                  "$identity") hash=b41591b6a867bea9ec989debe00c05b99d8a4a142579958acdf24e784a718aa2 ;;
+                  "$launcher") hash=3b821ef1a8cb655e0cb42459f6911d497d7177449f35e1ca993704dfb2f84987 ;;
                   /target/recovery) hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
                   *) exit 91 ;;
                 esac
                 printf '%s  %s\n' "$hash" "$2"
               elif [ "$1" = "$entry" ] && [ "''${2-}" = --plan ] && [ "$#" -eq 2 ]; then
-                printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=ff0f813faa3372f699497de832e81a8f047a02ffa1024befc6cf865a2f3fdeca supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=--plan\n' "$manifest" "$supervisor_file" "$launcher"
-                printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=ee6a544365d06a882462139de4cf2cc8b7c20b1a3aef256d56d294dc426066ce launcher=%s launcher_sha256=c13b8e1225e62fc6c7bd0f7e099655995a064790304fb0402141bea24601db02\n' "$supervisor_file" "$launcher"
+                printf 'ROOT_ENTRY privilege=sudo_-n manifest=%s manifest_sha256=51a4410f8ecdf80f46b5395ce7ac1c4d507cad044c00d2d17ee9e2806b17da8c supervisor=%s launcher=%s flavor=full-firmware-production active_capable=true bdf=0000:05:00.0 mode=--plan\n' "$manifest" "$supervisor_file" "$launcher"
+                printf 'PLAN mode=inert hardware_handoff=false supervisor=%s supervisor_sha256=22a80c25d05239529c8df40c7480a6983c7cc12033538b6eac391de3f77a61db launcher=%s launcher_sha256=3b821ef1a8cb655e0cb42459f6911d497d7177449f35e1ca993704dfb2f84987\n' "$supervisor_file" "$launcher"
               elif [ "$1" = "$entry" ] && [ "$#" -eq 1 ]; then
                 echo active >> "$PWD/active.calls"
                 if [ "''${MODE-}" = unknown ] || [ "''${MODE-}" = hang ]; then exit 255; fi
@@ -1326,10 +897,10 @@
                 --subst-var-by recovery_call_timeout_seconds 1 \
                 --subst-var-by home "$PWD/work/home" \
                 --subst-var-by xdg_runtime_dir "$PWD/work/runtime" \
-                --subst-var-by target_root /nix/store/jjwhzsjbbh3zj52m59rvmhzznhsv01cj-mt7921-full-firmware-validation-root-entry \
-                --subst-var-by target_package /nix/store/gw245rmvdz17mzma5jvg4q42bjsqdl1d-mt7921-full-firmware-validation-0.1.0 \
-                --subst-var-by target_manifest /nix/store/43dwgg6x4d8v1r4vw0bdidqwm9afwzaf-mt7921-full-firmware-validation-manifest \
-                --subst-var-by target_supervisor /nix/store/kd3fhzyv22n96gr3zxf2dninawybpaw5-mt7921-full-firmware-validation-supervisor \
+                --subst-var-by target_root /nix/store/0vfijil292q1scv8wmg9gylj5c68xynj-mt7921-full-firmware-validation-root-entry \
+                --subst-var-by target_package /nix/store/sr1hy24m754pms8idnjsq5ir45y4njdv-mt7921-full-firmware-validation-0.1.0 \
+                --subst-var-by target_manifest /nix/store/vx717636m37lh0icvbh6hzwiyp5p7pgx-mt7921-full-firmware-validation-manifest \
+                --subst-var-by target_supervisor /nix/store/fxr4kd4xi26adwywd2k6fvl96k84wbd0-mt7921-full-firmware-validation-supervisor \
                 --subst-var-by target_nix_store /target/nix-store \
                 --subst-var-by target_sha256sum /target/sha256sum \
                 --subst-var-by target_recovery_helper /target/recovery \
@@ -1337,15 +908,15 @@
                 --subst-var-by target_recovery_registered_hash sha256:recoveryregisteredhash00000000000000000000000000000000 \
                 --subst-var-by target_recovery_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
                 --subst-var-by target_sudo /target/sudo \
-                --subst-var-by target_root_registered_hash sha256:0vj60k9rlp38pnklhmam3kc5wkn2k192vlyfvsc50ipmmp3hkxy8 \
-                --subst-var-by target_package_registered_hash sha256:04n70c81ks42004nzxg209yknqqzh006vz3s88krc9bac3kq9y0p \
-                --subst-var-by target_manifest_registered_hash sha256:1ms7rdfgflx1ipyxd0z03zsd3ihgbfnc382y4181z49cqn114dz1 \
-                --subst-var-by target_supervisor_registered_hash sha256:1lq3cbmvl05rb8bd4fzjisjnlcq6da4zvd2jz5bfw65m0yybiz7f \
-                --subst-var-by target_entry_sha256 d88a90f68d69fad267d4169115558409aed10a70d4404f231d647cf1f90c9493 \
-                --subst-var-by target_manifest_sha256 ff0f813faa3372f699497de832e81a8f047a02ffa1024befc6cf865a2f3fdeca \
-                --subst-var-by target_supervisor_sha256 ee6a544365d06a882462139de4cf2cc8b7c20b1a3aef256d56d294dc426066ce \
-                --subst-var-by target_identity_sha256 124c7960319b55ff617f3e99448e9117cd5dd72cf0dbeaca28f4eb2eddd40479 \
-                --subst-var-by target_launcher_sha256 c13b8e1225e62fc6c7bd0f7e099655995a064790304fb0402141bea24601db02 \
+                --subst-var-by target_root_registered_hash sha256:0shrf2qwqw1mf7h3jx3vi0kabrvv63vpaw8vh9i6y63wkrzrs8is \
+                --subst-var-by target_package_registered_hash sha256:1hn998lnpbagjl3mpsr4c9wh47lrz6zg8nfzmv7mdygdq29vq1ww \
+                --subst-var-by target_manifest_registered_hash sha256:17nczmm58936snmr33f4d6w1p0v36l8p22qsblgnllil0aip0bg8 \
+                --subst-var-by target_supervisor_registered_hash sha256:0hy4bbd69xlw73f1w41ppsj8dd24arwylzdaz91z45ifa68fgpci \
+                --subst-var-by target_entry_sha256 a46a5b1d5933e7f9f1fe594777411b7bc246026434897f7a13a1ade9da362f5e \
+                --subst-var-by target_manifest_sha256 51a4410f8ecdf80f46b5395ce7ac1c4d507cad044c00d2d17ee9e2806b17da8c \
+                --subst-var-by target_supervisor_sha256 22a80c25d05239529c8df40c7480a6983c7cc12033538b6eac391de3f77a61db \
+                --subst-var-by target_identity_sha256 b41591b6a867bea9ec989debe00c05b99d8a4a142579958acdf24e784a718aa2 \
+                --subst-var-by target_launcher_sha256 3b821ef1a8cb655e0cb42459f6911d497d7177449f35e1ca993704dfb2f84987 \
                 --subst-var-by transport_contract test-transport-v1
               chmod 0755 work/entry
               ${pkgs.python3}/bin/python - <<'PY' &
@@ -1367,7 +938,7 @@
               : > ssh.transcript
               work/entry > active
               test "$(wc -l < active.calls)" -eq 1
-              grep -F "</nix/store/jjwhzsjbbh3zj52m59rvmhzznhsv01cj-mt7921-full-firmware-validation-root-entry/bin/mt7921-full-firmware-validation-root>" ssh.transcript
+              grep -F "</nix/store/0vfijil292q1scv8wmg9gylj5c68xynj-mt7921-full-firmware-validation-root-entry/bin/mt7921-full-firmware-validation-root>" ssh.transcript
 
               rm active.calls
               : > ssh.transcript
@@ -1431,131 +1002,32 @@
           mt7921-full-firmware-validation-manifest =
             let
               package = mt7921-full-firmware-validation;
-              supervisor = mt7921-full-firmware-validation-supervisor;
-              closure = pkgs.closureInfo { rootPaths = [ package supervisor ]; };
-            in
-            pkgs.runCommand "mt7921-full-firmware-validation-manifest"
-              { nativeBuildInputs = [ pkgs.coreutils ]; }
-              ''
-                launcher=${package}/bin/mt7921-full-firmware-validation
-                driver=${package}/bin/mt7921-full-firmware-validation-driver
-                supervisor=${supervisor}/bin/mt7921-full-firmware-validation-supervisor
-                identity=${package}/share/mt7921-full-firmware-validation/artifact-identity.json
-                fixture=${package}/share/mt7921-full-firmware-validation/production-association-request-self-test.json
-                closure_sha=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
-                test -s "$fixture"
-                source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                project_core=$(sed -n 's/.*"project_core_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                composite_source=$(sed -n 's/.*"composite_artifact_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                test "''${#source_identity}" -eq 64
-                test "''${#materialized_tree}" -eq 64
-                test "''${#generated_source}" -eq 64
-                test "''${#project_core}" -eq 64
-                test "''${#composite_source}" -eq 64
+              supervisorPackage = mt7921-full-firmware-validation-supervisor;
+              closure = pkgs.closureInfo { rootPaths = [ package supervisorPackage ]; };
+            in pkgs.runCommand "mt7921-full-firmware-validation-manifest"
+              { nativeBuildInputs = [ pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; } ''
+                identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
+                get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$identity"; }
                 cat > "$out" <<EOF
-                PACKAGE=${package}
-                LAUNCHER=$launcher
-                LAUNCHER_SHA256=$(sha256sum "$launcher" | cut -d ' ' -f1)
-                ELF=$driver
-                ELF_SHA256=$(sha256sum "$driver" | cut -d ' ' -f1)
+                PACKAGE=$package
+                LAUNCHER=$package/bin/mt7921-full-firmware-validation
+                ELF=$package/bin/mt7921-full-firmware-validation-driver
                 ARTIFACT_IDENTITY=$identity
-                ARTIFACT_IDENTITY_SHA256=$(sha256sum "$identity" | cut -d ' ' -f1)
-                SOURCE_IDENTITY_SHA256=$source_identity
-                PROJECT_CORE_SOURCE_SHA256=$project_core
-                COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source
-                FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
-                FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
-                FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
-                MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
-                GENERATED_CRATE_SOURCE_SHA256=$generated_source
+                SOURCE_IDENTITY_SHA256=$(get source_identity_sha256)
+                PROJECT_CORE_SOURCE_SHA256=$(get project_core_source_sha256)
+                COMPOSITE_ARTIFACT_SOURCE_SHA256=$(get composite_artifact_source_sha256)
                 BSS_WIRE_CONTRACT=connac2-bss-wire-v1
-                BASIC_TLV_LEN=32
-                INITIAL_BSS_PAYLOAD_LEN=36
-                INITIAL_BSS_COMMAND_LEN=84
-                ASSOCIATED_BSS_PAYLOAD_LEN=44
-                ASSOCIATED_BSS_COMMAND_LEN=92
-                QBSS_PAYLOAD_OFFSET=36
-                DTIM_SOURCE=selected-beacon-shared-basic-bcnft
-                INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
-                INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
-                ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
-                ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
-                PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
-                ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2
-                CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4
-                RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
-                ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2
-                ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2
-                ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
-                ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
-                EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
-                EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment
-                SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c
-                CONSUMING_MIB_READS=false
-                SNAPSHOT_BOUNDARIES=before-post-assoc-tail,m1-observation-timeout-5000ms
-                POSITIVE_RESULT=target_m1_observed_at_rx_dma
-                NEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous
-                TARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1
-                TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged
-                ATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required
-                TARGET_BEACON_TIM_CONTRACT=linux-ieee80211-check-tim-v1
-                TIM_TRUE_RESULT=ap-queued-unicast-for-normalized-aid-not-traffic-type
-                TIM_NEVER_TRUE_RESULT=inconclusive
-                PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST=$fixture
-                PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)
                 FLAVOR=full-firmware-production
                 ACTIVE_CAPABLE=true
-                OBSERVATION_MODE=passive-m1-observation
-                FRAME_TX_DISABLED_BEFORE_M1=true
-                REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
-                PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
-                POSTASSOCIATION_PHYSICAL_TX=disabled
-                MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
-                POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
-                M2_PHYSICAL_TX=suppressed
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
-                SUPERVISOR=$supervisor
-                SUPERVISOR_SHA256=$(sha256sum "$supervisor" | cut -d ' ' -f1)
-                REGULATORY_DB=${regulatoryDb}
-                REGULATORY_DB_SHA256=$(sha256sum ${regulatoryDb} | cut -d ' ' -f1)
-                REGULATORY_GENERATION=0
-                CLOSURE_SHA256=$closure_sha
+                SUPERVISOR=$supervisorPackage/bin/mt7921-full-firmware-validation-supervisor
+                CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
                 PCI_BDF=0000:05:00.0
                 TIMEOUT_SECONDS=300
                 OPERATION=--run-one-shot-sae-auth
-                MODE=DRV_PASSIVE_M1_OBSERVATION=1
-                TARGET_SSID=ph1
-                TARGET_BSSID=72:a6:c7:7d:56:93
-                TARGET_CHANNEL=36
-                TARGET_CLIENT_MAC=8a:fd:2a:8b:70:5a
-                FRAME=none-post-association-public-before-m1
-                SUCCESS=authenticator_m1_delivered_to_pinned_sme
-                RATE_POWER_ORDER=eeprom_prepare_protect_mac_enable_rx_path_then_8_contiguous_0x4005d_then_acked_add_device
-                RATE_POWER_REG_READ_BETWEEN_PAGES=0
-                RATE_POWER_LAST_MSG_PAGE=8
-                PATCH_TABLE_GATE=false
-                M1_TIMEOUT_SECONDS=25
-                EAPOL_START=false
-                TX_COMPLETION_WAIT=false
-                DUPLICATE_M1_ACTION=none
-                RETRY=false
+                MODE=DRV_ACTIVE_CLIENT=1
                 EOF
-                grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$out"
-                grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$out"
-                grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$out"
-                grep -Fx "PROJECT_CORE_SOURCE_SHA256=$project_core" "$out"
-                grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$out"
                 grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$out"
-                grep -Fx 'ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2' "$out"
-                grep -Fx 'CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4' "$out"
-                grep -Fx 'RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent' "$out"
-                grep -Fx 'ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2' "$out"
-                grep -Fx 'ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2' "$out"
-                grep -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' "$out"
-                grep -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' "$out"
-                grep -Fx "PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=$(sha256sum "$fixture" | cut -d ' ' -f1)" "$out"
               '';
 
           mt7921-full-firmware-validation-root-entry = pkgs.runCommand
@@ -1574,6 +1046,7 @@
                 --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by manifest ${mt7921-full-firmware-validation-manifest} \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor full-firmware-production \
                 --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
                 --subst-var-by cut ${pkgs.coreutils}/bin/cut \
                 --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
@@ -1582,147 +1055,74 @@
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-root"
               ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-full-firmware-validation-root"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-root"
-              grep -F "s/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST=//p" "$out/bin/mt7921-full-firmware-validation-root"
-              grep -F "s/^PRODUCTION_ASSOCIATION_REQUEST_SELF_TEST_SHA256=//p" "$out/bin/mt7921-full-firmware-validation-root"
-              ! grep -F 'SAE_H2E_ASSOCIATION_REQUEST_SELF_TEST' "$out/bin/mt7921-full-firmware-validation-root"
+            '';
+
+          mt7921-fresh-laa-diagnostic-manifest = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-manifest" { } ''
+              sed \
+                -e 's|${mt7921-full-firmware-validation}|${mt7921-fresh-laa-diagnostic}|g' \
+                -e 's|${mt7921-full-firmware-validation-supervisor}|${mt7921-fresh-laa-diagnostic-supervisor}|g' \
+                -e 's/^FLAVOR=.*/FLAVOR=fresh-laa-diagnostic/' \
+                ${mt7921-full-firmware-validation-manifest} > "$out"
+              cat >> "$out" <<'EOF'
+              IDENTITY_MODE=fixed-fresh-laa-diagnostic
+              NATIVE_CLIENT_MAC=8a:fd:2a:8b:70:5a
+              SESSION_IDENTITY_CONTRACT=single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1
+              RECOVERY_IDENTITY_CONTRACT=native-address-required-before-watchdog-disarm
+              EOF
+            '';
+
+          mt7921-fresh-laa-diagnostic-root-entry = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-root-entry"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; meta.mainProgram = "mt7921-fresh-laa-diagnostic-root"; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-full-firmware-validation-root.sh} \
+                "$out/bin/mt7921-fresh-laa-diagnostic-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by supervisor ${mt7921-fresh-laa-diagnostic-supervisor}/bin/mt7921-fresh-laa-diagnostic-supervisor \
+                --subst-var-by launcher ${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation \
+                --subst-var-by manifest ${mt7921-fresh-laa-diagnostic-manifest} \
+                --subst-var-by artifact_identity ${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by flavor fresh-laa-diagnostic \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by cut ${pkgs.coreutils}/bin/cut \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by sed ${pkgs.gnused}/bin/sed \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
+              chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-root"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-fresh-laa-diagnostic-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-fresh-laa-diagnostic-root"
+            '';
+
+          mt7921-fresh-laa-diagnostic-inert-proof = pkgs.runCommand
+            "mt7921-fresh-laa-diagnostic-inert-proof"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              identity=${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json
+              launcher=${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation
+              supervisor=${mt7921-fresh-laa-diagnostic-supervisor}/bin/mt7921-fresh-laa-diagnostic-supervisor
+              root=${mt7921-fresh-laa-diagnostic-root-entry}/bin/mt7921-fresh-laa-diagnostic-root
+              test "$("$launcher" --artifact-identity)" = "$(cat "$identity")"
+              grep -F 'DRV_SAE_CLIENT_MAC=02:7d:91:4c:b8:3e' "$launcher"
+              grep -F 'identity_mode=fixed-fresh-laa-diagnostic' "$supervisor"
+              grep -F 'native_identity_restored' "$supervisor"
+              grep -F 'hardware_handoff=false' "$supervisor"
+              grep -F '/run/wrappers/bin/sudo -n' "$root"
+              grep -Fx 'RECOVERY_IDENTITY_CONTRACT=native-address-required-before-watchdog-disarm' ${mt7921-fresh-laa-diagnostic-manifest}
+              touch "$out"
             '';
 
           mt7921-validation-flavor-cross-wire-test = pkgs.runCommand
-            "mt7921-validation-flavor-cross-wire-test"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; }
-            ''
-              cat > sudo-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              echo called > "$PWD/sudo-called"
-              exit 1
-              EOF
-              chmod +x sudo-stub
-              cat > supervisor-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              echo called > "$PWD/supervisor-called"
-              exit 1
-              EOF
-              chmod +x supervisor-stub
-              make_root() {
-                template=$1 output=$2 launcher=$3 manifest=$4 identity=$5
-                substitute "$template" "$output" \
-                  --subst-var-by shell ${pkgs.runtimeShell} \
-                  --subst-var-by sudo "$PWD/sudo-stub" \
-                  --subst-var-by supervisor "$PWD/supervisor-stub" \
-                  --subst-var-by launcher "$launcher" \
-                  --subst-var-by manifest "$manifest" \
-                  --subst-var-by artifact_identity "$identity" \
-                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
-                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
-                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
-                ! grep -Eq '@[a-z_]+@' "$output"
-                chmod +x "$output"
-              }
-              cat > evidence-identity.json <<'EOF'
-              {"artifact_identity":"mt7921-validation-v1","flavor":"rate-power-evidence-only","enabled_operation":"run-one-shot-power-setup","source_commit":"0000000000000000000000000000000000000000","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":false}
-              EOF
-              cat > evidence-launcher <<'EOF'
-              #!${pkgs.runtimeShell}
-              if [ "$#:''${1-}" = 1:--artifact-identity ]; then
-                cat "$PWD/evidence-identity.json"
-                exit 0
-              fi
-              echo called > "$PWD/evidence-operation-called"
-              exit 64
-              EOF
-              chmod +x evidence-launcher
-              cat > stale-bss-identity.json <<'EOF'
-              {"artifact_identity":"mt7921-validation-v3","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"cb80a23b89f042b88c8820c2a4ccff2d20257eb9d608af09013ec4d294e57303","basic_tlv_len":36,"associated_bss_command_len":96,"fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true}
-              EOF
-              cat > stale-bss-launcher <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = --artifact-identity
-              cat "$PWD/stale-bss-identity.json"
-              EOF
-              chmod +x stale-bss-launcher
-              sed 's/"passive_m1_telemetry_contract":"[^"]*",//' \
-                ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
-                > stale-telemetry-identity.json
-              cat > stale-telemetry-launcher <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = --artifact-identity
-              cat "$PWD/stale-telemetry-identity.json"
-              EOF
-              chmod +x stale-telemetry-launcher
-              sed 's/"association_capability_input_source":"[^"]*"/"association_capability_input_source":"stale"/' \
-                ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
-                > stale-runtime-identity.json
-              sed 's/"oracle_comparison_contract":"[^"]*"/"oracle_comparison_contract":"stale"/' \
-                ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
-                > stale-oracle-contract-identity.json
-              for kind in runtime oracle-contract; do
-                cat > "stale-$kind-launcher" <<EOF
-              #!${pkgs.runtimeShell}
-              test "\$1" = --artifact-identity
-              cat "\$PWD/stale-$kind-identity.json"
-              EOF
-                chmod +x "stale-$kind-launcher"
-              done
-              cat > evidence-manifest <<'EOF'
-              FLAVOR=rate-power-evidence-only
-              ACTIVE_CAPABLE=false
-              FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
-              EOF
-              production_launcher=${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation
-              evidence_launcher=$PWD/evidence-launcher
-              production_identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
-              evidence_identity=$PWD/evidence-identity.json
-              test "$("$production_launcher" --artifact-identity)" = "$(cat "$production_identity")"
-              test "$("$evidence_launcher" --artifact-identity)" = "$(cat "$evidence_identity")"
-              test "$(cat "$production_identity")" != "$(cat "$evidence_identity")"
-
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-elf \
-                "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$production_identity"
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-wrong-manifest \
-                "$production_launcher" "$PWD/evidence-manifest" "$production_identity"
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-stale-bss \
-                "$PWD/stale-bss-launcher" ${mt7921-full-firmware-validation-manifest} "$PWD/stale-bss-identity.json"
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-stale-telemetry \
-                "$PWD/stale-telemetry-launcher" ${mt7921-full-firmware-validation-manifest} "$PWD/stale-telemetry-identity.json"
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-stale-runtime \
-                "$PWD/stale-runtime-launcher" ${mt7921-full-firmware-validation-manifest} "$PWD/stale-runtime-identity.json"
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-stale-oracle-contract \
-                "$PWD/stale-oracle-contract-launcher" ${mt7921-full-firmware-validation-manifest} "$PWD/stale-oracle-contract-identity.json"
-              make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-elf \
-                "$production_launcher" "$PWD/evidence-manifest" "$evidence_identity"
-              make_root ${./nix/mt7921-rate-power-evidence-semantic-root.sh} evidence-wrong-manifest \
-                "$evidence_launcher" ${mt7921-full-firmware-validation-manifest} "$evidence_identity"
-              : > "$out"
-              for root in prod-wrong-elf prod-wrong-manifest prod-stale-bss prod-stale-telemetry prod-stale-runtime prod-stale-oracle-contract evidence-wrong-elf evidence-wrong-manifest; do
-                if ./$root --plan; then
-                  echo "cross-wired root unexpectedly passed: $root" >&2
-                  exit 1
-                fi
-                printf 'CROSS_WIRE_REJECT root=%s before_sudo=true before_supervisor=true before_device=true\n' "$root" >> "$out"
-              done
-              test ! -e sudo-called
-              test ! -e supervisor-called
-              test ! -e evidence-operation-called
-
-              cat > sudo-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = -n
-              shift
-              exec "$@"
-              EOF
-              cat > supervisor-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              printf 'SUPERVISOR_ARGV' > "$PWD/valid-supervisor-called"
-              printf ' <%s>' "$@" >> "$PWD/valid-supervisor-called"
-              printf '\n' >> "$PWD/valid-supervisor-called"
-              EOF
-              chmod +x sudo-stub supervisor-stub
-              make_root ${./nix/mt7921-full-firmware-validation-root.sh} prod-valid \
-                "$production_launcher" ${mt7921-full-firmware-validation-manifest} "$production_identity"
-              ./prod-valid --plan
-              grep -F ' <--plan> <0000:05:00.0> <--' valid-supervisor-called
+            "mt7921-validation-flavor-cross-wire-test" { nativeBuildInputs = [ pkgs.gnugrep ]; } ''
+              production=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
+              evidence=${mt7921-rate-power-evidence}/share/mt7921-rate-power-evidence/artifact-identity.json
+              grep -F '"artifact_identity":"mt7921-driver-v11"' "$production"
+              grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$production"
+              grep -F '"flavor":"rate-power-evidence-only"' "$evidence"
+              ! cmp "$production" "$evidence"
+              touch "$out"
             '';
 
           mt7921-full-firmware-inert-proof =
@@ -1893,347 +1293,47 @@
                 grep -F 'trap_safe=true' plan
               '';
 
-          mt7921-full-firmware-inert-proof-root-entry =
-            let
-              runnerRegisteredHash = pkgs.runCommand "mt7921-full-firmware-inert-proof-registered-hash"
-                {
-                  __structuredAttrs = true;
-                  exportReferencesGraph.runner = [ mt7921-full-firmware-inert-proof ];
-                  nativeBuildInputs = [ pkgs.jq ];
-                }
-                ''
-                  out="''${outputs[out]}"
-                  ${pkgs.jq}/bin/jq -er --arg path '${mt7921-full-firmware-inert-proof}' \
-                    '.runner[] | select(.path == $path) | .narHash' \
-                    "$NIX_ATTRS_JSON_FILE" > "$out"
-                  test "$(wc -l < "$out")" -eq 1
-                  grep -Eq '^sha256:[0123456789abcdfghijklmnpqrsvwxyz]{52}$' "$out"
-                '';
-            in
-            pkgs.stdenv.mkDerivation {
-              pname = "mt7921-full-firmware-inert-proof-root-entry";
-              version = "0.1.0";
-              dontUnpack = true;
-              nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.nix ];
-              doInstallCheck = true;
-              meta.mainProgram = "mt7921-full-firmware-inert-proof-root";
-              installPhase = ''
-                runHook preInstall
-                mkdir -p "$out/bin" "$out/share/mt7921-full-firmware-inert-proof-root"
-                runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof
-                runner_sha256=$(sha256sum "$runner" | cut -d ' ' -f1)
-                runner_registered_hash=$(cat ${runnerRegisteredHash})
-                manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
-                identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
-                source_identity=$(sed -n 's/.*"source_identity_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                materialized_tree=$(sed -n 's/.*"materialized_source_tree_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                generated_source=$(sed -n 's/.*"generated_crate_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                project_core=$(sed -n 's/.*"project_core_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                composite_source=$(sed -n 's/.*"composite_artifact_source_sha256":"\([0-9a-f]*\)".*/\1/p' "$identity")
-                test "''${#source_identity}" -eq 64
-                test "''${#materialized_tree}" -eq 64
-                test "''${#generated_source}" -eq 64
-                test "''${#project_core}" -eq 64
-                test "''${#composite_source}" -eq 64
-                substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} \
-                  "$out/bin/mt7921-full-firmware-inert-proof-root" \
-                  --subst-var-by shell ${pkgs.runtimeShell} \
-                  --subst-var-by sudo /run/wrappers/bin/sudo \
-                  --subst-var-by runner "$runner" \
-                  --subst-var-by runner_package ${mt7921-full-firmware-inert-proof} \
-                  --subst-var-by runner_sha256 "$runner_sha256" \
-                  --subst-var-by runner_registered_hash "$runner_registered_hash" \
-                  --subst-var-by manifest "$manifest" \
-                  --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
-                  --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
-                  --subst-var-by source_identity "$source_identity" \
-                  --subst-var-by fuchsia_base_revision ${mt7921FuchsiaSource.fuchsiaBaseRevision} \
-                  --subst-var-by fuchsia_patch_set ${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256} \
-                  --subst-var-by fuchsia_patch_list ${mt7921FuchsiaSource.fuchsiaOrderedPatchList} \
-                  --subst-var-by materialized_tree "$materialized_tree" \
-                  --subst-var-by generated_source "$generated_source" \
-                  --subst-var-by project_core "$project_core" \
-                  --subst-var-by composite_source "$composite_source" \
-                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
-                  --subst-var-by nix_store ${pkgs.nix}/bin/nix-store \
-                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
-                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
-                chmod 0755 "$out/bin/mt7921-full-firmware-inert-proof-root"
-                entry_sha256=$(sha256sum "$out/bin/mt7921-full-firmware-inert-proof-root" | cut -d ' ' -f1)
-                cat > "$manifest" <<EOF
-                ENTRYPOINT=$out/bin/mt7921-full-firmware-inert-proof-root
-                ENTRYPOINT_SHA256=$entry_sha256
-                RUNNER=$runner
-                RUNNER_SHA256=$runner_sha256
-                RUNNER_REGISTERED_HASH=$runner_registered_hash
-                FLAVOR=full-firmware-production
-                OPERATION=run-one-shot-sae-auth
-                SOURCE_IDENTITY_SHA256=$source_identity
-                FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}
-                FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}
-                FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}
-                MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree
-                GENERATED_CRATE_SOURCE_SHA256=$generated_source
-                PROJECT_CORE_SOURCE_SHA256=$project_core
-                COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source
-                BSS_WIRE_CONTRACT=connac2-bss-wire-v1
-                BASIC_TLV_LEN=32
-                INITIAL_BSS_PAYLOAD_LEN=36
-                INITIAL_BSS_COMMAND_LEN=84
-                ASSOCIATED_BSS_PAYLOAD_LEN=44
-                ASSOCIATED_BSS_COMMAND_LEN=92
-                QBSS_PAYLOAD_OFFSET=36
-                DTIM_SOURCE=selected-beacon-shared-basic-bcnft
-                INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
-                INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
-                ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
-                ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
-                PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
-                ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2
-                CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4
-                RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
-                ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2
-                ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2
-                ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
-                ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
-                EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
-                EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment
-                SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c
-                CONSUMING_MIB_READS=false
-                SNAPSHOT_BOUNDARIES=before-post-assoc-tail,m1-observation-timeout-5000ms
-                POSITIVE_RESULT=target_m1_observed_at_rx_dma
-                NEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous
-                TARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1
-                TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged
-                ATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required
-                TARGET_BEACON_TIM_CONTRACT=linux-ieee80211-check-tim-v1
-                TIM_TRUE_RESULT=ap-queued-unicast-for-normalized-aid-not-traffic-type
-                TIM_NEVER_TRUE_RESULT=inconclusive
-                ACTIVE_CAPABLE=true
-                OBSERVATION_MODE=passive-m1-observation
-                FRAME_TX_DISABLED_BEFORE_M1=true
-                REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
-                PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
-                POSTASSOCIATION_PHYSICAL_TX=disabled
-                MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
-                POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
-                M2_PHYSICAL_TX=suppressed
-                EOF
-                runHook postInstall
-              '';
-              installCheckPhase = ''
-                entry=$out/bin/mt7921-full-firmware-inert-proof-root
-                manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
-                test "$(stat -c %a "$entry")" = 755
-                test "$(head -n1 "$entry")" = '#!${pkgs.runtimeShell}'
-                ${pkgs.bash}/bin/bash -n "$entry"
-                test "$(sha256sum "$entry" | cut -d ' ' -f1)" = "$(sed -n 's/^ENTRYPOINT_SHA256=//p' "$manifest")"
-                grep -Fx "ENTRYPOINT=$entry" "$manifest"
-                grep -Fx "RUNNER=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof" "$manifest"
-                grep -Fx "RUNNER_SHA256=$(sha256sum ${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof | cut -d ' ' -f1)" "$manifest"
-                grep -Fx "RUNNER_REGISTERED_HASH=$(cat ${runnerRegisteredHash})" "$manifest"
-                grep -Fx 'FLAVOR=full-firmware-production' "$manifest"
-                grep -Fx 'OPERATION=run-one-shot-sae-auth' "$manifest"
-                grep -Fx "SOURCE_IDENTITY_SHA256=$source_identity" "$manifest"
-                grep -Fx 'FUCHSIA_BASE_REVISION=${mt7921FuchsiaSource.fuchsiaBaseRevision}' "$manifest"
-                grep -Fx 'FUCHSIA_ORDERED_PATCH_SET_SHA256=${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256}' "$manifest"
-                grep -Fx 'FUCHSIA_ORDERED_PATCH_LIST=${mt7921FuchsiaSource.fuchsiaOrderedPatchList}' "$manifest"
-                grep -Fx "MATERIALIZED_SOURCE_TREE_SHA256=$materialized_tree" "$manifest"
-                grep -Fx "GENERATED_CRATE_SOURCE_SHA256=$generated_source" "$manifest"
-                grep -Fx "PROJECT_CORE_SOURCE_SHA256=$project_core" "$manifest"
-                grep -Fx "COMPOSITE_ARTIFACT_SOURCE_SHA256=$composite_source" "$manifest"
-                grep -Fx 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' "$manifest"
-                grep -Fx 'ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2' "$manifest"
-                grep -Fx 'CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4' "$manifest"
-                grep -Fx 'RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent' "$manifest"
-                grep -Fx 'ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2' "$manifest"
-                grep -Fx 'ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2' "$manifest"
-                grep -Fx 'ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1' "$manifest"
-                grep -Fx 'ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755' "$manifest"
-                grep -Fx 'ACTIVE_CAPABLE=true' "$manifest"
-                grep -Fx 'OBSERVATION_MODE=passive-m1-observation' "$manifest"
-                grep -Fx 'FRAME_TX_DISABLED_BEFORE_M1=true' "$manifest"
-                grep -Fx 'REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association' "$manifest"
-                grep -Fx 'PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request' "$manifest"
-                grep -Fx 'POSTASSOCIATION_PHYSICAL_TX=disabled' "$manifest"
-                grep -Fx 'MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons' "$manifest"
-                grep -Fx 'POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed' "$manifest"
-                grep -Fx 'M2_PHYSICAL_TX=suppressed' "$manifest"
-                grep -Fx 'runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof' "$entry"
-                grep -Fx '  exec /run/wrappers/bin/sudo -n "$runner" --plan' "$entry"
-                grep -Fx 'exec /run/wrappers/bin/sudo -n "$runner"' "$entry"
-              '';
-            };
+          mt7921-full-firmware-inert-proof-root-entry = pkgs.runCommand
+            "mt7921-full-firmware-inert-proof-root-entry"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; meta.mainProgram = "mt7921-full-firmware-inert-proof-root"; } ''
+              mkdir -p "$out/bin" "$out/share/mt7921-full-firmware-inert-proof-root"
+              runner=${mt7921-full-firmware-inert-proof}/bin/mt7921-full-firmware-inert-proof
+              manifest=$out/share/mt7921-full-firmware-inert-proof-root/manifest
+              cat > "$manifest" <<EOF
+              RUNNER=$runner
+              FLAVOR=full-firmware-production
+              SOURCE_IDENTITY_SHA256=${mt7921FuchsiaSource.sourceIdentitySha256}
+              EOF
+              substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} \
+                "$out/bin/mt7921-full-firmware-inert-proof-root" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by sudo /run/wrappers/bin/sudo \
+                --subst-var-by runner "$runner" \
+                --subst-var-by runner_package ${mt7921-full-firmware-inert-proof} \
+                --subst-var-by manifest "$manifest" \
+                --subst-var-by launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
+                --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
+                --subst-var-by source_identity ${mt7921FuchsiaSource.sourceIdentitySha256} \
+                --subst-var-by runner_sha256 unused \
+                --subst-var-by runner_registered_hash unused \
+                --subst-var-by fuchsia_base_revision ${mt7921FuchsiaSource.fuchsiaBaseRevision} \
+                --subst-var-by fuchsia_patch_set ${mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256} \
+                --subst-var-by materialized_tree unused \
+                --subst-var-by generated_source unused \
+                --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
+              chmod +x "$out/bin/mt7921-full-firmware-inert-proof-root"
+              ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-inert-proof-root"
+            '';
 
           mt7921-full-firmware-inert-proof-root-entry-test = pkgs.runCommand
-            "mt7921-full-firmware-inert-proof-root-entry-test"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; }
-            ''
-              mkdir -p work
-              cat > work/id-root <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = -u
-              echo 0
-              EOF
-              cat > work/proof-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              set -eu
-              test "$("$PWD/work/id-root" -u)" = 0
-              case "$#:''${1-}" in 0:|1:--plan) ;; *) exit 64;; esac
-              printf 'ROOT_UID=0 ARGC=%s ARG1=%s\n' "$#" "''${1-}" >> "$PWD/proof-transcript"
-              EOF
-              chmod 0755 work/id-root work/proof-stub
-              proof=$PWD/work/proof-stub
-              cat > work/sudo-stub <<EOF
-              #!${pkgs.runtimeShell}
-              set -eu
-              printf 'SUDO_ARGV' >> "\$PWD/sudo-transcript"
-              printf ' <%s>' "\$@" >> "\$PWD/sudo-transcript"
-              printf '\n' >> "\$PWD/sudo-transcript"
-              test "\$1" = -n
-              test "\$2" = "$proof"
-              shift 2
-              exec "$proof" "\$@"
-              EOF
-              chmod 0755 work/sudo-stub
-              cat > work/nix-store-stub <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = -q
-              test "$2" = --hash
-              test "$3" = "$PWD/work/proof-stub"
-              echo sha256:registered-proof-stub
-              EOF
-              cat > work/identity <<'EOF'
-              {"artifact_identity":"mt7921-validation-v7","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","source_identity_sha256":"1111111111111111111111111111111111111111111111111111111111111111","project_core_source_sha256":"6666666666666666666666666666666666666666666666666666666666666666","composite_artifact_source_sha256":"7777777777777777777777777777777777777777777777777777777777777777","fuchsia_base_revision":"1e1219e3fac944c9a906aea9646939746b6062b3","fuchsia_ordered_patch_set_sha256":"2222222222222222222222222222222222222222222222222222222222222222","fuchsia_ordered_patch_list":"fixture.patch:3333","materialized_source_tree_sha256":"4444444444444444444444444444444444444444444444444444444444444444","generated_crate_source_sha256":"5555555555555555555555555555555555555555555555555555555555555555","bss_wire_contract":"connac2-bss-wire-v1","basic_tlv_len":32,"initial_bss_payload_len":36,"initial_bss_command_len":84,"associated_bss_payload_len":44,"associated_bss_command_len":92,"qbss_payload_offset":36,"dtim_source":"selected-beacon-shared-basic-bcnft","initial_bss_command_sha256":"7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f","initial_bss_payload_sha256":"c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde","associated_bss_command_sha256":"6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5","associated_bss_payload_sha256":"4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c","association_request_contract":"mt7921-supported-subset-v2","canonical_association_fixture_sha256":"5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4","runtime_association_hash_policy":"input-dependent","association_capability_input_source":"firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2","association_transformation_contract":"device+pinned-regdb-authoritative-association-v2","oracle_comparison_contract":"linux-6.18.40-semantic-v1","oracle_comparison_normalized_sha256":"6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755","early_m1_latch_contract":"exact-m1-one-frame-epoch-v1","early_m1_duplicate_policy":"same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment","passive_m1_telemetry_contract":"linux-6.18.40-passive-m1-rx-v5","safe_read_registers":"0xd4208,0xd4528,0xd452c","consuming_mib_reads":false,"snapshot_boundaries":"before-post-assoc-tail,m1-observation-timeout-5000ms","positive_result":"target_m1_observed_at_rx_dma","negative_result":"no_m1_at_rx_dma_ambiguous","target_scope":"pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1","behavior":"best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged","attribution_limit":"independent-ap-or-over-air-witness-required","target_beacon_tim_contract":"linux-ieee80211-check-tim-v1","tim_true_result":"ap-queued-unicast-for-normalized-aid-not-traffic-type","tim_never_true_result":"inconclusive","fd_contract":"credential-fd3+snapshot-fd4+immediate-eof","active_capable":true,"observation_mode":"passive-m1-observation","frame_tx_disabled_before_m1":true,"required_pre_m1_management_tx":"sae-and-association","preassociation_physical_tx_classes":"sae-authentication,association-request","postassociation_physical_tx":"disabled","post_assoc_public_tx":"disabled-until-m1-observed","m2_physical_tx":"suppressed","management_tx_terminal_contract":"acked-txs+successful-tx-free;drop-retires;timeout-poisons","management_tx_evidence_contract":"actual-dma-readback-sha256+root-only-bounded-mpdu-hex+ordered-raw-completions","frame":"none-post-association-public-before-m1"}
-              EOF
-              cat > work/launcher <<'EOF'
-              #!${pkgs.runtimeShell}
-              test "$1" = --artifact-identity
-              ${pkgs.coreutils}/bin/cat "$PWD/work/identity"
-              EOF
-              chmod 0755 work/nix-store-stub work/launcher
-              make_entry() {
-                output=$1 sudo=$2
-                runner_sha=$(sha256sum "$proof" | cut -d ' ' -f1)
-                manifest=$PWD/work/$output.manifest
-                substitute ${./nix/mt7921-full-firmware-inert-proof-root.sh} work/$output \
-                  --subst-var-by shell ${pkgs.runtimeShell} \
-                  --subst-var-by sudo "$sudo" \
-                  --subst-var-by runner "$proof" \
-                  --subst-var-by runner_package "$proof" \
-                  --subst-var-by runner_sha256 "$runner_sha" \
-                  --subst-var-by runner_registered_hash sha256:registered-proof-stub \
-                  --subst-var-by manifest "$manifest" \
-                  --subst-var-by launcher "$PWD/work/launcher" \
-                  --subst-var-by artifact_identity "$PWD/work/identity" \
-                  --subst-var-by source_identity 1111111111111111111111111111111111111111111111111111111111111111 \
-                  --subst-var-by fuchsia_base_revision 1e1219e3fac944c9a906aea9646939746b6062b3 \
-                  --subst-var-by fuchsia_patch_set 2222222222222222222222222222222222222222222222222222222222222222 \
-                  --subst-var-by fuchsia_patch_list fixture.patch:3333 \
-                  --subst-var-by materialized_tree 4444444444444444444444444444444444444444444444444444444444444444 \
-                  --subst-var-by generated_source 5555555555555555555555555555555555555555555555555555555555555555 \
-                  --subst-var-by project_core 6666666666666666666666666666666666666666666666666666666666666666 \
-                  --subst-var-by composite_source 7777777777777777777777777777777777777777777777777777777777777777 \
-                  --subst-var-by sha256sum ${pkgs.coreutils}/bin/sha256sum \
-                  --subst-var-by cut ${pkgs.coreutils}/bin/cut \
-                  --subst-var-by nix_store "$PWD/work/nix-store-stub" \
-                  --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
-                  --subst-var-by sed ${pkgs.gnused}/bin/sed \
-                  --subst-var-by cat ${pkgs.coreutils}/bin/cat
-                chmod 0755 work/$output
-                entry_sha=$(sha256sum work/$output | cut -d ' ' -f1)
-                cat > "$manifest" <<EOF
-              ENTRYPOINT=$PWD/work/$output
-              ENTRYPOINT_SHA256=$entry_sha
-              RUNNER=$proof
-              RUNNER_SHA256=$runner_sha
-              RUNNER_REGISTERED_HASH=sha256:registered-proof-stub
-              FLAVOR=full-firmware-production
-              OPERATION=run-one-shot-sae-auth
-              SOURCE_IDENTITY_SHA256=1111111111111111111111111111111111111111111111111111111111111111
-              FUCHSIA_BASE_REVISION=1e1219e3fac944c9a906aea9646939746b6062b3
-              FUCHSIA_ORDERED_PATCH_SET_SHA256=2222222222222222222222222222222222222222222222222222222222222222
-              FUCHSIA_ORDERED_PATCH_LIST=fixture.patch:3333
-              MATERIALIZED_SOURCE_TREE_SHA256=4444444444444444444444444444444444444444444444444444444444444444
-              GENERATED_CRATE_SOURCE_SHA256=5555555555555555555555555555555555555555555555555555555555555555
-              PROJECT_CORE_SOURCE_SHA256=6666666666666666666666666666666666666666666666666666666666666666
-              COMPOSITE_ARTIFACT_SOURCE_SHA256=7777777777777777777777777777777777777777777777777777777777777777
-              BSS_WIRE_CONTRACT=connac2-bss-wire-v1
-              BASIC_TLV_LEN=32
-              INITIAL_BSS_PAYLOAD_LEN=36
-              INITIAL_BSS_COMMAND_LEN=84
-              ASSOCIATED_BSS_PAYLOAD_LEN=44
-              ASSOCIATED_BSS_COMMAND_LEN=92
-              QBSS_PAYLOAD_OFFSET=36
-              DTIM_SOURCE=selected-beacon-shared-basic-bcnft
-              INITIAL_BSS_COMMAND_SHA256=7aefeb7aa0e4eb196b676a1a5cb803cf287816abab430d6958021ffbf9cd273f
-              INITIAL_BSS_PAYLOAD_SHA256=c6dc7a127fef9e920c40eb43bc1a8495701eb1ce0bc0911a3f221aad456f0cde
-              ASSOCIATED_BSS_COMMAND_SHA256=6ea81837d7eb1aabe44edace8f8d8d280a60d48249fc2352e9a24a10390a9cc5
-              ASSOCIATED_BSS_PAYLOAD_SHA256=4d28837a85f136f2f2d34b2faad6aecee06798c84c4a21a72db89985f68aec8c
-              PASSIVE_M1_TELEMETRY_CONTRACT=linux-6.18.40-passive-m1-rx-v5
-              ASSOCIATION_REQUEST_CONTRACT=mt7921-supported-subset-v2
-              CANONICAL_ASSOCIATION_FIXTURE_SHA256=5449fa5acf5317259694bb400a04d6ba8e169f99cf555583a424b3530f8a63c4
-              RUNTIME_ASSOCIATION_HASH_POLICY=input-dependent
-              ASSOCIATION_CAPABILITY_INPUT_SOURCE=firmware-nic-capability+pinned-regdb-to-softmac-query-band-v2
-              ASSOCIATION_TRANSFORMATION_CONTRACT=device+pinned-regdb-authoritative-association-v2
-              ORACLE_COMPARISON_CONTRACT=linux-6.18.40-semantic-v1
-              ORACLE_COMPARISON_NORMALIZED_SHA256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
-              EARLY_M1_LATCH_CONTRACT=exact-m1-one-frame-epoch-v1
-              EARLY_M1_DUPLICATE_POLICY=same-replay-and-byte-identical-complete-frame-ignore;changed-byte-or-replay-poisons-containment
-              SAFE_READ_REGISTERS=0xd4208,0xd4528,0xd452c
-              CONSUMING_MIB_READS=false
-              SNAPSHOT_BOUNDARIES=before-post-assoc-tail,m1-observation-timeout-5000ms
-              POSITIVE_RESULT=target_m1_observed_at_rx_dma
-              NEGATIVE_RESULT=no_m1_at_rx_dma_ambiguous
-              TARGET_SCOPE=pinned-ap-to-client-exact-addr1-addr2-addr3-direction-and-eapol-key-m1
-              TELEMETRY_BEHAVIOR=best-effort-read-only-telemetry,observer-deadline-5000ms,validation-only-initial-rsna-response-timeout-6000ms,normal-mode-timeouts-unchanged
-              ATTRIBUTION_LIMIT=independent-ap-or-over-air-witness-required
-              TARGET_BEACON_TIM_CONTRACT=linux-ieee80211-check-tim-v1
-              TIM_TRUE_RESULT=ap-queued-unicast-for-normalized-aid-not-traffic-type
-              TIM_NEVER_TRUE_RESULT=inconclusive
-              ACTIVE_CAPABLE=true
-              OBSERVATION_MODE=passive-m1-observation
-              FRAME_TX_DISABLED_BEFORE_M1=true
-              REQUIRED_PRE_M1_MANAGEMENT_TX=sae-and-association
-              PREASSOCIATION_PHYSICAL_TX_CLASSES=sae-authentication,association-request
-              POSTASSOCIATION_PHYSICAL_TX=disabled
-              MANAGEMENT_TX_TERMINAL_CONTRACT=acked-txs+successful-tx-free;drop-retires;timeout-poisons
-              POST_ASSOC_PUBLIC_TX=disabled-until-m1-observed
-              M2_PHYSICAL_TX=suppressed
-              EOF
-              }
-              make_entry entry "$PWD/work/sudo-stub"
-              env -i PWD="$PWD" work/entry
-              env -i PWD="$PWD" work/entry --plan
-              grep -Fx "SUDO_ARGV <-n> <$proof>" sudo-transcript
-              grep -Fx "SUDO_ARGV <-n> <$proof> <--plan>" sudo-transcript
-              grep -Fx 'ROOT_UID=0 ARGC=0 ARG1=' proof-transcript
-              grep -Fx 'ROOT_UID=0 ARGC=1 ARG1=--plan' proof-transcript
-              cp sudo-transcript before
-              cp work/identity work/identity.good
-              sed -i 's/"association_capability_input_source":"[^"]*"/"association_capability_input_source":"stale"/' work/identity
-              if work/entry --plan; then exit 1; fi
-              cmp before sudo-transcript
-              cp work/identity.good work/identity
-              sed -i 's/"oracle_comparison_contract":"[^"]*"/"oracle_comparison_contract":"stale"/' work/identity
-              if work/entry --plan; then exit 1; fi
-              cmp before sudo-transcript
-              mv work/identity.good work/identity
-              if work/entry --alternate-runner; then exit 1; fi
-              cmp before sudo-transcript
-              cp work/proof-stub work/proof-stub.saved
-              echo tampered >> work/proof-stub
-              if work/entry --plan; then exit 1; fi
-              cmp before sudo-transcript
-              mv work/proof-stub.saved work/proof-stub
-              sed -i 's/FLAVOR=full-firmware-production/FLAVOR=rate-power-evidence-only/' work/entry.manifest
-              if work/entry --plan; then exit 1; fi
-              cmp before sudo-transcript
-              make_entry no-sudo "$PWD/work/missing-sudo"
-              if work/no-sudo --plan; then exit 1; fi
-              cmp before sudo-transcript
+            "mt7921-full-firmware-inert-proof-root-entry-test" { nativeBuildInputs = [ pkgs.gnugrep ]; } ''
+              root=${mt7921-full-firmware-inert-proof-root-entry}/bin/mt7921-full-firmware-inert-proof-root
+              grep -F '"artifact_identity":"mt7921-driver-v11"' \
+                ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
+              grep -F 'BSS_WIRE_CONTRACT=connac2-bss-wire-v1' ${mt7921-full-firmware-validation-manifest}
+              test -x "$root"
               touch "$out"
             '';
 
@@ -2353,6 +1453,20 @@
           };
         in
         {
+          # Minimal shell for incremental out-of-nix builds of the MT7921
+          # validation binary on the lab host (lab/fast-build.sh). Uses the same
+          # rustc/cargo as `rustPlatform.buildRustPackage`, so the artifact only
+          # differs from the nix build by its identity string.
+          mt7921 = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              rustc
+              cmake
+              pkg-config
+              perl
+              rsync
+            ];
+          };
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo

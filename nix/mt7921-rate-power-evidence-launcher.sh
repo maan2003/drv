@@ -67,8 +67,8 @@ case "$#:${1-}" in
       DRV_VFIO_DEVICE="$DRV_VFIO_DEVICE" \
       DRV_LAB_SAFETY_STATE="$DRV_LAB_SAFETY_STATE" \
       DRV_SAE_BSSID=72:a6:c7:7d:56:93 \
-      DRV_SAE_CHANNEL=36 \
-      DRV_SAE_SSID=ph1 \
+      DRV_SAE_CHANNEL=149 \
+      DRV_SAE_SSID=ajay \
       DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a \
       DRV_SAE_CREDENTIAL_FD=3 \
       DRV_SAE_CREDENTIAL_LEN="$credential_len" \

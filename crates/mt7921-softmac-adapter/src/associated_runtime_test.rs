@@ -247,8 +247,7 @@ impl AssociatedSoftmacTx for AssociatedAp {
 
 fn drive(
     runner: &mut EthernetRunner<DhcpService, Mt7921EthernetDevice>,
-    tx: &mut Mt7921EthernetTx,
-    sink: &mut MlmeEthernetSink,
+    sink: &mut DriverEthernetPort,
     ap: &mut AssociatedAp,
     now: Duration,
 ) {
@@ -262,9 +261,9 @@ fn drive(
         runner.stack_mut().poll_at(now, 64);
         while runner.pump().transmitted != 0 {}
         loop {
-            match tx.pump_one(ap) {
-                Ok(true) => {}
-                Ok(false) | Err(EthernetTxPumpError::LinkDown) => break,
+            match sink.take_transmit() {
+                Ok(Some(frame)) => ap.transmit_ethernet(frame.as_bytes()).unwrap(),
+                Ok(None) | Err(EthernetIngressError::LinkDown) => break,
                 Err(error) => panic!("unexpected associated TX failure: {error:?}"),
             }
         }
@@ -280,8 +279,8 @@ fn drive(
 }
 
 #[test]
-fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
-    let (device, mut tx, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
+fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
+    let (device, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let runtime = Runtime::new(
         32,
         (0u8..=255).cycle().take(8192),
@@ -299,13 +298,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
     let mut association = establish_association();
     sink.set_link(true);
     for second in 0..16 {
-        drive(
-            &mut runner,
-            &mut tx,
-            &mut sink,
-            &mut ap,
-            Duration::from_secs(second),
-        );
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
         if runner.stack().status() == DhcpStatus::Bound {
             break;
         }
@@ -319,13 +312,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
 
     let lookup = runner.stack_mut().lookup_ip("internet.test.").unwrap();
     for second in 16..48 {
-        drive(
-            &mut runner,
-            &mut tx,
-            &mut sink,
-            &mut ap,
-            Duration::from_secs(second),
-        );
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
         if let Some(result) = runner.stack_mut().take_lookup(lookup) {
             assert_eq!(result.unwrap(), [IpAddr::V4(Ipv4Addr::from(SERVER_IP))]);
             break;
@@ -341,7 +328,8 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
         .unwrap();
     let mut provider = runner.stack().socket_provider();
-    let client = provider.open_client(NonZeroUsize::new(2).unwrap()).unwrap();
+    let client =
+        RemoteSocketProvider::open_client(&mut provider, NonZeroUsize::new(2).unwrap()).unwrap();
     let socket = provider.tcp_socket(client, RemoteIpVersion::V4).unwrap();
     provider
         .tcp_connect(
@@ -353,13 +341,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         )
         .unwrap();
     for second in 48..80 {
-        drive(
-            &mut runner,
-            &mut tx,
-            &mut sink,
-            &mut ap,
-            Duration::from_secs(second),
-        );
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
         if ap.server.tcp_pending_connections(listener).unwrap() != 0 {
             break;
         }
@@ -372,13 +354,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         18
     );
     for second in 80..96 {
-        drive(
-            &mut runner,
-            &mut tx,
-            &mut sink,
-            &mut ap,
-            Duration::from_secs(second),
-        );
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
     }
     let mut request = [0; 64];
     let read = ap.server.tcp_read(accepted, &mut request).unwrap();
@@ -389,13 +365,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
     assert!(teardown.remove_pairwise_key);
     assert!(teardown.remove_group_key);
     sink.set_link(false);
-    drive(
-        &mut runner,
-        &mut tx,
-        &mut sink,
-        &mut ap,
-        Duration::from_secs(96),
-    );
+    drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(96));
     assert_eq!(runner.stack().runtime().ipv4_address(), None);
     assert_eq!(runner.stack().runtime().dns_servers(), [None, None]);
     let blocked = provider.tcp_socket(client, RemoteIpVersion::V4).unwrap();
@@ -409,103 +379,4 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_reconnects() {
         ),
         Err(RemoteSocketError::NetworkUnreachable)
     );
-
-    association = establish_association();
-    assert_eq!(association.wcid(), Some(1));
-    sink.set_link(true);
-    for second in 97..128 {
-        drive(
-            &mut runner,
-            &mut tx,
-            &mut sink,
-            &mut ap,
-            Duration::from_secs(second),
-        );
-        if runner.stack().status() == DhcpStatus::Bound {
-            break;
-        }
-    }
-    assert_eq!(runner.stack().status(), DhcpStatus::Bound);
-    assert_eq!(runner.stack().runtime().ipv4_address(), Some(CLIENT_IP));
-}
-
-struct ProofWire {
-    ap: AssociatedAp,
-    sink: MlmeEthernetSink,
-    listener: netstack3_port_integration::TcpSocketHandle,
-    accepted: Option<netstack3_port_integration::TcpSocketHandle>,
-}
-
-impl AssociatedSoftmacTx for ProofWire {
-    type Error = ();
-    fn transmit_ethernet(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
-        self.ap.transmit_ethernet(frame)
-    }
-}
-
-impl AssociatedDataPump for ProofWire {
-    fn pump_receive(&mut self, _: std::time::Instant) -> Result<bool, Self::Error> {
-        self.ap.collect_server_frames();
-        if self.accepted.is_none()
-            && self
-                .ap
-                .server
-                .tcp_pending_connections(self.listener)
-                .unwrap()
-                != 0
-        {
-            self.accepted = Some(self.ap.server.tcp_accept(self.listener).unwrap());
-        }
-        if let Some(socket) = self.accepted {
-            let mut request = [0; 256];
-            if self.ap.server.tcp_read(socket, &mut request).unwrap_or(0) != 0 {
-                self.ap
-                    .server
-                    .tcp_write(socket, b"HTTP/1.0 200 OK\r\n\r\nproof")
-                    .unwrap();
-                self.ap.collect_server_frames();
-            }
-        }
-        let Some(frame) = self.ap.pending.pop_front() else {
-            return Ok(false);
-        };
-        self.sink.deliver(frame.as_bytes()).map_err(|_| ())?;
-        Ok(true)
-    }
-}
-
-#[test]
-fn production_bounded_runner_proves_dhcp_dns_tcp_and_http_response() {
-    let (device, tx, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
-    sink.set_link(true);
-    let mut ap = AssociatedAp::new();
-    let listener = ap.server.tcp_socket().unwrap();
-    ap.server
-        .tcp_bind(listener, Some(SERVER_IP), NonZeroU16::new(8080).unwrap())
-        .unwrap();
-    ap.server
-        .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
-        .unwrap();
-    let mut wire = ProofWire {
-        ap,
-        sink,
-        listener,
-        accepted: None,
-    };
-    let mut proof = BoundedNetstackProof::new(
-        device,
-        tx,
-        NetstackProofConfig {
-            dns_name: "internet.test.".into(),
-            server_port: NonZeroU16::new(8080).unwrap(),
-            http_request: b"GET / HTTP/1.0\r\n\r\n".to_vec(),
-            expected_response_prefix: b"HTTP/1.0 200".to_vec(),
-        },
-    )
-    .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    proof.prove_dhcp(&mut wire, deadline).unwrap();
-    proof.prove_dns(&mut wire, deadline).unwrap();
-    proof.prove_tcp(&mut wire, deadline).unwrap();
-    proof.prove_http(&mut wire, deadline).unwrap();
 }

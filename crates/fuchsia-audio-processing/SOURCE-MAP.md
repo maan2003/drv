@@ -7,7 +7,7 @@ Pinned closure path: `src/media/audio/lib/processing` in
 | Checked-in path | Status | SHA-256 |
 |---|---|---|
 | `upstream-cargo/src/media/audio/lib/processing/BUILD.gn` | pristine reference | `51cba9a94aa818255d0734d2b51d73f9dabdc71d15db979601f12c92f128c218` |
-| `upstream-cargo/src/media/audio/lib/processing/channel_strip.h` | pristine, compiled | `40c06462ba6fc6987f6fcadc8a05cdd957e50416cfbd6b8d1f59670474075e45` |
+| `upstream-cargo/src/media/audio/lib/processing/channel_strip.h` | pristine reference | `40c06462ba6fc6987f6fcadc8a05cdd957e50416cfbd6b8d1f59670474075e45` |
 | `upstream-cargo/src/media/audio/lib/processing/gain.h` | pristine, compiled | `4ff7727d915073951f626449361b99a1fc4e5656569f6a9306fe47750ed8519f` |
 | `upstream-cargo/src/media/audio/lib/processing/sampler.h` | pristine, compiled | `9068f65d946ca9f3bdd618bd308d1956c4bb3d605c85f9b91bba3a77c20de213` |
 | `upstream-cargo/src/media/audio/lib/processing/flags.h` | pristine, compiled | `42e30aa3bb890189570241531d5fa72077cb81ef1ae5aef824df5e18a14a3b4c` |
@@ -19,10 +19,12 @@ logging, tracing, fixed-point, format, timeline, and Zircon value facades needed
 to compile the selected unchanged sources without unavailable Fuchsia
 transports. `src/bridge.cc` is the isolated representation adapter.
 
-ChannelStrip owns the planar working buffer and channel access, and sampler
-`MixSample<kUnity, false/true>` owns overwrite/accumulation for two-stream
-mixing. PositionManager owns exact fractional source-position and residual-rate
+Sampler `MixSample<kUnity, false/true>` owns overwrite/accumulation for
+two-stream mixing directly into caller-provided output; this avoids the pinned
+ChannelStrip's internally allocated planar working buffer on real-time paths.
+PositionManager owns exact fractional source-position and residual-rate
 advancement for 44.1 kHz to 48 kHz point resampling; `MixSample<kUnity, false>`
 transfers each selected point sample. Gain classification, decibel-to-scale
 conversion, and per-sample gain multiplication remain direct calls into the
-unchanged pinned gain header.
+unchanged pinned gain header. The real-time gain entry point accepts a
+precomputed scale so `DbToScale` and its libm dependency remain off-thread.

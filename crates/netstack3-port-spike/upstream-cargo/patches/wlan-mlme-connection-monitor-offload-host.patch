@@ -1,0 +1,91 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/device.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/device.rs
+@@ -99,6 +99,17 @@
+ 
+ /// This trait abstracts operations performed by the vendor driver and ethernet device.
+ pub trait DeviceOps {
++    /// True when the device/firmware, rather than the host MLME, owns
++    /// associated-BSS connection monitoring. This is the SoftMAC equivalent
++    /// of Linux's IEEE80211_HW_CONNECTION_MONITOR capability.
++    ///
++    /// Implementations must not return true unless firmware connection-loss
++    /// events are routed into MLME teardown; beacon filtering alone is not a
++    /// complete connection monitor.
++    fn connection_monitor_offload(&self) -> bool {
++        false
++    }
++
+     fn wlan_softmac_query_response(
+         &mut self,
+     ) -> impl Future<Output = Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status>>;
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -475,8 +475,15 @@
+             DEFAULT_AUTO_DEAUTH_TIMEOUT_BEACON_COUNT,
+         );
+ 
+-        let status_check_timeout =
+-            schedule_association_status_timeout(sta.sta.beacon_period(), &mut sta.ctx.timer);
++        // A beacon-filtering device with a complete connection-loss event
++        // route owns this monitor. Otherwise the safe default is the host
++        // lost-BSS counter, matching mac80211's CONNECTION_MONITOR contract.
++        let connection_monitor_offload = sta.ctx.device.connection_monitor_offload();
++        let status_check_timeout = schedule_association_status_timeout_for_device(
++            sta.sta.beacon_period(),
++            &mut sta.ctx.timer,
++            connection_monitor_offload,
++        );
+ 
+         Ok(Some(Association {
+             aid,
+@@ -623,6 +630,18 @@
+     }
+ }
+ 
++fn schedule_association_status_timeout_for_device(
++    beacon_period: zx::MonotonicDuration,
++    timer: &mut Timer<TimedEvent>,
++    connection_monitor_offload: bool,
++) -> StatusCheckTimeout {
++    if connection_monitor_offload {
++        StatusCheckTimeout { next_event: None }
++    } else {
++        schedule_association_status_timeout(beacon_period, timer)
++    }
++}
++
+ #[derive(Debug, PartialEq)]
+ pub enum Qos {
+     Enabled,
+@@ -1758,6 +1777,31 @@
+     static BSSID: LazyLock<Bssid> = LazyLock::new(|| [6u8; 6].into());
+     static IFACE_MAC: LazyLock<MacAddr> = LazyLock::new(|| [3u8; 6].into());
+ 
++    #[fuchsia::test(allow_stalls = false)]
++    async fn connection_monitor_offload_controls_host_lost_bss_timer() {
++        let (mut host_timer, _host_events) = create_timer();
++        assert!(
++            schedule_association_status_timeout_for_device(
++                zx::MonotonicDuration::from_millis(100),
++                &mut host_timer,
++                false,
++            )
++            .next_event
++            .is_some()
++        );
++
++        let (mut offload_timer, _offload_events) = create_timer();
++        assert!(
++            schedule_association_status_timeout_for_device(
++                zx::MonotonicDuration::from_millis(100),
++                &mut offload_timer,
++                true,
++            )
++            .next_event
++            .is_none()
++        );
++    }
++
+     struct MockObjects {
+         fake_device: FakeDevice,
+         fake_device_state: Arc<Mutex<FakeDeviceState>>,

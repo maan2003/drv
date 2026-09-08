@@ -1,0 +1,328 @@
+use crate::{CoreError, PdevId, VdevId};
+use alloc::vec::Vec;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScanId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Channel {
+    pub primary_mhz: u16,
+    pub center1_mhz: u16,
+    pub center2_mhz: u16,
+}
+impl Channel {
+    pub const fn from_primary_frequency(primary_mhz: u16) -> Self {
+        Self {
+            primary_mhz,
+            center1_mhz: primary_mhz,
+            center2_mhz: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanConfig {
+    pub vdev: VdevId,
+    pub id: ScanId,
+    pub active: bool,
+    pub channels_mhz: Vec<u16>,
+    pub ssids: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cipher {
+    Ccmp128,
+    Ccmp256,
+    Tkip,
+    Gcmp128,
+    Gcmp256,
+    BipCmac128,
+    BipGmac128,
+    BipGmac256,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyKind {
+    Pairwise,
+    Group,
+    IntegrityGroup,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyConfig {
+    pub vdev: VdevId,
+    pub peer: [u8; 6],
+    pub index: u8,
+    pub cipher: Cipher,
+    pub kind: KeyKind,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegulatoryChannel {
+    pub frequency_mhz: u16,
+    pub max_power_dbm: i8,
+    pub max_reg_power_dbm: i8,
+    pub max_antenna_gain_dbi: i8,
+    pub passive: bool,
+    pub radar: bool,
+    pub allow_ht: bool,
+    pub allow_vht: bool,
+    pub allow_he: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegulatoryDomain {
+    pub alpha2: [u8; 2],
+    pub channels: Vec<RegulatoryChannel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagementFrame {
+    pub vdev: VdevId,
+    pub buffer_id: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Operation {
+    QmiInitService,
+    QmiDeinitService,
+    QmiFirmwareStart,
+    QmiWaitFirmwareReady,
+    QmiFirmwareStop,
+    HifPowerUp,
+    HifPowerDown,
+    HifStart,
+    HifStop,
+    HifIrqEnable,
+    HifIrqDisable,
+    CeInitPipes,
+    HtcInit,
+    HtcWaitTarget,
+    HtcStart,
+    WmiAttach,
+    WmiConnect,
+    WmiWaitServiceReady,
+    WmiCommandInit,
+    WmiWaitUnifiedReady,
+    WmiDetach,
+    DpAllocate,
+    DpFree,
+    DpHttConnect,
+    DpPdevPreAllocate,
+    DpPdevAllocate,
+    DpPdevFree,
+    DpReoSetup,
+    DpReoCleanup,
+    DpHttVersionRequest,
+    MacAllocate,
+    MacDestroy,
+    MacRegister,
+    MacUnregister,
+    RadioStart,
+    RegFree,
+    PdevSuspend,
+    RecoveryQuiesce,
+    RecoveryRestart,
+    WmiVdevCreate {
+        vdev: VdevId,
+        mac: [u8; 6],
+    },
+    WmiVdevSetNss {
+        vdev: VdevId,
+        nss: u8,
+    },
+    WmiStaPsRxWake {
+        vdev: VdevId,
+    },
+    WmiStaPsTxWake {
+        vdev: VdevId,
+    },
+    WmiStaPsPollCount {
+        vdev: VdevId,
+    },
+    WmiStaPsDisable {
+        vdev: VdevId,
+    },
+    WmiVdevSetRtsThreshold {
+        vdev: VdevId,
+        threshold: u32,
+    },
+    DpVdevTxAttach {
+        vdev: VdevId,
+    },
+    WmiVdevStart {
+        vdev: VdevId,
+        channel: Channel,
+    },
+    WaitVdevSetup {
+        vdev: VdevId,
+    },
+    WmiVdevUp {
+        vdev: VdevId,
+        bssid: [u8; 6],
+        aid: u16,
+    },
+    WmiObssSpatialReuse {
+        vdev: VdevId,
+    },
+    WmiDtimPolicyStick {
+        vdev: VdevId,
+    },
+    WmiVdevDown {
+        vdev: VdevId,
+    },
+    WmiVdevStop {
+        vdev: VdevId,
+    },
+    WmiVdevDelete {
+        vdev: VdevId,
+    },
+    WaitVdevDeleted {
+        vdev: VdevId,
+    },
+    WmiPeerCreate {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WaitPeerCreated {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WmiPeerAssociate {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WmiPeerSetSmps {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WaitPeerAssociated {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WmiPeerAuthorize {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WmiPeerDelete {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WaitPeerDeleted {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    WmiInstallKey(KeyConfig),
+    WaitKeyInstalled {
+        vdev: VdevId,
+        key_index: u8,
+    },
+    WmiScanStart(ScanConfig),
+    WmiScanStop {
+        vdev: VdevId,
+        scan: ScanId,
+    },
+    WmiMgmtTx(ManagementFrame),
+    WmiSetCurrentCountry {
+        alpha2: [u8; 2],
+    },
+    WmiScanChannelList {
+        pdev: PdevId,
+        channels: Vec<RegulatoryChannel>,
+    },
+    WaitRegulatoryUpdate {
+        pdev: PdevId,
+    },
+    WmiPdevSetTxPower {
+        pdev: PdevId,
+        half_dbm: i16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationTarget {
+    Qmi,
+    Hif,
+    CeHtc,
+    Wmi,
+    DpHtt,
+    MacMlme,
+    Regulatory,
+    Recovery,
+}
+impl Operation {
+    pub const fn target(&self) -> OperationTarget {
+        use Operation::*;
+        match self {
+            QmiInitService | QmiDeinitService | QmiFirmwareStart | QmiWaitFirmwareReady
+            | QmiFirmwareStop => OperationTarget::Qmi,
+            HifPowerUp | HifPowerDown | HifStart | HifStop | HifIrqEnable | HifIrqDisable => {
+                OperationTarget::Hif
+            }
+            CeInitPipes | HtcInit | HtcWaitTarget | HtcStart => OperationTarget::CeHtc,
+            DpAllocate
+            | DpFree
+            | DpHttConnect
+            | DpPdevPreAllocate
+            | DpPdevAllocate
+            | DpPdevFree
+            | DpReoSetup
+            | DpReoCleanup
+            | DpHttVersionRequest
+            | DpVdevTxAttach { .. } => OperationTarget::DpHtt,
+            MacAllocate | MacDestroy | MacRegister | MacUnregister | RadioStart => {
+                OperationTarget::MacMlme
+            }
+            RegFree => OperationTarget::Regulatory,
+            RecoveryQuiesce | RecoveryRestart => OperationTarget::Recovery,
+            _ => OperationTarget::Wmi,
+        }
+    }
+}
+
+/// Composition seam while subsystem crates acquire their source-shaped
+/// lifecycle APIs. Implementations dispatch operations to QMI/CE/HTC/WMI/DP.
+pub trait Subsystems {
+    fn execute(&mut self, operation: Operation) -> Result<(), CoreError>;
+
+    /// Drive the event-oriented QMI handshake until firmware reports ready.
+    /// The returned value is consumed by core rather than supplied by its caller.
+    fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError>;
+}
+
+/// Deterministic subsystem model used before transports are attached and by
+/// transcript conformance tests.
+#[derive(Default)]
+pub struct ModelSubsystems {
+    operations: Vec<Operation>,
+    fail_next: Option<Operation>,
+}
+impl ModelSubsystems {
+    pub fn operations(&self) -> &[Operation] {
+        &self.operations
+    }
+    pub fn clear(&mut self) {
+        self.operations.clear();
+    }
+    pub fn fail_once(&mut self, operation: Operation) {
+        self.fail_next = Some(operation);
+    }
+}
+impl Subsystems for ModelSubsystems {
+    fn execute(&mut self, operation: Operation) -> Result<(), CoreError> {
+        self.operations.push(operation.clone());
+        if self.fail_next.as_ref() == Some(&operation) {
+            self.fail_next = None;
+            Err(CoreError::DeviceFault)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError> {
+        self.execute(Operation::QmiWaitFirmwareReady)?;
+        Ok(ath11k_qmi::FirmwareReady {
+            firmware_version: 1,
+            target_mem_mode: 0,
+        })
+    }
+}

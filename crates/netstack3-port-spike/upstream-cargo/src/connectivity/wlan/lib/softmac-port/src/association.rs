@@ -49,7 +49,14 @@ impl RsnStationPolicy {
 pub struct AssociationRequestProfile {
     pub regulatory: Option<RegulatoryAssociationCapabilities>,
     pub station: ImplementedStationCapabilities,
-    pub rsn: RsnStationPolicy,
+    /// Optional RSN capability rewrite. `None` keeps the SME's RSNE verbatim,
+    /// which is mandatory in production: IEEE 802.11-2020 12.7.6.3 requires
+    /// the RSNE in EAPOL-Key message 2/4 to be bit-identical to the RSNE in
+    /// the (Re)Association Request, and hostapd disconnects the station
+    /// ("WPA IE from (Re)AssocReq did not match with msg 2/4") when it is
+    /// not. The supplicant that authors message 2/4 owns the RSNE, so the
+    /// driver must not restate it. Only comparison fixtures set a policy.
+    pub rsn: Option<RsnStationPolicy>,
     /// Authoritative station capabilities, when the hardware query is more
     /// precise than the ClientMlme intersection used to create the base frame.
     pub ht_capabilities: Option<[u8; 26]>,
@@ -61,7 +68,7 @@ impl Default for AssociationRequestProfile {
         Self {
             regulatory: None,
             station: ImplementedStationCapabilities::default(),
-            rsn: RsnStationPolicy::wpa3_personal(),
+            rsn: None,
             ht_capabilities: None,
             vht_capabilities: None,
         }
@@ -88,7 +95,10 @@ pub fn linux_61840_oracle_profile() -> AssociationRequestProfile {
             extended: Some(vec![0x04, 0, 0x08, 0, 0x01, 0, 0, 0x40, 0, 0x01]),
             extension: vec![vec![0x06, 0x1a]],
         },
-        rsn: RsnStationPolicy::wpa3_personal(),
+        // iwd advertises MFPC only; the fixture keeps that so the pinned
+        // 204-byte oracle hash stays comparable. Production leaves the RSNE
+        // to the supplicant (see `AssociationRequestProfile::rsn`).
+        rsn: Some(RsnStationPolicy::wpa3_personal()),
         ht_capabilities: Some([
             0xff, 0x09, 0x03, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0,
@@ -195,7 +205,9 @@ pub fn finalize_association_request(
         _ => return Err("unexpected RSNXE/WMM association tail"),
     };
     let mut rsn = parsed[2].1.clone();
-    rewrite_rsn_capabilities(&mut rsn, profile.rsn)?;
+    if let Some(policy) = profile.rsn {
+        rewrite_rsn_capabilities(&mut rsn, policy)?;
+    }
 
     let mut out = frame[..28].to_vec();
     // Association capabilities describe station behavior, not the selected
@@ -305,12 +317,21 @@ mod tests {
         let out =
             finalize_association_request(&base(), &AssociationRequestProfile::default()).unwrap();
         let rsn = out.windows(2).position(|bytes| bytes == [48, 20]).unwrap();
+        // Production keeps the SME RSNE verbatim so it matches EAPOL 2/4.
+        assert_eq!(&out[rsn + 20..rsn + 22], &[0xcc, 0]);
+        let mut fixture = AssociationRequestProfile::default();
+        fixture.rsn = Some(RsnStationPolicy::wpa3_personal());
+        let out = finalize_association_request(&base(), &fixture).unwrap();
+        let rsn = out.windows(2).position(|bytes| bytes == [48, 20]).unwrap();
         assert_eq!(&out[rsn + 20..rsn + 22], &[0x80, 0]);
         let mut invalid = AssociationRequestProfile::default();
-        invalid.rsn.mfpc = false;
-        invalid.rsn.mfpr = true;
+        invalid.rsn = Some(RsnStationPolicy {
+            mfpc: false,
+            mfpr: true,
+            ..RsnStationPolicy::wpa3_personal()
+        });
         assert!(finalize_association_request(&base(), &invalid).is_err());
-        invalid.rsn = RsnStationPolicy::wpa3_personal();
+        invalid.rsn = None;
         invalid.regulatory = Some(RegulatoryAssociationCapabilities {
             min_tx_power_dbm: 20,
             max_tx_power_dbm: 0,

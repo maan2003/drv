@@ -12,6 +12,7 @@ resolver = "3"
 fuchsia-passive = []
 rate-power-evidence-only = []
 full-firmware-production = []
+fresh-laa-diagnostic = []
 default = ["fuchsia-passive", "rate-power-evidence-only"]
 
 [dependencies]
@@ -46,6 +47,10 @@ wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea964693974
 [[bin]]
 name = "mt7921-passive-scan"
 path = "src/main.rs"
+
+[[bin]]
+name = "mt7921-netstack"
+path = "src/netstack_child.rs"
 
 [patch.crates-io]
 trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }

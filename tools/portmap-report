@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Validate and aggregate the seven normalized ath11k PORT-MAP files."""
+
+from __future__ import annotations
+import collections, pathlib, re, sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATUSES = ("ported", "ported-corrected", "wcn6750-specific", "local-seam",
+            "replaced-by-fuchsia-mlme", "kernel-substrate", "deferred", "blocked")
+HEADER = ["C symbol", "C file:lines", "Rust item", "status", "note"]
+MARKER = "<!-- PORT-MAP-SCHEMA:"
+RANGE = re.compile(r"([\w./-]+\.[ch]):(\d+)(?:-(\d+))?")
+
+def cells(line):
+    return [x.strip() for x in line.strip().strip("|").split("|")]
+
+def ranges(value, location):
+    if value in ("—", "-", ""):
+        return []
+    found = [(m.group(1), int(m.group(2)), int(m.group(3) or m.group(2)))
+             for m in RANGE.finditer(value)]
+    if not found or any(end < start for _, start, end in found):
+        raise ValueError(f"{location}: invalid inclusive C range {value!r}")
+    return found
+
+def parse(crate):
+    path = crate / "PORT-MAP.md"; lines = path.read_text().splitlines()
+    if not any(x.startswith(MARKER) for x in lines):
+        raise ValueError(f"{path}: missing PORT-MAP-SCHEMA marker")
+    try: head = next(i for i, x in enumerate(lines) if cells(x) == HEADER)
+    except StopIteration: raise ValueError(f"{path}: wrong five-column header")
+    rows = []
+    for number, line in enumerate(lines[head + 2:], head + 3):
+        if not line.startswith("|"):
+            if rows: break
+            continue
+        values = cells(line)
+        if len(values) != 5: raise ValueError(f"{path}:{number}: expected five columns")
+        row = dict(zip(HEADER, values))
+        if row["status"] not in STATUSES:
+            raise ValueError(f"{path}:{number}: invalid status {row['status']!r}")
+        row["ranges"] = ranges(row["C file:lines"], f"{path}:{number}")
+        rows.append(row)
+    return rows
+
+def item_names(cell):
+    return [x.strip().strip("`") for x in cell.split(",")
+            if x.strip().strip("`") not in ("", "—", "-")]
+
+def start_of(lines, name):
+    leaf = name.rsplit("::", 1)[-1]
+    if leaf in ("—", "-") or " " in leaf: return None
+    if "::" in name and leaf[:1].islower():
+        owner = name.rsplit("::", 2)[-2]
+        owner_pattern = re.compile(rf"\b(?:trait\s+{re.escape(owner)}|impl[^{{]*\b{re.escape(owner)}\b)")
+        for owner_start, line in enumerate(lines):
+            if not owner_pattern.search(line): continue
+            for i in range(owner_start, end_of(lines, owner_start) + 1):
+                if re.search(rf"\bfn\s+{re.escape(leaf)}\b", lines[i]): return i
+        return None
+    pats = [rf"\b(?:struct|enum|trait|type|const|static|mod)\s+{re.escape(leaf)}\b",
+            rf"\bfn\s+{re.escape(leaf)}\b"]
+    for pat in pats:
+        for i, line in enumerate(lines):
+            if re.search(pat, line): return i
+    return None
+
+def end_of(lines, start):
+    depth = 0; opened = False
+    for i in range(start, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}"); opened |= "{" in lines[i]
+        if (opened and depth == 0) or (not opened and ";" in lines[i]): return i
+    return start
+
+def rust_counts(crate, rows):
+    sources = {p: p.read_text().splitlines() for p in sorted((crate / "src").rglob("*.rs"))}
+    excluded = set()
+    for path, lines in sources.items():
+        if path.name == "tests.rs" or "tests" in path.relative_to(crate / "src").parts:
+            excluded.update((path, number) for number in range(len(lines))); continue
+        for index, line in enumerate(lines):
+            if line.strip() != "#[cfg(test)]": continue
+            start = index + 1
+            while start < len(lines) and "{" not in lines[start]: start += 1
+            if start < len(lines):
+                excluded.update((path, number) for number in range(index, end_of(lines, start) + 1))
+    assigned = {}; unresolved = set()
+    for row in rows:
+        for name in item_names(row["Rust item"]):
+            found = None
+            for path, lines in sources.items():
+                start = start_of(lines, name)
+                if start is not None: found = path, start, end_of(lines, start); break
+            if found is None: unresolved.add(name); continue
+            path, start, end = found
+            for line in range(start, end + 1):
+                key = path, line; old = assigned.get(key)
+                if key in excluded: continue
+                if old and old != row["status"]:
+                    priority = {status: i for i, status in enumerate((
+                        "ported", "ported-corrected", "local-seam", "kernel-substrate",
+                        "replaced-by-fuchsia-mlme", "deferred", "blocked", "wcn6750-specific"))}
+                    assigned[key] = max((old, row["status"]), key=priority.get)
+                else: assigned[key] = row["status"]
+    count = collections.Counter(assigned.values())
+    actual = sum(map(len, sources.values())) - len(excluded)
+    return count, actual, actual - len(assigned), len(unresolved)
+
+def fmt_ratio(a, b): return (f"{a / b:.2f}:1" if b else ("∞" if a else "—"))
+
+def main():
+    crates = sorted(
+        p.parent
+        for p in (ROOT / "crates").glob("ath11k-*/PORT-MAP.md")
+        if p.parent.name != "ath11k-qmi-qrtr"
+    )
+    if len(crates) != 7:
+        print(f"expected seven ath11k PORT-MAPs, found {len(crates)}", file=sys.stderr); return 2
+    maps = {}; unnormalized = set()
+    try:
+        for crate in crates:
+            try:
+                maps[crate] = parse(crate)
+            except ValueError:
+                if crate.name != "ath11k-platform-backend": raise
+                maps[crate] = []; unnormalized.add(crate)
+    except ValueError as error: print(error, file=sys.stderr); return 2
+    all_c = collections.Counter(); all_r = collections.Counter(); summaries = []; details = []
+    for crate, rows in maps.items():
+        # Count overlapping C ranges once per status, rather than once per row.
+        csets = {status: set() for status in STATUSES}
+        for row in rows:
+            for file, start, end in row["ranges"]:
+                csets[row["status"]].update((file, line) for line in range(start, end + 1))
+        c = collections.Counter({s: len(v) for s, v in csets.items()})
+        try: r, actual, unmapped, unresolved = rust_counts(crate, rows)
+        except ValueError as error: print(error, file=sys.stderr); return 2
+        all_c.update(c); all_r.update(r)
+        reusable = r["ported"] + r["ported-corrected"] + r["local-seam"]; chip = r["wcn6750-specific"]
+        normalized = "no" if crate in unnormalized else "yes"
+        summaries.append((crate.name, normalized, sum(c.values()), sum(r.values()), actual, reusable, chip,
+                          fmt_ratio(reusable, chip), unmapped, unresolved))
+        details += [(crate.name, s, c[s], r[s]) for s in STATUSES if c[s] or r[s]]
+    actual = sum(x[4] for x in summaries); unmapped = sum(x[8] for x in summaries)
+    unresolved = sum(x[9] for x in summaries); reusable = all_r["ported"] + all_r["ported-corrected"] + all_r["local-seam"]
+    chip = all_r["wcn6750-specific"]
+    print("# ath11k port-map report\n\n## Per crate\n")
+    print("| crate | normalized | mapped C | mapped Rust | actual Rust | reusable Rust | WCN6750 Rust | reusable:chip | unmapped Rust | unresolved items |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for row in summaries: print("| " + " | ".join(map(str, row)) + " |")
+    print(f"| **total** | **{len(crates)-len(unnormalized)}/7** | **{sum(all_c.values())}** | **{sum(all_r.values())}** | **{actual}** | **{reusable}** | **{chip}** | **{fmt_ratio(reusable, chip)}** | **{unmapped}** | **{unresolved}** |")
+    print("\n## Per crate and status\n\n| crate | status | C lines | Rust lines |\n|---|---|---:|---:|")
+    for row in details: print("| " + " | ".join(map(str, row)) + " |")
+    print("\n## Total by status\n\n| status | C lines | Rust lines |\n|---|---:|---:|")
+    for status in STATUSES: print(f"| {status} | {all_c[status]} | {all_r[status]} |")
+    print(f"| unmapped | 0 | {unmapped} |")
+    return 0
+
+if __name__ == "__main__": raise SystemExit(main())

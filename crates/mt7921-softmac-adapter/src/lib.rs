@@ -18,10 +18,10 @@ use fuchsia_softmac_port::{
     WlanSoftmacQueryResponse, construct_bss_description,
 };
 use mt7921_port_spike::{
-    CandidateChannel, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
+    CandidateChannel, ChannelSwitchReason, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
-    RegulatoryRatePowerSnapshot, SarFrequencyRange,
-    candidate_channels as capability_channels, encode_passive_mcu_command,
+    RegulatoryRatePowerSnapshot, SarFrequencyRange, candidate_channels as capability_channels,
+    conservative_channel_domain, encode_passive_mcu_command,
     regulatory_rate_power_channel_skeleton,
 };
 use std::collections::VecDeque;
@@ -176,6 +176,16 @@ pub trait Mt7921PassiveTransport {
         }
         self.set_channel(context.channel)
     }
+    /// Linux `mt7921_set_channel`: CHANNEL_SWITCH with `CH_SWITCH_NORMAL` on
+    /// the association chandef, issued before the JOIN ROC so the radio is
+    /// calibrated for the connected channel instead of staying in the scan
+    /// (`CH_SWITCH_SCAN_BYPASS_DPD`) form.
+    fn establish_client_channel(
+        &mut self,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn start_passive_scan(&mut self, command: PassiveScanCommand) -> Result<(), Self::Error>;
     fn cancel_passive_scan(&mut self, scan_id: u64) -> Result<(), Self::Error>;
     fn next_event(&mut self) -> Result<Option<TransportEvent>, Self::Error>;
@@ -190,6 +200,20 @@ pub trait Mt7921PassiveTransport {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn submit_client_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn acquire_client_join_roc(
+        &mut self,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: u64,
+        _: u32,
+    ) -> Result<u32, zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn client_join_roc_active(&mut self, _: u64) -> bool {
+        false
+    }
+    fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
@@ -219,6 +243,28 @@ pub struct PhysicalChannelContext {
     pub center_channel: u8,
     pub bandwidth: u8,
     pub center_channel2: u8,
+    pub switch_reason: ChannelSwitchReason,
+}
+
+/// Linux `ieee80211_channel_to_frequency` for the bands MT7921 serves; the
+/// client channel carries only band and number.
+pub fn client_channel_candidate(
+    channel: mt7921_port_spike::ClientPhysicalChannel,
+) -> Option<CandidateChannel> {
+    let number = channel.primary;
+    match channel.band {
+        0 if (1..=14).contains(&number) => Some(CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz2,
+            number,
+            frequency_mhz: if number == 14 { 2484 } else { 2407 + 5 * number },
+        }),
+        1 if (36..=177).contains(&number) => Some(CandidateChannel {
+            band: mt7921_port_spike::PhysicalBand::Ghz5,
+            number,
+            frequency_mhz: 5000 + 5 * number,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +319,20 @@ pub trait SourceExactPassiveMechanics {
     fn submit_client_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn acquire_client_join_roc(
+        &mut self,
+        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: u64,
+        _: u32,
+    ) -> Result<u32, zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn client_join_roc_active(&mut self, _: u64) -> bool {
+        false
+    }
+    fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn diagnostic_association_snapshot(&mut self, _: u64) -> Result<(), zx::Status> {
         Ok(())
     }
@@ -300,6 +360,7 @@ pub enum SourceExactTransportError<E> {
     UnsupportedSpatialStreams,
     MandatoryDependency(PassivePrerequisites),
     InvalidSequence,
+    InvalidChannelDomain,
     InvalidDwell,
     UnsupportedMultiChannelScan,
     ChannelNotSelected,
@@ -370,6 +431,16 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         })
     }
 
+    /// Override the interface MAC published by DEV_INFO_ACTIVE during
+    /// initialization. Linux programs DEV_INFO exactly once per interface-up
+    /// with the interface address mac80211 was given, so a client session
+    /// must present its own identity here rather than the EEPROM address;
+    /// firmware keeps the first address it saw in the RMAC own-MAC table.
+    pub fn with_interface_mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac = mac;
+        self
+    }
+
     pub fn into_mechanics(self) -> M {
         self.mechanics
     }
@@ -378,8 +449,8 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         &mut self.mechanics
     }
 
-    /// Execute the source-ordered EEPROM-buffer command and mandatory receive
-    /// preparation without enabling MAC/channel/scan operation.
+    /// Execute mandatory receive preparation without replaying loader-owned
+    /// EEPROM/protection commands.
     pub fn prepare_receive_only(
         &mut self,
     ) -> Result<PassivePrerequisites, SourceExactTransportError<M::Error>> {
@@ -390,7 +461,6 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
                 data_rx_owned: true,
             });
         }
-        self.issue(PassiveMcuCommand::EepromBufferMode)?;
         let prerequisites = self
             .mechanics
             .prepare_passive_receive()
@@ -414,13 +484,31 @@ impl<M: SourceExactPassiveMechanics> SourceExactPassiveTransport<M> {
         &mut self,
         command: PassiveMcuCommand,
     ) -> Result<(), SourceExactTransportError<M::Error>> {
-        self.mcu_sequence = self.mcu_sequence % 15 + 1;
-        let encoded = encode_passive_mcu_command(&command, self.mcu_sequence)
+        let template_sequence = self.mcu_sequence % 15 + 1;
+        let encoded = encode_passive_mcu_command(&command, template_sequence)
             .map_err(SourceExactTransportError::Encode)?;
         let wait = command.expects_response();
         self.mechanics
             .command(&command, &encoded, wait)
-            .map_err(SourceExactTransportError::Mechanics)
+            .map_err(SourceExactTransportError::Mechanics)?;
+        self.mcu_sequence = self
+            .mechanics
+            .current_mcu_sequence()
+            .unwrap_or(template_sequence);
+        Ok(())
+    }
+
+    fn install_rate_tx_power(&mut self) -> Result<(), SourceExactTransportError<M::Error>> {
+        self.mechanics
+            .install_rate_tx_power(self.capability)
+            .map_err(SourceExactTransportError::Mechanics)?;
+        if let Some(sequence) = self.mechanics.current_mcu_sequence() {
+            if !(1..=15).contains(&sequence) {
+                return Err(SourceExactTransportError::InvalidSequence);
+            }
+            self.mcu_sequence = sequence;
+        }
+        Ok(())
     }
 }
 
@@ -435,6 +523,38 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn submit_client_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         self.mechanics.submit_client_ce_no_ack(encoded)
+    }
+    fn acquire_client_join_roc(
+        &mut self,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+        generation: u64,
+        duration_ms: u32,
+    ) -> Result<u32, zx::Status> {
+        self.mechanics
+            .acquire_client_join_roc(channel, generation, duration_ms)
+    }
+    fn establish_client_channel(
+        &mut self,
+        channel: mt7921_port_spike::ClientPhysicalChannel,
+    ) -> Result<(), zx::Status> {
+        let candidate = client_channel_candidate(channel).ok_or(zx::Status::INVALID_ARGS)?;
+        if channel.center > u16::from(u8::MAX) || channel.center2 > u16::from(u8::MAX) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        self.set_channel_context(PhysicalChannelContext {
+            channel: candidate,
+            center_channel: channel.center as u8,
+            bandwidth: channel.bandwidth,
+            center_channel2: channel.center2 as u8,
+            switch_reason: ChannelSwitchReason::Normal,
+        })
+        .map_err(|_| zx::Status::IO)
+    }
+    fn client_join_roc_active(&mut self, generation: u64) -> bool {
+        self.mechanics.client_join_roc_active(generation)
+    }
+    fn abort_client_join_roc(&mut self, generation: u64) -> Result<(), zx::Status> {
+        self.mechanics.abort_client_join_roc(generation)
     }
     fn diagnostic_association_snapshot(&mut self, generation: u64) -> Result<(), zx::Status> {
         self.mechanics.diagnostic_association_snapshot(generation)
@@ -464,6 +584,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             center_channel: channel.number as u8,
             bandwidth: 0,
             center_channel2: 0,
+            switch_reason: ChannelSwitchReason::ScanBypassDpd,
         })
     }
 
@@ -471,8 +592,14 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         let channel = context.channel;
         if !self.initialized {
             self.prepare_receive_only()?;
-            self.issue(PassiveMcuCommand::ProtectCtrl)?;
+            // Registration's regulatory notifier publishes one complete SKU
+            // batch before runtime-power and PHY start.
+            self.install_rate_tx_power()?;
+            self.issue(PassiveMcuCommand::KeepFullPower)?;
             self.issue(PassiveMcuCommand::MacEnable)?;
+            let domain = conservative_channel_domain(self.capability, *b"00", true, 0)
+                .map_err(|_| SourceExactTransportError::InvalidChannelDomain)?;
+            self.issue(PassiveMcuCommand::SetChannelDomain(domain))?;
             self.issue(PassiveMcuCommand::SetRxPath {
                 // Linux starts the PHY with mac80211's initial 2.4 GHz
                 // channel definition, then applies the requested channel
@@ -485,17 +612,12 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                 },
                 antenna_mask: self.antenna_mask,
             })?;
-            self.mechanics
-                .install_rate_tx_power(self.capability)
-                .map_err(SourceExactTransportError::Mechanics)?;
-            if let Some(sequence) = self.mechanics.current_mcu_sequence() {
-                if !(1..=15).contains(&sequence) {
-                    return Err(SourceExactTransportError::InvalidSequence);
-                }
-                self.mcu_sequence = sequence;
-            }
+            self.install_rate_tx_power()?;
+            self.issue(PassiveMcuCommand::RadioLedCtrl { value: 1 })?;
+            self.issue(PassiveMcuCommand::RadioLedCtrl { value: 2 })?;
             self.issue(PassiveMcuCommand::AddDevice { mac: self.mac })?;
             self.issue(PassiveMcuCommand::AddBss)?;
+            self.issue(PassiveMcuCommand::InitialEdca)?;
             self.issue(PassiveMcuCommand::SetPassiveRxFilter)?;
             self.initialized = true;
         }
@@ -505,6 +627,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             bandwidth: context.bandwidth,
             center_channel2: context.center_channel2,
             antenna_mask: self.antenna_mask,
+            switch_reason: context.switch_reason,
         })?;
         self.selected = Some(channel);
         Ok(())
@@ -627,6 +750,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                         bandwidth: 0,
                         center_channel2: 0,
                         antenna_mask: self.antenna_mask,
+                        switch_reason: ChannelSwitchReason::ScanBypassDpd,
                     })?;
                     self.selected = Some(channel);
                     self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
@@ -911,6 +1035,10 @@ impl<T: Mt7921PassiveTransport> SoftmacHardware for Mt7921SoftmacAdapter<T> {
                 center_channel: shape.center_channel,
                 bandwidth: shape.bandwidth,
                 center_channel2: shape.center_channel2,
+                // Linux mt7921_config -> mt7921_set_channel: the configured
+                // (operating) chandef is switched with CH_SWITCH_NORMAL; only
+                // the scan-driven switches use CH_SWITCH_SCAN_BYPASS_DPD.
+                switch_reason: ChannelSwitchReason::Normal,
             })
             .map_err(|error| self.transport_failure(error))?;
         Ok(())
@@ -1133,16 +1261,17 @@ pub fn regulatory_rate_power_snapshot_from_fuchsia(
 ) -> Result<RegulatoryRatePowerSnapshot, RateTxPowerError> {
     let mut channels = regulatory_rate_power_channel_skeleton(capability)?;
     for input in &mut channels {
-        let candidate = candidates.iter().copied().find(|candidate| {
-            candidate.band == input.band && candidate.number == input.channel
-        });
+        let candidate = candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.band == input.band && candidate.number == input.channel);
         let Some(candidate) = candidate else { continue };
         if candidate.frequency_mhz != input.frequency_mhz {
             return Err(RateTxPowerError::InvalidChannelFrequency);
         }
         input.present = true;
-        let fuchsia_channel = to_fuchsia_channel(candidate)
-            .ok_or(RateTxPowerError::IncompleteSnapshot)?;
+        let fuchsia_channel =
+            to_fuchsia_channel(candidate).ok_or(RateTxPowerError::IncompleteSnapshot)?;
         input.disabled = !authorized.contains(&fuchsia_channel);
         input.max_reg_power_dbm = powers
             .iter()
@@ -1304,7 +1433,9 @@ mod tests {
         assert_eq!(&ht[16..], &[0; 10]);
         assert_eq!(
             vht,
-            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
+            [
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
+            ]
         );
         // MT7961 follows mt76_init_sband + mt7921_register_device's
         // non-MT7922 branch: SGI80 is advertised, SGI160 is not.
@@ -1337,33 +1468,35 @@ mod tests {
         );
         let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
         let regulatory = mt7921_port_spike::regulatory_rate_power_snapshot_from_regdb_v20(
-            database,
-            0,
-            *b"00",
-            capability,
-            [7; 32],
+            database, 0, *b"00", capability, [7; 32],
         )
         .unwrap();
-        let profile = crate::client_device::production_association_profile_from_query_and_regulatory(
-            &query,
-            WlanBand::FiveGhz,
-            36,
-            &regulatory,
-        )
-        .unwrap();
+        let profile =
+            crate::client_device::production_association_profile_from_query_and_regulatory(
+                &query,
+                WlanBand::FiveGhz,
+                36,
+                &regulatory,
+            )
+            .unwrap();
         assert_eq!(
             profile.ht_capabilities.unwrap(),
             [
-                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
+                0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
             ]
         );
         assert_eq!(
             profile.vht_capabilities.unwrap(),
-            [0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20]
+            [
+                0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20
+            ]
         );
         let regulatory = profile.regulatory.unwrap();
-        assert_eq!((regulatory.min_tx_power_dbm, regulatory.max_tx_power_dbm), (0, 20));
+        assert_eq!(
+            (regulatory.min_tx_power_dbm, regulatory.max_tx_power_dbm),
+            (0, 20)
+        );
         assert_eq!(
             regulatory
                 .supported_channels
@@ -1371,8 +1504,8 @@ mod tests {
                 .map(|range| (range.first, range.count))
                 .collect::<Vec<_>>(),
             [
-                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
-                128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136,
+                140, 144, 149, 153, 157, 161, 165,
             ]
             .map(|channel| (channel, 1))
         );
@@ -1723,8 +1856,14 @@ mod tests {
     #[test]
     fn real_fuchsia_adapter_drives_source_exact_passive_closure() {
         let capability = nic();
-        let transport =
-            SourceExactPassiveTransport::new(ScriptedMechanics::default(), capability).unwrap();
+        let transport = SourceExactPassiveTransport::new(
+            ScriptedMechanics {
+                mcu_sequence: Some(3),
+                ..Default::default()
+            },
+            capability,
+        )
+        .unwrap();
         let mut adapter = Mt7921SoftmacAdapter::new(
             transport,
             capability,
@@ -1749,13 +1888,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.scan_id, Some(1));
         let commands = &adapter.transport.mechanics.commands;
-        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(1));
-        assert_eq!(commands.len(), 9);
-        assert!(matches!(commands[0].0, PassiveMcuCommand::EepromBufferMode));
-        assert!(matches!(commands[1].0, PassiveMcuCommand::ProtectCtrl));
-        assert!(matches!(commands[2].0, PassiveMcuCommand::MacEnable));
+        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(0));
+        assert_eq!(commands.len(), 12);
+        assert!(matches!(commands[0].0, PassiveMcuCommand::KeepFullPower));
+        assert!(matches!(commands[1].0, PassiveMcuCommand::MacEnable));
+        assert!(matches!(
+            commands[2].0,
+            PassiveMcuCommand::SetChannelDomain(_)
+        ));
         assert!(matches!(commands[3].0, PassiveMcuCommand::SetRxPath { .. }));
-        assert_eq!(adapter.transport.mechanics.rate_power_after_commands, Some(4));
+        assert_eq!(
+            adapter.transport.mechanics.rate_power_after_commands,
+            Some(4)
+        );
+        assert_eq!(
+            adapter.transport.mechanics.rate_power_sequences,
+            [4, 5, 6, 7, 8, 9, 10, 11, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert!(matches!(
             commands[3].0,
             PassiveMcuCommand::SetRxPath {
@@ -1767,19 +1916,31 @@ mod tests {
                 antenna_mask: 3,
             }
         ));
-        assert!(matches!(commands[4].0, PassiveMcuCommand::AddDevice { .. }));
-        assert!(matches!(commands[5].0, PassiveMcuCommand::AddBss));
         assert!(matches!(
-            commands[6].0,
+            commands[4].0,
+            PassiveMcuCommand::RadioLedCtrl { value: 1 }
+        ));
+        assert!(matches!(
+            commands[5].0,
+            PassiveMcuCommand::RadioLedCtrl { value: 2 }
+        ));
+        assert!(matches!(commands[6].0, PassiveMcuCommand::AddDevice { .. }));
+        assert!(matches!(commands[7].0, PassiveMcuCommand::AddBss));
+        assert!(matches!(commands[8].0, PassiveMcuCommand::InitialEdca));
+        assert!(matches!(
+            commands[9].0,
             PassiveMcuCommand::SetPassiveRxFilter
         ));
         assert!(matches!(
-            commands[7].0,
+            commands[10].0,
             PassiveMcuCommand::ChannelSwitch { .. }
         ));
-        assert!(matches!(commands[8].0, PassiveMcuCommand::StartScan { .. }));
-        assert!(!commands[8].2);
-        let scan_request = &commands[8].1[64..];
+        assert!(matches!(
+            commands[11].0,
+            PassiveMcuCommand::StartScan { .. }
+        ));
+        assert!(!commands[11].2);
+        let scan_request = &commands[11].1[64..];
         assert_eq!(scan_request[2], 0);
         assert_eq!(scan_request[4], 0);
         assert_eq!(scan_request[5], 0);
@@ -2286,14 +2447,27 @@ mod tests {
             unknown_elements: 0,
         };
         let candidates = capability_channels(capability);
-        let authorized = vec![ChannelNumber { band: WlanBand::TwoGhz, number: 1 }];
+        let authorized = vec![ChannelNumber {
+            band: WlanBand::TwoGhz,
+            number: 1,
+        }];
         let incomplete = regulatory_rate_power_snapshot_from_fuchsia(
-            3, *b"00", capability, &candidates, &authorized, &[], Vec::new(), None,
+            3,
+            *b"00",
+            capability,
+            &candidates,
+            &authorized,
+            &[],
+            Vec::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
             mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
-                capability, &incomplete, 3, 1,
+                capability,
+                &incomplete,
+                3,
+                1,
             ),
             Err(RateTxPowerError::InvalidRegulatoryLimit)
         );
@@ -2304,7 +2478,10 @@ mod tests {
             capability,
             &candidates,
             &authorized,
-            &[FuchsiaRegulatoryPower { channel: authorized[0], max_reg_power_dbm: 17 }],
+            &[FuchsiaRegulatoryPower {
+                channel: authorized[0],
+                max_reg_power_dbm: 17,
+            }],
             Vec::new(),
             None,
         )
@@ -2314,7 +2491,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(commands.len(), 2);
-        assert_eq!(complete.channels().iter().filter(|channel| channel.present).count(), 14);
-        assert_eq!(complete.channels().iter().filter(|channel| channel.disabled).count(), 13);
+        assert_eq!(
+            complete
+                .channels()
+                .iter()
+                .filter(|channel| channel.present)
+                .count(),
+            14
+        );
+        assert_eq!(
+            complete
+                .channels()
+                .iter()
+                .filter(|channel| channel.disabled)
+                .count(),
+            13
+        );
     }
 }

@@ -1,0 +1,11 @@
+time=2026-09-08T12:40:36+05:30
+np_usb_device=18d1:4ee4 POCO X5 Pro
+np_usb_interface=enp103s0f3u1 172.16.42.2/24
+redwood_usb_interface=usb0 172.16.42.1/24
+precondition=checked-in transaction self-test SELF_TEST_RESTORE_OK
+experiment=transaction set wlan0 link down for 20 seconds
+independent_usb_ssh=wlan0 operstate down; command returned USB_SSH_WITH_WLAN_DOWN_OK over ProxyJump np to 172.16.42.1
+wifi_management_path=unavailable during interval
+restore=trap invoked; iwd restarted; RESTORE_OK persisted locally
+postcondition=wlan0 up; DHCP 172.20.10.7/28; lab.conf rw SSH restored
+result=USB ECM is a proven OOB SSH recovery path
