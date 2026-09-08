@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! Client (STA) TCL transmit and WBM completion path.
 
 use alloc::vec::Vec;

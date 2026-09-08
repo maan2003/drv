@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! Non-coherent packet-buffer DMA lifecycle owned by the data path.
 
 use alloc::vec;

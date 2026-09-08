@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! Host-target transport (HTT) wire messages from `dp.h`.
 
 use alloc::vec::Vec;

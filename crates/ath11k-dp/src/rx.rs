@@ -1,3 +1,4 @@
+// PORT-MAP: wcn6750-specific
 //! WCN6750 RX descriptor operations selected by `wcn6750_ops`.
 //!
 //! WCN6750 deliberately uses the QCN9074 RX TLV layout in the pinned source.

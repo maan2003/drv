@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 //! Data-driven native HTT trace parsing and byte-exact verification.
 //!
 //! Capture tooling writes `artifacts/redwood-native-ath11k/htt/ordered.jsonl`.

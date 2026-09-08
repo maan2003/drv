@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 //! HTT carriage over the HTC data-message service.
 
 use ath11k_ce::{HtcServiceTransport, RxFrame, ServiceId, Transport, TxFrame};
