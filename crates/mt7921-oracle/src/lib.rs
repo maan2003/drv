@@ -83,6 +83,27 @@ mod tests {
         rate_legacy: u16,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CUnsolicitedResult {
+        kind: u8,
+        queued: u8,
+        freed: u8,
+        connection_loss: u8,
+        fw_assert: u8,
+        reset_requested: u8,
+        bss_index: u8,
+        reason: u8,
+        token: u8,
+        status: u8,
+        primary_channel: u8,
+        band: u8,
+        bandwidth: u8,
+        center_channel: u8,
+        request_type: u8,
+        max_interval_ms: u32,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -195,6 +216,14 @@ mod tests {
             prior_rate_flags: u8,
             prior_he_gi: u8,
             output: *mut CTxsResult,
+        ) -> i32;
+        fn oracle_mt7921_unsolicited(
+            input: *const u8,
+            input_len: usize,
+            active_bss: u8,
+            beacon_filter: bool,
+            station: bool,
+            output: *mut CUnsolicitedResult,
         ) -> i32;
     }
 
@@ -681,6 +710,31 @@ mod tests {
         bytes
     }
 
+    fn c_unsolicited(
+        bytes: &[u8],
+        active_bss: u8,
+        beacon_filter: bool,
+        station: bool,
+    ) -> CUnsolicitedResult {
+        let mut result = CUnsolicitedResult::default();
+        // SAFETY: the input slice and output value are live for the call and
+        // C receives the exact input length.
+        assert_eq!(
+            unsafe {
+                oracle_mt7921_unsolicited(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    active_bss,
+                    beacon_filter,
+                    station,
+                    &mut result,
+                )
+            },
+            0
+        );
+        result
+    }
+
     fn words(bytes: [u8; 16]) -> CDescriptor {
         CDescriptor {
             buf0: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -715,7 +769,107 @@ mod tests {
         assert_eq!((rust.wcid, rust.pid, rust.acked), (19, 2, true));
     }
 
+    #[test]
+    fn scheduled_scan_done_is_queued_by_linux_but_has_no_rust_decoder() {
+        let bytes = response_bytes(0, 0x23, 0, 0, &[7, 1, 0, 0]);
+        let c = c_unsolicited(&bytes, 0, true, true);
+        assert_eq!((c.kind, c.queued, c.freed), (2, 1, 0));
+        assert_eq!(
+            mt7921_core::parse_passive_scan_done(&bytes),
+            Err(mt7921_core::PassiveRxError::WrongEvent)
+        );
+    }
+
+    #[test]
+    fn coredump_is_retained_and_reset_is_deferred_by_linux() {
+        let bytes = response_bytes(0, 0xf0, 0, 0, &[0xde, 0xad, 0xbe, 0xef]);
+        let header = mt76_core::parse_download_response(&bytes, 0).unwrap();
+        let c = c_unsolicited(&bytes, 0, true, true);
+        assert_eq!(header.event_id, 0xf0);
+        assert_eq!(&bytes[36..], &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            (c.kind, c.queued, c.freed, c.fw_assert, c.reset_requested),
+            (4, 1, 0, 1, 0)
+        );
+    }
+
     proptest! {
+        #[test]
+        fn beacon_loss_fields_and_linux_connection_filter_are_source_exact(
+            sequence: u8,
+            event_bss: u8,
+            reason: u8,
+            active_bss: u8,
+            beacon_filter: bool,
+            station: bool,
+        ) {
+            let bytes = response_bytes(sequence, 0x13, 0, 0, &[event_bss, reason, 0, 0]);
+            let header = mt76_core::parse_download_response(&bytes, sequence).unwrap();
+            let c = c_unsolicited(&bytes, active_bss, beacon_filter, station);
+            prop_assert_eq!(header.event_id, 0x13);
+            prop_assert_eq!((c.kind, c.freed, c.queued), (1, 1, 0));
+            prop_assert_eq!((c.bss_index, c.reason), (event_bss, reason));
+            prop_assert_eq!(c.connection_loss != 0, event_bss == active_bss && beacon_filter && station);
+        }
+
+        #[test]
+        fn scan_done_decoding_matches_linux_retained_bytes(
+            scan_sequence: u8,
+            completed_channels: u8,
+            beacon_scan_count: u32,
+            alpha2: [u8; 2],
+        ) {
+            let mut body = [0u8; 20];
+            body[0] = scan_sequence;
+            body[4] = completed_channels;
+            body[8..12].copy_from_slice(&beacon_scan_count.to_le_bytes());
+            body[17..19].copy_from_slice(&alpha2);
+            let bytes = response_bytes(0, 0x0d, 0, 0, &body);
+            let c = c_unsolicited(&bytes, 0, true, true);
+            let rust = mt7921_core::parse_passive_scan_done(&bytes).unwrap();
+            prop_assert_eq!((c.kind, c.queued, c.freed), (2, 1, 0));
+            prop_assert_eq!(rust.scan_sequence, scan_sequence & 0x7f);
+            prop_assert_eq!(rust.completed_channels, completed_channels);
+            prop_assert_eq!(rust.beacon_scan_count, beacon_scan_count);
+            prop_assert_eq!(rust.alpha2, alpha2);
+        }
+
+        #[test]
+        fn uni_roc_grant_decoding_matches_linux(
+            bss_index: u8,
+            token: u8,
+            status: u8,
+            primary_channel: u8,
+            band: u8,
+            bandwidth: u8,
+            center_channel: u8,
+            request_type: u8,
+            max_interval_ms: u32,
+        ) {
+            let mut body = [0u8; 24];
+            body[4..8].copy_from_slice(&[0, 0, 20, 0]);
+            body[8] = bss_index;
+            body[9] = token;
+            body[10] = status;
+            body[11] = primary_channel;
+            body[13] = band;
+            body[14] = bandwidth;
+            body[15] = center_channel;
+            body[17] = request_type;
+            body[20..24].copy_from_slice(&max_interval_ms.to_le_bytes());
+            let bytes = response_bytes(0, 0x27, 1 << 2, 0, &body);
+            let c = c_unsolicited(&bytes, 0, true, true);
+            let rust = mt7921_core::parse_client_join_roc_grant(&bytes).unwrap();
+            prop_assert_eq!((c.kind, c.freed, c.queued), (3, 1, 0));
+            prop_assert_eq!(
+                (c.bss_index, c.token, c.status, c.primary_channel, c.band,
+                 c.bandwidth, c.center_channel, c.request_type, c.max_interval_ms),
+                (rust.bss_index, rust.token, rust.status, rust.primary_channel,
+                 rust.band, rust.bandwidth, rust.center_channel,
+                 rust.request_type, rust.max_interval_ms)
+            );
+        }
+
         #[test]
         fn reportable_mpdu_txs_status_and_rate_fields_match_linux(
             pid in 3u8..=u8::MAX,

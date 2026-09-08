@@ -30,6 +30,16 @@ minimal station/status-queue stub. It compares MPDU ACK/PID/WCID behavior and
 exercises the rate mode, MCS, NSS/STBC, bandwidth, legacy, and HE fields read
 by Linux.
 
+Unsolicited MCU coverage applies the pinned
+`mt7921_mcu_rx_event`/`mt7921_mcu_rx_unsolicited_event` dispatch assignments
+to beacon loss, ordinary and scheduled scan completion, and coredump events,
+plus the separate UNI unsolicited ROC path. The C side normalizes ownership
+(free versus retain), connection-loss filtering, firmware-assert/reset timing,
+and the event fields Linux consumes. Ordinary scan completion and ROC grant
+fields are compared with the public Rust decoders; event types without a Rust
+decoder are compared at the common MCU header/raw-body boundary and recorded
+in `MISMATCHES.md` rather than papered over with a test-only decoder.
+
 Most MAC TX/RX consumers are too coupled to mac80211, station/vif, PHY, and
 skb state to extract usefully. Their oracle wrappers therefore use pinned
 macros and exact descriptor assignments with those inputs fixed to the public

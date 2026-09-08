@@ -4,6 +4,99 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+/* Normalized observations from the pinned mt7921_mcu_rx_event ->
+ * mt7921_mcu_{,uni_}rx_unsolicited_event path and the four children exercised
+ * by the Rust client seam.  These are source-exact field assignments: scan
+ * and coredump retain the complete skb in Linux, while beacon loss and ROC
+ * consume the fields below before freeing it. */
+struct oracle_unsolicited_result {
+    uint8_t kind;
+    uint8_t queued;
+    uint8_t freed;
+    uint8_t connection_loss;
+    uint8_t fw_assert;
+    uint8_t reset_requested;
+    uint8_t bss_index;
+    uint8_t reason;
+    uint8_t token;
+    uint8_t status;
+    uint8_t primary_channel;
+    uint8_t band;
+    uint8_t bandwidth;
+    uint8_t center_channel;
+    uint8_t request_type;
+    uint32_t max_interval_ms;
+};
+
+int oracle_mt7921_unsolicited(const uint8_t *input, size_t input_len,
+                              uint8_t active_bss, bool beacon_filter,
+                              bool station,
+                              struct oracle_unsolicited_result *out)
+{
+    const struct mt76_connac2_mcu_rxd *rxd;
+    const uint8_t *body;
+
+    if (!input || !out || input_len < sizeof(*rxd))
+        return -1;
+    memset(out, 0, sizeof(*out));
+    rxd = (const struct mt76_connac2_mcu_rxd *)input;
+    body = input + sizeof(*rxd);
+
+    /* mt7921_mcu_rx_event gives the UNI option precedence over legacy EIDs. */
+    if (rxd->option & BIT(2)) {
+        uint32_t interval;
+        const uint8_t *grant;
+        if (rxd->eid != 0x27) {
+            out->freed = 1;
+            return 0;
+        }
+        if (input_len < sizeof(*rxd) + 4 + 20)
+            return -2;
+        grant = body + 4; /* rxd->tlv + UNI event header */
+        out->kind = 3;
+        out->bss_index = grant[4];
+        out->token = grant[5];
+        out->status = grant[6];
+        out->primary_channel = grant[7];
+        out->band = grant[9];
+        out->bandwidth = grant[10];
+        out->center_channel = grant[11];
+        out->request_type = grant[13];
+        memcpy(&interval, grant + 16, sizeof(interval));
+        out->max_interval_ms = le32_to_cpu(interval);
+        out->freed = 1;
+        return 0;
+    }
+
+    switch (rxd->eid) {
+    case 0x13: /* MCU_EVENT_BSS_BEACON_LOSS */
+        if (input_len < sizeof(*rxd) + 4)
+            return -2;
+        out->kind = 1;
+        out->bss_index = body[0];
+        out->reason = body[1];
+        out->connection_loss = body[0] == active_bss && beacon_filter && station;
+        out->freed = 1;
+        break;
+    case 0x23: /* MCU_EVENT_SCHED_SCAN_DONE */
+    case 0x0d: /* MCU_EVENT_SCAN_DONE */
+        out->kind = 2;
+        out->queued = 1;
+        break;
+    case 0xf0: /* MCU_EVENT_COREDUMP */
+        out->kind = 4;
+        out->queued = 1;
+        out->fw_assert = 1;
+        /* Reset occurs later in mt7921_coredump_work, never in RX context. */
+        out->reset_requested = 0;
+        break;
+    default:
+        out->freed = 1;
+        break;
+    }
+    return 0;
+}
+
 struct oracle_txs_result {
     uint8_t skb_completed;
     uint8_t acked;
