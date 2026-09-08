@@ -34,18 +34,32 @@ impl FirmwareAssets for Wcn6750FirmwareAssets {
 /// allocation-derived IOMMU addresses can be returned to firmware.
 pub struct HardwareMemoryProvider<B: Backend> {
     device: Device<B>,
-    device_bar_region: u8,
+    device_bar_region: Option<u8>,
     firmware: Vec<CoherentDma<B, Bidirectional>>,
     device_bar: Option<MmioRegion<B>>,
+    device_bar_request: Option<(u64, u32)>,
 }
 
 impl<B: Backend> HardwareMemoryProvider<B> {
     pub fn new(device: Device<B>, device_bar_region: u8) -> Self {
         Self {
             device,
-            device_bar_region,
+            device_bar_region: Some(device_bar_region),
             firmware: Vec::new(),
             device_bar: None,
+            device_bar_request: None,
+        }
+    }
+
+    /// Record the QMI-selected hybrid BAR without mapping a VFIO region.
+    /// Used by the first hardware pass that discovers the DT reg value.
+    pub fn discover_device_bar(device: Device<B>) -> Self {
+        Self {
+            device,
+            device_bar_region: None,
+            firmware: Vec::new(),
+            device_bar: None,
+            device_bar_request: None,
         }
     }
 
@@ -56,9 +70,12 @@ impl<B: Backend> HardwareMemoryProvider<B> {
     pub fn device_bar(&self) -> Option<&MmioRegion<B>> {
         self.device_bar.as_ref()
     }
-
     pub fn take_device_bar(&mut self) -> Option<MmioRegion<B>> {
         self.device_bar.take()
+    }
+
+    pub fn device_bar_request(&self) -> Option<(u64, u32)> {
+        self.device_bar_request
     }
 }
 
@@ -119,12 +136,15 @@ impl<B: Backend> MemoryProvider for HardwareMemoryProvider<B> {
         Ok(region)
     }
 
-    fn map_device_bar(&mut self, _: u64, size: u32) -> Result<(), QmiError> {
-        let region = self
-            .device
-            .open_region_sized(self.device_bar_region, size as usize)
-            .map_err(qmi_transport_error)?;
-        self.device_bar = Some(region);
+    fn map_device_bar(&mut self, address: u64, size: u32) -> Result<(), QmiError> {
+        self.device_bar_request = Some((address, size));
+        if let Some(index) = self.device_bar_region {
+            let region = self
+                .device
+                .open_region_sized(index, size as usize)
+                .map_err(qmi_transport_error)?;
+            self.device_bar = Some(region);
+        }
         Ok(())
     }
 }
@@ -163,6 +183,17 @@ where
         self.handshake.init_service(&mut self.transport)?;
         self.service_started = true;
         Ok(())
+    }
+
+    pub fn discover_device_bar(&mut self) -> Result<(), QmiError> {
+        if !self.service_started {
+            self.init_service()?;
+        }
+        self.handshake.discover_device_bar(&mut self.transport)
+    }
+
+    pub fn memory(&self) -> &M {
+        self.handshake.memory()
     }
 
     pub fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, QmiError> {

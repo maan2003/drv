@@ -950,12 +950,6 @@ impl ath11k_core::WmiTraceSink for JsonTrace {
     }
 }
 
-fn control_deadline() -> u64 {
-    userspace_vfio::monotonic_time_ns()
-        .unwrap_or(0)
-        .saturating_add(10_000_000_000)
-}
-
 type LiveSubsystems = ath11k_core::Wcn6750Subsystems<
     LinuxVfio,
     QrtrTransport,
@@ -974,11 +968,20 @@ pub struct RealHost {
     dp_interrupts: Option<ath11k_core::Wcn6750DpInterrupts<LinuxVfio>>,
     qrtr: Option<QrtrTransport>,
     firmware: Option<ath11k_core::Wcn6750FirmwareAssets>,
+    vfio_regions: Vec<VfioRegion>,
     wmi_log: Option<PathBuf>,
     device: Option<LiveDevice>,
     vdev: Option<ath11k_core::VdevId>,
     summary: Option<ScanSummary>,
     dp_poll_log: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VfioRegion {
+    index: u32,
+    flags: u32,
+    size: u64,
+    offset: u64,
 }
 
 fn diagnose_iommufd_open(error: &str) -> String {
@@ -1075,10 +1078,24 @@ impl Host for RealHost {
             })
         })?;
         let resources = vfio
-            .validate_wcn6750_resources(0, 0x20_0000)
-            .map_err(|error| {
-                Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
+            .inspect_wcn6750_resources()
+            .map_err(|error| Error::Hardware(format!("inspect WCN6750 VFIO resources: {error}")))?;
+        self.vfio_regions.clear();
+        for index in 0..resources.num_regions {
+            let region = vfio.region_info(index).map_err(|error| {
+                Error::Hardware(format!("query WCN6750 VFIO region {index}: {error}"))
             })?;
+            println!(
+                "vfio_region index={} flags={:#x} size={:#x} offset={:#x}",
+                region.index, region.flags, region.size, region.offset
+            );
+            self.vfio_regions.push(VfioRegion {
+                index: region.index,
+                flags: region.flags,
+                size: region.size,
+                offset: region.offset,
+            });
+        }
         if let Some(containment) = remoteproc_containment_for_resources(
             resources.reset_supported,
             Path::new(REMOTEPROC_CLASS),
@@ -1130,8 +1147,6 @@ impl Host for RealHost {
     }
 
     fn qmi(&mut self) -> Result<(), Error> {
-        use ath11k_core::Lifecycle as _;
-
         let transport = self.qrtr.take().ok_or(Error::Unsupported(
             "QMI requested before resource acquisition",
         ))?;
@@ -1139,36 +1154,32 @@ impl Host for RealHost {
             .hardware
             .take()
             .ok_or(Error::Unsupported("QMI requested before VFIO acquisition"))?;
-        let waiter = self.waiter.take().ok_or(Error::Unsupported(
-            "QMI requested before interrupt acquisition",
-        ))?;
-        let dp_interrupts = self.dp_interrupts.take().ok_or(Error::Unsupported(
-            "QMI requested before DP interrupt acquisition",
-        ))?;
         let assets = self
             .firmware
             .take()
             .ok_or(Error::Unsupported("QMI requested before firmware loading"))?;
-        let path = self.wmi_log.as_ref().ok_or(Error::Unsupported(
-            "real mode requires a WMI run-record destination",
-        ))?;
-        let file = File::create(path).map_err(|source| Error::Io {
-            action: "create WMI JSONL run record",
-            source,
+        let memory = ath11k_core::HardwareMemoryProvider::discover_device_bar(hardware);
+        let mut qmi = ath11k_core::Wcn6750QmiSession::new(transport, assets, memory);
+        qmi.discover_device_bar().map_err(|error| {
+            Error::Hardware(format!("QMI server/device-info exchange failed: {error:?}"))
         })?;
-        let memory = ath11k_core::HardwareMemoryProvider::new(hardware.clone(), 0);
-        let qmi = ath11k_core::Wcn6750QmiSession::new(transport, assets, memory);
-        let subsystems = ath11k_core::Wcn6750Subsystems::new(
-            qmi,
-            hardware,
-            waiter,
-            dp_interrupts,
-            control_deadline as fn() -> u64,
-            JsonTrace(WmiJsonl::new(BufWriter::new(file))),
-        );
-        let mut device = ath11k_core::WCN6750.device(subsystems);
-        device.probe().map_err(Error::Core)?;
-        self.device = Some(device);
+        let (bar_address, bar_size) = qmi
+            .memory()
+            .device_bar_request()
+            .ok_or_else(|| Error::Hardware("QMI DeviceInfo did not publish a BAR".into()))?;
+        println!("qmi_device_info bar_addr={bar_address:#x} bar_size={bar_size:#x}");
+        if let Some(region) = self
+            .vfio_regions
+            .iter()
+            .find(|region| region.size == u64::from(bar_size))
+        {
+            println!(
+                "qmi_device_bar_vfio_match index={} flags={:#x} size={:#x} offset={:#x}",
+                region.index, region.flags, region.size, region.offset
+            );
+        } else {
+            println!("qmi_device_bar_vfio_match unavailable; stopping before MMIO/CE/HTC");
+        }
         Ok(())
     }
 
