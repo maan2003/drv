@@ -435,16 +435,9 @@ mod tests {
             frame[0..2].copy_from_slice(&(u16::from(subtype) << 4).to_le_bytes());
             let rust = mt7921_core::encode_client_management_tx(
                 &frame, u64::from(txwi_iova), u64::from(frame_iova), token, pid).unwrap();
-            let mut normalized_c = c_management_txwi(
+            let c = c_management_txwi(
                 frame_len, frame_iova, token, pid, subtype);
-            if subtype != 11 {
-                // Confirmed valid-domain difference: the public encoder
-                // rewrites TXD2 but leaves the auth-shaped TXD7 subtype.
-                prop_assert_eq!(&rust.txwi[28..32], &(11u32 << 16).to_le_bytes());
-                prop_assert_eq!(&normalized_c[28..32], &(u32::from(subtype) << 16).to_le_bytes());
-                normalized_c[28..32].copy_from_slice(&rust.txwi[28..32]);
-            }
-            prop_assert_eq!(rust.txwi, normalized_c);
+            prop_assert_eq!(rust.txwi, c);
             prop_assert_eq!(words(rust.descriptor.to_le_bytes()),
                 c_dma((u64::from(txwi_iova), 64), None, 0));
         }
@@ -473,14 +466,7 @@ mod tests {
             prop_assert_eq!(c.payload_offset as usize + frame.len(), bytes.len());
             prop_assert_eq!(rust.bytes, frame);
             prop_assert_eq!(rust.channel, c.channel);
-            let normalized_signal = [rcpi0, rcpi1].into_iter()
-                .map(|rcpi| ((i16::from(rcpi) - 220) / 2) as i8)
-                .max().unwrap();
-            prop_assert_eq!(rust.rssi_dbm, normalized_signal);
-            let linux_signal = [rcpi0, rcpi1].into_iter()
-                .map(|rcpi| ((i16::from(rcpi) - 220).div_euclid(2)) as i8)
-                .max().unwrap();
-            prop_assert_eq!(c.signal, linux_signal);
+            prop_assert_eq!(rust.rssi_dbm, c.signal);
             prop_assert_eq!(rust.pn, group1.map(|pn| [pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]]));
         }
 
