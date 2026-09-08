@@ -13,9 +13,10 @@ cargo run -p ath11k-bringup -- --dry-run
 ```
 
 Real mode acquires exclusive VFIO ownership first, then AF_QIPCRTR. The default
-is the non-coherent DMA broker required for unproven Redwood coherency.
-`--coherent` is an explicit opt-in and must only be used after coherency has
-been proved. Use `--stop-after` to bound execution:
+opens the supplied VFIO cdev, binds it to `/dev/iommu`, allocates and attaches
+an IOAS, and uses the coherent mapping path selected for kernel #3's first
+hardware run. `--broker` explicitly selects the narrowed default-domain broker
+once that kernel patch exists. Use `--stop-after` to bound execution:
 
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \

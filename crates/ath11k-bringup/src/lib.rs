@@ -73,7 +73,7 @@ impl FromStr for Stage {
 pub struct Cli {
     pub dry_run: bool,
     pub stop_after: Stage,
-    pub coherent: bool,
+    pub broker: bool,
     pub vfio_device: Option<PathBuf>,
     pub board: PathBuf,
     pub regdb: PathBuf,
@@ -85,7 +85,7 @@ impl Default for Cli {
         Self {
             dry_run: false,
             stop_after: Stage::PassiveScan,
-            coherent: false,
+            broker: false,
             vfio_device: None,
             board: DEFAULT_BOARD.into(),
             regdb: DEFAULT_REGDB.into(),
@@ -110,7 +110,10 @@ impl Cli {
             };
             match argument.as_str() {
                 "--dry-run" => cli.dry_run = true,
-                "--coherent" => cli.coherent = true,
+                "--coherent" => {
+                    return Err("--coherent is now the default; omit it or use --broker".into());
+                }
+                "--broker" => cli.broker = true,
                 "--stop-after" => {
                     cli.stop_after = value("--stop-after", &mut arguments)?.parse()?
                 }
@@ -124,8 +127,8 @@ impl Cli {
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
         }
-        if cli.dry_run && cli.coherent {
-            return Err("--coherent has no effect with --dry-run".into());
+        if cli.dry_run && cli.broker {
+            return Err("--broker has no effect with --dry-run".into());
         }
         if !cli.dry_run && cli.vfio_device.is_none() {
             return Err(format!(
@@ -138,7 +141,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--coherent]"
+    "usage: ath11k-bringup [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -304,12 +307,12 @@ pub struct RealHost {
 
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
-        let vfio = if config.coherent {
-            LinuxVfio::open_coherent(config.vfio_device.as_ref().ok_or(Error::Unsupported(
+        let vfio = if config.broker {
+            LinuxVfio::open_broker(config.vfio_device.as_ref().ok_or(Error::Unsupported(
                 "real mode requires an explicit VFIO cdev path",
             ))?)
         } else {
-            LinuxVfio::open_broker(config.vfio_device.as_ref().ok_or(Error::Unsupported(
+            LinuxVfio::open_coherent(config.vfio_device.as_ref().ok_or(Error::Unsupported(
                 "real mode requires an explicit VFIO cdev path",
             ))?)
         }
@@ -567,16 +570,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_cli_and_broker_is_default() {
+    fn parses_cli_and_cdev_iommufd_is_default() {
         let cli = Cli::parse(["--dry-run", "--stop-after", "qmi", "--board", "/b"]).unwrap();
         assert!(cli.dry_run);
-        assert!(!cli.coherent);
+        assert!(!cli.broker);
         assert_eq!(cli.stop_after, Stage::Qmi);
         assert_eq!(cli.board, PathBuf::from("/b"));
         assert_eq!(cli.regdb, PathBuf::from(DEFAULT_REGDB));
         assert!(Cli::parse(["--stop-after", "unknown"]).is_err());
         assert!(Cli::parse([] as [&str; 0]).is_err());
-        assert!(Cli::parse(["--dry-run", "--coherent"]).is_err());
+        assert!(Cli::parse(["--dry-run", "--broker"]).is_err());
+        assert!(Cli::parse(["--coherent"]).is_err());
     }
 
     #[test]
