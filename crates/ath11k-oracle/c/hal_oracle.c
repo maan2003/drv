@@ -258,6 +258,69 @@ int oracle_hal_ring_geometry(u8 type, u8 ring_number, u8 mac_id,
     return id < 172 ? (int)id : -1;
 }
 
+u8 oracle_hal_srng_setup(u8 type, u8 ring_number, u16 entries, u32 flags,
+                         u32 batch, u32 timer, u32 low, u64 msi, u32 msi_data,
+                         u32 max_buffer, u64 ring_address, u64 rdp_address,
+                         u8 kind[20], u32 offset[20], u64 value[20], u32 extra[20]) {
+    /* LMAC rings are configured by firmware, with no host MMIO writes. */
+    if (type >= 14)
+        return 0;
+    static const u32 r0_base[] = {
+        0x00a381ec, 0x00a383fc, 0x00a3813c, 0x00a380e4, 0x00a38504,
+        0x00a44694, 0x00a4479c, 0x00a448a4,
+        0x01b80000, 0x01b81000, 0x01b81058,
+        0x00a34874, 0x00a341ec, 0x00a34924,
+    };
+    static const u32 r2_base[] = {
+        0x00a3b028, 0x00a3b058, 0x00a3b018, 0x00a3b010, 0x00a3b070,
+        0x00a46000, 0x00a46018, 0x00a46030,
+        0x01b80400, 0x01b81400, 0x01b81408,
+        0x00a370b0, 0x00a37018, 0x00a370c0,
+    };
+    static const u32 r0_stride[] = {0x58,0,0,0,0,0x58,0,0,0x2000,0x2000,0x2000,0,0,0x58};
+    static const u32 r2_stride[] = {8,0,0,0,0,8,0,0,0x2000,0x2000,0x2000,0,0,8};
+    static const u8 words[] = {16,16,8,10,26,8,8,9,4,2,4,2,8,8};
+    static const u16 start[] = {0,4,5,8,9,16,24,25,32,56,80,104,105,106};
+    static const u8 source[] = {0,0,1,1,0,1,1,0,1,1,0,1,1,0};
+    u32 r0 = r0_base[type] + ring_number * r0_stride[type];
+    u32 r2 = r2_base[type] + ring_number * r2_stride[type];
+    u32 id = start[type] + ring_number;
+    u32 ring_words = entries * words[type];
+    u8 n = 0;
+#define OP(k, o, v, e) do { kind[n]=(k); offset[n]=(o); value[n]=(v); extra[n]=(e); n++; } while (0)
+    u8 src = source[type];
+    u32 intr0 = src ? 0x30 : 0x24;
+    if (flags & 0x20000) {
+        OP(1, r0 + 0x48, (u32)msi, 0);
+        OP(1, r0 + 0x4c, ((msi >> 32) & 0xff) | 0x100, 0);
+        OP(1, r0 + 0x50, msi_data, 0);
+    }
+    OP(2, r0, ring_address, r0 + 4);
+    OP(0, r0 + 4, (ring_address >> 32) & 0xff, 0);
+    OP(1, r0 + 4, ((ring_address >> 32) & 0xff) | (ring_words << 8), 0);
+    OP(1, r0 + 8, src ? words[type] : (id << 8) | words[type], 0);
+    if (src && id == 104) {
+        OP(2, r0, ring_address, r0 + 4);
+        OP(0, r0 + 4, (ring_address >> 32) & 0xff, 0);
+        OP(1, r0 + 4, ((ring_address >> 32) & 0xff) | (ring_words << 8), 0);
+    }
+    OP(1, r0 + intr0, ((src ? timer : timer >> 3) << 16) | batch * words[type], 0);
+    if (src)
+        OP(1, r0 + 0x34, (flags & 0x10000) ? low * words[type] : 0, 0);
+    if (!(src && id == 104))
+        OP(2, r0 + (src ? 0x1c : 0x14), rdp_address + id * 4,
+           r0 + (src ? 0x20 : 0x18));
+    OP(1, r2, 0, 0);
+    OP(1, r2 + 4, 0, 0);
+    OP(1, r0 + 0x10, 0x40 | (src ? 2 : 0) | (flags & 0x38), 0);
+    if (type == 9) {
+        OP(0, r0 + 0xb0, 0, 0);
+        OP(1, r0 + 0xb0, max_buffer & 0xffff, 0);
+    }
+#undef OP
+    return n;
+}
+
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
     struct buffer_addr d;
     set_addr(&d, address, cookie, manager);

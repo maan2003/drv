@@ -18,7 +18,8 @@ result-ath11k`, or set `ATH11K_REFERENCE_DIR` to its
 
 The HAL differential suite uses the descriptor layouts and masks from the same
 pinned `hal_desc.h`, `hal_rx.h`, `hal_rx.c`, `hal_tx.c`, and `hal.c`. It covers
-every WCN6750 ring's entry size, capacity, and ID geometry, the client-path
+every WCN6750 ring's entry size, capacity, and ID geometry; the complete ordered
+SRNG setup register trace for every host ring and the empty LMAC branch; the client-path
 TCL command, its complete 32-byte TLV ring entry, and
 DP field selection (including raw OPEN encryption and the QCN9074 mesh bit), every
 DSCP-to-TID map entry, RX buffer
