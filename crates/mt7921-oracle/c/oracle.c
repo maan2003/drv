@@ -1,6 +1,43 @@
 _Static_assert(sizeof(struct mt76_connac2_mcu_txd) == 64,
                "legacy MCU TXD layout changed");
 _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
+_Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
+               "MCU RXD layout changed");
+
+struct oracle_mcu_response {
+    int32_t result;
+    uint32_t payload_offset;
+    uint16_t length;
+    uint16_t packet_type;
+    uint8_t event_id;
+    uint8_t sequence;
+    uint8_t option;
+    uint8_t extended_event_id;
+};
+
+int oracle_mcu_parse_response(const uint8_t *input, size_t input_len, int cmd,
+                              int sequence, struct oracle_mcu_response *out)
+{
+    uint8_t storage[4096];
+    struct sk_buff skb;
+    struct mt76_dev dev = {0};
+    struct mt76_connac2_mcu_rxd *rxd;
+    if (!input || !out || input_len < sizeof(*rxd) || input_len > sizeof(storage))
+        return -1;
+    memcpy(storage, input, input_len);
+    skb.data = storage;
+    skb.len = input_len;
+    rxd = (struct mt76_connac2_mcu_rxd *)skb.data;
+    out->length = le16_to_cpu(rxd->len);
+    out->packet_type = le16_to_cpu(rxd->pkt_type_id);
+    out->event_id = rxd->eid;
+    out->sequence = rxd->seq;
+    out->option = rxd->option;
+    out->extended_event_id = rxd->ext_eid;
+    out->result = mt7921_mcu_parse_response(&dev, cmd, &skb, sequence);
+    out->payload_offset = (uint32_t)(skb.data - storage);
+    return 0;
+}
 
 int oracle_mcu_fill(const uint8_t *payload, size_t payload_len, int cmd,
                     uint8_t sequence, uint8_t *out, size_t out_len)

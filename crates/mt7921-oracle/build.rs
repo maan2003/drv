@@ -31,6 +31,7 @@ fn main() {
 fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     let mt76 = root.join("drivers/net/wireless/mediatek/mt76");
     let mcu = std::fs::read_to_string(mt76.join("mt76_connac_mcu.c")).expect("read MCU C");
+    let mt7921_mcu = std::fs::read_to_string(mt76.join("mt7921/mcu.c")).expect("read MT7921 MCU C");
     let dma = std::fs::read_to_string(mt76.join("dma.c")).expect("read DMA C");
     let mcu_function = item(
         &mcu,
@@ -47,12 +48,17 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
         "static int\nmt76_dma_add_rx_buf(",
         "static int\nmt76_dma_add_buf(",
     );
+    let response_function = item(
+        &mt7921_mcu,
+        "int mt7921_mcu_parse_response(",
+        "EXPORT_SYMBOL_GPL(mt7921_mcu_parse_response);",
+    );
     let wrapper = std::fs::read_to_string(manifest.join("c/oracle.c")).expect("read wrapper");
     let generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("mt76_oracle.c");
     std::fs::write(
         &generated,
         format!(
-            "{}\n{mcu_function}\n{dma_rx_function}\n{dma_function}\n{wrapper}",
+            "{}\n{mcu_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{wrapper}",
             prelude()
         ),
     )
@@ -123,10 +129,12 @@ struct mt76_connac2_mcu_txd { __le32 txd[8]; __le16 len; __le16 pq_id; u8 cid; u
 struct mt76_connac2_mcu_uni_txd { __le32 txd[8]; __le16 len; __le16 cid; u8 rsv; u8 pkt_type; u8 frag_n; u8 seq; __le16 checksum; u8 s2d_index; u8 option; u8 rsv1[4]; } __packed __aligned(4);
 struct sk_buff { u8 *data; unsigned int len; };
 static inline void *skb_push(struct sk_buff *skb, unsigned int len) { skb->data -= len; skb->len += len; memset(skb->data, 0, len); return skb->data; }
+static inline void *skb_pull(struct sk_buff *skb, unsigned int len) { skb->data += len; skb->len -= len; return skb->data; }
 struct mt76_queue;
 struct mt76_dev;
 struct mt76_driver_ops { int (*rx_rro_add_msdu_page)(struct mt76_dev *, struct mt76_queue *, dma_addr_t, void *); };
-struct mt76_dev { struct { unsigned int timeout; u8 msg_seq; } mcu; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; };
+struct mt76_dev { void *dev; struct { unsigned int timeout; u8 msg_seq; } mcu; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; };
+struct mt76_connac2_mcu_rxd { __le32 rxd[6]; __le16 len; __le16 pkt_type_id; u8 eid; u8 seq; u8 option; u8 rsv; u8 ext_eid; u8 rsv1[2]; u8 s2d_index; u8 tlv[]; } __packed __aligned(4);
 struct mt76_desc { __le32 buf0; __le32 ctrl; __le32 buf1; __le32 info; } __packed __aligned(4);
 struct mt76_wed_rro_desc { __le32 buf0; __le32 buf1; };
 struct mt76_txwi_cache { int qid; };
@@ -142,6 +150,29 @@ static inline struct mt76_txwi_cache *mt76_get_rxwi(struct mt76_dev *d) { (void)
 static inline int mt76_rx_token_consume(struct mt76_dev *d, void *a, void *b, dma_addr_t c) { (void)d; (void)a; (void)b; (void)c; return -1; }
 static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p; }
 #define ENOMEM 12
+#define EAGAIN 11
+#define ETIMEDOUT 110
+#define le16_to_cpu(x) ((u16)(x))
+#define le32_to_cpu(x) ((u32)(x))
+#define dev_err(...) ((void)0)
+static inline void mt792x_reset(struct mt76_dev *dev) { (void)dev; }
+#define MCU_CMD_PATCH_SEM_CONTROL 0x10
+#define MCU_CMD_PATCH_FINISH_REQ 0x07
+#define MCU_CMD_THERMAL_CTRL 0x2c
+#define MCU_CMD_DEV_INFO_UPDATE 0x01
+#define MCU_CMD_BSS_INFO_UPDATE 0x02
+#define MCU_CMD_STA_REC_UPDATE 0x03
+#define MCU_CMD_SUSPEND 0x05
+#define MCU_CMD_OFFLOAD 0x06
+#define MCU_CMD_HIF_CTRL 0x07
+#define MCU_CMD_REG_READ 0xc0
+#define MCU_CMD_WF_RF_PIN_CTRL 0xbd
+#define MCU_EXT_CMD(x) (MCU_CMD_##x | __MCU_CMD_FIELD_EXT_ID)
+#define MCU_UNI_CMD(x) (MCU_CMD_##x | __MCU_CMD_FIELD_UNI)
+#define MCU_CE_QUERY(x) (MCU_CMD_##x | __MCU_CMD_FIELD_CE | __MCU_CMD_FIELD_QUERY)
+struct mt76_connac_mcu_uni_event { u8 cid; u8 pad[3]; __le32 status; } __packed;
+struct mt76_connac_mcu_reg_event { __le32 reg; __le32 val; } __packed;
+struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
 #define MT_QFLAG_WED_RRO_EN BIT(0)
 #define MT_DMA_CTL_TOKEN GENMASK(31, 16)
 #define MT_DMA_CTL_TO_HOST BIT(8)

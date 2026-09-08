@@ -10,6 +10,8 @@ result-mt76`, or set `MT76_REFERENCE_DIR` to its `reference/linux-v7.1.5`
 directory, then run `cargo test -p mt7921-oracle`.
 
 The harness feeds only values accepted by the Rust API. It currently executes
-the pinned `mt76_connac2_mcu_fill_message` and `mt76_dma_add_buf` C bodies for
-legacy MCU command envelopes and one/two-segment DMA descriptors. Any confirmed
-reference defect is documented rather than copied into Rust.
+the pinned `mt76_connac2_mcu_fill_message`, `mt7921_mcu_parse_response`, and
+`mt76_dma_add_buf` C bodies for legacy MCU command envelopes, MCU reply/event
+headers and payload boundaries, patch reply scalars, EEPROM replies, and
+one/two-segment DMA descriptors. Any confirmed reference defect is documented
+rather than copied into Rust.
