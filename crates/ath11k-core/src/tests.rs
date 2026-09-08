@@ -402,9 +402,14 @@ fn actual_wmi_and_htt_share_one_htc_router() {
     use alloc::collections::VecDeque;
     use alloc::rc::Rc;
     use ath11k_ce::{CeError, Htc, HtcHeader, HtcPacketIo, HtcRouter, HtcTransport, ServiceId};
-    use ath11k_dp::{htt::request_target_version, transport::ath11k_dp_htt_connect_service};
+    use ath11k_dp::{
+        HttControl,
+        htt::{request_target_version, version_request},
+        transport::ath11k_dp_htt_connect_service,
+    };
     use ath11k_hal::RingId;
     use ath11k_wmi::{
+        WmiError,
         cmd::{HtcWmiTransport, Init, Wmi},
         tags::{
             WMI_INIT_CMDID, WMI_READY_EVENTID, WMI_SERVICE_READY_EVENTID,
@@ -504,17 +509,40 @@ fn actual_wmi_and_htt_share_one_htc_router() {
     .unwrap();
     wmi.wait_for_unified_ready(1_000).unwrap();
     assert_eq!(request_target_version(&mut htt, 1_000), Ok((3, 7)));
+    // WCN6750's shadow-register quirk leaves WMI with one credit, consumed by
+    // INIT above. HTT disables HTC credit flow in the connect request and can
+    // continue bursting while another WMI command is rejected.
+    for _ in 0..3 {
+        htt.send(version_request()).unwrap();
+    }
+    assert_eq!(
+        wmi.cmd_init(&Init {
+            resource_config: Default::default(),
+            memory_chunks: Vec::new(),
+            hardware_mode: None,
+            bands: Vec::new(),
+        }),
+        Err(WmiError::Transport)
+    );
 
     let outgoing = outgoing.borrow();
-    assert_eq!(outgoing.len(), 2);
+    assert_eq!(outgoing.len(), 5);
     assert_eq!(HtcHeader::decode(&outgoing[0]).unwrap().endpoint, 1);
-    assert_eq!(HtcHeader::decode(&outgoing[1]).unwrap().endpoint, 2);
+    assert_eq!(HtcHeader::decode(&outgoing[0]).unwrap().flags, 1);
+    assert!(outgoing[1..].iter().all(|frame| {
+        let header = HtcHeader::decode(frame).unwrap();
+        header.endpoint == 2 && header.flags == 0
+    }));
     let wmi_header = &outgoing[0][ath11k_ce::HTC_HEADER_LEN..][..4];
     assert_eq!(
         u32::from_le_bytes(wmi_header.try_into().unwrap()),
         WMI_INIT_CMDID.0
     );
-    assert_eq!(&outgoing[1][ath11k_ce::HTC_HEADER_LEN..], &[0, 0, 0, 0]);
+    assert!(
+        outgoing[1..]
+            .iter()
+            .all(|frame| frame[ath11k_ce::HTC_HEADER_LEN..] == [0, 0, 0, 0])
+    );
 }
 
 #[test]
