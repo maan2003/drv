@@ -1,6 +1,14 @@
-# ARCH-asahi-wifi-target: First physical device
+# ARCH-asahi-wifi-target: M2 connectivity target
 
-The first physical target is the complete BCM4387C2 connectivity device in the
+## Status
+
+M2 connectivity remains a separate target, not the first or currently active
+bring-up priority. MT7921 production readiness and Redwood bring-up are the
+active device goals in [ARCH-drv](ARCH-drv.md). The physical assignment and
+firmware milestones below remain unproved here; they are not scheduled work or
+prerequisites for those active targets.
+
+The target is the complete BCM4387C2 connectivity device in the
 13-inch M2 MacBook Air (`t8112-j413`, board `apple,hokkaido`): FullMAC PCIe Wi-Fi
 function `14e4:4433` and Bluetooth function `14e4:5f71`. They belong to one
 physical connectivity device but are separate software delivery targets. Target
@@ -15,7 +23,7 @@ hardware lifecycle; their delivery APIs must not encode the group layout.
 
 ## Development handoff
 
-Wi-Fi is the first hardware priority. During incremental testing, a small kernel
+Within this target, Wi-Fi precedes Bluetooth bring-up. During incremental testing, a small kernel
 broker may bind only `0000:01:00.0` in place of `brcmfmac`, retain kernel
 ownership of the shared DART domain, and expose bounded PCI, DMA, interrupt, and
 reset operations to the safe Rust driver. `hci_bcm4377` can remain bound to the

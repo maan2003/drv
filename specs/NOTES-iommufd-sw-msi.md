@@ -1,4 +1,4 @@
-# iommufd software-MSI path for the WCN6750 doorbell
+# NOTES-iommufd-sw-msi: Existing machinery and deferred WCN6750 interrupt gap
 
 ## Hardware message
 
@@ -70,52 +70,17 @@ its wired SPI property instead. No current VFIO or iommufd UAPI asks the kernel
 to install this software-MSI mapping and return the resulting address/data
 pair.
 
-## Smallest credible iommufd design
+## Deferred interrupt support
 
-A generic solution should add a device-authorized software-MSI message query,
-not expose arbitrary resource mapping:
+The source machinery above explains the missing doorbell path; it is not an
+approved implementation plan. Continue polling until interrupts are needed.
+No custom VFIO feature, synthetic MSI allocation, default-domain broker, or
+new portable `MsiDoorbell` type is currently prescribed. See
+[ARCH-dma-broker](ARCH-dma-broker.md) for the admitted DMA path and the status of
+experimental broker support.
 
-1. vfio-platform validates that the requested message belongs to one of the
-   device's own wired IRQ resources and that its physical target is the single
-   page containing device register resource 0. For WCN6750 that target is
-   `0x17a10040`; the page must be confirmed safe as a whole because the IOMMU
-   maps at page granularity.
-2. Through an iommufd helper, the bound device requests installation of that
-   physical page in its IOAS's `IOMMU_RESV_SW_MSI` window. The helper should
-   reuse iommufd's file-global mapping and per-HWPT installation/lifetime
-   tracking rather than create an `IOMMU_IOAS_MAP` entry.
-3. A narrow VFIO device feature returns only a composed `{address, data}`
-   message. Address is the kernel-selected reserved-window IOVA plus the
-   `0x40` page offset; data is the validated absolute SPI. Userspace cannot
-   supply a physical address, IOVA, page, or unrelated SPI.
-4. Attach/replace must install the mapping in every required paging HWPT, and
-   device detach/file close must release it through iommufd's existing
-   software-MSI map lifetime. Reset revokes the userspace `MsiDoorbell`
-   capability even if the file-global mapping remains cached for another
-   attached device.
-
-Trying to allocate synthetic platform MSIs is the wrong shortcut: it may
-allocate different SPIs, does not describe the already wired vfio-platform
-IRQ indices, and depends on an MBI domain the Redwood DT does not publish. A
-new raw-physical-address IOAS ioctl is also out of scope because it would
-bypass the device and IRQ-domain authorization which makes software-MSI
-mapping safe.
-
-## Contrast with the narrowed broker
-
-The narrowed design in [ARCH-dma-broker](ARCH-dma-broker.md) calls
-`dma_map_resource()` while vfio-platform retains the device's default domain,
-returns the same address/data-only capability, and rejects both
-`SET_CONTAINER` and `BIND_IOMMUFD`. It is the lower-schedule out-of-tree option:
-the existing ath11k operation is reproduced directly, and no generic
-MSI-descriptor gap has to be solved. Its costs are a private vfio-platform
-mode and inability to use a userspace IOAS for the device.
-
-The iommufd design keeps normal cdev/IOAS ownership and builds on upstream
-reserved-region, multi-HWPT, and lifetime machinery. Its kernel surface can be
-small, but it crosses iommufd, VFIO platform, and IRQ authorization, and the
-current tree lacks the request/query seam. Recommendation remains: use polling
-for the first hardware run; keep the narrowed broker as the bounded deployment
-fallback; prototype the device-authorized iommufd message query afterward and
-prefer it for steady state only if page safety and attach/reset lifetime are
-proved on Redwood.
+Any eventual interrupt mechanism must authorize the device's own message,
+respect page-granularity access and mapping lifetime, and preserve exclusive
+IOMMU ownership. Page safety and a working live doorbell mapping remain
+unverified. The polling-only unsafe-interrupts justification above must not be
+carried into a mapped interrupt path without reassessment.

@@ -31,7 +31,8 @@ separate hardware-broker process is not required by this architecture.
 The kernel retains narrow shared mechanisms such as IOMMU, interrupt routing,
 and platform firmware/reset support. Device-specific protocol policy remains
 in userspace. Complete IOMMU groups are assigned exclusively; no-IOMMU operation
-is forbidden. Non-coherent hardware additionally follows
+is forbidden. Current DMA backend selection and the distinction between RAM
+coherency and interrupt-doorbell mapping are described in
 [ARCH-dma-broker](ARCH-dma-broker.md).
 
 This boundary implements [REQ-isolation](REQ-isolation.md), preserves

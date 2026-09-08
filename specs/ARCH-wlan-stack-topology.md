@@ -22,7 +22,12 @@ MLME teardown. This temporarily diverges from current Linux mt7921, which
 enables BCNFT at association. The tracked destination is to complete the `0x13`
 event route, enable BCNFT and firmware connection-monitor offload, and suppress
 the host monitor as Linux `IEEE80211_HW_CONNECTION_MONITOR` does; those changes
-must land together.
+must land together. The selected-connection command boundary exists, but a
+separate wlancfg process does not yet. Failed connections currently revoke the
+runtime and reset the device; retry-safe per-attempt cleanup and callback
+quarantine remain incomplete. Ordinary rejection should eventually permit
+policy-driven retry without a privileged restart, while device/containment
+faults remain terminal.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
@@ -56,9 +61,10 @@ The internal structure copies Fuchsia's WLAN component contracts (`WlanSoftmac`,
 scaffolding (`WlanSoftmacBridge`, raw-pointer FFI frame protocols) exist only to
 work around a Fuchsia toolchain gap and are dropped; the method *semantics* are
 kept. The seam is a project-owned portable contract per
-[REQ-host-portability](REQ-host-portability.md); its host transport (Unix
-`SOCK_SEQPACKET` for control, a swappable fast path for bulk frames) is not part
-of the contract.
+[REQ-host-portability](REQ-host-portability.md). The current SoftMAC seam uses
+in-process synchronous Rust traits and callbacks with generated FIDL schema
+value types. Unix `SOCK_SEQPACKET` carries the separate Ethernet process seam,
+not these SoftMAC control/raw-frame calls.
 
 - **Control + raw-frame seam (WlanSoftmac).** driver <-> MLME. Methods to copy:
   `Query`/`Query*Support`, `SetChannel`, `JoinBss`, `InstallKey`,
@@ -90,10 +96,9 @@ MLME<->SME. Our threat model values a DMA-free Internet parser over frame
 latency, so the load-bearing cut is at the **Ethernet data-plane seam**: the
 netstack — the largest untrusted parser — runs in its own process with no VFIO,
 no filesystem, and no host network, connected to the driver only by a dumb,
-`SetEthernetStatus`-gated frame pipe. MLME/SME/RSN stay with the driver, matching
-Fuchsia, because they are chatty, latency-sensitive, and parse only local-air
-802.11. A further cut at the WlanSoftmac seam (driver alone) is available later
-as pure hardening; it is not required for the isolation goal. A compromised
+`SetEthernetStatus`-gated frame pipe. MLME/SME/RSN stay with the driver because
+they are chatty, latency-sensitive, and parse local-air 802.11. This grouping
+retains Fuchsia's protocol logic, not its exact process layout. A compromised
 netstack may reveal ciphertext and metadata for encrypted flows, plaintext for
 unencrypted flows, or affect availability, but must not reach
 application memory, device resources, DMA, or the host kernel, per
@@ -134,10 +139,10 @@ API/backends retain generic resource mechanics without device protocol policy.
 Remaining production transport mechanics move out of the lab binary into their
 library owner; production and lab entrypoints instantiate the same driver.
 The lab runner owns experiments and reporting, not an alternate implementation.
-Netstack3 binding, SOCKS, and network-service startup belong outside
-`wlan-softmac-host`, connected by the small existing Ethernet contract rather
-than a dependency from Wi-Fi runtime to Internet parsing. wlancfg owns the
-policy service. Large implementations can use modules without creating a crate
+Netstack3 binding, SOCKS, and network-service startup live in
+`drv-network-service`, connected to `wlan-softmac-host` by the small Ethernet
+contract rather than a dependency from Wi-Fi runtime to Internet parsing.
+wlancfg owns the policy service. Large implementations can use modules without creating a crate
 per mechanism. Oracles and test-only implementations stay outside production
 dependencies. Shared sandbox code may implement host mechanics, but each
 service declares its own authority rather than inheriting a broad default.
@@ -156,17 +161,20 @@ our bugs concentrate:
 - The policy layer role from `wlancfg`; the nl80211-style control surface from
   `wlanix` is available later if standard Linux Wi-Fi tooling must drive the
   stack.
-- Dropped: all `*Bridge` protocols, FIDL, Zircon channels, `fuchsia.io`
-  namespaces, and `component_manager` (heavily Zircon-bound; see Supervision).
+- Dropped: the Fuchsia bridge scaffolding, FIDL transport/endpoints, Zircon
+  channels, `fuchsia.io` namespaces, and `component_manager`. Generated FIDL
+  schema value types remain in the host bindings.
 
 ## Testing
 
-The "match the native Linux transcript" oracle is retained but rescoped to a
-**driver bring-up conformance harness at the WlanSoftmac seam**: it checks that a
-chip emits the same MCU/WTBL/TXWI/DMA command sequences as mac80211/mt76, which
-is what makes the next device tractable. The invented-guard validation glue above
-the seam is deleted. A hardware-independent net above the seam (hwsim virtual AP
-or frame replay) is future work per
+The shared WlanSoftmac conformance runner checks normalized lifecycle,
+identity/support queries, channel selection, passive scan progress/completion,
+and stop behavior. It does not inspect MCU commands, WTBL/TXWI bytes, or DMA
+descriptors. Chip-specific command/descriptor oracles and randomized tests
+provide separate evidence; native transcripts are compared for the phases and
+fields actually captured. Do not infer complete production-path coverage from
+one normalized seam test. A virtual AP remains future work; deterministic
+associated Ethernet/network tests already exist, as scoped by
 [REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
 
 ## Sandboxing and supervision

@@ -30,9 +30,9 @@ creates the station vdev, and installs `WlanSoftmacUpcalls` before the runtime
 begins polling. `stop` revokes callbacks first and then performs the existing
 core unwind. The runner's passive-scan stage becomes
 `WlanSoftmac::start_passive_scan`; its scan-results loop becomes ordinary
-`ClientRuntimeDriver::poll` work, not another production lifecycle phase.
+`ClientRuntimeDriver::drive` work, not another production lifecycle phase.
 
-The host schedules bounded `poll` calls. Each call services CE/WMI and the
+The host schedules bounded `drive` calls. Each call services CE/WMI and the
 polling-first DP rings, then delivers at most the deterministic receive slot
 allowed by the host contract. Unsolicited WMI management RX, scan completion,
 and management TX completion invoke `recv`, `notify_scan_complete`, and

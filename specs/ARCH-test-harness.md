@@ -16,12 +16,14 @@ through an exclusive Linux HCI user channel, root-only structured reporting,
 exact initial controller-flag restoration, and post-run exclusive
 reacquisition while Wi-Fi remains active.
 
-The same production Rust driver implementation runs against deterministic and
-native backends through the typed hardware interface. Lab entrypoints and
-oracles do not substitute a second production implementation. The deterministic model owns virtual time and scripted BAR, DMA,
-interrupt, reset, and fault behavior. It rejects unexpected operations and
-supports malformed data, missing or repeated interrupts, timeouts, worker failures,
-generation changes, and out-of-range access.
+The target is to exercise the same production Rust driver implementation through
+deterministic and native hardware interfaces, as required by
+[REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
+Existing tests have different scopes: legacy Wasm resource tests, native typed
+backend/lifecycle tests, chip protocol oracles, and normalized SoftMAC
+conformance. Test-only subsystem models do not by themselves establish complete
+production-driver behavior. Attribute virtual time, scripted responses, fault
+injection, and hardware coverage to the test that actually implements them.
 
 QEMU's `edu` PCI device exercises real VFIO/iommufd mechanics; a later
 `vfio-user` model may combine those mechanics with BCM-specific behavior.
@@ -29,15 +31,14 @@ Cuttlefish's virtio `mac80211_hwsim`, wmediumd, and OpenWRT are optional peers f
 scan and authentication behavior. They model SoftMAC radio behavior and cannot
 validate BCM FullMAC firmware, PCIe rings, `msgbuf`, DMA, or reset.
 
-Physical tests calibrate rather than merely confirm models. The x86_64 AMD host
-`no-plastic` is the primary generic physical VFIO, deployment, and recovery
-test device. Its Wi-Fi and Bluetooth hardware is also the first target for
-proving transactional handoff between a normal host driver and a safe Rust
-service while the other host service remains available. Scheduled `m2sh` tests
-prioritize BCM4387 Wi-Fi firmware, scan, association, traffic, timeout, reset,
-and automatic `brcmfmac` restoration through the development broker. Tests run
-to completion locally and spool durable reports while Wi-Fi and the remote
-session are unavailable. Complete group-10 VFIO tests validate the production
-path later; Bluetooth transport and profile tests are secondary. This
-architecture satisfies
-[REQ-hardware-independent-testing](REQ-hardware-independent-testing.md).
+Physical tests calibrate rather than merely confirm models. `no-plastic` is the
+shared generic VFIO and MT7921 test host; Redwood uses it for builds and USB
+control. Coordinate hardware windows rather than inferring availability from
+a document. Asahi/M2 feasibility remains separate unproved work described by
+[ARCH-asahi-wifi-target](ARCH-asahi-wifi-target.md), not a scheduled test suite.
+
+Runs persist reports locally and recover independently of the experimental
+Wi-Fi path. A physical result establishes only the exercised configuration and
+failure modes, not all model behavior or production readiness. Recovery and
+scope for Redwood follow
+[ARCH-redwood-wifi-target](ARCH-redwood-wifi-target.md).

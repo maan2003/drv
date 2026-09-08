@@ -7,7 +7,7 @@ public port seams are in `crates/ath11k-core/INTERFACES.md`.
 | phase | minimum Linux ownership path | completion evidence |
 |---|---|---|
 | WPSS ready | kernel remoteproc/PIL authenticates and boots `wpss`; QRTR service appears | remoteproc running and QMI service reachable |
-| QMI handshake | server arrive → connect → host capability → target capability → BDF/regdb/firmware memory exchange → mode mission | QMI responses and firmware-ready indication |
+| QMI handshake | server arrival → indication registration → host capability → target capability → hybrid DeviceInfo/BAR → regdb/BDF on the fixed-memory path; memory responses and firmware-ready progress follow the applicable firmware indications | DeviceInfo proves BAR discovery only; full startup additionally requires the applicable firmware-ready completion |
 | transport | AHB/HIF powers CE; HTC connects WMI control and HTT data services | service-ready/credit messages |
 | WMI init | service-ready/unified-ready, resource config, init, pdev capability/regulatory setup | WMI ready event and pdev created |
 | scan | vdev create/start plus scan-start TLVs; scan events deliver BSS frames | scan completion and selected BSS |
