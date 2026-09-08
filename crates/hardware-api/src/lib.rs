@@ -795,6 +795,22 @@ impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
     }
 }
 
+impl<B: Backend> StreamingDma<B, FromDevice> {
+    /// Return a device-to-CPU mapping to device ownership after the CPU has
+    /// consumed it. Unlike the `CpuWrite` synchronization path, this performs
+    /// no CPU-shadow copy.
+    pub fn prepare_for_device(&mut self, offset: usize, length: usize) -> Result<()> {
+        let range = self.0.range(offset, length)?;
+        let backend_range = self.0.backend_range(range);
+        let mut backend = self.0.allocation.shared.0.borrow_mut();
+        if backend.is_cache_coherent() {
+            Ok(())
+        } else {
+            backend.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrqEvent {
     pub vector: u32,
