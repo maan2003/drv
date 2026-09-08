@@ -70,6 +70,8 @@ fn covered_concrete_encoders_match_native_commands() {
             ("peer-assoc", 3),
             ("peer-create", 6),
             ("peer-delete", 1),
+            ("scan-channel-list", 14),
+            ("scan-start", 3),
             ("vdev-create", 4),
             ("vdev-delete", 3),
             ("vdev-start", 6),
