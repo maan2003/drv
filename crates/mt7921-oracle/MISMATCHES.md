@@ -31,3 +31,42 @@ counterpart.
 **Likely Rust port bug:** status/rate reporting is incomplete. Any consumer
 expecting Linux-equivalent station rate telemetry cannot obtain it from the
 Rust completion path.
+
+## Beacon loss is retained as raw input but never becomes connection loss
+
+For `MCU_EVENT_BSS_BEACON_LOSS` (0x13), Linux reads the four-byte beacon-loss
+body and reports connection loss only when its BSS index selects an active
+station interface with beacon filtering enabled. The Rust core has no decoder
+for that body. The active userspace path classifies 0x13 as unsolicited and
+retains the complete packet, but no consumer removes or acts on that event.
+
+**Likely Rust port bug:** a connected client can miss firmware beacon-loss
+notification and therefore fail to initiate Linux-equivalent disconnect and
+recovery behavior.
+
+## Scheduled scan completion has no Rust event decoder
+
+Linux retains both `MCU_EVENT_SCAN_DONE` (0x0d) and
+`MCU_EVENT_SCHED_SCAN_DONE` (0x23) for scan work. The public Rust decoder
+matches the retained ordinary-scan fields, including the seven-bit scan
+sequence normalization, but rejects 0x23. The active receive classifier also
+omits both scan IDs from its explicit Linux-derived unsolicited list; sequence
+zero still reaches the raw unsolicited queue through a later fallback, but an
+event carrying the currently awaited nonzero sequence can be mistaken for a
+command response. Linux routes both IDs as unsolicited regardless of the
+header sequence.
+
+**Likely Rust port bugs:** scheduled-scan completion cannot be consumed, and
+scan event routing is not equivalent for a colliding nonzero sequence.
+
+## Coredump notification never triggers firmware reset in the Rust port
+
+For `MCU_EVENT_COREDUMP` (0xf0), Linux immediately sets `fw_assert`, retains
+the skb in the coredump queue, and schedules coredump work. Reset is deliberately
+deferred: after the dump stream becomes inactive, `mt7921_coredump_work`
+publishes the dump and calls `mt792x_reset`. The Rust active receive path only
+retains the raw 0xf0 packet; it has no coredump consumer, firmware-assert state,
+delayed dump collection, or reset notification/action.
+
+**Likely Rust port bug:** a firmware assertion does not enter the Linux
+coredump-and-reset recovery path.
