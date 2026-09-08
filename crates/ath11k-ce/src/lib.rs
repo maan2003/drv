@@ -615,17 +615,43 @@ pub trait HtcPacketIo {
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
 }
 
+/// HIF-owned wait seam used when no CE receive descriptor is ready. A real
+/// implementation performs one `wait_any` over the HIF's CE interrupts.
+pub trait CeCompletionWait {
+    fn wait_for_ce(&mut self, deadline_ns: u64) -> Result<bool, CeError>;
+}
+
+pub struct NoCompletionWait;
+impl CeCompletionWait for NoCompletionWait {
+    fn wait_for_ce(&mut self, _: u64) -> Result<bool, CeError> {
+        Ok(false)
+    }
+}
+impl<F: FnMut(u64) -> Result<bool, CeError>> CeCompletionWait for F {
+    fn wait_for_ce(&mut self, deadline_ns: u64) -> Result<bool, CeError> {
+        self(deadline_ns)
+    }
+}
+
+pub type CePipesPacketIoParts<B> = (
+    Device<B>,
+    MmioRegion<B>,
+    CoherentDma<B, Bidirectional>,
+    CePipes<B>,
+);
+
 /// Owned real-CE implementation beneath `HtcTransport`. Core creates this
 /// after CE ring initialization, then retains the whole value through the HTC
 /// router until teardown.
-pub struct CePipesPacketIo<B: Backend> {
+pub struct CePipesPacketIo<B: Backend, W = NoCompletionWait> {
     device: Device<B>,
     mmio: MmioRegion<B>,
     remote_read_pointers: CoherentDma<B, Bidirectional>,
     pipes: CePipes<B>,
+    waiter: W,
 }
 
-impl<B: Backend> CePipesPacketIo<B> {
+impl<B: Backend> CePipesPacketIo<B, NoCompletionWait> {
     pub const fn new(
         device: Device<B>,
         mmio: MmioRegion<B>,
@@ -637,29 +663,10 @@ impl<B: Backend> CePipesPacketIo<B> {
             mmio,
             remote_read_pointers,
             pipes,
+            waiter: NoCompletionWait,
         }
     }
-
-    pub fn rx_post_buf(&mut self) -> Result<(), CeError> {
-        self.pipes
-            .rx_post_buf(&self.device, &self.mmio, &mut self.remote_read_pointers)
-    }
-
-    pub fn pipes(&self) -> &CePipes<B> {
-        &self.pipes
-    }
-    pub fn pipes_mut(&mut self) -> &mut CePipes<B> {
-        &mut self.pipes
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        Device<B>,
-        MmioRegion<B>,
-        CoherentDma<B, Bidirectional>,
-        CePipes<B>,
-    ) {
+    pub fn into_parts(self) -> CePipesPacketIoParts<B> {
         (
             self.device,
             self.mmio,
@@ -669,7 +676,46 @@ impl<B: Backend> CePipesPacketIo<B> {
     }
 }
 
-impl<B: Backend> HtcPacketIo for CePipesPacketIo<B> {
+impl<B: Backend, W: CeCompletionWait> CePipesPacketIo<B, W> {
+    pub const fn new_with_waiter(
+        device: Device<B>,
+        mmio: MmioRegion<B>,
+        remote_read_pointers: CoherentDma<B, Bidirectional>,
+        pipes: CePipes<B>,
+        waiter: W,
+    ) -> Self {
+        Self {
+            device,
+            mmio,
+            remote_read_pointers,
+            pipes,
+            waiter,
+        }
+    }
+    pub fn rx_post_buf(&mut self) -> Result<(), CeError> {
+        self.pipes
+            .rx_post_buf(&self.device, &self.mmio, &mut self.remote_read_pointers)
+    }
+    pub fn pipes(&self) -> &CePipes<B> {
+        &self.pipes
+    }
+    pub fn pipes_mut(&mut self) -> &mut CePipes<B> {
+        &mut self.pipes
+    }
+    pub fn into_parts_with_waiter(self) -> (CePipesPacketIoParts<B>, W) {
+        (
+            (
+                self.device,
+                self.mmio,
+                self.remote_read_pointers,
+                self.pipes,
+            ),
+            self.waiter,
+        )
+    }
+}
+
+impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
     fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError> {
         let mut buffer = CeTxBuffer::allocate(&self.device, frame.len())?;
         buffer.write(&frame)?;
@@ -681,18 +727,21 @@ impl<B: Backend> HtcPacketIo for CePipesPacketIo<B> {
             transfer_id,
         )
     }
-
-    fn receive_htc(&mut self, _deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
-        // WCN6750/QCA6390 destination pipes from the exact host CE table.
-        for pipe in [1, 2, 5] {
-            if let Some(frame) =
-                self.pipes
-                    .completed_recv_next(&self.mmio, &mut self.remote_read_pointers, pipe)?
-            {
-                return Ok(Some(frame));
+    fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+        loop {
+            for pipe in [1, 2, 5] {
+                if let Some(frame) = self.pipes.completed_recv_next(
+                    &self.mmio,
+                    &mut self.remote_read_pointers,
+                    pipe,
+                )? {
+                    return Ok(Some(frame));
+                }
+            }
+            if !self.waiter.wait_for_ce(deadline_ns)? {
+                return Ok(None);
             }
         }
-        Ok(None)
     }
 }
 
@@ -1146,6 +1195,15 @@ impl<I: HtcPacketIo> HtcRouter<I> {
             routed += 1;
         }
         Ok(routed)
+    }
+
+    /// Recover the sole transport for deterministic HIF/CE teardown after all
+    /// endpoint handles have been dropped.
+    pub fn try_into_transport(self) -> Result<HtcTransport<I>, Self> {
+        match Rc::try_unwrap(self.core) {
+            Ok(core) => Ok(core.into_inner().transport),
+            Err(core) => Err(Self { core }),
+        }
     }
 }
 
@@ -1769,6 +1827,11 @@ mod tests {
             (core.transport.io.sent[1].0, core.transport.io.sent[1].1),
             (4, 2)
         );
+        drop(core);
+        assert!(router.clone().try_into_transport().is_err());
+        drop(wmi);
+        drop(htt);
+        assert!(router.try_into_transport().is_ok());
     }
 
     #[test]
@@ -1985,7 +2048,17 @@ mod tests {
         let rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
         let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
         let pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
-        let mut packet_io = CePipesPacketIo::new(device, mmio, rdp, pipes);
+        let wait_state = state.clone();
+        let waiter = move |deadline_ns| {
+            assert_eq!(deadline_ns, 99);
+            // Simulate HIF wait-any observing CE1, after which firmware's
+            // status descriptor and remote HP are visible.
+            wait_state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
+            wait_state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
+                .copy_from_slice(&4_u32.to_le_bytes());
+            Ok(true)
+        };
+        let mut packet_io = CePipesPacketIo::new_with_waiter(device, mmio, rdp, pipes, waiter);
         assert_eq!(
             packet_io.pipes().get_attr_flags(4),
             Ok(CE_ATTR_DISABLE_INTR)
@@ -2021,15 +2094,11 @@ mod tests {
             .post_receive(&packet_io.mmio, &mut packet_io.remote_read_pointers, 1, rx)
             .unwrap();
         state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
-        // Allocation order: RDP=1, CE0 source=2, CE1 destination=3/status=4.
-        state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
-        state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
-            .copy_from_slice(&4_u32.to_le_bytes());
-        assert_eq!(packet_io.receive_htc(0), Ok(Some(b"hello".to_vec())));
+        assert_eq!(packet_io.receive_htc(99), Ok(Some(b"hello".to_vec())));
         assert!(state.borrow().operations.iter().any(
             |op| matches!(op, LargeOperation::SyncCpu(id, range) if *id == rx_id && range == &(0..64))
         ));
-        let (_, _, _, pipes) = packet_io.into_parts();
+        let ((_, _, _, pipes), _) = packet_io.into_parts_with_waiter();
         pipes.free_pipes();
     }
 }
