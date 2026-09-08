@@ -3191,8 +3191,17 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             bssid: peer,
             bss_type: fidl_ieee80211::BssType::Infrastructure,
             beacon_period: 100,
-            capability_info: 1,
-            ies: vec![0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12],
+            capability_info: 0x11,
+            ies: vec![
+                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12,
+                48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+                0, 0x0f, 0xac, 2, 0, 0,
+                // Production association shaping requires the AP's base HT
+                // and VHT capabilities before applying the device profile.
+                45, 26, 0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                191, 12, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+            ],
             primary: channel,
             bandwidth: ChannelBandwidth::Cbw80,
             vht_secondary_80_channel: ChannelNumber {
@@ -3204,8 +3213,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         },
         multiple_bss_candidates: false,
         authentication: fidl_internal::Authentication {
-            protocol: fidl_internal::Protocol::Open,
-            credentials: None,
+            protocol: fidl_internal::Protocol::Wpa2Personal,
+            credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
+                fidl_internal::WpaCredentials::Psk([1; 32]),
+            ))),
         },
         deprecated_scan_type: fidl_common::ScanType::Passive,
     };
@@ -3395,20 +3406,10 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     .await
     .map_err(|e| format!("self-test burst runtime: {e}"))?;
     let mut burst_request = comeback_request.clone();
-    burst_request.bss_description.capability_info = 0x11;
-    burst_request.bss_description.ies.extend_from_slice(&[
-        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
-    ]);
     burst_request
         .bss_description
         .ies
         .extend_from_slice(&wmm_parameters);
-    burst_request.authentication = fidl_internal::Authentication {
-        protocol: fidl_internal::Protocol::Wpa2Personal,
-        credentials: Some(Box::new(fidl_internal::Credentials::Wpa(
-            fidl_internal::WpaCredentials::Psk([1; 32]),
-        ))),
-    };
     let _ = burst_runtime
         .connect(
             burst_request,
