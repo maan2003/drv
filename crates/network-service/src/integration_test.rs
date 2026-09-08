@@ -10,8 +10,8 @@ use netstack3_port_integration::{
     service::{DhcpService, DhcpStatus},
 };
 use netstack3_port_spike::{
-    EthernetRunner, NetworkServiceEndpoint, RemoteIpAddress, RemoteIpVersion, RemoteSocketAddress,
-    RemoteSocketError, RemoteSocketProvider,
+    EthernetDeviceEvent, EthernetFrame, EthernetRunner, NetworkServiceEndpoint, RemoteIpAddress,
+    RemoteIpVersion, RemoteSocketAddress, RemoteSocketError, RemoteSocketProvider,
 };
 use packet::{Buf, NestableSerializer as _, Serializer as _};
 use packet_formats::{
@@ -26,6 +26,9 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::Duration,
+};
+use wlan_softmac_host::ethernet::{
+    AssociatedSoftmacTx, DriverEthernetPort, EthernetIngressError, ethernet_port,
 };
 
 const CLIENT_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
@@ -204,7 +207,7 @@ impl AssociatedSoftmacTx for AssociatedAp {
 }
 
 fn drive(
-    runner: &mut EthernetRunner<DhcpService, HostEthernetDevice>,
+    runner: &mut EthernetRunner<DhcpService, ServiceEthernetDevice>,
     sink: &mut DriverEthernetPort,
     ap: &mut AssociatedAp,
     now: Duration,
@@ -238,7 +241,10 @@ fn drive(
 
 #[test]
 fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
-    let (device, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let device = unsafe {
+        ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
+    };
     let runtime = Runtime::new(
         32,
         (0u8..=255).cycle().take(8192),

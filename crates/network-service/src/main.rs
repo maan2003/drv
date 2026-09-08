@@ -2,7 +2,7 @@
 
 fn main() {
     if let Err(error) = drv_network_service::run() {
-        eprintln!("mt7921-netstack: {error}");
+        eprintln!("drv-network-service: {error}");
         std::process::exit(1);
     }
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use crate::ethernet::{BoundedNetstackProof, HostEthernetDevice, NetstackProofConfig};
+use crate::{BoundedNetstackProof, NetstackProofConfig, ServiceEthernetDevice};
 use std::env;
 use std::ffi::c_void;
 use std::net::{SocketAddr, TcpListener};
@@ -362,7 +362,7 @@ pub fn run() -> Result<(), String> {
         println!("netstack_sandbox_self_test=true");
         return Ok(());
     }
-    let device = unsafe { HostEthernetDevice::from_frame_fd(frame, mac) };
+    let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, mac) };
     let mut proof = BoundedNetstackProof::new(
         device,
         NetstackProofConfig {
@@ -399,11 +399,4 @@ pub fn run() -> Result<(), String> {
             || false,
         )
         .map_err(str::to_string)
-}
-
-pub fn main() {
-    if let Err(error) = run() {
-        eprintln!("wlan-netstack: {error}");
-        std::process::exit(1);
-    }
 }

@@ -10,7 +10,6 @@
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
 pub mod ethernet;
-pub mod netstack_child;
 pub mod runtime;
 
 pub use fidl_fuchsia_wlan_common::{

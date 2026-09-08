@@ -467,31 +467,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "driver-runtime"
-version = "0.1.0"
-
-[[package]]
-name = "drv-hardware"
-version = "0.1.0"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
-name = "drv-hardware-backends"
-version = "0.1.0"
-dependencies = [
- "drv-hardware",
- "userspace-vfio",
-]
-
-[[package]]
 name = "drv-network-service"
 version = "0.1.0"
 dependencies = [
+ "dhcp-protocol",
+ "net_types",
  "netstack3-port-integration",
  "netstack3-port-spike",
+ "netstack3_base",
+ "packet",
+ "packet_formats",
  "rand 0.9.4",
+ "wlan-softmac-host",
 ]
 
 [[package]]
@@ -1081,93 +1068,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "mt76-core"
-version = "0.1.0"
-
-[[package]]
-name = "mt7921-core"
-version = "0.1.0"
-dependencies = [
- "driver-runtime",
- "mt76-core",
-]
-
-[[package]]
-name = "mt7921-passive-scan"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "driver-runtime",
- "drv-hardware",
- "drv-hardware-backends",
- "drv-network-service",
- "fdf",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-driver",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
- "fuchsia-inspect",
- "fuchsia-softmac-port",
- "fuchsia-trace",
- "futures",
- "ieee80211",
- "mt7921-port-spike",
- "mt7921-softmac-adapter",
- "num-bigint",
- "sha2",
- "userspace-vfio",
- "wlan-common",
- "wlan-mlme",
- "wlan-sme",
- "wlan-softmac-host",
- "zx",
-]
-
-[[package]]
-name = "mt7921-port-spike"
-version = "0.1.0"
-dependencies = [
- "driver-runtime",
- "drv-hardware",
- "drv-hardware-backends",
- "mt7921-core",
- "userspace-vfio",
-]
-
-[[package]]
-name = "mt7921-softmac-adapter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fdf",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-driver",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
- "fuchsia-inspect",
- "fuchsia-softmac-port",
- "fuchsia-trace",
- "futures",
- "mt7921-port-spike",
- "netstack3-port-integration",
- "netstack3-port-spike",
- "rand 0.9.4",
- "sha2",
- "tokio",
- "wlan-mlme",
- "wlan-sme",
- "wlan-softmac-class-support",
- "wlan-softmac-host",
- "zx",
-]
 
 [[package]]
 name = "mundane"
@@ -2283,10 +2183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "userspace-vfio"
-version = "0.1.0"
-
-[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2540,14 +2436,6 @@ dependencies = [
  "wlan-rsn",
  "wlan-statemachine",
  "zx",
-]
-
-[[package]]
-name = "wlan-softmac-class-support"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-softmac",
 ]
 
 [[package]]

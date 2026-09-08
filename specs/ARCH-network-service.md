@@ -6,7 +6,7 @@ The MT7921 path runs Netstack3, DHCP, DNS, and SOCKS in a separate self-sandboxe
 process connected to the Wi-Fi service by bounded Ethernet frames. Its startup
 still requires external DHCP/DNS/TCP proof and its lifetime is bounded: these
 are lab behavior, not the mature service contract. The service implementation
-currently lives in `wlan-softmac-host`; it is to be separated from Wi-Fi runtime
+and executable live in `drv-network-service`, independent of Wi-Fi runtime
 ownership. A Linux socket-provider spike also exists but is not the required
 application path.
 
