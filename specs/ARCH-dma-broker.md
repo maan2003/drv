@@ -48,7 +48,7 @@ no independent broker fd, arbitrary map ioctl, user-supplied IOVA, or raw
 physical-address interface.
 
 ```c
-#define VFIO_DEVICE_FEATURE_DMA_BROKER  /* out-of-tree feature index */
+#define VFIO_DEVICE_FEATURE_DMA_BROKER  0xff00 /* test-only; upstream must reassign */
 #define VFIO_DMA_BROKER_ALLOC_COHERENT  1
 #define VFIO_DMA_BROKER_MAP_STREAMING   2
 #define VFIO_DMA_BROKER_SYNC_CPU        3
@@ -77,12 +77,21 @@ struct vfio_device_dma_broker {
 };
 ```
 
-The structure is carried in `struct vfio_device_feature.data`; both `argsz`
+The feature index is deliberately high but within
+`VFIO_DEVICE_FEATURE_MASK`; it is frozen only for this out-of-tree test ABI
+and must be reassigned before any upstream submission. The structure is
+carried in `struct vfio_device_feature.data`; both `argsz`
 values must cover the supplied structures. Unknown flags, short structures,
 nonzero reserved fields, arithmetic overflow, zero sizes, invalid alignment,
 stale handles, disallowed directions, and out-of-range subranges fail without
 changing state. Closing the VFIO device fd revokes every handle after the
 required final ownership transition and unmap.
+
+`PROBE` accepts only `VFIO_DEVICE_FEATURE_PROBE`, and DMA operations reject
+`VFIO_DEVICE_FEATURE_GET`. Because generic VFIO core does not copy a SET
+payload back, the vfio-platform feature callback explicitly copies the
+mutated `ALLOC_COHERENT` and `MAP_STREAMING` structures to userspace after a
+successful operation.
 
 `ALLOC_COHERENT` calls the ordinary DMA API for this device, returns its
 DMA address, and permits exactly one shared, non-executable mmap at the
