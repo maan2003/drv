@@ -33,7 +33,7 @@ fn ingests_ordered_jsonl_and_reports_each_message() {
 }
 
 #[test]
-fn concrete_init_and_vdev_encoders_match_native_commands() {
+fn covered_concrete_encoders_match_native_commands() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl"
@@ -67,6 +67,9 @@ fn concrete_init_and_vdev_encoders_match_native_commands() {
         families,
         BTreeMap::from([
             ("init", 1),
+            ("peer-assoc", 3),
+            ("peer-create", 6),
+            ("peer-delete", 1),
             ("vdev-create", 4),
             ("vdev-delete", 3),
             ("vdev-start", 6),
