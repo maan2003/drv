@@ -82,6 +82,7 @@ impl<B: Backend, D: Direction> DmaPool<B, D> {
         Ok(DmaSegment {
             dma: Some(dma),
             pool: Rc::downgrade(&self.inner),
+            reusable: true,
             _direction: PhantomData,
         })
     }
@@ -113,6 +114,7 @@ fn refill<B: Backend, D: Direction>(inner: &mut Inner<B, D>) -> Result<Streaming
 pub struct DmaSegment<B: Backend, D: Direction> {
     dma: Option<StreamingDma<B, D>>,
     pool: Weak<RefCell<Inner<B, D>>>,
+    reusable: bool,
     _direction: PhantomData<D>,
 }
 
@@ -136,10 +138,14 @@ impl<B: Backend, D: Direction> DmaSegment<B, D> {
 
 impl<B: Backend, D: CpuWrite> DmaSegment<B, D> {
     pub fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        self.dma_mut().write(offset, bytes)
+        self.dma_mut().write(offset, bytes)?;
+        self.reusable = false;
+        Ok(())
     }
     pub fn sync_for_device(&mut self, offset: usize, len: usize) -> Result<()> {
-        self.dma_mut().sync_for_device(offset, len)
+        self.dma_mut().sync_for_device(offset, len)?;
+        self.reusable = true;
+        Ok(())
     }
 }
 
@@ -148,7 +154,9 @@ impl<B: Backend, D: CpuRead> DmaSegment<B, D> {
         self.dma().read(offset, bytes)
     }
     pub fn sync_for_cpu(&mut self, offset: usize, len: usize) -> Result<()> {
-        self.dma_mut().sync_for_cpu(offset, len)
+        self.dma_mut().sync_for_cpu(offset, len)?;
+        self.reusable = false;
+        Ok(())
     }
 }
 
@@ -157,13 +165,18 @@ impl<B: Backend> DmaSegment<B, FromDevice> {
     /// shadow, ready for republishing on a receive ring.
     pub fn prepare_for_device(&mut self) -> Result<()> {
         let len = self.len();
-        self.dma_mut().prepare_for_device(0, len)
+        self.dma_mut().prepare_for_device(0, len)?;
+        self.reusable = true;
+        Ok(())
     }
 }
 
 impl<B: Backend, D: Direction> Drop for DmaSegment<B, D> {
     fn drop(&mut self) {
         let Some(dma) = self.dma.take() else { return };
+        if !self.reusable {
+            return;
+        }
         let Some(pool) = self.pool.upgrade() else {
             return;
         };
@@ -246,5 +259,21 @@ mod tests {
         assert_eq!(bar.write_u32(0x98, 1 | 2), Err(Error::DeviceFault));
         completed.prepare_for_device().unwrap();
         bar.write_u32(0x98, 1 | 2).unwrap();
+    }
+
+    #[test]
+    fn failed_prepare_is_not_reused() {
+        let (device, failures) = DeterministicBackend::noncoherent_device_with_failures();
+        let pool = DmaPool::<_, FromDevice>::new(device, 128, 128, 128, 1).unwrap();
+        let mut completed = pool.allocate().unwrap();
+        let address = completed.device_address(0).unwrap().bits();
+        completed.sync_for_cpu(0, completed.len()).unwrap();
+        failures.fail_next_sync_for_device();
+        assert_eq!(completed.prepare_for_device(), Err(Error::DeviceFault));
+        drop(completed);
+        assert_eq!(pool.free_segments(), 0);
+
+        let replacement = pool.allocate().unwrap();
+        assert_ne!(replacement.device_address(0).unwrap().bits(), address);
     }
 }
