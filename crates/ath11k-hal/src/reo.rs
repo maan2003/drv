@@ -1,3 +1,4 @@
+// PORT-MAP: wcn6750-specific
 //! REO command/status ring codecs from `hal_rx.c`.
 
 use crate::{Descriptor, HalError, RingMemory};
@@ -26,6 +27,8 @@ pub fn setup_wcn6750<B: Backend>(mmio: &MmioRegion<B>) -> Result<(), HalError> {
     mmio.write_u32(UMAC_REO + 0x10, hash)
         .map_err(|_| HalError::DeviceFault)
 }
+
+// PORT-MAP: reusable
 
 const COMMAND_BYTES: usize = 40;
 const STATUS_BYTES: usize = 104;
