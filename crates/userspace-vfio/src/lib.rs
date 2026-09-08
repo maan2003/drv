@@ -206,10 +206,142 @@ fn size<T>() -> u32 {
     std::mem::size_of::<T>() as u32
 }
 fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Result<(), String> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_support::dispatch(fd, request, value as *mut T as *mut ()) {
+        return result.map_err(|error| format!("{operation}: fake errno {error}"));
+    }
     if unsafe { ioctl(fd, request, value) } < 0 {
         Err(format!("{operation}: {}", std::io::Error::last_os_error()))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum Record {
+        Bind,
+        AllocateIoas,
+        AttachIoas(u32),
+        Map {
+            iova: u64,
+            length: u64,
+        },
+        Unmap {
+            iova: u64,
+            length: u64,
+        },
+        DestroyIoas(u32),
+        ProbeBroker,
+        Broker {
+            operation: u32,
+            handle: u32,
+            offset: u64,
+            length: u64,
+        },
+    }
+
+    struct Fake {
+        broker_supported: bool,
+        records: Rc<RefCell<Vec<Record>>>,
+    }
+    thread_local! {
+        static FAKE: RefCell<Option<Fake>> = const { RefCell::new(None) };
+    }
+
+    /// Runs one host-side VFIO test with all ioctls intercepted. Anonymous and
+    /// shared mmap still use the supplied real file descriptors.
+    pub fn with_fake_io<T>(broker_supported: bool, run: impl FnOnce() -> T) -> (T, Vec<Record>) {
+        let records = Rc::new(RefCell::new(Vec::new()));
+        FAKE.with(|fake| {
+            assert!(fake.borrow().is_none(), "nested fake VFIO transport");
+            *fake.borrow_mut() = Some(Fake {
+                broker_supported,
+                records: Rc::clone(&records),
+            });
+        });
+        let result = run();
+        FAKE.with(|fake| *fake.borrow_mut() = None);
+        let recorded = records.borrow().clone();
+        (result, recorded)
+    }
+
+    pub(super) fn dispatch(
+        _fd: RawFd,
+        request: u64,
+        value: *mut (),
+    ) -> Option<std::result::Result<(), i32>> {
+        FAKE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fake = slot.as_mut()?;
+            let record = match request {
+                VFIO_DEVICE_BIND_IOMMUFD => Record::Bind,
+                IOMMU_IOAS_ALLOC => {
+                    // SAFETY: ioctl_mut supplies IoasAlloc for this request.
+                    unsafe { value.cast::<IoasAlloc>().as_mut().unwrap().out_ioas_id = 7 };
+                    Record::AllocateIoas
+                }
+                VFIO_DEVICE_ATTACH_IOMMUFD_PT => {
+                    // SAFETY: ioctl_mut supplies AttachIommufdPt for this request.
+                    let attach = unsafe { value.cast::<AttachIommufdPt>().as_ref().unwrap() };
+                    Record::AttachIoas(attach.pt_id)
+                }
+                IOMMU_IOAS_MAP => {
+                    // SAFETY: ioctl_mut supplies IoasMap for this request.
+                    let map = unsafe { value.cast::<IoasMap>().as_ref().unwrap() };
+                    Record::Map {
+                        iova: map.iova,
+                        length: map.length,
+                    }
+                }
+                IOMMU_IOAS_UNMAP => {
+                    // SAFETY: ioctl_mut supplies IoasUnmap for this request.
+                    let unmap = unsafe { value.cast::<IoasUnmap>().as_ref().unwrap() };
+                    Record::Unmap {
+                        iova: unmap.iova,
+                        length: unmap.length,
+                    }
+                }
+                IOMMU_DESTROY => {
+                    // SAFETY: ioctl_mut supplies Destroy for this request.
+                    let destroy = unsafe { value.cast::<Destroy>().as_ref().unwrap() };
+                    Record::DestroyIoas(destroy.id)
+                }
+                VFIO_DEVICE_FEATURE => {
+                    // SAFETY: both feature calls supply DmaBrokerFeature.
+                    let feature = unsafe { value.cast::<DmaBrokerFeature>().as_mut().unwrap() };
+                    if feature.flags & VFIO_DEVICE_FEATURE_PROBE != 0 {
+                        if !fake.broker_supported {
+                            return Some(Err(25));
+                        }
+                        Record::ProbeBroker
+                    } else {
+                        let operation = feature.command.operation;
+                        if operation == dma_broker_uapi::ALLOC_COHERENT {
+                            feature.command.handle = 11;
+                            feature.command.iova = 0x0200_0000;
+                            feature.command.mmap_offset = 4096;
+                        } else if operation == dma_broker_uapi::MAP_STREAMING {
+                            feature.command.handle = 12;
+                            feature.command.iova = 0x0300_0000;
+                        }
+                        Record::Broker {
+                            operation,
+                            handle: feature.command.handle,
+                            offset: feature.command.offset,
+                            length: feature.command.length,
+                        }
+                    }
+                }
+                _ => return Some(Err(25)),
+            };
+            fake.records.borrow_mut().push(record);
+            Some(Ok(()))
+        })
     }
 }
 

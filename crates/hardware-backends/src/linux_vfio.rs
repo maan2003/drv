@@ -560,6 +560,24 @@ impl Drop for LinuxVfio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use userspace_vfio::test_support::{Record, with_fake_io};
+
+    fn fake_device() -> (Arc<File>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "drv-vfio-fake-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(64 * 1024).unwrap();
+        (Arc::new(file), path)
+    }
 
     #[test]
     fn allocation_validation_is_fail_closed() {
@@ -576,31 +594,118 @@ mod tests {
     }
 
     #[test]
-    fn coherent_and_broker_flavors_keep_domain_ownership_separate() {
-        let device = Arc::new(File::open("/dev/null").unwrap());
+    fn coherent_flavor_binds_attaches_maps_and_unmaps_fake_fds() {
+        let (device, path) = fake_device();
         let iommu = Arc::new(File::open("/dev/null").unwrap());
-        let coherent =
-            LinuxVfio::initialize_coherent(Arc::clone(&device), Arc::clone(&iommu), |_, iommu| {
-                Ok(Ioas::from_allocated(iommu, 7))
+        let (_, records) = with_fake_io(false, || {
+            let mut backend = LinuxVfio::initialize_coherent(device, iommu, |device, iommu| {
+                userspace_vfio::bind_iommufd(device, iommu)?;
+                let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                userspace_vfio::attach_ioas(device, ioas.id())?;
+                Ok(ioas)
             })
             .unwrap();
-        assert_eq!(coherent.flavor, Flavor::Coherent);
-        assert!(coherent.iommu.is_some());
-        assert_eq!(coherent.ioas.as_ref().unwrap().id(), 7);
+            let dma = backend
+                .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
+                .unwrap();
+            backend.release_dma(dma);
+            drop(backend);
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Record::Bind,
+                Record::AllocateIoas,
+                Record::AttachIoas(7),
+                Record::Map {
+                    iova: FIRST_IOVA,
+                    length: PAGE as u64
+                },
+                Record::Unmap {
+                    iova: FIRST_IOVA,
+                    length: PAGE as u64
+                },
+                Record::DestroyIoas(7),
+            ]
+        );
+    }
 
-        let broker = LinuxVfio::initialize_broker(device, |_| Ok(())).unwrap();
-        assert_eq!(broker.flavor, Flavor::Broker);
-        assert!(broker.iommu.is_none());
-        assert!(broker.ioas.is_none());
+    #[test]
+    fn broker_flavor_probes_allocates_maps_syncs_and_releases_fake_fd() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_io(true, || {
+            let mut backend =
+                LinuxVfio::initialize_broker(device, userspace_vfio::probe_dma_broker).unwrap();
+            assert!(backend.iommu.is_none());
+            assert!(backend.ioas.is_none());
+
+            let coherent = backend
+                .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, true)
+                .unwrap();
+            backend.release_dma(coherent);
+
+            let streaming = backend
+                .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
+                .unwrap();
+            backend.sync_for_device(&streaming, 0..64).unwrap();
+            backend.sync_for_cpu(&streaming, 0..64).unwrap();
+            backend.release_dma(streaming);
+            drop(backend);
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Record::ProbeBroker,
+                Record::Broker {
+                    operation: broker::ALLOC_COHERENT,
+                    handle: 11,
+                    offset: 0,
+                    length: 0,
+                },
+                Record::Broker {
+                    operation: broker::FREE,
+                    handle: 11,
+                    offset: 0,
+                    length: 0,
+                },
+                Record::Broker {
+                    operation: broker::MAP_STREAMING,
+                    handle: 12,
+                    offset: 0,
+                    length: 0,
+                },
+                Record::Broker {
+                    operation: broker::SYNC_DEVICE,
+                    handle: 12,
+                    offset: 0,
+                    length: 64,
+                },
+                Record::Broker {
+                    operation: broker::SYNC_CPU,
+                    handle: 12,
+                    offset: 0,
+                    length: 64,
+                },
+                Record::Broker {
+                    operation: broker::UNMAP,
+                    handle: 12,
+                    offset: 0,
+                    length: 0,
+                },
+            ]
+        );
     }
 
     #[test]
     fn broker_probe_failure_is_a_precise_construction_error() {
-        let device = Arc::new(File::open("/dev/null").unwrap());
+        let (device, path) = fake_device();
         let error = match LinuxVfio::initialize_broker(device, |_| Err("ENOTTY".into())) {
             Err(error) => error,
             Ok(_) => panic!("missing broker feature unexpectedly succeeded"),
         };
+        std::fs::remove_file(path).unwrap();
         assert!(
             matches!(error, LinuxVfioError::DmaBrokerUnavailable(message) if message == "ENOTTY")
         );

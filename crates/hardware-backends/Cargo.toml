@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 drv-hardware = { path = "../hardware-api" }
 userspace-vfio = { path = "../userspace-vfio" }
+
+[dev-dependencies]
+userspace-vfio = { path = "../userspace-vfio", features = ["test-support"] }
