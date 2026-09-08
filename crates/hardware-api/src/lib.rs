@@ -348,7 +348,7 @@ impl<B: Backend> MmioRegion<B> {
         if let Some(h) = high {
             self.check(h, 4)?;
         }
-        if !Rc::ptr_eq(&self.allocation.shared.0, &address.dma.shared.0) {
+        if !Rc::ptr_eq(&self.allocation.shared.0, &address.dma.allocation.shared.0) {
             return Err(Error::Invalid);
         }
         current(&self.allocation.shared, address.dma.generation)?;
@@ -356,7 +356,7 @@ impl<B: Backend> MmioRegion<B> {
             self.allocation.token.as_ref().unwrap(),
             self.offset + low,
             high.map(|offset| self.offset + offset),
-            address.dma.token.as_ref().unwrap(),
+            address.dma.allocation.token.as_ref().unwrap(),
             address.offset,
         )
     }
@@ -368,10 +368,23 @@ impl<B: Backend> MmioRegion<B> {
         checked_range(o, n, self.len).map(|_| ())
     }
 }
-struct DmaBuffer<B: Backend, D: Direction> {
+struct DmaAllocation<B: Backend> {
     shared: Shared<B>,
     token: Option<B::Dma>,
+}
+impl<B: Backend> Drop for DmaAllocation<B> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.shared.0.borrow_mut().release_dma(token);
+        }
+    }
+}
+
+struct DmaBuffer<B: Backend, D: Direction> {
+    allocation: Rc<DmaAllocation<B>>,
     generation: u64,
+    offset: usize,
+    alignment: usize,
     bytes: Vec<u8>,
     _d: PhantomData<D>,
 }
@@ -399,23 +412,39 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
         }
         drop(b);
         Ok(Self {
-            shared,
-            token: Some(token),
+            allocation: Rc::new(DmaAllocation {
+                shared,
+                token: Some(token),
+            }),
             generation,
+            offset: 0,
+            alignment: constraints.alignment,
             bytes,
             _d: PhantomData,
         })
     }
     fn range(&self, o: usize, n: usize) -> Result<Range<usize>> {
-        current(&self.shared, self.generation)?;
+        current(&self.allocation.shared, self.generation)?;
         checked_range(o, n, self.bytes.len())
     }
-}
-impl<B: Backend, D: Direction> Drop for DmaBuffer<B, D> {
-    fn drop(&mut self) {
-        if let Some(t) = self.token.take() {
-            self.shared.0.borrow_mut().release_dma(t)
+    fn backend_range(&self, range: Range<usize>) -> Range<usize> {
+        self.offset + range.start..self.offset + range.end
+    }
+    fn split_at(mut self, offset: usize) -> Result<(Self, Self)> {
+        current(&self.allocation.shared, self.generation)?;
+        if offset == 0 || offset >= self.bytes.len() || !offset.is_multiple_of(self.alignment) {
+            return Err(Error::Invalid);
         }
+        let right_bytes = self.bytes.split_off(offset);
+        let right = Self {
+            allocation: self.allocation.clone(),
+            generation: self.generation,
+            offset: self.offset + offset,
+            alignment: self.alignment,
+            bytes: right_bytes,
+            _d: PhantomData,
+        };
+        Ok((self, right))
     }
 }
 
@@ -444,19 +473,23 @@ impl<B: Backend, D: Direction> CoherentDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
+    /// Split one backend allocation into two independently owned contiguous
+    /// views. The split must preserve the allocation's requested alignment.
+    pub fn split_at(self, offset: usize) -> Result<(Self, Self)> {
+        let (left, right) = self.0.split_at(offset)?;
+        Ok((Self(left), Self(right)))
+    }
     pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
         if offset >= self.len() {
             return Err(Error::OutOfBounds);
         }
-        let bits = self
-            .0
-            .shared
-            .0
-            .borrow()
-            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
+        let bits = self.0.allocation.shared.0.borrow().dma_device_address(
+            self.0.allocation.token.as_ref().unwrap(),
+            self.0.offset + offset,
+        )?;
         Ok(DeviceAddress {
             dma: &self.0,
-            offset,
+            offset: self.0.offset + offset,
             bits,
         })
     }
@@ -468,21 +501,23 @@ impl<B: Backend, D: CpuWrite> CoherentDma<B, D> {
     pub fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
         let r = self.0.range(offset, bytes.len())?;
         self.0.bytes[r.clone()].copy_from_slice(bytes);
-        self.0
-            .shared
-            .0
-            .borrow_mut()
-            .dma_write(self.0.token.as_ref().unwrap(), r, bytes)
+        let backend_range = self.0.backend_range(r);
+        self.0.allocation.shared.0.borrow_mut().dma_write(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range,
+            bytes,
+        )
     }
 }
 impl<B: Backend, D: CpuRead> CoherentDma<B, D> {
     pub fn read(&mut self, offset: usize, out: &mut [u8]) -> Result<()> {
         let r = self.0.range(offset, out.len())?;
-        self.0
-            .shared
-            .0
-            .borrow_mut()
-            .dma_read(self.0.token.as_ref().unwrap(), r.clone(), out)?;
+        let backend_range = self.0.backend_range(r.clone());
+        self.0.allocation.shared.0.borrow_mut().dma_read(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range,
+            out,
+        )?;
         self.0.bytes[r].copy_from_slice(out);
         Ok(())
     }
@@ -496,19 +531,23 @@ impl<B: Backend, D: Direction> StreamingDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
+    /// Split one backend allocation into two independently owned contiguous
+    /// views. The split must preserve the allocation's requested alignment.
+    pub fn split_at(self, offset: usize) -> Result<(Self, Self)> {
+        let (left, right) = self.0.split_at(offset)?;
+        Ok((Self(left), Self(right)))
+    }
     pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
         if offset >= self.len() {
             return Err(Error::OutOfBounds);
         }
-        let bits = self
-            .0
-            .shared
-            .0
-            .borrow()
-            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
+        let bits = self.0.allocation.shared.0.borrow().dma_device_address(
+            self.0.allocation.token.as_ref().unwrap(),
+            self.0.offset + offset,
+        )?;
         Ok(DeviceAddress {
             dma: &self.0,
-            offset,
+            offset: self.0.offset + offset,
             bits,
         })
     }
@@ -525,19 +564,28 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
     pub fn sync_for_device(&mut self, offset: usize, length: usize) -> Result<()> {
         let r = self.0.range(offset, length)?;
         let bytes = &self.0.bytes[r.clone()];
-        let mut b = self.0.shared.0.borrow_mut();
-        b.dma_write(self.0.token.as_ref().unwrap(), r.clone(), bytes)?;
-        b.sync_for_device(self.0.token.as_ref().unwrap(), r)
+        let backend_range = self.0.backend_range(r);
+        let mut b = self.0.allocation.shared.0.borrow_mut();
+        b.dma_write(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range.clone(),
+            bytes,
+        )?;
+        b.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)
     }
 }
 impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
     pub fn sync_for_cpu(&mut self, offset: usize, length: usize) -> Result<()> {
         let r = self.0.range(offset, length)?;
-        let mut b = self.0.shared.0.borrow_mut();
-        b.sync_for_cpu(self.0.token.as_ref().unwrap(), r.clone())?;
+        let backend_range = self.0.backend_range(r.clone());
+        let mut b = self.0.allocation.shared.0.borrow_mut();
+        b.sync_for_cpu(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range.clone(),
+        )?;
         b.dma_read(
-            self.0.token.as_ref().unwrap(),
-            r.clone(),
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range,
             &mut self.0.bytes[r],
         )
     }

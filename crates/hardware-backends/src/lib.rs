@@ -541,6 +541,42 @@ mod tests {
     }
 
     #[test]
+    fn dma_splits_preserve_one_backend_allocation_and_contiguous_addresses() {
+        let device = DeterministicBackend::device();
+        let coherent = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(64, 16)
+            .unwrap();
+        let (mut left, mut right) = coherent.split_at(32).unwrap();
+        assert_eq!(left.len(), 32);
+        assert_eq!(right.len(), 32);
+        assert_eq!(left.device_address(0).unwrap().bits(), FIRST_IOVA);
+        assert_eq!(right.device_address(0).unwrap().bits(), FIRST_IOVA + 32);
+        left.write(31, &[1]).unwrap();
+        right.write(0, &[2]).unwrap();
+        drop(left);
+        let mut observed = [0; 1];
+        right.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [2]);
+
+        let streaming = device
+            .alloc_streaming::<drv_hardware::Bidirectional>(64, 16)
+            .unwrap();
+        let (mut left, mut right) = streaming.split_at(16).unwrap();
+        left.write(0, &[3]).unwrap();
+        right.write(0, &[4]).unwrap();
+        left.sync_for_device(0, 1).unwrap();
+        right.sync_for_device(0, 1).unwrap();
+        right.sync_for_cpu(0, 1).unwrap();
+        right.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [4]);
+
+        let unaligned = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(64, 16)
+            .unwrap();
+        assert!(matches!(unaligned.split_at(8), Err(Error::Invalid)));
+    }
+
+    #[test]
     fn constrained_dma_enforces_address_alignment_and_segment_limits() {
         let device = DeterministicBackend::device();
         let low32 = DmaConstraints {
