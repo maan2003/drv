@@ -518,6 +518,17 @@ impl ReoDestinationRing {
 fixed_descriptor!(WbmReleaseRing, 32);
 
 impl WbmReleaseRing {
+    /// Port of `ath11k_hal_rx_msdu_link_desc_set`.
+    pub fn for_msdu_link(source: &WbmReleaseRing, action: u8) -> Self {
+        let mut descriptor = Self::new();
+        descriptor.0[..8].copy_from_slice(&source.0[..8]);
+        write_word(
+            &mut descriptor.0,
+            2,
+            4 | (u32::from(action) & 7) << 3 | 1 << 6,
+        );
+        descriptor
+    }
     pub fn buffer_address(&self) -> RxdmaBufferRing {
         RxdmaBufferRing::from_bytes(&self.0[..8]).expect("embedded fixed layout")
     }
@@ -584,6 +595,26 @@ impl WbmReleaseRing {
     field_accessors!(tid, set_tid, 7, 0x000f_0000, u8);
     field_accessors!(ring_id, set_ring_id, 7, 0x0ff0_0000, u8);
     field_accessors!(looping_count, set_looping_count, 7, 0xf000_0000, u8);
+}
+
+fixed_descriptor!(WbmLinkDescriptor, 8);
+impl WbmLinkDescriptor {
+    /// Port of `ath11k_hal_set_link_desc_addr` (return manager is WBM idle
+    /// descriptor list, numeric value 1).
+    pub fn new_at<B: Backend, D: Direction>(
+        address: &DeviceAddress<'_, B, D>,
+        cookie: u32,
+    ) -> Self {
+        let mut descriptor = Self::new();
+        let bits = address.bits();
+        write_word(&mut descriptor.0, 0, bits as u32);
+        write_word(
+            &mut descriptor.0,
+            1,
+            ((bits >> 32) as u32 & 0xff) | 1 << 8 | (cookie & 0x1f_ffff) << 11,
+        );
+        descriptor
+    }
 }
 
 // `struct hal_rx_msdu_details` and `struct hal_rx_msdu_link`.

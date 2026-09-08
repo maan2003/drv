@@ -16,7 +16,7 @@ C/header files. They size source ownership, not expected Rust output.
 | `ath11k-wmi` | `wmi.[ch]` | 16,769 | Checked TLV `Command`/`Event`, separately replaceable `CommandEncoder` and `EventDecoder`, and WMI service `Transport`. Split cmd encode and event decode between two engineers inside this crate because the shared IDs/TLV model must remain one API. |
 | `ath11k-hal` | `hal.[ch]`, `hal_desc.h`, `hal_{rx,tx}.[ch]` | 7,295 | WCN6750 register maps, checked descriptors, SRNG creation/publication/consumption. It owns generation-tied `CoherentDma<B, Bidirectional>` ring memory from `drv-hardware`; packet buffers retain typed coherent/streaming directions and explicit sync. |
 | `ath11k-ce` | `ce.[ch]`, then the HTC framing in `htc.[ch]` | 1,290 + 1,143 | Copy-engine rings, credits and typed service frames. It depends only on HAL; WMI and DP adapt this transport without CE depending upward on either protocol. |
-| `ath11k-dp` | `dp.[ch]`, `dp_{rx,tx}.[ch]` | 10,141 | HTT control plus TCL TX, REO RX, WBM completions. Public seams are `HttControl` and `DataPath`; descriptor mechanics remain in HAL and HTC carriage remains in CE. |
+| `ath11k-dp` | `dp.[ch]`, `dp_{rx,tx}.[ch]` | 10,141 | HTT control plus TCL TX, REO RX, WBM completions. Public seams are `HttControl` and `DataPath`; descriptor mechanics remain in HAL and HTC carriage remains in CE. DP directly owns directional streaming-DMA packet buffers because the pinned `dp_rx.c`/`dp_tx.c` own their map, sync, and unmap lifecycle. |
 | `ath11k-core` | `core.[ch]`, `hw.[ch]`, `ahb.[ch]`, `hif.h`, `peer.[ch]`, hardware-facing `mac.c` | 9,686 before `mac.c` | Composes lifecycle and owns pdev/vdev/peer state. `Lifecycle` consumes QMI'"'"'s `FirmwareReady`; `RadioControl` is the hardware-effects side of WlanSoftmac. |
 | `ath11k-platform-backend` | AHB host-resource portion of `ahb.c` | included above | Portable bottom contract: re-exports `drv-hardware` generation-tied bounded MMIO, directional coherent/streaming DMA with explicit sync, interrupt, reset and teardown types. A future host adapter alone may contain unsafe/VFIO details. |
 | replaced rather than ported | policy/callback portions of `mac.[ch]` | 11,062 total file size | Linux `ieee80211_ops`, cfg80211/mac80211 types, scan/association policy and management-frame policy are replaced by the existing Fuchsia MLME through WlanSoftmac. The WMI-emitting pdev/vdev/peer/key/channel operations are ported behind `RadioControl`. |
@@ -34,13 +34,15 @@ implementation live in `dp.[ch]`.
 ath11k-core ──▶ ath11k-qmi
      │       ├▶ ath11k-wmi
      │       ├▶ ath11k-dp ──▶ ath11k-ce ──▶ ath11k-hal
+     │       │      └──────────────▶ ath11k-platform-backend
      │       └▶ ath11k-hal ─────────────────────┘
      └────────────────────────▶ ath11k-platform-backend ──▶ drv-hardware
 ```
 
-Protocol crates never depend on core. HAL depends directly on the shared `drv-hardware` model re-exported by the platform crate, while
-the composition root supplies implementations; higher layers cannot reach raw
-host resources. Every crate forbids unsafe code. When a concrete OS adapter is
+Protocol crates never depend on core. HAL depends directly on the shared `drv-hardware` model re-exported by the platform crate. DP also
+depends on that contract for packet streaming-DMA buffers; it does not expose
+raw host resources at its MLME-facing `DataPath` seam. The composition root
+supplies implementations. Every crate forbids unsafe code. When a concrete OS adapter is
 added, unsafe is permitted only in that adapter, never in these protocol crates.
 
 ## Public API contract

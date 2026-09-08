@@ -3,6 +3,11 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use ath11k_hal::RingId;
+
+pub mod dma;
+pub mod htt;
+pub mod rx;
+pub mod transport;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerId(pub u16);
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +33,8 @@ pub struct DataRings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DpError {
     MalformedHtt,
+    MalformedDescriptor,
+    UnsupportedVersion,
     NoResources,
     DeviceFault,
 }
