@@ -545,8 +545,10 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         self.op(Operation::WmiScanStop { vdev, scan })
     }
     fn transmit_management(&mut self, frame: ManagementFrame) -> Result<(), CoreError> {
-        if !self.has_vdev(frame.vdev) {
-            return Err(CoreError::NotFound);
+        match self.vdevs.iter().find(|vdev| vdev.id == frame.vdev) {
+            Some(vdev) if vdev.started => {}
+            Some(_) => return Err(CoreError::WrongState),
+            None => return Err(CoreError::NotFound),
         }
         self.op(Operation::WmiMgmtTx(frame))
     }

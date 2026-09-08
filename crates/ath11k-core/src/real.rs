@@ -12,7 +12,9 @@ use ath11k_dp::{
     transport::{HtcHttTransport, ath11k_dp_htt_connect_service},
     tx::{ClientDataPath, ClientTxConfig},
 };
-use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma, Device, MmioRegion};
+use ath11k_platform_backend::{
+    Backend, Bidirectional, CoherentDma, Device, MmioRegion, StreamingDma, ToDevice,
+};
 use ath11k_qmi::{
     FirmwareReady, Transport as QmiTransport,
     wire::{
@@ -22,10 +24,16 @@ use ath11k_qmi::{
 use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
-        Channel as WmiChannel, HtcWmiTransport, Init, StaPowerSaveMode, StaPowerSaveParameter,
-        TxRxStreams, VdevCreate, VdevSetParam, VdevStart, Wmi,
+        Channel as WmiChannel, HtcWmiTransport, Init, MgmtSend, StaPowerSaveMode,
+        StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevSetParam, VdevStart, Wmi,
     },
 };
+
+const MGMT_RX_STATUS_ERROR_MASK: u32 = 0x01 | 0x08 | 0x10 | 0x20;
+
+fn management_rx_status_accepted(status: u32) -> bool {
+    status & MGMT_RX_STATUS_ERROR_MASK == 0
+}
 
 pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart {
     use ath11k_wmi::cmd::{ScanControlFlags, ScanEventFlags, ScanStart};
@@ -193,6 +201,7 @@ where
     trace: Option<S>,
     deadline: D,
     service_ready: Option<ath11k_wmi::event::ServiceReadyState>,
+    pending_mgmt_tx: Vec<(u32, StreamingDma<B, ToDevice>)>,
 }
 
 impl<B, Q, A, M, W, D, S> Wcn6750Subsystems<B, Q, A, M, W, D, S>
@@ -231,6 +240,7 @@ where
             trace: Some(trace),
             deadline,
             service_ready: None,
+            pending_mgmt_tx: Vec::new(),
         }
     }
 
@@ -373,6 +383,9 @@ where
     }
 
     fn teardown_transport(&mut self) -> Result<(), CoreError> {
+        // Firmware can no longer complete these frames. Revoke their
+        // device-readable mappings before the WMI/CE owners are dismantled.
+        self.pending_mgmt_tx.clear();
         if let Some(wmi) = self.wmi.take() {
             let tracing = wmi.detach();
             self.trace = Some(tracing.sink);
@@ -467,8 +480,10 @@ where
         &mut self,
         work_budget: usize,
     ) -> Result<(Option<WlanEvent>, bool), CoreError> {
-        use ath11k_wmi::event::{Decoder, EventDecoder as _, MgmtRx, Scan};
-        use ath11k_wmi::tags::{WMI_MGMT_RX_EVENTID, WMI_SCAN_EVENTID};
+        use ath11k_wmi::event::{Decoder, EventDecoder as _, MgmtRx, MgmtTxCompletion, Scan};
+        use ath11k_wmi::tags::{
+            WMI_MGMT_RX_EVENTID, WMI_MGMT_TX_COMPLETION_EVENTID, WMI_SCAN_EVENTID,
+        };
 
         let mut consumed = 0;
         while consumed < work_budget {
@@ -491,11 +506,38 @@ where
             consumed = consumed.saturating_add(1);
             let id = event.id;
             let decoded = match id {
-                WMI_MGMT_RX_EVENTID => WlanEvent::from(
-                    Decoder::<MgmtRx>::new(id)
+                WMI_MGMT_RX_EVENTID => {
+                    let received = Decoder::<MgmtRx>::new(id)
                         .decode(event)
-                        .map_err(|_| CoreError::Protocol)?,
-                ),
+                        .map_err(|_| CoreError::Protocol)?;
+                    if received.pdev_id != 0 {
+                        continue;
+                    }
+                    // Match the pinned C receive path's CRC, decrypt, and key
+                    // cache-miss rejection. MIC errors are also dropped until
+                    // the host receive surface can represent that metadata.
+                    if !management_rx_status_accepted(received.status) {
+                        continue;
+                    }
+                    WlanEvent::from(received)
+                }
+                WMI_MGMT_TX_COMPLETION_EVENTID => {
+                    let completion = Decoder::<MgmtTxCompletion>::new(id)
+                        .decode(event)
+                        .map_err(|_| CoreError::Protocol)?;
+                    if completion.pdev_id != 0 {
+                        continue;
+                    }
+                    let Some(index) = self
+                        .pending_mgmt_tx
+                        .iter()
+                        .position(|(buffer_id, _)| *buffer_id == completion.descriptor_id)
+                    else {
+                        continue;
+                    };
+                    self.pending_mgmt_tx.remove(index);
+                    WlanEvent::from(completion)
+                }
                 WMI_SCAN_EVENTID => WlanEvent::from(
                     Decoder::<Scan>::new(id)
                         .decode(event)
@@ -719,6 +761,39 @@ where
                 }
             }
             Operation::WmiScanStart(scan) => self.wmi_send(&wcn6750_scan_start(scan)),
+            Operation::WmiMgmtTx(frame) => {
+                if frame.bytes.is_empty()
+                    || self.pending_mgmt_tx.len() >= 512
+                    || self
+                        .pending_mgmt_tx
+                        .iter()
+                        .any(|(buffer_id, _)| *buffer_id == frame.buffer_id)
+                {
+                    return Err(CoreError::NoResources);
+                }
+                let mut payload = self
+                    .device
+                    .alloc_streaming::<ToDevice>(frame.bytes.len(), 4)
+                    .map_err(|_| CoreError::NoResources)?;
+                payload
+                    .write(0, &frame.bytes)
+                    .and_then(|()| payload.sync_for_device(0, frame.bytes.len()))
+                    .map_err(|_| CoreError::DeviceFault)?;
+                let paddr = payload
+                    .device_address(0)
+                    .map_err(|_| CoreError::DeviceFault)?
+                    .bits();
+                self.wmi_send(&MgmtSend {
+                    vdev_id: u32::from(frame.vdev.0),
+                    desc_id: frame.buffer_id,
+                    channel_freq: 0,
+                    paddr,
+                    frame: frame.bytes,
+                    tx_params_valid: false,
+                })?;
+                self.pending_mgmt_tx.push((frame.buffer_id, payload));
+                Ok(())
+            }
             Operation::WmiDetach => self.teardown_transport(),
             // The first hardware run intentionally polls DP ring shadows. Do
             // not enable DP eventfds until an MSI doorbell mapping exists.
@@ -897,5 +972,14 @@ mod tests {
         // CE frame. Its WMI payload remains queued for the next host drive.
         assert!(!control_budget_has_room(64, 64));
         assert!(control_budget_has_room(63, 64));
+    }
+
+    #[test]
+    fn management_rx_rejects_corrupt_or_unrepresentable_status() {
+        assert!(management_rx_status_accepted(0));
+        assert!(management_rx_status_accepted(0x40));
+        for status in [0x01, 0x08, 0x10, 0x20, 0x29] {
+            assert!(!management_rx_status_accepted(status));
+        }
     }
 }
