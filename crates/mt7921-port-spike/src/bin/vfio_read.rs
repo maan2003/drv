@@ -4,6 +4,8 @@
 
 #[cfg(feature = "fuchsia-passive")]
 use driver_runtime::{PublicationState, TranscriptEvent};
+use drv_hardware::{Backend, Device};
+use drv_hardware_backends::LinuxVfio;
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_common as fidl_common;
 #[cfg(feature = "fuchsia-passive")]
@@ -1905,6 +1907,84 @@ pub fn main() {
         eprintln!("mt7921-vfio-read: {message}");
         std::process::exit(1);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedRegisterSnapshot {
+    mcu: u32,
+    interrupt: u32,
+    wfdma_config: u32,
+    low_power: u32,
+    conn_misc: u32,
+}
+
+fn read_fixed_registers<B: Backend>(device: &Device<B>) -> Result<FixedRegisterSnapshot, String> {
+    let bar0 = device
+        .open_region(0)
+        .map_err(|error| format!("open BAR0: {error:?}"))?;
+    let wfdma = bar0
+        .slice(0xd4000, PAGE)
+        .map_err(|error| format!("slice WFDMA BAR page: {error:?}"))?;
+    let conn = bar0
+        .slice(0xe0000, PAGE)
+        .map_err(|error| format!("slice CONN BAR page: {error:?}"))?;
+    let read = |register: ReadRegister| {
+        let (page, base) = match register.bar_offset() / PAGE {
+            0xd4 => (&wfdma, 0xd4000),
+            0xe0 => (&conn, 0xe0000),
+            _ => return Err("register escaped immutable page allowlist".into()),
+        };
+        page.read_u32(register.bar_offset() - base)
+            .map_err(|error| format!("read {}: {error:?}", register.name()))
+    };
+    Ok(FixedRegisterSnapshot {
+        mcu: read(ReadRegister::McuCommand)?,
+        interrupt: read(ReadRegister::HostInterruptStatus)?,
+        wfdma_config: read(ReadRegister::WfdmaGlobalConfig)?,
+        low_power: read(ReadRegister::ConnOnLowPowerControl)?,
+        conn_misc: read(ReadRegister::ConnOnMisc)?,
+    })
+}
+
+fn run_typed_fixed_read(vfio: &str, bdf: &str) -> Result<(), String> {
+    let config = format!("/sys/bus/pci/devices/{bdf}/config");
+    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+        .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
+    let (backend, _pci, attached) = opened.into_parts();
+    if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
+        return Err(format!(
+            "attached PCI identity is {:04x}:{:04x}, expected 14c3:7961",
+            attached.vendor_id(),
+            attached.device_id()
+        ));
+    }
+    let registers = read_fixed_registers(&Device::from_backend(backend))?;
+    let status = ReadOnlyStatus::decode(
+        registers.conn_misc,
+        registers.low_power,
+        registers.wfdma_config,
+    );
+    println!(
+        "{{\"pci_bdf\":\"{bdf}\",\"vendor_device\":\"14c3:7961\",\"subsystem\":\"1a3b:4680\",\"registers\":{{\"{}\":\"{:#010x}\",\"{}\":\"{:#010x}\",\"{}\":\"{:#010x}\",\"{}\":\"{:#010x}\",\"{}\":\"{:#010x}\"}},\"status\":{{\"firmware_powered\":{},\"firmware_n9_ready\":{},\"firmware_owns_device\":{},\"tx_dma_enabled\":{},\"tx_dma_busy\":{},\"rx_dma_enabled\":{},\"rx_dma_busy\":{}}}}}",
+        ReadRegister::McuCommand.name(),
+        registers.mcu,
+        ReadRegister::HostInterruptStatus.name(),
+        registers.interrupt,
+        ReadRegister::WfdmaGlobalConfig.name(),
+        registers.wfdma_config,
+        ReadRegister::ConnOnLowPowerControl.name(),
+        registers.low_power,
+        ReadRegister::ConnOnMisc.name(),
+        registers.conn_misc,
+        status.firmware_powered,
+        status.firmware_n9_ready,
+        status.firmware_owns_device,
+        status.tx_dma_enabled,
+        status.tx_dma_busy,
+        status.rx_dma_enabled,
+        status.rx_dma_busy,
+    );
+    Ok(())
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -4699,6 +4779,9 @@ fn run() -> Result<(), String> {
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
+    if operation == Operation::ReadFixed {
+        return run_typed_fixed_read(&vfio, &bdf);
+    }
     let watchdog = operation
         .is_active_mcu()
         .then(verify_external_watchdog_armed)
@@ -18898,6 +18981,39 @@ fn decompress_verified_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_fixed_read_uses_only_the_two_allowlisted_bar_slices() {
+        let (device, operations) = drv_hardware_backends::DeterministicBackend::recording_device();
+        assert_eq!(
+            read_fixed_registers(&device).unwrap(),
+            FixedRegisterSnapshot {
+                mcu: 0,
+                interrupt: 0,
+                wfdma_config: 0,
+                low_power: 0,
+                conn_misc: 0,
+            }
+        );
+        let offsets = operations
+            .borrow()
+            .iter()
+            .filter_map(|operation| match operation {
+                drv_hardware_backends::Operation::ReadU32 { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets,
+            [
+                ReadRegister::McuCommand.bar_offset(),
+                ReadRegister::HostInterruptStatus.bar_offset(),
+                ReadRegister::WfdmaGlobalConfig.bar_offset(),
+                ReadRegister::ConnOnLowPowerControl.bar_offset(),
+                ReadRegister::ConnOnMisc.bar_offset(),
+            ]
+        );
+    }
 
     #[cfg(feature = "fuchsia-passive")]
     fn poll_option(poll: mt7921_softmac_adapter::client_device::ClientRxPoll) -> Option<ClientRxFrame> {

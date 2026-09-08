@@ -17,6 +17,8 @@ default = ["fuchsia-passive", "rate-power-evidence-only"]
 
 [dependencies]
 driver-runtime = { path = "../driver-runtime" }
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
 mt7921-port-spike = { path = "../mt7921-port-spike" }
 mt7921-softmac-adapter = { path = "../mt7921-softmac-adapter" }
 userspace-vfio = { path = "../userspace-vfio" }
