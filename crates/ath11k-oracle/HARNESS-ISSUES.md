@@ -16,12 +16,16 @@ documented init-command length convention without reporting truncation.
 
 Status: Open.
 
-The WMI command oracle is a wire-level transcription of the pinned builders in
-`ath11k/wmi.c`, not a compiled invocation of those functions. In particular,
-the `VdevStart` generator supplies arbitrary already-normalized channel words
-that do not necessarily have a semantic input accepted by the pinned channel
-helper. The differential run therefore proves the transcribed wire contract,
-but does not independently exercise that helper's channel normalization.
+The install-key, peer-association, and management-send oracles execute exact
+build-time extractions of their pinned `ath11k/wmi.c` builder bodies. Those
+paths also execute the extracted WMI allocation/zeroing helper and, for
+management send, the extracted CE byte-swap helper; only the allocator and
+command-send boundaries are stubbed. The remaining WMI command oracles are
+wire-level transcriptions. In particular, the `VdevStart` generator supplies
+arbitrary already-normalized channel words that do not necessarily have a
+semantic input accepted by the pinned channel helper. Those remaining
+differentials prove the transcribed wire contract, but do not independently
+exercise that helper's channel normalization.
 
 ## Newly typed event provenance
 
