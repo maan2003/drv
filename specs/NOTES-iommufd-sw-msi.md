@@ -17,6 +17,21 @@ With an iommufd IOAS, userspace cannot reproduce `dma_map_resource()` using
 setup can therefore succeed while the device still has no IOMMU-visible
 address at which to assert an interrupt.
 
+## Bind-time wired-IRQ gate
+
+Kernel #3 also rejects `VFIO_DEVICE_BIND_IOMMUFD` with `EPERM` before IOAS
+attachment. On arm64, `iommufd_device_bind` requires
+`iommu_group_has_isolated_msi()`; that predicate is false for a platform
+device with wired IRQs, independently of whether userspace later needs the
+software-MSI doorbell described below.
+
+The polling-only first run therefore uses the runtime parameter
+`iommufd.allow_unsafe_interrupts=1`. This is bounded for that run because no
+GIC doorbell page is mapped into the IOAS, so WCN6750 has no device-visible
+address at which to raise an interrupt. Installing any software-MSI mapping or
+otherwise making the GIC doorbell reachable invalidates that justification and
+must revisit the parameter before enabling the interrupt path.
+
 ## Machinery already in Linux 7.2
 
 The read-only Redwood target tree at `509ce3d952d5` already contains the generic
