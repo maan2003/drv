@@ -8,10 +8,12 @@ use ath11k_hal::RingId;
 pub mod dma;
 pub mod golden;
 pub mod htt;
+pub mod lifecycle;
 pub mod reo;
 pub mod rx;
 pub mod transport;
 pub mod tx;
+pub use lifecycle::{AllocatedDpRing, DpAllocationError, DpRingOps, DpRingSpec, Wcn6750DpRings};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerId(pub u16);
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +46,7 @@ pub enum DpError {
     Timeout,
     NoResources,
     DeviceFault,
+    WrongState,
 }
 pub trait HttControl {
     fn send(&mut self, message: HttHostMessage) -> Result<(), DpError>;

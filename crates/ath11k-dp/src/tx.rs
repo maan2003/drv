@@ -6,10 +6,12 @@ use ath11k_hal::descriptors::{
     ReoDestinationRing, RxdmaBufferRing, TclDataCommand, TxCommandInfo, WbmReleaseRing,
 };
 use ath11k_hal::{RingId, Rings};
-use ath11k_platform_backend::{Backend, Device};
+use ath11k_platform_backend::{Backend, Device, MmioRegion};
 
 use crate::dma::{RxBuffer, TxBuffer};
 use crate::htt::TxCompletion;
+use crate::lifecycle::{DpAllocationError, DpRingOps, Wcn6750DpRings};
+use crate::reo::ReoController;
 use crate::rx::{RxDescriptorStatus, WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
 use crate::{DataPath, DataRings, DpError, RxPacket, TxPacket};
 
@@ -100,12 +102,45 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     rxdma: Option<RxdmaConfig>,
     next_rx_cookie: u32,
     rx_buffers: Vec<PendingRx<B>>,
+    monitor_status_buffers: Vec<PendingRx<B>>,
     rx_chain: Vec<RxFragment>,
+    next_monitor_cookie: u32,
+    ring_resources: Wcn6750DpRings,
+    reo: Option<ReoController>,
 }
 
-impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
-    /// Source-shaped allocation seam for `ath11k_dp_alloc`.
-    pub fn ath11k_dp_alloc(device: Device<B>, rings: R, tx: ClientTxConfig) -> Self {
+impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
+    /// Allocate the complete WCN6750 SoC-level TCL/WBM/REO ring set in the
+    /// same order as `ath11k_dp_alloc`.
+    pub fn ath11k_dp_alloc(
+        device: Device<B>,
+        mut rings: R,
+        tx: ClientTxConfig,
+    ) -> Result<Self, DpAllocationError<B, R>> {
+        let mut ring_resources = Wcn6750DpRings::default();
+        if let Err(error) = ring_resources.allocate_common(&device, &mut rings) {
+            return Err(DpAllocationError::new(error, device, rings, ring_resources));
+        }
+        Ok(Self {
+            device,
+            rings,
+            data_rings: None,
+            tx,
+            next_msdu_id: 0,
+            pending: Vec::new(),
+            rxdma: None,
+            next_rx_cookie: 1,
+            rx_buffers: Vec::new(),
+            monitor_status_buffers: Vec::new(),
+            rx_chain: Vec::new(),
+            next_monitor_cookie: 1,
+            ring_resources,
+            reo: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn without_allocated_rings(device: Device<B>, rings: R, tx: ClientTxConfig) -> Self {
         Self {
             device,
             rings,
@@ -116,39 +151,152 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
             rxdma: None,
             next_rx_cookie: 1,
             rx_buffers: Vec::new(),
+            monitor_status_buffers: Vec::new(),
             rx_chain: Vec::new(),
+            next_monitor_cookie: 1,
+            ring_resources: Wcn6750DpRings::default(),
+            reo: None,
         }
     }
 
-    /// Source-shaped teardown seam. Dropping pending entries performs the C
-    /// `dma_unmap_single(..., DMA_TO_DEVICE)` cleanup boundary.
-    pub fn ath11k_dp_free(self) -> (Device<B>, R) {
-        (self.device, self.rings)
+    /// Tear down the SoC-level rings after all pdev phases have been freed.
+    /// Dropping pending entries also performs the C TX DMA cleanup boundary.
+    pub fn ath11k_dp_free(&mut self) -> Result<(), DpError> {
+        if !self.ring_resources.pdev_rx().is_empty()
+            || !self.ring_resources.reo_destination().is_empty()
+            || self.reo.is_some()
+        {
+            return Err(DpError::WrongState);
+        }
+        self.ring_resources.free_common(&mut self.rings)?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Recover the backend owners after the complete DP teardown sequence.
+    pub fn into_parts(self) -> Result<(Device<B>, R), DpError> {
+        if !self.ring_resources.common().is_empty()
+            || !self.ring_resources.pdev_rx().is_empty()
+            || !self.ring_resources.reo_destination().is_empty()
+            || self.reo.is_some()
+        {
+            return Err(DpError::WrongState);
+        }
+        Ok((self.device, self.rings))
     }
 
     pub fn rings(&self) -> &R {
         &self.rings
     }
 
-    pub fn rings_mut(&mut self) -> &mut R {
+    #[cfg(test)]
+    fn rings_mut(&mut self) -> &mut R {
         &mut self.rings
     }
 
-    /// `ath11k_dp_pdev_pre_alloc`; ID/cookie pools are initialized by alloc.
-    pub fn ath11k_dp_pdev_pre_alloc(&mut self) {}
-
-    pub fn ath11k_dp_pdev_alloc(
-        &mut self,
-        config: RxdmaConfig,
-        rx_buffer_count: usize,
-    ) -> Result<(), DpError> {
-        self.ath11k_dp_rxbufs_replenish(config, rx_buffer_count)
+    pub fn ring_resources(&self) -> &Wcn6750DpRings {
+        &self.ring_resources
     }
 
-    pub fn ath11k_dp_pdev_free(&mut self) {
+    /// `ath11k_dp_pdev_pre_alloc`: initialize the one WCN6750 pdev's buffer
+    /// identifiers and pending-TX state before firmware start.
+    pub fn ath11k_dp_pdev_pre_alloc(&mut self) -> Result<(), DpError> {
+        if !self.pending.is_empty()
+            || !self.rx_buffers.is_empty()
+            || !self.monitor_status_buffers.is_empty()
+        {
+            return Err(DpError::WrongState);
+        }
+        self.next_msdu_id = 0;
+        self.next_rx_cookie = 1;
+        self.next_monitor_cookie = 1;
+        self.rx_chain.clear();
+        Ok(())
+    }
+
+    /// Allocate the four REO destination rings from
+    /// `ath11k_dp_pdev_reo_setup` and bind the client data-ring view.
+    pub fn ath11k_dp_pdev_reo_setup(&mut self, mmio: &MmioRegion<B>) -> Result<(), DpError> {
+        if self.reo.is_some() {
+            return Err(DpError::WrongState);
+        }
+        let data_rings = self
+            .ring_resources
+            .allocate_reo_destination(&self.device, &mut self.rings)?;
+        let (command, status) = self.ring_resources.reo_controller_rings()?;
+        let reo = match ReoController::ath11k_dp_pdev_reo_setup(mmio, command, status) {
+            Ok(reo) => reo,
+            Err(error) => {
+                let _ = self.ring_resources.free_reo_destination(&mut self.rings);
+                return Err(error);
+            }
+        };
+        self.data_rings = Some(data_rings);
+        self.reo = Some(reo);
+        Ok(())
+    }
+
+    pub fn ath11k_dp_pdev_reo_cleanup(&mut self) -> Result<(), DpError> {
+        if !self.rx_buffers.is_empty() || !self.monitor_status_buffers.is_empty() {
+            return Err(DpError::WrongState);
+        }
+        self.ring_resources.free_reo_destination(&mut self.rings)?;
+        self.data_rings = None;
+        if let Some(reo) = self.reo.take() {
+            reo.ath11k_dp_pdev_reo_cleanup();
+        }
+        Ok(())
+    }
+
+    pub fn ath11k_dp_pdev_alloc(&mut self) -> Result<(), DpError> {
+        if self.reo.is_none() || self.data_rings.is_none() {
+            return Err(DpError::WrongState);
+        }
+        let ring = self
+            .ring_resources
+            .allocate_pdev_rx(&self.device, &mut self.rings)?;
+        let monitor_ring = self
+            .ring_resources
+            .pdev_ring(ath11k_hal::RingType::RxdmaMonitorStatus, 0)?;
+        let config = RxdmaConfig {
+            ring,
+            pdev_id: 0,
+            return_buffer_manager: 4,
+            buffer_size: 2_048,
+        };
+        let allocation = self
+            .ath11k_dp_rxbufs_replenish(config, 4_095)
+            .and_then(|()| {
+                replenish_pool(
+                    &self.device,
+                    &mut self.rings,
+                    monitor_ring,
+                    0,
+                    4,
+                    2_048,
+                    1_023,
+                    &mut self.next_monitor_cookie,
+                    &mut self.monitor_status_buffers,
+                )
+            });
+        if let Err(error) = allocation {
+            if self.ring_resources.free_pdev_rx(&mut self.rings).is_ok() {
+                self.rx_buffers.clear();
+                self.monitor_status_buffers.clear();
+                self.rxdma = None;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn ath11k_dp_pdev_free(&mut self) -> Result<(), DpError> {
+        self.ring_resources.free_pdev_rx(&mut self.rings)?;
         self.rx_buffers.clear();
+        self.monitor_status_buffers.clear();
         self.rx_chain.clear();
         self.rxdma = None;
+        Ok(())
     }
 
     /// `ath11k_dp_service_srng`: bounded interrupt service for client TX/RX.
@@ -265,24 +413,17 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
 
     fn replenish_one(&mut self) -> Result<(), DpError> {
         let config = self.rxdma.ok_or(DpError::NoResources)?;
-        let buffer_id = self.next_rx_cookie & 0x3_ffff;
-        let cookie = buffer_id | ((u32::from(config.pdev_id) & 7) << 18);
-        self.next_rx_cookie = if buffer_id == 0x3_ffff {
-            1
-        } else {
-            buffer_id + 1
-        };
-        let buffer = RxBuffer::replenish(&self.device, config.buffer_size)?;
-        let descriptor = RxdmaBufferRing::for_buffer(
-            &buffer.device_address()?,
-            cookie,
+        replenish_pool(
+            &self.device,
+            &mut self.rings,
+            config.ring,
+            config.pdev_id,
             config.return_buffer_manager,
-        );
-        self.rings
-            .publish(config.ring, descriptor.into_descriptor())
-            .map_err(map_hal)?;
-        self.rx_buffers.push(PendingRx { cookie, buffer });
-        Ok(())
+            config.buffer_size,
+            1,
+            &mut self.next_rx_cookie,
+            &mut self.rx_buffers,
+        )
     }
 
     fn allocate_msdu_id(&mut self) -> Result<u32, DpError> {
@@ -316,8 +457,42 @@ impl<B: Backend, R: Rings<B>> ClientDataPath<B, R> {
     }
 }
 
-impl<B: Backend, R: Rings<B>> DataPath for ClientDataPath<B, R> {
+#[allow(clippy::too_many_arguments)]
+fn replenish_pool<B: Backend, R: Rings<B>>(
+    device: &Device<B>,
+    rings: &mut R,
+    ring: RingId,
+    pdev_id: u8,
+    return_buffer_manager: u8,
+    buffer_size: usize,
+    count: usize,
+    next_cookie: &mut u32,
+    buffers: &mut Vec<PendingRx<B>>,
+) -> Result<(), DpError> {
+    for _ in 0..count {
+        let buffer_id = *next_cookie & 0x3_ffff;
+        let cookie = buffer_id | ((u32::from(pdev_id) & 7) << 18);
+        *next_cookie = if buffer_id == 0x3_ffff {
+            1
+        } else {
+            buffer_id + 1
+        };
+        let buffer = RxBuffer::replenish(device, buffer_size)?;
+        let descriptor =
+            RxdmaBufferRing::for_buffer(&buffer.device_address()?, cookie, return_buffer_manager);
+        rings
+            .publish(ring, descriptor.into_descriptor())
+            .map_err(map_hal)?;
+        buffers.push(PendingRx { cookie, buffer });
+    }
+    Ok(())
+}
+
+impl<B: Backend, R: DpRingOps<B>> DataPath for ClientDataPath<B, R> {
     fn configure(&mut self, rings: DataRings) -> Result<(), DpError> {
+        if !self.ring_resources.common().is_empty() {
+            return Err(DpError::WrongState);
+        }
         self.data_rings = Some(rings);
         Ok(())
     }
@@ -477,12 +652,16 @@ mod tests {
     use alloc::collections::VecDeque;
     use alloc::vec;
     use ath11k_hal::Descriptor;
+    use ath11k_platform_backend::{DmaConstraints, DmaDirection, Error as HardwareError, IrqEvent};
+    use core::ops::Range;
     use drv_hardware_backends::{DeterministicBackend, Operation};
 
     #[derive(Default)]
     struct ModelRings {
         published: Vec<(RingId, Descriptor)>,
         completions: VecDeque<Descriptor>,
+        next_ring: u16,
+        destroyed: Vec<RingId>,
     }
 
     impl Rings<DeterministicBackend> for ModelRings {
@@ -491,7 +670,9 @@ mod tests {
             _: ath11k_hal::RingKind,
             _: ath11k_hal::RingMemory<DeterministicBackend>,
         ) -> Result<RingId, ath11k_hal::HalError> {
-            Ok(RingId(0))
+            let id = RingId(self.next_ring);
+            self.next_ring += 1;
+            Ok(id)
         }
 
         fn publish(
@@ -505,6 +686,190 @@ mod tests {
 
         fn consume(&mut self, _: RingId) -> Result<Option<Descriptor>, ath11k_hal::HalError> {
             Ok(self.completions.pop_front())
+        }
+    }
+
+    impl DpRingOps<DeterministicBackend> for ModelRings {
+        fn create_dp_ring(
+            &mut self,
+            _: crate::DpRingSpec,
+            memory: ath11k_hal::RingMemory<DeterministicBackend>,
+        ) -> Result<RingId, ath11k_hal::HalError> {
+            self.create(ath11k_hal::RingKind::Tcl, memory)
+        }
+
+        fn destroy(&mut self, ring: RingId) -> Result<(), ath11k_hal::HalError> {
+            self.destroyed.push(ring);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct AggregateBackend {
+        next_dma: u64,
+    }
+
+    impl Backend for AggregateBackend {
+        type Region = u8;
+        type Dma = u64;
+        type Interrupt = u32;
+
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn open_region(&mut self, index: u8) -> Result<Self::Region, HardwareError> {
+            Ok(index)
+        }
+        fn region_len(&self, _: &Self::Region) -> usize {
+            0x0200_0000
+        }
+        fn read_u32(&mut self, _: &Self::Region, _: usize) -> Result<u32, HardwareError> {
+            Ok(0)
+        }
+        fn write_u32(&mut self, _: &Self::Region, _: usize, _: u32) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn write_dma_address(
+            &mut self,
+            _: &Self::Region,
+            _: usize,
+            _: Option<usize>,
+            _: &Self::Dma,
+            _: usize,
+        ) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn dma_device_address(&self, dma: &Self::Dma, offset: usize) -> Result<u64, HardwareError> {
+            dma.checked_add(offset as u64).ok_or(HardwareError::Limit)
+        }
+        fn alloc_dma(
+            &mut self,
+            size: usize,
+            align: usize,
+            _: DmaDirection,
+            _: bool,
+        ) -> Result<Self::Dma, HardwareError> {
+            let mask = align.checked_sub(1).ok_or(HardwareError::Invalid)? as u64;
+            self.next_dma = self
+                .next_dma
+                .checked_add(mask)
+                .ok_or(HardwareError::Limit)?
+                & !mask;
+            let address = self.next_dma;
+            self.next_dma = self
+                .next_dma
+                .checked_add(size as u64)
+                .ok_or(HardwareError::Limit)?;
+            Ok(address)
+        }
+        fn alloc_dma_constrained(
+            &mut self,
+            size: usize,
+            constraints: DmaConstraints,
+            direction: DmaDirection,
+            coherent: bool,
+        ) -> Result<Self::Dma, HardwareError> {
+            if constraints.max_segments == 0 || constraints.max_segment_size < size {
+                return Err(HardwareError::Limit);
+            }
+            self.alloc_dma(size, constraints.alignment, direction, coherent)
+        }
+        fn dma_read(
+            &mut self,
+            _: &Self::Dma,
+            _: Range<usize>,
+            out: &mut [u8],
+        ) -> Result<(), HardwareError> {
+            out.fill(0);
+            Ok(())
+        }
+        fn dma_write(
+            &mut self,
+            _: &Self::Dma,
+            _: Range<usize>,
+            _: &[u8],
+        ) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn sync_for_cpu(&mut self, _: &Self::Dma, _: Range<usize>) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn sync_for_device(&mut self, _: &Self::Dma, _: Range<usize>) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn open_interrupt(&mut self, vector: u32) -> Result<Self::Interrupt, HardwareError> {
+            Ok(vector)
+        }
+        fn wait_interrupt(
+            &mut self,
+            _: &Self::Interrupt,
+            _: u64,
+        ) -> Result<Option<IrqEvent>, HardwareError> {
+            Ok(None)
+        }
+        fn wait_any(
+            &mut self,
+            _: &[&Self::Interrupt],
+            _: u64,
+        ) -> Result<Vec<IrqEvent>, HardwareError> {
+            Ok(Vec::new())
+        }
+        fn reset(&mut self) -> Result<u64, HardwareError> {
+            Ok(0)
+        }
+        fn release_region(&mut self, _: Self::Region) {}
+        fn release_dma(&mut self, _: Self::Dma) {}
+        fn release_interrupt(&mut self, _: Self::Interrupt) {}
+    }
+
+    #[derive(Default)]
+    struct AggregateRings {
+        next: u16,
+        destroyed: Vec<RingId>,
+        fail_create: Option<u16>,
+        fail_destroy_once: Option<RingId>,
+    }
+
+    impl Rings<AggregateBackend> for AggregateRings {
+        fn create(
+            &mut self,
+            _: ath11k_hal::RingKind,
+            _: ath11k_hal::RingMemory<AggregateBackend>,
+        ) -> Result<RingId, ath11k_hal::HalError> {
+            Err(ath11k_hal::HalError::Unsupported)
+        }
+        fn publish(&mut self, _: RingId, _: Descriptor) -> Result<(), ath11k_hal::HalError> {
+            Ok(())
+        }
+        fn consume(&mut self, _: RingId) -> Result<Option<Descriptor>, ath11k_hal::HalError> {
+            Ok(None)
+        }
+    }
+
+    impl DpRingOps<AggregateBackend> for AggregateRings {
+        fn create_dp_ring(
+            &mut self,
+            spec: crate::DpRingSpec,
+            memory: ath11k_hal::RingMemory<AggregateBackend>,
+        ) -> Result<RingId, ath11k_hal::HalError> {
+            if self.fail_create == Some(self.next) {
+                return Err(ath11k_hal::HalError::NoResources);
+            }
+            assert_eq!(
+                memory.entry_bytes as usize,
+                ath11k_hal::Wcn6750Registers::entry_size(spec.ring_type)
+            );
+            let id = RingId(self.next);
+            self.next += 1;
+            Ok(id)
+        }
+        fn destroy(&mut self, ring: RingId) -> Result<(), ath11k_hal::HalError> {
+            if self.fail_destroy_once == Some(ring) {
+                self.fail_destroy_once = None;
+                return Err(ath11k_hal::HalError::DeviceFault);
+            }
+            self.destroyed.push(ring);
+            Ok(())
         }
     }
 
@@ -526,9 +891,72 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_allocates_sets_up_and_tears_down_every_phase() {
+        let device = Device::from_backend(AggregateBackend::default());
+        let mmio = device.open_region(0).unwrap();
+        let mut dp =
+            match ClientDataPath::ath11k_dp_alloc(device, AggregateRings::default(), config()) {
+                Ok(dp) => dp,
+                Err(_) => panic!("aggregate allocation failed"),
+            };
+        assert_eq!(dp.ring_resources().common().len(), 15);
+        dp.ath11k_dp_pdev_pre_alloc().unwrap();
+        dp.ath11k_dp_pdev_reo_setup(&mmio).unwrap();
+        assert_eq!(dp.ring_resources().reo_destination().len(), 4);
+        dp.ath11k_dp_pdev_alloc().unwrap();
+        assert_eq!(dp.ring_resources().pdev_rx().len(), 4);
+        assert_eq!(dp.rx_buffers.len(), 4_095);
+        assert_eq!(dp.monitor_status_buffers.len(), 1_023);
+
+        dp.ath11k_dp_pdev_free().unwrap();
+        dp.ath11k_dp_pdev_reo_cleanup().unwrap();
+        dp.ath11k_dp_free().unwrap();
+        let (_, rings) = dp.into_parts().unwrap();
+        assert_eq!(
+            rings.destroyed,
+            (19_u16..23)
+                .chain(15..19)
+                .chain(0..15)
+                .map(RingId)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn aggregate_allocation_error_retains_owners_for_cleanup_retry() {
+        let device = Device::from_backend(AggregateBackend::default());
+        let rings = AggregateRings {
+            fail_create: Some(2),
+            fail_destroy_once: Some(RingId(1)),
+            ..Default::default()
+        };
+        let error = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(_) => panic!("expected allocation failure"),
+            Err(error) => error,
+        };
+        assert_eq!(error.cause(), DpError::NoResources);
+        assert_eq!(error.cleanup_error(), Some(DpError::DeviceFault));
+        let (_, rings) = match error.into_parts() {
+            Ok(parts) => parts,
+            Err(_) => panic!("cleanup retry failed"),
+        };
+        assert_eq!(rings.destroyed, [RingId(0), RingId(1)]);
+    }
+
+    #[test]
+    fn pdev_allocation_requires_completed_reo_setup() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        assert_eq!(dp.ath11k_dp_pdev_alloc(), Err(DpError::WrongState));
+        assert!(dp.ring_resources().pdev_rx().is_empty());
+    }
+
+    #[test]
     fn client_tx_syncs_then_publishes_exact_tcl_command() {
         let (device, operations) = DeterministicBackend::recording_device();
-        let mut dp = ClientDataPath::ath11k_dp_alloc(device, ModelRings::default(), config());
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
         dp.configure(DataRings {
             tcl: RingId(1),
             reo: RingId(2),
@@ -559,7 +987,8 @@ mod tests {
     #[test]
     fn firmware_wbm_completion_releases_matching_dma_mapping() {
         let device = DeterministicBackend::device();
-        let mut dp = ClientDataPath::ath11k_dp_alloc(device, ModelRings::default(), config());
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
         dp.configure(DataRings {
             tcl: RingId(1),
             reo: RingId(2),
@@ -671,19 +1100,20 @@ mod tests {
         image[390..394].copy_from_slice(&[1, 2, 3, 4]);
         let source = TxBuffer::map(&device, &image).unwrap();
 
-        let mut dp = ClientDataPath::ath11k_dp_alloc(device, ModelRings::default(), config());
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
         dp.configure(DataRings {
             tcl: RingId(1),
             reo: RingId(2),
             wbm: RingId(3),
         })
         .unwrap();
-        dp.ath11k_dp_pdev_alloc(
+        dp.ath11k_dp_rxbufs_replenish(
             RxdmaConfig {
                 ring: RingId(4),
                 pdev_id: 0,
                 return_buffer_manager: 3,
-                buffer_size: 2048,
+                buffer_size: 2_048,
             },
             1,
         )
