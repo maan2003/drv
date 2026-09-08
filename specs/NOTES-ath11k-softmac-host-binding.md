@@ -2,11 +2,13 @@
 
 ## Status
 
-This is the binding design for ath11k as the second hardware backend. The
-chip-neutral host traits are being finalized by the MT7921 cut; the ath11k
-adapter does not yet exist. The current `ath11k-bringup` stages remain a
-diagnostic harness, while `ath11k-core` implements only part of the hardware
-effects and completion waits described below.
+Ath11k is the second hardware backend. `Ath11kClientDevice` binds the
+chip-neutral traits to either deterministic `ModelSubsystems` or real
+`Wcn6750Subsystems`; its deterministic lifecycle, query, 20 MHz channel, and
+passive-scan path passes the shared host conformance runner. The current
+`ath11k-bringup` stages remain a diagnostic harness, while `ath11k-core`
+implements only part of the hardware effects and completion waits described
+below.
 
 The binding follows [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) and
 keeps the WCN6750-specific resources described by

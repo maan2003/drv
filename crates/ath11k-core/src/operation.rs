@@ -293,6 +293,22 @@ pub trait Subsystems {
 
     /// Station spatial streams advertised by firmware for vdev setup.
     fn client_nss(&self) -> Result<u8, CoreError>;
+
+    /// Service bounded client data-path work without exposing rings or DMA.
+    /// Deterministic subsystem models have no data-path completions to report.
+    fn service_dp_host<H: ath11k_dp::tx::DpHost>(
+        &mut self,
+        _work_budget: usize,
+        _receive_budget: usize,
+        _host: &mut H,
+    ) -> Result<ath11k_dp::tx::HostServiceResult, CoreError> {
+        Ok(ath11k_dp::tx::HostServiceResult {
+            tx_delivered: 0,
+            tx_malformed: 0,
+            rx_delivered: 0,
+            rx_dropped: Default::default(),
+        })
+    }
 }
 
 /// Deterministic subsystem model used before transports are attached and by

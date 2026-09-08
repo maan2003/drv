@@ -68,6 +68,33 @@
           '';
         };
 
+      checks.x86_64-linux.ath11k-softmac-adapter =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "ath11k-softmac-adapter-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/ath11k-softmac-adapter";
+          buildAndTestSubdir = "crates/ath11k-softmac-adapter";
+          cargoLock.lockFile = ./crates/ath11k-softmac-adapter/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/ath11k-softmac-adapter
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       packages = forAllSystems (
         system:
         let
