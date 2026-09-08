@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! Little-endian WCN6750 data-path descriptor layouts.
 //!
 //! These layouts are transcribed from the pinned Linux ath11k `hal_desc.h`
@@ -804,12 +805,14 @@ impl RxPpduStart {
 }
 
 // WCN6750 selects `struct hal_rx_mpdu_info_ipq8074` for monitor MPDU info.
+// PORT-MAP: wcn6750-specific
 fixed_descriptor!(RxMpduInfoWcn6750, 92);
 impl RxMpduInfoWcn6750 {
     field_accessors!(peer_id, set_peer_id, 1, 0xffff_0000, u16);
     field_accessors!(mpdu_length, set_mpdu_length, 13, 0x3fff, u16);
 }
 
+// PORT-MAP: reusable
 // `struct hal_rx_ppdu_end_duration`.
 fixed_descriptor!(RxPpduEndDuration, 56);
 impl RxPpduEndDuration {

@@ -10,6 +10,7 @@ STATUSES = ("ported", "ported-corrected", "wcn6750-specific", "local-seam",
 HEADER = ["C symbol", "C file:lines", "Rust item", "status", "note"]
 MARKER = "<!-- PORT-MAP-SCHEMA:"
 RANGE = re.compile(r"([\w./-]+\.[ch]):(\d+)(?:-(\d+))?")
+ANNOTATION = re.compile(r"^\s*//\s*PORT-MAP:\s*(reusable|wcn6750-specific|local-seam)\s*$")
 
 def cells(line):
     return [x.strip() for x in line.strip().strip("|").split("|")]
@@ -82,8 +83,7 @@ def rust_counts(crate, rows):
             if line.strip() != "#[cfg(test)]": continue
             start = index + 1
             while start < len(lines) and "{" not in lines[start]: start += 1
-            if start < len(lines):
-                excluded.update((path, number) for number in range(index, end_of(lines, start) + 1))
+            if start < len(lines): excluded.update((path, n) for n in range(index, end_of(lines, start) + 1))
     assigned = {}; unresolved = set()
     for row in rows:
         for name in item_names(row["Rust item"]):
@@ -97,14 +97,34 @@ def rust_counts(crate, rows):
                 key = path, line; old = assigned.get(key)
                 if key in excluded: continue
                 if old and old != row["status"]:
-                    priority = {status: i for i, status in enumerate((
-                        "ported", "ported-corrected", "local-seam", "kernel-substrate",
-                        "replaced-by-fuchsia-mlme", "deferred", "blocked", "wcn6750-specific"))}
+                    priority = {status: i for i, status in enumerate(("ported", "ported-corrected", "local-seam", "kernel-substrate", "replaced-by-fuchsia-mlme", "deferred", "blocked", "wcn6750-specific"))}
                     assigned[key] = max((old, row["status"]), key=priority.get)
                 else: assigned[key] = row["status"]
+    annotation_status = {"reusable": "ported", "wcn6750-specific": "wcn6750-specific",
+                         "local-seam": "local-seam"}
+    for path, lines in sources.items():
+        markers = [(number, annotation_status[match.group(1)]) for number, line in enumerate(lines)
+                   if (match := ANNOTATION.match(line))]
+        for index, (start, status) in enumerate(markers):
+            end = markers[index + 1][0] if index + 1 < len(markers) else len(lines)
+            for number in range(start, end):
+                key = path, number
+                if key not in excluded and key not in assigned: assigned[key] = status
     count = collections.Counter(assigned.values())
     actual = sum(map(len, sources.values())) - len(excluded)
-    return count, actual, actual - len(assigned), len(unresolved)
+    unmapped_keys = {(path, number) for path, lines in sources.items() for number in range(len(lines))
+                     if (path, number) not in excluded and (path, number) not in assigned}
+    spans = []
+    for path in sources:
+        numbers = sorted(number for candidate, number in unmapped_keys if candidate == path)
+        if not numbers: continue
+        start = previous = numbers[0]
+        for number in numbers[1:] + [None]:
+            if number is not None and number == previous + 1:
+                previous = number; continue
+            spans.append(f"{path.relative_to(crate)}:{start + 1}-{previous + 1}")
+            if number is not None: start = previous = number
+    return count, actual, len(unmapped_keys), sorted(unresolved), spans
 
 def fmt_ratio(a, b): return (f"{a / b:.2f}:1" if b else ("∞" if a else "—"))
 
@@ -125,7 +145,7 @@ def main():
                 if crate.name != "ath11k-platform-backend": raise
                 maps[crate] = []; unnormalized.add(crate)
     except ValueError as error: print(error, file=sys.stderr); return 2
-    all_c = collections.Counter(); all_r = collections.Counter(); summaries = []; details = []
+    all_c = collections.Counter(); all_r = collections.Counter(); summaries = []; details = []; diagnostics = []
     for crate, rows in maps.items():
         # Count overlapping C ranges once per status, rather than once per row.
         csets = {status: set() for status in STATUSES}
@@ -133,13 +153,14 @@ def main():
             for file, start, end in row["ranges"]:
                 csets[row["status"]].update((file, line) for line in range(start, end + 1))
         c = collections.Counter({s: len(v) for s, v in csets.items()})
-        try: r, actual, unmapped, unresolved = rust_counts(crate, rows)
+        try: r, actual, unmapped, unresolved, spans = rust_counts(crate, rows)
         except ValueError as error: print(error, file=sys.stderr); return 2
         all_c.update(c); all_r.update(r)
         reusable = r["ported"] + r["ported-corrected"] + r["local-seam"]; chip = r["wcn6750-specific"]
         normalized = "no" if crate in unnormalized else "yes"
         summaries.append((crate.name, normalized, sum(c.values()), sum(r.values()), actual, reusable, chip,
-                          fmt_ratio(reusable, chip), unmapped, unresolved))
+                          fmt_ratio(reusable, chip), unmapped, len(unresolved)))
+        diagnostics.append((crate.name, unresolved, spans))
         details += [(crate.name, s, c[s], r[s]) for s in STATUSES if c[s] or r[s]]
     actual = sum(x[4] for x in summaries); unmapped = sum(x[8] for x in summaries)
     unresolved = sum(x[9] for x in summaries); reusable = all_r["ported"] + all_r["ported-corrected"] + all_r["local-seam"]
@@ -154,6 +175,12 @@ def main():
     print("\n## Total by status\n\n| status | C lines | Rust lines |\n|---|---:|---:|")
     for status in STATUSES: print(f"| {status} | {all_c[status]} | {all_r[status]} |")
     print(f"| unmapped | 0 | {unmapped} |")
+    if "--diagnostics" in sys.argv:
+        print("\n## Rust attribution diagnostics")
+        for crate, unresolved_items, spans in diagnostics:
+            print(f"\n### {crate}")
+            print("Unresolved items: " + (", ".join(f"`{item}`" for item in unresolved_items) or "none"))
+            print("\nUnmapped spans: " + (", ".join(f"`{span}`" for span in spans) or "none"))
     return 0
 
 if __name__ == "__main__": raise SystemExit(main())

@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -114,6 +115,7 @@ impl ServicePipeMap {
     }
 }
 
+// PORT-MAP: wcn6750-specific
 pub const WCN6750_HOST_CE_CONFIG: [HostPipeConfig; CE_COUNT] = [
     HostPipeConfig {
         flags: 0,
@@ -330,6 +332,7 @@ pub fn map_service_to_pipe(service: ServiceId) -> Option<(u8, u8)> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// PORT-MAP: reusable
 pub struct HtcHeader {
     pub endpoint: u8,
     pub flags: u8,

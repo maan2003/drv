@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! WCN6750 scatter/gather ring (SRNG) programming and index arithmetic.
 //!
 //! Offsets and write order follow Linux `hal.c` and the `wcn6750_regs` table
@@ -99,6 +100,7 @@ struct Config {
 }
 
 /// The register layout selected by `ath11k_hw_params` for WCN6750.
+// PORT-MAP: wcn6750-specific
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Wcn6750Registers;
 impl Wcn6750Registers {
@@ -358,6 +360,7 @@ const fn c(
 }
 
 /// Host state for one SRNG. Indices are in dwords, exactly as in Linux HAL.
+// PORT-MAP: reusable
 pub struct Srng<B: Backend> {
     pub id: RingId,
     pub ring_type: RingType,

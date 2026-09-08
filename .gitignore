@@ -2,3 +2,6 @@
 /target/
 
 **/target/
+
+# Local pinned-source build output
+/result-ath11k

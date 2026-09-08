@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! REO command/status and per-peer receive-TID lifecycle.
 
 use alloc::vec::Vec;

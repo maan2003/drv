@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 //! Firmware boot state machine corresponding to ath11k qmi.c's ordered event work.
 use crate::wire::{
     self, BdfDownloadRequest, BdfType, CapabilityResponse, DeviceInfoResponse,
@@ -47,6 +48,7 @@ pub enum DriverEvent {
     ColdBootCalibrationDone,
 }
 
+// PORT-MAP: wcn6750-specific
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HandshakeConfig {
     pub target_mem_mode: u32,
