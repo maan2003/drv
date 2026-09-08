@@ -384,22 +384,8 @@ pub fn program_dscp_tid_map<B: Backend>(
     mmio.write_u32(CONTROL, control | 1 << 17)
         .map_err(|_| crate::HalError::DeviceFault)?;
     let base = MAP + 24 * table_id;
-    // Eight equal three-bit values pack into each three-byte group; two
-    // groups form each little-endian register word in the Linux byte array.
-    for word in 0..6 {
-        // Direct construction below is clearer and exactly packs DSCP/8.
-        let mut value = 0_u32;
-        for byte in 0..4 {
-            let packed_bit = word * 32 + byte * 8;
-            for bit in 0..8 {
-                let stream_bit = packed_bit + bit;
-                let dscp_index = stream_bit / 3;
-                if dscp_index < 64 {
-                    value |=
-                        ((((dscp_index / 8) >> (stream_bit % 3)) & 1) as u32) << (byte * 8 + bit);
-                }
-            }
-        }
+    let table = core::array::from_fn(|dscp| (dscp / 8) as u8);
+    for (word, value) in dscp_tid_map_words(&table).into_iter().enumerate() {
         mmio.write_u32(base + word * 4, value)
             .map_err(|_| crate::HalError::DeviceFault)?;
     }
@@ -408,6 +394,20 @@ pub fn program_dscp_tid_map<B: Backend>(
         .map_err(|_| crate::HalError::DeviceFault)?;
     mmio.write_u32(CONTROL, control & !(1 << 17))
         .map_err(|_| crate::HalError::DeviceFault)
+}
+
+/// Packs the 64 three-bit DSCP mappings into TCL's six little-endian words.
+#[doc(hidden)]
+pub fn dscp_tid_map_words(table: &[u8; 64]) -> [u32; 6] {
+    let mut words = [0; 6];
+    for (dscp, tid) in table.iter().copied().enumerate() {
+        let bit = dscp * 3;
+        words[bit / 32] |= u32::from(tid & 7) << (bit % 32);
+        if bit % 32 > 29 {
+            words[bit / 32 + 1] |= u32::from(tid & 7) >> (32 - bit % 32);
+        }
+    }
+    words
 }
 
 // `struct hal_reo_entrance_ring` (RXDMA destination ring entry).
