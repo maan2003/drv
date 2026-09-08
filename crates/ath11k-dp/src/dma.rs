@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn tx_and_rx_use_directional_streaming_syncs() {
-        let (device, operations) = DeterministicBackend::recording_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let tx = TxBuffer::map(&device, &[1, 2, 3, 4]).unwrap();
         assert_eq!(tx.length(), 4);
         tx.device_address().unwrap();
