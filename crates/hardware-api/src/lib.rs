@@ -190,6 +190,8 @@ impl<B: Backend> Device<B> {
             len,
         })
     }
+    /// Allocate coherent DMA storage whose entire device-visible contents are
+    /// zero before this function returns.
     pub fn alloc_coherent<D: Direction>(
         &self,
         size: usize,
@@ -197,6 +199,8 @@ impl<B: Backend> Device<B> {
     ) -> Result<CoherentDma<B, D>> {
         self.alloc_coherent_with_constraints(size, DmaConstraints::new(align))
     }
+    /// Allocate constrained coherent DMA storage, zero-filled as for
+    /// [`Device::alloc_coherent`].
     pub fn alloc_coherent_with_constraints<D: Direction>(
         &self,
         size: usize,
@@ -211,6 +215,8 @@ impl<B: Backend> Device<B> {
         )
         .map(CoherentDma)
     }
+    /// Allocate streaming DMA storage whose entire device-visible contents and
+    /// CPU shadow are zero before this function returns.
     pub fn alloc_streaming<D: Direction>(
         &self,
         size: usize,
@@ -218,6 +224,8 @@ impl<B: Backend> Device<B> {
     ) -> Result<StreamingDma<B, D>> {
         self.alloc_streaming_with_constraints(size, DmaConstraints::new(align))
     }
+    /// Allocate constrained streaming DMA storage, zero-filled as for
+    /// [`Device::alloc_streaming`].
     pub fn alloc_streaming_with_constraints<D: Direction>(
         &self,
         size: usize,
@@ -358,12 +366,20 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
         let mut b = shared.0.borrow_mut();
         let generation = b.generation();
         let token = b.alloc_dma_constrained(size, constraints, dir, coherent)?;
+        // Allocation is the safe API's zero-initializing operation. Do this
+        // through the backend rather than relying on allocator-specific
+        // behavior so the device-visible storage and CPU shadow agree.
+        let bytes = vec![0; size];
+        if let Err(error) = b.dma_write(&token, 0..size, &bytes) {
+            b.release_dma(token);
+            return Err(error);
+        }
         drop(b);
         Ok(Self {
             shared,
             token: Some(token),
             generation,
-            bytes: vec![0; size],
+            bytes,
             _d: PhantomData,
         })
     }

@@ -256,7 +256,9 @@ impl Backend for DeterministicBackend {
         self.dmas.insert(
             id,
             Dma {
-                bytes: vec![0; size],
+                // Make tests prove that hardware-api performs its documented
+                // zero-initialization instead of inheriting it from a backend.
+                bytes: vec![0xa5; size],
                 iova: self.next,
                 direction,
                 coherent,
@@ -297,9 +299,9 @@ impl Backend for DeterministicBackend {
     }
     fn dma_write(&mut self, dma: &u64, r: Range<usize>, bytes: &[u8]) -> Result<()> {
         let d = self.dma_mut(dma)?;
-        if matches!(d.direction, DmaDirection::FromDevice) {
-            return Err(Error::Invalid);
-        }
+        // hardware-api uses this backend primitive to initialize every fresh
+        // allocation, including device-to-CPU buffers. Directional access is
+        // enforced by the public typed DMA handles.
         d.bytes[r].copy_from_slice(bytes);
         Ok(())
     }
@@ -416,6 +418,24 @@ mod tests {
     fn safe_sequence_covers_dma_mmio_irq_reset_and_bounds() {
         let dev = DeterministicBackend::device();
         assert_eq!(run_edu_sequence(&dev).unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn hardware_api_zeroes_fresh_coherent_and_streaming_allocations() {
+        let device = DeterministicBackend::device();
+        let mut coherent = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(32, 8)
+            .unwrap();
+        let mut observed = [0xff; 32];
+        coherent.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0; 32]);
+
+        let mut streaming = device
+            .alloc_streaming::<drv_hardware::Bidirectional>(32, 8)
+            .unwrap();
+        streaming.sync_for_cpu(0, 32).unwrap();
+        streaming.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0; 32]);
     }
 
     #[test]
