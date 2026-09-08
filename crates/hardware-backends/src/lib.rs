@@ -219,24 +219,16 @@ impl Backend for DeterministicBackend {
         Ok(value)
     }
     fn write_u32(&mut self, region: &u8, offset: usize, value: u32) -> Result<()> {
-        if let Some(ordering) = &self.ordering {
-            for dependency in ordering.0.borrow_mut().iter_mut() {
-                if dependency.doorbell_offset == offset {
-                    if !dependency.satisfied {
-                        return Err(Error::DeviceFault);
-                    }
-                    dependency.satisfied = false;
-                }
-            }
+        if let Some(ordering) = &self.ordering
+            && ordering
+                .0
+                .borrow()
+                .iter()
+                .any(|dependency| dependency.doorbell_offset == offset && !dependency.satisfied)
+        {
+            return Err(Error::DeviceFault);
         }
-        if let Some(log) = &self.operations {
-            log.borrow_mut().push(Operation::WriteU32 {
-                region: *region,
-                offset,
-                value,
-            });
-        }
-        match (offset, value) {
+        let result = (|| match (offset, value) {
             (0x40000, value) => {
                 self.edu_buffer[..4].copy_from_slice(&value.to_le_bytes());
                 Ok(())
@@ -309,7 +301,24 @@ impl Backend for DeterministicBackend {
                 Ok(())
             }
             _ => Ok(()),
+        })();
+        if result.is_ok() {
+            if let Some(ordering) = &self.ordering {
+                for dependency in ordering.0.borrow_mut().iter_mut() {
+                    if dependency.doorbell_offset == offset {
+                        dependency.satisfied = false;
+                    }
+                }
+            }
+            if let Some(log) = &self.operations {
+                log.borrow_mut().push(Operation::WriteU32 {
+                    region: *region,
+                    offset,
+                    value,
+                });
+            }
         }
+        result
     }
     fn write_dma_address(
         &mut self,
@@ -773,7 +782,8 @@ mod tests {
 
     #[test]
     fn recording_backend_rejects_doorbell_before_declared_descriptor_write() {
-        let (device, _, ordering) = DeterministicBackend::recording_device_with_ordering_checks();
+        let (device, operations, ordering) =
+            DeterministicBackend::recording_device_with_ordering_checks();
         let bar = device.open_region(0).unwrap();
         let mut descriptors = device
             .alloc_coherent::<drv_hardware::ToDevice>(16, 4)
@@ -782,9 +792,12 @@ mod tests {
         ordering.expect_descriptor_before_doorbell(descriptor..descriptor + 4, 0x100);
 
         assert_eq!(bar.write_u32(0x100, 1), Err(Error::DeviceFault));
+        assert!(operations.borrow().is_empty());
         descriptors.write(4, &[1, 2, 3, 4]).unwrap();
         bar.write_u32(0x100, 1).unwrap();
+        assert_eq!(operations.borrow().len(), 1);
         assert_eq!(bar.write_u32(0x100, 2), Err(Error::DeviceFault));
+        assert_eq!(operations.borrow().len(), 1);
     }
 
     #[test]

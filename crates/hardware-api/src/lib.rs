@@ -115,7 +115,8 @@ pub trait Backend {
     /// MMIO store with release ordering relative to preceding CPU writes to
     /// coherent DMA and preceding `sync_for_device` operations on the same
     /// thread. In particular, a descriptor write must become visible before a
-    /// later doorbell store performed through this method.
+    /// later doorbell store performed through this method. Returning `Err`
+    /// guarantees that the device did not observe the requested store.
     fn write_u32(&mut self, region: &Self::Region, offset: usize, value: u32) -> Result<()>;
     /// DMA-address store with the same release ordering as `write_u32`.
     fn write_dma_address(
@@ -376,6 +377,7 @@ impl<B: Backend> MmioRegion<B> {
             self.offset + offset,
         )
     }
+    /// Perform one checked MMIO store. `Err` means no store occurred.
     pub fn write_u32(&self, offset: usize, value: u32) -> Result<()> {
         self.check(offset, 4)?;
         self.allocation.shared.0.borrow_mut().write_u32(
