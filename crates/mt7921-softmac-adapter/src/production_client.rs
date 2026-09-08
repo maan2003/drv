@@ -20,7 +20,7 @@ trait RuntimeOwner {
         &'a mut self,
         request: fidl_sme::ConnectRequest,
         deadline: Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + 'a>>;
     fn next_connection_event(
         &mut self,
     ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError>;
@@ -62,7 +62,8 @@ where
         &'a mut self,
         request: fidl_sme::ConnectRequest,
         deadline: Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + 'a>>
+    {
         Box::pin(self.connect(request, deadline))
     }
 
@@ -145,7 +146,7 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
         &mut self,
         request: fidl_sme::ConnectRequest,
         deadline: Instant,
-    ) -> Result<(), PinnedConnectError> {
+    ) -> Result<fidl_sme::ConnectResult, PinnedConnectError> {
         self.runtime.connect(request, deadline).await
     }
 
@@ -194,9 +195,16 @@ mod tests {
             &'a mut self,
             _: fidl_sme::ConnectRequest,
             _: Instant,
-        ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + 'a>>
+        {
             self.calls.push("connect");
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                Ok(fidl_sme::ConnectResult {
+                    code: fidl_fuchsia_wlan_ieee80211::StatusCode::Success,
+                    is_credential_rejected: false,
+                    is_reconnect: false,
+                })
+            })
         }
         fn drive_once(
             &mut self,

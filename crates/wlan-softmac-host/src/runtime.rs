@@ -790,7 +790,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         &mut self,
         request: fidl_sme::ConnectRequest,
         deadline: std::time::Instant,
-    ) -> Result<(), ConnectError> {
+    ) -> Result<fidl_sme::ConnectResult, ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
@@ -881,7 +881,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         &mut self,
         request: fidl_sme::ConnectRequest,
         deadline: std::time::Instant,
-    ) -> Result<(), ConnectError> {
+    ) -> Result<fidl_sme::ConnectResult, ConnectError> {
         let mut transaction = self.sme.on_connect_command(request);
         loop {
             if std::time::Instant::now() >= deadline {
@@ -914,12 +914,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                         }
                         self.pump_once().await?;
                         if !self.sme.status().is_connected() {
-                            return Err(ConnectError::Driver(
-                                DriverError::ConnectStateMismatch,
-                            ));
+                            return Err(ConnectError::Driver(DriverError::ConnectStateMismatch));
                         }
                         self.connection = Some(transaction);
-                        return Ok(());
+                        return Ok(fidl_sme::ConnectResult {
+                            code: fidl_ieee80211::StatusCode::Success,
+                            is_credential_rejected: false,
+                            is_reconnect,
+                        });
                     }
                     Ok(_) => {}
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -948,8 +950,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         match connection.try_recv() {
             Ok(event) => {
                 if matches!(
-                    event,
-                    wlan_sme::client::ConnectTransactionEvent::OnDisconnect { .. }
+                    &event,
+                    wlan_sme::client::ConnectTransactionEvent::OnDisconnect { info }
+                        if !info.is_sme_reconnecting
                 ) {
                     self.connection = None;
                 }
@@ -1642,15 +1645,64 @@ mod tests {
             assert!(!state.calls.contains(&"reset"));
         }
 
-        futures::executor::block_on(runtime.connect(
+        let result = futures::executor::block_on(runtime.connect(
             connect_request(),
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         ))
         .unwrap();
+        assert_eq!(
+            result,
+            fidl_sme::ConnectResult {
+                code: fidl_ieee80211::StatusCode::Success,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            }
+        );
         assert!(runtime.sme().status().is_connected());
         let ethernet = runtime.take_ethernet_device().unwrap();
         assert!(ethernet.properties().is_some());
         assert!(runtime.take_ethernet_device().is_none());
+    }
+
+    #[test]
+    fn reconnecting_disconnect_retains_the_transaction_stream() {
+        let (fake, _) = Fake::new(0);
+        let mut runtime = runtime(fake);
+        let (events, stream) = mpsc::unbounded();
+        runtime.connection = Some(stream);
+        events
+            .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+                info: fidl_sme::DisconnectInfo {
+                    is_sme_reconnecting: true,
+                    disconnect_source: fidl_sme::DisconnectSource::User(
+                        fidl_sme::UserDisconnectReason::FailedToConnect,
+                    ),
+                },
+            })
+            .unwrap();
+        events
+            .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
+                result: wlan_sme::client::ConnectResult::Success,
+                is_reconnect: true,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            runtime.next_connection_event().unwrap(),
+            Some(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+                info: fidl_sme::DisconnectInfo {
+                    is_sme_reconnecting: true,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            runtime.next_connection_event().unwrap(),
+            Some(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
+                result: wlan_sme::client::ConnectResult::Success,
+                is_reconnect: true,
+            })
+        ));
     }
 
     #[test]
