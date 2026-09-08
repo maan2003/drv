@@ -1154,7 +1154,7 @@
                 SUPERVISOR=$supervisorPackage/bin/mt7921-full-firmware-validation-supervisor
                 CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
                 PCI_BDF=0000:05:00.0
-                TIMEOUT_SECONDS=300
+                TIMEOUT_SECONDS=420
                 OPERATION=--run-one-shot-sae-auth
                 MODE=DRV_ACTIVE_CLIENT=1
                 EOF
