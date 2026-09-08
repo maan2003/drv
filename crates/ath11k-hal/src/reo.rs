@@ -236,7 +236,7 @@ impl ReoCommand {
                 put(
                     &mut bytes,
                     3,
-                    ((address >> 32) as u32 & 0xff) | params.update0 & 0x67ff_ff00,
+                    ((address >> 32) as u32 & 0xff) | params.update0 & 0x6fff_ff00,
                 );
                 put(
                     &mut bytes,

@@ -29,7 +29,7 @@ Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
 | `ath11k_dp_rx_msdu_coalesce` | `dp_rx.c:1753-1838` | `parse_received_chain` | ported | Multi-buffer continuation and first-buffer L3-pad boundary model fixture. |
 | `wcn6750_ops` QCN9074 RX descriptor accessors | `hw.c:1103-1137` | `rx::Wcn6750RxDescriptor` | wcn6750-specific | Exact 388-byte QCN9074 layout selected by WCN6750; every truncation rejected. |
 | `ath11k_peer_rx_tid_setup` descriptor/DMA portion | `dp_rx.c:997-1083` | `reo::ReoTid::setup` | ported | Non-coherent REO qdesc is explicitly synced for device after initialization. |
-| `ath11k_dp_tx_send_reo_cmd` | `dp_tx.c:756-808` | `reo::ReoController::ath11k_dp_tx_send_reo_cmd` | ported | HAL preserves source-supported QueueStats, FlushCache, and UpdateRxQueue commands. |
+| `ath11k_dp_tx_send_reo_cmd` | `dp_tx.c:756-808` | `reo::ReoController::ath11k_dp_tx_send_reo_cmd` | ported | Generated C differentials cover every field and resource outcome of source-supported QueueStats, FlushCache, and UpdateRxQueue commands. |
 | `ath11k_dp_process_reo_status` | `dp_rx.c:858-909` | `reo::ReoController::ath11k_dp_process_reo_status` | ported | Typed status tag/header decode; malformed descriptors fail. |
 | `ath11k_dp_pdev_reo_setup` | `dp_rx.c:546-569` | `reo::ReoController::ath11k_dp_pdev_reo_setup` | wcn6750-specific | Calls HAL WCN6750 REO MMIO setup and owns command/status rings. |
 | `ath11k_dp_pdev_reo_cleanup` | `dp_rx.c:537-544` | `reo::ReoController::ath11k_dp_pdev_reo_cleanup` | ported | Typed REO controller teardown. |

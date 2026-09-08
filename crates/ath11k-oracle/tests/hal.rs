@@ -1,4 +1,5 @@
 use ath11k_hal::descriptors::*;
+use ath11k_hal::{ReoCommand, ReoCommandKind, ReoCommandParams, ReoResources};
 use ath11k_oracle as _;
 use ath11k_platform_backend::{FromDevice, ToDevice};
 use drv_hardware_backends::DeterministicBackend;
@@ -105,6 +106,28 @@ unsafe extern "C" {
         duration: *mut u8,
         usecs: u32,
     );
+    fn oracle_hal_reo_queue_stats(out: *mut u8, number: u16, address: u64, flags: u32);
+    fn oracle_hal_reo_flush_cache(
+        out: *mut u8,
+        number: u16,
+        address: u64,
+        flags: u32,
+        available: u8,
+        current: *mut u8,
+    ) -> i32;
+    fn oracle_hal_reo_update_rx_queue(
+        out: *mut u8,
+        number: u16,
+        address: u64,
+        flags: u32,
+        update0: u32,
+        update1: u32,
+        update2: u32,
+        pn: *const u32,
+        rxq: u16,
+        ba_window: u16,
+        pn_size: u8,
+    );
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -145,6 +168,72 @@ proptest! {
             encap, encrypt, u32::from(len), offset, flags0, flags1, addr_flags,
             u32::from(ast_index), ast_hash, tid, search, lmac, dscp, mesh.into(), manager) };
         prop_assert_eq!(rust.as_bytes(), &c);
+    }
+
+    #[test]
+    fn reo_queue_stats_command_matches_pinned_c(
+        number in any::<u16>(), flags in any::<u32>(),
+    ) {
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(1, 1).unwrap();
+        let address = dma.device_address(0).unwrap();
+        let mut resources = ReoResources::default();
+        let rust = ReoCommand::encode(number, ReoCommandKind::QueueStats, &address,
+            ReoCommandParams { flags, ..Default::default() }, &mut resources).unwrap();
+        let mut c = [0; 40];
+        // SAFETY: exact output size and typed scalar arguments.
+        unsafe { oracle_hal_reo_queue_stats(c.as_mut_ptr(), number, address.bits(), flags) };
+        let rust = rust.into_descriptor();
+        prop_assert_eq!(rust.bytes(), &c);
+    }
+
+    #[test]
+    fn reo_flush_cache_command_matches_pinned_c(
+        number in any::<u16>(), flags in any::<u32>(), available in 0u8..=7,
+        current in 0u8..=2,
+    ) {
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(1, 1).unwrap();
+        let address = dma.device_address(0).unwrap();
+        let mut resources = ReoResources {
+            available_block_resources: available,
+            current_block_index: current,
+        };
+        let rust = ReoCommand::encode(number, ReoCommandKind::FlushCache, &address,
+            ReoCommandParams { flags, ..Default::default() }, &mut resources);
+        let mut c = [0; 40];
+        let mut c_current = current;
+        // SAFETY: exact output size, valid current pointer, and typed scalar arguments.
+        let c_result = unsafe { oracle_hal_reo_flush_cache(c.as_mut_ptr(), number,
+            address.bits(), flags, available, &mut c_current) };
+        prop_assert_eq!(rust.is_ok(), c_result == 0);
+        if let Ok(rust) = rust {
+            let rust = rust.into_descriptor();
+            prop_assert_eq!(rust.bytes(), &c);
+            prop_assert_eq!(resources.current_block_index, c_current);
+        }
+    }
+
+    #[test]
+    fn reo_update_rx_queue_command_matches_pinned_c(
+        number in any::<u16>(), flags in any::<u32>(), update0 in any::<u32>(),
+        update1 in any::<u32>(), update2 in any::<u32>(), pn in any::<[u32; 4]>(),
+        rxq in any::<u16>(), ba_window in any::<u16>(), pn_size in any::<u8>(),
+    ) {
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(1, 1).unwrap();
+        let address = dma.device_address(0).unwrap();
+        let params = ReoCommandParams { flags, update0, update1, update2, pn,
+            rx_queue_number: rxq, ba_window_size: ba_window, pn_size };
+        let mut resources = ReoResources::default();
+        let rust = ReoCommand::encode(number, ReoCommandKind::UpdateRxQueue, &address,
+            params, &mut resources).unwrap();
+        let mut c = [0; 40];
+        // SAFETY: exact output size, four-element PN input, and typed scalar arguments.
+        unsafe { oracle_hal_reo_update_rx_queue(c.as_mut_ptr(), number, address.bits(),
+            flags, update0, update1, update2, pn.as_ptr(), rxq, ba_window, pn_size) };
+        let rust = rust.into_descriptor();
+        prop_assert_eq!(rust.bytes(), &c);
     }
 
     #[test]

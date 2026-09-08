@@ -20,7 +20,8 @@ The HAL differential suite uses the descriptor layouts and masks from the same
 pinned `hal_desc.h`, `hal_rx.h`, `hal_rx.c`, `hal_tx.c`, and `hal.c`. It covers
 the WCN6750 client-path TCL command (including the QCN9074 mesh bit), RX buffer
 address setup/get, REO entrance and destination parsing, WBM release and MSDU
-link setup, CE source/destination/status descriptors, and the WCN6750 monitor
+link setup, all three source-supported REO commands, CE
+source/destination/status descriptors, and the WCN6750 monitor
 MPDU and PPDU-duration fields. All generated values are within the hardware
 field widths. `ath11k-hal` has no descriptor `TraceSink`; where a Rust builder
 is not public, the suite compares a normalized sequence of parsed fields from

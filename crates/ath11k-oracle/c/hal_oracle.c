@@ -25,11 +25,13 @@ struct wbm_release { struct buffer_addr addr; u32 info0, info1, info2, rate[2], 
 struct ce_source { u32 addr_lo, addr_info, meta, flags; } PACKED;
 struct ce_destination { u32 addr_lo, addr_info; } PACKED;
 struct ce_status { u32 flags, hash0, hash1, meta; } PACKED;
+struct reo_cmd { u32 tlv, header, address_lo, info0, info1, info2, pn[4]; } PACKED;
 
 _Static_assert(sizeof(struct tcl_data) == 28, "hal_tcl_data_cmd layout");
 _Static_assert(sizeof(struct reo_entrance) == 32, "hal_reo_entrance_ring layout");
 _Static_assert(sizeof(struct reo_destination) == 64, "hal_reo_dest_ring layout");
 _Static_assert(sizeof(struct wbm_release) == 32, "hal_wbm_release_ring layout");
+_Static_assert(sizeof(struct reo_cmd) == 40, "hal_reo command layout");
 
 static void set_addr(struct buffer_addr *out, u64 address, u32 cookie, u8 manager) {
     out->info0 = PREP(ADDR_LO, address);
@@ -52,6 +54,62 @@ void oracle_hal_tx_setup(u8 out[28], u64 address, u16 metadata, u32 id,
               PREP(0x3c000000, ast_hash);
     /* WCN6750 uses the QCN9074 tx_mesh_enable callback. */
     if (mesh) d.info3 |= 0x40000000;
+    memcpy(out, &d, sizeof(d));
+}
+
+static u32 reo_tlv(u32 tag) {
+    return PREP(0x000003fe, tag) | PREP(0x03fffc00, 36);
+}
+
+void oracle_hal_reo_queue_stats(u8 out[40], u16 number, u64 address, u32 flags) {
+    struct reo_cmd d = {0};
+    d.tlv = reo_tlv(306);
+    d.header = number | ((flags & 1) ? 0x10000 : 0);
+    d.address_lo = (u32)address;
+    d.info0 = PREP(0xff, address >> 32) | ((flags & 2) ? 0x100 : 0);
+    memcpy(out, &d, sizeof(d));
+}
+
+int oracle_hal_reo_flush_cache(u8 out[40], u16 number, u64 address, u32 flags,
+                               u8 available, u8 *current) {
+    struct reo_cmd d = {0};
+    u8 slot = (u8)__builtin_ctz((u32)(~available) & 0xff);
+    if ((flags & 4) && slot >= 3)
+        return -1;
+    d.tlv = reo_tlv(308);
+    d.header = number | ((flags & 1) ? 0x10000 : 0);
+    d.address_lo = (u32)address;
+    d.info0 = PREP(0xff, address >> 32);
+    if (flags & 0x20) d.info0 |= 0x100;
+    if (flags & 4) {
+        *current = slot;
+        d.info0 |= 0x2000 | PREP(0xc00, slot);
+    }
+    if (flags & 0x10) d.info0 |= 0x1000;
+    if (flags & 0x40) d.info0 |= 0x4000;
+    memcpy(out, &d, sizeof(d));
+    return 0;
+}
+
+void oracle_hal_reo_update_rx_queue(u8 out[40], u16 number, u64 address,
+                                    u32 flags, u32 update0, u32 update1,
+                                    u32 update2, const u32 pn[4], u16 rxq,
+                                    u16 ba_window, u8 pn_size) {
+    struct reo_cmd d = {0};
+    d.tlv = reo_tlv(419);
+    d.header = number | ((flags & 1) ? 0x10000 : 0);
+    d.address_lo = (u32)address;
+    /* The pinned source has no UPD_PN_ERR term in info0. */
+    d.info0 = PREP(0xff, address >> 32) | (update0 & 0x6fffff00);
+    d.info1 = rxq | (update1 & 0xffff0000);
+    if (pn_size == 24) pn_size = 0;
+    else if (pn_size == 48) pn_size = 1;
+    else if (pn_size == 128) pn_size = 2;
+    if (ba_window < 1) ba_window = 1;
+    if (ba_window == 1) ba_window++;
+    d.info2 = PREP(0xff, ba_window - 1) | PREP(0x300, pn_size) |
+              (update2 & 0x01fffc00);
+    memcpy(d.pn, pn, sizeof(d.pn));
     memcpy(out, &d, sizeof(d));
 }
 
