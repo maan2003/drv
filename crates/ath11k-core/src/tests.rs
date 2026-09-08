@@ -451,6 +451,8 @@ fn actual_wmi_and_htt_share_one_htc_router() {
     }
 
     let mut htc = Htc::new(1, true, true);
+    htc.connect_service(ServiceId::RESERVED_CONTROL, &[])
+        .unwrap();
     htc.wait_target(&[1, 0, 4, 0, 0, 8, 9, 0]).unwrap();
     htc.connect_service(
         ServiceId::WMI_CONTROL,

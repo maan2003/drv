@@ -465,7 +465,10 @@ where
                 Ok(())
             }
             Operation::HtcInit => {
-                self.htc = Some(Htc::new(1, true, true));
+                let mut htc = Htc::new(1, true, true);
+                htc.connect_service(ServiceId::RESERVED_CONTROL, &[])
+                    .map_err(|_| CoreError::Protocol)?;
+                self.htc = Some(htc);
                 Ok(())
             }
             Operation::WmiAttach => Ok(()),

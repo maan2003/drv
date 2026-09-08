@@ -827,16 +827,19 @@ impl Htc {
     }
 
     pub fn wait_target(&mut self, bytes: &[u8]) -> Result<ReadyMessage, CeError> {
+        if self.endpoints[0].service != ServiceId::RESERVED_CONTROL {
+            return Err(CeError::InvalidFrame);
+        }
         let ready = ReadyMessage::decode(bytes)?;
         if ready.credit_count == 0 || ready.credit_size == 0 {
             return Err(CeError::InvalidFrame);
         }
-        self.total_transmit_credits = if self.supports_shadow_registers {
+        let total_transmit_credits = if self.supports_shadow_registers {
             1
         } else {
             ready.credit_count
         };
-        self.target_credit_size = ready.credit_size;
+        let mut service_allocations = self.service_allocations;
         // The setup helper rejects this range, but Linux's wait-target caller
         // intentionally ignores that return value.
         if self.wmi_endpoint_count != 0 && self.wmi_endpoint_count <= 3 {
@@ -845,13 +848,16 @@ impl Htc {
                 ServiceId::WMI_CONTROL_MAC1,
                 ServiceId::WMI_CONTROL_MAC2,
             ];
-            let credits = (self.total_transmit_credits / self.wmi_endpoint_count as u16) as u8;
+            let credits = (total_transmit_credits / self.wmi_endpoint_count as u16) as u8;
             let mut i = 0;
             while i < self.wmi_endpoint_count as usize {
-                self.service_allocations[i] = (services[i], credits);
+                service_allocations[i] = (services[i], credits);
                 i += 1;
             }
         }
+        self.total_transmit_credits = total_transmit_credits;
+        self.target_credit_size = ready.credit_size;
+        self.service_allocations = service_allocations;
         Ok(ready)
     }
 
@@ -878,6 +884,10 @@ impl Htc {
             // Linux uses 256 only for its local validity check, then copies
             // the zeroed dummy response's max-message field into endpoint 0.
             return self.install_endpoint(service, 0, 0, true, HTC_MAX_CTRL_MSG_LEN as u16);
+        }
+        if self.endpoints[0].service != ServiceId::RESERVED_CONTROL || self.target_credit_size == 0
+        {
+            return Err(CeError::InvalidFrame);
         }
         let response = ConnectServiceResponse::decode(response)?;
         if response.status != 0
@@ -946,6 +956,9 @@ impl Htc {
             .endpoints
             .get_mut(endpoint as usize)
             .ok_or(CeError::InvalidFrame)?;
+        if ep.service == ServiceId::RESERVED {
+            return Err(CeError::InvalidFrame);
+        }
         let frame_len = payload.len() + HTC_HEADER_LEN;
         let credits = if self.credit_flow && ep.credit_flow_enabled {
             if self.target_credit_size == 0 {
@@ -972,13 +985,6 @@ impl Htc {
         bytes.extend_from_slice(&header.encode());
         bytes.extend_from_slice(payload);
         Ok(bytes)
-    }
-
-    fn restore_send_credits(&mut self, endpoint: u8, frame_len: usize) {
-        let ep = &mut self.endpoints[endpoint as usize];
-        if self.credit_flow && ep.credit_flow_enabled {
-            ep.tx_credits += frame_len.div_ceil(self.target_credit_size as usize) as i32;
-        }
     }
 
     pub fn receive(&mut self, frame: &[u8]) -> Result<Option<RxFrame>, CeError> {
@@ -1019,6 +1025,7 @@ impl Htc {
     }
 
     fn process_trailer(&mut self, mut bytes: &[u8]) -> Result<(), CeError> {
+        let mut credits = self.endpoints.map(|endpoint| endpoint.tx_credits);
         while !bytes.is_empty() {
             if bytes.len() < 4 {
                 return Err(CeError::InvalidFrame);
@@ -1038,10 +1045,15 @@ impl Htc {
                     if endpoint >= HTC_ENDPOINT_COUNT {
                         break;
                     }
-                    self.endpoints[endpoint].tx_credits += report[1] as i32;
+                    credits[endpoint] = credits[endpoint]
+                        .checked_add(report[1] as i32)
+                        .ok_or(CeError::InvalidFrame)?;
                 }
             }
             bytes = &bytes[total..];
+        }
+        for (endpoint, credits) in self.endpoints.iter_mut().zip(credits) {
+            endpoint.tx_credits = credits;
         }
         Ok(())
     }
@@ -1049,6 +1061,10 @@ impl Htc {
     /// Port of `ath11k_htc_start`: frame the setup-complete-extended control
     /// message on endpoint zero.
     pub fn start(&mut self) -> Result<Vec<u8>, CeError> {
+        if self.endpoints[0].service != ServiceId::RESERVED_CONTROL || self.target_credit_size == 0
+        {
+            return Err(CeError::InvalidFrame);
+        }
         self.send(0, &setup_complete_message(self.credit_flow))
     }
 
@@ -1111,13 +1127,13 @@ impl<I: HtcPacketIo> Transport for HtcTransport<I> {
             .htc
             .endpoint_for_service(frame.service)
             .ok_or(CeError::InvalidFrame)?;
+        let credits_before = endpoint.tx_credits;
         let bytes = self.htc.send(endpoint.endpoint, &frame.bytes)?;
-        let frame_len = bytes.len();
         if let Err(error) = self
             .io
             .send_htc(endpoint.uplink_pipe, endpoint.endpoint as u16, bytes)
         {
-            self.htc.restore_send_credits(endpoint.endpoint, frame_len);
+            self.htc.endpoints[endpoint.endpoint as usize].tx_credits = credits_before;
             return Err(error);
         }
         Ok(())
@@ -1836,6 +1852,8 @@ mod tests {
     #[test]
     fn ready_connect_credit_exhaustion_and_report() {
         let mut htc = Htc::new(1, true, false);
+        htc.connect_service(ServiceId::RESERVED_CONTROL, &[])
+            .unwrap();
         htc.wait_target(&[1, 0, 4, 0, 0, 1, 9, 0]).unwrap();
         assert_eq!(htc.connect_request(ServiceId::WMI_CONTROL).flags, 0x0400);
         let ep = htc
@@ -1857,8 +1875,11 @@ mod tests {
     #[test]
     fn pseudo_control_start_and_local_stop_follow_lifecycle() {
         let mut htc = Htc::new(1, true, true);
-        htc.wait_target(&[1, 0, 8, 0, 0, 1, 9, 0]).unwrap();
-        assert_eq!(htc.total_transmit_credits, 1);
+        assert_eq!(htc.start(), Err(CeError::InvalidFrame));
+        assert_eq!(
+            htc.wait_target(&[1, 0, 8, 0, 0, 1, 9, 0]),
+            Err(CeError::InvalidFrame)
+        );
         let control = htc
             .connect_service(ServiceId::RESERVED_CONTROL, &[])
             .unwrap();
@@ -1866,6 +1887,24 @@ mod tests {
         // This apparently surprising zero is what Linux copies from its
         // zeroed pseudo-service response, despite validating against 256.
         assert_eq!(control.max_message_len, 0);
+        assert_eq!(htc.start(), Err(CeError::InvalidFrame));
+        assert_eq!(
+            htc.connect_service(
+                ServiceId::WMI_CONTROL,
+                &[3, 0, 0, 1, 0, 1, 0, 8, 0, 0, 0, 0],
+            ),
+            Err(CeError::InvalidFrame)
+        );
+        htc.wait_target(&[1, 0, 8, 0, 0, 1, 9, 0]).unwrap();
+        assert_eq!(htc.total_transmit_credits, 1);
+        assert_eq!(
+            htc.wait_target(&[0, 0, 0, 0, 0, 1, 9, 0]),
+            Err(CeError::InvalidFrame)
+        );
+        assert_eq!(
+            (htc.total_transmit_credits, htc.target_credit_size),
+            (1, 256)
+        );
         let start = htc.start().unwrap();
         assert_eq!(&start[HTC_HEADER_LEN..], &setup_complete_message(true));
         assert_eq!(htc.tx_completion(0), Some(ServiceId::RESERVED_CONTROL));
@@ -1896,6 +1935,8 @@ mod tests {
 
     fn connected_wmi_htc() -> Htc {
         let mut htc = Htc::new(1, true, false);
+        htc.connect_service(ServiceId::RESERVED_CONTROL, &[])
+            .unwrap();
         htc.wait_target(&[1, 0, 4, 0, 0, 1, 9, 0]).unwrap();
         htc.connect_service(
             ServiceId::WMI_CONTROL,
@@ -1967,14 +2008,45 @@ mod tests {
         };
         let mut transport = HtcTransport::new(connected_wmi_htc(), io);
         assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 4);
-        assert_eq!(
-            transport.send(TxFrame {
+        for _ in 0..2 {
+            assert_eq!(
+                transport.send(TxFrame {
+                    service: ServiceId::WMI_CONTROL,
+                    bytes: vec![1; 257]
+                }),
+                Err(CeError::DeviceFault)
+            );
+            assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 4);
+        }
+        transport.io.fail_send = false;
+        transport
+            .send(TxFrame {
                 service: ServiceId::WMI_CONTROL,
-                bytes: vec![1]
-            }),
-            Err(CeError::DeviceFault)
-        );
-        assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 4);
+                bytes: vec![1; 257],
+            })
+            .unwrap();
+        assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 2);
+    }
+
+    #[test]
+    fn malformed_trailer_does_not_apply_an_earlier_credit_report() {
+        let mut htc = connected_wmi_htc();
+        let malformed = [
+            1, 2, 11, 0, 11, 0, 0, 0, // HTC header: all payload is trailer
+            1, 4, 0, 0, 1, 2, 0, 0, // valid two-credit report for endpoint 1
+            0, 0, 0, // truncated next record header
+        ];
+        for _ in 0..2 {
+            assert_eq!(htc.receive(&malformed), Err(CeError::InvalidFrame));
+            assert_eq!(htc.endpoint(1).unwrap().tx_credits, 4);
+        }
+
+        let valid = [
+            1, 2, 8, 0, 8, 0, 0, 0, // HTC header: all payload is trailer
+            1, 4, 0, 0, 1, 2, 0, 0,
+        ];
+        assert_eq!(htc.receive(&valid), Ok(None));
+        assert_eq!(htc.endpoint(1).unwrap().tx_credits, 6);
     }
 
     #[test]

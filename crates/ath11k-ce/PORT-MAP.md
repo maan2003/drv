@@ -33,16 +33,16 @@ Pinned source: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`. WCN6750 selects
 | `ath11k_htc_record_hdr` | `htc.h:138-143` | `Htc::process_trailer` | ported | Malformed trailer tests |
 | `ath11k_htc_credit_report` | `htc.h:145-150` | `Htc::process_trailer` | ported | Credit report fixture |
 | `ath11k_htc_svc_id` | `htc.h:173-196` | `ServiceId` | ported | All source service IDs |
-| `ath11k_htc_init` | `htc.c:798-845` | `Htc::new` | ported | Endpoint lifecycle |
+| `ath11k_htc_init` | `htc.c:798-845` | `Htc::new`, core `HtcInit` | ported | Reserved-control endpoint is installed before ready wait, matching C ordering |
 | `ath11k_htc_wait_target` | `htc.c:524-594` | `Htc::wait_target` | ported | Ignored helper error and WCN credit quirk preserved |
 | `ath11k_htc_connect_service` | `htc.c:596-764` | `Htc::connect_request, Htc::connect_service` | ported | Connect/credit state fixture |
 | `ath11k_htc_start` | `htc.c:766-796` | `Htc::start` | ported | Setup-complete fixture |
 | `ath11k_htc_send` | `htc.c:74-148` | `Htc::send` | ported | Credit exhaustion and rollback |
-| `ath11k_htc_process_credit_report` | `htc.c:151-183` | `Htc::process_trailer` | ported | Credit report fixture |
-| `ath11k_htc_process_trailer` | `htc.c:185-241` | `Htc::process_trailer` | ported | Malformed records fail without panic |
+| `ath11k_htc_process_credit_report` | `htc.c:151-183` | `Htc::process_trailer` | ported | Credit reports apply only after the complete trailer validates |
+| `ath11k_htc_process_trailer` | `htc.c:185-241` | `Htc::process_trailer` | ported | Malformed records fail without panic or partial credit mutation |
 | `ath11k_htc_rx_completion_handler` | `htc.c:285-416` | `Htc::receive` | ported | Frame/trailer demultiplex |
 | `ath11k_htc_tx_completion_handler` | `htc.c:255-278` | `Htc::tx_completion` | ported | Endpoint lookup |
 | — | — | `Htc::stop` | local-seam | No pinned C symbol; core reset seam |
-| — | — | `HtcPacketIo, HtcTransport` | local-seam | Raw CE/HTC composition and credit rollback |
+| — | — | `HtcPacketIo, HtcTransport` | local-seam | Raw CE/HTC composition and exact credit rollback after rejected CE sends |
 | `ath11k_htc_rx_completion_handler` | `htc.c:285-416` | `HtcRouter, BoundService` | ported | Shared endpoint router mirrors eid callback dispatch |
 | — | — | `HtcServiceTransport` | local-seam | Endpoint-bound WMI/HTT payload seam |
