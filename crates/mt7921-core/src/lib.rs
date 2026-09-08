@@ -3454,7 +3454,7 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     }
     let rssi_dbm = (0..2)
         .map(|chain| ((rcpi >> (chain * 8)) & 0xff) as i16)
-        .map(|value| (value - 220) / 2)
+        .map(|value| (value - 220).div_euclid(2))
         .max()
         .unwrap_or(-128)
         .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
@@ -7266,8 +7266,12 @@ pub fn encode_client_management_tx(
     txd0 = (txd0 & !0xffff) | ((frame.len() as u32 + 32) & 0xffff);
     encoded.txwi[0..4].copy_from_slice(&txd0.to_le_bytes());
     let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
-    txd2 = (txd2 & !0xf) | u32::from((control >> 4) & 0xf);
+    let subtype = u32::from((control >> 4) & 0xf);
+    txd2 = (txd2 & !0xf) | subtype;
     encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
+    let mut txd7 = u32::from_le_bytes(encoded.txwi[28..32].try_into().unwrap());
+    txd7 = (txd7 & !(0xf << 16)) | (subtype << 16);
+    encoded.txwi[28..32].copy_from_slice(&txd7.to_le_bytes());
     // The auth-shaped padding is never published; TXP length is the original
     // MPDU length and the DMA payload arena contains only `frame`.
     encoded.txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
@@ -11462,6 +11466,21 @@ mod tests {
     }
 
     #[test]
+    fn client_management_tx_encodes_actual_subtype_in_txd2_and_txd7() {
+        for (control, expected_subtype) in [(0x0000u16, 0u32), (0x00b0, 11)] {
+            let mut frame = vec![0u8; 30];
+            frame[0..2].copy_from_slice(&control.to_le_bytes());
+
+            let encoded = encode_client_management_tx(&frame, 0x1000, 0x2000, 7, 11).unwrap();
+            let txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
+            let txd7 = u32::from_le_bytes(encoded.txwi[28..32].try_into().unwrap());
+
+            assert_eq!(txd2 & 0xf, expected_subtype);
+            assert_eq!((txd7 >> 16) & 0xf, expected_subtype);
+        }
+    }
+
+    #[test]
     fn parses_correlated_tx_free_and_txs_completion() {
         let mut free = [0u8; 12];
         free[0..4].copy_from_slice(&((6u32 << 27) | (1 << 16) | 12).to_le_bytes());
@@ -14264,6 +14283,20 @@ mod tests {
                 assert_eq!(advertisement.rssi_dbm, if with_group_5 { -60 } else { -50 });
                 assert_eq!(advertisement.ies, stripped.bytes[36..]);
             }
+        }
+    }
+
+    #[test]
+    fn connac2_rssi_floors_negative_half_dbm_values_like_linux() {
+        for (rcpi, expected_rssi) in [(220u8, 0i8), (219, -1), (100, -60), (101, -60)] {
+            let mut rx = vec![0u8; 24 + 8 + 2];
+            let rxd0 = (2u32 << 27) | rx.len() as u32;
+            rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
+            rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+            rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
+            rx[28..32].copy_from_slice(&u32::from(rcpi).wrapping_mul(0x0101).to_le_bytes());
+
+            assert_eq!(parse_connac2_rx_frame(&rx).unwrap().rssi_dbm, expected_rssi);
         }
     }
 
