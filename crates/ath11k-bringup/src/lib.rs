@@ -5,7 +5,7 @@
 compile_error!("ath11k-bringup is Linux-only");
 
 use ath11k_qmi_qrtr::QrtrTransport;
-use drv_hardware::{Device as HardwareDevice, Interrupt};
+use drv_hardware::Device as HardwareDevice;
 use drv_hardware_backends::LinuxVfio;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -250,19 +250,6 @@ impl Host for DryRunHost {
     }
 }
 
-struct HifWaiter {
-    interrupts: Vec<Interrupt<LinuxVfio>>,
-}
-
-impl ath11k_ce::CeCompletionWait for HifWaiter {
-    fn wait_for_ce(&mut self, deadline_ns: u64) -> Result<bool, ath11k_ce::CeError> {
-        let interrupts = self.interrupts.iter().collect::<Vec<_>>();
-        Interrupt::wait_any(&interrupts, deadline_ns)
-            .map(|ready| !ready.is_empty())
-            .map_err(|_| ath11k_ce::CeError::DeviceFault)
-    }
-}
-
 struct JsonTrace(WmiJsonl<BufWriter<File>>);
 
 impl ath11k_core::WmiTraceSink for JsonTrace {
@@ -297,7 +284,7 @@ type LiveSubsystems = ath11k_core::Wcn6750Subsystems<
     QrtrTransport,
     ath11k_core::Wcn6750FirmwareAssets,
     ath11k_core::HardwareMemoryProvider<LinuxVfio>,
-    HifWaiter,
+    ath11k_core::Wcn6750CeWaiter<LinuxVfio>,
     fn() -> u64,
     JsonTrace,
 >;
@@ -306,7 +293,8 @@ type LiveDevice = ath11k_core::Device<LiveSubsystems>;
 #[derive(Default)]
 pub struct RealHost {
     hardware: Option<HardwareDevice<LinuxVfio>>,
-    waiter: Option<HifWaiter>,
+    waiter: Option<ath11k_core::Wcn6750CeWaiter<LinuxVfio>>,
+    dp_interrupts: Option<ath11k_core::Wcn6750DpInterrupts<LinuxVfio>>,
     qrtr: Option<QrtrTransport>,
     firmware: Option<ath11k_core::Wcn6750FirmwareAssets>,
     wmi_log: Option<PathBuf>,
@@ -332,19 +320,12 @@ impl Host for RealHost {
             source,
         })?;
         let hardware = HardwareDevice::from_backend(vfio);
-        let interrupts = ath11k_core::WCN6750_INTERRUPT_ROUTES
-            .iter()
-            .filter(|route| route.user == ath11k_core::MsiUser::CopyEngine)
-            .map(|route| {
-                hardware
-                    .open_interrupt(u32::from(route.vector))
-                    .map_err(|error| {
-                        Error::Hardware(format!("open CE interrupt {}: {error:?}", route.vector))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (waiter, dp_interrupts) = ath11k_core::Wcn6750Interrupts::configure(hardware.clone())
+            .map_err(|error| Error::Hardware(format!("configure WCN6750 interrupts: {error:?}")))?
+            .split();
         self.hardware = Some(hardware);
-        self.waiter = Some(HifWaiter { interrupts });
+        self.waiter = Some(waiter);
+        self.dp_interrupts = Some(dp_interrupts);
         self.qrtr = Some(qrtr);
         self.wmi_log = config.wmi_log.clone();
         Ok(())
@@ -383,6 +364,9 @@ impl Host for RealHost {
         let waiter = self.waiter.take().ok_or(Error::Unsupported(
             "QMI requested before interrupt acquisition",
         ))?;
+        let dp_interrupts = self.dp_interrupts.take().ok_or(Error::Unsupported(
+            "QMI requested before DP interrupt acquisition",
+        ))?;
         let assets = self
             .firmware
             .take()
@@ -400,6 +384,7 @@ impl Host for RealHost {
             qmi,
             hardware,
             waiter,
+            dp_interrupts,
             control_deadline as fn() -> u64,
             JsonTrace(WmiJsonl::new(BufWriter::new(file))),
         );
