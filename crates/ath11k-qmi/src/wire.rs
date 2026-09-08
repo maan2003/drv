@@ -39,6 +39,29 @@ pub enum MessageId {
     DeviceInfo = 0x004c,
 }
 
+impl MessageId {
+    pub fn from_u16(value: u16) -> Result<Self, QmiError> {
+        match value {
+            0x0020 => Ok(Self::IndicationRegister),
+            0x0021 => Ok(Self::FirmwareReady),
+            0x0022 => Ok(Self::WlanMode),
+            0x0023 => Ok(Self::WlanConfig),
+            0x0024 => Ok(Self::Capability),
+            0x0025 => Ok(Self::BdfDownload),
+            0x002f => Ok(Self::WlanIni),
+            0x0034 => Ok(Self::HostCapability),
+            0x0035 => Ok(Self::RequestMemory),
+            0x0036 => Ok(Self::RespondMemory),
+            0x0037 => Ok(Self::FirmwareMemoryReady),
+            0x0038 => Ok(Self::FirmwareInitDone),
+            0x003c => Ok(Self::M3Info),
+            0x003e => Ok(Self::ColdBootCalibrationDone),
+            0x004c => Ok(Self::DeviceInfo),
+            _ => Err(QmiError::Malformed),
+        }
+    }
+}
+
 /// The C QMI decoder accepts the full signed-enum range; named constants are
 /// the values currently defined by WLFW v01.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
