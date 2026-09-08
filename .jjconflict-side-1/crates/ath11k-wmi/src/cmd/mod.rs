@@ -459,7 +459,9 @@ impl EncodeCommand for ScanStop {
 }
 
 mod init;
+mod lifecycle;
 pub use init::*;
+pub use lifecycle::*;
 
 #[cfg(test)]
 mod tests {
