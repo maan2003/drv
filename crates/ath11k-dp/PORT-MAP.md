@@ -22,7 +22,7 @@ Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
 | `ath11k_dp_htt_htc_t2h_msg_handler` client branches | `dp_rx.c:1677-1749` | `HttTargetMessage::decode`, `htt::HttEvent` | ported | Version and peer map/unmap handled; malformed length sweeps do not panic. |
 | `ath11k_dp_tx` | `dp_tx.c:83-310` | `tx::ClientDataPath::transmit` | ported | HAL TCL codec; recording backend proves streaming-DMA sync before ring publication. |
 | `ath11k_dp_tx_encap_nwifi` | `dp_tx.c:30-46` | `encap_native_wifi` | ported | QoS control removal and subtype clearing preserved. |
-| `ath11k_dp_tx_completion_handler` | `dp_tx.c:687-754` | `tx::ClientDataPath::service_tx_completions` | ported | TQM and firmware/HTT WBM completions release matching DMA ownership. |
+| `ath11k_dp_tx_completion_handler` | `dp_tx.c:687-754` | `tx::ClientDataPath::service_tx_completions` | ported-corrected | TQM and firmware/HTT WBM completions release matching DMA ownership; unknown firmware statuses fail a matching live owner rather than stranding its DMA mapping. |
 | `ath11k_dp_rxbufs_replenish` | `dp_rx.c:344-430` | `tx::ClientDataPath::ath11k_dp_rxbufs_replenish` | ported | 128-byte-aligned `StreamingDma<FromDevice>` plus typed RXDMA descriptors. |
 | `ath11k_dp_process_rx` | `dp_rx.c:2650-2785` | `tx::ClientDataPath::receive_with_status` | ported | REO cookie lookup, routing-drop behavior, sync-for-CPU, and budget semantics. |
 | `ath11k_dp_rx_process_msdu` | `dp_rx.c:2534-2610` | `parse_received_chain` | ported | Validates MSDU-done/length exactly before yielding payload and metadata. |
@@ -39,7 +39,7 @@ Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
 | `ath11k_dp_pdev_alloc` | `dp.c:911-940` | `tx::ClientDataPath::ath11k_dp_pdev_alloc` | ported | Client RXDMA allocation; monitor attach is deferred separately. |
 | `ath11k_dp_pdev_free` | `dp.c:872-885` | `tx::ClientDataPath::ath11k_dp_pdev_free` | ported | Releases client RXDMA ownership; monitor detach is deferred. |
 | `ath11k_dp_service_srng` client rings | `dp.c:770-866` | `tx::ClientDataPath::ath11k_dp_service_srng` | ported | Bounded TCL/WBM and REO/RXDMA interrupt service. |
-| `DataPath::transmit` MLME frame seam | `dp_tx.c:83-310` | `DataPath::transmit` | local-seam | Vec copy is the intentional safe MLME boundary; internal buffers retain DMA ownership. |
+| `DataPath::transmit` MLME frame seam | `dp_tx.c:83-310` | `DataPath::transmit` | local-seam | Vec copy is the intentional safe MLME boundary; internal buffers retain DMA ownership. QoS-control TID is the host input contract corresponding to mac80211's skb priority. |
 | `DataPath::receive` MLME frame seam | `dp_rx.c:2534-2648` | `DataPath::receive` | local-seam | Vec copy is the intentional safe MLME boundary; internal buffers retain DMA ownership. |
 | Native HTT golden artifact verifier | `trace.h:36-121` | `parse_jsonl`, `verify_trace`, `golden::GoldenRecord` | local-seam | Parses `artifacts/redwood-native-ath11k/htt/ordered.jsonl`, validates dynamic-array lengths/lower hex, reports exact/unmapped/first differing offset/decode failure, and runs RX descriptors through the real parser. |
 | Link-descriptor error paths | `dp_rx.c:3380-3480` | — | deferred | HAL codecs exist in `ath11k-hal`; common STA REO destination path receives direct MSDU buffers. |

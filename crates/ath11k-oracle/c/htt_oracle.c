@@ -150,3 +150,56 @@ int oracle_undecap_nwifi(const u8 *b, size_t len, const u8 *first_hdr,
     memcpy(out + hdrlen + crypto, b + native_len, len - native_len);
     return hdrlen + crypto + len - native_len;
 }
+
+int oracle_tx_encap_nwifi(const u8 *b, size_t len, u8 priority,
+                          u8 *out, size_t capacity, u8 *tid) {
+    u16 fc;
+    size_t qos;
+    if (len < 24 || capacity < len) return -22;
+    fc = get16(b);
+    if ((fc & 0x000c) != 0x0008) return -95;
+    *tid = 16;
+    if ((fc & 0x008c) != 0x0088) {
+        memcpy(out, b, len);
+        return len;
+    }
+    qos = (fc & 0x0300) == 0x0300 ? 30 : 24;
+    if (len < qos + 2) return -22;
+    *tid = priority & 0x0f;
+    memcpy(out, b, qos);
+    memcpy(out + qos, b + qos + 2, len - qos - 2);
+    fc &= ~0x0080;
+    memcpy(out, &fc, sizeof(fc));
+    return len - 2;
+}
+
+/* action: 0 = retain/ignore, 1 = free silently, 2 = free and report. */
+int oracle_tx_completion_decision(const u8 *b, size_t len, u8 *status,
+                                  u8 *acked, s8 *ack_rssi,
+                                  u8 *peer_valid, u16 *peer) {
+    u32 info0, info1, info2;
+    u8 source;
+    if (len < 32) return -22;
+    info0 = get32(b + 8); info1 = get32(b + 12); info2 = get32(b + 16);
+    source = info0 & 7;
+    *status = 0; *acked = 0; *ack_rssi = 0; *peer_valid = 0; *peer = 0xffff;
+    if (source == 3) {
+        *status = (info0 >> 9) & 0xf;
+        if (*status <= 2) {
+            *acked = *status == 0;
+            *ack_rssi = info1 >> 24;
+            *peer_valid = (info2 >> 21) & 1;
+            if (*peer_valid) *peer = info2;
+            return 2;
+        }
+        if (*status == 3 || *status == 4) return 1;
+        return 0;
+    }
+    if (source != 0) return 0;
+    *status = (info0 >> 13) & 0xf;
+    *acked = *status == 0;
+    *ack_rssi = info2;
+    *peer_valid = 1;
+    *peer = get32(b + 28);
+    return 2;
+}

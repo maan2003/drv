@@ -42,3 +42,13 @@ It does not compile those helpers directly because they depend on kernel skb,
 mac80211, and hardware-operation-table infrastructure. The generated-input
 differential therefore proves agreement with the pinned bit and frame
 transformations, but not an independently linked invocation of those symbols.
+
+## TX helper provenance
+
+Status: Open.
+
+The TX C oracle is a wire-level transcription of `ath11k_hal_tx_cmd_desc_setup`,
+`ath11k_dp_tx_encap_nwifi`, `ath11k_dp_tx_process_htt_tx_complete`, and
+`ath11k_dp_tx_status_parse`. These functions depend on kernel skb, DMA, ring,
+and mac80211 infrastructure, so the userspace harness exercises their pinned
+field and buffer transformations rather than directly linking the symbols.
