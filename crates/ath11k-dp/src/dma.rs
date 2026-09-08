@@ -48,7 +48,10 @@ pub struct RxBuffer<B: Backend> {
 impl<B: Backend> RxBuffer<B> {
     pub fn replenish(device: &Device<B>, size: usize) -> Result<Self, DpError> {
         let dma = device
-            .alloc_streaming::<FromDevice>(size, 4)
+            // DP_RX_BUFFER_ALIGN_SIZE. Linux over-allocates an skb and pulls
+            // its data pointer to this boundary; the capability API can ask
+            // the allocator for that boundary directly.
+            .alloc_streaming::<FromDevice>(size, 128)
             .map_err(|_| DpError::NoResources)?;
         Ok(Self { dma })
     }

@@ -144,7 +144,7 @@ pub fn request_target_version<C: HttControl>(
 ) -> Result<(u8, u8), DpError> {
     control.send(version_request())?;
     loop {
-        let message = control.receive(deadline_ns)?.ok_or(DpError::DeviceFault)?;
+        let message = control.receive(deadline_ns)?.ok_or(DpError::Timeout)?;
         if let HttEvent::VersionConfirm { major, minor } = message.decode()? {
             if major != TARGET_VERSION_MAJOR {
                 return Err(DpError::UnsupportedVersion);
@@ -284,11 +284,49 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::VecDeque;
     use alloc::vec;
+
+    struct Control {
+        sent: Vec<HttHostMessage>,
+        received: VecDeque<HttTargetMessage>,
+    }
+
+    impl HttControl for Control {
+        fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
+            self.sent.push(message);
+            Ok(())
+        }
+
+        fn receive(&mut self, _: u64) -> Result<Option<HttTargetMessage>, DpError> {
+            Ok(self.received.pop_front())
+        }
+    }
 
     #[test]
     fn version_request_matches_htt_ver_req_cmd() {
         assert_eq!(version_request().0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn version_handshake_ignores_other_events_and_checks_major() {
+        let mut control = Control {
+            sent: Vec::new(),
+            received: VecDeque::from([
+                HttTargetMessage(vec![0x08, 0, 0, 0]),
+                HttTargetMessage(vec![0, 9, TARGET_VERSION_MAJOR, 0]),
+            ]),
+        };
+        assert_eq!(request_target_version(&mut control, 3), Ok((3, 9)));
+        assert_eq!(control.sent, [version_request()]);
+
+        control
+            .received
+            .push_back(HttTargetMessage(vec![0, 0, 4, 0]));
+        assert_eq!(
+            request_target_version(&mut control, 3),
+            Err(DpError::UnsupportedVersion)
+        );
     }
 
     #[test]
