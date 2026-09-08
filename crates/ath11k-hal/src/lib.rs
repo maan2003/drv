@@ -1,6 +1,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 extern crate alloc;
+
+pub mod descriptors;
+
 use alloc::vec::Vec;
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma};
 pub mod srng;
