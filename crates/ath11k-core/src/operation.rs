@@ -9,6 +9,9 @@ pub struct Channel {
     pub primary_mhz: u16,
     pub center1_mhz: u16,
     pub center2_mhz: u16,
+    pub info: u32,
+    pub reg_info_1: u32,
+    pub reg_info_2: u32,
 }
 impl Channel {
     pub const fn from_primary_frequency(primary_mhz: u16) -> Self {
@@ -16,6 +19,9 @@ impl Channel {
             primary_mhz,
             center1_mhz: primary_mhz,
             center2_mhz: 0,
+            info: 0,
+            reg_info_1: 0,
+            reg_info_2: 0,
         }
     }
 }
@@ -66,6 +72,32 @@ pub struct RegulatoryChannel {
     pub allow_ht: bool,
     pub allow_vht: bool,
     pub allow_he: bool,
+}
+
+impl Channel {
+    /// Normalize the C `ath11k_mac_vdev_start_restart` channel fields for a
+    /// 20 MHz client channel.
+    pub fn client_20mhz(channel: RegulatoryChannel) -> Self {
+        let mut info = if channel.frequency_mhz < 3_000 {
+            21
+        } else {
+            16
+        };
+        if channel.passive {
+            info |= 1 << 7;
+        }
+        let max_power = u32::from(channel.max_power_dbm as u8);
+        let max_reg_power = u32::from(channel.max_reg_power_dbm as u8);
+        let max_antenna_gain = u32::from(channel.max_antenna_gain_dbi as u8);
+        Self {
+            primary_mhz: channel.frequency_mhz,
+            center1_mhz: channel.frequency_mhz,
+            center2_mhz: 0,
+            info,
+            reg_info_1: (max_power << 8) | (max_reg_power << 16),
+            reg_info_2: max_antenna_gain | (max_power << 8),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +183,7 @@ pub enum Operation {
     },
     WmiVdevStart {
         vdev: VdevId,
+        restart: bool,
         channel: Channel,
     },
     WaitVdevSetup {

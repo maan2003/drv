@@ -81,7 +81,7 @@ impl<B: Subsystems> EventSource for Device<B> {
 /// The frozen, minimal hardware-effects interface.
 pub trait RadioControl {
     fn create_client_vdev(&mut self, mac: [u8; 6]) -> Result<VdevId, CoreError>;
-    fn start_vdev(&mut self, vdev: VdevId, frequency_mhz: u16) -> Result<(), CoreError>;
+    fn start_vdev(&mut self, vdev: VdevId, channel: RegulatoryChannel) -> Result<(), CoreError>;
     fn create_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
     fn delete_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
 }
@@ -404,12 +404,21 @@ impl<B: Subsystems> RadioControl for Device<B> {
         Ok(id)
     }
 
-    fn start_vdev(&mut self, vdev: VdevId, frequency_mhz: u16) -> Result<(), CoreError> {
+    fn start_vdev(&mut self, vdev: VdevId, regulatory: RegulatoryChannel) -> Result<(), CoreError> {
         if self.state != DeviceState::Ready || !self.has_vdev(vdev) {
             return Err(CoreError::WrongState);
         }
-        let channel = Channel::from_primary_frequency(frequency_mhz);
-        self.op(Operation::WmiVdevStart { vdev, channel })?;
+        let restart = self
+            .vdevs
+            .iter()
+            .find(|item| item.id == vdev)
+            .is_some_and(|item| item.started);
+        let channel = Channel::client_20mhz(regulatory);
+        self.op(Operation::WmiVdevStart {
+            vdev,
+            restart,
+            channel,
+        })?;
         self.op(Operation::WaitVdevSetup { vdev })?;
         if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
             item.started = true;

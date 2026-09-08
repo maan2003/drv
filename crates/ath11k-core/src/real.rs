@@ -22,8 +22,8 @@ use ath11k_qmi::{
 use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
-        HtcWmiTransport, Init, StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams, VdevCreate,
-        VdevSetParam, Wmi,
+        Channel as WmiChannel, HtcWmiTransport, Init, StaPowerSaveMode, StaPowerSaveParameter,
+        TxRxStreams, VdevCreate, VdevSetParam, VdevStart, Wmi,
     },
 };
 
@@ -71,6 +71,41 @@ pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart
         extra_ie: Vec::new(),
         short_ssid_hints: Vec::new(),
         bssid_hints: Vec::new(),
+    }
+}
+
+fn wcn6750_client_vdev_start(
+    vdev: crate::VdevId,
+    restart: bool,
+    channel: crate::Channel,
+    nss: u32,
+) -> VdevStart {
+    VdevStart {
+        restart,
+        vdev_id: u32::from(vdev.0),
+        beacon_interval: 0,
+        dtim_period: 0,
+        hidden_ssid: false,
+        pmf_enabled: false,
+        hw_crypto_disabled: false,
+        ssid: None,
+        bcn_tx_rate: 0,
+        num_noa_descriptors: 0,
+        preferred_tx_streams: nss,
+        preferred_rx_streams: nss,
+        he_ops: 0,
+        cac_duration_ms: 0,
+        regdomain: 0,
+        mbssid_flags: 0,
+        mbssid_tx_vdev_id: 0,
+        channel: WmiChannel {
+            mhz: u32::from(channel.primary_mhz),
+            band_center_freq1: u32::from(channel.center1_mhz),
+            band_center_freq2: u32::from(channel.center2_mhz),
+            info: channel.info,
+            reg_info_1: channel.reg_info_1,
+            reg_info_2: channel.reg_info_2,
+        },
     }
 }
 
@@ -635,6 +670,26 @@ where
                 param_id: 1,
                 param_value: threshold,
             }),
+            Operation::WmiVdevStart {
+                vdev,
+                restart,
+                channel,
+            } => {
+                let nss = u32::from(self.client_nss()?);
+                self.wmi_send(&wcn6750_client_vdev_start(vdev, restart, channel, nss))
+            }
+            Operation::WaitVdevSetup { vdev } => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                let response = Self::protocol(self.wmi.as_mut())?
+                    .wait_for_vdev_start(deadline, u32::from(vdev.0))
+                    .map_err(|_| CoreError::Protocol)?;
+                if response.status == 0 {
+                    Ok(())
+                } else {
+                    Err(CoreError::Protocol)
+                }
+            }
             Operation::WmiScanStart(scan) => self.wmi_send(&wcn6750_scan_start(scan)),
             Operation::WmiDetach => self.teardown_transport(),
             // The first hardware run intentionally polls DP ring shadows. Do
@@ -729,6 +784,33 @@ mod tests {
         assert!(config.target_pipes.unwrap().iter().any(|pipe| {
             pipe.pipe_num == 7 && pipe.direction == QmiPipeDirection::InOutHostToHost
         }));
+    }
+
+    #[test]
+    fn client_vdev_start_uses_c_station_defaults_and_selected_channel() {
+        let channel = crate::Channel::client_20mhz(crate::RegulatoryChannel {
+            frequency_mhz: 2437,
+            max_power_dbm: 20,
+            max_reg_power_dbm: 18,
+            max_antenna_gain_dbi: 6,
+            passive: false,
+            radar: false,
+            allow_ht: true,
+            allow_vht: true,
+            allow_he: true,
+        });
+        let command = wcn6750_client_vdev_start(crate::VdevId(2), true, channel, 2);
+        assert!(command.restart);
+        assert_eq!(command.vdev_id, 2);
+        assert_eq!((command.beacon_interval, command.dtim_period), (0, 0));
+        assert_eq!(
+            (command.preferred_tx_streams, command.preferred_rx_streams),
+            (2, 2)
+        );
+        assert_eq!(command.channel.mhz, 2437);
+        assert_eq!(command.channel.info, channel.info);
+        assert_eq!(command.channel.reg_info_1, channel.reg_info_1);
+        assert_eq!(command.channel.reg_info_2, channel.reg_info_2);
     }
 
     struct DummyQmi;

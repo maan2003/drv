@@ -68,7 +68,7 @@ complete-before-return contract.
 Ath11k currently needs these additions before it can implement the traits
 without invented values:
 
-- The real subsystem must implement the existing vdev start/up, peer
+- The real subsystem must implement the existing vdev up, peer
   create/associate/authorize, key, management-TX, stop/delete, and correlated
   wait operations. The typed WMI encoders exist for most of them, but the real
   dispatcher currently rejects the operations.
@@ -82,9 +82,8 @@ without invented values:
   required metadata through the adapter. Conversely, ath11k's pdev ID, WMI
   flags, and firmware-only scan reasons do not belong in the chip-neutral
   trait unless the host demonstrates a policy use.
-- Repeated `set_channel` requires explicit start-versus-restart state and
-  completion correlation. Scan IDs, management buffer IDs, peer completions,
-  and key completions likewise need adapter-owned correlation tables.
+- Scan IDs, management buffer IDs, peer completions, and key completions need
+  adapter-owned correlation tables.
 - The controlled-port/link downcall being added with `ClientRuntimeDriver`
   must not report link-up until WMI peer authorization succeeds. Ath11k's
   separate authorize operation therefore maps to that downcall, not to
