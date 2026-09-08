@@ -21,6 +21,14 @@ trait RuntimeOwner {
         request: fidl_sme::ConnectRequest,
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + 'a>>;
+    fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError>;
+    fn disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + '_>>;
     fn drive_once(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PinnedConnectError>> + '_>>;
@@ -34,6 +42,20 @@ where
 {
     fn take_ethernet_device(&mut self) -> Option<HostEthernetDevice> {
         self.take_ethernet_device()
+    }
+
+    fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+        self.next_connection_event()
+    }
+
+    fn disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + '_>> {
+        Box::pin(self.disconnect(reason, deadline))
     }
 
     fn connect<'a>(
@@ -131,6 +153,25 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
         self.runtime.drive_once().await
     }
 
+    /// Pop one retained SME connection event without driving hardware or
+    /// applying policy. Call [`Self::drive_once`] separately to make progress.
+    pub fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+        self.runtime.next_connection_event()
+    }
+
+    /// Request a caller-selected disconnect and drive the pinned runtime until
+    /// SME reaches Idle or `deadline`. The resulting disconnect event remains
+    /// available through [`Self::next_connection_event`].
+    pub async fn disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError> {
+        self.runtime.disconnect(reason, deadline).await
+    }
+
     pub fn stop(&mut self) -> Result<(), zx::Status> {
         self.runtime.stop()
     }
@@ -163,6 +204,20 @@ mod tests {
             self.calls.push("drive");
             Box::pin(async { Ok(true) })
         }
+        fn next_connection_event(
+            &mut self,
+        ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+            self.calls.push("event");
+            Ok(None)
+        }
+        fn disconnect(
+            &mut self,
+            _: fidl_sme::UserDisconnectReason,
+            _: Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PinnedConnectError>> + '_>> {
+            self.calls.push("disconnect");
+            Box::pin(async { Ok(()) })
+        }
         fn stop(&mut self) -> Result<(), zx::Status> {
             self.calls.push("stop");
             Ok(())
@@ -178,6 +233,12 @@ mod tests {
         assert_eq!(client.public_mac(), [2, 1, 2, 3, 4, 5]);
         assert!(client.take_ethernet_device().is_none());
         assert!(futures::executor::block_on(client.drive_once()).unwrap());
+        assert!(client.next_connection_event().unwrap().is_none());
+        futures::executor::block_on(client.disconnect(
+            fidl_sme::UserDisconnectReason::FailedToConnect,
+            Instant::now(),
+        ))
+        .unwrap();
         client.stop().unwrap();
     }
 }

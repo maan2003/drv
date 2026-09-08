@@ -1070,15 +1070,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mt7921-port-spike"
-version = "0.1.0"
-dependencies = [
- "driver-runtime",
- "mt7921-core",
- "userspace-vfio",
-]
-
-[[package]]
 name = "mt7921-softmac-adapter"
 version = "0.1.0"
 dependencies = [
@@ -1097,7 +1088,7 @@ dependencies = [
  "fuchsia-softmac-port",
  "fuchsia-trace",
  "futures",
- "mt7921-port-spike",
+ "mt7921-core",
  "net_types",
  "netstack3-port-integration",
  "netstack3-port-spike",

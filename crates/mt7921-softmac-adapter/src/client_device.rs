@@ -87,7 +87,7 @@ pub fn production_association_profile_from_query_and_regulatory(
     query: &fidl_softmac::WlanSoftmacQueryResponse,
     band: fidl_ieee80211::WlanBand,
     current_channel: u8,
-    regulatory: &mt7921_port_spike::RegulatoryRatePowerSnapshot,
+    regulatory: &mt7921_core::RegulatoryRatePowerSnapshot,
 ) -> Result<fuchsia_softmac_port::AssociationRequestProfile, zx::Status> {
     let mut profile = production_association_profile_from_query(query, band)?;
     let band_capability = query
@@ -104,8 +104,8 @@ pub fn production_association_profile_from_query_and_regulatory(
         .as_ref()
         .ok_or(zx::Status::NOT_SUPPORTED)?;
     let physical_band = match band {
-        fidl_ieee80211::WlanBand::TwoGhz => mt7921_port_spike::PhysicalBand::Ghz2,
-        fidl_ieee80211::WlanBand::FiveGhz => mt7921_port_spike::PhysicalBand::Ghz5,
+        fidl_ieee80211::WlanBand::TwoGhz => mt7921_core::PhysicalBand::Ghz2,
+        fidl_ieee80211::WlanBand::FiveGhz => mt7921_core::PhysicalBand::Ghz5,
         _ => return Err(zx::Status::NOT_SUPPORTED),
     };
     let mut supported_channels = Vec::new();
@@ -319,7 +319,7 @@ pub trait Mt7921ClientIo {
     fn submit_ce_no_ack(&mut self, encoded: &[u8]) -> Result<(), zx::Status>;
     fn acquire_join_roc(
         &mut self,
-        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: mt7921_core::ClientPhysicalChannel,
         _: u64,
         _: u32,
     ) -> Result<u32, zx::Status> {
@@ -327,7 +327,7 @@ pub trait Mt7921ClientIo {
     }
     fn establish_client_channel(
         &mut self,
-        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: mt7921_core::ClientPhysicalChannel,
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
@@ -701,7 +701,7 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     }
     fn acquire_join_roc(
         &mut self,
-        channel: mt7921_port_spike::ClientPhysicalChannel,
+        channel: mt7921_core::ClientPhysicalChannel,
         generation: u64,
         duration_ms: u32,
     ) -> Result<u32, zx::Status> {
@@ -711,7 +711,7 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientIo for Mt7921SoftmacAdapter<T
     }
     fn establish_client_channel(
         &mut self,
-        channel: mt7921_port_spike::ClientPhysicalChannel,
+        channel: mt7921_core::ClientPhysicalChannel,
     ) -> Result<(), zx::Status> {
         self.with_transport_mut(|transport| transport.establish_client_channel(channel))
     }
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum PassiveCall {
-        Channel(mt7921_port_spike::CandidateChannel),
+        Channel(mt7921_core::CandidateChannel),
         Start(crate::PassiveScanCommand),
         Cancel(u64),
     }
@@ -1717,7 +1717,7 @@ mod tests {
 
         fn set_channel(
             &mut self,
-            channel: mt7921_port_spike::CandidateChannel,
+            channel: mt7921_core::CandidateChannel,
         ) -> Result<(), Self::Error> {
             self.0.lock().unwrap().push(PassiveCall::Channel(channel));
             Ok(())
@@ -1741,11 +1741,11 @@ mod tests {
         }
     }
 
-    fn nic() -> mt7921_port_spike::NicCapability {
-        mt7921_port_spike::NicCapability {
+    fn nic() -> mt7921_core::NicCapability {
+        mt7921_core::NicCapability {
             element_count: 2,
             mac_address: Some([2, 0, 0, 0, 0, 1]),
-            phy: Some(mt7921_port_spike::NicPhyCapability {
+            phy: Some(mt7921_core::NicPhyCapability {
                 ht: true,
                 vht: true,
                 has_5ghz: true,
@@ -2034,7 +2034,7 @@ mod tests {
             let passive = Mt7921SoftmacAdapter::new(
                 FakePassiveTransport::default(),
                 capability,
-                mt7921_port_spike::candidate_channels(capability),
+                mt7921_core::candidate_channels(capability),
                 vec![channel(36)],
             )
             .unwrap();
@@ -2063,7 +2063,7 @@ mod tests {
             let passive = Mt7921SoftmacAdapter::new(
                 transport,
                 capability,
-                mt7921_port_spike::candidate_channels(capability),
+                mt7921_core::candidate_channels(capability),
                 vec![channel(36)],
             )
             .unwrap();
@@ -2564,7 +2564,7 @@ mod tests {
                 ..Default::default()
             }]);
             let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
-            let regulatory = mt7921_port_spike::regulatory_rate_power_snapshot_from_regdb_v20(
+            let regulatory = mt7921_core::regulatory_rate_power_snapshot_from_regdb_v20(
                 database,
                 0,
                 *b"00",
@@ -2746,7 +2746,7 @@ mod tests {
             let passive = Mt7921SoftmacAdapter::new(
                 transport,
                 capability,
-                mt7921_port_spike::candidate_channels(capability),
+                mt7921_core::candidate_channels(capability),
                 vec![channel(36)],
             )
             .unwrap();
@@ -2867,7 +2867,7 @@ mod tests {
             let passive = Mt7921SoftmacAdapter::new(
                 FakePassiveTransport::default(),
                 capability,
-                mt7921_port_spike::candidate_channels(capability),
+                mt7921_core::candidate_channels(capability),
                 vec![channel(36)],
             )
             .unwrap();
@@ -2961,7 +2961,7 @@ mod tests {
             let passive = Mt7921SoftmacAdapter::new(
                 transport,
                 capability,
-                mt7921_port_spike::candidate_channels(capability),
+                mt7921_core::candidate_channels(capability),
                 vec![channel(36)],
             )
             .unwrap();

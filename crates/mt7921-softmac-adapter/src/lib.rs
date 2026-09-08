@@ -20,7 +20,7 @@ use fuchsia_softmac_port::{
     WlanSoftmacBaseStartPassiveScanRequest, WlanSoftmacBaseStartPassiveScanResponse,
     WlanSoftmacQueryResponse, construct_bss_description,
 };
-use mt7921_port_spike::{
+use mt7921_core::{
     CandidateChannel, ChannelSwitchReason, NicCapability, PassiveAdvertisement, PassiveMcuCommand,
     PassiveMcuCommandError, PassiveScanDone, PhysicalBand, RateTxPowerError,
     RegulatoryRatePowerSnapshot, SarFrequencyRange, candidate_channels as capability_channels,
@@ -63,12 +63,12 @@ pub struct PinnedClientRx<P> {
 pub fn pinned_client_rx_from_connac2<P>(
     envelope: &[u8],
     provenance: P,
-) -> Result<PinnedClientRx<P>, mt7921_port_spike::PassiveRxError> {
-    let frame = mt7921_port_spike::parse_connac2_rx_frame(envelope)?;
+) -> Result<PinnedClientRx<P>, mt7921_core::PassiveRxError> {
+    let frame = mt7921_core::parse_connac2_rx_frame(envelope)?;
     let band = match frame.band {
         PhysicalBand::Ghz2 => fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
         PhysicalBand::Ghz5 => fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz,
-        PhysicalBand::Ghz6 => return Err(mt7921_port_spike::PassiveRxError::InvalidChannel),
+        PhysicalBand::Ghz6 => return Err(mt7921_core::PassiveRxError::InvalidChannel),
     };
     let primary = fidl_fuchsia_wlan_ieee80211::ChannelNumber {
         band,
@@ -185,7 +185,7 @@ pub trait Mt7921PassiveTransport {
     /// (`CH_SWITCH_SCAN_BYPASS_DPD`) form.
     fn establish_client_channel(
         &mut self,
-        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: mt7921_core::ClientPhysicalChannel,
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
@@ -207,7 +207,7 @@ pub trait Mt7921PassiveTransport {
     }
     fn acquire_client_join_roc(
         &mut self,
-        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: mt7921_core::ClientPhysicalChannel,
         _: u64,
         _: u32,
     ) -> Result<u32, zx::Status> {
@@ -252,12 +252,12 @@ pub struct PhysicalChannelContext {
 /// Linux `ieee80211_channel_to_frequency` for the bands MT7921 serves; the
 /// client channel carries only band and number.
 pub fn client_channel_candidate(
-    channel: mt7921_port_spike::ClientPhysicalChannel,
+    channel: mt7921_core::ClientPhysicalChannel,
 ) -> Option<CandidateChannel> {
     let number = channel.primary;
     match channel.band {
         0 if (1..=14).contains(&number) => Some(CandidateChannel {
-            band: mt7921_port_spike::PhysicalBand::Ghz2,
+            band: mt7921_core::PhysicalBand::Ghz2,
             number,
             frequency_mhz: if number == 14 {
                 2484
@@ -266,7 +266,7 @@ pub fn client_channel_candidate(
             },
         }),
         1 if (36..=177).contains(&number) => Some(CandidateChannel {
-            band: mt7921_port_spike::PhysicalBand::Ghz5,
+            band: mt7921_core::PhysicalBand::Ghz5,
             number,
             frequency_mhz: 5000 + 5 * number,
         }),
@@ -328,7 +328,7 @@ pub trait SourceExactPassiveMechanics {
     }
     fn acquire_client_join_roc(
         &mut self,
-        _: mt7921_port_spike::ClientPhysicalChannel,
+        _: mt7921_core::ClientPhysicalChannel,
         _: u64,
         _: u32,
     ) -> Result<u32, zx::Status> {
@@ -533,7 +533,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn acquire_client_join_roc(
         &mut self,
-        channel: mt7921_port_spike::ClientPhysicalChannel,
+        channel: mt7921_core::ClientPhysicalChannel,
         generation: u64,
         duration_ms: u32,
     ) -> Result<u32, zx::Status> {
@@ -542,7 +542,7 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
     }
     fn establish_client_channel(
         &mut self,
-        channel: mt7921_port_spike::ClientPhysicalChannel,
+        channel: mt7921_core::ClientPhysicalChannel,
     ) -> Result<(), zx::Status> {
         let candidate = client_channel_candidate(channel).ok_or(zx::Status::INVALID_ARGS)?;
         if channel.center > u16::from(u8::MAX) || channel.center2 > u16::from(u8::MAX) {
@@ -1358,7 +1358,7 @@ pub fn query_from_capabilities(
 // representation deliberately omits HE because the pinned Fuchsia
 // BandCapability has no HE field.
 fn mt7921_ht_vht_capabilities(
-    phy: mt7921_port_spike::NicPhyCapability,
+    phy: mt7921_core::NicPhyCapability,
 ) -> (Option<HtCapabilities>, Option<VhtCapabilities>) {
     let streams = usize::from(phy.spatial_streams.clamp(1, 8));
     let mut ht = [0; 26];
@@ -1410,7 +1410,7 @@ mod tests {
         let nic = NicCapability {
             element_count: 1,
             mac_address: Some([2, 0, 0, 0, 0, 1]),
-            phy: Some(mt7921_port_spike::NicPhyCapability {
+            phy: Some(mt7921_core::NicPhyCapability {
                 ht: true,
                 vht: true,
                 has_5ghz: true,
@@ -1456,7 +1456,7 @@ mod tests {
         let capability = NicCapability {
             element_count: 1,
             mac_address: Some([2, 0, 0, 0, 0, 1]),
-            phy: Some(mt7921_port_spike::NicPhyCapability {
+            phy: Some(mt7921_core::NicPhyCapability {
                 ht: true,
                 vht: true,
                 has_5ghz: true,
@@ -1471,10 +1471,10 @@ mod tests {
         };
         let query = query_from_capabilities(
             capability,
-            &mt7921_port_spike::candidate_channels(capability),
+            &mt7921_core::candidate_channels(capability),
         );
         let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
-        let regulatory = mt7921_port_spike::regulatory_rate_power_snapshot_from_regdb_v20(
+        let regulatory = mt7921_core::regulatory_rate_power_snapshot_from_regdb_v20(
             database, 0, *b"00", capability, [7; 32],
         )
         .unwrap();
@@ -1694,7 +1694,7 @@ mod tests {
         NicCapability {
             element_count: 2,
             mac_address: Some([2, 0, 0, 0, 0, 1]),
-            phy: Some(mt7921_port_spike::NicPhyCapability {
+            phy: Some(mt7921_core::NicPhyCapability {
                 ht: true,
                 vht: true,
                 has_5ghz: true,
@@ -2440,7 +2440,7 @@ mod tests {
         let capability = NicCapability {
             element_count: 0,
             mac_address: Some([2, 0, 0, 0, 0, 1]),
-            phy: Some(mt7921_port_spike::NicPhyCapability {
+            phy: Some(mt7921_core::NicPhyCapability {
                 ht: true,
                 vht: true,
                 has_5ghz: false,
@@ -2470,7 +2470,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
+            mt7921_core::encode_regulatory_rate_tx_power_commands(
                 capability,
                 &incomplete,
                 3,
@@ -2493,7 +2493,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let commands = mt7921_port_spike::encode_regulatory_rate_tx_power_commands(
+        let commands = mt7921_core::encode_regulatory_rate_tx_power_commands(
             capability, &complete, 3, 1,
         )
         .unwrap();

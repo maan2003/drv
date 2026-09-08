@@ -8,7 +8,7 @@ use fuchsia_softmac_port::HardwareScanEvent;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::lock::Mutex as AsyncMutex;
-use mt7921_port_spike::{CandidateChannel, NicCapability, NicPhyCapability, PhysicalBand};
+use mt7921_core::{CandidateChannel, NicCapability, NicPhyCapability, PhysicalBand};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};

@@ -1,7 +1,7 @@
 # MT7921 pinned-Fuchsia SoftMAC adapter
 
 This GPL-2.0-only crate is the offline-testable seam between the typed MT7921
-NIC capability/channel inventory in `mt7921-port-spike` and the BSD-2-Clause
+NIC capability/channel inventory in `mt7921-core` and the BSD-2-Clause
 `fuchsia-softmac-port` at Fuchsia commit
 `1e1219e3fac944c9a906aea9646939746b6062b3`. Keeping the adapter separate makes
 the combined Linux-derived/Fuchsia-derived distribution and its provenance
