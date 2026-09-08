@@ -1,0 +1,1409 @@
+--- a/src/connectivity/wlan/lib/sme/src/client/scan.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/scan.rs
+@@ -35,7 +35,10 @@
+ 
+ impl<T> DiscoveryScan<T> {
+     pub fn new(token: T, scan_request: fidl_sme::ScanRequest) -> Self {
+-        Self { tokens: vec![token], scan_request }
++        Self {
++            tokens: vec![token],
++            scan_request,
++        }
+     }
+ 
+     pub fn matches(&self, scan: &DiscoveryScan<T>) -> bool {
+@@ -59,7 +62,12 @@
+         txn_id: ScanTxnId,
+         mlme_sink: MlmeSink,
+     ) -> Self {
+-        Self { scan_results_receiver, txn_id, mlme_sink, stopped_by_firmware: false }
++        Self {
++            scan_results_receiver,
++            txn_id,
++            mlme_sink,
++            stopped_by_firmware: false,
++        }
+     }
+ }
+ impl futures::stream::Stream for ScheduledScanReceiver {
+@@ -82,9 +90,12 @@
+         // command. Sending it anyway could result in MLME returning ZX_ERR_NOT_FOUND and
+         // logging errors.
+         if !self.stopped_by_firmware {
+-            let mlme_req = fidl_mlme::MlmeStopScheduledScanRequest { txn_id: self.txn_id };
++            let mlme_req = fidl_mlme::MlmeStopScheduledScanRequest {
++                txn_id: self.txn_id,
++            };
+             let (responder, _) = Responder::new();
+-            self.mlme_sink.send(MlmeRequest::StopScheduledScan(mlme_req, responder));
++            self.mlme_sink
++                .send(MlmeRequest::StopScheduledScan(mlme_req, responder));
+         }
+     }
+ }
+@@ -93,16 +104,243 @@
+ /// scan results and send them via VMO when ready.
+ pub(crate) struct ScheduledScanState {
+     scan_results_sender: mpsc::UnboundedSender<fidl::Vmo>,
+-    bss_map: std::collections::HashMap<
+-        Bssid,
+-        (fidl_ieee80211::BssDescription, wlan_common::ie::IesMerger),
+-    >,
++    bss_map: BssMap,
+ }
+ impl ScheduledScanState {
+     fn new(scan_results_sender: mpsc::UnboundedSender<fidl::Vmo>) -> Self {
+-        Self { scan_results_sender, bss_map: HashMap::new() }
++        Self {
++            scan_results_sender,
++            bss_map: HashMap::new(),
++        }
++    }
++}
++const TRUSTED_SCAN_CAPACITY: usize = 4096;
++type BssMap = HashMap<
++    Bssid,
++    (
++        fidl_ieee80211::BssDescription,
++        IesMerger,
++        Option<TrustedBssLineage>,
++    ),
++>;
++
++/// Untrusted structural routing state. Supplying `P` does not make it trusted:
++/// only a private owner can mint and later validate its affine value.
++pub struct TrustedScanState<P> {
++    generation: u64,
++    txn_id: Option<ScanTxnId>,
++    terminal_seen: bool,
++    inputs: Vec<TrustedScanInput<P>>,
++    in_flight: Option<TrustedScanInput<P>>,
++    next_encounter_index: usize,
++    #[cfg(not(target_os = "fuchsia"))]
++    panic_after_result_retained: bool,
++    #[cfg(not(target_os = "fuchsia"))]
++    terminal_corruption: Option<TrustedScanCorruption>,
++}
++
++pub struct TrustedScanInput<P> {
++    provenance: P,
++    original_result: fidl_mlme::ScanResult,
++    table_index: usize,
++    encounter_index: usize,
++}
++
++impl<P> TrustedScanInput<P> {
++    pub fn provenance(&self) -> &P {
++        &self.provenance
++    }
++    pub fn original_result(&self) -> &fidl_mlme::ScanResult {
++        &self.original_result
++    }
++    pub fn table_index(&self) -> usize {
++        self.table_index
++    }
++    pub fn encounter_index(&self) -> usize {
++        self.encounter_index
+     }
+ }
++
++#[derive(Debug)]
++pub struct TrustedBssLineage {
++    bssid: Bssid,
++    representative_index: usize,
++    merger_input_indices: Vec<usize>,
++    dropped_input_indices: Vec<usize>,
++    occupied_predicate_evaluations: usize,
++}
++
++impl TrustedBssLineage {
++    pub fn bssid(&self) -> Bssid {
++        self.bssid
++    }
++    pub fn representative_index(&self) -> usize {
++        self.representative_index
++    }
++    pub fn merger_input_indices(&self) -> &[usize] {
++        &self.merger_input_indices
++    }
++    pub fn dropped_input_indices(&self) -> &[usize] {
++        &self.dropped_input_indices
++    }
++    pub fn occupied_predicate_evaluations(&self) -> usize {
++        self.occupied_predicate_evaluations
++    }
++}
++
++#[derive(Debug)]
++pub struct TrustedScanAggregate {
++    fixed_bss: fidl_ieee80211::BssDescription,
++    lineage: TrustedBssLineage,
++}
++
++impl TrustedScanAggregate {
++    pub fn fixed_bss(&self) -> &fidl_ieee80211::BssDescription {
++        &self.fixed_bss
++    }
++    pub fn lineage(&self) -> &TrustedBssLineage {
++        &self.lineage
++    }
++}
++
++/// Caller-owned rejection from the public, generic, explicitly untrusted
++/// structural gateway. Neither the MLME value nor affine `P` was admitted.
++pub struct TrustedScanResultRejection<P> {
++    error: TrustedScanError,
++    msg: fidl_mlme::ScanResult,
++    provenance: P,
++}
++
++impl<P> std::fmt::Debug for TrustedScanResultRejection<P> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TrustedScanResultRejection")
++            .field("error", &self.error)
++            .field("txn_id", &self.msg.txn_id)
++            .finish_non_exhaustive()
++    }
++}
++
++impl<P> TrustedScanResultRejection<P> {
++    pub fn error(&self) -> TrustedScanError {
++        self.error
++    }
++    pub fn into_parts(self) -> (TrustedScanError, fidl_mlme::ScanResult, P) {
++        (self.error, self.msg, self.provenance)
++    }
++}
++
++#[cfg(not(target_os = "fuchsia"))]
++#[derive(Clone, Copy, Debug)]
++pub enum TrustedFixedField {
++    Bssid,
++    BssType,
++    BeaconPeriod,
++    CapabilityInfo,
++    Primary,
++    Bandwidth,
++    VhtSecondary80Channel,
++    RssiDbm,
++    SnrDb,
++}
++
++#[cfg(not(target_os = "fuchsia"))]
++#[derive(Clone, Copy, Debug)]
++pub enum TrustedScanCorruption {
++    AcceptedPermutation,
++    DroppedPermutation,
++    BadEncounter,
++    BadTableIndex,
++    ProducedBindingPermutation,
++    BadTxnId,
++    BadTimestamp,
++    DuplicateRole,
++    MissingRole,
++    CrossBssidAssignment,
++    InvalidRepresentative,
++    NonLastRepresentative,
++    RepresentativeFixedField(TrustedFixedField),
++    DuplicateSplitAggregate,
++}
++
++impl<P> TrustedScanState<P> {
++    pub fn new(generation: u64) -> Self {
++        Self {
++            generation,
++            txn_id: None,
++            terminal_seen: false,
++            inputs: Vec::new(),
++            in_flight: None,
++            next_encounter_index: 0,
++            #[cfg(not(target_os = "fuchsia"))]
++            panic_after_result_retained: false,
++            #[cfg(not(target_os = "fuchsia"))]
++            terminal_corruption: None,
++        }
++    }
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++    pub fn txn_id(&self) -> Option<u64> {
++        self.txn_id
++    }
++    pub fn input_count(&self) -> usize {
++        self.inputs.len() + usize::from(self.in_flight.is_some())
++    }
++    #[cfg(not(target_os = "fuchsia"))]
++    pub fn inject_result_aggregation_panic_for_test(&mut self) {
++        self.panic_after_result_retained = true;
++    }
++    #[cfg(not(target_os = "fuchsia"))]
++    pub fn inject_terminal_corruption_for_test(&mut self, corruption: TrustedScanCorruption) {
++        self.terminal_corruption = Some(corruption);
++    }
++}
++
++/// Opaque untrusted structural terminal. Its borrowed views allow the private
++/// owner to validate; no acceptance or trust decision is represented here.
++pub struct TrustedScanTerminal<P> {
++    generation: u64,
++    txn_id: u64,
++    bss_description_list: Vec<BssDescription>,
++    inputs: Vec<TrustedScanInput<P>>,
++}
++
++impl<P> TrustedScanTerminal<P> {
++    pub fn generation(&self) -> u64 {
++        self.generation
++    }
++    pub fn txn_id(&self) -> u64 {
++        self.txn_id
++    }
++    pub fn bss_description_list(&self) -> &[BssDescription] {
++        &self.bss_description_list
++    }
++    pub fn inputs(&self) -> &[TrustedScanInput<P>] {
++        &self.inputs
++    }
++    pub fn input_provenance(&self) -> impl ExactSizeIterator<Item = &P> {
++        self.inputs.iter().map(|input| &input.provenance)
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum TrustedScanError {
++    Busy,
++    Exhausted,
++    Inactive,
++    Collision,
++    Mismatch,
++    DuplicateOrLate,
++    Failed,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct TrustedScanTag {
++    generation: u64,
++    txn_id: ScanTxnId,
++    poisoned: bool,
++}
++
+ pub struct ScanScheduler<T> {
+     // The currently running scan. We assume that MLME can handle a single concurrent scan
+     // regardless of its own state.
+@@ -114,6 +352,13 @@
+     // Map of active scheduled scan transaction IDs to their internal states.
+     pub(crate) scheduled_scan_receivers: HashMap<ScanTxnId, ScheduledScanState>,
+     last_mlme_txn_id: ScanTxnId,
++    // Private routing guard only. Every affine `P` remains in caller-owned
++    // `TrustedScanState<P>` across the actual scheduler calls.
++    trusted: Option<TrustedScanTag>,
++    trusted_quarantine: Vec<DiscoveryScan<T>>,
++    trusted_scheduled_quarantine: Vec<Responder<Result<(), i32>>>,
++    trusted_scheduled_senders: Vec<mpsc::UnboundedSender<fidl::Vmo>>,
++    trusted_value_quarantine: Vec<BssMap>,
+ }
+ 
+ #[derive(Debug)]
+@@ -122,7 +367,12 @@
+     ScanningToDiscover {
+         cmd: DiscoveryScan<T>,
+         mlme_txn_id: ScanTxnId,
+-        bss_map: HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>,
++        bss_map: BssMap,
++    },
++    ScanningTrusted {
++        generation: u64,
++        mlme_txn_id: ScanTxnId,
++        bss_map: BssMap,
+     },
+ }
+ 
+@@ -145,6 +395,11 @@
+             spectrum_management_support,
+             scheduled_scan_receivers: HashMap::new(),
+             last_mlme_txn_id: 0,
++            trusted: None,
++            trusted_quarantine: Vec::new(),
++            trusted_scheduled_quarantine: Vec::new(),
++            trusted_scheduled_senders: Vec::new(),
++            trusted_value_quarantine: Vec::new(),
+         }
+     }
+ 
+@@ -155,13 +410,22 @@
+         &mut self,
+         s: DiscoveryScan<T>,
+     ) -> Option<fidl_mlme::ScanRequest> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            self.trusted_quarantine.push(s);
++            return None;
++        }
+         if let ScanState::ScanningToDiscover { cmd, .. } = &mut self.current
+             && cmd.matches(&s)
+         {
+             cmd.merges(s);
+             return None;
+         }
+-        if let Some(scan_cmd) = self.pending_discovery.iter_mut().find(|cmd| cmd.matches(&s)) {
++        if let Some(scan_cmd) = self
++            .pending_discovery
++            .iter_mut()
++            .find(|cmd| cmd.matches(&s))
++        {
+             scan_cmd.merges(s);
+             return None;
+         }
+@@ -175,12 +439,256 @@
+         self.last_mlme_txn_id
+     }
+ 
++    pub(crate) fn has_trusted_scan(&self) -> bool {
++        self.trusted.is_some()
++    }
++
++    pub fn start_trusted_scan<P>(
++        &mut self,
++        state: &mut TrustedScanState<P>,
++        scan_request: fidl_sme::ScanRequest,
++    ) -> Result<fidl_mlme::ScanRequest, TrustedScanError> {
++        if self.trusted.is_some()
++            || !matches!(self.current, ScanState::NotScanning)
++            || !self.pending_discovery.is_empty()
++            || !self.scheduled_scan_receivers.is_empty()
++            || !self.trusted_quarantine.is_empty()
++            || !self.trusted_scheduled_quarantine.is_empty()
++            || !self.trusted_scheduled_senders.is_empty()
++            || !self.trusted_value_quarantine.is_empty()
++            || !state.inputs.is_empty()
++            || state.in_flight.is_some()
++            || state.txn_id.is_some()
++            || state.terminal_seen
++        {
++            if let Some(tag) = &mut self.trusted {
++                tag.poisoned = true;
++            }
++            return Err(TrustedScanError::Busy);
++        }
++        state
++            .inputs
++            .try_reserve_exact(TRUSTED_SCAN_CAPACITY)
++            .map_err(|_| TrustedScanError::Exhausted)?;
++        let txn_id = self
++            .last_mlme_txn_id
++            .checked_add(1)
++            .ok_or(TrustedScanError::Exhausted)?;
++        self.last_mlme_txn_id = txn_id;
++        state.txn_id = Some(txn_id);
++        self.current = ScanState::ScanningTrusted {
++            generation: state.generation,
++            mlme_txn_id: txn_id,
++            bss_map: HashMap::new(),
++        };
++        self.trusted = Some(TrustedScanTag {
++            generation: state.generation,
++            txn_id,
++            poisoned: false,
++        });
++        Ok(new_scan_request(
++            txn_id,
++            scan_request,
++            vec![],
++            &self.device_info,
++            self.spectrum_management_support.clone(),
++        ))
++    }
++
++    /// Synchronous preflight-and-consume gateway. All structural checks consult
++    /// the scheduler's sole durable poison state before affine admission. A
++    /// rejection returns the exact `(ScanResult, P)` to its untrusted caller.
++    pub fn on_trusted_mlme_scan_result<P>(
++        &mut self,
++        msg: fidl_mlme::ScanResult,
++        provenance: P,
++        state: &mut TrustedScanState<P>,
++    ) -> Result<(), TrustedScanResultRejection<P>> {
++        let reject = |error, msg, provenance| TrustedScanResultRejection {
++            error,
++            msg,
++            provenance,
++        };
++        let Some(tag) = &mut self.trusted else {
++            return Err(reject(TrustedScanError::Inactive, msg, provenance));
++        };
++        if tag.poisoned {
++            return Err(reject(TrustedScanError::Failed, msg, provenance));
++        }
++        if state.in_flight.is_some() {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::Failed, msg, provenance));
++        }
++        if self.scheduled_scan_receivers.contains_key(&msg.txn_id) {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::Collision, msg, provenance));
++        }
++        if state.terminal_seen {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::DuplicateOrLate, msg, provenance));
++        }
++        if state.inputs.len() >= TRUSTED_SCAN_CAPACITY {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::Exhausted, msg, provenance));
++        }
++        let Some(next_encounter_index) = state.next_encounter_index.checked_add(1) else {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::Exhausted, msg, provenance));
++        };
++        let current_matches = matches!(
++            &self.current,
++            ScanState::ScanningTrusted { generation, mlme_txn_id, .. }
++                if *generation == state.generation && *mlme_txn_id == msg.txn_id
++        );
++        if tag.txn_id != msg.txn_id
++            || tag.generation != state.generation
++            || state.txn_id != Some(msg.txn_id)
++            || !current_matches
++        {
++            tag.poisoned = true;
++            return Err(reject(TrustedScanError::Mismatch, msg, provenance));
++        }
++
++        let table_index = state.inputs.len();
++        let encounter_index = state.next_encounter_index;
++        // Set the durable admitted/in-progress guard before moving either affine
++        // value. The following Option store is non-allocating and proven empty.
++        tag.poisoned = true;
++        state.in_flight = Some(TrustedScanInput {
++            provenance,
++            original_result: msg,
++            table_index,
++            encounter_index,
++        });
++        #[cfg(not(target_os = "fuchsia"))]
++        if mem::take(&mut state.panic_after_result_retained) {
++            panic!("injected trusted scan result aggregation panic");
++        }
++        let bss = state
++            .in_flight
++            .as_ref()
++            .expect("installed after preflight")
++            .original_result
++            .bss
++            .clone();
++        let ScanState::ScanningTrusted { bss_map, .. } = &mut self.current else {
++            unreachable!("preflight proved trusted scan state");
++        };
++        maybe_insert_bss(
++            bss_map,
++            bss,
++            InsertMode::Trusted {
++                table_index,
++                encounter_index,
++            },
++        );
++        let input = state.in_flight.take().expect("installed after preflight");
++        state.inputs.push(input);
++        state.next_encounter_index = next_encounter_index;
++        tag.poisoned = false;
++        Ok(())
++    }
++
++    pub fn on_trusted_mlme_scan_end<P>(
++        &mut self,
++        msg: fidl_mlme::ScanEnd,
++        state: &mut TrustedScanState<P>,
++        sme_inspect: &Arc<inspect::SmeTree>,
++        validate: impl FnOnce(&[TrustedScanInput<P>], &[TrustedScanAggregate]) -> bool,
++    ) -> Result<TrustedScanTerminal<P>, TrustedScanError> {
++        if state.terminal_seen {
++            if let Some(tag) = &mut self.trusted {
++                tag.poisoned = true;
++            }
++            return Err(TrustedScanError::DuplicateOrLate);
++        }
++        state.terminal_seen = true;
++        let Some(tag) = self.trusted.as_mut() else {
++            return Err(TrustedScanError::Inactive);
++        };
++        let ordinary_empty = self.pending_discovery.is_empty()
++            && self.scheduled_scan_receivers.is_empty()
++            && self.trusted_quarantine.is_empty()
++            && self.trusted_scheduled_quarantine.is_empty()
++            && self.trusted_scheduled_senders.is_empty()
++            && self.trusted_value_quarantine.is_empty();
++        let current = mem::replace(&mut self.current, ScanState::NotScanning);
++        let ScanState::ScanningTrusted {
++            generation,
++            mlme_txn_id,
++            bss_map,
++        } = current
++        else {
++            if let ScanState::ScanningToDiscover { cmd, bss_map, .. } = current {
++                self.trusted_quarantine.push(cmd);
++                self.trusted_value_quarantine.push(bss_map);
++            }
++            tag.poisoned = true;
++            return Err(TrustedScanError::Mismatch);
++        };
++        let clean = !tag.poisoned
++            && state.in_flight.is_none()
++            && tag.txn_id == msg.txn_id
++            && tag.generation == state.generation
++            && state.txn_id == Some(msg.txn_id)
++            && mlme_txn_id == msg.txn_id
++            && generation == state.generation
++            && msg.code == fidl_mlme::ScanResultCode::Success
++            && ordinary_empty;
++        if !clean {
++            self.trusted_value_quarantine.push(bss_map);
++            tag.poisoned = true;
++            return Err(
++                if tag.txn_id != msg.txn_id || tag.generation != state.generation {
++                    TrustedScanError::Mismatch
++                } else {
++                    TrustedScanError::Failed
++                },
++            );
++        }
++        let (ordinary_map, mut aggregates) = destructure_trusted_bss_map(bss_map);
++        #[cfg(not(target_os = "fuchsia"))]
++        if let Some(corruption) = state.terminal_corruption.take() {
++            corrupt_trusted_structure_for_test(&mut state.inputs, &mut aggregates, corruption);
++        }
++        // The generic SME treats this only as an untrusted structural decision.
++        // The binary-private owner is the sole validator for its actual `P`.
++        tag.poisoned = true;
++        if !validate(&state.inputs, &aggregates) {
++            self.trusted_value_quarantine.push(ordinary_map);
++            return Err(TrustedScanError::Failed);
++        }
++        let bss_description_list = convert_bss_map(ordinary_map, None::<Ssid>, sme_inspect);
++        drop(aggregates);
++        self.trusted = None;
++        // Last non-panicking SME operation: move the whole affine table and return.
++        Ok(TrustedScanTerminal {
++            generation,
++            txn_id: mlme_txn_id,
++            bss_description_list,
++            inputs: mem::take(&mut state.inputs),
++        })
++    }
++
+     pub(crate) fn start_scheduled_scan(
+         &mut self,
+         req: fidl_common::ScheduledScanRequest,
+         mlme_sink: MlmeSink,
+         responder: Responder<Result<(), i32>>,
+     ) -> ScheduledScanReceiver {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            // No request, response, or stop-on-drop may escape this rejection.
++            self.trusted_scheduled_quarantine.push(responder);
++            let (sender, receiver) = mpsc::unbounded();
++            self.trusted_scheduled_senders.push(sender);
++            return ScheduledScanReceiver {
++                scan_results_receiver: receiver,
++                txn_id: 0,
++                mlme_sink,
++                stopped_by_firmware: true,
++            };
++        }
+         // Send start request to MLME with a new transaction ID
+         let txn_id = self.get_next_mlme_txn_id();
+         let mlme_req = fidl_mlme::MlmeStartScheduledScanRequest { txn_id, req };
+@@ -188,15 +696,21 @@
+ 
+         // Create a channel to process scan results streamed from MLME
+         let (sender, receiver) = mpsc::unbounded();
+-        let _ = self.scheduled_scan_receivers.insert(txn_id, ScheduledScanState::new(sender));
++        let _ = self
++            .scheduled_scan_receivers
++            .insert(txn_id, ScheduledScanState::new(sender));
+         ScheduledScanReceiver::new(receiver, txn_id, mlme_sink)
+     }
+ 
+     // Should be called for every OnScanResult event received from MLME.
+     pub fn on_mlme_scan_result(&mut self, msg: fidl_mlme::ScanResult) -> Result<(), Error> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return Err(Error::ScanResultWrongTxnId);
++        }
+         // First check if this belongs to a scheduled scan session.
+         if let Some(session) = self.scheduled_scan_receivers.get_mut(&msg.txn_id) {
+-            maybe_insert_bss(&mut session.bss_map, msg.bss);
++            maybe_insert_bss(&mut session.bss_map, msg.bss, InsertMode::Ordinary);
+             return Ok(());
+         }
+ 
+@@ -206,9 +720,10 @@
+                 Err(Error::ScanResultWrongTxnId)
+             }
+             ScanState::ScanningToDiscover { bss_map, .. } => {
+-                maybe_insert_bss(bss_map, msg.bss);
++                maybe_insert_bss(bss_map, msg.bss, InsertMode::Ordinary);
+                 Ok(())
+             }
++            ScanState::ScanningTrusted { .. } => Err(Error::ScanResultWrongTxnId),
+         }
+     }
+ 
+@@ -220,6 +735,10 @@
+         device_info: &fidl_mlme::DeviceInfo,
+         security_support: &fidl_common::SecuritySupport,
+     ) {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return;
++        }
+         if let Some(session) = self.scheduled_scan_receivers.get_mut(&txn_id) {
+             #[cfg(target_os = "fuchsia")]
+             let bss_map = std::mem::take(&mut session.bss_map);
+@@ -253,6 +772,10 @@
+     }
+ 
+     pub(crate) fn on_scheduled_scan_stopped_by_firmware(&mut self, txn_id: ScanTxnId) {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return;
++        }
+         let _ = self.scheduled_scan_receivers.remove(&txn_id);
+     }
+ 
+@@ -263,6 +786,10 @@
+         msg: fidl_mlme::ScanEnd,
+         sme_inspect: &Arc<inspect::SmeTree>,
+     ) -> Result<(ScanEnd<T>, Option<fidl_mlme::ScanRequest>), Error> {
++        if let Some(tag) = &mut self.trusted {
++            tag.poisoned = true;
++            return Err(Error::ScanEndWrongTxnId);
++        }
+         match mem::replace(&mut self.current, ScanState::NotScanning) {
+             ScanState::NotScanning => Err(Error::ScanEndNotScanning),
+             ScanState::ScanningToDiscover { mlme_txn_id, .. } if mlme_txn_id != msg.txn_id => {
+@@ -278,6 +805,10 @@
+                 let request = self.start_next_scan();
+                 Ok((scan_end, request))
+             }
++            ScanState::ScanningTrusted { bss_map, .. } => {
++                self.trusted_value_quarantine.push(bss_map);
++                Err(Error::ScanEndWrongTxnId)
++            }
+         }
+     }
+ 
+@@ -302,56 +833,249 @@
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++enum InsertMode {
++    Ordinary,
++    Trusted {
++        table_index: usize,
++        encounter_index: usize,
++    },
++}
++
+ fn maybe_insert_bss(
+-    bss_map: &mut HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>,
++    bss_map: &mut BssMap,
+     mut fidl_bss: fidl_ieee80211::BssDescription,
++    mode: InsertMode,
+ ) {
++    let bssid = Bssid::from(fidl_bss.bssid);
+     let mut ies = vec![];
+     std::mem::swap(&mut ies, &mut fidl_bss.ies);
+-
+-    match bss_map.entry(Bssid::from(fidl_bss.bssid)) {
++    match bss_map.entry(bssid) {
+         hash_map::Entry::Occupied(mut entry) => {
+-            let (existing_bss, ies_merger) = entry.get_mut();
+-
+-            if (fidl_bss.primary != existing_bss.primary)
+-                && (fidl_bss.rssi_dbm < existing_bss.rssi_dbm)
+-            {
+-                // Assume `fidl_bss` is from an "echo" Beacon frame from the same BSSID
++            let (existing_bss, ies_merger, lineage) = entry.get_mut();
++            let weaker_cross_channel = fidl_bss.primary != existing_bss.primary
++                && fidl_bss.rssi_dbm < existing_bss.rssi_dbm;
++            if let InsertMode::Trusted { table_index, .. } = mode {
++                let lineage = lineage.as_mut().expect("trusted entry has lineage");
++                lineage.occupied_predicate_evaluations += 1;
++                if weaker_cross_channel {
++                    lineage.dropped_input_indices.push(table_index);
++                    return;
++                }
++                lineage.merger_input_indices.push(table_index);
++            } else if weaker_cross_channel {
+                 return;
+             }
+-
+             ies_merger.merge(&ies[..]);
+             if ies_merger.buffer_overflow() {
+                 warn!(
+                     "Not merging some IEs due to running out of buffer. BSSID: {}",
+-                    Bssid::from(fidl_bss.bssid)
++                    bssid
+                 );
+             }
++            if let InsertMode::Trusted { table_index, .. } = mode {
++                lineage
++                    .as_mut()
++                    .expect("trusted entry has lineage")
++                    .representative_index = table_index;
++            }
+             *existing_bss = fidl_bss;
+         }
+         hash_map::Entry::Vacant(entry) => {
+-            let _ = entry.insert((fidl_bss, IesMerger::new(ies)));
++            let ies_merger = IesMerger::new(ies);
++            let lineage = match mode {
++                InsertMode::Ordinary => None,
++                InsertMode::Trusted {
++                    table_index,
++                    encounter_index,
++                } => {
++                    debug_assert_eq!(table_index, encounter_index);
++                    Some(TrustedBssLineage {
++                        bssid,
++                        representative_index: table_index,
++                        merger_input_indices: vec![table_index],
++                        dropped_input_indices: vec![],
++                        occupied_predicate_evaluations: 0,
++                    })
++                }
++            };
++            let _ = entry.insert((fidl_bss, ies_merger, lineage));
++        }
++    }
++}
++
++fn destructure_trusted_bss_map(bss_map: BssMap) -> (BssMap, Vec<TrustedScanAggregate>) {
++    let mut ordinary = HashMap::with_capacity(bss_map.len());
++    let mut aggregates = Vec::with_capacity(bss_map.len());
++    for (bssid, (fixed_bss, merger, lineage)) in bss_map {
++        ordinary.insert(bssid, (fixed_bss.clone(), merger, None));
++        aggregates.push(TrustedScanAggregate {
++            fixed_bss,
++            lineage: lineage.expect("trusted entry has lineage"),
++        });
++    }
++    (ordinary, aggregates)
++}
++
++#[cfg(not(target_os = "fuchsia"))]
++fn corrupt_trusted_structure_for_test<P>(
++    inputs: &mut [TrustedScanInput<P>],
++    aggregates: &mut Vec<TrustedScanAggregate>,
++    corruption: TrustedScanCorruption,
++) {
++    match corruption {
++        TrustedScanCorruption::AcceptedPermutation => {
++            let indices = &mut aggregates
++                .iter_mut()
++                .find(|aggregate| aggregate.lineage.merger_input_indices.len() >= 2)
++                .expect("test requires accepted inputs")
++                .lineage
++                .merger_input_indices;
++            let last = indices.len() - 1;
++            indices.swap(0, last);
++        }
++        TrustedScanCorruption::DroppedPermutation => {
++            let indices = &mut aggregates
++                .iter_mut()
++                .find(|aggregate| aggregate.lineage.dropped_input_indices.len() >= 2)
++                .expect("test requires dropped inputs")
++                .lineage
++                .dropped_input_indices;
++            indices.swap(0, 1);
++        }
++        TrustedScanCorruption::BadEncounter => {
++            inputs
++                .first_mut()
++                .expect("test requires input")
++                .encounter_index += 1;
++        }
++        TrustedScanCorruption::BadTableIndex => {
++            inputs.first_mut().expect("test requires input").table_index += 1;
++        }
++        TrustedScanCorruption::ProducedBindingPermutation => {
++            assert!(inputs.len() >= 2, "test requires two inputs");
++            let (first, rest) = inputs.split_at_mut(1);
++            mem::swap(&mut first[0].provenance, &mut rest[0].provenance);
++        }
++        TrustedScanCorruption::BadTxnId => {
++            inputs
++                .first_mut()
++                .expect("test requires input")
++                .original_result
++                .txn_id += 1;
++        }
++        TrustedScanCorruption::BadTimestamp => {
++            inputs
++                .first_mut()
++                .expect("test requires input")
++                .original_result
++                .timestamp_nanos += 1;
++        }
++        TrustedScanCorruption::DuplicateRole => {
++            let lineage = &mut aggregates
++                .first_mut()
++                .expect("test requires aggregate")
++                .lineage;
++            lineage
++                .dropped_input_indices
++                .push(lineage.merger_input_indices[0]);
++            lineage.occupied_predicate_evaluations += 1;
++        }
++        TrustedScanCorruption::MissingRole => {
++            let lineage = &mut aggregates
++                .first_mut()
++                .expect("test requires aggregate")
++                .lineage;
++            assert!(lineage.merger_input_indices.len() >= 2);
++            lineage.merger_input_indices.remove(0);
++            lineage.occupied_predicate_evaluations -= 1;
++        }
++        TrustedScanCorruption::CrossBssidAssignment => {
++            assert!(aggregates.len() >= 2, "test requires two BSSIDs");
++            let foreign = aggregates[1].lineage.representative_index;
++            aggregates[0].lineage.merger_input_indices[0] = foreign;
++        }
++        TrustedScanCorruption::InvalidRepresentative => {
++            aggregates
++                .first_mut()
++                .expect("test requires aggregate")
++                .lineage
++                .representative_index = usize::MAX;
++        }
++        TrustedScanCorruption::NonLastRepresentative => {
++            let lineage = &mut aggregates
++                .first_mut()
++                .expect("test requires aggregate")
++                .lineage;
++            assert!(lineage.merger_input_indices.len() >= 2);
++            lineage.representative_index = lineage.merger_input_indices[0];
++        }
++        TrustedScanCorruption::RepresentativeFixedField(field) => {
++            let bss = &mut aggregates
++                .first_mut()
++                .expect("test requires aggregate")
++                .fixed_bss;
++            match field {
++                TrustedFixedField::Bssid => bss.bssid[0] ^= 1,
++                TrustedFixedField::BssType => bss.bss_type = fidl_ieee80211::BssType::Independent,
++                TrustedFixedField::BeaconPeriod => bss.beacon_period ^= 1,
++                TrustedFixedField::CapabilityInfo => bss.capability_info ^= 1,
++                TrustedFixedField::Primary => bss.primary.number ^= 1,
++                TrustedFixedField::Bandwidth => {
++                    bss.bandwidth = fidl_ieee80211::ChannelBandwidth::Cbw40
++                }
++                TrustedFixedField::VhtSecondary80Channel => {
++                    bss.vht_secondary_80_channel.number ^= 1
++                }
++                TrustedFixedField::RssiDbm => bss.rssi_dbm ^= 1,
++                TrustedFixedField::SnrDb => bss.snr_db ^= 1,
++            }
++        }
++        TrustedScanCorruption::DuplicateSplitAggregate => {
++            let duplicate = {
++                let original = aggregates.first_mut().expect("test requires aggregate");
++                assert!(original.lineage.merger_input_indices.len() >= 2);
++                let split_index = original.lineage.merger_input_indices.remove(0);
++                original.lineage.occupied_predicate_evaluations =
++                    original.lineage.merger_input_indices.len()
++                        + original.lineage.dropped_input_indices.len()
++                        - 1;
++                TrustedScanAggregate {
++                    fixed_bss: original.fixed_bss.clone(),
++                    lineage: TrustedBssLineage {
++                        bssid: original.lineage.bssid,
++                        representative_index: split_index,
++                        merger_input_indices: vec![split_index],
++                        dropped_input_indices: vec![],
++                        occupied_predicate_evaluations: 0,
++                    },
++                }
++            };
++            aggregates.push(duplicate);
+         }
+     }
+ }
+ 
+ fn convert_bss_map(
+-    bss_map: HashMap<Bssid, (fidl_ieee80211::BssDescription, IesMerger)>,
++    bss_map: BssMap,
+     ssid_selector: Option<Ssid>,
+     sme_inspect: &Arc<inspect::SmeTree>,
+ ) -> Vec<BssDescription> {
+     let bss_description_list =
+-        bss_map.into_iter().filter_map(|(_bssid, (mut bss, mut ies_merger))| {
+-            let _ = sme_inspect.scan_merge_ie_failures.add(ies_merger.merge_ie_failures() as u64);
+-
+-            let mut ies = ies_merger.finalize();
+-            std::mem::swap(&mut ies, &mut bss.ies);
+-            let bss: Option<BssDescription> = bss.try_into().ok();
+-            if bss.is_none() {
+-                let _ = sme_inspect.scan_discard_fidl_bss.add(1);
+-            }
+-            bss
+-        });
++        bss_map
++            .into_iter()
++            .filter_map(|(_bssid, (mut bss, mut ies_merger, _lineage))| {
++                let _ = sme_inspect
++                    .scan_merge_ie_failures
++                    .add(ies_merger.merge_ie_failures() as u64);
++                let mut ies = ies_merger.finalize();
++                std::mem::swap(&mut ies, &mut bss.ies);
++                let bss: Option<BssDescription> = bss.try_into().ok();
++                if bss.is_none() {
++                    let _ = sme_inspect.scan_discard_fidl_bss.add(1);
++                }
++                bss
++            });
+ 
+     match ssid_selector {
+         None => bss_description_list.collect(),
+@@ -467,7 +1191,10 @@
+ 
+     if channels.is_empty() {
+         if !requested_channels.is_empty() {
+-            warn!("All channels are filtered out. Requested channels: {:?}", requested_channels);
++            warn!(
++                "All channels are filtered out. Requested channels: {:?}",
++                requested_channels
++            );
+         } else {
+             warn!("All channels are filtered out.");
+         };
+@@ -599,10 +1326,18 @@
+             "expected discovery scan to be completed successfully"
+         );
+         assert_eq!(vec![10], tokens);
+-        let mut ssid_list =
+-            bss_description_list.into_iter().map(|bss| bss.ssid).collect::<Vec<_>>();
++        let mut ssid_list = bss_description_list
++            .into_iter()
++            .map(|bss| bss.ssid)
++            .collect::<Vec<_>>();
+         ssid_list.sort();
+-        assert_eq!(vec![Ssid::try_from("foo").unwrap(), Ssid::try_from("qux").unwrap()], ssid_list);
++        assert_eq!(
++            vec![
++                Ssid::try_from("foo").unwrap(),
++                Ssid::try_from("qux").unwrap()
++            ],
++            ssid_list
++        );
+     }
+ 
+     #[test_case(vec![
+@@ -770,7 +1505,11 @@
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Passive);
+         assert_eq!(
+             req.channel_list.into_iter().collect::<HashSet<_>>(),
+-            CANDIDATE_PRIMARY_CHANNELS.iter().copied().map(|c| c.into()).collect::<HashSet<_>>()
++            CANDIDATE_PRIMARY_CHANNELS
++                .iter()
++                .copied()
++                .map(|c| c.into())
++                .collect::<HashSet<_>>()
+         );
+         assert_eq!(req.ssid_list, Vec::<Vec<u8>>::new());
+         assert_eq!(req.probe_delay, 0);
+@@ -793,7 +1532,10 @@
+         let device_info = device_info_with_channel(vec![1, 36, 165]);
+         let mut spectrum_management = fake_spectrum_management_support_empty();
+         if dfs_supported {
+-            spectrum_management.dfs.get_or_insert_with(Default::default).supported = Some(true);
++            spectrum_management
++                .dfs
++                .get_or_insert_with(Default::default)
++                .supported = Some(true);
+         }
+         let mut sched: ScanScheduler<i32> =
+             ScanScheduler::new(Arc::new(device_info), spectrum_management);
+@@ -805,11 +1547,16 @@
+                 channels: vec![],
+             }),
+         );
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Active);
+-        assert_eq!(req.channel_list.into_iter().collect::<HashSet<_>>(), expected_channels);
++        assert_eq!(
++            req.channel_list.into_iter().collect::<HashSet<_>>(),
++            expected_channels
++        );
+         assert_eq!(req.ssid_list, Vec::<Vec<u8>>::new());
+         assert_eq!(req.probe_delay, 5);
+         assert_eq!(req.min_channel_time, 75);
+@@ -819,8 +1566,10 @@
+     #[test]
+     fn test_active_discovery_scan_args_filled() {
+         let device_info = device_info_with_channel(vec![1, 36, 165]);
+-        let mut sched: ScanScheduler<i32> =
+-            ScanScheduler::new(Arc::new(device_info), fake_spectrum_management_support_empty());
++        let mut sched: ScanScheduler<i32> = ScanScheduler::new(
++            Arc::new(device_info),
++            fake_spectrum_management_support_empty(),
++        );
+         let _next_txn_id = 0;
+         let ssid1: Vec<u8> = Ssid::try_from("ssid1").unwrap().into();
+         let ssid2: Vec<u8> = Ssid::try_from("ssid2").unwrap().into();
+@@ -832,13 +1581,18 @@
+                 channels: vec![1, 20, 100],
+             }),
+         );
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Active);
+         assert_eq!(
+             req.channel_list,
+-            vec![fidl_ieee80211::ChannelNumber { number: 1, band: TwoGhz }]
++            vec![fidl_ieee80211::ChannelNumber {
++                number: 1,
++                band: TwoGhz
++            }]
+         );
+         assert_eq!(req.ssid_list, vec![ssid1, ssid2]);
+         assert_eq!(req.probe_delay, 5);
+@@ -850,15 +1604,21 @@
+     fn test_passive_discovery_scan_args_filled() {
+         // Set up the device that can operate on channels 1, 36, and 165.
+         let device_info = device_info_with_channel(vec![1, 36, 165]);
+-        let mut sched: ScanScheduler<i32> =
+-            ScanScheduler::new(Arc::new(device_info), fake_spectrum_management_support_empty());
++        let mut sched: ScanScheduler<i32> = ScanScheduler::new(
++            Arc::new(device_info),
++            fake_spectrum_management_support_empty(),
++        );
+         // Request a scan using only some of the supported channels.
+         let scan_cmd = DiscoveryScan::new(
+             10,
+-            fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![1, 36] }),
++            fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
++                channels: vec![1, 36],
++            }),
+         );
+         let _next_txn_id = 0;
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Passive);
+@@ -866,8 +1626,14 @@
+         assert_eq!(
+             req.channel_list.into_iter().collect::<HashSet<_>>(),
+             HashSet::from([
+-                fidl_ieee80211::ChannelNumber { number: 1, band: TwoGhz },
+-                fidl_ieee80211::ChannelNumber { number: 36, band: FiveGhz },
++                fidl_ieee80211::ChannelNumber {
++                    number: 1,
++                    band: TwoGhz
++                },
++                fidl_ieee80211::ChannelNumber {
++                    number: 36,
++                    band: FiveGhz
++                },
+             ])
+         );
+         assert_eq!(req.ssid_list, Vec::<Vec<u8>>::new());
+@@ -879,8 +1645,10 @@
+     #[test]
+     fn test_passive_discovery_scan_args_unsupported_filtered() {
+         let device_info = device_info_with_channel(vec![1, 36]);
+-        let mut sched: ScanScheduler<i32> =
+-            ScanScheduler::new(Arc::new(device_info), fake_spectrum_management_support_empty());
++        let mut sched: ScanScheduler<i32> = ScanScheduler::new(
++            Arc::new(device_info),
++            fake_spectrum_management_support_empty(),
++        );
+         let _next_txn_id = 0;
+         // Request a scan that includes a channel not supported by the device.
+         let scan_cmd = DiscoveryScan::new(
+@@ -889,7 +1657,9 @@
+                 channels: vec![1, 6, 36],
+             }),
+         );
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Passive);
+@@ -897,8 +1667,14 @@
+         assert_eq!(
+             req.channel_list.into_iter().collect::<HashSet<_>>(),
+             HashSet::from([
+-                fidl_ieee80211::ChannelNumber { number: 1, band: TwoGhz },
+-                fidl_ieee80211::ChannelNumber { number: 36, band: FiveGhz },
++                fidl_ieee80211::ChannelNumber {
++                    number: 1,
++                    band: TwoGhz
++                },
++                fidl_ieee80211::ChannelNumber {
++                    number: 36,
++                    band: FiveGhz
++                },
+             ])
+         );
+     }
+@@ -906,45 +1682,67 @@
+     #[test]
+     fn test_passive_discovery_scan_args_invalid_filtered() {
+         let device_info = device_info_with_channel(vec![1, 200]);
+-        let mut sched: ScanScheduler<i32> =
+-            ScanScheduler::new(Arc::new(device_info), fake_spectrum_management_support_empty());
++        let mut sched: ScanScheduler<i32> = ScanScheduler::new(
++            Arc::new(device_info),
++            fake_spectrum_management_support_empty(),
++        );
+         let _next_txn_id = 0;
+         // Request a scan that includes an invalid channel.
+         let scan_cmd = DiscoveryScan::new(
+             10,
+-            fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![1, 200] }),
++            fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
++                channels: vec![1, 200],
++            }),
+         );
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Passive);
+         // Verify that the invalid channel 200 was filtered out and the valid channel is included.
+         assert_eq!(
+             req.channel_list,
+-            vec![fidl_ieee80211::ChannelNumber { number: 1, band: TwoGhz }]
++            vec![fidl_ieee80211::ChannelNumber {
++                number: 1,
++                band: TwoGhz
++            }]
+         );
+     }
+ 
+     #[test]
+     fn test_passive_discovery_scan_args_empty_list() {
+         let device_info = device_info_with_channel(vec![1, 36, 165]);
+-        let mut sched: ScanScheduler<i32> =
+-            ScanScheduler::new(Arc::new(device_info), fake_spectrum_management_support_empty());
++        let mut sched: ScanScheduler<i32> = ScanScheduler::new(
++            Arc::new(device_info),
++            fake_spectrum_management_support_empty(),
++        );
+         let _next_txn_id = 0;
+         let scan_cmd = DiscoveryScan::new(
+             10,
+             fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
+         );
+-        let req = sched.enqueue_scan_to_discover(scan_cmd).expect("expected a ScanRequest");
++        let req = sched
++            .enqueue_scan_to_discover(scan_cmd)
++            .expect("expected a ScanRequest");
+ 
+         assert_eq!(req.txn_id, 1);
+         assert_eq!(req.scan_type, fidl_mlme::ScanTypes::Passive);
+         assert_eq!(
+             req.channel_list.into_iter().collect::<HashSet<_>>(),
+             HashSet::from([
+-                fidl_ieee80211::ChannelNumber { number: 1, band: TwoGhz },
+-                fidl_ieee80211::ChannelNumber { number: 36, band: FiveGhz },
+-                fidl_ieee80211::ChannelNumber { number: 165, band: FiveGhz },
++                fidl_ieee80211::ChannelNumber {
++                    number: 1,
++                    band: TwoGhz
++                },
++                fidl_ieee80211::ChannelNumber {
++                    number: 36,
++                    band: FiveGhz
++                },
++                fidl_ieee80211::ChannelNumber {
++                    number: 165,
++                    band: FiveGhz
++                },
+             ])
+         );
+     }
+@@ -975,7 +1773,11 @@
+ 
+         // Post another command. It should not issue another request to the MLME since
+         // there is already an on-going one
+-        assert!(sched.enqueue_scan_to_discover(passive_discovery_scan(20)).is_none());
++        assert!(
++            sched
++                .enqueue_scan_to_discover(passive_discovery_scan(20))
++                .is_none()
++        );
+ 
+         // Report another scan result and the end of the scan transaction
+         sched
+@@ -1002,7 +1804,10 @@
+         assert_discovery_scan_result(
+             scan_end,
+             vec![10, 20],
+-            vec![Ssid::try_from("bar").unwrap(), Ssid::try_from("foo").unwrap()],
++            vec![
++                Ssid::try_from("bar").unwrap(),
++                Ssid::try_from("foo").unwrap(),
++            ],
+         );
+     }
+ 
+@@ -1029,7 +1834,11 @@
+ 
+         // Post a passive scan command. It should be merged with the ongoing one and so should not
+         // issue another request to MLME
+-        assert!(sched.enqueue_scan_to_discover(passive_discovery_scan(30)).is_none());
++        assert!(
++            sched
++                .enqueue_scan_to_discover(passive_discovery_scan(30))
++                .is_none()
++        );
+ 
+         // Post an active scan command. It should be merged with the active scan command that's
+         // still enqueued, and so should not issue another request to MLME
+@@ -1149,7 +1958,10 @@
+ 
+         assert_matches!(
+             sched.on_mlme_scan_end(
+-                fidl_mlme::ScanEnd { txn_id: txn_id + 1, code: fidl_mlme::ScanResultCode::Success },
++                fidl_mlme::ScanEnd {
++                    txn_id: txn_id + 1,
++                    code: fidl_mlme::ScanResultCode::Success
++                },
+                 &sme_inspect
+             ),
+             Err(Error::ScanEndWrongTxnId)
+@@ -1163,7 +1975,10 @@
+         let (_inspector, sme_inspect) = sme_inspect();
+         assert_matches!(
+             sched.on_mlme_scan_end(
+-                fidl_mlme::ScanEnd { txn_id: 0, code: fidl_mlme::ScanResultCode::Success },
++                fidl_mlme::ScanEnd {
++                    txn_id: 0,
++                    code: fidl_mlme::ScanResultCode::Success
++                },
+                 &sme_inspect
+             ),
+             Err(Error::ScanEndNotScanning)
+@@ -1185,8 +2000,10 @@
+             "expected discovery scan to be completed successfully"
+         );
+         assert_eq!(tokens, expected_tokens);
+-        let mut ssid_list =
+-            bss_description_list.into_iter().map(|bss| bss.ssid.clone()).collect::<Vec<_>>();
++        let mut ssid_list = bss_description_list
++            .into_iter()
++            .map(|bss| bss.ssid.clone())
++            .collect::<Vec<_>>();
+         ssid_list.sort();
+         assert_eq!(ssid_list, expected_ssids);
+     }
+@@ -1233,7 +2050,9 @@
+ 
+         let (responder, _receiver) = Responder::new();
+         let mut stream = sched.start_scheduled_scan(
+-            fidl_common::ScheduledScanRequest { ..Default::default() },
++            fidl_common::ScheduledScanRequest {
++                ..Default::default()
++            },
+             mlme_sink,
+             responder,
+         );
+@@ -1241,7 +2060,9 @@
+         assert_eq!(sched_txn_id, 1);
+ 
+         // Enqueue discovery scan
+-        let req = sched.enqueue_scan_to_discover(passive_discovery_scan(10)).unwrap();
++        let req = sched
++            .enqueue_scan_to_discover(passive_discovery_scan(10))
++            .unwrap();
+         let disc_txn_id = req.txn_id;
+         assert_eq!(disc_txn_id, 2);
+ 
+--- a/src/connectivity/wlan/lib/sme/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+@@ -16,8 +16,13 @@
+ 
+ use self::event::Event;
+ use self::protection::{Protection, SecurityContext};
+-pub use self::scan::ScheduledScanReceiver;
++#[cfg(not(target_os = "fuchsia"))]
++pub use self::scan::{TrustedFixedField, TrustedScanCorruption};
+ use self::scan::{DiscoveryScan, ScanScheduler};
++pub use self::scan::{
++    ScheduledScanReceiver, TrustedBssLineage, TrustedScanAggregate, TrustedScanError,
++    TrustedScanInput, TrustedScanResultRejection, TrustedScanState, TrustedScanTerminal,
++};
+ use self::state::{ClientState, ConnectCommand};
+ use crate::responder::Responder;
+ use crate::{Config, MlmeRequest, MlmeSink, MlmeStream};
+@@ -812,13 +817,51 @@
+         self.context.inspect.update_pulse(self.status());
+     }
+ 
++    /// Starts a host-private trusted scan on the actual scheduler. The caller
++    /// retains every affine provenance carrier in `state`; this method only
++    /// installs the scheduler routing tag and emits the real MLME request.
++    pub fn start_trusted_scan<P>(
++        &mut self,
++        state: &mut TrustedScanState<P>,
++        scan_request: fidl_sme::ScanRequest,
++    ) -> Result<u64, TrustedScanError> {
++        let request = self.scan_sched.start_trusted_scan(state, scan_request)?;
++        let txn_id = request.txn_id;
++        self.send_scan_request(Some(request));
++        Ok(txn_id)
++    }
++
++    pub fn on_trusted_mlme_scan_result<P>(
++        &mut self,
++        result: fidl_mlme::ScanResult,
++        provenance: P,
++        state: &mut TrustedScanState<P>,
++    ) -> Result<(), TrustedScanResultRejection<P>> {
++        self.scan_sched
++            .on_trusted_mlme_scan_result(result, provenance, state)
++    }
++
++    pub fn on_trusted_mlme_scan_end<P>(
++        &mut self,
++        end: fidl_mlme::ScanEnd,
++        state: &mut TrustedScanState<P>,
++        validate: impl FnOnce(&[TrustedScanInput<P>], &[TrustedScanAggregate]) -> bool,
++    ) -> Result<TrustedScanTerminal<P>, TrustedScanError> {
++        self.scan_sched
++            .on_trusted_mlme_scan_end(end, state, &self.context.inspect, validate)
++    }
++
+     pub fn on_scan_command(
+         &mut self,
+         scan_request: fidl_sme::ScanRequest,
+     ) -> oneshot::Receiver<Result<Vec<wlan_common::scan::ScanResult>, fidl_mlme::ScanResultCode>>
+     {
+         let (responder, receiver) = Responder::new();
+-        if self.status().is_connecting() {
++        if self.scan_sched.has_trusted_scan() {
++            let scan = DiscoveryScan::new(responder, scan_request);
++            let req = self.scan_sched.enqueue_scan_to_discover(scan);
++            self.send_scan_request(req);
++        } else if self.status().is_connecting() {
+             info!("SME ignoring scan request because a connect is in progress");
+             responder.respond(Err(fidl_mlme::ScanResultCode::ShouldWait));
+         } else {

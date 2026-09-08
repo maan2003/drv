@@ -1,0 +1,14 @@
+[package]
+name = "fuchsia-inspect"
+workspace = "../../../../connectivity/network/netstack3"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "fuchsia_inspect"
+path = "host/src/lib.rs"
+doctest = false
+
+[dependencies]
+fidl = { path = "../../../fidl/rust/fidl" }

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+manifest=$(cd "$(dirname "$0")/.." && pwd)/nix/fuchsia-reference.json
+readarray -t metadata < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+print(manifest["commit"])
+print(manifest["closure"])
+print(manifest["boringsslCommit"])
+print(manifest["pigweedCommit"])
+PY
+)
+commit=${metadata[0]}
+closure=${metadata[1]}
+boringssl_commit=${metadata[2]}
+pigweed_commit=${metadata[3]}
+
+if [[ ${1:-} == --print-commit ]]; then
+  printf "%s\n" "$commit"
+  exit 0
+fi
+cache=${DRV_REFERENCE_CACHE:-reference}
+root=${DRV_FUCHSIA_REFERENCE_ROOT:-reference/fuchsia-$commit}
+root_tmp="$root.tmp.$$"
+pigweed_base=${DRV_PIGWEED_REFERENCE_ROOT:-reference/pigweed-$pigweed_commit}
+pigweed_tmp="$pigweed_base.tmp.$$"
+
+if [[ -e "$root" || -e "$root_tmp" ]]; then
+  printf 'refusing to replace existing Fuchsia reference: %s\n' "$root" >&2
+  printf 'choose a new DRV_FUCHSIA_REFERENCE_ROOT path\n' >&2
+  exit 2
+fi
+if [[ -e "$pigweed_base" || -e "$pigweed_tmp" ]]; then
+  printf 'refusing to replace existing Pigweed reference: %s\n' "$pigweed_base" >&2
+  printf 'choose a new DRV_PIGWEED_REFERENCE_ROOT path\n' >&2
+  exit 2
+fi
+mkdir -p "$cache" "$(dirname "$root")" "$root_tmp"
+mkdir -p "$(dirname "$pigweed_base")" "$pigweed_tmp/pw_bluetooth_sapphire"
+trap 'rm -rf "$root_tmp" "$pigweed_tmp"' EXIT
+
+readarray -t paths < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+print(*manifest["paths"], sep="\n")
+PY
+)
+
+# Additional pinned paths may be supplied by package overlays. This keeps one
+# project pin/archive/hash convention while avoiding duplicate fetch scripts.
+for path in "$@"; do
+  if [[ -z "$path" || "$path" == /* || "$path" == *..* ]]; then
+    printf "invalid Fuchsia repository path: %s\n" "$path" >&2
+    exit 2
+  fi
+  paths+=("$path")
+done
+
+for path in "${paths[@]}"; do
+  name=${path//\//_}
+  archive="$cache/fuchsia-${name}-${commit}.tar.gz"
+
+  if [[ ! -f "$archive" ]]; then
+    curl -fL --retry 3 \
+      "https://fuchsia.googlesource.com/fuchsia/+archive/$commit/$path.tar.gz" \
+      -o "$archive"
+  fi
+
+  sha256sum "$archive" >"$archive.sha256"
+  mkdir -p "$root_tmp/$path"
+  tar -xzf "$archive" -C "$root_tmp/$path"
+done
+
+# BoringSSL is a gitlink in fuchsia.git, so fetch the exact revision recorded
+# by the pinned Fuchsia tree separately into its expected checkout path.
+boringssl_archive="$cache/boringssl-$boringssl_commit.tar.gz"
+boringssl_root="$root_tmp/third_party/boringssl/src"
+
+if [[ ! -f "$boringssl_archive" ]]; then
+  curl -fL --retry 3 \
+    "https://boringssl.googlesource.com/boringssl/+archive/$boringssl_commit.tar.gz" \
+    -o "$boringssl_archive"
+fi
+
+sha256sum "$boringssl_archive" >"$boringssl_archive.sha256"
+mkdir -p "$boringssl_root"
+tar -xzf "$boringssl_archive" -C "$boringssl_root"
+printf '%s\n' "$boringssl_commit" >"$root_tmp/third_party/boringssl/COMMIT"
+
+printf '%s\n' "$commit" >"$root_tmp/COMMIT"
+printf '%s\n' "$closure" >"$root_tmp/.drv-source-closure"
+mv "$root_tmp" "$root"
+
+# Fuchsia's core Sapphire host stack moved to Pigweed and is consumed as a
+# prebuilt by fuchsia.git. Keep its source beside the Fuchsia integration and
+# Rust profile layers.
+pigweed_archive="$cache/pigweed-pw_bluetooth_sapphire-$pigweed_commit.tar.gz"
+
+if [[ ! -f "$pigweed_archive" ]]; then
+  curl -fL --retry 3 \
+    "https://pigweed.googlesource.com/pigweed/pigweed/+archive/$pigweed_commit/pw_bluetooth_sapphire.tar.gz" \
+    -o "$pigweed_archive"
+fi
+
+sha256sum "$pigweed_archive" >"$pigweed_archive.sha256"
+tar -xzf "$pigweed_archive" -C "$pigweed_tmp/pw_bluetooth_sapphire"
+printf '%s\n' "$pigweed_commit" >"$pigweed_tmp/COMMIT"
+mv "$pigweed_tmp" "$pigweed_base"
+trap - EXIT

@@ -1,0 +1,201 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+//! Host subset generated from the pinned `fuchsia.wlan.common` schema.
+
+use fidl_fuchsia_wlan_ieee80211::{MacAddr, Ssid, WlanBand};
+
+pub const WLAN_TX_VECTOR_IDX_INVALID: u16 = 0;
+pub const MAX_SUPPORTED_PHY_TYPES: u8 = 64;
+pub const MAX_BANDS: u8 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ScanType {
+    Active = 1,
+    Passive = 2,
+}
+
+macro_rules! flexible_enum {
+    ($name:ident, $raw:ty, {$($variant:ident = $value:expr),+ $(,)?}) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[repr(transparent)]
+        pub struct $name($raw);
+
+        #[allow(non_upper_case_globals)]
+        impl $name {
+            $(pub const $variant: Self = Self($value);)+
+
+            pub const fn from_primitive(value: $raw) -> Option<Self> {
+                $(if value == $value {
+                    return Some(Self::$variant);
+                })+
+                None
+            }
+
+            pub const fn from_primitive_allow_unknown(value: $raw) -> Self {
+                Self(value)
+            }
+
+            pub const fn into_primitive(self) -> $raw {
+                self.0
+            }
+
+            pub const fn unknown() -> Self {
+                Self(<$raw>::MAX)
+            }
+        }
+    };
+}
+
+flexible_enum!(WlanMacRole, u32, {
+    Client = 1,
+    Ap = 2,
+    Mesh = 3,
+});
+
+flexible_enum!(DataPlaneType, u8, {
+    EthernetDevice = 1,
+    GenericNetworkDevice = 2,
+});
+
+flexible_enum!(MacImplementationType, u8, {
+    Softmac = 1,
+    Fullmac = 2,
+});
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RateSelectionOffloadExtension {
+    pub supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DataPlaneExtension {
+    pub data_plane_type: Option<DataPlaneType>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeviceExtension {
+    pub is_synthetic: Option<bool>,
+    pub mac_implementation_type: Option<MacImplementationType>,
+    pub tx_status_report_supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MacSublayerSupport {
+    pub rate_selection_offload: Option<RateSelectionOffloadExtension>,
+    pub data_plane: Option<DataPlaneExtension>,
+    pub device: Option<DeviceExtension>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SaeFeature {
+    pub driver_handler_supported: Option<bool>,
+    pub sme_handler_supported: Option<bool>,
+    pub hash_to_element_supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MfpFeature {
+    pub supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OweFeature {
+    pub supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecuritySupport {
+    pub sae: Option<SaeFeature>,
+    pub mfp: Option<MfpFeature>,
+    pub owe: Option<OweFeature>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsFeature {
+    pub supported: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SpectrumManagementSupport {
+    pub dfs: Option<DfsFeature>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApfPacketFilterSupport {
+    pub supported: Option<bool>,
+    pub version: Option<i32>,
+    pub max_filter_length: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledScanPlan {
+    pub interval: u32,
+    pub iterations: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BandRssiAdjustment {
+    pub band: WlanBand,
+    pub rssi_adjustment: i8,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduledScanMatchSet {
+    pub ssid: Option<Ssid>,
+    pub bssid: Option<MacAddr>,
+    pub min_rssi_threshold: Option<i8>,
+    pub relative_rssi_threshold: Option<i8>,
+    pub band_rssi_adjustments: Option<Vec<BandRssiAdjustment>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScheduledScanRequest {
+    pub scan_plans: Option<Vec<ScheduledScanPlan>>,
+    pub ssids: Option<Vec<Ssid>>,
+    pub frequencies: Option<Vec<u32>>,
+    pub min_rssi_threshold: Option<i8>,
+    pub relative_rssi_threshold: Option<i8>,
+    pub band_rssi_adjustments: Option<Vec<BandRssiAdjustment>>,
+    pub match_sets: Option<Vec<ScheduledScanMatchSet>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_values_match_pinned_fidl() {
+        assert_eq!(WLAN_TX_VECTOR_IDX_INVALID, 0);
+        assert_eq!(MAX_SUPPORTED_PHY_TYPES, 64);
+        assert_eq!(MAX_BANDS, 16);
+        assert_eq!(ScanType::Passive as u32, 2);
+        assert_eq!(WlanMacRole::Mesh.into_primitive(), 3);
+        assert_eq!(DataPlaneType::GenericNetworkDevice.into_primitive(), 2);
+        assert_eq!(MacImplementationType::Fullmac.into_primitive(), 2);
+    }
+
+    #[test]
+    fn flexible_unknown_and_table_defaults_match_binding_contract() {
+        assert_eq!(WlanMacRole::from_primitive(3), Some(WlanMacRole::Mesh));
+        assert_eq!(WlanMacRole::from_primitive(44), None);
+        assert_eq!(
+            WlanMacRole::from_primitive_allow_unknown(44).into_primitive(),
+            44
+        );
+        assert_eq!(DataPlaneType::unknown().into_primitive(), u8::MAX);
+        assert_eq!(
+            SecuritySupport::default(),
+            SecuritySupport {
+                sae: None,
+                mfp: None,
+                owe: None
+            }
+        );
+        assert_eq!(MacSublayerSupport::default().device, None);
+        assert_eq!(ScheduledScanRequest::default().scan_plans, None);
+        assert_eq!(ApfPacketFilterSupport::default().supported, None);
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "internet_checksum"
+workspace = "../../network/netstack3"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[features]
+benchmark = []

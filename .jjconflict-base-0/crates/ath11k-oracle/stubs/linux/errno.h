@@ -1,0 +1,7 @@
+#ifndef ATH11K_ORACLE_LINUX_ERRNO_H
+#define ATH11K_ORACLE_LINUX_ERRNO_H
+#define ENOMEM 12
+#define EFAULT 14
+#define EINVAL 22
+#define ETOOSMALL 525
+#endif

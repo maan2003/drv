@@ -1,0 +1,36 @@
+diff -ruN -U2 a/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs b/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs
+--- a/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs	2026-08-09 19:30:24.440459027 +0000
++++ b/src/connectivity/wlan/lib/frame_writer/macro/src/frame_writer.rs	2026-08-09 19:30:24.462917647 +0000
+@@ -298,8 +298,12 @@
+ pub fn process_with_default_source(input: TokenStream) -> TokenStream {
+     let macro_args = parse_macro_input!(input as DefaultSourceMacroArgs);
+     let buf_tokens = quote!(
++        #[cfg(target_os = "fuchsia")]
+         let arena = wlan_frame_writer::__Arena::new();
++        #[cfg(target_os = "fuchsia")]
+         let mut buffer = arena.insert_default_slice::<u8>(frame_len);
++        #[cfg(not(target_os = "fuchsia"))]
++        let mut buffer = vec![0u8; frame_len];
+         let mut w = BufferWriter::new(&mut buffer[..]);
+     );
+     let return_buf_tokens = quote!(
+@@ -309,7 +313,11 @@
+                     w.bytes_appended(), frame_len)
+             ));
+         }
+-        Ok(arena.make_static(buffer))
++        #[cfg(target_os = "fuchsia")]
++        let buffer = arena.make_static(buffer);
++        #[cfg(not(target_os = "fuchsia"))]
++        let buffer = buffer;
++        Ok(buffer)
+     );
+     process_write_definitions(macro_args.write_defs, buf_tokens, return_buf_tokens, false)
+ }
+diff -ruN a/src/connectivity/wlan/lib/frame_writer/src/lib.rs b/src/connectivity/wlan/lib/frame_writer/src/lib.rs
+--- a/src/connectivity/wlan/lib/frame_writer/src/lib.rs
++++ b/src/connectivity/wlan/lib/frame_writer/src/lib.rs
+@@ -9,2 +9,3 @@
++#[cfg(target_os = "fuchsia")]
+ pub use fdf::Arena as __Arena;
+ pub use {wlan_common as __wlan_common, zerocopy as __zerocopy};

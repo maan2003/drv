@@ -1,0 +1,24 @@
+[package]
+name = "dhcp-protocol"
+workspace = "../../netstack3"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bstr.workspace = true
+hex.workspace = true
+log.workspace = true
+net_types.workspace = true
+num-derive.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+assert_matches.workspace = true
+net_declare.workspace = true
+rand.workspace = true

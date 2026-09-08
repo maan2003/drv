@@ -1,0 +1,21 @@
+[package]
+name = "wlan-fidl-ext"
+workspace = "../../../network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wlan_fidl_ext"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fidl = { path = "../../../../lib/fidl/rust/fidl" }
+itertools.workspace = true
+paste.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true
+zx = { path = "../../../../../sdk/rust/zx" }

@@ -1,0 +1,26 @@
+[Unit]
+Description=Opt-in drv Fuchsia ADR PipeWire compatibility daemon
+Documentation=file:@readme@
+
+[Service]
+Type=simple
+ExecStart=@launcher@
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s
+KillMode=mixed
+RuntimeDirectory=drv-audio-pipewire
+RuntimeDirectoryMode=0700
+Environment=DRV_AUDIO_RUNTIME_DIR=%t/drv-audio-pipewire
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

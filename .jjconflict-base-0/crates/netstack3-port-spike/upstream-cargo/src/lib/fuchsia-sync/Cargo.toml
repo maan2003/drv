@@ -1,0 +1,17 @@
+[package]
+name = "fuchsia-sync"
+workspace = "../../connectivity/network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lock_api.workspace = true
+parking_lot.workspace = true
+parking_lot_core.workspace = true
+
+[dev-dependencies]
+crossbeam.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(detect_lock_cycles)'] }

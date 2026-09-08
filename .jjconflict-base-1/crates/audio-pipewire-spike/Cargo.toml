@@ -1,0 +1,11 @@
+[package]
+name = "drv-audio-pipewire-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drv-fuchsia-audio-processing = { path = "../fuchsia-audio-processing" }
+drv-fuchsia-audio-timeline = { path = "../fuchsia-audio-timeline" }
+nix = { version = "=0.30.1", features = ["event", "fs", "socket", "time", "uio"] }
+pipewire-native-spa = "=0.1.4"

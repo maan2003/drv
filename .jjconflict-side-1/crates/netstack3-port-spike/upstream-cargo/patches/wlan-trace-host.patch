@@ -1,0 +1,24 @@
+--- a/src/connectivity/wlan/lib/trace/src/lib.rs
++++ b/src/connectivity/wlan/lib/trace/src/lib.rs
+@@ -54,11 +54,21 @@
+     );
+ }
+ 
++#[cfg(target_os = "fuchsia")]
+ pub fn async_end_wlansoftmac_tx(async_id: trace::Id, status: zx::Status) {
++    async_end_wlansoftmac_tx_status(async_id, status);
++}
++
++#[cfg(not(target_os = "fuchsia"))]
++pub fn async_end_wlansoftmac_tx(async_id: trace::Id, status: impl std::fmt::Display) {
++    async_end_wlansoftmac_tx_status(async_id, status);
++}
++
++fn async_end_wlansoftmac_tx_status(async_id: trace::Id, status: impl std::fmt::Display) {
+     trace::async_end(
+         async_id,
+         names::CATEGORY_WLAN,
+         names::NAME_WLANSOFTMAC_TX,
+         &[trace::ArgValue::of("status", format!("{}", status).as_str())],
+     );
+ }

@@ -1,0 +1,350 @@
+# Native Netstack3 production source map
+
+Pinned Fuchsia revision: `1e1219e3fac944c9a906aea9646939746b6062b3`.
+
+The fetch script downloads every path below directly from the pinned revision.
+Except for the explicitly project-owned host fixture described below, the Cargo
+overlay supplies build metadata only. Unless a patch is named, production source
+files are byte-for-byte upstream. The project-owned `host_fixture.rs` and
+`wlan-mlme-host-fixture.patch` export deterministic, effect-only self-test
+plumbing; they do not replace or implement the production `ClientMlme`.
+
+| Native package / responsibility | Pinned Fuchsia production source | Host modification | License |
+|---|---|---|---|
+| `dhcp-protocol`: DHCP message, option, serialization and size-constrained types | `src/connectivity/network/dhcpv4/protocol/src/{lib,size_constrained,size_of_contents}.rs` | Cargo manifest only | Fuchsia BSD-2-Clause |
+| `dhcp_client_core`: complete client state machine, transitions, retransmission/jitter, lease phases, parsing and abstract dependencies | `src/connectivity/network/dhcpv4/client/core/src/{client,deps,inspect,lib,parse}.rs` | `dhcp-client-core-host.patch` gates only the `fuchsia_async::MonotonicInstant` convenience import/impl; traits and algorithms unchanged | Fuchsia BSD-2-Clause |
+| `trust-dns-proto`: DNS protocol and transport state | `third_party/rust_crates/forks/trust-dns-proto-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
+| `trust-dns-resolver`: resolver cache, retry, name-server ordering and lookup lifecycle | `third_party/rust_crates/forks/trust-dns-resolver-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
+| `wlan-statemachine` and `wlan-statemachine-macro`: portable state transition DSL used by client SME/RSN | `src/connectivity/wlan/lib/statemachine/{src,macro/src}/**` | Cargo manifests only; upstream unit tests retained; Cargo doctests disabled because upstream illustrative fragments are intentionally non-standalone and GN does not compile them | Fuchsia BSD-2-Clause |
+| `wlan-bitfield` and `wlan-bitfield-wrapper`: 802.11/EAPOL bitfield generator and its upstream conformance tests | `src/connectivity/wlan/lib/bitfield/{src,wlan-bitfield-tests/src}/**` | Cargo manifests only; all 14 upstream tests retained; Cargo doctests disabled because GN does not compile the illustrative fragments | Fuchsia BSD-2-Clause |
+| `ieee80211`: SSID, MAC address, BSSID, parsing and formatting | `src/connectivity/wlan/lib/ieee80211/src/**` | Cargo manifest only; all 38 upstream unit tests unchanged; Cargo doctest disabled because GN does not compile the non-standalone illustrative fragment | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_common` host subset | `sdk/fidl/fuchsia.wlan.common/{driver_features,wlan_common}.fidl` | Narrow schema binding replacement exports WLAN common's pinned bounds, scan type, TX-vector sentinel, flexible MAC/data-plane/implementation enums, and feature-support tables consumed by WLAN common, SoftMAC MLME, and SME values; exact discriminants, unknown-value round trips, and table defaults are tested; no transport or policy | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_driver` host values | `sdk/fidl/fuchsia.wlan.driver/types.fidl` | Path-shaped schema binding exports the complete pinned join, key, WMM, and SoftMAC capability value model consumed by SoftMAC MLME; IEEE value dependencies, table optionality, strict discriminants, bit values, and field widths are preserved and tested; no protocol transport | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_ieee80211` host subset | `sdk/fidl/fuchsia.wlan.ieee80211/{channel,constants,fields,reason_code,rsn,status_code}.fidl` | Narrow schema binding replacement exports the pinned bounds, SSID aliases/C representation, MAC address/BSS description, channel/band/access-category/BSS/PHY/reason/status/key/cipher enums, channel number, and fixed-size HT/VHT records required by WLAN common, FCG crypto, and SoftMAC/driver/MLME values; exact known-value validation, explicit unknown-value construction, and record lengths are tested; no policy | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_internal` host subset | `sdk/fidl/fuchsia.wlan.internal/{security,wlan_internal}.fidl` | Narrow schema binding replacement exports the protocol/authentication/credential values required by WLAN common plus OWE, signal-report, channel-switch, and bounds consumed by MLME; exact protocol discriminants, credential shapes, nullable/opaque union payloads, and channel records are preserved; no service transport or authentication policy | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_mlme` host values | `sdk/fidl/fuchsia.wlan.mlme/{wlan_mlme,wlan_mlme_ext}.fidl` | Path-shaped schema binding exports the pinned scan, connect/roam, authentication, association, key, AP start/stop, EAPOL, capability, stats, Minstrel, controlled-port, PMK, SAE, and complete MLME event-envelope values consumed by SoftMAC MLME and SME; strict discriminants, nullable boxes, strict unions, event variants, bounds, and cross-schema dependencies are preserved and tested; channel protocol transport remains excluded | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_minstrel` host values | `sdk/fidl/fuchsia.wlan.minstrel/wlan_minstrel.fidl` | Path-shaped schema binding exports the complete pinned peer list and per-rate Minstrel statistics value model consumed by SoftMAC MLME; integer widths, floating-point estimates, MAC addresses, strings, and vectors are preserved and tested; no protocol transport | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_sme` host values | `sdk/fidl/fuchsia.wlan.sme/sme.fidl` | Path-shaped schema binding exports the pinned protection/compatibility, scan, connect/roam/disconnect, status, AP configuration/result, generic-query, and connect-transaction event values consumed by WLAN common and SME; strict discriminants/unions, nullable boxes, and common/internal/IEEE field shapes are preserved and tested; VMO handles, persistence codecs, protocol endpoints, and SME policy are excluded | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_softmac` host values | `sdk/fidl/fuchsia.wlan.softmac/{features,softmac,tx}.fidl` | Path-shaped schema binding exports the pinned discovery/query, RX/TX metadata and result, key/association, scan, beacon/channel/WMM, packet, and FFI transfer value types consumed by SoftMAC MLME; flag masks, flexible result codes, table optionality, fixed attempt arrays, and cross-schema dependencies are preserved and tested; protocol proxies and driver policy remain excluded | Fuchsia BSD-2-Clause |
+| `fuchsia-softmac-port`: portable passive offload-scan hardware edge and state | `src/connectivity/wlan/lib/mlme/rust/src/{device.rs,client/scanner.rs,client/convert_beacon.rs}`, SME `client/scan.rs`, plus pinned SoftMAC/MLME/IEEE schema values | Retains passive validation, Time Unit conversion, scan identity/completion, exact BSS conversion, and the pinned SME physical-channel intersection under fixed world/indoor policy; firmware CLC input can restrict but never expand; the fake adapter remains non-I/O | Fuchsia BSD-2-Clause |
+| `fidl_fuchsia_wlan_stats` host values | `sdk/fidl/fuchsia.wlan.stats/wlan_stats.fidl` | Path-shaped schema binding exports the complete pinned histogram, interface/connection counter, signal-report, and telemetry-support value model; strict/flexible discriminants, nullable boxes, table optionality, sparse vectors, and bounds are preserved; no protocol transport or persistence | Fuchsia BSD-2-Clause |
+| `wlan-frame-writer-macro`: frame/header/IE construction macros used by SoftMAC MLME | `src/connectivity/wlan/lib/frame_writer/macro/src/**` | Cargo manifest only; source unchanged; tests arrive with the upstream frame-writer consumer after WLAN common is packaged | Fuchsia BSD-2-Clause |
+| `wlan-frame-writer`: complete management/data header and information-element serialization used by SoftMAC MLME | `src/connectivity/wlan/lib/frame_writer/src/**` | Cargo manifest plus `wlan-frame-writer-host.patch`: substitutes an owned zeroed vector only for the Fuchsia driver-arena allocation/ownership boundary; macro parsing, length calculation, field/IE serialization, fixed-slice and append paths are unchanged; all upstream unit tests retained | Fuchsia BSD-2-Clause |
+| `fuchsia-trace` host boundary and `wlan-trace` | `src/lib/trace/rust/src/lib.rs` and `src/connectivity/wlan/lib/trace/src/**` | The pinned Fuchsia trace runtime remains the semantic/API reference; a path-shaped local host binding preserves trace IDs, argument/event signatures, and macros but deliberately disables emission where Fuchsia's trace engine is absent. `wlan-trace-host.patch` generalizes only the host TX-status display boundary; pinned WLAN event names and event calls are unchanged | Fuchsia BSD-2-Clause reference; local host binding MIT OR Apache-2.0 |
+| `fuchsia-inspect` and `fuchsia-inspect-contrib` host boundary | `src/lib/diagnostics/inspect/{rust,contrib/rust}/**` | Path-shaped local host bindings preserve the node/property, bounded-list, monotonic-time, and logging macro API required by pinned SME. Scalar/string/byte properties retain values in memory and snapshots expose owned host bytes; hierarchy serialization and convenience log emission are deliberately disabled without the Fuchsia Inspect VMO runtime | Fuchsia Inspect API reference; local host binding MIT OR Apache-2.0 |
+| `zx-types`, `zx-status`, and host `zx` value facade | `sdk/rust/{zx-types,zx-status,zx}/src/**` | Exact pinned `zx-types` and `zx-status` sources are packaged unchanged. A path-shaped local `zx` facade re-exports their status/raw value API and preserves pinned monotonic instant/duration units, conversions, ordering, and saturating arithmetic using the host monotonic clock, without exposing unavailable Zircon syscalls or handles | Fuchsia BSD-2-Clause reference and value crates; local facade MIT OR Apache-2.0 |
+| Generic FIDL responder support and `wlan-fidl-ext` | `src/lib/fidl/rust/fidl/src/error.rs` and `src/connectivity/wlan/lib/fidl-ext/src/**` | A local host `fidl` boundary exposes the pinned `InvalidHeader` error contract plus an explicit unavailable-transport error; encoding and endpoint transport remain excluded. `wlan-fidl-ext-host.patch` gates only generated Fuchsia protocol responder impls; generic responder error handling and required-field unpacking are unchanged and retain the complete upstream test suite | Fuchsia BSD-2-Clause reference/WLAN source; local host boundary MIT OR Apache-2.0 |
+| `wlan-common`: IEEE 802.11 frame/IE parsing and writing, capability derivation, channel/rate-vector logic, BSS classification, SME compatibility, security conversion, and MLME/SME timer queue | `src/connectivity/wlan/lib/common/rust/src/**` | Cargo manifest plus `wlan-common-host.patch` and `wlan-timer-host.patch`: gates only the Zircon-status conversion, retains monotonic scan timestamps on host, exposes portable test support, enables the unchanged IEEE TimeUnit conversion, and substitutes Tokio sleep only at the fuchsia-async wake-up boundary; event IDs, deadlines, unordered concurrency, cancellation handles, and filtering remain pinned source and have host tests; scan-result VMO persistence reports unavailable on host | Fuchsia BSD-2-Clause |
+| `eapol`: EAPOL and EAPOL-Key frame parsing, validation, serialization, and key-information bitfields | `src/connectivity/wlan/lib/eapol/src/lib.rs` | Cargo manifest only; source and all upstream unit tests unchanged | Fuchsia BSD-2-Clause |
+| `mundane`: BoringSSL-backed hash, HMAC, key derivation, password and public-key primitives used by WLAN RSN/SAE | `src/lib/mundane/src/**` plus BoringSSL revision `156c7b75ae9b8c3b3f847acf264f17594c3859fb` recorded by the pinned Fuchsia gitlink | Cargo manifests plus a host build script that compiles the pinned gitlink revision and uses Fuchsia.s generated `bssl-sys` bindings/wrapper; `wlan-fcg-crypto-host.patch` adds the P-384/SHA-384 variant of BoringSSL.s existing WPA3 SAE hash-to-curve entry point | Fuchsia BSD-2-Clause and BoringSSL Apache-2.0 |
+| `wlan-fcg-crypto`: finite cyclic group operations and complete SAE/OWE authentication handshakes | `src/connectivity/wlan/lib/fcg-crypto/src/**` | Cargo manifest plus `wlan-fcg-crypto-host.patch`: adds WPA3 SAE group 20/P-384 H2E, strict Rejected Groups extension parsing and key derivation binding, group fallback support, secret zeroization, and cryptographic/protocol regression tests | Fuchsia BSD-2-Clause |
+| `fuchsia-sync`: mutex, rwlock, and condition-variable primitives used by RSN | `src/lib/fuchsia-sync/src/**` | Cargo manifest only; the pinned source's upstream non-Fuchsia parking_lot backend is selected unchanged | Fuchsia BSD-2-Clause |
+| `wlan-rsn`: WPA personal/enterprise RSN association, PSK derivation, EAPOL four-way/group-key handshakes, key wrapping/integrity, SAE, and OWE integration | `src/connectivity/wlan/lib/rsn/src/**` | Cargo manifests plus `wlan-rsn-host.patch` and `wlan-fcg-crypto-host.patch`: retain the host timestamp/test adaptations and add Direct SAE group 20-first negotiation with fail-closed group 19 fallback | Fuchsia BSD-2-Clause |
+| `wlan-sme`: AP/client policy, scan scheduling, connect/roam/disconnect state machines, RSN integration, and MLME request/event handling | `src/connectivity/wlan/lib/sme/src/**` | Cargo manifest plus `wlan-sme-host.patch`: excludes only generated Fuchsia endpoint serving, corrects a generated-binding macro namespace and a host newtype comparison, while retaining pinned core policy. `wlan-sme-passive-observation-timeout-host.patch` adds an opt-in initial RSNA response timeout; its default remains the pinned 4000 ms and only passive validation selects 6000 ms so its 5000 ms observer owns termination. Host integration tests drive passive scan and open-network connect request/completion across the real SME/MLME boundary; endpoint responders and scan-result VMO persistence explicitly report unavailable on host | Fuchsia BSD-2-Clause |
+| Native Ethernet, device, route, UDP and TCP bindings | `src/connectivity/network/netstack3/src/bindings/{devices,routes,socket,timers,time,waker}.rs` as semantic reference; production core APIs under `netstack3/core/**` are linked directly | Native capability adapter remains custom because FIDL, Zircon handles/signals, fuchsia-async, netdevice FIDL, Inspect and component lifecycle have no authority-free host implementation | Local MIT OR Apache-2.0 adapter; linked Fuchsia core BSD-2-Clause |
+| DHCP configuration policy | `src/connectivity/policy/netcfg/src/dhcpv4.rs` | Adapted in cargo/port-integration/src/service.rs at the effect boundary only: address, route and DNS ownership are applied through native Netstack3 APIs instead of interfaces-admin/routes-admin/LookupAdmin FIDL | Fuchsia BSD-2-Clause |
+| DNS source policy | `src/connectivity/policy/netcfg/src/dns.rs` | Adapted by the DHCP effect and NativeDnsBridge configuration boundary; FIDL watcher plumbing is excluded | Fuchsia BSD-2-Clause |
+
+## Outer WLAN service inventory
+
+This is the pinned source inventory for an eventual host service with iwd-like
+responsibility. It is discovery, not part of the current Cargo closure. The
+canonical fetch already archives all of `src/connectivity/wlan`; the additional
+SDK FIDL directories named below must be requested from the same revision when
+their bindings are packaged. No second Fuchsia pin is needed.
+
+| Responsibility | Pinned production source | Port boundary |
+|---|---|---|
+| Client policy service, connect lifecycle, scan distribution, roaming and reconnect | `src/connectivity/wlan/wlancfg/src/client/{mod.rs,state_machine.rs,types.rs,scan/**,connection_selection/**,roaming/**}` | The selection/scoring and state-transition policy is host-reusable. Generated policy/SME values, monotonic timers, Inspect calls, scan-result VMO decoding, and SME endpoint proxies need existing host value facades or narrow adapters. |
+| Saved network model and history | `src/connectivity/wlan/wlancfg/src/config_management/{config_manager.rs,network_config.rs,stash_conversion.rs}` | The credential validation, compatibility, hidden-network probability, failure history, and `SavedNetworksManagerApi` contract are reusable. `PolicyStorage` and periodic metrics are effects, not policy. |
+| Persistent saved-network backend | `src/connectivity/wlan/lib/storage/src/{policy.rs,storage_store.rs,stash_store.rs,constants.rs}` | `wlan-storage` owns JSON/storage conversion and migration, but its production backends use component namespace `/data` and `fuchsia.stash.SecureStore`; substitute a project-owned durable store behind the saved-network contract on host. |
+| Interface/PHY ownership and recovery | `src/connectivity/wlan/wlancfg/src/mode_management/{iface_manager.rs,iface_manager_api.rs,iface_manager_types.rs,phy_manager.rs,device_monitor.rs,recovery.rs}` | Orchestration and recovery policy are reusable only after separating `DeviceMonitorProxy`, FIDL endpoint creation, Zircon statuses, and Inspect. Hardware discovery, interface creation/destruction, SME lookup, PHY reset, and country setting belong to the platform adapter. |
+| Regulatory coordination | `src/connectivity/wlan/wlancfg/src/regulatory_manager.rs` and `mode_management/{iface_manager.rs,phy_manager.rs}` | The stop/set-country/recreate/reconnect ordering is policy. `fuchsia.location.namedplace/RegulatoryRegionWatcher` and `DeviceMonitor.{SetCountry,ClearCountry}` are Fuchsia transports; the host must supply an authoritative regulatory source and driver operation and must retain the fail-closed channel authorization described by `fuchsia-softmac-port`. |
+| Metrics and diagnostics | `src/connectivity/wlan/wlancfg/src/telemetry/**` and `src/connectivity/wlan/lib/telemetry/src/**` | Windowed connection, scan, recovery, timeout, disconnect, power and interface counters are reusable logic. Cobalt-generated metric registries, `fuchsia.metrics`, Inspect publication/VMOs, tracing, battery service, and device-counter FIDL are replaceable sinks/sources. Metrics failure is non-fatal in pinned `main.rs`. |
+| AP and compatibility surfaces | `src/connectivity/wlan/wlancfg/src/access_point/**` and `src/connectivity/wlan/wlancfg/src/legacy/**` | `ApSme` start/stop/status and deprecated product protocols are outside the smallest client closure; add them only after the client service is complete. |
+| Process/service composition | `src/connectivity/wlan/wlancfg/src/{main.rs,lib.rs}`, `meta/wlancfg.cml` | `ServiceFs`, component capability routing/config, FIDL serving, Inspect publication and trace-provider setup are Fuchsia-only. A host daemon should preserve policy semantics behind a project-owned control API rather than emulate Component Framework or Zircon channels. |
+
+The direct crate/source closure is `wlancfg_lib`, `wlan-storage`,
+`wlan-telemetry`, `wlan-common`, `ieee80211`, and the already packaged
+`wlan-sme`, `wlan-rsn`, `wlan-fcg-crypto`, `eapol`, frame/bitfield/state-machine
+libraries and WLAN FIDL value crates. `wlancfg_lib` additionally uses
+`async-utils`, Fuchsia async/sync/time, Inspect/contrib, FIDL/component runtime,
+Cobalt client, and ordinary Rust crates (`anyhow`, `async-trait`, `futures`,
+`itertools`, `log`, `num-traits`, `rand`, and `thiserror`). Those runtime and
+diagnostic dependencies do not gain authority in the host design.
+
+### Service and SME/MLME boundary
+
+The exact transport schemas used by the outer service are
+`sdk/fidl/fuchsia.wlan.{policy,device.service,sme,common,ieee80211,internal,stats}`,
+`sdk/fidl/fuchsia.location.{namedplace,sensor}`, `sdk/fidl/fuchsia.metrics`,
+`sdk/fidl/fuchsia.stash`, and the two
+`sdk/fidl/fuchsia.wlan.product.deprecated*` libraries. Only the WLAN
+common/IEEE/internal/SME/stats value subsets are in the host overlay today;
+policy and device-service values plus all protocol endpoints remain absent.
+
+`wlancfg` has no direct MLME channel. It obtains `ClientSme` and `ApSme`
+endpoints through `DeviceMonitor` (`WatchDevices`, `QueryIface`,
+`CreateIface`, `DestroyIface`, `GetClientSme`, and `GetApSme`) and invokes:
+
+* client `Scan`, `Connect`, `Disconnect`, `Roam`, and `Status`, consuming
+  connect-transaction events for connect/roam results, disconnects, signal
+  reports, and channel switches;
+* AP `Start`, `Stop`, and `Status`; and
+* device/PHY query, reset, country set/clear, and counter-stat operations.
+
+Below that endpoint, the pinned `wlan-sme` crate already converts SME commands
+and events to its `MlmeRequest`/`MlmeEvent` state-machine boundary. Therefore a
+host port should adapt `wlancfg` to an in-process SME command/event interface;
+it should not recreate FIDL channels or bypass SME by duplicating MLME policy.
+
+### WLAN authority map
+
+| State or operation | Sole owner | Host/backend boundary |
+|---|---|---|
+| Country and regulatory lifecycle | Pinned `wlancfg/regulatory_manager.rs` plus `IfaceManager`/`PhyManager` | The host supplies authoritative location and `DeviceMonitor.SetCountry/ClearCountry`; stop/recreate/reconnect ordering remains Fuchsia policy. |
+| World-domain beacon hint | Narrow regulatory capability adapter at the scan boundary | A direct error-free ESS beacon may mint only a run/scoped channel capability. It does not set country, interpret AP Country IE as authority, or become MT7921 policy. |
+| Client authentication, association, SAE timers/retries, RSN and connect result | Full pinned client MLME plus `wlan-sme`/`wlan-rsn` | Package the production state machine and adapt its existing request/event seam. Status 30 is retried only for one valid Association Comeback Timeout Interval IE, after its TU delay and with bounded generation-safe attempts; other statuses and malformed comeback responses retain the pinned failure path. The extracted `open_client` and VFIO SAE loop are offline scaffolding, not a second connect implementation. |
+| Rate/SAR power tables, MCU commands, WFDMA descriptors, completion and key programming | MT7921 backend | The backend consumes already-authorized channel/power inputs and reports mechanics completion; it owns no country, scan-selection, credential, retry, or connect policy. |
+| Direct VFIO orchestration | Temporary no-plastic lab harness | Bounded evidence collection only. It is not a production service boundary and must not accumulate WLAN policy. |
+
+### Staged WLAN selection gates
+
+Gate A is complete at commit `d97e1fd8`. The host package compiles the exact
+pinned `wlancfg` connection-selection sources and returns their ordinary
+`ScannedCandidate`; it adds no provenance or authority. A fresh materialization
+of Fuchsia pin `1e1219e3fac944c9a906aea9646939746b6062b3` and a fresh Pigweed
+checkout completed `prepare-upstream`, including exact patch application with
+zero fuzz/offset. The focused selector, SME, MLME, and RSN results were
+respectively 6/6, 2/2, 2/2, and 187/187. Advisor `adv-m21s` and source reviewer
+`eng-xqca` approved the gate as preserving pinned filtering, scoring, stable
+ordering, active augmentation, cancellation, and ordinary output without
+introducing Gate B/C or live/hardware authority.
+
+Gate B is private provenance plumbing only. It must carry exact descriptor
+occurrence identities into the structured aggregate/lineage selected by the
+pinned policy; it must not infer an identity from a `BssDescription`, BSSID,
+SSID, channel, signal, serialized bytes, or any other value after the fact.
+Comparisons already made by pinned scan/selection policy remain policy, but
+each element carries its structured lineage through those comparisons. Gate B
+ends at an interface/request-bound selected provenance aggregate. It does not
+perform a final scan, mint beacon or power authority, issue Connect/Join,
+publish a frame, or make any live device operation reachable.
+
+#### Private identity and lifetime contract
+
+The RX owner is the sole mint. After observing a CPU-owned completed descriptor
+and the acquire fence, it validates the descriptor, copies the bounded frame,
+and mints the occurrence before writing or publishing the replacement
+descriptor. The stable identity is the tuple
+`(interface-owner, interface-epoch, device/reset/ownership epochs, scan-id,
+scan-epoch, ring-id, descriptor-slot, slot-epoch, occurrence-sequence)`. The
+slot epoch advances on every arm or rearm; all counters advance with checked
+arithmetic and exhaustion poisons the interface rather than wrapping. A copied
+occurrence can survive physical slot reuse because its sealed identity records
+the pre-rearm slot epoch, while no later bytes in that slot can acquire that
+identity.
+
+B1 must cover both accepted descriptor routes in the current backend:
+`vfio_read.rs::drain_data_rx_queue`, which parses the data RX ring directly,
+and the normal-frame branch of `vfio_read.rs::drain_rx_queue`, which routes a
+frame from an MCU RX ring. Each route mints with its actual ring and slot before
+that route rearms. If a future implementation does not carry one route, that
+route is explicitly provenance-dropping and its advertisements are ineligible
+for Gate B selection rather than being upgraded later.
+
+The identity is held in a host-private carrier whose minting constructor and
+fields are inaccessible to ordinary scan, policy, SME, and service callers.
+Cloning a carrier copies the same identity and never mints a new one. Public
+FIDL schemas and pinned value types do not gain a caller-settable token. At a
+clone or value conversion the private carrier moves with the exact element. At
+a FIDL-shaped seam it remains in a trusted, in-process sidecar paired by the
+message occurrence and vector position; it is never encoded, accepted from the
+wire, or reattached by comparing values. Any boundary that cannot preserve
+this structural pairing is an explicit provenance-dropping boundary and may
+produce only an ordinary, unprovenanced result.
+
+After B1, the descriptor-backed occurrence is only an input identity. Gate B
+removes or bypasses the custom MT7921 strongest-per-BSSID aggregation: every
+accepted raw occurrence reaches pinned client MLME/SME in receive order. Equal
+and weaker observations are not dropped at this boundary; pinned SME owns the
+first aggregation and deduplication policy. Each later aggregate retains a
+structured private lineage that records representative/contributor roles and
+the disposition of inputs dropped by pinned policy:
+
+* pinned SME `maybe_insert_bss` separately records the fixed-field
+  representative and the ordered IE contributors. The rejected weaker
+  cross-channel echo is a dropped input and leaves both roles unchanged;
+  otherwise the exact incoming input becomes the fixed-field representative
+  when it overwrites `existing_bss`, while accepted IE contributors remain in
+  the merge lineage. The synthesized merged IE value does not claim to be the
+  bytes of one descriptor;
+* pinned `wlancfg` `bss_to_network_map` keeps the first unique BSSID aggregate
+  it accepts for each detailed network and records later duplicate aggregates
+  as dropped. HashMap draining or network regrouping moves that whole aggregate
+  with the element rather than recovering it by key;
+* filtering and stable score sorting move or clone the entire structured
+  lineage embedded in the candidate. Equal scores therefore preserve the
+  pinned input-order aggregate. Successful active augmentation carries the
+  complete active-scan structured aggregate--its SME fixed-field
+  representative, IE contributors, and later grouping lineage--as the source
+  of the replacement `bss_description`, while the discovery lineage remains
+  the source of the candidate's retained signal, channel, timestamp,
+  observation, compatibility, and other `Bss` fields. Missing active sidecar
+  lineage is a provenance transport failure, not an unprovenanced replacement.
+  Augmentation never recovers either lineage by looking up a sidecar with
+  BSSID/SSID values.
+
+No individual occurrence identity claims to identify the synthesized SME
+value, the `wlancfg` candidate, or the selected aggregate as a whole. Neither
+an input identity nor the composite lineage grants authority.
+
+The terminal selected aggregate remains bound to the interface owner/epoch and
+the selector request generation. Interface removal or rebinding, device reset,
+firmware reload, DMA-ownership loss, RX teardown, a failed or mismatched scan
+terminal, scan cancellation, selector cancellation, or provenance transport
+failure revokes the affected generation before buffers or queued results are
+released. Late events from a revoked generation are discarded and cannot
+restore it. Rearm revokes only the live descriptor-slot lease after the sealed
+copy exists; scan or interface invalidation revokes its derived lineage too. A
+successful matching scan terminal seals the structured lineage for selection
+but grants no connection capability. An ordinary caller can construct or
+serialize only unprovenanced values, and the private interface binding rejects
+those values rather than upgrading them.
+
+#### Gate B review splits and admission blockers
+
+The previously recorded advisor blockers are admission criteria, not deferred
+cleanup: provenance must be minted from exact descriptor consumption before
+rearm; stable identity must not be reconstructed by value matching; every
+clone, conversion, FIDL-shaped seam, aggregation, deduplication, reorder, tie,
+and cancellation path must have an explicit carrier rule; slot and interface
+epochs must revoke stale occurrences; ordinary callers must be unable to forge
+or deserialize provenance; and the actual pinned selector, rather than a
+parallel selector, must choose the carried aggregate. An individual occurrence
+identity must never be presented as the identity of a synthesized candidate. A
+design that reaches a final observation, Connect/Join, frame publication, or
+live authority in the same change is outside Gate B.
+
+Those obligations are not independently reviewable as one implementation, so
+future code is split further:
+
+1. **B1 -- descriptor occurrence:** mint the private identity at exact RX
+   consumption on both data-RX and MCU-RX normal-frame routes, copy before
+   rearm, advance per-slot epochs, and prove stale, duplicate, overflow,
+   teardown, uncovered-route, and cancellation rejection. Stop at the raw
+   advertisement carrier.
+2. **B2 -- scan lineage:** carry B1 identities through pinned beacon
+   conversion and FIDL-shaped value seams, remove/bypass MT7921
+   strongest-BSSID pre-aggregation, and let pinned SME/`wlancfg` own
+   aggregation and deduplication. Prove equal/weaker raw inputs reach SME, then
+   test pinned echo rejection, overwrite, IE merge, first-unique behavior, and
+   reorder handling. Stop at structured, provenanced `wlancfg` scan aggregates.
+3. **B3 -- policy selection and binding:** feed those candidates to the actual
+   pinned `wlancfg` selector, move the whole lineage through filtering, stable
+   score ties and augmentation, and return a private interface/request-bound
+   selected provenance aggregate. Prove ordinary selector/FIDL callers cannot
+   mint or submit it and prove cancellation/invalidation. Stop before any final
+   scan or Connect/Join call.
+
+Each subgate requires its own source/advisor approval and negative tests before
+the next begins. Gate C, if separately approved later, owns fresh final
+observation and any live authorization; no Gate B token is itself such
+authority.
+
+### Smallest staged closure
+
+1. Package and test the decision core: `client/types.rs`,
+   `config_management/{network_config.rs,config_manager.rs}`, and
+   `client/connection_selection/**`, initially with fake scan, saved-network,
+   telemetry and Inspect dependencies. Add only the missing policy value shapes
+   from the pinned schema.
+2. Add one client interface: `client/{scan/**,state_machine.rs}` and the narrow
+   client portions of `iface_manager_api.rs`, backed directly by the packaged
+   `wlan-sme` station/MLME request-event boundary. Prove scan, open connect,
+   protected connect, disconnect and reconnect before porting PHY hotplug.
+3. Replace fakes with durable saved-network storage, a regulatory source/driver
+   adapter, metrics/diagnostic sinks, and the project-owned service transport.
+   Keep each effect outside the policy core and preserve metrics-unavailable
+   operation.
+4. Add multi-PHY lifecycle/recovery, roaming refinements and AP support as
+   separate closures. Do not carry legacy product protocols unless an actual
+   compatibility consumer requires them.
+
+## Replacement rule
+
+The upstream DHCP state machine/protocol and Trust-DNS resolver are the sole
+production implementations. Native code may implement their socket, clock,
+RNG, spawning and configuration-effect traits, but must not retain a parallel
+codec, retry/cache, lease state machine, or service lifecycle.
+
+The former custom control-plane module, its Edge-DHCP/Hickory dependencies, and the frozen service prototype were removed after the pinned upstream adapters landed.
+
+### Native DNS bridge mapping
+
+| Adapter symbol | Upstream contract reused unchanged |
+|---|---|
+| NativeDnsTime | trust-dns-proto Time |
+| NativeUdp | trust-dns-proto UdpSocket |
+| NativeTcp | trust-dns-proto DnsTcpStream and Connect |
+| NativeSpawn / NativeDnsRuntime | trust-dns-resolver Spawn and RuntimeProvider |
+| NativeDnsBridge configure / lookup_ip | trust-dns-resolver AsyncResolver and NameServerConfigGroup |
+
+The bridge queue is bounded to 64 commands and each receive queue to 64
+datagrams. It owns no resolver algorithm: caching, retry, server ordering,
+truncation detection, and TCP fallback execute in the pinned resolver.
+
+### Remote application socket provider mapping
+
+| Native boundary | Pinned Fuchsia semantic source |
+|---|---|
+| nonblocking accept / WouldBlock | netstack3/src/bindings/socket/stream.rs AcceptError to_errno |
+| connect, bind, listen and connection errors | netstack3/src/bindings/socket/stream.rs error mappings |
+| readable/writable edge model | netstack3/src/bindings/socket/event_pair.rs |
+| bounded datagram receive and error delivery | netstack3/src/bindings/socket/queue.rs and datagram.rs |
+| TCP application buffers and readiness | bindings/socket/stream.rs and production ReceiveBuffer / SendBuffer |
+| worker lifetime / handle revocation reference | netstack3/src/bindings/socket/worker.rs |
+
+RemoteSocketProvider deliberately stops before FIDL, Zircon eventpairs, fd
+tables, Linux errno conversion, and socket-option policy. NativeSocketProvider
+adds only non-reused capability IDs, per-client quotas, revocation, and bounded
+readiness staging around the production Runtime handles. Configuration and
+filter administration are separate traits and cannot be reached through an
+application socket capability.
+
+### Filter and configuration administration
+
+NativeFilterRules exposes the pinned netstack3_filter Routines types without
+translation. Runtime implements PacketFilterAdmin by calling the pinned
+FilterApi set_filter_state in netstack3/core/filter/src/api.rs, preserving its
+cycle validation, hook ordering, NAT activation, matcher and action semantics.
+Runtime configuration continues to call production device and RoutesApi
+operations; the separate admin traits are not implemented by
+NativeSocketProvider.
+
+### Kernel-provider framing
+
+provider_transport.rs preserves the experimental incompatible v1 framing oracle.
+provider_transport_v2.rs is the kernel-provider contract: it retains the 40-byte
+header, immutable namespace/client identity, 64 KiB payload bound and strict
+version rejection while adding unambiguous POSIX operation results, sequenced
+level readiness, source addresses, EOF/errors and directional shutdown. Golden
+bytes and cross-version rejection are compatibility oracles. Loopback selection is tested
+separately: IPv4 127/8 and IPv6 ::1 stay private; all other destinations select
+Netstack3.
+
+`netstack3-provider-daemon` opens `/dev/netstack3-provider`, validates each
+multiplexed identity before dispatch, and routes requests through
+ProviderDispatcherV2 and NativeSocketProvider. Its bounded reader channel also
+drives monotonic Netstack3 time and emits only changed, sequenced readiness
+snapshots. `ethernet_transport.rs` adapts an inherited connected
+`SOCK_SEQPACKET` capability to versioned attach, link, and owned Ethernet-frame
+messages with bounded queues and one retained transmit frame under backpressure.
+The daemon opens the provider device after attach and link-up, independently of
+IP configuration. DHCP or static administration changes address, route, and DNS
+state without revoking sockets; only device/data-plane transport failure or
+shutdown drops the descriptor and provider generation. DhcpService, rather than
+the frame peer or application provider, owns dynamic address, route, and DNS
+configuration. `netstack3-link-supervisor` owns the Linux process boundary: it
+creates one connected socketpair, transfers fd 3 to the daemon and configured
+link peer, reaps both children, and terminates the sibling on either exit.

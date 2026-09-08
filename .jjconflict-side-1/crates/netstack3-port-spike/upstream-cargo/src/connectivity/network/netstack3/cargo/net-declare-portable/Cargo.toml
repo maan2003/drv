@@ -1,0 +1,7 @@
+[package]
+name = "net_declare"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[dependencies]
+net_declare_macros.workspace = true
