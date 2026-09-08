@@ -22143,7 +22143,7 @@ mod tests {
             assert!(!exchange.contains(forbidden), "{forbidden}");
         }
 
-        let child = include_str!("../../../mt7921-passive-scan/src/netstack_child.rs");
+        let child = include_str!("../../../wlan-softmac-host/src/netstack_child.rs");
         let dhcp = child.find("proof.prove_dhcp(initial_deadline)").unwrap();
         let dns = child.find("proof.prove_dns(initial_deadline)").unwrap();
         let tcp = child.find("proof.prove_tcp(initial_deadline)").unwrap();

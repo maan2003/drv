@@ -1096,6 +1096,7 @@ dependencies = [
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
+ "wlan-softmac-host",
  "zx",
 ]
 
@@ -1134,6 +1135,7 @@ dependencies = [
  "wlan-mlme",
  "wlan-sme",
  "wlan-softmac-class-support",
+ "wlan-softmac-host",
  "zx",
 ]
 
@@ -2437,6 +2439,7 @@ dependencies = [
  "fidl-fuchsia-wlan-softmac",
  "fidl-fuchsia-wlan-stats",
  "fuchsia-async",
+ "fuchsia-softmac-port",
  "fuchsia-sync",
  "fuchsia-trace",
  "futures",
@@ -2515,6 +2518,30 @@ version = "0.1.0"
 dependencies = [
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-softmac",
+]
+
+[[package]]
+name = "wlan-softmac-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fdf",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fidl-fuchsia-wlan-softmac",
+ "fuchsia-inspect",
+ "fuchsia-trace",
+ "futures",
+ "netstack3-port-integration",
+ "netstack3-port-spike",
+ "rand 0.9.4",
+ "tokio",
+ "wlan-mlme",
+ "wlan-sme",
+ "zx",
 ]
 
 [[package]]

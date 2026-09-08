@@ -20,6 +20,7 @@ driver-runtime = { path = "../driver-runtime" }
 mt7921-port-spike = { path = "../mt7921-port-spike" }
 mt7921-softmac-adapter = { path = "../mt7921-softmac-adapter" }
 userspace-vfio = { path = "../userspace-vfio" }
+wlan-softmac-host = { path = "../wlan-softmac-host" }
 fuchsia-softmac-port = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/softmac-port" }
 ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/ieee80211" }
 fdf = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/driver-runtime-host" }
