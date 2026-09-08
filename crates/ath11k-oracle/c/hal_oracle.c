@@ -186,6 +186,26 @@ void oracle_hal_reo_init_cmd_ring(u8 *out, u16 entries, u16 entry_bytes) {
         put_u32(out + entry * entry_bytes, 1, entry + 1);
 }
 
+void oracle_hal_wcn6750_reo_setup(u8 kind[10], u32 offset[10], u32 value[10],
+                                  u32 general, u32 misc) {
+    static const u32 setup_offsets[10] = {
+        0x00a38000, 0x00a38000, 0x00a385d8, 0x00a385d8,
+        0x00a38564, 0x00a38568, 0x00a3856c, 0x00a38570,
+        0x00a3800c, 0x00a38010,
+    };
+    static const u8 setup_kind[10] = {0, 1, 0, 1, 1, 1, 1, 1, 1, 1};
+    memcpy(kind, setup_kind, sizeof(setup_kind));
+    memcpy(offset, setup_offsets, sizeof(setup_offsets));
+    value[0] = general;
+    value[1] = general | 0xc;
+    value[2] = misc;
+    value[3] = misc & ~(0xfu << 17);
+    for (u32 i = 4; i < 8; i++)
+        value[i] = 40000;
+    value[8] = 0x43214321;
+    value[9] = 0x43214321;
+}
+
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
     struct buffer_addr d;
     set_addr(&d, address, cookie, manager);

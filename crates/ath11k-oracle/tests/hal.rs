@@ -2,7 +2,7 @@ use ath11k_hal::descriptors::*;
 use ath11k_hal::{
     Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
     ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingMemory,
-    initialize_command_ring,
+    initialize_command_ring, setup_wcn6750_io,
 };
 use ath11k_oracle as _;
 use ath11k_platform_backend::{Bidirectional, FromDevice, ToDevice};
@@ -148,6 +148,13 @@ unsafe extern "C" {
         pn_type: u8,
     ) -> u32;
     fn oracle_hal_reo_init_cmd_ring(out: *mut u8, entries: u16, entry_bytes: u16);
+    fn oracle_hal_wcn6750_reo_setup(
+        kind: *mut u8,
+        offset: *mut u32,
+        value: *mut u32,
+        general: u32,
+        misc: u32,
+    );
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -349,6 +356,32 @@ proptest! {
         // SAFETY: output holds exactly entries * entry_bytes bytes.
         unsafe { oracle_hal_reo_init_cmd_ring(c.as_mut_ptr(), entries, ENTRY_BYTES) };
         prop_assert_eq!(rust, c);
+    }
+
+    #[test]
+    fn wcn6750_reo_setup_matches_pinned_c(general in any::<u32>(), misc in any::<u32>()) {
+        use std::cell::RefCell;
+        const GENERAL: usize = 0x00a3_8000;
+        let rust = RefCell::new(Vec::new());
+        setup_wcn6750_io(
+            |offset| {
+                let value = if offset == GENERAL { general } else { misc };
+                rust.borrow_mut().push((0_u8, offset as u32, value));
+                Ok(value)
+            },
+            |offset, value| {
+                rust.borrow_mut().push((1_u8, offset as u32, value));
+                Ok(())
+            },
+        ).unwrap();
+        let mut kind = [0; 10];
+        let mut offset = [0; 10];
+        let mut value = [0; 10];
+        // SAFETY: each output has the exact ten-element C layout.
+        unsafe { oracle_hal_wcn6750_reo_setup(kind.as_mut_ptr(), offset.as_mut_ptr(),
+            value.as_mut_ptr(), general, misc) };
+        let c: Vec<_> = (0..10).map(|index| (kind[index], offset[index], value[index])).collect();
+        prop_assert_eq!(rust.into_inner(), c);
     }
 
     #[test]

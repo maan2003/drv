@@ -22,7 +22,8 @@ the WCN6750 client-path TCL command (including the QCN9074 mesh bit), every
 DSCP-to-TID map entry, RX buffer
 address setup/get, REO entrance and destination parsing, WBM release and MSDU
 link setup, REO queue descriptors and command-ring initialization, all three
-source-supported REO commands and every REO status tag, CE
+source-supported REO commands, every REO status tag, WCN6750 REO register
+setup, CE
 source/destination/status descriptors, and the WCN6750 monitor
 MPDU and PPDU-duration fields. All generated values are within the hardware
 field widths. `ath11k-hal` has no descriptor `TraceSink`; where a Rust builder
