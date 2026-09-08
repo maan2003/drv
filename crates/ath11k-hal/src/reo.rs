@@ -9,23 +9,31 @@ const UMAC_REO: usize = 0x00a3_8000;
 
 /// WCN6750's `ath11k_hw_wcn6855_reo_setup` register sequence.
 pub fn setup_wcn6750<B: Backend>(mmio: &MmioRegion<B>) -> Result<(), HalError> {
-    let general = mmio.read_u32(UMAC_REO).map_err(|_| HalError::DeviceFault)?;
-    mmio.write_u32(UMAC_REO, general | 1 << 2 | 1 << 3)
-        .map_err(|_| HalError::DeviceFault)?;
-    let misc = mmio
-        .read_u32(UMAC_REO + 0x5d8)
-        .map_err(|_| HalError::DeviceFault)?;
-    mmio.write_u32(UMAC_REO + 0x5d8, misc & !(0xf << 17))
-        .map_err(|_| HalError::DeviceFault)?;
+    setup_wcn6750_io(
+        |offset| mmio.read_u32(offset).map_err(|_| HalError::DeviceFault),
+        |offset, value| {
+            mmio.write_u32(offset, value)
+                .map_err(|_| HalError::DeviceFault)
+        },
+    )
+}
+
+/// I/O seam for the generated differential of WCN6750's ordered REO setup.
+#[doc(hidden)]
+pub fn setup_wcn6750_io(
+    mut read: impl FnMut(usize) -> Result<u32, HalError>,
+    mut write: impl FnMut(usize, u32) -> Result<(), HalError>,
+) -> Result<(), HalError> {
+    let general = read(UMAC_REO)?;
+    write(UMAC_REO, general | 1 << 2 | 1 << 3)?;
+    let misc = read(UMAC_REO + 0x5d8)?;
+    write(UMAC_REO + 0x5d8, misc & !(0xf << 17))?;
     for offset in [0x564, 0x568, 0x56c, 0x570] {
-        mmio.write_u32(UMAC_REO + offset, 40_000)
-            .map_err(|_| HalError::DeviceFault)?;
+        write(UMAC_REO + offset, 40_000)?;
     }
     let hash = 0x4321_4321;
-    mmio.write_u32(UMAC_REO + 0x0c, hash)
-        .map_err(|_| HalError::DeviceFault)?;
-    mmio.write_u32(UMAC_REO + 0x10, hash)
-        .map_err(|_| HalError::DeviceFault)
+    write(UMAC_REO + 0x0c, hash)?;
+    write(UMAC_REO + 0x10, hash)
 }
 
 // PORT-MAP: reusable

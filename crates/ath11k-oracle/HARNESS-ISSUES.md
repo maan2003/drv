@@ -52,6 +52,7 @@ The TX C oracle is a wire-level transcription of `ath11k_hal_tx_cmd_desc_setup`,
 `ath11k_hal_reo_cmd_queue_stats`, `ath11k_hal_reo_cmd_flush_cache`,
 `ath11k_hal_reo_cmd_update_rx_queue`, `ath11k_hal_reo_process_status`,
 `ath11k_hal_reo_qdesc_setup`, `ath11k_hal_reo_init_cmd_ring`,
+`ath11k_hw_wcn6855_reo_setup`,
 `ath11k_dp_tx_encap_nwifi`, `ath11k_dp_tx_process_htt_tx_complete`, and
 `ath11k_dp_tx_status_parse`. These functions depend on kernel skb, DMA, ring,
 and mac80211 infrastructure, so the userspace harness exercises their pinned

@@ -12,7 +12,7 @@ pub mod srng;
 pub use reo::{
     PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams, ReoQueueDescriptor,
     ReoResources, ReoStatus, ReoStatusHeader, ReoStatusKind, initialize_command_ring,
-    setup_wcn6750,
+    setup_wcn6750, setup_wcn6750_io,
 };
 pub use srng::{RingDirection, RingFlags, RingType, Srng, SrngParams, Wcn6750Registers};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
