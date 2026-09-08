@@ -91,3 +91,15 @@ API: its public RX surface prepares descriptor arrays, while `WfdmaRing` is a
 TX ring model. Consequently the RX cleanup checkpoint executes and asserts the
 pinned C ownership path but does not claim a Rust equivalence or add a test-only
 RX ownership adapter.
+
+Block-ack and power-save coverage executes source-pinned v7.1.5 request
+assignments for `mt7921_mcu_uni_tx_ba`, `mt7921_mcu_uni_rx_ba`, both WTBL and
+STA_REC BA bodies, BSS power state, beacon-filter enable/disable, Connac2 deep
+sleep, and sniffer enable. Valid TID, SSN, window, AMSDU, station identity,
+beacon timing, and policy inputs are varied. The public post-association BSS
+power, beacon timing, and RX-filter encoders match the complete C-produced MCU
+messages. For paths without a public Rust operation, the oracle retains exact
+request bytes and compares normalized AMPDU/monitor state transitions instead
+of introducing a test-only core model. Monitor normalization preserves
+Linux's sniffer → runtime-PM state → deep-sleep state/command order and its
+conditional beacon-filter teardown.

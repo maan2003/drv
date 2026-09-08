@@ -41,6 +41,8 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     let mt792x_dma = std::fs::read_to_string(mt76.join("mt792x_dma.c")).expect("read MT792x DMA C");
     let mt7921_pci_mac =
         std::fs::read_to_string(mt76.join("mt7921/pci_mac.c")).expect("read MT7921 PCI MAC C");
+    let mt7921_main =
+        std::fs::read_to_string(mt76.join("mt7921/main.c")).expect("read MT7921 main C");
     let util = std::fs::read_to_string(mt76.join("util.c")).expect("read mt76 util C");
     let poll_function = item(
         &util,
@@ -141,6 +143,107 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
         &mt7921_mac,
         "void mt7921_mac_add_txs(",
         "static void mt7921_mac_tx_free(",
+    );
+    // Checkpoint-six wrappers execute the exact request assignments below in
+    // a deliberately smaller type universe. Pin every normalized assignment
+    // and the monitor ordering to the immutable source before compiling them.
+    require_ordered(
+        item(
+            &mcu,
+            "void mt76_connac_mcu_sta_ba_tlv(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_ba_tlv);",
+        ),
+        &[
+            "ba->ba_type = tx ? MT_BA_TYPE_ORIGINATOR : MT_BA_TYPE_RECIPIENT;",
+            "ba->winsize = cpu_to_le16(params->buf_size);",
+            "ba->ssn = cpu_to_le16(params->ssn);",
+            "ba->ba_en = enable << params->tid;",
+            "ba->amsdu = params->amsdu;",
+            "ba->tid = params->tid;",
+        ],
+    );
+    require_ordered(
+        item(
+            &mcu,
+            "void mt76_connac_mcu_wtbl_ba_tlv(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_wtbl_ba_tlv);",
+        ),
+        &[
+            "ba->tid = params->tid;",
+            "ba->ba_type = MT_BA_TYPE_ORIGINATOR;",
+            "ba->sn = enable ? cpu_to_le16(params->ssn) : 0;",
+            "ba->ba_winsize = enable ? cpu_to_le16(params->buf_size) : 0;",
+            "ba->ba_en = enable;",
+            "memcpy(ba->peer_addr, params->sta->addr, ETH_ALEN);",
+            "ba->ba_type = MT_BA_TYPE_RECIPIENT;",
+            "ba->rst_ba_tid = params->tid;",
+            "ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;",
+            "ba->rst_ba_sb = 1;",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_uni_bss_ps(",
+            "static int\nmt7921_mcu_uni_bss_bcnft(",
+        ),
+        &[
+            ".ps_state = vif->cfg.ps ? 2 : 0,",
+            "MCU_UNI_CMD(BSS_INFO_UPDATE)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_set_beacon_filter(",
+            "int mt7921_get_txpwr_info(",
+        ),
+        &[
+            "mt7921_mcu_uni_bss_bcnft(dev, vif, true);",
+            "MT7921_FIF_BIT_SET",
+            "MT_WF_RFCR_DROP_OTHER_BEACON",
+            "mt7921_mcu_set_bss_pm(dev, vif, false);",
+            "MT7921_FIF_BIT_CLR",
+            "MT_WF_RFCR_DROP_OTHER_BEACON",
+        ],
+    );
+    require_ordered(
+        item(
+            &mcu,
+            "int mt76_connac_mcu_set_deep_sleep(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_set_deep_sleep);",
+        ),
+        &[
+            "snprintf(req.data, sizeof(req.data), \"KeepFullPwr %d\", !enable);",
+            "MCU_CE_CMD(CHIP_CONFIG)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_set_sniffer(",
+            "int mt7921_mcu_config_sniffer(",
+        ),
+        &[
+            ".tag = cpu_to_le16(0),",
+            ".enable = enable,",
+            "MCU_UNI_CMD(SNIFFER)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_main,
+            "mt7921_sniffer_interface_iter(",
+            "void mt7921_set_runtime_pm(",
+        ),
+        &[
+            "mt7921_mcu_set_sniffer(dev, vif, monitor);",
+            "pm->enable = pm->enable_user && !monitor;",
+            "pm->ds_enable = pm->ds_enable_user && !monitor;",
+            "mt76_connac_mcu_set_deep_sleep(&dev->mt76, pm->ds_enable);",
+            "if (monitor)",
+            "mt7921_mcu_set_beacon_filter(dev, vif, false);",
+        ],
     );
     // The reset oracle below spells out only register and branch observations.
     // Pin that normalization to the ordered source operations it represents so
