@@ -2,8 +2,8 @@ use ath11k_dp::tx::{ClientTxConfig, EncapType, client_tx_command_info};
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
     Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
-    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingMemory,
-    initialize_command_ring, setup_wcn6750_io,
+    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingMemory, RingType,
+    Wcn6750Registers, initialize_command_ring, setup_wcn6750_io,
 };
 use ath11k_oracle as _;
 use ath11k_platform_backend::{Bidirectional, FromDevice, ToDevice};
@@ -182,6 +182,13 @@ unsafe extern "C" {
         general: u32,
         misc: u32,
     );
+    fn oracle_hal_ring_geometry(
+        kind: u8,
+        ring_number: u8,
+        mac_id: u8,
+        entry_bytes: *mut u16,
+        max_entries: *mut u32,
+    ) -> i32;
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -450,6 +457,46 @@ proptest! {
             value.as_mut_ptr(), general, misc) };
         let c: Vec<_> = (0..10).map(|index| (kind[index], offset[index], value[index])).collect();
         prop_assert_eq!(rust.into_inner(), c);
+    }
+
+    #[test]
+    fn ring_geometry_matches_pinned_c(
+        kind in 0u8..=20, ring_number in any::<u8>(), mac_id in 0u8..=3,
+    ) {
+        let ring_type = match kind {
+            0 => RingType::ReoDestination,
+            1 => RingType::ReoException,
+            2 => RingType::ReoReinject,
+            3 => RingType::ReoCommand,
+            4 => RingType::ReoStatus,
+            5 => RingType::TclData,
+            6 => RingType::TclCommand,
+            7 => RingType::TclStatus,
+            8 => RingType::CeSource,
+            9 => RingType::CeDestination,
+            10 => RingType::CeDestinationStatus,
+            11 => RingType::WbmIdleLink,
+            12 => RingType::SwToWbmRelease,
+            13 => RingType::WbmToSwRelease,
+            14 => RingType::RxdmaBuffer,
+            15 => RingType::RxdmaDestination,
+            16 => RingType::RxdmaMonitorBuffer,
+            17 => RingType::RxdmaMonitorStatus,
+            18 => RingType::RxdmaMonitorDestination,
+            19 => RingType::RxdmaMonitorDescriptor,
+            _ => RingType::RxdmaDirectBuffer,
+        };
+        let mut entry_bytes = 0;
+        let mut max_entries = 0;
+        // SAFETY: valid kind and writable scalar outputs.
+        let ring_id = unsafe { oracle_hal_ring_geometry(kind, ring_number, mac_id,
+            &mut entry_bytes, &mut max_entries) };
+        prop_assert_eq!(Wcn6750Registers::entry_size(ring_type), usize::from(entry_bytes));
+        prop_assert_eq!(Wcn6750Registers::max_entries(ring_type), max_entries);
+        prop_assert_eq!(
+            Wcn6750Registers::ring_id(ring_type, ring_number, mac_id).map(|id| i32::from(id.0)),
+            (ring_id >= 0).then_some(ring_id),
+        );
     }
 
     #[test]

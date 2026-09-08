@@ -231,6 +231,33 @@ void oracle_hal_wcn6750_reo_setup(u8 kind[10], u32 offset[10], u32 value[10],
     value[9] = 0x43214321;
 }
 
+int oracle_hal_ring_geometry(u8 type, u8 ring_number, u8 mac_id,
+                             u16 *entry_bytes, u32 *max_entries) {
+    static const u16 start[] = {
+        0, 4, 5, 8, 9, 16, 24, 25, 32, 56, 80, 104, 105, 106,
+        128, 133, 130, 132, 134, 135, 136,
+    };
+    static const u8 rings[] = {
+        4, 1, 1, 1, 1, 3, 1, 1, 12, 12, 12, 1, 1, 5,
+        2, 1, 1, 1, 1, 1, 2,
+    };
+    static const u8 words[] = {
+        16, 16, 8, 10, 26, 8, 8, 9, 4, 2, 4, 2, 8, 8,
+        2, 8, 2, 2, 8, 2, 2,
+    };
+    static const u32 max_size[] = {
+        0xfffff, 0xfffff, 0xffff, 0xffff, 0xffff, 0xfffff, 0xfffff,
+        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xfffff,
+        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    };
+    *entry_bytes = (u16)words[type] * 4;
+    *max_entries = max_size[type] / words[type];
+    if (ring_number >= rings[type])
+        return -1;
+    u32 id = start[type] + ring_number + (type >= 14 ? (u32)mac_id * 15 : 0);
+    return id < 172 ? (int)id : -1;
+}
+
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
     struct buffer_addr d;
     set_addr(&d, address, cookie, manager);
