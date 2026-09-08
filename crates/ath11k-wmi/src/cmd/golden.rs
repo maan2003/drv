@@ -39,15 +39,15 @@ pub struct ByteMismatch {
     pub actual_len: usize,
 }
 
-/// A command family recovered from a native trace record.
+/// A command envelope recovered from a native trace record.
 ///
-/// This intentionally models the wire request rather than borrowing the
-/// original bytes: each TLV is decoded into its tag, declared value, and
-/// canonical zero padding, then encoded again through [`EncodeCommand`].  It
-/// is useful for golden traces, where constructing a higher-level request is
-/// impossible after host state has gone away.
+/// This is deliberately envelope-level verification: each TLV is separated
+/// into its tag, declared value, and canonical zero padding, but the value is
+/// retained as opaque bytes. It checks command-family dispatch, envelope and
+/// TLV headers, lengths, padding, and documented masks. It does **not** verify
+/// the field semantics or the existing concrete command-family encoders.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GoldenCommandRequest {
+pub struct GoldenCommandEnvelope {
     pub family: &'static str,
     tlvs: Vec<GoldenTlv>,
     /// Host-only fields excluded from comparison for this command family.
@@ -65,7 +65,7 @@ struct GoldenTlv {
     value: Vec<u8>,
 }
 
-impl crate::cmd::EncodeCommand for GoldenCommandRequest {
+impl crate::cmd::EncodeCommand for GoldenCommandEnvelope {
     fn encode_command(&self) -> Result<Command, WmiError> {
         let mut bytes = Vec::new();
         for tlv in &self.tlvs {
@@ -126,10 +126,10 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
 
 /// Reverse maps a command captured by the pinned native ath11k tracepoint.
 /// Unknown command IDs are deliberately not guessed.
-pub fn reverse_map_command(
+pub fn reverse_map_command_envelope(
     id: CommandId,
     bytes: &[u8],
-) -> Result<Option<GoldenCommandRequest>, WmiError> {
+) -> Result<Option<GoldenCommandEnvelope>, WmiError> {
     let Some((family, masked_fields)) = command_family(id.0) else {
         return Ok(None);
     };
@@ -201,7 +201,7 @@ pub fn reverse_map_command(
             top += 4 + tlv.value.len().next_multiple_of(4);
         }
     }
-    Ok(Some(GoldenCommandRequest {
+    Ok(Some(GoldenCommandEnvelope {
         family,
         tlvs,
         masked_fields,

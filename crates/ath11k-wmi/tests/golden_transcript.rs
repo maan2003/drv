@@ -1,5 +1,5 @@
 use ath11k_wmi::cmd::golden::{
-    TranscriptKind, Verification, compare_reencoded, parse_jsonl, reverse_map_command,
+    TranscriptKind, Verification, compare_reencoded, parse_jsonl, reverse_map_command_envelope,
     verify_transcript,
 };
 use ath11k_wmi::cmd::{EncodeCommand, VdevDelete};
@@ -33,7 +33,7 @@ fn ingests_ordered_jsonl_and_reports_each_message() {
 }
 
 #[test]
-fn validates_native_capture_when_present() {
+fn validates_native_event_decoders_and_command_envelopes_when_present() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl"
@@ -45,7 +45,7 @@ fn validates_native_capture_when_present() {
     let reports = verify_transcript(
         &records,
         |id, tlvs| {
-            reverse_map_command(id, tlvs)
+            reverse_map_command_envelope(id, tlvs)
                 .and_then(|request| request.map(|request| request.encode_command()).transpose())
         },
         ath11k_wmi::event::validate_known_event,
@@ -95,7 +95,7 @@ fn validates_native_capture_when_present() {
         .filter(|record| record.kind == TranscriptKind::Command)
     {
         let (_, tlvs) = record.envelope_parts().expect("validated envelope");
-        let request = reverse_map_command(CommandId(record.id), tlvs)
+        let request = reverse_map_command_envelope(CommandId(record.id), tlvs)
             .unwrap_or_else(|error| panic!("seq {} id {:#x}: {error:?}", record.seq, record.id))
             .unwrap_or_else(|| panic!("unmapped command id {:#x}", record.id));
         let command = request.encode_command().expect("re-encode native request");
