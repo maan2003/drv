@@ -149,7 +149,10 @@ impl<B: Backend> PeerRxTids<B> {
         })
     }
 
-    pub fn ath11k_dp_peer_setup(
+    /// Minimal admission seam called only after firmware peer creation and
+    /// the source's routing/initial-queue setup have succeeded. It is not a
+    /// port of the broader `ath11k_dp_peer_setup` transaction.
+    pub fn register_peer_after_firmware_create(
         &mut self,
         vdev_id: u32,
         peer_addr: [u8; 6],
@@ -372,6 +375,7 @@ impl<B: Backend> PeerRxTids<B> {
             self.fragments
                 .retain(|state| state.key != key || state.tid != tid);
         }
+        self.try_retire_teardown(key);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -448,6 +452,7 @@ impl<B: Backend> PeerRxTids<B> {
     }
 
     fn apply_status(&mut self, status: ReoStatus, now_ms: u64) {
+        let mut completed_key = None;
         if let Some(index) = self
             .pending_delete
             .iter()
@@ -475,7 +480,14 @@ impl<B: Backend> PeerRxTids<B> {
         {
             // Success and failure both release the host owner, matching
             // ath11k_dp_reo_cmd_free's terminal callback behavior.
-            self.pending_flush.swap_remove(index);
+            let pending = self.pending_flush.swap_remove(index);
+            completed_key = Some(PeerKey {
+                vdev_id: pending.vdev_id,
+                peer_addr: pending.peer_addr,
+            });
+        }
+        if let Some(key) = completed_key {
+            self.try_retire_teardown(key);
         }
     }
 
@@ -491,7 +503,14 @@ impl<B: Backend> PeerRxTids<B> {
                 > REO_DESCRIPTOR_FREE_TIMEOUT_MS;
             if self.cached_delete.len() > REO_DESCRIPTOR_FREE_THRESHOLD || aged {
                 let cached = self.cached_delete.swap_remove(index);
-                self.flush_one(controller, rings, cached)?;
+                let key = PeerKey {
+                    vdev_id: cached.vdev_id,
+                    peer_addr: cached.peer_addr,
+                };
+                if let Err(error) = self.flush_one(controller, rings, cached) {
+                    self.try_retire_teardown(key);
+                    return Err(error);
+                }
             } else {
                 index += 1;
             }
@@ -537,6 +556,31 @@ impl<B: Backend> PeerRxTids<B> {
         self.tids.iter().any(|active| {
             active.vdev_id == vdev_id && active.peer_addr == peer_addr && active.tid.tid == tid
         })
+    }
+
+    fn try_retire_teardown(&mut self, key: PeerKey) {
+        let active = self
+            .tids
+            .iter()
+            .any(|entry| entry.vdev_id == key.vdev_id && entry.peer_addr == key.peer_addr);
+        let pending = self
+            .pending_delete
+            .iter()
+            .chain(&self.pending_flush)
+            .any(|entry| entry.vdev_id == key.vdev_id && entry.peer_addr == key.peer_addr);
+        let cached = self
+            .cached_delete
+            .iter()
+            .any(|entry| entry.vdev_id == key.vdev_id && entry.peer_addr == key.peer_addr);
+        let quarantined = self
+            .uncertain_setup
+            .iter()
+            .chain(&self.failed_delete)
+            .any(|entry| entry.vdev_id == key.vdev_id && entry.peer_addr == key.peer_addr);
+        let fragments = self.fragments.iter().any(|entry| entry.key == key);
+        if !(active || pending || cached || quarantined || fragments) {
+            self.tearing_down.retain(|teardown| *teardown != key);
+        }
     }
 }
 
@@ -773,7 +817,8 @@ mod tests {
             Err(DpError::WrongState)
         );
         assert!(wmi.commands.is_empty());
-        peer.ath11k_dp_peer_setup(4, [1, 2, 3, 4, 5, 6]).unwrap();
+        peer.register_peer_after_firmware_create(4, [1, 2, 3, 4, 5, 6])
+            .unwrap();
         peer.ath11k_peer_rx_tid_setup(
             &mut reo,
             &mut rings,
@@ -825,7 +870,7 @@ mod tests {
         let mut rings = ModelRings::default();
         let mut reo = controller();
         let mut wmi = ModelWmi::default();
-        peer.ath11k_dp_peer_setup(1, [2; 6]).unwrap();
+        peer.register_peer_after_firmware_create(1, [2; 6]).unwrap();
         peer.ath11k_peer_rx_tid_setup(
             &mut reo,
             &mut rings,
@@ -869,7 +914,7 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peer.ath11k_dp_peer_setup(1, [3; 6]).unwrap();
+        peer.register_peer_after_firmware_create(1, [3; 6]).unwrap();
         failures.fail_next_sync_for_device();
         assert_eq!(
             peer.ath11k_peer_rx_tid_setup(
@@ -914,7 +959,7 @@ mod tests {
         let mut peer = PeerRxTids::new(DeterministicBackend::device()).unwrap();
         let mut reo = controller();
         let mut rings = ModelRings::default();
-        peer.ath11k_dp_peer_setup(1, [9; 6]).unwrap();
+        peer.register_peer_after_firmware_create(1, [9; 6]).unwrap();
         assert_eq!(
             peer.ath11k_peer_rx_tid_setup(
                 &mut reo,
@@ -957,7 +1002,7 @@ mod tests {
             let mut reo = controller();
             let mut rings = ModelRings::default();
             let mut wmi = ModelWmi::default();
-            peer.ath11k_dp_peer_setup(1, [4; 6]).unwrap();
+            peer.register_peer_after_firmware_create(1, [4; 6]).unwrap();
             peer.ath11k_peer_rx_tid_setup(
                 &mut reo,
                 &mut rings,
@@ -994,7 +1039,7 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peer.ath11k_dp_peer_setup(1, [5; 6]).unwrap();
+        peer.register_peer_after_firmware_create(1, [5; 6]).unwrap();
         peer.ath11k_peer_rx_tid_setup(
             &mut reo,
             &mut rings,
@@ -1039,8 +1084,12 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peers.ath11k_dp_peer_setup(1, [6; 6]).unwrap();
-        peers.ath11k_dp_peer_setup(1, [7; 6]).unwrap();
+        peers
+            .register_peer_after_firmware_create(1, [6; 6])
+            .unwrap();
+        peers
+            .register_peer_after_firmware_create(1, [7; 6])
+            .unwrap();
         for addr in [[6; 6], [7; 6]] {
             peers
                 .ath11k_peer_rx_tid_setup(
@@ -1074,7 +1123,9 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peers.ath11k_dp_peer_setup(1, [8; 6]).unwrap();
+        peers
+            .register_peer_after_firmware_create(1, [8; 6])
+            .unwrap();
         peers
             .ath11k_peer_rx_tid_setup(
                 &mut reo,
@@ -1120,8 +1171,12 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peers.ath11k_dp_peer_setup(2, [0xaa; 6]).unwrap();
-        peers.ath11k_dp_peer_setup(2, [0xbb; 6]).unwrap();
+        peers
+            .register_peer_after_firmware_create(2, [0xaa; 6])
+            .unwrap();
+        peers
+            .register_peer_after_firmware_create(2, [0xbb; 6])
+            .unwrap();
         for tid in [0, 8, 16] {
             peers
                 .ath11k_peer_rx_tid_setup(
@@ -1200,7 +1255,9 @@ mod tests {
         let mut reo = controller();
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
-        peers.ath11k_dp_peer_setup(3, [0xcc; 6]).unwrap();
+        peers
+            .register_peer_after_firmware_create(3, [0xcc; 6])
+            .unwrap();
         for tid in [0, 1, 2] {
             peers
                 .ath11k_peer_rx_tid_setup(
@@ -1244,7 +1301,9 @@ mod tests {
         let mut peers = PeerRxTids::new(device).unwrap();
         let mut reo = controller();
         let mut rings = ModelRings::default();
-        peers.ath11k_dp_peer_setup(3, [0xcc; 6]).unwrap();
+        peers
+            .register_peer_after_firmware_create(3, [0xcc; 6])
+            .unwrap();
         peers
             .ath11k_peer_rx_tid_setup(
                 &mut reo,
@@ -1258,6 +1317,47 @@ mod tests {
                 PacketNumberType::None,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn successful_teardown_retires_key_after_terminal_flush_status() {
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        let mut wmi = ModelWmi::default();
+        let key = [0xcd; 6];
+        peers.register_peer_after_firmware_create(7, key).unwrap();
+        peers
+            .ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                7,
+                key,
+                3,
+                64,
+                0,
+                PacketNumberType::None,
+            )
+            .unwrap();
+        peers
+            .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 7, key)
+            .unwrap();
+        assert_eq!(
+            peers.register_peer_after_firmware_create(7, key),
+            Err(DpError::WrongState)
+        );
+
+        rings.status.push_back(status(1, 153, 0));
+        peers
+            .ath11k_dp_rx_tid_del_func(&mut reo, &mut rings, 0)
+            .unwrap();
+        peers.flush_aged(&mut reo, &mut rings, 1_001).unwrap();
+        rings.status.push_back(status(5, 313, 0));
+        peers
+            .ath11k_dp_rx_tid_del_func(&mut reo, &mut rings, 1_001)
+            .unwrap();
+        peers.register_peer_after_firmware_create(7, key).unwrap();
     }
 
     #[test]
@@ -1284,7 +1384,7 @@ mod tests {
         assert!(rings.published.is_empty());
         assert!(wmi.commands.is_empty());
 
-        peers.ath11k_dp_peer_setup(4, addr).unwrap();
+        peers.register_peer_after_firmware_create(4, addr).unwrap();
         assert_eq!(
             peers.ath11k_dp_rx_ampdu_start(
                 &mut reo,
@@ -1346,7 +1446,7 @@ mod tests {
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
         let addr = [0xd2; 6];
-        peers.ath11k_dp_peer_setup(5, addr).unwrap();
+        peers.register_peer_after_firmware_create(5, addr).unwrap();
         assert_eq!(
             peers.ath11k_dp_rx_ampdu_stop(&mut reo, &mut rings, &mut wmi, 5, addr, 16),
             Err(DpError::WrongState)
@@ -1402,7 +1502,7 @@ mod tests {
         let mut rings = ModelRings::default();
         let mut wmi = ModelWmi::default();
         for addr in [[0xe1; 6], [0xe2; 6]] {
-            peers.ath11k_dp_peer_setup(6, addr).unwrap();
+            peers.register_peer_after_firmware_create(6, addr).unwrap();
             peers
                 .ath11k_dp_rx_ampdu_start(
                     &mut reo,
