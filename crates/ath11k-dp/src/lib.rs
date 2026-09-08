@@ -7,12 +7,14 @@ use ath11k_hal::RingId;
 
 pub mod dma;
 pub mod golden;
+pub mod hal_rings;
 pub mod htt;
 pub mod lifecycle;
 pub mod reo;
 pub mod rx;
 pub mod transport;
 pub mod tx;
+pub use hal_rings::{HalDpRings, Wcn6750DpMsi};
 pub use lifecycle::{AllocatedDpRing, DpAllocationError, DpRingOps, DpRingSpec, Wcn6750DpRings};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerId(pub u16);

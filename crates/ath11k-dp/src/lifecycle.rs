@@ -40,6 +40,16 @@ pub trait DpRingOps<B: Backend>: Rings<B> {
         memory: RingMemory<B>,
     ) -> Result<RingId, HalError>;
     fn destroy(&mut self, ring: RingId) -> Result<(), HalError>;
+    fn send_htt_ring_setup<C: crate::HttControl>(
+        &self,
+        index: usize,
+        control: &mut C,
+    ) -> Result<bool, DpError>;
+    fn setup_reo_controller(
+        &self,
+        command_ring: RingId,
+        status_ring: RingId,
+    ) -> Result<crate::reo::ReoController, DpError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,6 +407,22 @@ mod tests {
             }
             self.destroyed.push(ring);
             Ok(())
+        }
+
+        fn send_htt_ring_setup<C: crate::HttControl>(
+            &self,
+            _: usize,
+            _: &mut C,
+        ) -> Result<bool, DpError> {
+            Ok(false)
+        }
+
+        fn setup_reo_controller(
+            &self,
+            _: RingId,
+            _: RingId,
+        ) -> Result<crate::reo::ReoController, DpError> {
+            Err(DpError::UnsupportedDescriptor)
         }
     }
 

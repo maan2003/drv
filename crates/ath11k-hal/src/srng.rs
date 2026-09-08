@@ -381,7 +381,30 @@ pub struct Srng<B: Backend> {
     flags: RingFlags,
 }
 
+#[derive(Clone, Copy)]
+pub struct SrngCursor {
+    head: u32,
+    tail: u32,
+    reap_head: u32,
+    loop_count: u16,
+}
+
 impl<B: Backend> Srng<B> {
+    pub fn checkpoint(&self) -> SrngCursor {
+        SrngCursor {
+            head: self.head,
+            tail: self.tail,
+            reap_head: self.reap_head,
+            loop_count: self.loop_count,
+        }
+    }
+
+    pub fn restore(&mut self, cursor: SrngCursor) {
+        self.head = cursor.head;
+        self.tail = cursor.tail;
+        self.reap_head = cursor.reap_head;
+        self.loop_count = cursor.loop_count;
+    }
     /// Equivalent to `ath11k_hal_srng_setup`. `remote_read_pointers` is the
     /// coherent RDP array indexed by hardware ring id.
     pub fn setup(
@@ -719,6 +742,27 @@ impl<B: Backend> Srng<B> {
         remote_write_pointers
             .write(self.firmware_pointer_offset, &value.to_le_bytes())
             .map_err(|_| HalError::DeviceFault)
+    }
+
+    /// Quiesce host-owned SRNG state before its coherent ring memory is
+    /// released. The caller must already have stopped firmware/interrupt
+    /// dispatch, matching `ath11k_dp_srng_cleanup`'s lifecycle ordering.
+    pub fn teardown(
+        &mut self,
+        mmio: &MmioRegion<B>,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+        remote_write_pointers: &mut CoherentDma<B, Bidirectional>,
+    ) -> Result<(), HalError> {
+        if config(self.ring_type).lmac {
+            remote_read_pointers
+                .write(self.pointer_offset, &0_u32.to_le_bytes())
+                .map_err(|_| HalError::DeviceFault)?;
+            remote_write_pointers
+                .write(self.firmware_pointer_offset, &0_u32.to_le_bytes())
+                .map_err(|_| HalError::DeviceFault)
+        } else {
+            w(mmio, self.r0 + 0x10, 0)
+        }
     }
 }
 

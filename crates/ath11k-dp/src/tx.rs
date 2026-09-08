@@ -6,7 +6,7 @@ use ath11k_hal::descriptors::{
     ReoDestinationRing, RxdmaBufferRing, TclDataCommand, TxCommandInfo, WbmReleaseRing,
 };
 use ath11k_hal::{RingId, Rings};
-use ath11k_platform_backend::{Backend, Device, MmioRegion};
+use ath11k_platform_backend::{Backend, Device};
 
 use crate::dma::{RxBuffer, TxBuffer};
 use crate::htt::TxCompletion;
@@ -41,6 +41,31 @@ pub struct ClientTxConfig {
     pub ast_hash: u8,
     pub tid: u8,
     pub checksum_offload: bool,
+}
+
+impl ClientTxConfig {
+    /// WCN6750 station-vdev defaults from `ath11k_dp_vdev_tx_attach` and its
+    /// non-v2 peer-map search path. Queue/TID selection can be refined per
+    /// packet without making core duplicate hardware constants.
+    pub const fn wcn6750_station(vdev_id: u8) -> Self {
+        Self {
+            // TCL ring 0 maps to HAL_RX_BUF_RBM_SW0_BM.
+            return_buffer_manager: 3,
+            pool_id: 0,
+            mac_id: 0,
+            lmac_id: 0,
+            metadata: 1 | ((vdev_id as u16) << 2),
+            encapsulation: EncapType::NativeWifi,
+            // WCN6750 has htt_peer_map_v2=false: use ADDRY/default search.
+            address_search_enable: 2,
+            search_type: 0,
+            ast_index: 0,
+            ast_hash: 0,
+            tid: 0,
+            // Linux enables this only for CHECKSUM_PARTIAL packets.
+            checksum_offload: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +132,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     next_monitor_cookie: u32,
     ring_resources: Wcn6750DpRings,
     reo: Option<ReoController>,
+    htt_setup_index: usize,
 }
 
 impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
@@ -136,6 +162,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             next_monitor_cookie: 1,
             ring_resources,
             reo: None,
+            htt_setup_index: 0,
         })
     }
 
@@ -156,6 +183,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             next_monitor_cookie: 1,
             ring_resources: Wcn6750DpRings::default(),
             reo: None,
+            htt_setup_index: 0,
         }
     }
 
@@ -165,6 +193,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         if !self.ring_resources.pdev_rx().is_empty()
             || !self.ring_resources.reo_destination().is_empty()
             || self.reo.is_some()
+            || self.htt_setup_index != 0
         {
             return Err(DpError::WrongState);
         }
@@ -179,6 +208,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             || !self.ring_resources.pdev_rx().is_empty()
             || !self.ring_resources.reo_destination().is_empty()
             || self.reo.is_some()
+            || self.htt_setup_index != 0
         {
             return Err(DpError::WrongState);
         }
@@ -216,7 +246,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
 
     /// Allocate the four REO destination rings from
     /// `ath11k_dp_pdev_reo_setup` and bind the client data-ring view.
-    pub fn ath11k_dp_pdev_reo_setup(&mut self, mmio: &MmioRegion<B>) -> Result<(), DpError> {
+    pub fn ath11k_dp_pdev_reo_setup(&mut self) -> Result<(), DpError> {
         if self.reo.is_some() {
             return Err(DpError::WrongState);
         }
@@ -224,7 +254,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             .ring_resources
             .allocate_reo_destination(&self.device, &mut self.rings)?;
         let (command, status) = self.ring_resources.reo_controller_rings()?;
-        let reo = match ReoController::ath11k_dp_pdev_reo_setup(mmio, command, status) {
+        let reo = match self.rings.setup_reo_controller(command, status) {
             Ok(reo) => reo,
             Err(error) => {
                 let _ = self.ring_resources.free_reo_destination(&mut self.rings);
@@ -296,6 +326,32 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         self.monitor_status_buffers.clear();
         self.rx_chain.clear();
         self.rxdma = None;
+        self.htt_setup_index = 0;
+        Ok(())
+    }
+
+    /// Send the four WCN6750 LMAC RX ring configurations in the order used by
+    /// `ath11k_dp_rx_pdev_alloc`. A failed send leaves the completed prefix so
+    /// retry resumes without re-sending firmware-visible DMA addresses.
+    pub fn configure_htt<C: crate::HttControl>(&mut self, control: &mut C) -> Result<(), DpError> {
+        if self.reo.is_none()
+            || self.data_rings.is_none()
+            || self.ring_resources.pdev_rx().len() != 4
+            || self.rx_buffers.is_empty()
+            || self.monitor_status_buffers.is_empty()
+            || self.htt_setup_index == 4
+        {
+            return Err(DpError::WrongState);
+        }
+        while self.htt_setup_index < 4 {
+            if !self
+                .rings
+                .send_htt_ring_setup(self.htt_setup_index, control)?
+            {
+                return Err(DpError::NoResources);
+            }
+            self.htt_setup_index += 1;
+        }
         Ok(())
     }
 
@@ -649,11 +705,12 @@ fn map_hal(error: ath11k_hal::HalError) -> DpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::collections::VecDeque;
+    use crate::{HttControl, HttHostMessage};
+    use alloc::{collections::{BTreeMap, VecDeque}, rc::Rc};
     use alloc::vec;
     use ath11k_hal::Descriptor;
     use ath11k_platform_backend::{DmaConstraints, DmaDirection, Error as HardwareError, IrqEvent};
-    use core::ops::Range;
+    use core::{cell::{Cell, RefCell}, ops::Range};
     use drv_hardware_backends::{DeterministicBackend, Operation};
 
     #[derive(Default)]
@@ -702,11 +759,46 @@ mod tests {
             self.destroyed.push(ring);
             Ok(())
         }
+
+        fn send_htt_ring_setup<C: crate::HttControl>(
+            &self,
+            _: usize,
+            _: &mut C,
+        ) -> Result<bool, DpError> {
+            Ok(false)
+        }
+
+        fn setup_reo_controller(
+            &self,
+            _: RingId,
+            _: RingId,
+        ) -> Result<crate::reo::ReoController, DpError> {
+            Err(DpError::UnsupportedDescriptor)
+        }
     }
 
-    #[derive(Default)]
     struct AggregateBackend {
         next_dma: u64,
+        memory: Rc<RefCell<BTreeMap<u64, Vec<u8>>>>,
+        dma_writes: Rc<RefCell<Vec<(u64, Range<usize>)>>>,
+        mmio_writes: Rc<RefCell<Vec<(usize, u32)>>>,
+        fail_dma_write_once: Rc<Cell<bool>>,
+        fail_dma_read_token_once: Rc<Cell<Option<u64>>>,
+        fail_mmio_write_once: Rc<Cell<bool>>,
+    }
+
+    impl Default for AggregateBackend {
+        fn default() -> Self {
+            Self {
+                next_dma: 0,
+                memory: Rc::new(RefCell::new(BTreeMap::new())),
+                dma_writes: Rc::new(RefCell::new(Vec::new())),
+                mmio_writes: Rc::new(RefCell::new(Vec::new())),
+                fail_dma_write_once: Rc::new(Cell::new(false)),
+                fail_dma_read_token_once: Rc::new(Cell::new(None)),
+                fail_mmio_write_once: Rc::new(Cell::new(false)),
+            }
+        }
     }
 
     impl Backend for AggregateBackend {
@@ -726,7 +818,11 @@ mod tests {
         fn read_u32(&mut self, _: &Self::Region, _: usize) -> Result<u32, HardwareError> {
             Ok(0)
         }
-        fn write_u32(&mut self, _: &Self::Region, _: usize, _: u32) -> Result<(), HardwareError> {
+        fn write_u32(&mut self, _: &Self::Region, offset: usize, value: u32) -> Result<(), HardwareError> {
+            if self.fail_mmio_write_once.replace(false) {
+                return Err(HardwareError::DeviceFault);
+            }
+            self.mmio_writes.borrow_mut().push((offset, value));
             Ok(())
         }
         fn write_dma_address(
@@ -760,6 +856,7 @@ mod tests {
                 .next_dma
                 .checked_add(size as u64)
                 .ok_or(HardwareError::Limit)?;
+            self.memory.borrow_mut().insert(address, vec![0xa5; size]);
             Ok(address)
         }
         fn alloc_dma_constrained(
@@ -776,19 +873,39 @@ mod tests {
         }
         fn dma_read(
             &mut self,
-            _: &Self::Dma,
-            _: Range<usize>,
+            dma: &Self::Dma,
+            range: Range<usize>,
             out: &mut [u8],
         ) -> Result<(), HardwareError> {
-            out.fill(0);
+            if self.fail_dma_read_token_once.get() == Some(*dma) {
+                self.fail_dma_read_token_once.set(None);
+                return Err(HardwareError::DeviceFault);
+            }
+            out.copy_from_slice(
+                self.memory
+                    .borrow()
+                    .get(dma)
+                    .and_then(|bytes| bytes.get(range))
+                    .ok_or(HardwareError::OutOfBounds)?,
+            );
             Ok(())
         }
         fn dma_write(
             &mut self,
-            _: &Self::Dma,
-            _: Range<usize>,
-            _: &[u8],
+            dma: &Self::Dma,
+            range: Range<usize>,
+            bytes: &[u8],
         ) -> Result<(), HardwareError> {
+            if self.fail_dma_write_once.replace(false) {
+                return Err(HardwareError::DeviceFault);
+            }
+            self.memory
+                .borrow_mut()
+                .get_mut(dma)
+                .and_then(|target| target.get_mut(range.clone()))
+                .ok_or(HardwareError::OutOfBounds)?
+                .copy_from_slice(bytes);
+            self.dma_writes.borrow_mut().push((*dma, range));
             Ok(())
         }
         fn sync_for_cpu(&mut self, _: &Self::Dma, _: Range<usize>) -> Result<(), HardwareError> {
@@ -818,7 +935,9 @@ mod tests {
             Ok(0)
         }
         fn release_region(&mut self, _: Self::Region) {}
-        fn release_dma(&mut self, _: Self::Dma) {}
+        fn release_dma(&mut self, dma: Self::Dma) {
+            self.memory.borrow_mut().remove(&dma);
+        }
         fn release_interrupt(&mut self, _: Self::Interrupt) {}
     }
 
@@ -871,6 +990,22 @@ mod tests {
             self.destroyed.push(ring);
             Ok(())
         }
+
+        fn send_htt_ring_setup<C: crate::HttControl>(
+            &self,
+            _: usize,
+            _: &mut C,
+        ) -> Result<bool, DpError> {
+            Ok(false)
+        }
+
+        fn setup_reo_controller(
+            &self,
+            _: RingId,
+            _: RingId,
+        ) -> Result<crate::reo::ReoController, DpError> {
+            Err(DpError::UnsupportedDescriptor)
+        }
     }
 
     fn config() -> ClientTxConfig {
@@ -891,35 +1026,162 @@ mod tests {
     }
 
     #[test]
+    fn wcn6750_station_config_uses_source_defaults() {
+        let config = ClientTxConfig::wcn6750_station(7);
+        assert_eq!(config.return_buffer_manager, 3);
+        assert_eq!(config.metadata, 1 | (7 << 2));
+        assert_eq!(config.encapsulation, EncapType::NativeWifi);
+        assert_eq!((config.address_search_enable, config.search_type), (2, 0));
+        assert_eq!((config.mac_id, config.lmac_id, config.pool_id), (0, 0, 0));
+        assert!(!config.checksum_offload);
+    }
+
+    #[derive(Default)]
+    struct HttMessages {
+        messages: Vec<HttHostMessage>,
+        fail_at: Option<usize>,
+    }
+
+    impl HttControl for HttMessages {
+        fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
+            if self.fail_at == Some(self.messages.len()) {
+                return Err(DpError::DeviceFault);
+            }
+            self.messages.push(message);
+            Ok(())
+        }
+
+        fn receive(&mut self, _: u64) -> Result<Option<crate::HttTargetMessage>, DpError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
     fn aggregate_allocates_sets_up_and_tears_down_every_phase() {
-        let device = Device::from_backend(AggregateBackend::default());
-        let mmio = device.open_region(0).unwrap();
-        let mut dp =
-            match ClientDataPath::ath11k_dp_alloc(device, AggregateRings::default(), config()) {
-                Ok(dp) => dp,
-                Err(_) => panic!("aggregate allocation failed"),
-            };
+        let backend = AggregateBackend::default();
+        let memory = backend.memory.clone();
+        let dma_writes = backend.dma_writes.clone();
+        let mmio_writes = backend.mmio_writes.clone();
+        let fail_dma_write = backend.fail_dma_write_once.clone();
+        let fail_dma_read = backend.fail_dma_read_token_once.clone();
+        let fail_mmio_write = backend.fail_mmio_write_once.clone();
+        let device = Device::from_backend(backend);
+        let rings = crate::HalDpRings::new(
+            &device,
+            crate::Wcn6750DpMsi { address: 0xfeed_0000 },
+        )
+        .unwrap();
+        assert!(
+            memory
+                .borrow()
+                .values()
+                .all(|bytes| bytes.iter().all(|byte| *byte == 0))
+        );
+        let mut dp = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(dp) => dp,
+            Err(_) => panic!("aggregate allocation failed"),
+        };
         assert_eq!(dp.ring_resources().common().len(), 15);
         dp.ath11k_dp_pdev_pre_alloc().unwrap();
-        dp.ath11k_dp_pdev_reo_setup(&mmio).unwrap();
+        dp.ath11k_dp_pdev_reo_setup().unwrap();
         assert_eq!(dp.ring_resources().reo_destination().len(), 4);
+
+        let tcl = dp.data_rings.unwrap().tcl;
+        let descriptor = Descriptor::new(vec![0x5a; 28], 28).unwrap();
+        dma_writes.borrow_mut().clear();
+        mmio_writes.borrow_mut().clear();
+        fail_dma_write.set(true);
+        assert_eq!(
+            dp.rings_mut().publish(tcl, descriptor.clone()),
+            Err(ath11k_hal::HalError::DeviceFault)
+        );
+        assert!(dma_writes.borrow().is_empty());
+        assert!(mmio_writes.borrow().is_empty());
+        dp.rings_mut().publish(tcl, descriptor.clone()).unwrap();
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 0..28);
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 7);
+
+        fail_mmio_write.set(true);
+        assert_eq!(
+            dp.rings_mut().publish(tcl, descriptor.clone()),
+            Err(ath11k_hal::HalError::DeviceFault)
+        );
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 28..56);
+        dp.rings_mut().publish(tcl, descriptor).unwrap();
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 28..56);
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 14);
+
+        let reo = dp.data_rings.unwrap().reo;
+        let reo_dma = *memory
+            .borrow()
+            .iter()
+            .find(|(_, bytes)| bytes.len() == 2_048 * 64 + 7)
+            .map(|(address, _)| address)
+            .unwrap();
+        memory.borrow_mut().get_mut(&0).unwrap()[..4]
+            .copy_from_slice(&16_u32.to_le_bytes());
+        memory.borrow_mut().get_mut(&reo_dma).unwrap()[..64].fill(0x33);
+        fail_dma_read.set(Some(reo_dma));
+        assert_eq!(
+            dp.rings_mut().consume(reo),
+            Err(ath11k_hal::HalError::DeviceFault)
+        );
+        let consumed = dp.rings_mut().consume(reo).unwrap().unwrap();
+        assert!(consumed.bytes().iter().all(|byte| *byte == 0x33));
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 16);
+
+        memory.borrow_mut().get_mut(&0).unwrap()[..4]
+            .copy_from_slice(&32_u32.to_le_bytes());
+        memory.borrow_mut().get_mut(&reo_dma).unwrap()[64..128].fill(0x44);
+        fail_mmio_write.set(true);
+        assert_eq!(
+            dp.rings_mut().consume(reo),
+            Err(ath11k_hal::HalError::DeviceFault)
+        );
+        let consumed = dp.rings_mut().consume(reo).unwrap().unwrap();
+        assert!(consumed.bytes().iter().all(|byte| *byte == 0x44));
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 32);
+
         dp.ath11k_dp_pdev_alloc().unwrap();
         assert_eq!(dp.ring_resources().pdev_rx().len(), 4);
         assert_eq!(dp.rx_buffers.len(), 4_095);
         assert_eq!(dp.monitor_status_buffers.len(), 1_023);
+        let mut htt = HttMessages {
+            fail_at: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(dp.configure_htt(&mut htt), Err(DpError::DeviceFault));
+        assert_eq!(htt.messages.len(), 2);
+        htt.fail_at = None;
+        dp.configure_htt(&mut htt).unwrap();
+        assert_eq!(htt.messages.len(), 4);
+        assert_eq!(
+            htt.messages
+                .iter()
+                .map(|message| u32::from_le_bytes(message.0[..4].try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![0x0205_000b, 0x0100_010b, 0x0007_010b, 0x0101_010b]
+        );
+        let words = |message: &HttHostMessage| {
+            message
+                .0
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let setups = htt.messages.iter().map(words).collect::<Vec<_>>();
+        assert_eq!((setups[0][4], setups[0][6]), (688, 512));
+        assert_eq!((setups[1][4], setups[1][6]), (692, 516));
+        assert_eq!((setups[2][4], setups[2][6]), (532, 708));
+        assert_eq!((setups[3][4], setups[3][6]), (704, 528));
+        assert_eq!((setups[2][8], setups[2][10]), (0xfeed_0000, 10));
+        assert_eq!((setups[3][8], setups[3][10]), (0xfeed_0000, 16));
+        assert_eq!(dp.configure_htt(&mut htt), Err(DpError::WrongState));
 
         dp.ath11k_dp_pdev_free().unwrap();
         dp.ath11k_dp_pdev_reo_cleanup().unwrap();
         dp.ath11k_dp_free().unwrap();
-        let (_, rings) = dp.into_parts().unwrap();
-        assert_eq!(
-            rings.destroyed,
-            (19_u16..23)
-                .chain(15..19)
-                .chain(0..15)
-                .map(RingId)
-                .collect::<Vec<_>>()
-        );
+        let _ = dp.into_parts().unwrap();
     }
 
     #[test]
