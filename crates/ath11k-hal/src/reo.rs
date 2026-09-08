@@ -159,7 +159,16 @@ impl ReoQueueDescriptor {
         if start_sequence <= 0xfff {
             put(&mut bytes, 3, (start_sequence & 0xfff) << 1);
         }
-        let length = if tid == 16 { 128 } else { 512 };
+        let length = if tid == 16 {
+            128 * match ba_window_size {
+                0..=1 => 1,
+                2..=105 => 2,
+                106..=210 => 3,
+                _ => 4,
+            }
+        } else {
+            512
+        };
         if tid != 16 {
             for (offset, magic) in [(128, 0xadbeef_u32), (256, 0xbdbeef), (384, 0xcdbeef)] {
                 put(&mut bytes, offset / 4, magic << 8 | 0x94);
@@ -384,5 +393,13 @@ mod tests {
         let non_qos = ReoQueueDescriptor::new(16, 0, 0x1000, PacketNumberType::None);
         assert_eq!(non_qos.bytes().len(), 128);
         assert_eq!(word(non_qos.bytes(), 3), 0);
+
+        // ath11k_hal_reo_qdesc_size still allocates extension storage for a
+        // non-QoS queue when firmware requests a BA window larger than one;
+        // qdesc_setup itself leaves that storage zeroed.
+        let non_qos_ba = ReoQueueDescriptor::new(16, 106, 0, PacketNumberType::None);
+        assert_eq!(non_qos_ba.bytes().len(), 384);
+        assert_eq!(word(non_qos_ba.bytes(), 2) >> 11 & 0xff, 105);
+        assert_eq!(&non_qos_ba.bytes()[128..], &[0; 256]);
     }
 }
