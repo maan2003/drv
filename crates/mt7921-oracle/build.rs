@@ -71,6 +71,21 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
         "int mt7921_mcu_parse_response(",
         "EXPORT_SYMBOL_GPL(mt7921_mcu_parse_response);",
     );
+    let channel_domain_function = item(
+        &mcu,
+        "int mt76_connac_mcu_set_channel_domain(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_set_channel_domain);",
+    );
+    let channel_info_function = item(
+        &mt7921_mcu,
+        "int mt7921_mcu_set_chan_info(",
+        "int mt7921_mcu_set_eeprom(",
+    );
+    let clc_function = item(
+        &mt7921_mcu,
+        "int __mt7921_mcu_set_clc(",
+        "int mt7921_mcu_set_clc(",
+    );
     let fill_txs_function = item(
         &connac_mac,
         "bool mt76_connac2_mac_fill_txs(",
@@ -91,7 +106,7 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     std::fs::write(
         &generated,
         format!(
-            "{}\n{mcu_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{dma_get_buf_function}\n{dma_dequeue_function}\n{dma_rx_cleanup_function}\n{fill_txs_function}\n{add_txs_skb_function}\n{add_txs_function}\n{wrapper}",
+            "{}\n{mcu_function}\n{channel_domain_function}\n{channel_info_function}\n{clc_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{dma_get_buf_function}\n{dma_dequeue_function}\n{dma_rx_cleanup_function}\n{fill_txs_function}\n{add_txs_skb_function}\n{add_txs_function}\n{wrapper}",
             prelude()
         ),
     )
@@ -122,7 +137,7 @@ fn prelude() -> &'static str {
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 typedef uint16_t __le16; typedef uint32_t __le32; typedef uint64_t dma_addr_t;
 #define __packed __attribute__((packed))
 #define __aligned(x) __attribute__((aligned(x)))
@@ -165,6 +180,9 @@ struct ieee80211_tx_info { u32 flags; struct { u8 ampdu_len, ampdu_ack_len; stru
 struct sk_buff { u8 *data; unsigned int len; u8 cb[64]; };
 static inline void *skb_push(struct sk_buff *skb, unsigned int len) { skb->data -= len; skb->len += len; memset(skb->data, 0, len); return skb->data; }
 static inline void *skb_pull(struct sk_buff *skb, unsigned int len) { skb->data += len; skb->len -= len; return skb->data; }
+static inline void skb_reserve(struct sk_buff *skb, unsigned int len) { skb->data += len; }
+static inline void skb_put_data(struct sk_buff *skb, const void *data, unsigned int len) { memcpy(skb->data + skb->len, data, len); skb->len += len; }
+#define __skb_push skb_push
 struct mt76_queue;
 struct mt76_dev;
 struct rate_info { u8 mcs, nss, flags, bw, he_gi, he_dcm; u16 legacy; };
@@ -172,13 +190,15 @@ struct mt76_sta_stats { uint64_t tx_mode[16], tx_bw[5], tx_nss[4], tx_mcs[16], t
 struct mt76_wcid { struct rate_info rate; struct mt76_sta_stats stats; void *sta; u8 phy_idx; };
 struct ieee80211_sta { struct mt76_wcid drv_priv; };
 struct ieee80211_rate { u16 bitrate; };
-struct ieee80211_supported_band { struct ieee80211_rate bitrates[64]; };
+struct ieee80211_supported_band { struct ieee80211_rate bitrates[64]; struct ieee80211_channel *channels; int n_channels; };
 struct mt76_sband { struct ieee80211_supported_band sband; };
-struct ieee80211_channel { int band; };
-struct cfg80211_chan_def { struct ieee80211_channel *chan; };
-struct mt76_phy { struct mt76_dev *dev; struct cfg80211_chan_def chandef; struct mt76_sband sband_2g, sband_5g, sband_6g; };
+struct ieee80211_channel { int band; int center_freq; u16 hw_value; u32 flags; };
+struct cfg80211_chan_def { struct ieee80211_channel *chan; int center_freq1, center_freq2, width; };
+struct mt76_phy { struct mt76_dev *dev; struct cfg80211_chan_def chandef; struct mt76_sband sband_2g, sband_5g, sband_6g; u8 antenna_mask; bool offchannel; };
+struct ieee80211_conf { u32 flags; };
+struct ieee80211_hw { struct ieee80211_conf conf; void *wiphy; };
 struct mt76_driver_ops { int (*rx_rro_add_msdu_page)(struct mt76_dev *, struct mt76_queue *, dma_addr_t, void *); };
-struct mt76_dev { void *dev, *dma_dev; struct { unsigned int timeout; u8 msg_seq; } mcu; struct { struct { int unused; } wed; } mmio; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; struct mt76_phy phy; struct mt76_phy *phys[2]; };
+struct mt76_dev { void *dev, *dma_dev; struct { unsigned int timeout; u8 msg_seq; } mcu; struct { struct { int unused; } wed; } mmio; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; struct mt76_phy phy; struct mt76_phy *phys[2]; struct ieee80211_hw *hw; u8 alpha2[2]; };
 struct mt76_connac2_mcu_rxd { __le32 rxd[6]; __le16 len; __le16 pkt_type_id; u8 eid; u8 seq; u8 option; u8 rsv; u8 ext_eid; u8 rsv1[2]; u8 s2d_index; u8 tlv[]; } __packed __aligned(4);
 struct mt76_desc { __le32 buf0; __le32 ctrl; __le32 buf1; __le32 info; } __packed __aligned(4);
 struct mt76_wed_rro_desc { __le32 buf0; __le32 buf1; };
@@ -198,6 +218,7 @@ static inline struct mt76_txwi_cache *mt76_rx_token_release(struct mt76_dev *d, 
 static inline int mt76_rx_token_consume(struct mt76_dev *d, void *a, void *b, dma_addr_t c) { (void)d; (void)a; (void)b; (void)c; return -1; }
 static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p; }
 #define ENOMEM 12
+#define ENOENT 2
 #define EAGAIN 11
 #define ETIMEDOUT 110
 #define le16_to_cpu(x) ((u16)(x))
@@ -215,7 +236,12 @@ static inline void mt792x_reset(struct mt76_dev *dev) { (void)dev; }
 #define MCU_CMD_HIF_CTRL 0x07
 #define MCU_CMD_REG_READ 0xc0
 #define MCU_CMD_WF_RF_PIN_CTRL 0xbd
-#define MCU_EXT_CMD(x) (MCU_CMD_##x | __MCU_CMD_FIELD_EXT_ID)
+#define MCU_CMD_SET_CHAN_DOMAIN 0x0f
+#define MCU_CMD_SET_CLC 0x5c
+#define MCU_CMD_SET_RX_PATH 0x4e
+#define MCU_CMD_CHANNEL_SWITCH 0x08
+#define MCU_EXT_CMD(x) (FIELD_PREP(__MCU_CMD_FIELD_ID, 0xed) | FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, MCU_CMD_##x))
+#define MCU_CE_CMD(x) (FIELD_PREP(__MCU_CMD_FIELD_ID, MCU_CMD_##x) | __MCU_CMD_FIELD_CE)
 #define MCU_UNI_CMD(x) (MCU_CMD_##x | __MCU_CMD_FIELD_UNI)
 #define MCU_CE_QUERY(x) (MCU_CMD_##x | __MCU_CMD_FIELD_CE | __MCU_CMD_FIELD_QUERY)
 struct mt76_connac_mcu_uni_event { u8 cid; u8 pad[3]; __le32 status; } __packed;
@@ -272,6 +298,7 @@ struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
 #define MT_PRXV_RCPI1 GENMASK(15, 8)
 #define le32_get_bits(v, mask) FIELD_GET(mask, le32_to_cpu(v))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BUILD_BUG_ON(c) _Static_assert(!(c), "build bug")
 #define fallthrough __attribute__((fallthrough))
 #define MT_TX_RATE_STBC BIT(13)
 #define MT_TX_RATE_NSS GENMASK(12, 10)
@@ -295,6 +322,13 @@ struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
 #define MT_BAND1 1
 #define NL80211_BAND_5GHZ 1
 #define NL80211_BAND_6GHZ 2
+#define IEEE80211_CHAN_DISABLED BIT(0)
+#define IEEE80211_CONF_MONITOR BIT(0)
+#define NL80211_IFTYPE_AP 3
+#define NL80211_CHAN_WIDTH_80P80 3
+#define CH_SWITCH_NORMAL 0
+#define CH_SWITCH_DFS 5
+#define CH_SWITCH_SCAN_BYPASS_DPD 9
 #define MT_PHY_TYPE_CCK 0
 #define MT_PHY_TYPE_OFDM 1
 #define MT_PHY_TYPE_HT 2
@@ -319,7 +353,36 @@ struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
 #define IEEE80211_SKB_CB(skb) ((struct ieee80211_tx_info *)(skb)->cb)
 struct sk_buff_head { int unused; };
 struct mt792x_link_sta { struct mt76_wcid wcid; };
-struct mt792x_dev { struct mt76_dev mt76; struct mt792x_link_sta *wcids[MT792x_WTBL_SIZE]; };
+struct mt792x_dev;
+struct mt792x_phy { struct mt76_phy *mt76; struct mt792x_dev *dev; u8 power_type; u64 chip_cap; u8 clc_chan_conf; };
+struct mt792x_dev { struct mt76_dev mt76; struct mt792x_phy phy; struct mt792x_link_sta *wcids[MT792x_WTBL_SIZE]; };
+struct mt7921_clc_rule { u8 alpha2[2]; u8 type[2]; __le16 len; u8 data[]; } __packed;
+struct mt7921_clc { __le32 len; u8 idx, ver, nr_country, type; u8 rsv[8]; u8 data[]; } __packed;
+struct mt7921_clc_info_tlv { __le16 tag, len; u8 chan_conf; u8 rsv[63]; } __packed;
+enum environment_cap { ENVIRON_INDOOR = 1 };
+#define MT792x_CHIP_CAP_CLC_EVT_EN BIT(0)
+#define GFP_KERNEL 0
+static u8 oracle_mcu_payload[4096];
+static size_t oracle_mcu_payload_len;
+static int oracle_mcu_command;
+static bool oracle_mcu_wait;
+static u8 oracle_channel_bw;
+static bool oracle_reg_can_beacon = true;
+static u8 oracle_acpi_flags, oracle_mtcl_conf;
+static bool oracle_power_limits;
+static struct sk_buff oracle_alloc_skb;
+static inline struct sk_buff *mt76_mcu_msg_alloc(struct mt76_dev *d, const void *data, int len) { (void)d; (void)data; (void)len; oracle_alloc_skb.data = oracle_mcu_payload; oracle_alloc_skb.len = 0; return &oracle_alloc_skb; }
+static inline struct sk_buff *__mt76_mcu_msg_alloc(struct mt76_dev *d, const void *data, int len, int headroom, int flags) { (void)d; (void)flags; oracle_alloc_skb.data = oracle_mcu_payload; oracle_alloc_skb.len = 0; if (data && headroom) skb_put_data(&oracle_alloc_skb, data, headroom); (void)len; return &oracle_alloc_skb; }
+static inline int mt76_mcu_send_msg(struct mt76_dev *d, int cmd, const void *data, int len, bool wait) { (void)d; memcpy(oracle_mcu_payload, data, len); oracle_mcu_payload_len = len; oracle_mcu_command = cmd; oracle_mcu_wait = wait; return 0; }
+static inline int mt76_mcu_skb_send_msg(struct mt76_dev *d, struct sk_buff *skb, int cmd, bool wait) { return mt76_mcu_send_msg(d, cmd, skb->data, skb->len, wait); }
+static inline int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *d, struct sk_buff *skb, int cmd, bool wait, struct sk_buff **ret) { *ret = NULL; return mt76_mcu_skb_send_msg(d, skb, cmd, wait); }
+static inline int ieee80211_frequency_to_channel(int freq) { return freq == 2484 ? 14 : freq < 2484 ? (freq - 2407) / 5 : (freq - 5000) / 5; }
+static inline u8 mt76_connac_chan_bw(struct cfg80211_chan_def *c) { (void)c; return oracle_channel_bw; }
+static inline int hweight8(u8 value) { return __builtin_popcount(value); }
+static inline bool cfg80211_reg_can_beacon(void *w, struct cfg80211_chan_def *c, int t) { (void)w; (void)c; (void)t; return oracle_reg_can_beacon; }
+static inline u8 mt792x_acpi_get_flags(struct mt792x_phy *p) { (void)p; return oracle_acpi_flags; }
+static inline u8 mt792x_acpi_get_mtcl_conf(struct mt792x_phy *p, u8 *a) { (void)p; (void)a; return oracle_mtcl_conf; }
+static inline void *mt76_find_power_limits_node(struct mt76_dev *d) { (void)d; return oracle_power_limits ? (void *)1 : NULL; }
 static struct sk_buff *oracle_status_skb;
 static bool oracle_status_done, oracle_polled;
 static inline int mt76_get_rate(struct mt76_dev *d, struct ieee80211_supported_band *s, int idx, bool cck) { (void)d; (void)s; (void)cck; return idx; }

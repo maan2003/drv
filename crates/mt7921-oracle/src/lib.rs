@@ -12,6 +12,8 @@ mod tests {
     use mt7921_core::{DownloadCommand, encode_download_command};
     use proptest::prelude::*;
 
+    static CHANNEL_ORACLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct CDescriptor {
@@ -225,6 +227,38 @@ mod tests {
             station: bool,
             output: *mut CUnsolicitedResult,
         ) -> i32;
+        fn oracle_mt7921_channel_info(
+            primary: u16,
+            center: u16,
+            bandwidth: u8,
+            center2: u16,
+            band: u8,
+            antenna_mask: u8,
+            channel_switch: bool,
+            offchannel: bool,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_channel_domain(
+            alpha2: *const u8,
+            bands: *const u8,
+            channels: *const u16,
+            flags: *const u32,
+            count: u8,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_clc_set(
+            index: u8,
+            environment: u8,
+            capability: u8,
+            alpha2: *const u8,
+            rule_type: *const u8,
+            environment_6ghz: u8,
+            acpi_configuration: u8,
+            mtcl_configuration: u8,
+            data: *const u8,
+            data_len: u16,
+            output: *mut u8,
+        ) -> i32;
     }
 
     fn c_fill(payload: &[u8], command: i32, sequence: u8) -> Vec<u8> {
@@ -265,6 +299,102 @@ mod tests {
             0
         );
         c_fill(&payload, (1 << 18) | 0x1b, sequence)
+    }
+
+    fn c_channel_info(
+        channel: mt7921_core::CandidateChannel,
+        center: u8,
+        bandwidth: u8,
+        center2: u8,
+        channel_switch: bool,
+        offchannel: bool,
+        sequence: u8,
+    ) -> Vec<u8> {
+        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let mut payload = [0; 76];
+        let band = match channel.band {
+            mt7921_core::PhysicalBand::Ghz2 => 0,
+            mt7921_core::PhysicalBand::Ghz5 => 1,
+            mt7921_core::PhysicalBand::Ghz6 => unreachable!("unsupported by public encoder"),
+        };
+        // SAFETY: `payload` is live and exactly the request size written by C.
+        let command = unsafe {
+            oracle_mt7921_channel_info(
+                channel.number,
+                u16::from(center),
+                bandwidth,
+                u16::from(center2),
+                band,
+                3,
+                channel_switch,
+                offchannel,
+                payload.as_mut_ptr(),
+            )
+        };
+        assert!(command >= 0);
+        c_fill(&payload, command, sequence)
+    }
+
+    fn c_channel_domain(command: &mt7921_core::ChannelDomainCommand, sequence: u8) -> Vec<u8> {
+        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let bands = command
+            .channels
+            .iter()
+            .map(|channel| match channel.band {
+                mt7921_core::PhysicalBand::Ghz2 => 0,
+                mt7921_core::PhysicalBand::Ghz5 => 1,
+                mt7921_core::PhysicalBand::Ghz6 => unreachable!("invalid typed command"),
+            })
+            .collect::<Vec<_>>();
+        let channels = command
+            .channels
+            .iter()
+            .map(|channel| channel.number)
+            .collect::<Vec<_>>();
+        let flags = command
+            .channels
+            .iter()
+            .map(|channel| channel.flags)
+            .collect::<Vec<_>>();
+        let mut payload = vec![0; 12 + command.channels.len() * 8];
+        // SAFETY: every slice remains live and `payload` has the exact length
+        // implied by the valid typed channel count.
+        let length = unsafe {
+            oracle_channel_domain(
+                command.alpha2.as_ptr(),
+                bands.as_ptr(),
+                channels.as_ptr(),
+                flags.as_ptr(),
+                u8::try_from(command.channels.len()).unwrap(),
+                payload.as_mut_ptr(),
+            )
+        };
+        assert_eq!(length as usize, payload.len());
+        c_fill(&payload, (1 << 18) | 0x0f, sequence)
+    }
+
+    fn c_clc(command: &mt7921_core::ClcSetCommand, sequence: u8) -> Vec<u8> {
+        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let mut payload = vec![0; 76 + command.data.len()];
+        // SAFETY: fixed fields and data remain live, and `payload` is sized to
+        // the request length accepted by the valid public command.
+        let length = unsafe {
+            oracle_clc_set(
+                command.index,
+                command.environment,
+                command.capability,
+                command.alpha2.as_ptr(),
+                command.rule_type.as_ptr(),
+                command.environment_6ghz,
+                command.acpi_configuration,
+                command.mtcl_configuration,
+                command.data.as_ptr(),
+                u16::try_from(command.data.len()).unwrap(),
+                payload.as_mut_ptr(),
+            )
+        };
+        assert_eq!(length as usize, payload.len());
+        c_fill(&payload, (1 << 18) | 0x5c, sequence)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1195,6 +1325,103 @@ mod tests {
                 sequence,
             ).unwrap();
             prop_assert_eq!(cancel, c_cancel_scan(scan_sequence, sequence));
+        }
+
+        #[test]
+        fn channel_programming_bodies_match_pinned_linux(
+            sequence in 1u8..=15,
+            programming in prop::sample::select(vec![
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz2, number: 1, frequency_mhz: 2412 }, 1u8, 0u8, 0u8),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz2, number: 1, frequency_mhz: 2412 }, 3, 1, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz2, number: 14, frequency_mhz: 2484 }, 14, 0, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 36, frequency_mhz: 5180 }, 36, 0, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 36, frequency_mhz: 5180 }, 38, 1, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 36, frequency_mhz: 5180 }, 42, 2, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 36, frequency_mhz: 5180 }, 50, 3, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 36, frequency_mhz: 5180 }, 42, 6, 155),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 100, frequency_mhz: 5500 }, 100, 0, 0),
+                (mt7921_core::CandidateChannel { band: mt7921_core::PhysicalBand::Ghz5, number: 165, frequency_mhz: 5825 }, 165, 0, 0),
+            ]),
+            offchannel: bool,
+        ) {
+            let (channel, center, bandwidth, center2) = programming;
+            let primary = channel.number as u8;
+            let rx_path = mt7921_core::encode_passive_mcu_command(
+                &mt7921_core::PassiveMcuCommand::SetRxPath { channel, antenna_mask: 3 },
+                sequence,
+            ).unwrap();
+            prop_assert_eq!(rx_path, c_channel_info(channel, primary, 0, 0, false, false, sequence));
+
+            let reason = if offchannel {
+                mt7921_core::ChannelSwitchReason::ScanBypassDpd
+            } else {
+                mt7921_core::ChannelSwitchReason::Normal
+            };
+            let switch = mt7921_core::encode_passive_mcu_command(
+                &mt7921_core::PassiveMcuCommand::ChannelSwitch {
+                    channel,
+                    center_channel: center,
+                    bandwidth,
+                    center_channel2: center2,
+                    antenna_mask: 3,
+                    switch_reason: reason,
+                },
+                sequence,
+            ).unwrap();
+            prop_assert_eq!(switch, c_channel_info(
+                channel, center, bandwidth, center2, true, offchannel, sequence));
+        }
+
+        #[test]
+        fn conservative_channel_domain_body_matches_pinned_linux(
+            sequence in 1u8..=15,
+            has_5ghz: bool,
+        ) {
+            let capability = mt7921_core::NicCapability {
+                element_count: 0,
+                mac_address: None,
+                phy: Some(mt7921_core::NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz,
+                    max_bandwidth: 3,
+                    spatial_streams: 2,
+                    hardware_path: 1,
+                    he: true,
+                }),
+                has_6ghz: Some(false),
+                chip_capability: None,
+                unknown_elements: 0,
+            };
+            let command = mt7921_core::conservative_channel_domain(
+                capability, *b"00", true, 0,
+            ).unwrap();
+            let rust = mt7921_core::encode_channel_domain_command(&command, sequence).unwrap();
+            prop_assert_eq!(rust, c_channel_domain(&command, sequence));
+        }
+
+        #[test]
+        fn clc_set_command_body_matches_pinned_linux(
+            sequence in 1u8..=15,
+            index in 0u8..=1,
+            capability in 0u8..=1,
+            acpi_configuration in 0u8..=1,
+            rule_type: [u8; 2],
+            data in proptest::collection::vec(any::<u8>(), 1..=256),
+        ) {
+            let command = mt7921_core::ClcSetCommand {
+                index,
+                environment: 1,
+                acpi_configuration,
+                capability,
+                alpha2: *b"00",
+                rule_type,
+                environment_6ghz: 0,
+                mtcl_configuration: 0xff,
+                data,
+            };
+            let rust = mt7921_core::encode_clc_set_command(&command, sequence).unwrap();
+            prop_assert_eq!(rust, c_clc(&command, sequence));
         }
 
         #[test]

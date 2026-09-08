@@ -624,3 +624,124 @@ int oracle_connac2_rx_frame(const uint8_t *input, size_t input_len,
     out->payload_offset = offset;
     return 0;
 }
+
+/* Execute pinned mt7921_mcu_set_chan_info and retain the request body passed
+ * to mt76_mcu_send_msg.  The wrapper admits only the channel forms exposed by
+ * mt7921-core: SET_RX_PATH or CHANNEL_SWITCH with normal/off-channel reason. */
+int oracle_mt7921_channel_info(uint16_t primary, uint16_t center,
+                               uint8_t bandwidth, uint16_t center2,
+                               uint8_t band, uint8_t antenna_mask,
+                               bool channel_switch, bool offchannel,
+                               uint8_t out[76])
+{
+    struct mt792x_dev dev = {0};
+    struct mt76_phy mphy = {0};
+    struct ieee80211_channel channel = {0};
+    struct ieee80211_hw hw = {0};
+    int cmd;
+
+    if (!out || !primary || primary > 255 || !center || center > 255 ||
+        center2 > 255 || band > 1 || antenna_mask != 3 ||
+        !(bandwidth <= 3 || bandwidth == 6) ||
+        (bandwidth == 0 && center != primary) ||
+        (bandwidth != 6 && center2) || (bandwidth == 6 && !center2))
+        return -1;
+    channel.band = band;
+    channel.hw_value = primary;
+    mphy.dev = &dev.mt76;
+    mphy.chandef.chan = &channel;
+    mphy.chandef.center_freq1 = center == 14 ? 2484 :
+        (band ? 5000 : 2407) + center * 5;
+    mphy.chandef.center_freq2 = center2 ? 5000 + center2 * 5 : 0;
+    mphy.chandef.width = center2 ? NL80211_CHAN_WIDTH_80P80 : 0;
+    mphy.antenna_mask = antenna_mask;
+    mphy.offchannel = offchannel;
+    dev.mt76.hw = &hw;
+    dev.phy.mt76 = &mphy;
+    dev.phy.dev = &dev;
+    oracle_channel_bw = bandwidth;
+    oracle_reg_can_beacon = true;
+    oracle_mcu_payload_len = 0;
+    cmd = channel_switch ? MCU_EXT_CMD(CHANNEL_SWITCH) : MCU_EXT_CMD(SET_RX_PATH);
+    if (mt7921_mcu_set_chan_info(&dev.phy, cmd) || oracle_mcu_payload_len != 76)
+        return -2;
+    memcpy(out, oracle_mcu_payload, 76);
+    return oracle_mcu_command;
+}
+
+/* Execute pinned mt76_connac_mcu_set_channel_domain over enabled channel
+ * records. The public Rust command rejects disabled and 6 GHz entries, so the
+ * wrapper's typed domain is precisely ordered 2/5 GHz records. */
+int oracle_channel_domain(const uint8_t alpha2[2], const uint8_t *bands,
+                          const uint16_t *channels, const uint32_t *flags,
+                          uint8_t count, uint8_t *out)
+{
+    struct mt76_dev dev = {0};
+    struct mt76_phy phy = {0};
+    struct ieee80211_channel ch2[64] = {{0}}, ch5[64] = {{0}};
+    int n2 = 0, n5 = 0, i;
+
+    if (!alpha2 || !bands || !channels || !flags || !out || count > 64)
+        return -1;
+    for (i = 0; i < count; i++) {
+        struct ieee80211_channel *channel;
+        if (bands[i] == 0)
+            channel = &ch2[n2++];
+        else if (bands[i] == 1)
+            channel = &ch5[n5++];
+        else
+            return -1;
+        channel->hw_value = channels[i];
+        channel->flags = flags[i];
+    }
+    memcpy(dev.alpha2, alpha2, 2);
+    phy.dev = &dev;
+    phy.sband_2g.sband.channels = ch2;
+    phy.sband_2g.sband.n_channels = n2;
+    phy.sband_5g.sband.channels = ch5;
+    phy.sband_5g.sband.n_channels = n5;
+    oracle_mcu_payload_len = 0;
+    if (mt76_connac_mcu_set_channel_domain(&phy) ||
+        oracle_mcu_payload_len != 12 + (size_t)count * 8)
+        return -2;
+    memcpy(out, oracle_mcu_payload, oracle_mcu_payload_len);
+    return oracle_mcu_payload_len;
+}
+
+/* Execute pinned __mt7921_mcu_set_clc for one valid matching rule and retain
+ * the exact SET_CLC request body. */
+int oracle_clc_set(uint8_t index, uint8_t environment, uint8_t capability,
+                   const uint8_t alpha2[2], const uint8_t rule_type[2],
+                   uint8_t environment_6ghz, uint8_t acpi_configuration,
+                   uint8_t mtcl_configuration, const uint8_t *data,
+                   uint16_t data_len, uint8_t *out)
+{
+    uint8_t storage[4096] = {0};
+    struct mt7921_clc *clc = (struct mt7921_clc *)storage;
+    struct mt7921_clc_rule *rule = (struct mt7921_clc_rule *)clc->data;
+    struct mt792x_dev dev = {0};
+    size_t total = 16 + 6 + (size_t)data_len + 16;
+
+    if (!out || !alpha2 || !rule_type || !data || index > 1 || !data_len ||
+        total > sizeof(storage) || capability > 1)
+        return -1;
+    clc->len = cpu_to_le32(total);
+    clc->idx = index;
+    memcpy(rule->alpha2, alpha2, 2);
+    memcpy(rule->type, rule_type, 2);
+    rule->len = cpu_to_le16(data_len);
+    memcpy(rule->data, data, data_len);
+    dev.phy.mt76 = &dev.mt76.phy;
+    dev.phy.dev = &dev;
+    dev.phy.power_type = environment_6ghz;
+    dev.phy.chip_cap = capability ? MT792x_CHIP_CAP_CLC_EVT_EN : 0;
+    oracle_acpi_flags = acpi_configuration;
+    oracle_mtcl_conf = mtcl_configuration;
+    oracle_power_limits = false;
+    oracle_mcu_payload_len = 0;
+    if (__mt7921_mcu_set_clc(&dev, (u8 *)alpha2, environment, clc, index) ||
+        oracle_mcu_payload_len != 76 + (size_t)data_len)
+        return -2;
+    memcpy(out, oracle_mcu_payload, oracle_mcu_payload_len);
+    return oracle_mcu_payload_len;
+}
