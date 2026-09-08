@@ -70,3 +70,36 @@ delayed dump collection, or reset notification/action.
 
 **Likely Rust port bug:** a firmware assertion does not enter the Linux
 coredump-and-reset recovery path.
+
+## Ownership timeout returns earlier than pinned Linux
+
+Pinned `____mt76_poll_msec` uses a `do ... while (timeout-- > 0)` loop. For a
+50 ms timeout and 1 ms tick it performs 51 reads and, when all fail, 51 sleeps.
+Both PCIe ownership functions repeat that shape ten times. The Rust ownership
+model performs the same 10 writes and 510 reads, but checks its deadline before
+sleeping after each attempt's terminal read, so it performs only 500 sleeps.
+With the oracle's deterministic minimum sleep, Linux returns `-EIO` after
+510 ms while Rust returns its timeout after 500 ms. The same difference occurs
+before every later successful retry; successful first-attempt register traces
+and all write/read sequences otherwise agree. ASPM's separate 2--3 ms driver
+ownership delay is preserved by both implementations.
+
+**Likely Rust port bug:** `DRIVER_OWN_ATTEMPT_MS` is implemented as a hard
+elapsed deadline rather than reproducing the pinned poll helper's terminal
+sleep. Host timeout and retry timing can therefore run up to 10 ms earlier than
+Linux (apart from scheduler variance and the ASPM sleep range).
+
+## RAM download command can disagree at the Connac2 patch address
+
+Pinned `mt76_connac_mcu_init_download` chooses `PATCH_START_REQ` (CID `0x05`)
+whenever a Connac2 download address is `0x00900000`, independent of which
+firmware section led to the call. The public Rust
+`DownloadCommand::TargetAddressLength` accepts that address but always emits
+`TARGET_ADDRESS_LEN_REQ` (CID `0x01`). The remaining 12-byte request and
+Connac2 envelope fields agree. `DownloadCommand::PatchStart` emits the pinned
+CID for the ordinary patch path.
+
+**Likely Rust port bug:** the command enum exposes a caller-selected wire CID
+where pinned Linux derives it from device generation and address. A valid RAM
+region at the reserved Connac2 patch address would be initialized with a
+different command from Linux.

@@ -62,6 +62,19 @@ world CLC rules. The channel-domain and CLC wrappers use only ordered enabled
 2/5 GHz records and valid public command fields; the shared capture shim is
 serialized because the extracted kernel send boundary is process-global.
 
+Firmware power and download coverage executes the pinned
+`____mt76_poll_msec`, `__mt792xe_mcu_drv_pmctrl`,
+`mt792xe_mcu_fw_pmctrl`, `mt76_connac_mcu_init_download`,
+`mt76_connac_mcu_patch_sem_ctrl`, `mt76_connac_mcu_start_patch`, and
+`mt76_connac_mcu_start_firmware` bodies. Minimal MMIO/time stubs normalize
+ownership writes, status reads, sleeps, return status, and successful retry
+position. The command wrappers run the pinned request assignments before the
+existing extracted Connac2 envelope builder, so patch semaphore, patch/RAM
+section initialization, patch finish, and firmware start are compared as
+complete bytes rather than using a Rust-produced payload as C input. Two
+valid-domain differences found by this checkpoint are recorded in
+`MISMATCHES.md`.
+
 `mt7921-core` does not currently expose an RX ring entry ownership or cleanup
 API: its public RX surface prepares descriptor arrays, while `WfdmaRing` is a
 TX ring model. Consequently the RX cleanup checkpoint executes and asserts the

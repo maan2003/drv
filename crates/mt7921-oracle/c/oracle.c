@@ -4,6 +4,83 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+int oracle_power_control(bool firmware, bool aspm, uint8_t success_attempt,
+                         uint8_t success_read,
+                         struct oracle_power_event *events, size_t *event_count,
+                         uint64_t *elapsed_us)
+{
+    struct mt792x_dev dev = {0};
+    int result;
+    if (!events || !event_count || !elapsed_us || success_attempt > 10)
+        return -99;
+    oracle_power_event_count = 0;
+    oracle_power_time_us = 0;
+    oracle_power_attempt = 0;
+    oracle_power_read = 0;
+    oracle_power_success_attempt = success_attempt;
+    oracle_power_success_read = success_read;
+    oracle_power_firmware = firmware;
+    dev.aspm_supported = aspm;
+    result = firmware ? mt792xe_mcu_fw_pmctrl(&dev)
+                      : __mt792xe_mcu_drv_pmctrl(&dev);
+    memcpy(events, oracle_power_events,
+           oracle_power_event_count * sizeof(*events));
+    *event_count = oracle_power_event_count;
+    *elapsed_us = oracle_power_time_us;
+    return result;
+}
+
+/* Execute the pinned request builders before the already-extracted Connac2
+ * envelope builder. This keeps request assignments independent of Rust. */
+int oracle_download_command(uint8_t kind, uint8_t sequence, uint32_t address,
+                            uint32_t length, uint32_t mode,
+                            uint8_t *out, size_t out_capacity)
+{
+    struct mt76_dev dev = {0};
+    struct sk_buff skb;
+    uint8_t storage[128] = {0};
+    uint8_t payload[16];
+    size_t payload_len;
+    int wait_seq = 0, result;
+
+    if (!out || !sequence || sequence > 15)
+        return -1;
+    oracle_mcu_payload_len = 0;
+    switch (kind) {
+    case 0:
+        result = mt76_connac_mcu_init_download(&dev, address, length, mode);
+        break;
+    case 1:
+        result = mt76_connac_mcu_patch_sem_ctrl(&dev, true);
+        break;
+    case 2:
+        result = mt76_connac_mcu_patch_sem_ctrl(&dev, false);
+        break;
+    case 3:
+        result = mt76_connac_mcu_start_patch(&dev);
+        break;
+    case 4:
+        result = mt76_connac_mcu_start_firmware(&dev, address, mode);
+        break;
+    default:
+        return -2;
+    }
+    if (result)
+        return result;
+    payload_len = oracle_mcu_payload_len;
+    memcpy(payload, oracle_mcu_payload, payload_len);
+    memcpy(storage + 64, payload, payload_len);
+    skb.data = storage + 64;
+    skb.len = payload_len;
+    dev.mcu.msg_seq = sequence - 1;
+    if (mt76_connac2_mcu_fill_message(&dev, &skb, oracle_mcu_command,
+                                      &wait_seq) || wait_seq != sequence ||
+        skb.len > out_capacity)
+        return -3;
+    memcpy(out, skb.data, skb.len);
+    return (int)skb.len;
+}
+
 /* Normalized observations from the pinned mt7921_mcu_rx_event ->
  * mt7921_mcu_{,uni_}rx_unsolicited_event path and the four children exercised
  * by the Rust client seam.  These are source-exact field assignments: scan
