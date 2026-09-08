@@ -7,6 +7,7 @@ description = "Staged Linux host bring-up runner for Redwood WCN6750"
 
 [dependencies]
 ath11k-core = { path = "../ath11k-core" }
+ath11k-dp = { path = "../ath11k-dp" }
 ath11k-qmi = { path = "../ath11k-qmi" }
 ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }
 ath11k-wmi = { path = "../ath11k-wmi" }

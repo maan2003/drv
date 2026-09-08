@@ -54,7 +54,7 @@ if "$dry_run"; then
     printf ' > '
     quote "$log_dir/preflight.log"
     printf ' 2>&1\n'
-    for stage in resources firmware qmi core passive-scan scan-results; do
+    for stage in resources firmware qmi core passive-scan scan-results dp-poll; do
         print_command :
         printf ' > '
         quote "$log_dir/$stage.wmi.jsonl"
@@ -70,7 +70,7 @@ if "$dry_run"; then
     printf ' && sha256sum *.log *.jsonl > SHA256SUMS)\n'
     printf '\nCompare the final stage with:\n'
     print_command cargo run -p ath11k-wmi --bin compare-wmi -- \
-        "$native_trace" "$log_dir/scan-results.wmi.jsonl"
+        "$native_trace" "$log_dir/dp-poll.wmi.jsonl"
     printf '\n'
     exit 0
 fi
@@ -105,7 +105,7 @@ fi
 
 previous_log=$log_dir/preflight.log
 previous_wmi=
-for stage in resources firmware qmi core passive-scan scan-results; do
+for stage in resources firmware qmi core passive-scan scan-results dp-poll; do
     [ -f "$previous_log" ] || {
         write_sums
         echo "previous stage log is missing; refusing $stage stage" >&2
@@ -136,8 +136,8 @@ for stage in resources firmware qmi core passive-scan scan-results; do
 done
 
 write_sums
-printf 'All six stages completed. SHA-256 manifest: %s\n' "$log_dir/SHA256SUMS"
+printf 'All seven stages completed. SHA-256 manifest: %s\n' "$log_dir/SHA256SUMS"
 printf '\nCompare the final stage with:\n'
 print_command cargo run -p ath11k-wmi --bin compare-wmi -- \
-    "$native_trace" "$log_dir/scan-results.wmi.jsonl"
+    "$native_trace" "$log_dir/dp-poll.wmi.jsonl"
 printf '\n'

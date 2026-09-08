@@ -54,6 +54,7 @@ name = "ath11k-bringup"
 version = "0.1.0"
 dependencies = [
  "ath11k-core",
+ "ath11k-dp",
  "ath11k-qmi",
  "ath11k-qmi-qrtr",
  "ath11k-wmi",

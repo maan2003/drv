@@ -46,16 +46,18 @@ pub enum Stage {
     Core,
     PassiveScan,
     ScanResults,
+    DpPoll,
 }
 
 impl Stage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Resources,
         Self::Firmware,
         Self::Qmi,
         Self::Core,
         Self::PassiveScan,
         Self::ScanResults,
+        Self::DpPoll,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -66,6 +68,7 @@ impl Stage {
             Self::Core => "core",
             Self::PassiveScan => "passive-scan",
             Self::ScanResults => "scan-results",
+            Self::DpPoll => "dp-poll",
         }
     }
 }
@@ -77,7 +80,7 @@ impl FromStr for Stage {
         Self::ALL
             .into_iter()
             .find(|stage| stage.as_str() == value)
-            .ok_or_else(|| format!("unknown stage {value:?}; expected resources, firmware, qmi, core, passive-scan, or scan-results"))
+            .ok_or_else(|| format!("unknown stage {value:?}; expected resources, firmware, qmi, core, passive-scan, scan-results, or dp-poll"))
     }
 }
 
@@ -99,7 +102,7 @@ impl Default for Cli {
         Self {
             preflight: false,
             dry_run: false,
-            stop_after: Stage::ScanResults,
+            stop_after: Stage::DpPoll,
             broker: false,
             vfio_device: None,
             board: DEFAULT_BOARD.into(),
@@ -162,7 +165,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -472,6 +475,7 @@ pub trait Host {
     fn core(&mut self) -> Result<(), Error>;
     fn passive_scan(&mut self) -> Result<(), Error>;
     fn scan_results(&mut self, ssid: Option<&[u8]>) -> Result<(), Error>;
+    fn dp_poll(&mut self) -> Result<(), Error>;
 }
 
 pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
@@ -484,6 +488,7 @@ pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
             Stage::Core => host.core()?,
             Stage::PassiveScan => host.passive_scan()?,
             Stage::ScanResults => host.scan_results(config.ssid.as_deref())?,
+            Stage::DpPoll => host.dp_poll()?,
         }
         completed.push(stage);
         if stage == config.stop_after {
@@ -714,6 +719,7 @@ pub struct DryRunHost {
     vdev: Option<ath11k_core::VdevId>,
     summary: Option<ScanSummary>,
     wmi_log: Option<WmiJsonl<BufWriter<File>>>,
+    dp_poll_log: Vec<String>,
 }
 
 impl Default for DryRunHost {
@@ -723,6 +729,7 @@ impl Default for DryRunHost {
             vdev: None,
             summary: None,
             wmi_log: None,
+            dp_poll_log: Vec::new(),
         }
     }
 }
@@ -798,11 +805,25 @@ impl Host for DryRunHost {
         self.summary = Some(collect_scan_results(device, ssid)?);
         Ok(())
     }
+
+    fn dp_poll(&mut self) -> Result<(), Error> {
+        self.dp_poll_log = vec![dp_poll_summary_line(ath11k_dp::tx::HostServiceResult {
+            tx_delivered: 0,
+            tx_malformed: 0,
+            rx_delivered: 0,
+            rx_dropped: Default::default(),
+        })];
+        Ok(())
+    }
 }
 
 impl DryRunHost {
     pub fn scan_summary(&self) -> Option<&ScanSummary> {
         self.summary.as_ref()
+    }
+
+    pub fn dp_poll_log(&self) -> &[String] {
+        &self.dp_poll_log
     }
 
     fn record_command(
@@ -883,6 +904,62 @@ impl DryRunHost {
 
 struct JsonTrace(WmiJsonl<BufWriter<File>>);
 
+#[derive(Default)]
+struct DiagnosticDpHost {
+    lines: Vec<String>,
+}
+
+impl ath11k_dp::tx::DpHost for DiagnosticDpHost {
+    fn receive(&mut self, frame: ath11k_dp::tx::HostRxFrame) {
+        let peer = frame
+            .info
+            .peer
+            .map_or_else(|| "none".into(), |peer| peer.0.to_string());
+        let bytes_hex = frame
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.lines.push(format!(
+            "dp_rx len={} peer={peer} tid={} decap={:?} decrypt={:?} phy_metadata={:#010x} bandwidth={} mcs={} packet_type={} nss={} ppdu_id={} bytes_hex={bytes_hex}",
+            frame.bytes.len(),
+            frame.info.tid,
+            frame.info.decap_type,
+            frame.info.decrypt_status,
+            frame.info.phy_metadata,
+            frame.info.bandwidth,
+            frame.info.mcs,
+            frame.info.packet_type,
+            frame.info.nss,
+            frame.info.phy_ppdu_id,
+        ));
+    }
+
+    fn tx_complete(&mut self, result: ath11k_dp::tx::TxResult) {
+        let peer = result
+            .peer
+            .map_or_else(|| "none".into(), |peer| peer.0.to_string());
+        self.lines.push(format!(
+            "dp_tx_complete msdu_id={} status={} acknowledged={} ack_rssi={} peer={peer}",
+            result.msdu_id, result.status, result.acknowledged, result.ack_rssi,
+        ));
+    }
+}
+
+fn dp_poll_summary_line(result: ath11k_dp::tx::HostServiceResult) -> String {
+    format!(
+        "dp_poll tx_delivered={} tx_malformed={} rx_delivered={} rx_dropped_malformed={} rx_dropped_fcs={} rx_dropped_decrypt={} rx_dropped_tkip_mic={} rx_dropped_decap={}",
+        result.tx_delivered,
+        result.tx_malformed,
+        result.rx_delivered,
+        result.rx_dropped.malformed,
+        result.rx_dropped.fcs_error,
+        result.rx_dropped.decrypt_error,
+        result.rx_dropped.tkip_mic_error,
+        result.rx_dropped.unsupported_decap,
+    )
+}
+
 impl ath11k_core::WmiTraceSink for JsonTrace {
     fn record(
         &mut self,
@@ -932,6 +1009,7 @@ pub struct RealHost {
     device: Option<LiveDevice>,
     vdev: Option<ath11k_core::VdevId>,
     summary: Option<ScanSummary>,
+    dp_poll_log: Vec<String>,
 }
 
 impl Host for RealHost {
@@ -1067,11 +1145,33 @@ impl Host for RealHost {
         )?);
         Ok(())
     }
+
+    fn dp_poll(&mut self) -> Result<(), Error> {
+        const WORK_BUDGET: usize = 64;
+        const RECEIVE_BUDGET: usize = 64;
+
+        let device = self
+            .device
+            .as_mut()
+            .ok_or(Error::Unsupported("DP poll requested before core startup"))?;
+        let mut host = DiagnosticDpHost::default();
+        let result = device
+            .backend_mut()
+            .service_dp_host(WORK_BUDGET, RECEIVE_BUDGET, &mut host)
+            .map_err(Error::Core)?;
+        host.lines.push(dp_poll_summary_line(result));
+        self.dp_poll_log = host.lines;
+        Ok(())
+    }
 }
 
 impl RealHost {
     pub fn scan_summary(&self) -> Option<&ScanSummary> {
         self.summary.as_ref()
+    }
+
+    pub fn dp_poll_log(&self) -> &[String] {
+        &self.dp_poll_log
     }
 }
 
@@ -1228,6 +1328,9 @@ mod tests {
         fn scan_results(&mut self, _: Option<&[u8]>) -> Result<(), Error> {
             self.visit(Stage::ScanResults)
         }
+        fn dp_poll(&mut self) -> Result<(), Error> {
+            self.visit(Stage::DpPoll)
+        }
     }
 
     #[test]
@@ -1371,7 +1474,41 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_reaches_passive_scan_without_paths_or_hardware() {
+    fn diagnostic_dp_host_logs_deliveries_and_completions() {
+        use ath11k_dp::tx::{
+            DpHost as _, HostRxFrame, HostRxInfo, RxDecapType, RxDecryptStatus, TxResult,
+        };
+
+        let mut host = DiagnosticDpHost::default();
+        host.receive(HostRxFrame {
+            bytes: vec![0x08, 0xaf],
+            info: HostRxInfo {
+                decap_type: RxDecapType::NativeWifi,
+                peer: Some(ath11k_dp::PeerId(7)),
+                tid: 3,
+                decrypt_status: RxDecryptStatus::Decrypted,
+                phy_metadata: 0x1234,
+                bandwidth: 1,
+                mcs: 5,
+                packet_type: 2,
+                nss: 2,
+                phy_ppdu_id: 9,
+            },
+        });
+        host.tx_complete(TxResult {
+            msdu_id: 11,
+            status: 0,
+            acknowledged: true,
+            ack_rssi: -42,
+            peer: Some(ath11k_dp::PeerId(7)),
+        });
+        assert!(host.lines[0].contains("peer=7 tid=3"));
+        assert!(host.lines[0].ends_with("bytes_hex=08af"));
+        assert!(host.lines[1].contains("msdu_id=11 status=0 acknowledged=true"));
+    }
+
+    #[test]
+    fn dry_run_completes_dp_poll_without_paths_or_hardware() {
         let cli = Cli {
             dry_run: true,
             vfio_device: Some("/does/not/exist".into()),
@@ -1383,7 +1520,9 @@ mod tests {
         };
         let mut host = DryRunHost::default();
         let completed = run(&cli, &mut host).unwrap();
-        assert_eq!(completed.last(), Some(&Stage::ScanResults));
+        assert_eq!(completed.last(), Some(&Stage::DpPoll));
+        assert_eq!(host.dp_poll_log.len(), 1);
+        assert!(host.dp_poll_log[0].contains("rx_delivered=0"));
         assert_eq!(host.scan_summary().unwrap().bsses[0].ssid, b"dry-run");
         assert_eq!(
             host.scan_summary().unwrap().selected.as_ref().unwrap().ssid,
