@@ -50,8 +50,11 @@ The one successful observation reached `7.2.0+ #9` but ignored the DTB
 argument. A later attempt from a `degraded`, rather than `running`, flashed
 userspace reset back to flashed `#1`; no retained evidence distinguishes a
 reset before candidate entry from a candidate failure before USB. Do not treat
-the first hop as reproducible or proceed from a degraded system. Require a
-16-byte Wi-Fi `reg` and live-FDT SHA-256
+the first hop as reproducible or proceed from a degraded system. A diagnostic
+retry from `running` userspace also failed to return USB and required a manual
+power-cycle; its exact inputs and successful `kexec_loaded` transition do not
+show whether the candidate kernel began executing. Require a 16-byte Wi-Fi
+`reg` and live-FDT SHA-256
 `d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
 After the approved stdin-only unlock and return to `#9` userspace, make the
 second hop with the legacy syscall forced:

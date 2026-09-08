@@ -6,7 +6,9 @@ use ath11k_core::{
     ClientRadioControl as _, Device, DeviceState, Lifecycle as _, ManagementFrame, ModelSubsystems,
     RadioControl as _, ScanConfig, ScanId, Subsystems, VdevId, WCN6750, WlanEvent,
 };
-use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType};
+use fidl_fuchsia_wlan_ieee80211::{
+    BssType, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
+};
 use wlan_softmac_host::{
     ClientRuntimeDriver, DiscoverySupport, JoinBssRequest, MacSublayerSupport, SecuritySupport,
     SpectrumManagementSupport, WlanAssociationConfig, WlanKeyConfiguration, WlanRxInfo,
@@ -386,6 +388,9 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
     }
 
     fn set_link_up(&mut self, _up: bool) -> Result<(), zx::Status> {
+        // The core seam only exposes authorize_peer(), not the required
+        // symmetric deauthorization operation. Supporting only the up half
+        // would leave firmware data admission open when the host closes it.
         Err(zx::Status::NOT_SUPPORTED)
     }
 
@@ -435,23 +440,61 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
 
     fn join_bss(&mut self, request: JoinBssRequest) -> Result<(), zx::Status> {
-        let _ = request;
-        Err(zx::Status::NOT_SUPPORTED)
+        let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        if request.beacon_period.is_none() {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        if request.bss_type != Some(BssType::Infrastructure) || request.remote != Some(true) {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        if self.peer.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let vdev = self.ready_vdev()?;
+        if let Err(error) = self.device.create_peer(vdev, peer) {
+            // A failed completion can leave peer creation ambiguous. Only a
+            // terminal firmware stop is representable at the current seam.
+            let _ = self.stop();
+            return Err(status(error));
+        }
+        self.peer = Some(peer);
+        Ok(())
     }
     fn install_key(&mut self, _configuration: WlanKeyConfiguration) -> Result<(), zx::Status> {
+        // FIDL protection and group-key RSC are security-relevant. Core's
+        // KeyConfig carries neither, so accepting this call would silently
+        // weaken a valid request.
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn notify_association_complete(
         &mut self,
         _configuration: WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
+        // WlanAssociationConfig's negotiated rates, capabilities, QoS/WMM,
+        // and channel width are required FIDL fields. associate_peer() accepts
+        // only an address, so it cannot faithfully complete this operation.
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn clear_association(
         &mut self,
-        _request: WlanSoftmacBaseClearAssociationRequest,
+        request: WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+        if request.peer_addr != Some(peer) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let vdev = self.ready_vdev()?;
+        // Revoke adapter-side peer authority before the fallible firmware
+        // deletion. notify_association_complete is unsupported, so this vdev
+        // cannot have been brought up through this adapter.
+        self.peer = None;
+        if let Err(error) = self.device.delete_peer(vdev, peer) {
+            // Firmware peer ownership is now ambiguous; stop rather than
+            // allowing a new join to reuse possibly-live state.
+            let _ = self.stop();
+            return Err(status(error));
+        }
+        Ok(())
     }
 
     fn start_passive_scan(
@@ -643,6 +686,177 @@ mod tests {
         let mut adapter = Ath11kClientDevice::new(WCN6750.device(backend), CLIENT);
         assert!(adapter.start(Box::new(NoopUpcalls)).is_err());
         adapter.into_device()
+    }
+
+    const PEER: [u8; 6] = [2, 0, 0, 0, 0, 2];
+
+    fn join_request() -> JoinBssRequest {
+        JoinBssRequest {
+            bssid: Some(PEER),
+            bss_type: Some(BssType::Infrastructure),
+            remote: Some(true),
+            beacon_period: Some(100),
+        }
+    }
+
+    fn ready_adapter() -> Ath11kClientDevice<ModelSubsystems> {
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(NoopUpcalls)).unwrap();
+        adapter
+            .set_channel(WlanSoftmacBaseSetChannelRequest {
+                primary: Some(ChannelNumber {
+                    band: WlanBand::TwoGhz,
+                    number: 6,
+                }),
+                bandwidth: Some(ChannelBandwidth::Cbw20),
+                vht_secondary_80_channel: Some(ChannelNumber {
+                    band: WlanBand::TwoGhz,
+                    number: 0,
+                }),
+            })
+            .unwrap();
+        adapter.device.backend_mut().clear();
+        adapter
+    }
+
+    #[test]
+    fn join_and_clear_bind_and_delete_exactly_one_peer() {
+        let mut adapter = ready_adapter();
+        adapter.join_bss(join_request()).unwrap();
+        let vdev = adapter.vdev.unwrap();
+        assert_eq!(
+            adapter.device.backend().operations(),
+            &[
+                Operation::WmiPeerCreate {
+                    vdev,
+                    address: PEER,
+                },
+                Operation::WaitPeerCreated {
+                    vdev,
+                    address: PEER,
+                },
+            ]
+        );
+        adapter
+            .clear_association(WlanSoftmacBaseClearAssociationRequest {
+                peer_addr: Some(PEER),
+            })
+            .unwrap();
+        assert_eq!(adapter.peer, None);
+        assert!(adapter.device.backend().operations().ends_with(&[
+            Operation::WmiPeerDelete {
+                vdev,
+                address: PEER,
+            },
+            Operation::WaitPeerDeleted {
+                vdev,
+                address: PEER,
+            },
+        ]));
+        adapter.join_bss(join_request()).unwrap();
+    }
+
+    #[test]
+    fn failed_peer_deletion_still_revokes_adapter_peer_authority() {
+        let mut adapter = ready_adapter();
+        adapter.join_bss(join_request()).unwrap();
+        let vdev = adapter.vdev.unwrap();
+        adapter.device.backend_mut().clear();
+        adapter
+            .device
+            .backend_mut()
+            .fail_once(Operation::WmiPeerDelete {
+                vdev,
+                address: PEER,
+            });
+
+        assert_eq!(
+            adapter.clear_association(WlanSoftmacBaseClearAssociationRequest {
+                peer_addr: Some(PEER),
+            }),
+            Err(zx::Status::IO)
+        );
+        assert_eq!(adapter.peer, None);
+        assert_eq!(adapter.device.state(), DeviceState::Stopped);
+        assert_eq!(
+            adapter.device.backend().operations().first(),
+            Some(&Operation::WmiPeerDelete {
+                vdev,
+                address: PEER,
+            })
+        );
+        assert!(
+            adapter
+                .device
+                .backend()
+                .operations()
+                .contains(&Operation::QmiFirmwareStop)
+        );
+        assert_eq!(
+            adapter.clear_association(WlanSoftmacBaseClearAssociationRequest {
+                peer_addr: Some(PEER),
+            }),
+            Err(zx::Status::BAD_STATE)
+        );
+    }
+
+    #[test]
+    fn ambiguous_join_peer_creation_stops_the_device() {
+        let mut adapter = ready_adapter();
+        let vdev = adapter.vdev.unwrap();
+        adapter
+            .device
+            .backend_mut()
+            .fail_once(Operation::WaitPeerCreated {
+                vdev,
+                address: PEER,
+            });
+
+        assert_eq!(adapter.join_bss(join_request()), Err(zx::Status::IO));
+        assert_eq!(adapter.peer, None);
+        assert_eq!(adapter.device.state(), DeviceState::Stopped);
+        assert!(adapter.device.backend().operations().starts_with(&[
+            Operation::WmiPeerCreate {
+                vdev,
+                address: PEER,
+            },
+            Operation::WaitPeerCreated {
+                vdev,
+                address: PEER,
+            },
+        ]));
+    }
+
+    #[test]
+    fn unrepresentable_association_security_and_link_calls_fail_closed() {
+        let mut adapter = ready_adapter();
+        adapter.join_bss(join_request()).unwrap();
+        adapter.device.backend_mut().clear();
+
+        assert_eq!(
+            adapter.notify_association_complete(WlanAssociationConfig {
+                bssid: Some(PEER),
+                aid: Some(42),
+                ..Default::default()
+            }),
+            Err(zx::Status::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            adapter.install_key(WlanKeyConfiguration {
+                protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
+                cipher_oui: Some([0x00, 0x0f, 0xac]),
+                cipher_type: Some(4),
+                peer_addr: Some(PEER),
+                key_idx: Some(0),
+                key: Some(vec![0x55; 16]),
+                rsc: Some(0),
+                ..Default::default()
+            }),
+            Err(zx::Status::NOT_SUPPORTED)
+        );
+        assert_eq!(adapter.set_link_up(true), Err(zx::Status::NOT_SUPPORTED));
+        assert_eq!(adapter.set_link_up(false), Err(zx::Status::NOT_SUPPORTED));
+        assert!(adapter.device.backend().operations().is_empty());
     }
 
     #[test]
