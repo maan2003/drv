@@ -2502,6 +2502,17 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
         }
         Ok(())
     }
+    fn acquire_client_join_roc(
+        &mut self,
+        _: ClientPhysicalChannel,
+        _: u64,
+        duration_ms: u32,
+    ) -> Result<u32, zx::Status> {
+        Ok(duration_ms)
+    }
+    fn abort_client_join_roc(&mut self, _: u64) -> Result<(), zx::Status> {
+        Ok(())
+    }
     fn submit_client_edca(&mut self, encoded: &[u8]) -> Result<(), zx::Status> {
         if encoded.len() != 108
             || encoded.get(36..39) != Some(&[0x1d, 0xa0, 1])
