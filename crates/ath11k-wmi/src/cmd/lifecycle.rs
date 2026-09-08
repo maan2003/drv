@@ -64,6 +64,10 @@ impl<T: Transport> Wmi<T> {
         self.events.pop_pending()
     }
 
+    pub fn next_event(&mut self, deadline_ns: u64) -> Result<Option<crate::Event>, WmiError> {
+        self.events.next_event(deadline_ns)
+    }
+
     pub fn detach(self) -> T {
         self.events.into_inner()
     }

@@ -1,4 +1,4 @@
-use crate::{CoreError, PdevId, VdevId};
+use crate::{CoreError, PdevId, VdevId, WlanEvent};
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,6 +287,9 @@ pub trait Subsystems {
     /// Drive the event-oriented QMI handshake until firmware reports ready.
     /// The returned value is consumed by core rather than supplied by its caller.
     fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError>;
+
+    /// Receive the next hardware event consumed by the WlanSoftmac half.
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError>;
 }
 
 /// Deterministic subsystem model used before transports are attached and by
@@ -295,6 +298,7 @@ pub trait Subsystems {
 pub struct ModelSubsystems {
     operations: Vec<Operation>,
     fail_next: Option<Operation>,
+    events: Vec<WlanEvent>,
 }
 impl ModelSubsystems {
     pub fn operations(&self) -> &[Operation] {
@@ -305,6 +309,9 @@ impl ModelSubsystems {
     }
     pub fn fail_once(&mut self, operation: Operation) {
         self.fail_next = Some(operation);
+    }
+    pub fn push_event(&mut self, event: WlanEvent) {
+        self.events.push(event);
     }
 }
 impl Subsystems for ModelSubsystems {
@@ -324,5 +331,13 @@ impl Subsystems for ModelSubsystems {
             firmware_version: 1,
             target_mem_mode: 0,
         })
+    }
+
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
+        if self.events.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.events.remove(0)))
+        }
     }
 }

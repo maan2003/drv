@@ -56,6 +56,7 @@ dependencies = [
  "ath11k-core",
  "ath11k-qmi",
  "ath11k-qmi-qrtr",
+ "ath11k-wmi",
  "drv-hardware",
  "drv-hardware-backends",
  "sha2",

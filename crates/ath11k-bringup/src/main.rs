@@ -10,15 +10,28 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let result = if config.dry_run {
-        run(&config, &mut DryRunHost::default())
+    let (result, summary) = if config.dry_run {
+        let mut host = DryRunHost::default();
+        let result = run(&config, &mut host);
+        (result, host.scan_summary().cloned())
     } else {
-        run(&config, &mut RealHost::default())
+        let mut host = RealHost::default();
+        let result = run(&config, &mut host);
+        (result, host.scan_summary().cloned())
     };
     match result {
         Ok(stages) => {
             for stage in stages {
                 println!("completed {}", stage.as_str());
+            }
+            if let Some(summary) = summary {
+                if let Some(selected) = summary.selected {
+                    println!("selected {selected}");
+                } else {
+                    for bss in summary.bsses {
+                        println!("bss {bss}");
+                    }
+                }
             }
         }
         Err(error) => {

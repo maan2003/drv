@@ -1,6 +1,6 @@
 //! Concrete composition of QMI, CE/HTC, WMI, and HTT for WCN6750.
 
-use crate::{CoreError, Operation, Subsystems, Wcn6750QmiSession};
+use crate::{CoreError, Operation, Subsystems, Wcn6750QmiSession, WlanEvent};
 use alloc::vec::Vec;
 use ath11k_ce::{
     BoundService, CE_COUNT, CeAllocatedPipes, CeCompletionWait, CePipes, CePipesPacketIo, Htc,
@@ -20,12 +20,55 @@ use ath11k_qmi::{
     },
 };
 use ath11k_wmi::{
-    Command, Event, Transport as WmiTransport, WmiError,
+    Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
-        HtcWmiTransport, Init, ScanControlFlags, ScanEventFlags, ScanStart, StaPowerSaveMode,
-        StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevSetParam, Wmi,
+        HtcWmiTransport, Init, StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams, VdevCreate,
+        VdevSetParam, Wmi,
     },
 };
+
+pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart {
+    use ath11k_wmi::cmd::{ScanControlFlags, ScanEventFlags, ScanStart};
+    ScanStart {
+        scan_id: scan.id.0,
+        scan_requester_id: 1,
+        vdev_id: u32::from(scan.vdev.0),
+        scan_priority: 0,
+        notify_scan_events: 0,
+        event_flags: ScanEventFlags {
+            completed: true,
+            ..Default::default()
+        },
+        control_flags: ScanControlFlags {
+            passive: !scan.active,
+            strict_passive: !scan.active,
+            ..Default::default()
+        },
+        control_flags_ext: 0,
+        dwell_time_active: 0,
+        dwell_time_active_2ghz: 0,
+        dwell_time_passive: 110,
+        dwell_time_active_6ghz: 0,
+        dwell_time_passive_6ghz: 110,
+        min_rest_time: 50,
+        max_rest_time: 500,
+        repeat_probe_time: 0,
+        probe_spacing_time: 0,
+        idle_time: 0,
+        max_scan_time: 30_000,
+        probe_delay: 0,
+        burst_duration: 0,
+        n_probes: 0,
+        mac_addr: [0; 6],
+        mac_mask: [0; 6],
+        channels: scan.channels_mhz.into_iter().map(u32::from).collect(),
+        ssids: scan.ssids,
+        bssids: Vec::new(),
+        extra_ie: Vec::new(),
+        short_ssid_hints: Vec::new(),
+        bssid_hints: Vec::new(),
+    }
+}
 
 const RDP_BYTES: usize = 176 * 4;
 
@@ -329,6 +372,40 @@ where
             .map_err(|_| CoreError::Protocol)
     }
 
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
+        use ath11k_wmi::event::{Decoder, EventDecoder as _, MgmtRx, Scan};
+        use ath11k_wmi::tags::{WMI_MGMT_RX_EVENTID, WMI_SCAN_EVENTID};
+
+        loop {
+            let deadline = (self.deadline)();
+            let mut event = Self::protocol(self.wmi.as_mut())?
+                .next_event(deadline)
+                .map_err(|_| CoreError::Protocol)?;
+            if event.is_none() {
+                self.pump()?;
+                event = Self::protocol(self.wmi.as_mut())?
+                    .next_event(deadline)
+                    .map_err(|_| CoreError::Protocol)?;
+            }
+            let Some(event) = event else { return Ok(None) };
+            let id = event.id;
+            let decoded = match id {
+                WMI_MGMT_RX_EVENTID => WlanEvent::from(
+                    Decoder::<MgmtRx>::new(id)
+                        .decode(event)
+                        .map_err(|_| CoreError::Protocol)?,
+                ),
+                WMI_SCAN_EVENTID => WlanEvent::from(
+                    Decoder::<Scan>::new(id)
+                        .decode(event)
+                        .map_err(|_| CoreError::Protocol)?,
+                ),
+                EventId(_) => continue,
+            };
+            return Ok(Some(decoded));
+        }
+    }
+
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError> {
         match operation {
             Operation::QmiInitService => self.qmi.init_service().map_err(|_| CoreError::Protocol),
@@ -498,45 +575,7 @@ where
                 param_id: 1,
                 param_value: threshold,
             }),
-            Operation::WmiScanStart(scan) => self.wmi_send(&ScanStart {
-                scan_id: scan.id.0,
-                scan_requester_id: 1,
-                vdev_id: u32::from(scan.vdev.0),
-                scan_priority: 0,
-                notify_scan_events: 0,
-                event_flags: ScanEventFlags {
-                    completed: true,
-                    ..Default::default()
-                },
-                control_flags: ScanControlFlags {
-                    passive: !scan.active,
-                    strict_passive: !scan.active,
-                    ..Default::default()
-                },
-                control_flags_ext: 0,
-                dwell_time_active: 0,
-                dwell_time_active_2ghz: 0,
-                dwell_time_passive: 110,
-                dwell_time_active_6ghz: 0,
-                dwell_time_passive_6ghz: 110,
-                min_rest_time: 50,
-                max_rest_time: 500,
-                repeat_probe_time: 0,
-                probe_spacing_time: 0,
-                idle_time: 0,
-                max_scan_time: 30_000,
-                probe_delay: 0,
-                burst_duration: 0,
-                n_probes: 0,
-                mac_addr: [0; 6],
-                mac_mask: [0; 6],
-                channels: scan.channels_mhz.into_iter().map(u32::from).collect(),
-                ssids: scan.ssids,
-                bssids: Vec::new(),
-                extra_ie: Vec::new(),
-                short_ssid_hints: Vec::new(),
-                bssid_hints: Vec::new(),
-            }),
+            Operation::WmiScanStart(scan) => self.wmi_send(&wcn6750_scan_start(scan)),
             Operation::WmiDetach => self.teardown_transport(),
             // The first hardware run intentionally polls DP ring shadows. Do
             // not enable DP eventfds until an MSI doorbell mapping exists.

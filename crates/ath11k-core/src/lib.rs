@@ -27,7 +27,7 @@ pub use operation::{
     OperationTarget, RegulatoryChannel, RegulatoryDomain, ScanConfig, ScanId, Subsystems,
 };
 pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
-pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink};
+pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink, wcn6750_scan_start};
 
 use alloc::vec::Vec;
 use ath11k_qmi::FirmwareReady;
@@ -62,6 +62,20 @@ pub trait Lifecycle {
     fn attach_firmware(&mut self) -> Result<FirmwareReady, CoreError>;
     fn start_radio(&mut self) -> Result<(), CoreError>;
     fn stop(&mut self) -> Result<(), CoreError>;
+}
+
+/// Ordered firmware event source handed upward after lifecycle initialization.
+pub trait EventSource {
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError>;
+}
+
+impl<B: Subsystems> EventSource for Device<B> {
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        self.backend.next_wlan_event()
+    }
 }
 
 /// The frozen, minimal hardware-effects interface.

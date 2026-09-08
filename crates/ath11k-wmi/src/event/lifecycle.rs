@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::tags::{
     WMI_READY_EVENTID, WMI_SERVICE_AVAILABLE_EVENTID, WMI_SERVICE_READY_EVENTID,
-    WMI_SERVICE_READY_EXT2_EVENTID, WMI_SERVICE_READY_EXT_EVENTID, WMI_TAG_ARRAY_STRUCT,
+    WMI_SERVICE_READY_EXT_EVENTID, WMI_SERVICE_READY_EXT2_EVENTID, WMI_TAG_ARRAY_STRUCT,
     WMI_TAG_ARRAY_UINT32, WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT,
     WMI_TAG_HW_MODE_CAPABILITIES, WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT,
     WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
@@ -13,7 +13,7 @@ use crate::tags::{
 use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, Transport, WmiError};
 
-use super::{word, EventDecoder, Ready, ReadyDecoder, TlvIter};
+use super::{EventDecoder, Ready, ReadyDecoder, TlvIter, word};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceReadyFixed {
@@ -471,6 +471,17 @@ impl<T: Transport> EventStream<T> {
             None
         } else {
             Some(self.pending.remove(0))
+        }
+    }
+
+    /// Return the oldest event retained by an earlier lifecycle wait, or
+    /// receive the next event from firmware. This preserves firmware order
+    /// when ownership passes from bring-up waits to the runtime event pump.
+    pub fn next_event(&mut self, deadline_ns: u64) -> Result<Option<Event>, WmiError> {
+        if let Some(event) = self.pop_pending() {
+            Ok(Some(event))
+        } else {
+            self.transport.receive(deadline_ns)
         }
     }
 
