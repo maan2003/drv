@@ -36,6 +36,44 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     let connac_mac =
         std::fs::read_to_string(mt76.join("mt76_connac_mac.c")).expect("read Connac2 MAC C");
     let mt7921_mac = std::fs::read_to_string(mt76.join("mt7921/mac.c")).expect("read MT7921 MAC C");
+    let mt792x_core =
+        std::fs::read_to_string(mt76.join("mt792x_core.c")).expect("read MT792x core C");
+    let util = std::fs::read_to_string(mt76.join("util.c")).expect("read mt76 util C");
+    let poll_function = item(
+        &util,
+        "bool ____mt76_poll_msec(",
+        "EXPORT_SYMBOL_GPL(____mt76_poll_msec);",
+    );
+    let driver_pm_function = item(
+        &mt792x_core,
+        "int __mt792xe_mcu_drv_pmctrl(",
+        "EXPORT_SYMBOL_GPL(__mt792xe_mcu_drv_pmctrl);",
+    );
+    let firmware_pm_function = item(
+        &mt792x_core,
+        "int mt792xe_mcu_fw_pmctrl(",
+        "EXPORT_SYMBOL_GPL(mt792xe_mcu_fw_pmctrl);",
+    );
+    let start_firmware_function = item(
+        &mcu,
+        "int mt76_connac_mcu_start_firmware(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_start_firmware);",
+    );
+    let patch_sem_function = item(
+        &mcu,
+        "int mt76_connac_mcu_patch_sem_ctrl(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_patch_sem_ctrl);",
+    );
+    let start_patch_function = item(
+        &mcu,
+        "int mt76_connac_mcu_start_patch(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_start_patch);",
+    );
+    let init_download_function = item(
+        &mcu,
+        "int mt76_connac_mcu_init_download(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_init_download);",
+    );
     let mcu_function = item(
         &mcu,
         "int mt76_connac2_mcu_fill_message(",
@@ -106,7 +144,7 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     std::fs::write(
         &generated,
         format!(
-            "{}\n{mcu_function}\n{channel_domain_function}\n{channel_info_function}\n{clc_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{dma_get_buf_function}\n{dma_dequeue_function}\n{dma_rx_cleanup_function}\n{fill_txs_function}\n{add_txs_skb_function}\n{add_txs_function}\n{wrapper}",
+            "{}\n{poll_function}\n{driver_pm_function}\n{firmware_pm_function}\n{start_firmware_function}\n{patch_sem_function}\n{start_patch_function}\n{init_download_function}\n{mcu_function}\n{channel_domain_function}\n{channel_info_function}\n{clc_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{dma_get_buf_function}\n{dma_dequeue_function}\n{dma_rx_cleanup_function}\n{fill_txs_function}\n{add_txs_skb_function}\n{add_txs_function}\n{wrapper}",
             prelude()
         ),
     )
@@ -194,7 +232,7 @@ struct ieee80211_supported_band { struct ieee80211_rate bitrates[64]; struct iee
 struct mt76_sband { struct ieee80211_supported_band sband; };
 struct ieee80211_channel { int band; int center_freq; u16 hw_value; u32 flags; };
 struct cfg80211_chan_def { struct ieee80211_channel *chan; int center_freq1, center_freq2, width; };
-struct mt76_phy { struct mt76_dev *dev; struct cfg80211_chan_def chandef; struct mt76_sband sband_2g, sband_5g, sband_6g; u8 antenna_mask; bool offchannel; };
+struct mt76_phy { struct mt76_dev *dev; struct cfg80211_chan_def chandef; struct mt76_sband sband_2g, sband_5g, sband_6g; u64 state; u8 antenna_mask; bool offchannel; };
 struct ieee80211_conf { u32 flags; };
 struct ieee80211_hw { struct ieee80211_conf conf; void *wiphy; };
 struct mt76_driver_ops { int (*rx_rro_add_msdu_page)(struct mt76_dev *, struct mt76_queue *, dma_addr_t, void *); };
@@ -220,6 +258,7 @@ static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p
 #define ENOMEM 12
 #define ENOENT 2
 #define EAGAIN 11
+#define EIO 5
 #define ETIMEDOUT 110
 #define le16_to_cpu(x) ((u16)(x))
 #define le32_to_cpu(x) ((u32)(x))
@@ -227,6 +266,9 @@ static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p
 static inline void mt792x_reset(struct mt76_dev *dev) { (void)dev; }
 #define MCU_CMD_PATCH_SEM_CONTROL 0x10
 #define MCU_CMD_PATCH_FINISH_REQ 0x07
+#define MCU_CMD_FW_START_REQ 0x02
+#define MCU_CMD_PATCH_START_REQ 0x05
+#define MCU_CMD_TARGET_ADDRESS_LEN_REQ 0x01
 #define MCU_CMD_THERMAL_CTRL 0x2c
 #define MCU_CMD_DEV_INFO_UPDATE 0x01
 #define MCU_CMD_BSS_INFO_UPDATE 0x02
@@ -355,7 +397,55 @@ struct sk_buff_head { int unused; };
 struct mt792x_link_sta { struct mt76_wcid wcid; };
 struct mt792x_dev;
 struct mt792x_phy { struct mt76_phy *mt76; struct mt792x_dev *dev; u8 power_type; u64 chip_cap; u8 clc_chan_conf; };
-struct mt792x_dev { struct mt76_dev mt76; struct mt792x_phy phy; struct mt792x_link_sta *wcids[MT792x_WTBL_SIZE]; };
+struct mt76_connac_pm_stats { u64 last_wake_event, last_doze_event, awake_time, doze_time; };
+struct mt76_connac_pm { int mutex; struct mt76_connac_pm_stats stats; };
+struct mt792x_dev { struct mt76_dev mt76; struct mt792x_phy phy; struct mt76_connac_pm pm; struct mt792x_link_sta *wcids[MT792x_WTBL_SIZE]; bool aspm_supported; };
+#define MT792x_DRV_OWN_RETRY_COUNT 10
+#define MT_CONN_ON_LPCTL 0x7c060010
+#define PCIE_LPCR_HOST_SET_OWN BIT(0)
+#define PCIE_LPCR_HOST_CLR_OWN BIT(1)
+#define PCIE_LPCR_HOST_OWN_SYNC BIT(2)
+#define MT76_STATE_PM 0
+#define PATCH_SEM_RELEASE 0
+#define PATCH_SEM_GET 1
+#define MCU_PATCH_ADDRESS 0x200000
+static inline bool is_connac_v1(struct mt76_dev *d) { (void)d; return false; }
+static inline bool is_connac2(struct mt76_dev *d) { (void)d; return true; }
+static inline bool is_mt7925(struct mt76_dev *d) { (void)d; return false; }
+static inline bool is_mt799x(struct mt76_dev *d) { (void)d; return false; }
+static inline void clear_bit(unsigned int bit, u64 *value) { *value &= ~(1ULL << bit); }
+static u64 jiffies;
+struct oracle_power_event { u8 kind; u8 pad[3]; u32 value; u64 at_us; };
+static struct oracle_power_event oracle_power_events[2048];
+static size_t oracle_power_event_count;
+static u64 oracle_power_time_us;
+static u8 oracle_power_success_attempt, oracle_power_success_read;
+static u8 oracle_power_attempt, oracle_power_read;
+static bool oracle_power_firmware;
+static void oracle_power_push(u8 kind, u32 value) {
+    oracle_power_events[oracle_power_event_count++] =
+        (struct oracle_power_event){ kind, {0}, value, oracle_power_time_us };
+}
+static inline void oracle_mt76_wr(struct mt792x_dev *d, u32 reg, u32 value) {
+    (void)d; (void)reg; oracle_power_attempt++; oracle_power_read = 0;
+    oracle_power_push(1, value);
+}
+#define mt76_wr(dev, reg, value) oracle_mt76_wr((dev), (reg), (value))
+static inline u32 __mt76_rr(struct mt76_dev *d, u32 reg) {
+    bool success;
+    (void)d; (void)reg; oracle_power_read++;
+    success = oracle_power_success_attempt == oracle_power_attempt &&
+              oracle_power_success_read == oracle_power_read;
+    u32 value = oracle_power_firmware ? (success ? PCIE_LPCR_HOST_OWN_SYNC : 0)
+                                      : (success ? 0 : PCIE_LPCR_HOST_OWN_SYNC);
+    oracle_power_push(2, value);
+    return value;
+}
+static inline void usleep_range(u64 minimum, u64 maximum) {
+    (void)maximum; oracle_power_push(3, (u32)minimum);
+    oracle_power_time_us += minimum;
+}
+#define mt76_poll_msec_tick(dev, ...) ____mt76_poll_msec(&((dev)->mt76), __VA_ARGS__)
 struct mt7921_clc_rule { u8 alpha2[2]; u8 type[2]; __le16 len; u8 data[]; } __packed;
 struct mt7921_clc { __le32 len; u8 idx, ver, nr_country, type; u8 rsv[8]; u8 data[]; } __packed;
 struct mt7921_clc_info_tlv { __le16 tag, len; u8 chan_conf; u8 rsv[63]; } __packed;

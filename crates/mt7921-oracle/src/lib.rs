@@ -10,9 +10,15 @@ mod tests {
         RingPublisher, WfdmaRing,
     };
     use mt7921_core::{DownloadCommand, encode_download_command};
+    use mt7921_core::{
+        FirmwareOwnershipEvent, OwnershipEvent, OwnershipRoundTripEvent,
+        OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
+        PCIE_LPCR_HOST_OWN_SYNC, PCIE_LPCR_HOST_SET_OWN, acquire_driver_ownership_with_aspm,
+        round_trip_driver_ownership,
+    };
     use proptest::prelude::*;
 
-    static CHANNEL_ORACLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static C_ORACLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,6 +110,15 @@ mod tests {
         center_channel: u8,
         request_type: u8,
         max_interval_ms: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CPowerEvent {
+        kind: u8,
+        pad: [u8; 3],
+        value: u32,
+        at_us: u64,
     }
 
     unsafe extern "C" {
@@ -259,6 +274,24 @@ mod tests {
             data_len: u16,
             output: *mut u8,
         ) -> i32;
+        fn oracle_power_control(
+            firmware: bool,
+            aspm: bool,
+            success_attempt: u8,
+            success_read: u8,
+            events: *mut CPowerEvent,
+            event_count: *mut usize,
+            elapsed_us: *mut u64,
+        ) -> i32;
+        fn oracle_download_command(
+            kind: u8,
+            sequence: u8,
+            address: u32,
+            length: u32,
+            mode: u32,
+            output: *mut u8,
+            output_capacity: usize,
+        ) -> i32;
     }
 
     fn c_fill(payload: &[u8], command: i32, sequence: u8) -> Vec<u8> {
@@ -310,7 +343,7 @@ mod tests {
         offchannel: bool,
         sequence: u8,
     ) -> Vec<u8> {
-        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
         let mut payload = [0; 76];
         let band = match channel.band {
             mt7921_core::PhysicalBand::Ghz2 => 0,
@@ -336,7 +369,7 @@ mod tests {
     }
 
     fn c_channel_domain(command: &mt7921_core::ChannelDomainCommand, sequence: u8) -> Vec<u8> {
-        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
         let bands = command
             .channels
             .iter()
@@ -374,7 +407,7 @@ mod tests {
     }
 
     fn c_clc(command: &mt7921_core::ClcSetCommand, sequence: u8) -> Vec<u8> {
-        let _guard = CHANNEL_ORACLE_LOCK.lock().unwrap();
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
         let mut payload = vec![0; 76 + command.data.len()];
         // SAFETY: fixed fields and data remain live, and `payload` is sized to
         // the request length accepted by the valid public command.
@@ -559,7 +592,44 @@ mod tests {
     }
 
     fn c_mcu(command: DownloadCommand, sequence: u8) -> Vec<u8> {
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
         let rust = encode_download_command(command, sequence).expect("valid typed command");
+        let exact = match command {
+            DownloadCommand::PatchStart {
+                address,
+                length,
+                mode,
+            }
+            | DownloadCommand::TargetAddressLength {
+                address,
+                length,
+                mode,
+            } => Some((0, address, length, mode)),
+            DownloadCommand::PatchSemaphoreGet => Some((1, 0, 0, 0)),
+            DownloadCommand::PatchSemaphoreRelease => Some((2, 0, 0, 0)),
+            DownloadCommand::PatchFinish => Some((3, 0, 0, 0)),
+            DownloadCommand::FirmwareStart { address, option } => Some((4, address, 0, option)),
+            _ => None,
+        };
+        if let Some((kind, address, length, mode)) = exact {
+            let mut output = vec![0; rust.len()];
+            // SAFETY: output is live with its exact advertised capacity. The
+            // scalar command values are accepted by the public Rust encoder.
+            let actual = unsafe {
+                oracle_download_command(
+                    kind,
+                    sequence,
+                    address,
+                    length,
+                    mode,
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            };
+            assert!(actual >= 0);
+            output.truncate(actual as usize);
+            return output;
+        }
         let payload = &rust[mt7921_core::CONNAC2_MCU_TXD_BYTES..];
         let mut output = vec![0; rust.len()];
         // SAFETY: both slices remain live for the call and advertise their exact
@@ -874,6 +944,218 @@ mod tests {
         }
     }
 
+    fn c_power(
+        firmware: bool,
+        aspm: bool,
+        success_attempt: u8,
+        success_read: u8,
+    ) -> (i32, Vec<(u8, u32)>, u64) {
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
+        let mut events = [CPowerEvent::default(); 2048];
+        let mut count = 0;
+        let mut elapsed = 0;
+        // SAFETY: the fixed event array and scalar outputs remain live for the
+        // call and are larger than the bounded ten-attempt trace.
+        let result = unsafe {
+            oracle_power_control(
+                firmware,
+                aspm,
+                success_attempt,
+                success_read,
+                events.as_mut_ptr(),
+                &mut count,
+                &mut elapsed,
+            )
+        };
+        assert!(count <= events.len());
+        (
+            result,
+            events[..count]
+                .iter()
+                .map(|event| (event.kind, event.value))
+                .collect(),
+            elapsed,
+        )
+    }
+
+    struct PowerTransport {
+        now_us: u64,
+        attempt: u8,
+        read: u8,
+        success_attempt: u8,
+        success_read: u8,
+        restore_attempt: u8,
+        restore_read: u8,
+        firmware_phase: bool,
+        trace: Vec<(u8, u32)>,
+    }
+
+    impl PowerTransport {
+        fn new(success_attempt: u8, success_read: u8) -> Self {
+            Self {
+                now_us: 0,
+                attempt: 0,
+                read: 0,
+                success_attempt,
+                success_read,
+                restore_attempt: success_attempt,
+                restore_read: success_read,
+                firmware_phase: false,
+                trace: Vec::new(),
+            }
+        }
+
+        fn transition_succeeds(&self) -> bool {
+            let (attempt, read) = if self.firmware_phase {
+                (self.restore_attempt, self.restore_read)
+            } else {
+                (self.success_attempt, self.success_read)
+            };
+            self.attempt == attempt && self.read == read
+        }
+    }
+
+    impl OwnershipTransport for PowerTransport {
+        type Error = ();
+
+        fn now_ms(&self) -> u64 {
+            self.now_us / 1_000
+        }
+
+        fn write_clear_own(&mut self) -> Result<(), Self::Error> {
+            self.firmware_phase = false;
+            self.attempt += 1;
+            self.read = 0;
+            self.trace.push((1, PCIE_LPCR_HOST_CLR_OWN));
+            Ok(())
+        }
+
+        fn read_low_power_control(&mut self) -> Result<u32, Self::Error> {
+            self.read += 1;
+            let value = if self.firmware_phase {
+                u32::from(self.transition_succeeds()) * PCIE_LPCR_HOST_OWN_SYNC
+            } else if self.transition_succeeds() {
+                0
+            } else {
+                PCIE_LPCR_HOST_OWN_SYNC
+            };
+            self.trace.push((2, value));
+            Ok(value)
+        }
+
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.trace.push((3, (milliseconds * 1_000) as u32));
+            self.now_us += milliseconds * 1_000;
+        }
+
+        fn sleep_us_range(&mut self, minimum: u64, _maximum: u64) {
+            self.trace.push((3, minimum as u32));
+            self.now_us += minimum;
+        }
+    }
+
+    impl OwnershipRoundTripTransport for PowerTransport {
+        fn write_set_own(&mut self) -> Result<(), Self::Error> {
+            if self.firmware_phase {
+                self.attempt += 1;
+            } else {
+                self.attempt = 1;
+            }
+            self.firmware_phase = true;
+            self.read = 0;
+            self.trace.push((1, PCIE_LPCR_HOST_SET_OWN));
+            Ok(())
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn driver_power_control_register_trace_matches_linux_on_success(
+            attempt in 1u8..=10,
+            read in 1u8..=51,
+            aspm: bool,
+        ) {
+            let (c_result, c_trace, _) = c_power(false, aspm, attempt, read);
+            let mut rust = PowerTransport::new(attempt, read);
+            let mut events = Vec::new();
+            let result = acquire_driver_ownership_with_aspm(&mut rust, aspm, |event| events.push(event));
+            prop_assert_eq!(c_result, 0);
+            prop_assert_eq!(result, Ok(()));
+            let register_trace = |trace: &[(u8, u32)]| trace.iter().copied()
+                .filter(|event| event.0 != 3).collect::<Vec<_>>();
+            prop_assert_eq!(register_trace(&rust.trace), register_trace(&c_trace));
+            prop_assert_eq!(matches!(events.last(), Some(OwnershipEvent::Acquired { .. })), true);
+        }
+
+        #[test]
+        fn firmware_power_control_register_trace_matches_linux_on_success(
+            attempt in 1u8..=10,
+            read in 1u8..=51,
+        ) {
+            let (c_result, c_trace, _) = c_power(true, false, attempt, read);
+            let mut rust = PowerTransport::new(1, 1);
+            rust.restore_attempt = attempt;
+            rust.restore_read = read;
+            let mut events = Vec::new();
+            let result = round_trip_driver_ownership(&mut rust, false, |event| events.push(event));
+            let set = rust.trace.iter().position(|event| *event == (1, PCIE_LPCR_HOST_SET_OWN)).unwrap();
+            prop_assert_eq!(c_result, 0);
+            prop_assert!(result.is_ok());
+            let rust_registers = rust.trace[set..].iter().copied()
+                .filter(|event| event.0 != 3).collect::<Vec<_>>();
+            let c_registers = c_trace.iter().copied()
+                .filter(|event| event.0 != 3).collect::<Vec<_>>();
+            prop_assert_eq!(rust_registers, c_registers);
+            prop_assert_eq!(events.iter().any(|event| matches!(event,
+                OwnershipRoundTripEvent::Firmware(FirmwareOwnershipEvent::Restored { .. }))), true);
+        }
+    }
+
+    #[test]
+    fn linux_power_timeout_has_one_terminal_sleep_per_attempt() {
+        let (c_driver, c_trace, c_elapsed) = c_power(false, false, 0, 0);
+        let mut rust = PowerTransport::new(0, 0);
+        assert!(acquire_driver_ownership_with_aspm(&mut rust, false, |_| {}).is_err());
+        assert_eq!(c_driver, -5);
+        assert_eq!(c_elapsed, 510_000);
+        assert_eq!(rust.now_us, 500_000);
+        assert_eq!(c_trace.iter().filter(|event| event.0 == 1).count(), 10);
+        assert_eq!(c_trace.iter().filter(|event| event.0 == 2).count(), 510);
+        assert_eq!(c_trace.iter().filter(|event| event.0 == 3).count(), 510);
+        assert_eq!(rust.trace.iter().filter(|event| event.0 == 3).count(), 500);
+
+        let (c_firmware, _, c_elapsed) = c_power(true, false, 0, 0);
+        let mut rust = PowerTransport::new(1, 1);
+        rust.restore_attempt = 0;
+        rust.restore_read = 0;
+        assert!(round_trip_driver_ownership(&mut rust, false, |_| {}).is_err());
+        let set = rust
+            .trace
+            .iter()
+            .position(|event| *event == (1, PCIE_LPCR_HOST_SET_OWN))
+            .unwrap();
+        let rust_firmware_sleeps = rust.trace[set..]
+            .iter()
+            .filter(|event| event.0 == 3)
+            .count();
+        assert_eq!((c_firmware, c_elapsed), (-5, 510_000));
+        assert_eq!(rust_firmware_sleeps, 500);
+    }
+
+    #[test]
+    fn connac2_init_download_reclassifies_patch_address() {
+        let command = DownloadCommand::TargetAddressLength {
+            address: 0x0090_0000,
+            length: 4096,
+            mode: 0x8000_0001,
+        };
+        let rust = encode_download_command(command, 7).unwrap();
+        let c = c_mcu(command, 7);
+        assert_eq!(rust[36], 0x01);
+        assert_eq!(c[36], 0x05);
+        assert_ne!(rust, c);
+    }
+
     #[test]
     fn valid_ppdu_txs_is_ignored_by_both_implementations() {
         let mut txs = [0u32; 8];
@@ -1062,6 +1344,9 @@ mod tests {
             eeprom_block in 0u32..=0x9f,
             release: bool,
         ) {
+            // The reserved Connac2 patch address is a documented valid-domain
+            // mismatch covered by `connac2_init_download_reclassifies_patch_address`.
+            let target_address = if address == 0x0090_0000 { address + 1 } else { address };
             let commands = [
                 DownloadCommand::NicPowerControl,
                 DownloadCommand::GetNicCapability,
@@ -1073,7 +1358,7 @@ mod tests {
                 DownloadCommand::PatchFinish,
                 DownloadCommand::FirmwareStart { address: 0x0091_5000, option: 1 },
                 DownloadCommand::PatchStart { address: 0x0090_0000, length, mode },
-                DownloadCommand::TargetAddressLength { address, length, mode },
+                DownloadCommand::TargetAddressLength { address: target_address, length, mode },
             ];
             for command in commands {
                 prop_assert_eq!(encode_download_command(command, sequence).unwrap(), c_mcu(command, sequence));
