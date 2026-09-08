@@ -131,6 +131,25 @@ macro_rules! flag_accessors {
 fixed_descriptor!(RxdmaBufferRing, 8);
 
 impl RxdmaBufferRing {
+    /// Port of `ath11k_hal_rx_buf_addr_info_set` and the RXDMA buffer-ring
+    /// descriptor construction path.
+    pub fn for_buffer<B: Backend>(
+        address: &DeviceAddress<'_, B, FromDevice>,
+        cookie: u32,
+        manager: u8,
+    ) -> Self {
+        let mut descriptor = Self::new();
+        descriptor
+            .set_address_bits(address.bits())
+            .expect("40-bit RXDMA address");
+        let high_address = read_word(&descriptor.0, 1) & 0xff;
+        write_word(
+            &mut descriptor.0,
+            1,
+            high_address | (u32::from(manager) & 7) << 8 | (cookie & 0x1f_ffff) << 11,
+        );
+        descriptor
+    }
     pub fn address(&self) -> u64 {
         u64::from(read_word(&self.0, 0)) | (u64::from(field(&self.0, 1, 0xff)) << 32)
     }
@@ -158,6 +177,23 @@ impl RxdmaBufferRing {
         u8
     );
     field_accessors!(software_cookie, set_software_cookie, 1, 0xffff_f800, u32);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferAddressInfo {
+    pub address: u64,
+    pub cookie: u32,
+    pub return_buffer_manager: u8,
+}
+impl RxdmaBufferRing {
+    /// Port of `ath11k_hal_rx_buf_addr_info_get`.
+    pub fn info(&self) -> BufferAddressInfo {
+        BufferAddressInfo {
+            address: self.address(),
+            cookie: self.software_cookie(),
+            return_buffer_manager: self.return_buffer_manager(),
+        }
+    }
 }
 
 // `struct rx_mpdu_desc`, embedded in REO descriptors.
@@ -412,6 +448,21 @@ impl ReoEntranceRing {
     field_accessors!(rxdma_error_code, set_rxdma_error_code, 6, 0x7c, u8);
     field_accessors!(ring_id, set_ring_id, 7, 0x0ff0_0000, u8);
     field_accessors!(looping_count, set_looping_count, 7, 0xf000_0000, u8);
+
+    /// Port of `ath11k_hal_rx_reo_ent_buf_paddr_get`.
+    pub fn received_buffer(&self) -> ReoEntranceBuffer {
+        let buffer = self.buffer_address();
+        ReoEntranceBuffer {
+            info: buffer.info(),
+            msdu_count: self.mpdu().msdu_count(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReoEntranceBuffer {
+    pub info: BufferAddressInfo,
+    pub msdu_count: u8,
 }
 
 // `struct hal_reo_dest_ring`.
@@ -533,6 +584,65 @@ impl WbmReleaseRing {
     field_accessors!(tid, set_tid, 7, 0x000f_0000, u8);
     field_accessors!(ring_id, set_ring_id, 7, 0x0ff0_0000, u8);
     field_accessors!(looping_count, set_looping_count, 7, 0xf000_0000, u8);
+}
+
+// `struct hal_rx_msdu_details` and `struct hal_rx_msdu_link`.
+fixed_descriptor!(RxMsduDetails, 16);
+impl RxMsduDetails {
+    pub fn buffer_address(&self) -> RxdmaBufferRing {
+        RxdmaBufferRing::from_bytes(&self.0[..8]).expect("embedded fixed layout")
+    }
+    pub fn msdu(&self) -> RxMsduDescriptor {
+        RxMsduDescriptor::from_bytes(&self.0[8..]).expect("embedded fixed layout")
+    }
+}
+
+fixed_descriptor!(RxMsduLink, 128);
+impl RxMsduLink {
+    pub fn next_link(&self) -> RxdmaBufferRing {
+        RxdmaBufferRing::from_bytes(&self.0[4..12]).expect("embedded fixed layout")
+    }
+    pub fn rx_queue_number(&self) -> u16 {
+        field(&self.0, 3, 0xffff) as u16
+    }
+    pub fn first_link(&self) -> bool {
+        flag(&self.0, 3, 1 << 16)
+    }
+    pub fn msdu(&self, index: usize) -> Option<RxMsduDetails> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = 32 + index * 16;
+        Some(
+            RxMsduDetails::from_bytes(&self.0[offset..offset + 16]).expect("embedded fixed layout"),
+        )
+    }
+    /// Port of `ath11k_hal_rx_msdu_link_info_get`. Linux takes RBM from the
+    /// first slot and stops at the first slot whose low address word is zero.
+    pub fn info(&self) -> RxMsduLinkInfo {
+        let first = self.msdu(0).expect("six fixed slots").buffer_address();
+        let mut result = RxMsduLinkInfo {
+            count: 6,
+            cookies: [0; 6],
+            return_buffer_manager: first.return_buffer_manager(),
+        };
+        for index in 0..6 {
+            let buffer = self.msdu(index).expect("six fixed slots").buffer_address();
+            if read_word(buffer.as_bytes(), 0) == 0 {
+                result.count = index as u8;
+                break;
+            }
+            result.cookies[index] = buffer.software_cookie();
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RxMsduLinkInfo {
+    pub count: u8,
+    pub cookies: [u32; 6],
+    pub return_buffer_manager: u8,
 }
 
 // `struct hal_ce_srng_src_desc`.

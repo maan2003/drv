@@ -44,3 +44,8 @@ oracle-checked, or hardware-checked.
 | hal.c:`ath11k_hal_srng_src_reap_next` | `Srng::source_reap_next` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
 | hal.c:`ath11k_hal_srng_src_get_next_reaped` | `Srng::source_next_reaped` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
 | hal.c:`ath11k_hal_srng_src_next_peek` | `Srng::source_next_peek` | ported | source-derived arithmetic |
+| hal_rx.c:`ath11k_hal_rx_buf_addr_info_set/get` | `RxdmaBufferRing::for_buffer/info`, `BufferAddressInfo` | oracle-checked | `reo_and_rxdma_masks_land_in_oracle_words` |
+| hal_rx.c:`ath11k_hal_rx_reo_ent_buf_paddr_get` | `ReoEntranceRing::received_buffer` | oracle-checked | REO/RXDMA oracle fixture |
+| hal_rx.c:`ath11k_hal_rx_msdu_link_info_get` | `RxMsduLink::info`, `RxMsduLinkInfo` | oracle-checked | `msdu_link_info_stops_at_first_zero_low_address` |
+| hal_desc.h:`struct hal_rx_msdu_details` | `RxMsduDetails` | oracle-checked | MSDU-link fixture |
+| hal_desc.h:`struct hal_rx_msdu_link` | `RxMsduLink` | oracle-checked | 128-byte MSDU-link fixture |

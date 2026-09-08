@@ -106,6 +106,23 @@ fn reo_and_rxdma_masks_land_in_oracle_words() {
 }
 
 #[test]
+fn msdu_link_info_stops_at_first_zero_low_address() {
+    let mut bytes = [0_u8; 128];
+    // msdu_link starts at byte 32; each hal_rx_msdu_details is 16 bytes.
+    bytes[32..36].copy_from_slice(&0x1234_u32.to_le_bytes());
+    bytes[36..40].copy_from_slice(&(3_u32 << 8 | 0x4567_u32 << 11).to_le_bytes());
+    bytes[48..52].copy_from_slice(&0x5678_u32.to_le_bytes());
+    bytes[52..56].copy_from_slice(&(3_u32 << 8 | 0x89ab_u32 << 11).to_le_bytes());
+    let link = RxMsduLink::from_bytes(&bytes).unwrap();
+    let info = link.info();
+    assert_eq!(info.count, 2);
+    assert_eq!(info.return_buffer_manager, 3);
+    assert_eq!(&info.cookies[..2], &[0x4567, 0x89ab]);
+    assert_eq!(link.msdu(0).unwrap().buffer_address().address(), 0x1234);
+    assert!(link.msdu(6).is_none());
+}
+
+#[test]
 fn ce_and_wbm_layouts_are_little_endian() {
     let mut source = CeSourceDescriptor::from_bytes(&[
         0xef, 0xbe, 0xad, 0xde, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
