@@ -5,3 +5,6 @@ edition.workspace=true
 license.workspace=true
 [dependencies]
 ath11k-hal={path="../ath11k-hal"}
+ath11k-platform-backend={path="../ath11k-platform-backend"}
+[dev-dependencies]
+drv-hardware-backends={path="../hardware-backends"}

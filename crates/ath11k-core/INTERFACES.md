@@ -52,7 +52,12 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
   DMA addresses remain allocation-derived `DeviceAddress` values. Ring
   publication is streaming-buffer sync followed by a release-ordered index
   write, while consumption acquire-reads the hardware pointer before bytes.
-- **CE:** `ServiceId`, `TxFrame`/`RxFrame`, and `Transport`.
+- **CE:** `ServiceId`, `TxFrame`/`RxFrame`, and `Transport` are the common
+  transport floor. Its source-shaped lifecycle also exposes CE pipe allocation,
+  initialization, attachment/service, RX posting, send and free, plus HTC
+  initialization, target-ready wait, service connection, setup-complete
+  start/stop and TX completion. Core composes those seams; CE retains
+  streaming-DMA packet-buffer and endpoint-credit ownership.
 - **QMI:** bounded `Request`, `Response`, `Transport`, `Handshake`, and
   `FirmwareReady`.
 - **WMI:** `CommandId`/`EventId`, word-aligned checked TLV envelopes,
