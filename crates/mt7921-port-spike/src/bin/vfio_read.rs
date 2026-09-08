@@ -609,7 +609,6 @@ impl Drop for NetstackChildGuard {
     }
 }
 
-
 #[cfg(feature = "fuchsia-passive")]
 fn prebind_socks_listener(address: SocketAddr) -> Result<TcpListener, String> {
     const SOCK_STREAM: i32 = 1;
@@ -751,7 +750,13 @@ fn spawn_netstack_child(
         listener: Some(listener),
         handshake: NetworkReadyHandshake::default(),
     };
-    drop((frame, frame_pass, listener_pass, bootstrap_pass, bootstrap_child));
+    drop((
+        frame,
+        frame_pass,
+        listener_pass,
+        bootstrap_pass,
+        bootstrap_child,
+    ));
     let bootstrap = child.bootstrap.as_mut().expect("bootstrap installed");
     let mut ready = [0u8; 5];
     bootstrap
@@ -878,9 +883,7 @@ fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_runtime_descriptors(
-    descriptors: &[(String, String)],
-) -> Result<(), String> {
+fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
     let mut base = [false; 5];
     let mut seen = Vec::new();
     for (name, target) in descriptors {
@@ -3387,14 +3390,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             beacon_period: 100,
             capability_info: 0x11,
             ies: vec![
-                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12,
-                48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
-                0, 0x0f, 0xac, 2, 0, 0,
+                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1,
+                0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
                 // Production association shaping requires the AP's base HT
                 // and VHT capabilities before applying the device profile.
-                45, 26, 0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                191, 12, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+                45, 26, 0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 191, 12, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0,
+                0x20,
             ],
             primary: channel,
             bandwidth: ChannelBandwidth::Cbw80,
@@ -14338,139 +14340,21 @@ impl Mt7921ClientEffects for LiveClientEffects {
             return Ok(ClientRxPoll::Idle);
         };
         let outcome = (|| -> Result<Option<ClientRxFrame>, zx::Status> {
-        let control = frame
-            .bytes
-            .get(..2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-            .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-        let authentication = control & 0x00fc == 0x00b0;
-        if authentication {
-            let admitted = {
-                let state = self.state.lock().unwrap();
-                state
-                    .channel
-                    .authorized_channel()
-                    .ok()
-                    .filter(|channel| {
-                        state.selection.permits_join(self.target, *channel)
-                            && channel.channel.band
-                                == match frame.status.primary.band {
-                                    WlanBand::TwoGhz => 0,
-                                    WlanBand::FiveGhz => 1,
-                                    _ => u8::MAX,
-                                }
-                            && channel.channel.primary == u16::from(frame.status.primary.number)
-                    })
-                    .is_some()
-            };
-            if !admitted {
-                record_sae_stage("client_rx_filtered reason=stale_or_wrong_channel subtype=auth");
-                return Ok(None);
-            }
-            match classify_preassociation_sae_auth(&frame.bytes, self.client, self.target) {
-                Ok(Some(auth)) => {
-                    record_sae_auth_frame_structure("rx", &frame.bytes);
-                    record_sae_stage(&format!(
-                        "client_rx_admitted subtype=auth transaction={} status={} address_match=true",
-                        auth.transaction, auth.status
-                    ));
-                }
-                Ok(None) => unreachable!("authentication subtype was checked"),
-                Err(reason) => {
-                    record_sae_stage(&format!(
-                        "client_rx_filtered reason={reason} subtype=auth address_match=false"
-                    ));
-                    return Ok(None);
-                }
-            }
-            if frame.bytes.get(26..28) == Some(&[2, 0]) {
-                self.abort_join_roc(io)?;
-            }
-        } else if control & 0x000c == 0 {
-            let subtype = ((control >> 4) & 15) as u8;
-            let protected = control & 0x4000 != 0;
-            if protected && matches!(subtype, 10 | 12) {
-                let association_generation = self.firmware.association_generation;
-                let pmf = self
-                    .firmware
-                    .association
-                    .is_some_and(|association| association.mfp_required);
-                let key_current = self.firmware.ptk_installed
-                    && self.firmware.ptk_rx_pn.is_some()
-                    && !self.firmware.firmware_uncertain
-                    && association_generation.is_some();
-                let decrypted = frame.security.is_some_and(|security| {
-                    security.security_mode == 4
-                        && !security.cm
-                        && !security.clm
-                        && !security.icv_error
-                        && !security.mic_error
-                        && !security.fcs_error
-                        && security.pn.is_some()
-                });
-                record_sae_stage(&format!(
-                    "protected_management_candidate subtype={subtype} fc_protected=true rx_security={} decrypted={decrypted} key_current={key_current} association_generation={} pmf={pmf}",
-                    frame.security.is_some(),
-                    association_generation
-                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
-                ));
-                let admitted = frame.security.and_then(|security| {
-                    association_generation.map(|generation| ClientRxCandidate {
-                        generation: ClientDataGeneration::Association(generation),
-                        eapol: false,
-                        wcid: security.wcid,
-                        tid: security.tid,
-                        group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
-                        key_id: security.key_id,
-                        security_mode: security.security_mode,
-                        cm: security.cm,
-                        clm: security.clm,
-                        icv_error: security.icv_error,
-                        mic_error: security.mic_error,
-                        fcs_error: security.fcs_error,
-                        pn: security.pn.unwrap_or([0; 6]),
-                    })
-                });
-                if !decrypted {
-                    record_sae_stage(&format!(
-                        "client_rx_integrity_validation result=drop reason=protected_not_decrypted subtype={subtype}"
-                    ));
-                    return Err(zx::Status::IO_DATA_INTEGRITY);
-                }
-                let Some(admitted) = admitted else {
-                    record_sae_stage(&format!(
-                        "client_rx_filtered reason=protected_stale_or_unassociated subtype={subtype}"
-                    ));
-                    return Ok(None);
-                };
-                if let Err(reason) = self.firmware.deliver_protected_management_rx(admitted) {
-                    record_sae_stage(&format!(
-                        "client_rx_integrity_validation result=drop reason={reason} subtype={subtype}"
-                    ));
-                    return Err(zx::Status::IO_DATA_INTEGRITY);
-                }
-                // Connac2 leaves the CCMP header and MIC in an otherwise
-                // decrypted management MPDU. Strip them only after the
-                // current-key/generation and replay checks above succeed.
-                strip_verified_management_ccmp(&mut frame.bytes)
-                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
-                record_sae_stage(&format!(
-                    "protected_management_admitted subtype={subtype} decrypted=true key_generation_current=true"
-                ));
-            }
-            let classification =
-                classify_client_management_frame(&frame.bytes, self.client, self.target);
-            let channel_generation_match = {
-                let state = self.state.lock().unwrap();
-                state
-                    .channel
-                    .authorized_channel()
-                    .ok()
-                    .is_some_and(|channel| {
-                        self.firmware.joined.is_some_and(|joined| {
-                            joined.bssid == self.target
-                                && joined.channel == channel.channel.primary
-                                && joined.channel_generation == channel.generation
+            let control = frame
+                .bytes
+                .get(..2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+            let authentication = control & 0x00fc == 0x00b0;
+            if authentication {
+                let admitted = {
+                    let state = self.state.lock().unwrap();
+                    state
+                        .channel
+                        .authorized_channel()
+                        .ok()
+                        .filter(|channel| {
+                            state.selection.permits_join(self.target, *channel)
                                 && channel.channel.band
                                     == match frame.status.primary.band {
                                         WlanBand::TwoGhz => 0,
@@ -14479,93 +14363,216 @@ impl Mt7921ClientEffects for LiveClientEffects {
                                     }
                                 && channel.channel.primary == u16::from(frame.status.primary.number)
                         })
-                    })
-            };
-            if classification.subtype == 1 {
-                let capability = frame
-                    .bytes
-                    .get(24..26)
-                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
-                let status = frame
-                    .bytes
-                    .get(26..28)
-                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
-                let raw_aid = frame
-                    .bytes
-                    .get(28..30)
-                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
-                let sequence = frame
-                    .bytes
-                    .get(22..24)
-                    .map(|field| u16::from_le_bytes([field[0], field[1]]) >> 4);
-                record_sae_stage(&format!(
-                    "association_response_structure monotonic_ns={} capability={} status={} raw_aid={} retry={} sequence={} fixed_fields_complete={}",
-                    management_tx_monotonic_ns(),
-                    capability
-                        .map_or_else(|| "unknown".to_string(), |value| format!("0x{value:04x}")),
-                    status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-                    raw_aid.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-                    control & 0x0800 != 0,
-                    sequence.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-                    capability.is_some()
-                        && status.is_some()
-                        && raw_aid.is_some()
-                        && sequence.is_some(),
-                ));
-                record_sae_stage(&format!(
-                    "association_response_candidate addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} channel_generation_match={channel_generation_match}",
-                    classification.addr1_is_client,
-                    classification.addr2_is_peer,
-                    classification.addr3_is_bssid,
-                ));
-            }
-            if !channel_generation_match
-                || !self
-                    .firmware
-                    .accepts_joined_management(&frame.bytes, self.client)
-            {
-                let reason = if !channel_generation_match {
-                    "stale_or_wrong_channel"
-                } else if !classification.addr1_is_client {
-                    "foreign_receiver"
-                } else {
-                    "foreign_bss"
+                        .is_some()
+                };
+                if !admitted {
+                    record_sae_stage(
+                        "client_rx_filtered reason=stale_or_wrong_channel subtype=auth",
+                    );
+                    return Ok(None);
+                }
+                match classify_preassociation_sae_auth(&frame.bytes, self.client, self.target) {
+                    Ok(Some(auth)) => {
+                        record_sae_auth_frame_structure("rx", &frame.bytes);
+                        record_sae_stage(&format!(
+                            "client_rx_admitted subtype=auth transaction={} status={} address_match=true",
+                            auth.transaction, auth.status
+                        ));
+                    }
+                    Ok(None) => unreachable!("authentication subtype was checked"),
+                    Err(reason) => {
+                        record_sae_stage(&format!(
+                            "client_rx_filtered reason={reason} subtype=auth address_match=false"
+                        ));
+                        return Ok(None);
+                    }
+                }
+                if frame.bytes.get(26..28) == Some(&[2, 0]) {
+                    self.abort_join_roc(io)?;
+                }
+            } else if control & 0x000c == 0 {
+                let subtype = ((control >> 4) & 15) as u8;
+                let protected = control & 0x4000 != 0;
+                if protected && matches!(subtype, 10 | 12) {
+                    let association_generation = self.firmware.association_generation;
+                    let pmf = self
+                        .firmware
+                        .association
+                        .is_some_and(|association| association.mfp_required);
+                    let key_current = self.firmware.ptk_installed
+                        && self.firmware.ptk_rx_pn.is_some()
+                        && !self.firmware.firmware_uncertain
+                        && association_generation.is_some();
+                    let decrypted = frame.security.is_some_and(|security| {
+                        security.security_mode == 4
+                            && !security.cm
+                            && !security.clm
+                            && !security.icv_error
+                            && !security.mic_error
+                            && !security.fcs_error
+                            && security.pn.is_some()
+                    });
+                    record_sae_stage(&format!(
+                        "protected_management_candidate subtype={subtype} fc_protected=true rx_security={} decrypted={decrypted} key_current={key_current} association_generation={} pmf={pmf}",
+                        frame.security.is_some(),
+                        association_generation
+                            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    ));
+                    let admitted = frame.security.and_then(|security| {
+                        association_generation.map(|generation| ClientRxCandidate {
+                            generation: ClientDataGeneration::Association(generation),
+                            eapol: false,
+                            wcid: security.wcid,
+                            tid: security.tid,
+                            group: frame.bytes.get(4).is_some_and(|byte| byte & 1 != 0),
+                            key_id: security.key_id,
+                            security_mode: security.security_mode,
+                            cm: security.cm,
+                            clm: security.clm,
+                            icv_error: security.icv_error,
+                            mic_error: security.mic_error,
+                            fcs_error: security.fcs_error,
+                            pn: security.pn.unwrap_or([0; 6]),
+                        })
+                    });
+                    if !decrypted {
+                        record_sae_stage(&format!(
+                            "client_rx_integrity_validation result=drop reason=protected_not_decrypted subtype={subtype}"
+                        ));
+                        return Err(zx::Status::IO_DATA_INTEGRITY);
+                    }
+                    let Some(admitted) = admitted else {
+                        record_sae_stage(&format!(
+                            "client_rx_filtered reason=protected_stale_or_unassociated subtype={subtype}"
+                        ));
+                        return Ok(None);
+                    };
+                    if let Err(reason) = self.firmware.deliver_protected_management_rx(admitted) {
+                        record_sae_stage(&format!(
+                            "client_rx_integrity_validation result=drop reason={reason} subtype={subtype}"
+                        ));
+                        return Err(zx::Status::IO_DATA_INTEGRITY);
+                    }
+                    // Connac2 leaves the CCMP header and MIC in an otherwise
+                    // decrypted management MPDU. Strip them only after the
+                    // current-key/generation and replay checks above succeed.
+                    strip_verified_management_ccmp(&mut frame.bytes)
+                        .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                    record_sae_stage(&format!(
+                        "protected_management_admitted subtype={subtype} decrypted=true key_generation_current=true"
+                    ));
+                }
+                let classification =
+                    classify_client_management_frame(&frame.bytes, self.client, self.target);
+                let channel_generation_match = {
+                    let state = self.state.lock().unwrap();
+                    state
+                        .channel
+                        .authorized_channel()
+                        .ok()
+                        .is_some_and(|channel| {
+                            self.firmware.joined.is_some_and(|joined| {
+                                joined.bssid == self.target
+                                    && joined.channel == channel.channel.primary
+                                    && joined.channel_generation == channel.generation
+                                    && channel.channel.band
+                                        == match frame.status.primary.band {
+                                            WlanBand::TwoGhz => 0,
+                                            WlanBand::FiveGhz => 1,
+                                            _ => u8::MAX,
+                                        }
+                                    && channel.channel.primary
+                                        == u16::from(frame.status.primary.number)
+                            })
+                        })
                 };
                 if classification.subtype == 1 {
+                    let capability = frame
+                        .bytes
+                        .get(24..26)
+                        .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                    let status = frame
+                        .bytes
+                        .get(26..28)
+                        .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                    let raw_aid = frame
+                        .bytes
+                        .get(28..30)
+                        .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                    let sequence = frame
+                        .bytes
+                        .get(22..24)
+                        .map(|field| u16::from_le_bytes([field[0], field[1]]) >> 4);
                     record_sae_stage(&format!(
-                        "association_response_drop subreason={reason} channel_generation_match={channel_generation_match}"
+                        "association_response_structure monotonic_ns={} capability={} status={} raw_aid={} retry={} sequence={} fixed_fields_complete={}",
+                        management_tx_monotonic_ns(),
+                        capability.map_or_else(
+                            || "unknown".to_string(),
+                            |value| format!("0x{value:04x}")
+                        ),
+                        status.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                        raw_aid.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                        control & 0x0800 != 0,
+                        sequence.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                        capability.is_some()
+                            && status.is_some()
+                            && raw_aid.is_some()
+                            && sequence.is_some(),
+                    ));
+                    record_sae_stage(&format!(
+                        "association_response_candidate addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} channel_generation_match={channel_generation_match}",
+                        classification.addr1_is_client,
+                        classification.addr2_is_peer,
+                        classification.addr3_is_bssid,
                     ));
                 }
-                record_sae_stage(&format!(
-                    "client_rx_filtered reason={reason} subtype={}",
-                    classification.subtype
-                ));
-                return Ok(None);
-            }
-            self.observe_target_beacon_tim(&frame.bytes);
-            if classification.subtype == 1 {
-                record_sae_stage(
-                    "association_response_admitted address_match=true channel_generation_match=true",
-                );
-                record_sae_stage(&format!(
-                    "association_response_ies ie_id_lengths={}",
-                    management_ie_id_lengths(&frame.bytes, 30)
-                ));
-                let status = frame
-                    .bytes
-                    .get(26..28)
-                    .map(|field| u16::from_le_bytes([field[0], field[1]]));
-                let comeback = association_comeback_interval(&frame.bytes, 30);
-                if let Some((tu, ms)) = comeback {
+                if !channel_generation_match
+                    || !self
+                        .firmware
+                        .accepts_joined_management(&frame.bytes, self.client)
+                {
+                    let reason = if !channel_generation_match {
+                        "stale_or_wrong_channel"
+                    } else if !classification.addr1_is_client {
+                        "foreign_receiver"
+                    } else {
+                        "foreign_bss"
+                    };
+                    if classification.subtype == 1 {
+                        record_sae_stage(&format!(
+                            "association_response_drop subreason={reason} channel_generation_match={channel_generation_match}"
+                        ));
+                    }
                     record_sae_stage(&format!(
-                        "association_comeback advertised=true valid=true tu={tu} ms={ms}"
+                        "client_rx_filtered reason={reason} subtype={}",
+                        classification.subtype
                     ));
-                } else if status == Some(30) {
+                    return Ok(None);
+                }
+                self.observe_target_beacon_tim(&frame.bytes);
+                if classification.subtype == 1 {
                     record_sae_stage(
-                        "association_comeback advertised=unknown valid=false tu=unknown ms=unknown",
+                        "association_response_admitted address_match=true channel_generation_match=true",
                     );
-                }
-                record_sae_stage(&match status {
+                    record_sae_stage(&format!(
+                        "association_response_ies ie_id_lengths={}",
+                        management_ie_id_lengths(&frame.bytes, 30)
+                    ));
+                    let status = frame
+                        .bytes
+                        .get(26..28)
+                        .map(|field| u16::from_le_bytes([field[0], field[1]]));
+                    let comeback = association_comeback_interval(&frame.bytes, 30);
+                    if let Some((tu, ms)) = comeback {
+                        record_sae_stage(&format!(
+                            "association_comeback advertised=true valid=true tu={tu} ms={ms}"
+                        ));
+                    } else if status == Some(30) {
+                        record_sae_stage(
+                            "association_comeback advertised=unknown valid=false tu=unknown ms=unknown",
+                        );
+                    }
+                    record_sae_stage(&match status {
                     Some(0) => "mlme_association_disposition result=success status=0 retry_supported=true".to_string(),
                     Some(30) if comeback.is_some() => "mlme_association_disposition result=comeback status=30 retry_supported=true".to_string(),
                     Some(status) => format!(
@@ -14573,159 +14580,159 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     ),
                     None => "mlme_association_disposition result=malformed status=unknown retry_supported=true".to_string(),
                 });
-                if status.is_some_and(|status| status != 0) {
-                    self.abort_join_roc(io)?;
-                    record_sae_stage(&format!(
-                        "join_roc_lifecycle phase=association_response status={} abort=non_success_before_retry",
-                        status.expect("non-success status was checked")
-                    ));
+                    if status.is_some_and(|status| status != 0) {
+                        self.abort_join_roc(io)?;
+                        record_sae_stage(&format!(
+                            "join_roc_lifecycle phase=association_response status={} abort=non_success_before_retry",
+                            status.expect("non-success status was checked")
+                        ));
+                    }
+                }
+                if matches!(classification.subtype, 10 | 12) {
+                    self.invalidate_association_rx();
+                    self.eapol_start_deadline = None;
                 }
             }
-            if matches!(classification.subtype, 10 | 12) {
-                self.invalidate_association_rx();
-                self.eapol_start_deadline = None;
-            }
-        }
-        if control & 0x000c == 0x0008 {
-            let observation_started = self.post_association_data_wait.take();
-            if let Some(started) = observation_started {
-                record_sae_stage(&format!(
-                    "post_association_first_data result=observed elapsed_ms={} data_candidate=true",
-                    started.elapsed().as_millis()
-                ));
-            }
-            let classification = classify_client_data_frame(&frame.bytes, self.client, self.target);
-            let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-            let eapol = classification.snap_present
-                && classification.ether_type == Some(0x888e)
-                && classification.llc_result == "valid";
-            let generation = self.firmware.tx_generation(eapol);
-            let association_generation_match =
-                self.firmware
+            if control & 0x000c == 0x0008 {
+                let observation_started = self.post_association_data_wait.take();
+                if let Some(started) = observation_started {
+                    record_sae_stage(&format!(
+                        "post_association_first_data result=observed elapsed_ms={} data_candidate=true",
+                        started.elapsed().as_millis()
+                    ));
+                }
+                let classification =
+                    classify_client_data_frame(&frame.bytes, self.client, self.target);
+                let security = frame.security.ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+                let eapol = classification.snap_present
+                    && classification.ether_type == Some(0x888e)
+                    && classification.llc_result == "valid";
+                let generation = self.firmware.tx_generation(eapol);
+                let association_generation_match = self
+                    .firmware
                     .association_generation
                     .is_some_and(|expected| {
                         generation == Ok(ClientDataGeneration::Association(expected))
                     });
-            record_sae_stage(&format!(
-                "client_data_candidate frame_type={} subtype={} to_ds={} from_ds={} protected={} header_offset={} qos={} amsdu={} addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} snap_present={} ether_type={} llc_result={} wcid={} security_mode={} cm={} clm={} icv_error={} mic_error={} fcs_error={} association_generation_match={association_generation_match}",
-                classification.frame_type,
-                classification.subtype,
-                classification.to_ds,
-                classification.from_ds,
-                classification.protected,
-                classification.header_offset,
-                classification.qos,
-                classification.amsdu,
-                classification.addr1_is_client,
-                classification.addr2_is_peer,
-                classification.addr3_is_bssid,
-                classification.snap_present,
-                classification.ether_type.map_or(0, u16::from),
-                classification.llc_result,
-                security.wcid,
-                security.security_mode,
-                security.cm,
-                security.clm,
-                security.icv_error,
-                security.mic_error,
-                security.fcs_error,
-            ));
-            record_sae_stage(&format!(
-                "firmware_rx_lookup observed_wcid={} peer_wcid={} lookup_match={} firmware_wcid_stage={} association_generation_match={association_generation_match}",
-                security.wcid,
-                self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
-                self.peer_wcid
-                    .is_some_and(|wcid| security.wcid == u16::from(wcid.get())),
-                if self.firmware.association.is_some() {
-                    "associated"
-                } else if self.firmware.preauth_peer.is_some() {
-                    "preauth"
-                } else {
-                    "absent"
-                },
-            ));
-            let drop = |subreason| {
                 record_sae_stage(&format!(
-                    "client_data_drop subreason={subreason} wcid={} association_generation_match={association_generation_match}",
-                    security.wcid
+                    "client_data_candidate frame_type={} subtype={} to_ds={} from_ds={} protected={} header_offset={} qos={} amsdu={} addr1_is_client={} addr2_is_peer={} addr3_is_bssid={} snap_present={} ether_type={} llc_result={} wcid={} security_mode={} cm={} clm={} icv_error={} mic_error={} fcs_error={} association_generation_match={association_generation_match}",
+                    classification.frame_type,
+                    classification.subtype,
+                    classification.to_ds,
+                    classification.from_ds,
+                    classification.protected,
+                    classification.header_offset,
+                    classification.qos,
+                    classification.amsdu,
+                    classification.addr1_is_client,
+                    classification.addr2_is_peer,
+                    classification.addr3_is_bssid,
+                    classification.snap_present,
+                    classification.ether_type.map_or(0, u16::from),
+                    classification.llc_result,
+                    security.wcid,
+                    security.security_mode,
+                    security.cm,
+                    security.clm,
+                    security.icv_error,
+                    security.mic_error,
+                    security.fcs_error,
                 ));
-            };
-            let firmware_rx_ready =
-                self.firmware
-                    .association_generation
-                    .is_some_and(|generation| {
-                        self.firmware.qos_tx_ready()
-                            && self.post_assoc_rx_ready_generation == Some(generation)
+                record_sae_stage(&format!(
+                    "firmware_rx_lookup observed_wcid={} peer_wcid={} lookup_match={} firmware_wcid_stage={} association_generation_match={association_generation_match}",
+                    security.wcid,
+                    self.peer_wcid.map(ClientWcid::get).unwrap_or(0),
+                    self.peer_wcid
+                        .is_some_and(|wcid| security.wcid == u16::from(wcid.get())),
+                    if self.firmware.association.is_some() {
+                        "associated"
+                    } else if self.firmware.preauth_peer.is_some() {
+                        "preauth"
+                    } else {
+                        "absent"
+                    },
+                ));
+                let drop = |subreason| {
+                    record_sae_stage(&format!(
+                        "client_data_drop subreason={subreason} wcid={} association_generation_match={association_generation_match}",
+                        security.wcid
+                    ));
+                };
+                let firmware_rx_ready =
+                    self.firmware
+                        .association_generation
+                        .is_some_and(|generation| {
+                            self.firmware.qos_tx_ready()
+                                && self.post_assoc_rx_ready_generation == Some(generation)
+                        });
+                if self.firmware.association.is_none() {
+                    drop("no_association");
+                    return Ok(None);
+                }
+                if eapol && !firmware_rx_ready {
+                    record_sae_stage(&format!(
+                        "post_assoc_rx_ready_debug qos_tx_ready={} ready_generation={:?} association_generation={:?} eapol_start_emitted={}",
+                        self.firmware.qos_tx_ready(),
+                        self.post_assoc_rx_ready_generation,
+                        self.firmware.association_generation,
+                        self.eapol_start_emitted,
+                    ));
+                    drop("post_assoc_rx_not_ready");
+                    return Ok(None);
+                }
+                if classification.to_ds || !classification.from_ds {
+                    drop("direction_not_ap_to_sta");
+                    return Ok(None);
+                }
+                if !classification.addr1_is_client {
+                    drop("foreign_receiver");
+                    return Ok(None);
+                }
+                if !classification.addr2_is_peer {
+                    drop("foreign_transmitter");
+                    return Ok(None);
+                }
+                if eapol && !classification.addr3_is_bssid {
+                    drop("foreign_bssid");
+                    return Ok(None);
+                }
+                let current_channel = {
+                    let state = self.state.lock().unwrap();
+                    state.channel.authorized_channel().is_ok_and(|channel| {
+                        channel.channel.band
+                            == match frame.status.primary.band {
+                                WlanBand::TwoGhz => 0,
+                                WlanBand::FiveGhz => 1,
+                                _ => u8::MAX,
+                            }
+                            && channel.channel.primary == u16::from(frame.status.primary.number)
+                    })
+                };
+                if !current_channel {
+                    drop("wrong_channel");
+                    return Ok(None);
+                }
+                if security.wcid == 1023 && classification.llc_result != "valid" {
+                    drop(match classification.llc_result {
+                        "llc_truncated" | "header_truncated" => "malformed_llc",
+                        "amsdu" => "amsdu_unicast_search_miss",
+                        _ => "non_snap_sentinel",
                     });
-            if self.firmware.association.is_none() {
-                drop("no_association");
-                return Ok(None);
-            }
-            if eapol && !firmware_rx_ready {
-                record_sae_stage(&format!(
-                    "post_assoc_rx_ready_debug qos_tx_ready={} ready_generation={:?} association_generation={:?} eapol_start_emitted={}",
-                    self.firmware.qos_tx_ready(),
-                    self.post_assoc_rx_ready_generation,
-                    self.firmware.association_generation,
-                    self.eapol_start_emitted,
-                ));
-                drop("post_assoc_rx_not_ready");
-                return Ok(None);
-            }
-            if classification.to_ds || !classification.from_ds {
-                drop("direction_not_ap_to_sta");
-                return Ok(None);
-            }
-            if !classification.addr1_is_client {
-                drop("foreign_receiver");
-                return Ok(None);
-            }
-            if !classification.addr2_is_peer {
-                drop("foreign_transmitter");
-                return Ok(None);
-            }
-            if eapol && !classification.addr3_is_bssid {
-                drop("foreign_bssid");
-                return Ok(None);
-            }
-            let current_channel = {
-                let state = self.state.lock().unwrap();
-                state.channel.authorized_channel().is_ok_and(|channel| {
-                    channel.channel.band
-                        == match frame.status.primary.band {
-                            WlanBand::TwoGhz => 0,
-                            WlanBand::FiveGhz => 1,
-                            _ => u8::MAX,
-                        }
-                        && channel.channel.primary == u16::from(frame.status.primary.number)
-                })
-            };
-            if !current_channel {
-                drop("wrong_channel");
-                return Ok(None);
-            }
-            if security.wcid == 1023 && classification.llc_result != "valid" {
-                drop(match classification.llc_result {
-                    "llc_truncated" | "header_truncated" => "malformed_llc",
-                    "amsdu" => "amsdu_unicast_search_miss",
-                    _ => "non_snap_sentinel",
-                });
-                return Ok(None);
-            }
-            if security.wcid == 1023 && !eapol {
-                drop("non_eapol_sentinel");
-                return Ok(None);
-            }
-            if security.wcid == 1023 && !classification.addr3_is_bssid {
-                drop("foreign_bssid_sentinel");
-                return Ok(None);
-            }
-            let generation = generation.map_err(|_| {
-                drop("security_generation_gate");
-                zx::Status::ACCESS_DENIED
-            })?;
-            let validation = self.firmware
-                .deliver_rx(ClientRxCandidate {
+                    return Ok(None);
+                }
+                if security.wcid == 1023 && !eapol {
+                    drop("non_eapol_sentinel");
+                    return Ok(None);
+                }
+                if security.wcid == 1023 && !classification.addr3_is_bssid {
+                    drop("foreign_bssid_sentinel");
+                    return Ok(None);
+                }
+                let generation = generation.map_err(|_| {
+                    drop("security_generation_gate");
+                    zx::Status::ACCESS_DENIED
+                })?;
+                let validation = self.firmware.deliver_rx(ClientRxCandidate {
                     generation,
                     eapol,
                     wcid: security.wcid,
@@ -14740,45 +14747,47 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     fcs_error: security.fcs_error,
                     pn: security.pn.unwrap_or([0; 6]),
                 });
-            if let Err(reason) = validation {
-                drop("security_replay_or_integrity");
+                if let Err(reason) = validation {
+                    drop("security_replay_or_integrity");
+                    record_sae_stage(&format!(
+                        "client_rx_integrity_validation result=drop reason={reason}"
+                    ));
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
+                }
+                let m1 = is_exact_target_eapol_candidate(&classification)
+                    && is_authenticator_m1(&frame.bytes);
+                if m1 {
+                    self.post_association_data_wait = None;
+                    self.eapol_start_deadline = None;
+                    record_sae_stage(
+                        "eapol_liveness type=start timer=cancelled one_shot=suppressed",
+                    );
+                }
                 record_sae_stage(&format!(
-                    "client_rx_integrity_validation result=drop reason={reason}"
+                    "client_data_admitted eapol={eapol} wcid={} association_generation_match={association_generation_match}",
+                    security.wcid
                 ));
+            } else if control & 0x000c != 0 {
                 return Err(zx::Status::IO_DATA_INTEGRITY);
+            } else if authentication {
+                let sequence = frame
+                    .bytes
+                    .get(26..28)
+                    .map(|value| u16::from_le_bytes([value[0], value[1]]))
+                    .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+                let status = frame
+                    .bytes
+                    .get(28..30)
+                    .map(|value| u16::from_le_bytes([value[0], value[1]]))
+                    .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
+                record_sae_stage(match sequence {
+                    1 => "sae_peer_commit_rx",
+                    2 => "sae_peer_confirm_rx",
+                    _ => "sae_peer_protocol_rx",
+                });
+                println!(r#"{{"sae_peer_status":{{"sequence":{sequence},"status":{status}}}}}"#);
             }
-            let m1 = is_exact_target_eapol_candidate(&classification)
-                && is_authenticator_m1(&frame.bytes);
-            if m1 {
-                self.post_association_data_wait = None;
-                self.eapol_start_deadline = None;
-                record_sae_stage("eapol_liveness type=start timer=cancelled one_shot=suppressed");
-            }
-            record_sae_stage(&format!(
-                "client_data_admitted eapol={eapol} wcid={} association_generation_match={association_generation_match}",
-                security.wcid
-            ));
-        } else if control & 0x000c != 0 {
-            return Err(zx::Status::IO_DATA_INTEGRITY);
-        } else if authentication {
-            let sequence = frame
-                .bytes
-                .get(26..28)
-                .map(|value| u16::from_le_bytes([value[0], value[1]]))
-                .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-            let status = frame
-                .bytes
-                .get(28..30)
-                .map(|value| u16::from_le_bytes([value[0], value[1]]))
-                .ok_or(zx::Status::IO_DATA_INTEGRITY)?;
-            record_sae_stage(match sequence {
-                1 => "sae_peer_commit_rx",
-                2 => "sae_peer_confirm_rx",
-                _ => "sae_peer_protocol_rx",
-            });
-            println!(r#"{{"sae_peer_status":{{"sequence":{sequence},"status":{status}}}}}"#);
-        }
-        Ok(Some(frame))
+            Ok(Some(frame))
         })();
         match outcome {
             Ok(Some(frame)) => Ok(ClientRxPoll::Frame(frame)),
@@ -16275,8 +16284,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         }
         let sequence = self.loader.sequence % 15 + 1;
         self.active_join_roc = None;
-        let command = encode_client_join_roc_abort(sequence, 0, token)
-            .map_err(|_| zx::Status::IO)?;
+        let command =
+            encode_client_join_roc_abort(sequence, 0, token).map_err(|_| zx::Status::IO)?;
         self.loader.send_unacknowledged_uni_command(0x27, &command).map_err(|(error, _)| {
             record_sae_stage(&format!("join_roc_abort result=error token={token} generation={generation} reason={error}"));
             zx::Status::IO
@@ -18895,7 +18904,9 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "fuchsia-passive")]
-    fn poll_option(poll: mt7921_softmac_adapter::client_device::ClientRxPoll) -> Option<ClientRxFrame> {
+    fn poll_option(
+        poll: mt7921_softmac_adapter::client_device::ClientRxPoll,
+    ) -> Option<ClientRxFrame> {
         use mt7921_softmac_adapter::client_device::ClientRxPoll;
         match poll {
             ClientRxPoll::Frame(frame) => Some(frame),
@@ -20727,7 +20738,9 @@ mod tests {
             security: None,
         });
         assert_eq!(
-            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap())
+                .unwrap()
+                .bytes,
             association_response
         );
         assert!(effects.firmware.association.is_none());
@@ -20740,7 +20753,9 @@ mod tests {
             security: None,
         });
         assert_eq!(
-            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap())
+                .unwrap()
+                .bytes,
             association_response
         );
         assert!(effects.firmware.association.is_none());
@@ -20842,7 +20857,9 @@ mod tests {
             security: Some(peer_security),
         });
         assert_eq!(
-            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap())
+                .unwrap()
+                .bytes,
             inbound_eapol
         );
         effects.eapol_start_deadline = Some((Instant::now(), generation));
@@ -20854,7 +20871,9 @@ mod tests {
             security: Some(peer_security),
         });
         assert_eq!(
-            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap())
+                .unwrap()
+                .bytes,
             inbound_eapol
         );
         assert!(effects.eapol_start_deadline.is_none());
@@ -22124,8 +22143,10 @@ mod tests {
         assert!(connect < spawn && spawn < pump);
         let launcher = include_str!("vfio_read.rs");
         let process = launcher
-            .find(r#".spawn()
-        .map_err(|error| format!("spawn netstack child"#)
+            .find(
+                r#".spawn()
+        .map_err(|error| format!("spawn netstack child"#,
+            )
             .unwrap();
         let guard = launcher[process..]
             .find("let mut child = NetstackChildGuard")
@@ -22157,8 +22178,7 @@ mod tests {
     #[test]
     fn fragmented_network_ready_alone_activates_prebound_socks_socket() {
         const SIGNAL_FRAGMENT_POLL_LIMIT: usize = 4;
-        let mut listener =
-            Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
+        let mut listener = Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
         let address = listener.as_ref().unwrap().local_addr().unwrap();
         let mut child_listener = listener.as_ref().unwrap().try_clone().unwrap();
         let (mut parent, mut child) = UnixStream::pair().unwrap();
@@ -22166,36 +22186,25 @@ mod tests {
         let mut handshake = NetworkReadyHandshake::default();
 
         child.write_all(b"NETWORK_").unwrap();
-        assert!(!poll_network_ready_handshake(
-            &mut parent,
-            &mut listener,
-            &mut handshake
-        )
-        .unwrap());
-        assert!(std::net::TcpStream::connect_timeout(
-            &address,
-            std::time::Duration::from_millis(100),
-        )
-        .is_err());
+        assert!(!poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap());
+        assert!(
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100),)
+                .is_err()
+        );
 
         child.write_all(b"READY").unwrap();
         for _ in 0..SIGNAL_FRAGMENT_POLL_LIMIT {
-            assert!(!poll_network_ready_handshake(
-                &mut parent,
-                &mut listener,
-                &mut handshake
-            )
-            .unwrap());
+            assert!(
+                !poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap()
+            );
             if listener.is_none() {
                 break;
             }
         }
         assert!(listener.is_none());
-        let client = std::net::TcpStream::connect_timeout(
-            &address,
-            std::time::Duration::from_secs(1),
-        )
-        .unwrap();
+        let client =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1))
+                .unwrap();
         let mut accepted = None;
         for _ in 0..100 {
             match child_listener.accept() {
@@ -22215,20 +22224,12 @@ mod tests {
         child.read_exact(&mut serve).unwrap();
         assert_eq!(&serve, b"SERVE");
         drop(child);
-        assert!(poll_network_ready_handshake(
-            &mut parent,
-            &mut listener,
-            &mut handshake
-        )
-        .unwrap());
+        assert!(poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap());
 
-        let accepted_target = std::fs::read_link(format!(
-            "/proc/self/fd/{}",
-            accepted.as_raw_fd()
-        ))
-        .unwrap()
-        .display()
-        .to_string();
+        let accepted_target = std::fs::read_link(format!("/proc/self/fd/{}", accepted.as_raw_fd()))
+            .unwrap()
+            .display()
+            .to_string();
         let mut descriptors = (0..5)
             .map(|fd| (fd.to_string(), format!("base-{fd}")))
             .collect::<Vec<_>>();
@@ -22260,11 +22261,13 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("invalid") || error.contains("before network readiness"));
-            assert!(std::net::TcpStream::connect_timeout(
-                &address,
-                std::time::Duration::from_millis(100),
-            )
-            .is_err());
+            assert!(
+                std::net::TcpStream::connect_timeout(
+                    &address,
+                    std::time::Duration::from_millis(100),
+                )
+                .is_err()
+            );
             drop(listener);
             TcpListener::bind(address).unwrap();
         }

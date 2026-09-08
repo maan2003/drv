@@ -66,6 +66,7 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+    #[cfg(feature = "test-support")]
     fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
     fn ppoll(fds: *mut PollFd, count: usize, timeout: *const Timespec, sigmask: *const ()) -> i32;
     fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
