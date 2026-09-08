@@ -3,8 +3,9 @@
 //! Ath11k client binding for the chip-neutral synchronous SoftMAC contract.
 
 use ath11k_core::{
-    ClientRadioControl as _, Device, DeviceState, Lifecycle as _, ManagementFrame, ModelSubsystems,
-    RadioControl as _, ScanConfig, ScanId, Subsystems, VdevId, WCN6750, WlanEvent,
+    AssociationBandwidth, ClientRadioControl as _, Device, DeviceState, Lifecycle as _,
+    ManagementFrame, ModelSubsystems, PeerAssociation, RadioControl as _, ScanConfig, ScanId,
+    Subsystems, VdevId, WCN6750, WlanEvent, WmmAccessCategory, WmmConfig,
 };
 use fidl_fuchsia_wlan_ieee80211::{
     BssType, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
@@ -73,6 +74,8 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     mac: [u8; 6],
     vdev: Option<VdevId>,
     peer: Option<[u8; 6]>,
+    associated: bool,
+    link_up: bool,
     upcalls: Option<Box<dyn WlanSoftmacUpcalls>>,
     next_scan_id: u32,
     active_scan: Option<u32>,
@@ -90,6 +93,8 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             mac,
             vdev: None,
             peer: None,
+            associated: false,
+            link_up: false,
             upcalls: None,
             next_scan_id: 1,
             active_scan: None,
@@ -200,6 +205,8 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
         self.pending_mgmt_tx.clear();
         self.deferred_mgmt_rx = None;
         self.peer = None;
+        self.associated = false;
+        self.link_up = false;
         self.vdev = None;
         self.device.stop().map_err(status)
     }
@@ -387,11 +394,20 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         Ok(progressed)
     }
 
-    fn set_link_up(&mut self, _up: bool) -> Result<(), zx::Status> {
-        // The core seam only exposes authorize_peer(), not the required
-        // symmetric deauthorization operation. Supporting only the up half
-        // would leave firmware data admission open when the host closes it.
-        Err(zx::Status::NOT_SUPPORTED)
+    fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
+        if !self.associated {
+            return Err(zx::Status::BAD_STATE);
+        }
+        if self.link_up == up {
+            return Ok(());
+        }
+        let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+        let vdev = self.ready_vdev()?;
+        self.device
+            .set_peer_authorized(vdev, peer, up)
+            .map_err(status)?;
+        self.link_up = up;
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), zx::Status> {
@@ -461,19 +477,147 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         Ok(())
     }
     fn install_key(&mut self, _configuration: WlanKeyConfiguration) -> Result<(), zx::Status> {
-        // FIDL protection and group-key RSC are security-relevant. Core's
-        // KeyConfig carries neither, so accepting this call would silently
-        // weaken a valid request.
+        // WMI carries protection and RSC after the widened core seam, but
+        // ath11k's complete set-key effect also programs REO PN replay and
+        // peer security/key-index state. Those DP effects are not ported.
         Err(zx::Status::NOT_SUPPORTED)
     }
     fn notify_association_complete(
         &mut self,
-        _configuration: WlanAssociationConfig,
+        configuration: WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
-        // WlanAssociationConfig's negotiated rates, capabilities, QoS/WMM,
-        // and channel width are required FIDL fields. associate_peer() accepts
-        // only an address, so it cannot faithfully complete this operation.
-        Err(zx::Status::NOT_SUPPORTED)
+        if self.associated {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+        if self.peer != Some(peer) {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let aid = configuration.aid.ok_or(zx::Status::INVALID_ARGS)?;
+        if !(1..=2007).contains(&aid) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let listen_interval = configuration
+            .listen_interval
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+        let qos = configuration.qos.ok_or(zx::Status::INVALID_ARGS)?;
+        let capability_info = configuration
+            .capability_info
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        if capability_info & 0x0010 != 0 {
+            // WlanAssociationConfig omits the RSN/WPA/PMF facts required to
+            // build ath11k's secure peer-association flags.
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        if configuration.bandwidth != Some(ChannelBandwidth::Cbw20) {
+            // The current vdev-start seam configures only 20 MHz.
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        let secondary = configuration
+            .vht_secondary_80_channel
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        if secondary.band != primary.band || secondary.number != 0 {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        if configuration.ht_cap.is_some() != configuration.ht_op.is_some()
+            || configuration.vht_cap.is_some() != configuration.vht_op.is_some()
+            || (configuration.vht_cap.is_some() && configuration.ht_cap.is_none())
+            || (!qos && (configuration.ht_cap.is_some() || configuration.vht_cap.is_some()))
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let rates = configuration.rates.ok_or(zx::Status::INVALID_ARGS)?;
+        if rates.is_empty() {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let allowed: &[u8] = match primary.band {
+            WlanBand::TwoGhz => &[2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108],
+            WlanBand::FiveGhz => &[12, 18, 24, 36, 48, 72, 96, 108],
+            _ => return Err(zx::Status::NOT_SUPPORTED),
+        };
+        if rates.iter().any(|rate| !allowed.contains(&(rate & 0x7f))) {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let legacy_rates = allowed
+            .iter()
+            .copied()
+            .filter(|allowed| rates.iter().any(|rate| rate & 0x7f == *allowed))
+            .collect();
+        let wmm = configuration
+            .wmm_params
+            .map(|wmm| {
+                if wmm.apsd {
+                    return Err(zx::Status::NOT_SUPPORTED);
+                }
+                if !qos {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                macro_rules! convert {
+                    ($ac:expr) => {{
+                        let ac = $ac;
+                        if ac.ecw_min > 15
+                            || ac.ecw_max > 15
+                            || ac.ecw_min > ac.ecw_max
+                            || ac.aifsn > 15
+                        {
+                            return Err(zx::Status::INVALID_ARGS);
+                        }
+                        WmmAccessCategory {
+                            ecw_min: ac.ecw_min,
+                            ecw_max: ac.ecw_max,
+                            aifsn: ac.aifsn,
+                            txop_limit: ac.txop_limit,
+                            admission_control_mandatory: ac.acm,
+                        }
+                    }};
+                }
+                Ok(WmmConfig {
+                    access_categories: [
+                        convert!(wmm.ac_be_params),
+                        convert!(wmm.ac_bk_params),
+                        convert!(wmm.ac_vi_params),
+                        convert!(wmm.ac_vo_params),
+                    ],
+                })
+            })
+            .transpose()?;
+        let vdev = self.ready_vdev()?;
+        let association = PeerAssociation {
+            vdev,
+            peer,
+            aid,
+            listen_interval,
+            primary_mhz: channel_frequency(primary)?,
+            bandwidth: AssociationBandwidth::Bw20,
+            capability_info,
+            legacy_rates,
+            qos,
+            ht_capabilities: configuration.ht_cap.map(|cap| cap.bytes),
+            vht_capabilities: configuration.vht_cap.map(|cap| cap.bytes),
+            wmm,
+        };
+        if let Err(error) = self.device.associate_peer(association) {
+            self.peer = None;
+            if self.device.delete_peer(vdev, peer).is_err() {
+                let _ = self.stop();
+            }
+            return Err(status(error));
+        }
+        if let Err(error) = self.device.up_vdev(vdev, peer, aid) {
+            self.peer = None;
+            let down = self.device.down_vdev(vdev);
+            let deleted = self.device.delete_peer(vdev, peer);
+            if down.is_err() || deleted.is_err() {
+                let _ = self.stop();
+            }
+            return Err(status(error));
+        }
+        self.associated = true;
+        // Open associations are emitted with ath11k's source-derived AUTH
+        // peer flag, so mirror the firmware state until the host closes it.
+        self.link_up = true;
+        Ok(())
     }
     fn clear_association(
         &mut self,
@@ -484,13 +628,28 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             return Err(zx::Status::INVALID_ARGS);
         }
         let vdev = self.ready_vdev()?;
-        // Revoke adapter-side peer authority before the fallible firmware
-        // deletion. notify_association_complete is unsupported, so this vdev
-        // cannot have been brought up through this adapter.
+        let was_associated = self.associated;
+        let was_link_up = self.link_up;
+        // Revoke adapter-side authority before the first fallible operation.
         self.peer = None;
-        if let Err(error) = self.device.delete_peer(vdev, peer) {
-            // Firmware peer ownership is now ambiguous; stop rather than
-            // allowing a new join to reuse possibly-live state.
+        self.associated = false;
+        self.link_up = false;
+        let mut first_error = None;
+        if was_link_up && let Err(error) = self.device.set_peer_authorized(vdev, peer, false) {
+            first_error = Some(error);
+        }
+        if was_associated
+            && let Err(error) = self.device.down_vdev(vdev)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = self.device.delete_peer(vdev, peer)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(error) = first_error {
             let _ = self.stop();
             return Err(status(error));
         }
@@ -719,6 +878,27 @@ mod tests {
         adapter
     }
 
+    fn open_association() -> WlanAssociationConfig {
+        WlanAssociationConfig {
+            bssid: Some(PEER),
+            aid: Some(42),
+            listen_interval: Some(0),
+            primary: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 6,
+            }),
+            qos: Some(false),
+            rates: Some(vec![0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36]),
+            capability_info: Some(0x0421),
+            bandwidth: Some(ChannelBandwidth::Cbw20),
+            vht_secondary_80_channel: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn join_and_clear_bind_and_delete_exactly_one_peer() {
         let mut adapter = ready_adapter();
@@ -828,19 +1008,17 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_association_security_and_link_calls_fail_closed() {
+    fn open_association_and_symmetric_link_preserve_operation_order() {
         let mut adapter = ready_adapter();
         adapter.join_bss(join_request()).unwrap();
         adapter.device.backend_mut().clear();
+        let vdev = adapter.vdev.unwrap();
 
-        assert_eq!(
-            adapter.notify_association_complete(WlanAssociationConfig {
-                bssid: Some(PEER),
-                aid: Some(42),
-                ..Default::default()
-            }),
-            Err(zx::Status::NOT_SUPPORTED)
-        );
+        adapter
+            .notify_association_complete(open_association())
+            .unwrap();
+        adapter.set_link_up(true).unwrap();
+        adapter.set_link_up(false).unwrap();
         assert_eq!(
             adapter.install_key(WlanKeyConfiguration {
                 protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
@@ -854,8 +1032,54 @@ mod tests {
             }),
             Err(zx::Status::NOT_SUPPORTED)
         );
-        assert_eq!(adapter.set_link_up(true), Err(zx::Status::NOT_SUPPORTED));
-        assert_eq!(adapter.set_link_up(false), Err(zx::Status::NOT_SUPPORTED));
+        assert_eq!(
+            adapter.device.backend().operations(),
+            &[
+                Operation::WmiPeerAssociate(PeerAssociation {
+                    vdev,
+                    peer: PEER,
+                    aid: 42,
+                    listen_interval: 0,
+                    primary_mhz: 2437,
+                    bandwidth: AssociationBandwidth::Bw20,
+                    capability_info: 0x0421,
+                    legacy_rates: vec![2, 4, 11, 22, 12, 18, 24, 36],
+                    qos: false,
+                    ht_capabilities: None,
+                    vht_capabilities: None,
+                    wmm: None,
+                }),
+                Operation::WaitPeerAssociated {
+                    vdev,
+                    address: PEER,
+                },
+                Operation::WmiVdevUp {
+                    vdev,
+                    bssid: PEER,
+                    aid: 42,
+                },
+                Operation::WmiObssSpatialReuse { vdev },
+                Operation::WmiDtimPolicyStick { vdev },
+                Operation::WmiPeerAuthorize {
+                    vdev,
+                    address: PEER,
+                    authorized: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn secure_association_remains_unsupported_without_rsn_and_pmf_facts() {
+        let mut adapter = ready_adapter();
+        adapter.join_bss(join_request()).unwrap();
+        adapter.device.backend_mut().clear();
+        let mut association = open_association();
+        association.capability_info = Some(0x0431);
+        assert_eq!(
+            adapter.notify_association_complete(association),
+            Err(zx::Status::NOT_SUPPORTED)
+        );
         assert!(adapter.device.backend().operations().is_empty());
     }
 

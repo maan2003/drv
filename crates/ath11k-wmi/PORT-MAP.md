@@ -42,8 +42,8 @@ Native golden verification uses the checked-in tracing-kexec capture at
 | ath11k_wmi_send_bcn_offload_control_cmd | wmi.c:1690-1722 | cmd::BeaconOffloadControl | ported | source-derived AP fixture |
 | ath11k_wmi_p2p_go_bcn_ie | wmi.c:1724-1761 | cmd::P2pGoBeaconIe | ported | source-derived AP fixture |
 | ath11k_wmi_bcn_tmpl | wmi.c:1763-1832 | cmd::BeaconTemplate | ported | source-derived AP fixture |
-| ath11k_wmi_vdev_install_key | wmi.c:1834-1884 | cmd::VdevInstallKey | ported | cmd::tests::key_padding |
-| ath11k_wmi_send_peer_assoc_cmd | wmi.c:1970-2135 | cmd::PeerAssoc | ported | cmd::peer_assoc source-derived layout |
+| ath11k_wmi_vdev_install_key | wmi.c:1834-1884 | cmd::VdevInstallKey / Wmi::wait_for_key_installed | ported | cmd::tests::key_padding; correlated completion retains unrelated events |
+| ath11k_wmi_send_peer_assoc_cmd | wmi.c:1970-2135 | cmd::PeerAssoc / Wmi::wait_for_peer_associated | ported | cmd::peer_assoc source-derived layout; correlated completion retains unrelated events |
 | ath11k_wmi_send_scan_start_cmd | wmi.c:2255-2442 | cmd::ScanStart | ported | cmd::scan source-derived layout |
 | ath11k_wmi_send_vdev_set_tpc_power | wmi.c:2444-2506 | cmd::VdevSetTpcPower | ported | source-derived nested TLV |
 | ath11k_wmi_send_scan_stop_cmd | wmi.c:2508-2556 | cmd::ScanStop | ported | source-derived fixed TLV |

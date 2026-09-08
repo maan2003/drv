@@ -3,7 +3,10 @@
 use alloc::vec::Vec;
 
 use super::{EncodeCommand, Init};
-use crate::event::{EventStream, Ready, ServiceReadyState, VdevStartResponse};
+use crate::event::{
+    EventStream, InstallKeyCompletion, PeerAssocConfirmation, PeerCreateConfirmation,
+    PeerDeleteResponse, Ready, ServiceReadyState, VdevStartResponse,
+};
 use crate::{Transport, WmiError};
 
 /// Host-side state created by `ath11k_wmi_attach` and destroyed by detach.
@@ -66,6 +69,62 @@ impl<T: Transport> Wmi<T> {
 
     pub fn discard_vdev_start(&mut self, vdev_id: u32) {
         self.events.discard_vdev_start(vdev_id);
+    }
+
+    pub fn wait_for_peer_created(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerCreateConfirmation, WmiError> {
+        self.events
+            .wait_for_peer_created(deadline_ns, vdev_id, peer)
+    }
+
+    pub fn discard_peer_created(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.events.discard_peer_created(vdev_id, peer);
+    }
+
+    pub fn discard_peer_deleted(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.events.discard_peer_deleted(vdev_id, peer);
+    }
+
+    pub fn discard_peer_associated(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.events.discard_peer_associated(vdev_id, peer);
+    }
+
+    pub fn discard_key_installed(&mut self, vdev_id: u32, key_index: u32) {
+        self.events.discard_key_installed(vdev_id, key_index);
+    }
+
+    pub fn wait_for_peer_deleted(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerDeleteResponse, WmiError> {
+        self.events
+            .wait_for_peer_deleted(deadline_ns, vdev_id, peer)
+    }
+
+    pub fn wait_for_peer_associated(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerAssocConfirmation, WmiError> {
+        self.events
+            .wait_for_peer_associated(deadline_ns, vdev_id, peer)
+    }
+
+    pub fn wait_for_key_installed(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        key_index: u32,
+    ) -> Result<InstallKeyCompletion, WmiError> {
+        self.events
+            .wait_for_key_installed(deadline_ns, vdev_id, key_index)
     }
 
     pub fn send<R: EncodeCommand>(&mut self, request: &R) -> Result<(), WmiError> {
@@ -137,6 +196,23 @@ mod tests {
         Event::from_tlvs(crate::tags::WMI_VDEV_START_RESP_EVENTID, tlvs).unwrap()
     }
 
+    fn install_key_completion(vdev_id: u32, key_index: u32, status: u32) -> Event {
+        let mut value = Vec::new();
+        value.extend_from_slice(&vdev_id.to_le_bytes());
+        value.extend_from_slice(&[2, 0, 0, 0, 0, 2, 0, 0]);
+        value.extend_from_slice(&key_index.to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes());
+        value.extend_from_slice(&status.to_le_bytes());
+        let mut tlvs = Vec::new();
+        tlvs.extend_from_slice(
+            &((u32::from(crate::tags::WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT.0) << 16)
+                | value.len() as u32)
+                .to_le_bytes(),
+        );
+        tlvs.extend_from_slice(&value);
+        Event::from_tlvs(crate::tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID, tlvs).unwrap()
+    }
+
     #[test]
     fn vdev_start_wait_correlates_id_and_retains_earlier_events() {
         let unrelated = Event::from_tlvs(crate::EventId(0x123), Vec::new()).unwrap();
@@ -165,5 +241,18 @@ mod tests {
         wmi.discard_vdev_start(1);
         let response = wmi.wait_for_vdev_start(10, 1).unwrap();
         assert_eq!(response.status, 7);
+    }
+
+    #[test]
+    fn key_wait_correlates_index_and_retains_other_completion() {
+        let other = install_key_completion(1, 2, 0);
+        let matched = install_key_completion(1, 1, 7);
+        let mut wmi = Wmi::attach(MockTransport {
+            commands: Vec::new(),
+            incoming: VecDeque::from([other.clone(), matched]),
+        });
+        let response = wmi.wait_for_key_installed(10, 1, 1).unwrap();
+        assert_eq!((response.key_index, response.status), (1, 7));
+        assert_eq!(wmi.next_event(10), Ok(Some(other)));
     }
 }

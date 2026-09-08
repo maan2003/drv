@@ -23,9 +23,10 @@ pub use ahb::{
 pub use events::{EventSink, WlanEvent};
 pub use hw::{FirmwareLayout, HardwareParams, RingMask, WCN6750, Wcn6750};
 pub use operation::{
-    Channel, Cipher, KeyConfig, KeyKind, ManagementFrame, ModelSubsystems, Operation,
-    OperationTarget, RegulatoryChannel, RegulatoryDomain, ScanConfig, ScanId, Subsystems,
-    VdevStartFailure,
+    AssociationBandwidth, Channel, Cipher, KeyConfig, KeyKind, KeyProtection, ManagementFrame,
+    ModelSubsystems, Operation, OperationTarget, PeerAssociation, RegulatoryChannel,
+    RegulatoryDomain, ScanConfig, ScanId, Subsystems, VdevStartFailure, WmmAccessCategory,
+    WmmConfig,
 };
 pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
 pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink, wcn6750_scan_start};
@@ -94,9 +95,14 @@ pub trait ClientRadioControl {
     fn down_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
     fn stop_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
     fn delete_vdev(&mut self, vdev: VdevId) -> Result<(), CoreError>;
-    fn associate_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+    fn associate_peer(&mut self, association: PeerAssociation) -> Result<(), CoreError>;
     fn install_key(&mut self, key: KeyConfig) -> Result<(), CoreError>;
-    fn authorize_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError>;
+    fn set_peer_authorized(
+        &mut self,
+        vdev: VdevId,
+        address: [u8; 6],
+        authorized: bool,
+    ) -> Result<(), CoreError>;
     fn start_scan(&mut self, scan: ScanConfig) -> Result<(), CoreError>;
     fn stop_scan(&mut self, vdev: VdevId, scan: ScanId) -> Result<(), CoreError>;
     fn transmit_management(&mut self, frame: ManagementFrame) -> Result<(), CoreError>;
@@ -110,6 +116,7 @@ struct Vdev {
     mac: [u8; 6],
     started: bool,
     up: bool,
+    channel: Option<Channel>,
 }
 
 /// Runtime owner of the post-substrate ath11k device.
@@ -404,6 +411,7 @@ impl<B: Subsystems> RadioControl for Device<B> {
             mac,
             started: false,
             up: false,
+            channel: None,
         });
         Ok(id)
     }
@@ -434,6 +442,7 @@ impl<B: Subsystems> RadioControl for Device<B> {
         }
         if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
             item.started = true;
+            item.channel = Some(channel);
         }
         Ok(())
     }
@@ -505,13 +514,43 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         self.peers.retain(|peer| peer.0 != vdev);
         Ok(())
     }
-    fn associate_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+    fn associate_peer(&mut self, association: PeerAssociation) -> Result<(), CoreError> {
+        let vdev = association.vdev;
+        let address = association.peer;
         if !self.peers.contains(&(vdev, address)) {
             return Err(CoreError::NotFound);
         }
-        self.op(Operation::WmiPeerAssociate { vdev, address })?;
+        let channel = self
+            .vdevs
+            .iter()
+            .find(|item| item.id == vdev && item.started)
+            .and_then(|item| item.channel)
+            .ok_or(CoreError::WrongState)?;
+        if channel.primary_mhz != association.primary_mhz {
+            return Err(CoreError::WrongState);
+        }
+        let smps = association.ht_capabilities.map(|cap| {
+            match (u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 {
+                0 => 1,
+                1 => 2,
+                3 => 0,
+                _ => 0,
+            }
+        });
+        let wmm = association.wmm;
+        self.op(Operation::WmiPeerAssociate(association))?;
         self.op(Operation::WaitPeerAssociated { vdev, address })?;
-        self.op(Operation::WmiPeerSetSmps { vdev, address })
+        if let Some(wmm) = wmm {
+            self.op(Operation::WmiWmmUpdate { vdev, wmm })?;
+        }
+        if let Some(mode) = smps {
+            self.op(Operation::WmiPeerSetSmps {
+                vdev,
+                address,
+                mode,
+            })?;
+        }
+        Ok(())
     }
     fn install_key(&mut self, key: KeyConfig) -> Result<(), CoreError> {
         if !self.has_vdev(key.vdev) {
@@ -523,17 +562,40 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         ) {
             return Err(CoreError::Protocol);
         }
+        if key.protection != KeyProtection::RxTx {
+            return Err(CoreError::Protocol);
+        }
+        let expected_len = match key.cipher {
+            Cipher::Ccmp128 | Cipher::Gcmp128 => 16,
+            Cipher::Ccmp256 | Cipher::Gcmp256 | Cipher::Tkip => 32,
+            _ => return Err(CoreError::Protocol),
+        };
+        if key.index > 3
+            || key.bytes.len() != expected_len
+            || (key.kind == KeyKind::Pairwise && key.receive_sequence_counter != 0)
+        {
+            return Err(CoreError::Protocol);
+        }
         self.op(Operation::WmiInstallKey(key.clone()))?;
         self.op(Operation::WaitKeyInstalled {
             vdev: key.vdev,
             key_index: key.index,
         })
     }
-    fn authorize_peer(&mut self, vdev: VdevId, address: [u8; 6]) -> Result<(), CoreError> {
+    fn set_peer_authorized(
+        &mut self,
+        vdev: VdevId,
+        address: [u8; 6],
+        authorized: bool,
+    ) -> Result<(), CoreError> {
         if !self.peers.contains(&(vdev, address)) {
             return Err(CoreError::NotFound);
         }
-        self.op(Operation::WmiPeerAuthorize { vdev, address })
+        self.op(Operation::WmiPeerAuthorize {
+            vdev,
+            address,
+            authorized,
+        })
     }
     fn start_scan(&mut self, scan: ScanConfig) -> Result<(), CoreError> {
         if !self.has_vdev(scan.vdev) {

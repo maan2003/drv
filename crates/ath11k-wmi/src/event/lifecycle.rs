@@ -3,17 +3,22 @@
 use alloc::vec::Vec;
 
 use crate::tags::{
+    WMI_PEER_ASSOC_CONF_EVENTID, WMI_PEER_CREATE_CONF_EVENTID, WMI_PEER_DELETE_RESP_EVENTID,
     WMI_READY_EVENTID, WMI_SERVICE_AVAILABLE_EVENTID, WMI_SERVICE_READY_EVENTID,
     WMI_SERVICE_READY_EXT_EVENTID, WMI_SERVICE_READY_EXT2_EVENTID, WMI_TAG_ARRAY_STRUCT,
     WMI_TAG_ARRAY_UINT32, WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT,
     WMI_TAG_HW_MODE_CAPABILITIES, WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT,
     WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
-    WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS, WMI_VDEV_START_RESP_EVENTID,
+    WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS, WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID,
+    WMI_VDEV_START_RESP_EVENTID,
 };
 use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, Transport, WmiError};
 
-use super::{Decoder, EventDecoder, Ready, ReadyDecoder, TlvIter, VdevStartResponse, word};
+use super::{
+    Decoder, EventDecoder, InstallKeyCompletion, PeerAssocConfirmation, PeerCreateConfirmation,
+    PeerDeleteResponse, Ready, ReadyDecoder, TlvIter, VdevStartResponse, WireEvent, word,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceReadyFixed {
@@ -451,6 +456,132 @@ pub struct EventStream<T> {
 }
 
 impl<T: Transport> EventStream<T> {
+    fn wait_for<TEvent, F>(
+        &mut self,
+        deadline_ns: u64,
+        event_id: crate::EventId,
+        matches: F,
+    ) -> Result<TEvent, WmiError>
+    where
+        TEvent: WireEvent,
+        F: Fn(&TEvent) -> bool,
+    {
+        if let Some(index) = self.pending.iter().position(|event| {
+            event.id == event_id
+                && Decoder::<TEvent>::new(event_id)
+                    .decode(event.clone())
+                    .is_ok_and(|decoded| matches(&decoded))
+        }) {
+            return Decoder::<TEvent>::new(event_id).decode(self.pending.remove(index));
+        }
+        loop {
+            let event = self
+                .transport
+                .receive(deadline_ns)?
+                .ok_or(WmiError::Timeout)?;
+            if event.id == event_id {
+                let decoded = Decoder::<TEvent>::new(event_id).decode(event.clone())?;
+                if matches(&decoded) {
+                    return Ok(decoded);
+                }
+            }
+            self.pending.push(event);
+        }
+    }
+
+    fn discard<TEvent, F>(&mut self, event_id: crate::EventId, matches: F)
+    where
+        TEvent: WireEvent,
+        F: Fn(&TEvent) -> bool,
+    {
+        self.pending.retain(|event| {
+            event.id != event_id
+                || !Decoder::<TEvent>::new(event_id)
+                    .decode(event.clone())
+                    .is_ok_and(|decoded| matches(&decoded))
+        });
+    }
+
+    pub fn discard_peer_created(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.discard(
+            WMI_PEER_CREATE_CONF_EVENTID,
+            |event: &PeerCreateConfirmation| event.vdev_id == vdev_id && event.peer_mac == peer,
+        );
+    }
+
+    pub fn discard_peer_deleted(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.discard(
+            WMI_PEER_DELETE_RESP_EVENTID,
+            |event: &PeerDeleteResponse| event.vdev_id == vdev_id && event.peer_mac == peer,
+        );
+    }
+
+    pub fn discard_peer_associated(&mut self, vdev_id: u32, peer: [u8; 6]) {
+        self.discard(
+            WMI_PEER_ASSOC_CONF_EVENTID,
+            |event: &PeerAssocConfirmation| event.vdev_id == vdev_id && event.peer_mac == peer,
+        );
+    }
+
+    pub fn discard_key_installed(&mut self, vdev_id: u32, key_index: u32) {
+        self.discard(
+            WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID,
+            |event: &InstallKeyCompletion| event.vdev_id == vdev_id && event.key_index == key_index,
+        );
+    }
+
+    pub fn wait_for_peer_created(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerCreateConfirmation, WmiError> {
+        self.wait_for(
+            deadline_ns,
+            WMI_PEER_CREATE_CONF_EVENTID,
+            |event: &PeerCreateConfirmation| event.vdev_id == vdev_id && event.peer_mac == peer,
+        )
+    }
+
+    pub fn wait_for_peer_deleted(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerDeleteResponse, WmiError> {
+        self.wait_for(
+            deadline_ns,
+            WMI_PEER_DELETE_RESP_EVENTID,
+            |event: &PeerDeleteResponse| event.vdev_id == vdev_id && event.peer_mac == peer,
+        )
+    }
+
+    pub fn wait_for_peer_associated(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        peer: [u8; 6],
+    ) -> Result<PeerAssocConfirmation, WmiError> {
+        self.wait_for(
+            deadline_ns,
+            WMI_PEER_ASSOC_CONF_EVENTID,
+            |event: &PeerAssocConfirmation| event.vdev_id == vdev_id && event.peer_mac == peer,
+        )
+    }
+
+    pub fn wait_for_key_installed(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+        key_index: u32,
+    ) -> Result<InstallKeyCompletion, WmiError> {
+        self.wait_for(
+            deadline_ns,
+            WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID,
+            |event: &InstallKeyCompletion| event.vdev_id == vdev_id && event.key_index == key_index,
+        )
+    }
+
     pub fn new(transport: T) -> Self {
         Self {
             transport,

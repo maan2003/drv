@@ -1,6 +1,9 @@
 //! Concrete composition of QMI, CE/HTC, WMI, and HTT for WCN6750.
 
-use crate::{CoreError, Operation, Subsystems, Wcn6750QmiSession, WlanEvent};
+use crate::{
+    AssociationBandwidth, Cipher, CoreError, KeyConfig, KeyKind, Operation, PeerAssociation,
+    Subsystems, Wcn6750QmiSession, WlanEvent,
+};
 use alloc::vec::Vec;
 use ath11k_ce::{
     BoundService, CE_COUNT, CeAllocatedPipes, CeCompletionWait, CePipes, CePipesPacketIo, Htc,
@@ -24,12 +27,191 @@ use ath11k_qmi::{
 use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
-        Channel as WmiChannel, HtcWmiTransport, Init, MgmtSend, StaPowerSaveMode,
-        StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevSetParam, VdevStart, Wmi,
+        Channel as WmiChannel, HtcWmiTransport, Init, KeySeqCounter, MgmtSend, PeerAssoc,
+        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, StaPowerSaveMode,
+        StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevDelete, VdevDown, VdevInstallKey,
+        VdevSetParam, VdevStart, VdevStop, VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
     },
 };
 
 const MGMT_RX_STATUS_ERROR_MASK: u32 = 0x01 | 0x08 | 0x10 | 0x20;
+
+fn wcn6750_install_key(key: KeyConfig) -> Result<VdevInstallKey, CoreError> {
+    let (key_cipher, mic_len) = match key.cipher {
+        Cipher::Ccmp128 | Cipher::Ccmp256 => (4, 0),
+        Cipher::Tkip => (2, 8),
+        Cipher::Gcmp128 | Cipher::Gcmp256 => (9, 0),
+        Cipher::BipCmac128 | Cipher::BipGmac128 | Cipher::BipGmac256 => {
+            return Err(CoreError::Protocol);
+        }
+    };
+    Ok(VdevInstallKey {
+        vdev_id: u32::from(key.vdev.0),
+        peer_addr: key.peer,
+        key_idx: u32::from(key.index),
+        key_flags: match key.kind {
+            KeyKind::Pairwise => 0,
+            KeyKind::Group => 1,
+            KeyKind::IntegrityGroup => return Err(CoreError::Protocol),
+        },
+        key_cipher,
+        key_rsc_counter: KeySeqCounter {
+            low: key.receive_sequence_counter as u32,
+            high: (key.receive_sequence_counter >> 32) as u32,
+        },
+        key_data: key.bytes,
+        key_txmic_len: mic_len,
+        key_rxmic_len: mic_len,
+    })
+}
+
+fn wcn6750_wmm(vdev: crate::VdevId, wmm: crate::WmmConfig) -> WmmUpdate {
+    WmmUpdate {
+        vdev_id: u32::from(vdev.0),
+        parameter_type: 0,
+        access_categories: wmm.access_categories.map(|ac| WmmAccessCategory {
+            cw_min: (1u32 << ac.ecw_min) - 1,
+            cw_max: (1u32 << ac.ecw_max) - 1,
+            aifs: u32::from(ac.aifsn),
+            txop_limit: u32::from(ac.txop_limit),
+            admission_control_mandatory: u32::from(ac.admission_control_mandatory),
+            no_ack: 0,
+        }),
+    }
+}
+
+fn wcn6750_peer_assoc(association: PeerAssociation, local_nss: u8) -> PeerAssoc {
+    let band_2ghz = association.primary_mhz < 3000;
+    let mut params = PeerAssocParams {
+        vdev_id: u32::from(association.vdev.0),
+        peer_new_assoc: 1,
+        peer_associd: u32::from(association.aid),
+        peer_mac: association.peer,
+        peer_caps: u32::from(association.capability_info),
+        peer_listen_intval: u32::from(association.listen_interval),
+        peer_nss: 1,
+        peer_legacy_rates: association
+            .legacy_rates
+            .iter()
+            // This is the WMI CCK encoding from
+            // ath11k_mac_bitrate_to_rate(), not an 802.11 basic-rate flag.
+            .map(|rate| {
+                if matches!(*rate, 2 | 4 | 11 | 22) {
+                    *rate | 0x80
+                } else {
+                    *rate
+                }
+            })
+            .collect(),
+        peer_phymode: if band_2ghz {
+            if association
+                .legacy_rates
+                .iter()
+                .any(|rate| matches!(*rate, 12 | 18 | 24 | 36 | 48 | 72 | 96 | 108))
+            {
+                1
+            } else {
+                2
+            }
+        } else {
+            0
+        },
+        is_wme_set: association.qos,
+        qos_flag: association.qos,
+        auth_flag: true,
+        is_assoc: true,
+        ..Default::default()
+    };
+    if let Some(ht) = association.ht_capabilities {
+        let cap = u16::from_le_bytes([ht[0], ht[1]]);
+        let ampdu = ht[2];
+        let rx_mask = &ht[3..13];
+        params.ht_flag = true;
+        params.peer_ht_caps = u32::from(cap);
+        params.peer_max_mpdu = (1u32 << (13 + u32::from(ampdu & 3))) - 1;
+        params.peer_mpdu_density = match (ampdu >> 2) & 7 {
+            0 => 0,
+            1..=3 => 1,
+            4 => 2,
+            5 => 4,
+            6 => 8,
+            _ => 16,
+        };
+        params.peer_ht_rates = rx_mask
+            .iter()
+            .enumerate()
+            .flat_map(|(byte, mask)| {
+                (0..8).filter_map(move |bit| {
+                    (mask & (1 << bit) != 0).then_some((byte * 8 + bit) as u8)
+                })
+            })
+            .collect();
+        if params.peer_ht_rates.is_empty() {
+            params.peer_ht_rates.extend(0..8);
+        }
+        // mac80211 derives sta::rx_nss from the four equal-modulation HT
+        // stream masks, not from the later unequal-modulation/special MCS
+        // bytes (sta_info.c:3509-3519 in the pinned source).
+        params.peer_nss = rx_mask[..4]
+            .iter()
+            .filter(|mask| **mask != 0)
+            .count()
+            .max(1)
+            .min(usize::from(local_nss)) as u32;
+        params.peer_rate_caps |= 0x08;
+        if cap & ((1 << 5) | (1 << 6)) != 0 {
+            params.peer_rate_caps |= 0x04;
+        }
+        if cap & (1 << 7) != 0 {
+            params.peer_rate_caps |= 0x20;
+            params.stbc_flag = true;
+        }
+        let rx_stbc = (cap >> 8) & 3;
+        params.peer_rate_caps |= u32::from(rx_stbc) << 6;
+        params.stbc_flag |= rx_stbc != 0;
+        if rx_mask[1] != 0 {
+            params.peer_rate_caps |= if rx_mask[2] != 0 { 0x200 } else { 0x01 };
+        }
+        params.ldpc_flag = cap & 1 != 0;
+        match (cap >> 2) & 3 {
+            0 => params.static_mimops_flag = true,
+            1 => params.dynamic_mimops_flag = true,
+            3 => params.spatial_mux_flag = true,
+            _ => {}
+        }
+        params.peer_phymode = match (band_2ghz, association.bandwidth) {
+            (true, AssociationBandwidth::Bw20) => 5,
+            (false, AssociationBandwidth::Bw20) => 4,
+        };
+    }
+    if let Some(vht) = association.vht_capabilities {
+        let cap = u32::from_le_bytes(vht[0..4].try_into().unwrap());
+        let rx_map = u16::from_le_bytes(vht[4..6].try_into().unwrap());
+        params.vht_flag = true;
+        params.vht_capable = true;
+        params.peer_vht_caps = cap;
+        params.peer_max_mpdu = params
+            .peer_max_mpdu
+            .max((1u32 << (13 + ((cap >> 23) & 7))) - 1);
+        let nss = (0..8)
+            .rfind(|index| (rx_map >> (2 * index)) & 3 != 3)
+            .map_or(1, |index| index + 1);
+        params.peer_nss = nss.min(u32::from(local_nss));
+        params.rx_mcs_set = u32::from(rx_map);
+        params.rx_max_rate = u32::from(u16::from_le_bytes(vht[6..8].try_into().unwrap()));
+        let tx_map = u32::from(u16::from_le_bytes(vht[8..10].try_into().unwrap()));
+        params.tx_mcs_set = (tx_map & !0x00ff_0000) | 0x0100_0000;
+        if params.tx_mcs_set & 3 == 3 {
+            params.peer_vht_caps &= !0x0010_0000;
+        }
+        params.tx_max_rate = u32::from(u16::from_le_bytes(vht[10..12].try_into().unwrap()));
+        params.peer_phymode = 8;
+    }
+    PeerAssoc {
+        params,
+        hw_crypto_disabled: false,
+    }
+}
 
 fn management_rx_status_accepted(status: u32) -> bool {
     status & MGMT_RX_STATUS_ERROR_MASK == 0
@@ -748,6 +930,109 @@ where
                 Self::protocol(self.wmi.as_mut())?.discard_vdev_start(u32::from(vdev.0));
                 self.wmi_send(&wcn6750_client_vdev_start(vdev, restart, channel, nss))
             }
+            Operation::WmiVdevUp { vdev, bssid, aid } => self.wmi_send(&VdevUp {
+                vdev_id: u32::from(vdev.0),
+                assoc_id: u32::from(aid),
+                bssid,
+                tx_bssid: None,
+                nontx_profile_idx: 0,
+                nontx_profile_cnt: 0,
+            }),
+            Operation::WmiVdevDown { vdev } => self.wmi_send(&VdevDown {
+                vdev_id: u32::from(vdev.0),
+            }),
+            Operation::WmiVdevStop { vdev } => self.wmi_send(&VdevStop {
+                vdev_id: u32::from(vdev.0),
+            }),
+            Operation::WmiVdevDelete { vdev } => self.wmi_send(&VdevDelete {
+                vdev_id: u32::from(vdev.0),
+            }),
+            Operation::WmiPeerCreate { vdev, address } => {
+                Self::protocol(self.wmi.as_mut())?.discard_peer_created(u32::from(vdev.0), address);
+                self.wmi_send(&PeerCreate {
+                    vdev_id: u32::from(vdev.0),
+                    peer_addr: address,
+                    peer_type: 0,
+                })
+            }
+            Operation::WmiPeerDelete { vdev, address } => {
+                Self::protocol(self.wmi.as_mut())?.discard_peer_deleted(u32::from(vdev.0), address);
+                self.wmi_send(&PeerDelete {
+                    vdev_id: u32::from(vdev.0),
+                    peer_addr: address,
+                })
+            }
+            Operation::WmiPeerAssociate(association) => {
+                Self::protocol(self.wmi.as_mut())?
+                    .discard_peer_associated(u32::from(association.vdev.0), association.peer);
+                let local_nss = self.client_nss()?;
+                self.wmi_send(&wcn6750_peer_assoc(association, local_nss))
+            }
+            Operation::WmiWmmUpdate { vdev, wmm } => self.wmi_send(&wcn6750_wmm(vdev, wmm)),
+            Operation::WmiPeerSetSmps {
+                vdev,
+                address,
+                mode,
+            } => self.wmi_send(&PeerSetParam {
+                vdev_id: u32::from(vdev.0),
+                peer_addr: address,
+                param_id: 1,
+                param_value: mode,
+            }),
+            Operation::WaitPeerCreated { vdev, address } => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                let response = Self::protocol(self.wmi.as_mut())?
+                    .wait_for_peer_created(deadline, u32::from(vdev.0), address)
+                    .map_err(|_| CoreError::Protocol)?;
+                if response.status == 0 {
+                    Ok(())
+                } else {
+                    Err(CoreError::Protocol)
+                }
+            }
+            Operation::WaitPeerDeleted { vdev, address } => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                Self::protocol(self.wmi.as_mut())?
+                    .wait_for_peer_deleted(deadline, u32::from(vdev.0), address)
+                    .map(|_| ())
+                    .map_err(|_| CoreError::Protocol)
+            }
+            Operation::WaitPeerAssociated { vdev, address } => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                Self::protocol(self.wmi.as_mut())?
+                    .wait_for_peer_associated(deadline, u32::from(vdev.0), address)
+                    .map(|_| ())
+                    .map_err(|_| CoreError::Protocol)
+            }
+            Operation::WmiInstallKey(key) => {
+                Self::protocol(self.wmi.as_mut())?
+                    .discard_key_installed(u32::from(key.vdev.0), u32::from(key.index));
+                self.wmi_send(&wcn6750_install_key(key)?)
+            }
+            Operation::WaitKeyInstalled { vdev, key_index } => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                let response = Self::protocol(self.wmi.as_mut())?
+                    .wait_for_key_installed(deadline, u32::from(vdev.0), u32::from(key_index))
+                    .map_err(|_| CoreError::Protocol)?;
+                if response.status == 0 {
+                    Ok(())
+                } else {
+                    Err(CoreError::Protocol)
+                }
+            }
+            Operation::WmiPeerAuthorize {
+                vdev,
+                address,
+                authorized,
+            } => self.wmi_send(&PeerAuthorize {
+                vdev_id: u32::from(vdev.0),
+                peer_addr: address,
+                authorized,
+            }),
             Operation::WaitVdevSetup { vdev } => {
                 self.pump()?;
                 let deadline = (self.deadline)();
@@ -873,6 +1158,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_conversion_preserves_group_rsc_and_tkip_mic_lengths() {
+        let command = wcn6750_install_key(KeyConfig {
+            vdev: crate::VdevId(3),
+            peer: [2, 0, 0, 0, 0, 2],
+            index: 2,
+            cipher: Cipher::Tkip,
+            kind: KeyKind::Group,
+            protection: crate::KeyProtection::RxTx,
+            receive_sequence_counter: 0x1122_3344_5566_7788,
+            bytes: alloc::vec![0x55; 32],
+        })
+        .unwrap();
+        assert_eq!(command.key_flags, 1);
+        assert_eq!(command.key_cipher, 2);
+        assert_eq!(command.key_rsc_counter.low, 0x5566_7788);
+        assert_eq!(command.key_rsc_counter.high, 0x1122_3344);
+        assert_eq!((command.key_txmic_len, command.key_rxmic_len), (8, 8));
+    }
+
+    #[test]
+    fn legacy_peer_conversion_adds_wmi_cck_marker() {
+        let command = wcn6750_peer_assoc(
+            PeerAssociation {
+                vdev: crate::VdevId(0),
+                peer: [2, 0, 0, 0, 0, 2],
+                aid: 42,
+                listen_interval: 0,
+                primary_mhz: 2437,
+                bandwidth: AssociationBandwidth::Bw20,
+                capability_info: 0x0421,
+                legacy_rates: alloc::vec![2, 4, 11, 22, 12, 18, 24, 36],
+                qos: false,
+                ht_capabilities: None,
+                vht_capabilities: None,
+                wmm: None,
+            },
+            2,
+        );
+        assert_eq!(
+            command.params.peer_legacy_rates,
+            [0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36]
+        );
+        assert_eq!(command.params.peer_phymode, 1);
+        assert_eq!(ath11k_wmi::cmd::copy_peer_flags(&command.params, false), 1);
+    }
+
+    #[test]
+    fn ht_peer_conversion_preserves_capabilities_and_mcs() {
+        let mut ht = [0; 26];
+        ht[..5].copy_from_slice(&[0xef, 0x01, 0x13, 0xff, 0xff]);
+        let command = wcn6750_peer_assoc(
+            PeerAssociation {
+                vdev: crate::VdevId(0),
+                peer: [2, 0, 0, 0, 0, 2],
+                aid: 42,
+                listen_interval: 0,
+                primary_mhz: 5180,
+                bandwidth: AssociationBandwidth::Bw20,
+                capability_info: 0x0421,
+                legacy_rates: alloc::vec![12, 18, 24],
+                qos: true,
+                ht_capabilities: Some(ht),
+                vht_capabilities: None,
+                wmm: None,
+            },
+            2,
+        );
+        assert_eq!(command.params.peer_ht_caps, 0x01ef);
+        assert_eq!(command.params.peer_max_mpdu, 65_535);
+        assert_eq!(command.params.peer_mpdu_density, 2);
+        assert_eq!(command.params.peer_ht_rates, (0..16).collect::<Vec<_>>());
+        assert_eq!(command.params.peer_nss, 2);
+        assert_eq!(command.params.peer_rate_caps, 0x6d);
+        assert_eq!(command.params.peer_phymode, 4);
+        assert_eq!(
+            ath11k_wmi::cmd::copy_peer_flags(&command.params, false),
+            0x0021_9003
+        );
+    }
+
+    #[test]
+    fn ht_special_mcs_bytes_do_not_inflate_peer_nss() {
+        let mut ht = [0; 26];
+        ht[3] = 0xff;
+        ht[12] = 0x01;
+        let command = wcn6750_peer_assoc(
+            PeerAssociation {
+                vdev: crate::VdevId(0),
+                peer: [2, 0, 0, 0, 0, 2],
+                aid: 42,
+                listen_interval: 0,
+                primary_mhz: 2437,
+                bandwidth: AssociationBandwidth::Bw20,
+                capability_info: 0x0421,
+                legacy_rates: alloc::vec![2, 4, 11, 22],
+                qos: true,
+                ht_capabilities: Some(ht),
+                vht_capabilities: None,
+                wmm: None,
+            },
+            2,
+        );
+        assert_eq!(command.params.peer_nss, 1);
+    }
 
     #[test]
     fn qmi_config_preserves_host_to_host_pipe_direction() {

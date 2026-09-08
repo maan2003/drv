@@ -62,9 +62,9 @@ misreported as replaced code.
 | `ath11k_mac_op_add_interface` STA effects | `mac.c:7073-7331` | `RadioControl::create_client_vdev` | ported | Vdev create, NSS, PS, RTS, DP attach and unwind order asserted. |
 | `ath11k_mac_vdev_start` | `mac.c:7716-7720` | `RadioControl::start_vdev` | ported | Typed channel and setup completion. |
 | `ath11k_mac_vdev_stop` | `mac.c:7676-7714` | `ClientRadioControl::stop_vdev` | ported | Command then setup completion. |
-| `ath11k_bss_assoc` | `mac.c:3093-3209` | `associate_peer` / `up_vdev` | ported | Peer assoc, SMPS, vdev-up, OBSS and DTIM order asserted. |
+| `ath11k_bss_assoc` | `mac.c:3093-3209` | `PeerAssociation` / `associate_peer` / `up_vdev` | ported | Exact open Cbw20 legacy/HT/VHT parameters, optional WMM, correlated completion, SMPS, vdev-up, OBSS and DTIM order. Secure association is blocked because pinned FIDL omits RSN/WPA/PMF facts; wider widths require widening vdev start. |
 | `ath11k_bss_disassoc` | `mac.c:3211-3233` | `ClientRadioControl::down_vdev` | ported | Policy-free hardware effect. |
-| `ath11k_install_key` | `mac.c:4352-4417` | `ClientRadioControl::install_key` | ported | Supported cipher mapping and correlated completion. |
+| `ath11k_install_key` | `mac.c:4352-4417` | `KeyConfig` / `ClientRadioControl::install_key` | ported | Core accepts RxTx protection only; WMI mapping preserves group RSC and cipher and waits for the correlated completion. Adapter exposure remains blocked on the unported DP PN-replay and peer security-index effects in `ath11k_mac_op_set_key`. |
 | `ath11k_mac_op_hw_scan` | `mac.c:4183-4338` | `ClientRadioControl::start_scan` | ported | Typed request/channel/SSID data. |
 | `ath11k_mac_op_cancel_hw_scan` | `mac.c:4340-4350` | `ClientRadioControl::stop_scan` | ported | WMI scan stop effect. |
 | `ath11k_mac_mgmt_tx_wmi` | `mac.c:6174-6254` | `ClientRadioControl::transmit_management` | ported | Buffer identity retained for completion. |

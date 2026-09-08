@@ -36,6 +36,43 @@ pub struct ScanConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssociationBandwidth {
+    Bw20,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WmmAccessCategory {
+    pub ecw_min: u8,
+    pub ecw_max: u8,
+    pub aifsn: u8,
+    pub txop_limit: u16,
+    pub admission_control_mandatory: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WmmConfig {
+    /// Firmware order: best-effort, background, video, voice.
+    pub access_categories: [WmmAccessCategory; 4],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerAssociation {
+    pub vdev: VdevId,
+    pub peer: [u8; 6],
+    pub aid: u16,
+    pub listen_interval: u16,
+    pub primary_mhz: u16,
+    pub bandwidth: AssociationBandwidth,
+    pub capability_info: u16,
+    /// IEEE half-Mbps values with the basic-rate bit removed.
+    pub legacy_rates: Vec<u8>,
+    pub qos: bool,
+    pub ht_capabilities: Option<[u8; 26]>,
+    pub vht_capabilities: Option<[u8; 12]>,
+    pub wmm: Option<WmmConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cipher {
     Ccmp128,
     Ccmp256,
@@ -52,6 +89,12 @@ pub enum KeyKind {
     Group,
     IntegrityGroup,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyProtection {
+    Rx,
+    Tx,
+    RxTx,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyConfig {
     pub vdev: VdevId,
@@ -59,6 +102,10 @@ pub struct KeyConfig {
     pub index: u8,
     pub cipher: Cipher,
     pub kind: KeyKind,
+    /// Requested traffic direction. WCN6750 WMI has no direction field, so
+    /// core accepts only `RxTx` rather than silently weakening this contract.
+    pub protection: KeyProtection,
+    pub receive_sequence_counter: u64,
     pub bytes: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,13 +267,15 @@ pub enum Operation {
         vdev: VdevId,
         address: [u8; 6],
     },
-    WmiPeerAssociate {
+    WmiPeerAssociate(PeerAssociation),
+    WmiWmmUpdate {
         vdev: VdevId,
-        address: [u8; 6],
+        wmm: WmmConfig,
     },
     WmiPeerSetSmps {
         vdev: VdevId,
         address: [u8; 6],
+        mode: u32,
     },
     WaitPeerAssociated {
         vdev: VdevId,
@@ -235,6 +284,7 @@ pub enum Operation {
     WmiPeerAuthorize {
         vdev: VdevId,
         address: [u8; 6],
+        authorized: bool,
     },
     WmiPeerDelete {
         vdev: VdevId,

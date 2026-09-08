@@ -229,7 +229,21 @@ fn client_sequence_preserves_mac_c_wmi_order() {
         .unwrap();
     device.stop_scan(vdev, ScanId(7)).unwrap();
     device.create_peer(vdev, bssid).unwrap();
-    device.associate_peer(vdev, bssid).unwrap();
+    let association = PeerAssociation {
+        vdev,
+        peer: bssid,
+        aid: 42,
+        listen_interval: 0,
+        primary_mhz: 5180,
+        bandwidth: AssociationBandwidth::Bw20,
+        capability_info: 0x421,
+        legacy_rates: vec![12, 18, 24, 36, 48, 72, 96, 108],
+        qos: false,
+        ht_capabilities: None,
+        vht_capabilities: None,
+        wmm: None,
+    };
+    device.associate_peer(association.clone()).unwrap();
     device.up_vdev(vdev, bssid, 42).unwrap();
     device
         .install_key(KeyConfig {
@@ -238,11 +252,13 @@ fn client_sequence_preserves_mac_c_wmi_order() {
             index: 0,
             cipher: Cipher::Ccmp128,
             kind: KeyKind::Pairwise,
+            protection: KeyProtection::RxTx,
+            receive_sequence_counter: 0,
             bytes: vec![0x55; 16],
         })
         .unwrap();
 
-    device.authorize_peer(vdev, bssid).unwrap();
+    device.set_peer_authorized(vdev, bssid, true).unwrap();
 
     assert_eq!(
         device.backend().log,
@@ -283,15 +299,8 @@ fn client_sequence_preserves_mac_c_wmi_order() {
                 vdev,
                 address: bssid
             },
-            Operation::WmiPeerAssociate {
-                vdev,
-                address: bssid
-            },
+            Operation::WmiPeerAssociate(association),
             Operation::WaitPeerAssociated {
-                vdev,
-                address: bssid
-            },
-            Operation::WmiPeerSetSmps {
                 vdev,
                 address: bssid
             },
@@ -308,12 +317,15 @@ fn client_sequence_preserves_mac_c_wmi_order() {
                 index: 0,
                 cipher: Cipher::Ccmp128,
                 kind: KeyKind::Pairwise,
+                protection: KeyProtection::RxTx,
+                receive_sequence_counter: 0,
                 bytes: vec![0x55; 16],
             }),
             Operation::WaitKeyInstalled { vdev, key_index: 0 },
             Operation::WmiPeerAuthorize {
                 vdev,
-                address: bssid
+                address: bssid,
+                authorized: true,
             },
         ]
     );
