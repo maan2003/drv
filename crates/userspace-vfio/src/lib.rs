@@ -309,6 +309,8 @@ pub mod test_support {
         Map {
             iova: u64,
             length: u64,
+            device_reads: bool,
+            device_writes: bool,
         },
         Unmap {
             iova: u64,
@@ -486,6 +488,8 @@ pub mod test_support {
                     Record::Map {
                         iova: map.iova,
                         length: map.length,
+                        device_reads: map.flags & IOMMU_MAP_READABLE != 0,
+                        device_writes: map.flags & IOMMU_MAP_WRITEABLE != 0,
                     }
                 }
                 IOMMU_IOAS_UNMAP => {

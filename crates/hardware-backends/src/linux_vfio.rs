@@ -834,6 +834,8 @@ mod tests {
             Record::Map {
                 iova: FIRST_IOVA,
                 length: PAGE as u64,
+                device_reads: true,
+                device_writes: true,
             },
             Record::QueryIrq(3),
             Record::InstallIrq(3),
@@ -1064,6 +1066,62 @@ mod tests {
         assert!(records.contains(&Record::QueryIrq(1)));
         assert!(records.contains(&Record::InstallIrq(1)));
         assert!(records.contains(&Record::DisableIrq(1)));
+    }
+
+    #[test]
+    fn pci_dma_is_low_addressed_and_directionally_mapped() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 0,
+                eventfd: true,
+            },
+            || {
+                let mut backend = fake_pci_backend(device);
+                let low32 = DmaConstraints {
+                    alignment: PAGE,
+                    max_device_address: u32::MAX.into(),
+                    max_segment_size: PAGE,
+                    max_segments: 1,
+                };
+                for direction in [
+                    DmaDirection::ToDevice,
+                    DmaDirection::FromDevice,
+                    DmaDirection::Bidirectional,
+                ] {
+                    let dma = backend
+                        .alloc_dma_constrained(PAGE, low32, direction, true)
+                        .unwrap();
+                    assert!(backend.dma_device_address(&dma, PAGE - 1).unwrap() <= u32::MAX.into());
+                    backend.release_dma(dma);
+                }
+            },
+        );
+        std::fs::remove_file(path).unwrap();
+        let maps = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Map {
+                    iova,
+                    device_reads,
+                    device_writes,
+                    ..
+                } => Some((*iova, *device_reads, *device_writes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            maps,
+            vec![
+                (FIRST_IOVA, true, false),
+                (FIRST_IOVA + PAGE as u64, false, true),
+                (FIRST_IOVA + 2 * PAGE as u64, true, true),
+            ]
+        );
     }
 
     #[test]
