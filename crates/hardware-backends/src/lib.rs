@@ -99,6 +99,7 @@ pub struct DeterministicBackend {
     ordering: Option<OrderingAssertions>,
     cache_coherent: bool,
     failures: Option<FailureInjection>,
+    region_len: usize,
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +128,7 @@ impl Default for DeterministicBackend {
             ordering: None,
             cache_coherent: true,
             failures: None,
+            region_len: 0x10_0000,
         }
     }
 }
@@ -153,6 +155,17 @@ impl DeterministicBackend {
         let operations = Rc::new(RefCell::new(Vec::new()));
         let backend = Self {
             operations: Some(operations.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations)
+    }
+    /// Recording device with a caller-sized BAR for drivers whose register
+    /// windows exceed the compact default test region.
+    pub fn recording_device_with_region_len(region_len: usize) -> (Device<Self>, OperationLog) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let backend = Self {
+            operations: Some(operations.clone()),
+            region_len,
             ..Self::default()
         };
         (Device::from_backend(backend), operations)
@@ -230,7 +243,7 @@ impl Backend for DeterministicBackend {
         Ok(index)
     }
     fn region_len(&self, _: &u8) -> usize {
-        0x10_0000
+        self.region_len
     }
     fn read_u32(&mut self, region: &u8, offset: usize) -> Result<u32> {
         let value = match offset {

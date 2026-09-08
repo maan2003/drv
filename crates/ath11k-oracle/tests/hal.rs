@@ -2,12 +2,12 @@ use ath11k_dp::tx::{ClientTxConfig, EncapType, client_tx_command_info};
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
     Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
-    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingMemory, RingType,
-    Wcn6750Registers, initialize_command_ring, setup_wcn6750_io,
+    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingFlags, RingMemory, RingType,
+    Srng, SrngParams, Wcn6750Registers, initialize_command_ring, setup_wcn6750_io,
 };
 use ath11k_oracle as _;
 use ath11k_platform_backend::{Bidirectional, FromDevice, ToDevice};
-use drv_hardware_backends::DeterministicBackend;
+use drv_hardware_backends::{DeterministicBackend, Operation};
 use proptest::prelude::*;
 
 unsafe extern "C" {
@@ -189,6 +189,24 @@ unsafe extern "C" {
         entry_bytes: *mut u16,
         max_entries: *mut u32,
     ) -> i32;
+    fn oracle_hal_srng_setup(
+        kind: u8,
+        ring_number: u8,
+        entries: u16,
+        flags: u32,
+        batch: u32,
+        timer: u32,
+        low: u32,
+        msi: u64,
+        msi_data: u32,
+        max_buffer: u32,
+        ring_address: u64,
+        rdp_address: u64,
+        operation_kind: *mut u8,
+        offset: *mut u32,
+        value: *mut u64,
+        extra: *mut u32,
+    ) -> u8;
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -497,6 +515,104 @@ proptest! {
             Wcn6750Registers::ring_id(ring_type, ring_number, mac_id).map(|id| i32::from(id.0)),
             (ring_id >= 0).then_some(ring_id),
         );
+    }
+
+    #[test]
+    fn srng_setup_register_trace_matches_pinned_c(
+        kind in 0u8..=20, ring_number in any::<u8>(), entries in 2u16..=16,
+        flag_selector in any::<u8>(), batch in 0u32..=255, timer in 0u32..=255,
+        low in 0u32..=255, msi in any::<u64>(), msi_data in any::<u32>(),
+        max_buffer in any::<u32>(),
+    ) {
+        let ring_type = match kind {
+            0 => RingType::ReoDestination,
+            1 => RingType::ReoException,
+            2 => RingType::ReoReinject,
+            3 => RingType::ReoCommand,
+            4 => RingType::ReoStatus,
+            5 => RingType::TclData,
+            6 => RingType::TclCommand,
+            7 => RingType::TclStatus,
+            8 => RingType::CeSource,
+            9 => RingType::CeDestination,
+            10 => RingType::CeDestinationStatus,
+            11 => RingType::WbmIdleLink,
+            12 => RingType::SwToWbmRelease,
+            13 => RingType::WbmToSwRelease,
+            14 => RingType::RxdmaBuffer,
+            15 => RingType::RxdmaDestination,
+            16 => RingType::RxdmaMonitorBuffer,
+            17 => RingType::RxdmaMonitorStatus,
+            18 => RingType::RxdmaMonitorDestination,
+            19 => RingType::RxdmaMonitorDescriptor,
+            _ => RingType::RxdmaDirectBuffer,
+        };
+        const MAX_RINGS: [u8; 21] = [
+            4, 1, 1, 1, 1, 3, 1, 1, 12, 12, 12, 1, 1, 5, 2, 1, 1, 1, 1, 1, 2,
+        ];
+        let ring_number = ring_number % MAX_RINGS[usize::from(kind)];
+        let mut flags = 0;
+        for (selected, bit) in [
+            (0, RingFlags::MSI_SWAP.bits()),
+            (1, RingFlags::POINTER_SWAP.bits()),
+            (2, RingFlags::DATA_TLV_SWAP.bits()),
+            (3, RingFlags::LOW_THRESHOLD_INTERRUPT.bits()),
+            (4, RingFlags::MSI_INTERRUPT.bits()),
+        ] {
+            if flag_selector & (1 << selected) != 0 {
+                flags |= bit;
+            }
+        }
+        let params = SrngParams {
+            interrupt_batch_entries: batch,
+            interrupt_timer_us: timer,
+            flags: RingFlags::from_bits(flags),
+            max_buffer_len: max_buffer,
+            low_threshold: low,
+            msi_address: msi,
+            msi_data,
+        };
+        let (device, operations) =
+            DeterministicBackend::recording_device_with_region_len(0x0200_0000);
+        let mmio = device.open_region(0).unwrap();
+        let entry_bytes = Wcn6750Registers::entry_size(ring_type);
+        let memory = RingMemory {
+            dma: device
+                .alloc_coherent::<Bidirectional>(entry_bytes * usize::from(entries), 8)
+                .unwrap(),
+            entries,
+            entry_bytes: u16::try_from(entry_bytes).unwrap(),
+        };
+        let ring_address = memory.dma.device_address(0).unwrap().bits();
+        let rdp = device.alloc_coherent::<Bidirectional>(172 * 4, 4).unwrap();
+        let rdp_address = rdp.device_address(0).unwrap().bits();
+        operations.borrow_mut().clear();
+
+        Srng::setup(&mmio, ring_type, ring_number, 0, memory, &rdp, params).unwrap();
+        let rust: Vec<_> = operations.borrow().iter().map(|operation| match operation {
+            Operation::ReadU32 { offset, value, .. } =>
+                (0, u32::try_from(*offset).unwrap(), u64::from(*value), 0),
+            Operation::WriteU32 { offset, value, .. } =>
+                (1, u32::try_from(*offset).unwrap(), u64::from(*value), 0),
+            Operation::WriteDeviceAddress { low, high, value, .. } =>
+                (2, u32::try_from(*low).unwrap(), *value,
+                    u32::try_from(high.unwrap_or(0)).unwrap()),
+            operation => panic!("unexpected SRNG setup operation: {operation:?}"),
+        }).collect();
+
+        let mut operation_kind = [0; 20];
+        let mut offset = [0; 20];
+        let mut value = [0; 20];
+        let mut extra = [0; 20];
+        // SAFETY: all four output arrays have the exact twenty-element C layout.
+        let count = unsafe { oracle_hal_srng_setup(
+            kind, ring_number, entries, flags, batch, timer, low, msi, msi_data,
+            max_buffer, ring_address, rdp_address, operation_kind.as_mut_ptr(),
+            offset.as_mut_ptr(), value.as_mut_ptr(), extra.as_mut_ptr(),
+        ) };
+        let c: Vec<_> = (0..usize::from(count)).map(|index|
+            (operation_kind[index], offset[index], value[index], extra[index])).collect();
+        prop_assert_eq!(rust, c);
     }
 
     #[test]
