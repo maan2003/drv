@@ -1012,6 +1012,19 @@ pub struct RealHost {
     dp_poll_log: Vec<String>,
 }
 
+fn diagnose_iommufd_open(error: &str) -> String {
+    if error.contains("bind VFIO device to iommufd") && error.contains("os error 1") {
+        format!(
+            "VFIO_DEVICE_BIND_IOMMUFD returned EPERM: the arm64 wired-IRQ gate \
+             iommu_group_has_isolated_msi() requires runtime parameter \
+             iommufd.allow_unsafe_interrupts=1 for the polling-only first run; \
+             revisit this override before installing software MSI ({error})"
+        )
+    } else {
+        error.into()
+    }
+}
+
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
         let vfio = if config.broker {
@@ -1023,7 +1036,14 @@ impl Host for RealHost {
                 "real mode requires an explicit VFIO cdev path",
             ))?)
         }
-        .map_err(|error| Error::Hardware(error.to_string()))?;
+        .map_err(|error| {
+            let error = error.to_string();
+            Error::Hardware(if config.broker {
+                error
+            } else {
+                diagnose_iommufd_open(&error)
+            })
+        })?;
         vfio.validate_wcn6750_resources().map_err(|error| {
             Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
         })?;
@@ -1437,6 +1457,17 @@ mod tests {
             vec![Stage::Resources, Stage::Firmware]
         );
         assert_eq!(host.visited, vec![Stage::Resources, Stage::Firmware]);
+    }
+
+    #[test]
+    fn iommufd_bind_eperm_names_the_wired_irq_gate_and_parameter() {
+        let message = diagnose_iommufd_open(
+            "initialize coherent VFIO/iommufd device: bind VFIO device to iommufd: Operation not permitted (os error 1)",
+        );
+        assert!(message.contains("VFIO_DEVICE_BIND_IOMMUFD returned EPERM"));
+        assert!(message.contains("iommu_group_has_isolated_msi()"));
+        assert!(message.contains("iommufd.allow_unsafe_interrupts=1"));
+        assert!(message.contains("before installing software MSI"));
     }
 
     #[test]
