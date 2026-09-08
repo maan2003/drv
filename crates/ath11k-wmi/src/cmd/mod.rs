@@ -308,8 +308,8 @@ pub struct PeerSetParam {
 impl EncodeCommand for PeerSetParam {
     fn encode_command(&self) -> Result<Command, WmiError> {
         one(WMI_PEER_SET_PARAM_CMDID, WMI_TAG_PEER_SET_PARAM_CMD, |w| {
-            w.mac(&self.peer_addr);
             w.u32(self.vdev_id);
+            w.mac(&self.peer_addr);
             w.u32(self.param_id);
             w.u32(self.param_value);
         })
@@ -324,8 +324,8 @@ pub struct PdevSuspend {
 impl EncodeCommand for PdevSuspend {
     fn encode_command(&self) -> Result<Command, WmiError> {
         one(WMI_PDEV_SUSPEND_CMDID, WMI_TAG_PDEV_SUSPEND_CMD, |w| {
-            w.u32(self.suspend_option);
             w.u32(self.pdev_id);
+            w.u32(self.suspend_option);
         })
     }
 }
