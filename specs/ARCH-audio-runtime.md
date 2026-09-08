@@ -1,17 +1,15 @@
-# ARCH-audio-runtime: Userspace audio runtime
+# ARCH-audio-runtime: Userspace audio runtime (obsolete)
 
 ## Status
 
-The persistent real-time runtime is being introduced in phases. The current
-physical spike owns AMD HDA through VFIO/iommufd, but starts and stops its HDA
-stream for each allocating PipeWire quantum. Phase 1A replaces that model with
-a hardware-free fixed executor and continuous-ring contract; physical use is
-disabled until the protection envelope and watchdog have passed review and an
-explicit hardware window is granted.
+**Legacy / outdated.** This record is retained for the existing experimental
+artifacts, not as current production architecture or an active implementation
+plan. Details below may be stale and must be checked before reuse. Current
+project direction is defined by [ARCH-drv](ARCH-drv.md).
 
-This architecture realizes the audio direction in [IDEA-audio](IDEA-audio.md)
-while retaining its chosen PipeWire client integration within the scope of
-[REQ-application-compatibility](REQ-application-compatibility.md).
+Existing speaker-protection and hardware-use constraints still apply to legacy
+experiments. This label does not authorize physical audio output or bypass the
+existing protection review and hardware-window requirements.
 
 ## Process and real-time boundaries
 

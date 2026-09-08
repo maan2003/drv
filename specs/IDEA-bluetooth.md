@@ -1,14 +1,15 @@
-# IDEA-bluetooth: Fuchsia-derived Bluetooth service
+# IDEA-bluetooth: Fuchsia-derived Bluetooth service (obsolete)
 
 ## Status
 
-Fuchsia-derived Rust services and capability-scoped integration are adopted by
-[ARCH-bluetooth](ARCH-bluetooth.md). The earlier incremental C++ host proposal
-is not the production direction: [ARCH-drv](ARCH-drv.md) requires native Rust,
-not Wasm. This record does not supersede the hardware and isolation records,
-especially
-[ARCH-asahi-wifi-target](ARCH-asahi-wifi-target.md) and
-[REQ-isolation](REQ-isolation.md).
+**Legacy / outdated.** This record is retained for the existing experimental
+artifacts, not as current production architecture or an active implementation
+plan. Details below may be stale and must be checked before reuse. Current
+project direction is defined by [ARCH-drv](ARCH-drv.md).
+
+Existing device-containment and hardware-use constraints still apply to legacy
+experiments. This label does not authorize new device operations or revive the
+Sapphire/Wasm path as a production direction.
 
 ## Idea
 

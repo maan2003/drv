@@ -1,13 +1,15 @@
-# ARCH-bluetooth: Fuchsia-derived Bluetooth service
+# ARCH-bluetooth: Fuchsia-derived Bluetooth service (obsolete)
 
 ## Status
 
-The current implementation is a deterministic and physically verified Linux
-HCI transport oracle plus legacy Sapphire/Wasm scaffolding, not a production
-Bluetooth service. Under [ARCH-drv](ARCH-drv.md), native Rust and strong process
-sandboxing replace the previously proposed Sapphire Wasm execution direction.
-The complete Rust host-stack implementation remains future work; this decision
-does not claim a completed Sapphire port.
+**Legacy / outdated.** This record is retained for the existing experimental
+artifacts, not as current production architecture or an active implementation
+plan. Details below may be stale and must be checked before reuse. Current
+project direction is defined by [ARCH-drv](ARCH-drv.md).
+
+Existing device-containment and hardware-use constraints still apply to legacy
+experiments. This label does not authorize new device operations or revive the
+Sapphire/Wasm path as a production direction.
 
 ## Architecture
 

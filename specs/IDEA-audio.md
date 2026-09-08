@@ -1,11 +1,15 @@
-# IDEA-audio: Fuchsia-derived Rust media service
+# IDEA-audio: Fuchsia-derived Rust media service (obsolete)
 
 ## Status
 
-The broad media-service direction remains exploratory. The real-time executor,
-process boundary, speaker containment, and kernel-PCM transition are now owned
-by [ARCH-audio-runtime](ARCH-audio-runtime.md). This record retains the wider
-Fuchsia-derived media direction that is not yet committed architecture.
+**Legacy / outdated.** This record is retained for the existing experimental
+artifacts, not as current production architecture or an active implementation
+plan. Details below may be stale and must be checked before reuse. Current
+project direction is defined by [ARCH-drv](ARCH-drv.md).
+
+Existing speaker-protection and hardware-use constraints still apply to legacy
+experiments. This label does not authorize physical audio output or bypass the
+existing protection review and hardware-window requirements.
 
 ## Idea
 
