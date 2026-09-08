@@ -105,6 +105,12 @@ impl LinuxVfio {
         Self::initialize_broker(device, userspace_vfio::probe_dma_broker)
     }
 
+    pub fn validate_wcn6750_resources(
+        &self,
+    ) -> std::result::Result<userspace_vfio::PlatformDeviceInfo, LinuxVfioError> {
+        userspace_vfio::validate_wcn6750_platform_cdev(&self.device).map_err(LinuxVfioError::Setup)
+    }
+
     pub fn open_pci_coherent(path: impl AsRef<Path>) -> std::result::Result<Self, LinuxVfioError> {
         let device = Arc::new(open_device(path)?);
         let iommu = Arc::new(
@@ -739,8 +745,8 @@ impl Drop for LinuxVfio {
 mod tests {
     use super::*;
     use userspace_vfio::test_support::{
-        Failure, FakeIrq, Record, signal_eventfd, with_fake_io, with_fake_io_failure,
-        with_fake_pci_io,
+        Failure, FakeIrq, Record, signal_eventfd, with_fake_automasked_io, with_fake_io,
+        with_fake_io_failure, with_fake_pci_io,
     };
 
     fn fake_device() -> (Arc<File>, std::path::PathBuf) {
@@ -786,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_cdev_binds_attaches_maps_and_sets_level_irq_in_order() {
+    fn platform_cdev_validates_edge_irqs_before_attach_and_use() {
         let (device, path) = fake_device();
         let iommu = Arc::new(File::open("/dev/null").unwrap());
         let (_, records) = with_fake_io(false, || {
@@ -797,6 +803,7 @@ mod tests {
                 Ok(ioas)
             })
             .unwrap();
+            backend.validate_wcn6750_resources().unwrap();
             let dma = backend
                 .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
                 .unwrap();
@@ -816,27 +823,28 @@ mod tests {
             drop(backend);
         });
         std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            records,
-            vec![
-                Record::Bind,
-                Record::AllocateIoas,
-                Record::AttachIoas(7),
-                Record::Map {
-                    iova: FIRST_IOVA,
-                    length: PAGE as u64
-                },
-                Record::QueryIrq(3),
-                Record::InstallIrq(3),
-                Record::UnmaskIrq(3),
-                Record::DisableIrq(3),
-                Record::Unmap {
-                    iova: FIRST_IOVA,
-                    length: PAGE as u64
-                },
-                Record::DestroyIoas(7),
-            ]
-        );
+        let mut expected = vec![
+            Record::Bind,
+            Record::AllocateIoas,
+            Record::AttachIoas(7),
+            Record::QueryDevice,
+        ];
+        expected.extend((0..32).map(Record::QueryIrq));
+        expected.extend([
+            Record::Map {
+                iova: FIRST_IOVA,
+                length: PAGE as u64,
+            },
+            Record::QueryIrq(3),
+            Record::InstallIrq(3),
+            Record::DisableIrq(3),
+            Record::Unmap {
+                iova: FIRST_IOVA,
+                length: PAGE as u64,
+            },
+            Record::DestroyIoas(7),
+        ]);
+        assert_eq!(records, expected);
     }
 
     #[test]
@@ -922,7 +930,7 @@ mod tests {
     #[test]
     fn automasked_irq_is_unmasked_before_next_wait_and_balanced_on_release() {
         let (device, path) = fake_device();
-        let (_, records) = with_fake_io(true, || {
+        let (_, records) = with_fake_automasked_io(|| {
             let mut backend = LinuxVfio::initialize_broker(device, |_| Ok(())).unwrap();
             let irq = backend.open_interrupt(3).unwrap();
             let event_fd = backend.interrupts.get(&irq).unwrap().1.event_fd();
@@ -994,9 +1002,7 @@ mod tests {
                 Record::InstallIrq(3),
                 Record::QueryIrq(4),
                 Record::InstallIrq(4),
-                Record::UnmaskIrq(3),
                 Record::DisableIrq(3),
-                Record::UnmaskIrq(4),
                 Record::DisableIrq(4),
             ]
         );

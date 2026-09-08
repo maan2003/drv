@@ -37,6 +37,7 @@ const VFIO_REGION_INFO_FLAG_WRITE: u32 = 2;
 const VFIO_REGION_INFO_FLAG_MMAP: u32 = 4;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const VFIO_DEVICE_FLAGS_PCI: u32 = 1 << 1;
+const VFIO_DEVICE_FLAGS_PLATFORM: u32 = 1 << 2;
 const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
@@ -67,7 +68,7 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
     fn ppoll(fds: *mut PollFd, count: usize, timeout: *const Timespec, sigmask: *const ()) -> i32;
     fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
@@ -107,6 +108,67 @@ struct DeviceInfo {
     num_irqs: u32,
     cap_offset: u32,
     pad: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlatformDeviceInfo {
+    pub flags: u32,
+    pub num_regions: u32,
+    pub num_irqs: u32,
+}
+
+fn validate_platform_info(info: &DeviceInfo) -> Result<(), String> {
+    if info.flags & VFIO_DEVICE_FLAGS_PLATFORM == 0 || info.flags & VFIO_DEVICE_FLAGS_PCI != 0 {
+        return Err("VFIO cdev is not a platform device".into());
+    }
+    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+        return Err("VFIO platform device lacks reset support".into());
+    }
+    if info.num_regions != 1 {
+        return Err(format!(
+            "expected 1 VFIO region, found {}",
+            info.num_regions
+        ));
+    }
+    if info.num_irqs != 32 {
+        return Err(format!("expected 32 VFIO IRQs, found {}", info.num_irqs));
+    }
+    Ok(())
+}
+
+fn validate_platform_irq(index: u32, irq: IrqCapability) -> Result<(), String> {
+    if irq.count != 1 || !irq.eventfd || irq.automasked {
+        Err(format!(
+            "VFIO IRQ {index} is not one edge-triggered eventfd line"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate the WCN6750 VFIO resource contract after the caller has bound the
+/// cdev to iommufd. VFIO cdev resource ioctls are unavailable before bind.
+pub fn validate_wcn6750_platform_cdev(device: &File) -> Result<PlatformDeviceInfo, String> {
+    let mut info = DeviceInfo {
+        argsz: size::<DeviceInfo>(),
+        ..Default::default()
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_GET_INFO,
+        &mut info,
+        "query VFIO platform device",
+    )?;
+    validate_platform_info(&info)?;
+    for index in 0..32 {
+        let irq = irq_capability(device, index)?;
+        validate_platform_irq(index, irq)?;
+    }
+    Ok(PlatformDeviceInfo {
+        flags: info.flags,
+        num_regions: info.num_regions,
+        num_irqs: info.num_irqs,
+    })
 }
 #[repr(C)]
 #[derive(Default)]
@@ -210,7 +272,7 @@ fn size<T>() -> u32 {
     std::mem::size_of::<T>() as u32
 }
 fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Result<(), String> {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(result) = test_support::dispatch(fd, request, value as *mut T as *mut ()) {
         return result.map_err(|error| format!("{operation}: fake errno {error}"));
     }
@@ -222,7 +284,7 @@ fn ioctl_mut<T>(fd: RawFd, request: u64, value: &mut T, operation: &str) -> Resu
 }
 
 fn ioctl_none(fd: RawFd, request: u64, operation: &str) -> Result<(), String> {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(result) = test_support::dispatch(fd, request, std::ptr::null_mut()) {
         return result.map_err(|error| format!("{operation}: fake errno {error}"));
     }
@@ -233,7 +295,7 @@ fn ioctl_none(fd: RawFd, request: u64, operation: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
     use std::{cell::RefCell, rc::Rc};
@@ -282,6 +344,9 @@ pub mod test_support {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Failure {
+        DeviceInfo,
+        IrqInfo(u32),
+        Bind,
         IoasUnmap,
         Broker(u32),
     }
@@ -291,6 +356,8 @@ pub mod test_support {
         records: Rc<RefCell<Vec<Record>>>,
         fail_once: Option<Failure>,
         pci_irqs: Option<[FakeIrq; 2]>,
+        bound: bool,
+        platform_automasked: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +388,27 @@ pub mod test_support {
                 records: Rc::clone(&records),
                 fail_once,
                 pci_irqs: None,
+                bound: false,
+                platform_automasked: false,
+            });
+        });
+        let result = run();
+        FAKE.with(|fake| *fake.borrow_mut() = None);
+        let recorded = records.borrow().clone();
+        (result, recorded)
+    }
+
+    pub fn with_fake_automasked_io<T>(run: impl FnOnce() -> T) -> (T, Vec<Record>) {
+        let records = Rc::new(RefCell::new(Vec::new()));
+        FAKE.with(|fake| {
+            assert!(fake.borrow().is_none(), "nested fake VFIO transport");
+            *fake.borrow_mut() = Some(Fake {
+                broker_supported: true,
+                records: Rc::clone(&records),
+                fail_once: None,
+                pci_irqs: None,
+                bound: false,
+                platform_automasked: true,
             });
         });
         let result = run();
@@ -342,6 +430,8 @@ pub mod test_support {
                 records: Rc::clone(&records),
                 fail_once: None,
                 pci_irqs: Some([msi, msix]),
+                bound: false,
+                platform_automasked: false,
             });
         });
         let result = run();
@@ -358,11 +448,25 @@ pub mod test_support {
         FAKE.with(|slot| {
             let mut slot = slot.borrow_mut();
             let fake = slot.as_mut()?;
+            if matches!(
+                request,
+                VFIO_DEVICE_GET_INFO | VFIO_DEVICE_GET_REGION_INFO | VFIO_DEVICE_GET_IRQ_INFO
+            ) && !fake.bound
+                && !fake.broker_supported
+            {
+                return Some(Err(22));
+            }
             let record = match request {
                 VFIO_DEVICE_GET_INFO => {
                     // SAFETY: ioctl_mut supplies DeviceInfo for this request.
                     let info = unsafe { value.cast::<DeviceInfo>().as_mut().unwrap() };
-                    info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI;
+                    if fake.pci_irqs.is_some() {
+                        info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI;
+                    } else {
+                        info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PLATFORM;
+                        info.num_regions = 1;
+                        info.num_irqs = 32;
+                    }
                     Record::QueryDevice
                 }
                 VFIO_DEVICE_BIND_IOMMUFD => Record::Bind,
@@ -434,7 +538,7 @@ pub mod test_support {
                         info.flags = u32::from(irq.eventfd);
                     } else {
                         info.count = 1;
-                        info.flags = 1 | (1 << 1) | (1 << 2);
+                        info.flags = 1 | if fake.platform_automasked { 1 << 2 } else { 0 };
                     }
                     Record::QueryIrq(info.index)
                 }
@@ -489,17 +593,24 @@ pub mod test_support {
                 _ => return Some(Err(25)),
             };
             let fail = match (&record, fake.fail_once) {
+                (Record::QueryDevice, Some(Failure::DeviceInfo))
+                | (Record::Bind, Some(Failure::Bind)) => true,
+                (Record::QueryIrq(index), Some(Failure::IrqInfo(failed))) => *index == failed,
                 (Record::Unmap { .. }, Some(Failure::IoasUnmap)) => true,
                 (Record::Broker { operation, .. }, Some(Failure::Broker(failed_operation))) => {
                     *operation == failed_operation
                 }
                 _ => false,
             };
+            let is_bind = record == Record::Bind;
             fake.records.borrow_mut().push(record);
             if fail {
                 fake.fail_once = None;
                 Some(Err(5))
             } else {
+                if is_bind {
+                    fake.bound = true;
+                }
                 Some(Ok(()))
             }
         })
@@ -1421,6 +1532,7 @@ pub fn reset_device_unchecked(device: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_support::{Failure, Record, with_fake_io, with_fake_io_failure};
     #[test]
     fn abi_layouts_are_linux_uapi_exact() {
         assert_eq!(size::<RegionInfo>(), 32);
@@ -1433,5 +1545,101 @@ mod tests {
         assert_eq!(dma_broker_uapi::GET, 1 << 16);
         assert_eq!(dma_broker_uapi::SET, 1 << 17);
         assert_eq!(dma_broker_uapi::PROBE, 1 << 18);
+    }
+
+    #[test]
+    fn platform_validation_requires_bind_then_queries_every_irq() {
+        let device = File::open("/dev/null").unwrap();
+        let iommu = File::open("/dev/null").unwrap();
+        let (info, records) = with_fake_io(false, || {
+            bind_iommufd(&device, &iommu)?;
+            validate_wcn6750_platform_cdev(&device)
+        });
+        assert_eq!(info.unwrap().num_irqs, 32);
+        assert_eq!(records.first(), Some(&Record::Bind));
+        assert_eq!(records.get(1), Some(&Record::QueryDevice));
+        assert_eq!(
+            records[2..34],
+            (0..32).map(Record::QueryIrq).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn platform_validation_rejects_queries_before_bind() {
+        let device = File::open("/dev/null").unwrap();
+        let (result, records) = with_fake_io(false, || validate_wcn6750_platform_cdev(&device));
+        assert!(result.is_err());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn platform_validation_fails_closed_on_each_transport_boundary() {
+        for failure in [Failure::DeviceInfo, Failure::IrqInfo(17), Failure::Bind] {
+            let device = File::open("/dev/null").unwrap();
+            let iommu = File::open("/dev/null").unwrap();
+            let (result, _) = with_fake_io_failure(false, Some(failure), || {
+                bind_iommufd(&device, &iommu)?;
+                validate_wcn6750_platform_cdev(&device)
+            });
+            assert!(result.is_err(), "accepted injected failure {failure:?}");
+        }
+    }
+
+    #[test]
+    fn platform_validation_rejects_each_device_info_mismatch() {
+        let valid = DeviceInfo {
+            flags: VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PLATFORM,
+            num_regions: 1,
+            num_irqs: 32,
+            ..Default::default()
+        };
+        assert!(validate_platform_info(&valid).is_ok());
+        for invalid in [
+            DeviceInfo {
+                flags: VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI,
+                ..valid
+            },
+            DeviceInfo {
+                flags: VFIO_DEVICE_FLAGS_PLATFORM,
+                ..valid
+            },
+            DeviceInfo {
+                num_regions: 0,
+                ..valid
+            },
+            DeviceInfo {
+                num_irqs: 31,
+                ..valid
+            },
+        ] {
+            assert!(validate_platform_info(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn platform_validation_rejects_invalid_irq_capabilities() {
+        let valid_irq = IrqCapability {
+            index: 0,
+            count: 1,
+            eventfd: true,
+            automasked: false,
+        };
+        assert!(validate_platform_irq(0, valid_irq).is_ok());
+        for invalid in [
+            IrqCapability {
+                count: 0,
+                ..valid_irq
+            },
+            IrqCapability {
+                eventfd: false,
+                ..valid_irq
+            },
+            IrqCapability {
+                automasked: true,
+                ..valid_irq
+            },
+        ] {
+            assert!(validate_platform_irq(0, invalid).is_err());
+        }
     }
 }

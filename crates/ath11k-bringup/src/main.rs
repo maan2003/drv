@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use ath11k_bringup::{Cli, DryRunHost, RealHost, run};
+use ath11k_bringup::{Cli, DryRunHost, RealHost, preflight, run};
 
 fn main() {
     let config = match Cli::parse(std::env::args().skip(1)) {
@@ -10,6 +10,20 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if config.preflight {
+        match preflight(&config) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("ath11k-bringup: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let (result, summary) = if config.dry_run {
         let mut host = DryRunHost::default();
         let result = run(&config, &mut host);
