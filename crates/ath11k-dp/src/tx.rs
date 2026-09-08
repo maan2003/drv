@@ -83,6 +83,78 @@ pub struct TxResult {
     pub peer: Option<crate::PeerId>,
 }
 
+/// Host-originated transmit attributes which must survive the chip boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostTxFlags {
+    pub protected: bool,
+    pub favor_reliability: bool,
+    pub qos: bool,
+}
+
+/// RX decapsulation selected by firmware for the completed MSDU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RxDecapType {
+    Raw = 0,
+    NativeWifi = 1,
+    Ethernet2Dix = 2,
+    Ieee8023 = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxDecryptStatus {
+    NotDecrypted,
+    Decrypted,
+}
+
+/// Descriptor facts needed by the host adapter to construct its RX metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostRxInfo {
+    pub decap_type: RxDecapType,
+    pub peer: Option<crate::PeerId>,
+    pub tid: u8,
+    pub decrypt_status: RxDecryptStatus,
+    /// Packed RX PHY metadata: channel in low 16 bits and 6 GHz center
+    /// frequency in high 16 bits, matching the pinned descriptor contract.
+    pub phy_metadata: u32,
+    pub bandwidth: u8,
+    pub mcs: u8,
+    pub packet_type: u8,
+    pub nss: u8,
+    pub phy_ppdu_id: u16,
+}
+
+/// A complete, reassembled raw/native-802.11 MSDU ready for host delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostRxFrame {
+    pub bytes: Vec<u8>,
+    pub info: HostRxInfo,
+}
+
+/// Infallible because the RX buffers have already been returned to hardware;
+/// host backpressure cannot safely cause this callback to be retried.
+pub trait DpHost {
+    fn receive(&mut self, frame: HostRxFrame);
+    fn tx_complete(&mut self, result: TxResult);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostRxDropCounters {
+    pub malformed: usize,
+    pub fcs_error: usize,
+    pub decrypt_error: usize,
+    pub tkip_mic_error: usize,
+    pub unsupported_decap: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostServiceResult {
+    pub tx_delivered: usize,
+    pub tx_malformed: usize,
+    pub rx_delivered: usize,
+    pub rx_dropped: HostRxDropCounters,
+}
+
 struct PendingTx<B: Backend> {
     msdu_id: u32,
     #[allow(dead_code)]
@@ -114,6 +186,7 @@ pub struct RxdmaConfig {
 pub struct ReceivedFrame {
     pub packet: RxPacket,
     pub status: RxDescriptorStatus,
+    header_status: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +213,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     ring_resources: Wcn6750DpRings,
     reo: Option<ReoController>,
     htt_setup_index: usize,
+    host_rx_first: bool,
 }
 
 impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
@@ -177,6 +251,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             ring_resources,
             reo: None,
             htt_setup_index: 0,
+            host_rx_first: true,
         })
     }
 
@@ -200,6 +275,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             ring_resources: Wcn6750DpRings::default(),
             reo: None,
             htt_setup_index: 0,
+            host_rx_first: true,
         }
     }
 
@@ -394,21 +470,192 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         Ok(ServiceResult { tx, rx })
     }
 
+    /// Host-facing form of the RX process/deliver path. Only complete
+    /// raw/native-802.11 frames cross this seam; hardware-reported failures
+    /// and Ethernet decapsulation are consumed and counted as polling work.
+    pub fn service_host<H: DpHost>(
+        &mut self,
+        work_budget: usize,
+        receive_budget: usize,
+        host: &mut H,
+    ) -> Result<HostServiceResult, DpError> {
+        let mut remaining_work = work_budget;
+        let mut rx_delivered = 0;
+        let mut rx_dropped = HostRxDropCounters::default();
+        // Alternate the reserved one-credit probe so neither nonempty ring
+        // can starve when the caller supplies a one-descriptor budget.
+        let probe_rx_first = receive_budget != 0 && self.host_rx_first;
+        if receive_budget != 0 && work_budget != 0 {
+            self.host_rx_first = !self.host_rx_first;
+        }
+        if probe_rx_first && remaining_work != 0 {
+            let mut rx_credit = 1;
+            self.service_host_rx_once(&mut rx_credit, host, &mut rx_delivered, &mut rx_dropped)?;
+            remaining_work -= 1 - rx_credit;
+        }
+        let tx_budget = remaining_work;
+        let (tx_work, tx_delivered, tx_malformed) =
+            self.service_host_tx_completions(tx_budget, host)?;
+        remaining_work -= tx_work;
+        while remaining_work != 0 && rx_delivered < receive_budget {
+            if !self.service_host_rx_once(
+                &mut remaining_work,
+                host,
+                &mut rx_delivered,
+                &mut rx_dropped,
+            )? {
+                break;
+            }
+        }
+        Ok(HostServiceResult {
+            tx_delivered,
+            tx_malformed,
+            rx_delivered,
+            rx_dropped,
+        })
+    }
+
+    fn service_host_rx_once<H: DpHost>(
+        &mut self,
+        remaining_work: &mut usize,
+        host: &mut H,
+        delivered: &mut usize,
+        dropped: &mut HostRxDropCounters,
+    ) -> Result<bool, DpError> {
+        let received = match self.receive_with_status_bounded(remaining_work) {
+            Ok(Some(received)) => received,
+            Ok(None) => return Ok(false),
+            Err(DpError::MalformedDescriptor | DpError::InvalidFrame) => {
+                self.rx_chain.clear();
+                dropped.malformed += 1;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        match host_frame(received) {
+            Ok(frame) => {
+                host.receive(frame);
+                *delivered += 1;
+            }
+            Err(HostRxDropReason::Malformed) => dropped.malformed += 1,
+            Err(HostRxDropReason::Fcs) => dropped.fcs_error += 1,
+            Err(HostRxDropReason::Decrypt) => dropped.decrypt_error += 1,
+            Err(HostRxDropReason::TkipMic) => dropped.tkip_mic_error += 1,
+            Err(HostRxDropReason::UnsupportedDecap) => dropped.unsupported_decap += 1,
+        }
+        Ok(true)
+    }
+
+    fn service_host_tx_completions<H: DpHost>(
+        &mut self,
+        budget: usize,
+        host: &mut H,
+    ) -> Result<(usize, usize, usize), DpError> {
+        let ring = self.data_rings.ok_or(DpError::NoResources)?.wbm;
+        let mut work = 0;
+        let mut delivered = 0;
+        let mut malformed = 0;
+        while work < budget {
+            let Some(descriptor) = self.rings.consume(ring).map_err(map_hal)? else {
+                break;
+            };
+            work += 1;
+            let Ok(release) = WbmReleaseRing::from_bytes(descriptor.bytes()) else {
+                malformed += 1;
+                continue;
+            };
+            let htt = if release.release_source() == 3 {
+                match TxCompletion::decode_wbm_release(release.as_bytes()) {
+                    Ok(htt) => htt,
+                    Err(_) => {
+                        malformed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                TxCompletion {
+                    status: release.tqm_release_reason(),
+                    reinject_reason: 0,
+                    ack_rssi: release.ack_rssi() as i8,
+                    peer: Some(crate::PeerId(release.peer_id())),
+                }
+            };
+            if release.release_source() == 3 && htt.status == 5 {
+                continue;
+            }
+            let msdu_id = (release.buffer_address().software_cookie() >> 2) & 0x1_ffff;
+            let Some(position) = self
+                .pending
+                .iter()
+                .position(|pending| pending.msdu_id == msdu_id)
+            else {
+                malformed += 1;
+                continue;
+            };
+            drop(self.pending.swap_remove(position));
+            host.tx_complete(TxResult {
+                msdu_id,
+                status: htt.status,
+                acknowledged: htt.status == 0,
+                ack_rssi: htt.ack_rssi,
+                peer: htt.peer,
+            });
+            delivered += 1;
+        }
+        Ok((work, delivered, malformed))
+    }
+
+    /// Submit a host-owned 802.11 frame through the existing TCL DMA path.
+    /// The peer remains chip-local; host scheduling attributes are retained
+    /// until the matching completion is reported.
+    pub fn submit_host_frame(
+        &mut self,
+        bytes: &[u8],
+        peer: crate::PeerId,
+        flags: HostTxFlags,
+    ) -> Result<(), DpError> {
+        if flags.favor_reliability {
+            return Err(DpError::UnsupportedTxFlags);
+        }
+        let fc = u16::from_le_bytes(
+            bytes
+                .get(..2)
+                .ok_or(DpError::InvalidFrame)?
+                .try_into()
+                .map_err(|_| DpError::InvalidFrame)?,
+        );
+        let is_qos = fc & 0x000c == 0x0008 && fc & 0x0080 != 0;
+        if flags.qos != is_qos || flags.protected != (fc & 0x4000 != 0) {
+            return Err(DpError::InvalidFrame);
+        }
+        self.transmit_client(TxPacket {
+            peer,
+            bytes: bytes.to_vec(),
+        })
+    }
+
     /// Drain WBM release entries as `ath11k_dp_tx_completion_handler` does.
     pub fn service_tx_completions(&mut self) -> Result<Vec<TxResult>, DpError> {
+        self.service_tx_completions_bounded(usize::MAX)
+            .map(|(results, _)| results)
+    }
+
+    fn service_tx_completions_bounded(
+        &mut self,
+        budget: usize,
+    ) -> Result<(Vec<TxResult>, usize), DpError> {
         let ring = self.data_rings.ok_or(DpError::NoResources)?.wbm;
         let mut results = Vec::new();
-        while let Some(descriptor) = self.rings.consume(ring).map_err(map_hal)? {
+        let mut work = 0;
+        while work < budget {
+            let Some(descriptor) = self.rings.consume(ring).map_err(map_hal)? else {
+                break;
+            };
+            work += 1;
             let release = WbmReleaseRing::from_bytes(descriptor.bytes())
                 .map_err(|_| DpError::MalformedDescriptor)?;
             let cookie = release.buffer_address().software_cookie();
             let msdu_id = (cookie >> 2) & 0x1_ffff;
-            let position = self
-                .pending
-                .iter()
-                .position(|pending| pending.msdu_id == msdu_id)
-                .ok_or(DpError::MalformedDescriptor)?;
-
             let htt = if release.release_source() == 3 {
                 TxCompletion::decode_wbm_release(release.as_bytes())?
             } else {
@@ -419,14 +666,21 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                     peer: Some(crate::PeerId(release.peer_id())),
                 }
             };
-            // MEC notify (5) is WDS-only and unknown firmware statuses are
-            // only logged by Linux; neither owns/completes this MSDU.
-            if release.release_source() == 3 && htt.status >= 5 {
+            // MEC notify (5) is WDS-only and owns no MSDU. Linux only warns
+            // for unknown statuses; the host path completes a matching live
+            // owner as failed instead so an untrusted status cannot strand a
+            // DMA mapping indefinitely.
+            if release.release_source() == 3 && htt.status == 5 {
                 continue;
             }
+            let position = self
+                .pending
+                .iter()
+                .position(|pending| pending.msdu_id == msdu_id)
+                .ok_or(DpError::MalformedDescriptor)?;
             // Removing drops the streaming mapping at the same point as the
             // C completion handler's dma_unmap_single.
-            self.pending.swap_remove(position);
+            drop(self.pending.swap_remove(position));
             results.push(TxResult {
                 msdu_id,
                 status: htt.status,
@@ -435,7 +689,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                 peer: htt.peer,
             });
         }
-        Ok(results)
+        Ok((results, work))
     }
 
     /// Configure and initially fill the client RXDMA buffer ring.
@@ -453,12 +707,24 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
 
     /// Interrupt-driven REO destination processing for direct MSDU buffers.
     pub fn receive_with_status(&mut self) -> Result<Option<ReceivedFrame>, DpError> {
+        let mut remaining_work = usize::MAX;
+        self.receive_with_status_bounded(&mut remaining_work)
+    }
+
+    fn receive_with_status_bounded(
+        &mut self,
+        remaining_work: &mut usize,
+    ) -> Result<Option<ReceivedFrame>, DpError> {
         let reo_ring = self.data_rings.ok_or(DpError::NoResources)?.reo;
         loop {
+            if *remaining_work == 0 {
+                return Ok(None);
+            }
             let descriptor = match self.rings.consume(reo_ring).map_err(map_hal)? {
                 Some(descriptor) => descriptor,
                 None => return Ok(None),
             };
+            *remaining_work -= 1;
             let destination = ReoDestinationRing::from_bytes(descriptor.bytes())
                 .map_err(|_| DpError::MalformedDescriptor)?;
             let cookie = destination.buffer_address().software_cookie();
@@ -529,12 +795,15 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
 
     fn transmit_client(&mut self, mut packet: TxPacket) -> Result<(), DpError> {
         let data_rings = self.data_rings.ok_or(DpError::NoResources)?;
-        if self.tx.encapsulation == EncapType::NativeWifi {
-            encap_native_wifi(&mut packet.bytes)?;
+        let mut tx = self.tx;
+        if tx.encapsulation == EncapType::NativeWifi
+            && let Some(tid) = encap_native_wifi(&mut packet.bytes)?
+        {
+            tx.tid = tid;
         }
         let msdu_id = self.allocate_msdu_id()?;
         let buffer = TxBuffer::map(&self.device, &packet.bytes)?;
-        let descriptor = make_tcl_descriptor(&buffer, msdu_id, self.tx)?;
+        let descriptor = make_tcl_descriptor(&buffer, msdu_id, tx)?;
         self.rings
             .publish(data_rings.tcl, descriptor.into_descriptor())
             .map_err(map_hal)?;
@@ -649,10 +918,11 @@ fn parse_received_chain(fragments: &[RxFragment]) -> Result<ReceivedFrame, DpErr
     status.last_msdu = end_status.last_msdu;
     status.l3_padding = end_status.l3_padding;
     status.msdu_done = end_status.msdu_done;
-    status.msdu_length_error = end_status.msdu_length_error;
     status.fcs_error = end_status.fcs_error;
     status.decrypt_error = end_status.decrypt_error;
     status.tkip_mic_error = end_status.tkip_mic_error;
+    status.mpdu_errors = end_status.mpdu_errors;
+    status.multicast_broadcast = end_status.multicast_broadcast;
     status.decrypted = end_status.decrypted;
     if !status.multicast_broadcast && first.peer.0 != 0xffff {
         status.peer = first.peer;
@@ -696,7 +966,229 @@ fn parse_received_chain(fragments: &[RxFragment]) -> Result<ReceivedFrame, DpErr
             bytes: payload,
         },
         status,
+        header_status: descriptor.header_status().to_vec(),
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostRxDropReason {
+    Malformed,
+    Fcs,
+    Decrypt,
+    TkipMic,
+    UnsupportedDecap,
+}
+
+fn host_frame(received: ReceivedFrame) -> Result<HostRxFrame, HostRxDropReason> {
+    let status = received.status;
+    if status.fcs_error {
+        return Err(HostRxDropReason::Fcs);
+    }
+    if status.tkip_mic_error {
+        return Err(HostRxDropReason::TkipMic);
+    }
+    if status.decrypt_error {
+        return Err(HostRxDropReason::Decrypt);
+    }
+    let decap_type = match status.decap_type {
+        0 => RxDecapType::Raw,
+        1 => RxDecapType::NativeWifi,
+        2 | 3 => return Err(HostRxDropReason::UnsupportedDecap),
+        _ => unreachable!("RX decap is a two-bit descriptor field"),
+    };
+    let decrypted = status.encryption_info_valid
+        && status.encryption_type != 7
+        && status.mpdu_errors == 0
+        && status.decrypted;
+    let bytes = match decap_type {
+        RxDecapType::Raw => normalize_raw(received.packet.bytes, status, decrypted)?,
+        RxDecapType::NativeWifi => normalize_native_wifi(
+            received.packet.bytes,
+            &received.header_status,
+            status,
+            decrypted,
+        )?,
+        RxDecapType::Ethernet2Dix | RxDecapType::Ieee8023 => unreachable!(),
+    };
+    Ok(HostRxFrame {
+        bytes,
+        info: HostRxInfo {
+            decap_type,
+            peer: received.packet.peer.filter(|peer| peer.0 != 0xffff),
+            tid: status.tid,
+            decrypt_status: if decrypted {
+                RxDecryptStatus::Decrypted
+            } else {
+                RxDecryptStatus::NotDecrypted
+            },
+            phy_metadata: status.frequency,
+            bandwidth: status.bandwidth,
+            mcs: status.mcs,
+            packet_type: status.packet_type,
+            nss: status.nss,
+            phy_ppdu_id: status.phy_ppdu_id,
+        },
+    })
+}
+
+fn ieee80211_header_len(frame: &[u8]) -> Result<usize, HostRxDropReason> {
+    let fc = u16::from_le_bytes(
+        frame
+            .get(..2)
+            .ok_or(HostRxDropReason::Malformed)?
+            .try_into()
+            .map_err(|_| HostRxDropReason::Malformed)?,
+    );
+    let data = fc & 0x000c == 0x0008;
+    let qos = data && fc & 0x0080 != 0;
+    let mut len = if fc & 0x0300 == 0x0300 { 30 } else { 24 };
+    if qos {
+        len += 2;
+        if fc & 0x8000 != 0 {
+            len += 4;
+        }
+    }
+    (frame.len() >= len)
+        .then_some(len)
+        .ok_or(HostRxDropReason::Malformed)
+}
+
+fn address_offsets(frame: &[u8]) -> Result<(usize, usize), HostRxDropReason> {
+    let fc = u16::from_le_bytes(
+        frame
+            .get(..2)
+            .ok_or(HostRxDropReason::Malformed)?
+            .try_into()
+            .map_err(|_| HostRxDropReason::Malformed)?,
+    );
+    Ok(match fc & 0x0300 {
+        0x0000 => (4, 10),
+        0x0100 => (16, 10),
+        0x0200 => (4, 16),
+        0x0300 => (16, 24),
+        _ => unreachable!(),
+    })
+}
+
+fn crypto_lengths(encryption_type: u8) -> (usize, usize, usize) {
+    match encryption_type {
+        2 | 4 => (8, 0, 4),
+        6 => (8, 8, 0),
+        8 => (8, 16, 0),
+        9 | 10 => (8, 16, 0),
+        _ => (0, 0, 0),
+    }
+}
+
+fn normalize_raw(
+    mut bytes: Vec<u8>,
+    status: RxDescriptorStatus,
+    decrypted: bool,
+) -> Result<Vec<u8>, HostRxDropReason> {
+    if !status.first_msdu || !status.last_msdu || bytes.len() < 4 {
+        return Err(HostRxDropReason::Malformed);
+    }
+    bytes.truncate(bytes.len() - 4);
+    if !decrypted {
+        return Ok(bytes);
+    }
+    let header_len = ieee80211_header_len(&bytes)?;
+    let (crypto, mic, icv) = crypto_lengths(status.encryption_type);
+    let more_fragments = u16::from_le_bytes([bytes[0], bytes[1]]) & 0x0400 != 0;
+    let mmic = usize::from(status.encryption_type == 4 && !more_fragments) * 8;
+    if bytes.len() < header_len + crypto + mic + icv + mmic {
+        return Err(HostRxDropReason::Malformed);
+    }
+    let iv_stripped = !status.multicast_broadcast;
+    if iv_stripped {
+        bytes.drain(header_len..header_len + crypto);
+    }
+    bytes.truncate(bytes.len() - mic - icv - mmic);
+    if iv_stripped {
+        bytes[1] &= !0x40; // IEEE80211_FCTL_PROTECTED
+    }
+    Ok(bytes)
+}
+
+fn normalize_native_wifi(
+    bytes: Vec<u8>,
+    header_status: &[u8],
+    status: RxDescriptorStatus,
+    decrypted: bool,
+) -> Result<Vec<u8>, HostRxDropReason> {
+    let native_header_len = ieee80211_header_len(&bytes)?;
+    let iv_stripped = decrypted && !status.multicast_broadcast;
+    if !status.first_msdu {
+        let mut header = bytes[..native_header_len].to_vec();
+        let mut fc = u16::from_le_bytes([header[0], header[1]]);
+        fc = (fc | 0x0080) & !0x8000;
+        if iv_stripped {
+            fc &= !0x4000;
+        }
+        header[..2].copy_from_slice(&fc.to_le_bytes());
+        let qos = u16::from(status.tid) | (u16::from(status.mesh_control_present) << 8);
+        header.extend_from_slice(&qos.to_le_bytes());
+        let crypto = if iv_stripped {
+            0
+        } else {
+            crypto_lengths(status.encryption_type).0
+        };
+        let crypto_end = native_header_len + crypto;
+        header.extend_from_slice(
+            bytes
+                .get(native_header_len..crypto_end)
+                .ok_or(HostRxDropReason::Malformed)?,
+        );
+        // `skb_push(crypto_len)` copies the parameters in front of the
+        // original post-native-header bytes before rebuilding the header.
+        header.extend_from_slice(&bytes[native_header_len..]);
+        return Ok(header);
+    }
+    let (native_da, native_sa) = address_offsets(&bytes)?;
+    let da: [u8; 6] = bytes
+        .get(native_da..native_da + 6)
+        .ok_or(HostRxDropReason::Malformed)?
+        .try_into()
+        .map_err(|_| HostRxDropReason::Malformed)?;
+    let sa: [u8; 6] = bytes
+        .get(native_sa..native_sa + 6)
+        .ok_or(HostRxDropReason::Malformed)?
+        .try_into()
+        .map_err(|_| HostRxDropReason::Malformed)?;
+    let original_len = ieee80211_header_len(header_status)?;
+    let mut header = header_status[..original_len].to_vec();
+    if status.first_msdu && header[0] & 0x80 != 0 {
+        let qos = if header[1] & 0x03 == 0x03 { 30 } else { 24 };
+        header[qos] &= !0x80; // IEEE80211_QOS_CTL_A_MSDU_PRESENT
+    }
+    let (da_offset, sa_offset) = address_offsets(&header)?;
+    header[da_offset..da_offset + 6].copy_from_slice(&da);
+    header[sa_offset..sa_offset + 6].copy_from_slice(&sa);
+    if iv_stripped {
+        header[1] &= !0x40;
+    } else {
+        let (crypto, _, _) = crypto_lengths(status.encryption_type);
+        header.extend_from_slice(
+            header_status
+                .get(original_len..original_len + crypto)
+                .ok_or(HostRxDropReason::Malformed)?,
+        );
+    }
+    header.extend_from_slice(&bytes[native_header_len..]);
+    Ok(header)
+}
+
+/// Pure generated-frame oracle seam; production delivery uses the same
+/// normalizer before invoking `DpHost`.
+#[doc(hidden)]
+pub fn normalize_native_wifi_frame(
+    bytes: Vec<u8>,
+    header_status: &[u8],
+    status: RxDescriptorStatus,
+    decrypted: bool,
+) -> Result<Vec<u8>, DpError> {
+    normalize_native_wifi(bytes, header_status, status, decrypted)
+        .map_err(|_| DpError::InvalidFrame)
 }
 
 fn make_tcl_descriptor<B: Backend>(
@@ -736,7 +1228,7 @@ fn make_tcl_descriptor<B: Backend>(
 }
 
 /// `ath11k_dp_tx_encap_nwifi`: remove the QoS control and clear QoS subtype.
-fn encap_native_wifi(frame: &mut Vec<u8>) -> Result<(), DpError> {
+fn encap_native_wifi(frame: &mut Vec<u8>) -> Result<Option<u8>, DpError> {
     let fc_bytes = frame.get(..2).ok_or(DpError::InvalidFrame)?;
     let mut frame_control = u16::from_le_bytes([fc_bytes[0], fc_bytes[1]]);
     let is_data = frame_control & 0x000c == 0x0008;
@@ -745,17 +1237,18 @@ fn encap_native_wifi(frame: &mut Vec<u8>) -> Result<(), DpError> {
     }
     let is_qos = is_data && frame_control & 0x0080 != 0;
     if !is_qos {
-        return Ok(());
+        return Ok(None);
     }
     let has_address4 = frame_control & 0x0300 == 0x0300;
     let qos_offset = if has_address4 { 30 } else { 24 };
     if frame.len() < qos_offset + 2 {
         return Err(DpError::InvalidFrame);
     }
+    let tid = frame[qos_offset] & 0x0f;
     frame.drain(qos_offset..qos_offset + 2);
     frame_control &= !0x0080;
     frame[..2].copy_from_slice(&frame_control.to_le_bytes());
-    Ok(())
+    Ok(Some(tid))
 }
 
 fn map_hal(error: ath11k_hal::HalError) -> DpError {
@@ -790,6 +1283,10 @@ mod tests {
     struct ModelRings {
         published: Vec<(RingId, Descriptor)>,
         completions: VecDeque<Descriptor>,
+        ring_completions: BTreeMap<u16, VecDeque<Descriptor>>,
+        completion_ring: Option<RingId>,
+        fail_consume_ring: Option<RingId>,
+        fail_consume_after: usize,
         next_ring: u16,
         destroyed: Vec<RingId>,
     }
@@ -814,7 +1311,22 @@ mod tests {
             Ok(())
         }
 
-        fn consume(&mut self, _: RingId) -> Result<Option<Descriptor>, ath11k_hal::HalError> {
+        fn consume(&mut self, ring: RingId) -> Result<Option<Descriptor>, ath11k_hal::HalError> {
+            if self.fail_consume_ring == Some(ring) {
+                if self.fail_consume_after == 0 {
+                    return Err(ath11k_hal::HalError::DeviceFault);
+                }
+                self.fail_consume_after -= 1;
+            }
+            if self
+                .completion_ring
+                .is_some_and(|expected| expected != ring)
+            {
+                return Ok(None);
+            }
+            if let Some(completions) = self.ring_completions.get_mut(&ring.0) {
+                return Ok(completions.pop_front());
+            }
             Ok(self.completions.pop_front())
         }
     }
@@ -1589,8 +2101,9 @@ mod tests {
     #[test]
     fn client_tx_syncs_then_publishes_exact_tcl_command() {
         let (device, operations) = DeterministicBackend::recording_noncoherent_device();
-        let mut dp =
-            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        let mut tx = config();
+        tx.tid = 0;
+        let mut dp = ClientDataPath::without_allocated_rings(device, ModelRings::default(), tx);
         dp.configure(DataRings {
             tcl: RingId(1),
             reo: RingId(2),
@@ -1600,10 +2113,14 @@ mod tests {
         let mut frame = vec![0; 30];
         frame[0..2].copy_from_slice(&0x0088_u16.to_le_bytes());
         frame[24..26].copy_from_slice(&[5, 0]);
-        dp.transmit(TxPacket {
-            peer: crate::PeerId(4),
-            bytes: frame,
-        })
+        dp.submit_host_frame(
+            &frame,
+            crate::PeerId(4),
+            HostTxFlags {
+                qos: true,
+                ..HostTxFlags::default()
+            },
+        )
         .unwrap();
 
         assert!(
@@ -1630,12 +2147,14 @@ mod tests {
         })
         .unwrap();
         let mut frame = vec![0; 24];
-        frame[0..2].copy_from_slice(&0x0008_u16.to_le_bytes());
-        dp.transmit(TxPacket {
-            peer: crate::PeerId(4),
-            bytes: frame,
-        })
-        .unwrap();
+        frame[0..2].copy_from_slice(&0x4008_u16.to_le_bytes());
+        let flags = HostTxFlags {
+            protected: true,
+            favor_reliability: false,
+            qos: false,
+        };
+        dp.submit_host_frame(&frame, crate::PeerId(4), flags)
+            .unwrap();
 
         let mut release = WbmReleaseRing::new();
         let mut address = RxdmaBufferRing::new();
@@ -1648,8 +2167,282 @@ mod tests {
         dp.rings_mut()
             .completions
             .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
-        assert!(dp.service_tx_completions().unwrap()[0].acknowledged);
+        let result = dp.service_tx_completions().unwrap().remove(0);
+        assert!(result.acknowledged);
         assert!(dp.pending.is_empty());
+    }
+
+    #[test]
+    fn unsupported_reliability_hint_is_rejected_before_dma_mapping() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        assert_eq!(
+            dp.submit_host_frame(
+                &frame,
+                crate::PeerId(4),
+                HostTxFlags {
+                    favor_reliability: true,
+                    ..HostTxFlags::default()
+                }
+            ),
+            Err(DpError::UnsupportedTxFlags)
+        );
+        assert!(dp.rings().published.is_empty());
+    }
+
+    #[test]
+    fn mec_notification_without_live_cookie_is_ignored() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut release = WbmReleaseRing::new();
+        release.set_release_source(3).unwrap();
+        let mut raw = *release.as_bytes();
+        raw[8..12].copy_from_slice(&(3_u32 | (5 << 9)).to_le_bytes());
+        dp.rings_mut()
+            .completions
+            .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
+        assert!(dp.service_tx_completions().unwrap().is_empty());
+        assert!(dp.pending.is_empty());
+    }
+
+    #[test]
+    fn zero_host_budget_consumes_no_completion() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        dp.rings_mut()
+            .completions
+            .push_back(Descriptor::new(vec![0; 32], 32).unwrap());
+        dp.rings_mut().completion_ring = Some(RingId(3));
+        struct NoopHost;
+        impl DpHost for NoopHost {
+            fn receive(&mut self, _: HostRxFrame) {}
+            fn tx_complete(&mut self, _: TxResult) {}
+        }
+        let result = dp.service_host(0, 1, &mut NoopHost).unwrap();
+        assert_eq!(result.tx_delivered, 0);
+        assert_eq!(dp.rings().completions.len(), 1);
+    }
+
+    #[test]
+    fn host_observes_valid_tx_before_later_missing_owner() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        dp.submit_host_frame(&frame, crate::PeerId(4), HostTxFlags::default())
+            .unwrap();
+        let mut valid = WbmReleaseRing::new();
+        let mut address = RxdmaBufferRing::new();
+        address.set_software_cookie(1 << 19).unwrap();
+        valid.set_buffer_address(&address);
+        valid.set_release_source(3).unwrap();
+        let mut raw = *valid.as_bytes();
+        raw[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        dp.rings_mut()
+            .completions
+            .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
+        dp.rings_mut()
+            .completions
+            .push_back(Descriptor::new(vec![0; 32], 32).unwrap());
+        dp.rings_mut().completion_ring = Some(RingId(3));
+        #[derive(Default)]
+        struct CompletionHost(Vec<TxResult>);
+        impl DpHost for CompletionHost {
+            fn receive(&mut self, _: HostRxFrame) {}
+            fn tx_complete(&mut self, result: TxResult) {
+                self.0.push(result);
+            }
+        }
+        let mut host = CompletionHost::default();
+        let first = dp.service_host(1, 1, &mut host).unwrap();
+        assert_eq!(host.0.len(), 1);
+        assert!(host.0[0].acknowledged);
+        assert_eq!((first.tx_delivered, first.tx_malformed), (1, 0));
+        let second = dp.service_host(1, 0, &mut host).unwrap();
+        assert_eq!((second.tx_delivered, second.tx_malformed), (0, 1));
+    }
+
+    #[test]
+    fn host_observes_tx_completion_before_later_rx_fault() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        dp.submit_host_frame(&frame, crate::PeerId(4), HostTxFlags::default())
+            .unwrap();
+        let mut release = WbmReleaseRing::new();
+        let mut address = RxdmaBufferRing::new();
+        address.set_software_cookie(1 << 19).unwrap();
+        release.set_buffer_address(&address);
+        release.set_release_source(3).unwrap();
+        let mut raw = *release.as_bytes();
+        raw[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        dp.rings_mut()
+            .completions
+            .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
+        dp.rings_mut().fail_consume_ring = Some(RingId(2));
+        dp.rings_mut().fail_consume_after = 1;
+        dp.rings_mut().completion_ring = Some(RingId(3));
+        #[derive(Default)]
+        struct CompletionHost(Vec<TxResult>);
+        impl DpHost for CompletionHost {
+            fn receive(&mut self, _: HostRxFrame) {}
+            fn tx_complete(&mut self, result: TxResult) {
+                self.0.push(result);
+            }
+        }
+        let mut host = CompletionHost::default();
+        assert_eq!(dp.service_host(3, 1, &mut host), Err(DpError::DeviceFault));
+        assert_eq!(host.0.len(), 1);
+    }
+
+    #[test]
+    fn host_delivery_rejects_failed_and_ethernet_decapped_frames() {
+        let mut bytes = vec![0; 2048];
+        bytes[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13)).to_le_bytes());
+        bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        bytes[96..100].copy_from_slice(&5_u32.to_le_bytes());
+        bytes[388] = 7;
+
+        let valid = parse_received_buffer(&bytes).unwrap();
+        assert_eq!(host_frame(valid).unwrap().bytes, [7]);
+
+        // msdu_start.info2 decap_type = Ethernet2Dix.
+        bytes[100..104].copy_from_slice(&(2_u32 << 8).to_le_bytes());
+        assert_eq!(
+            host_frame(parse_received_buffer(&bytes).unwrap()),
+            Err(HostRxDropReason::UnsupportedDecap)
+        );
+        // attention.info1 FCS error takes precedence over decapsulation.
+        bytes[80..84].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        assert_eq!(
+            host_frame(parse_received_buffer(&bytes).unwrap()),
+            Err(HostRxDropReason::Fcs)
+        );
+    }
+
+    #[test]
+    fn host_decryption_status_requires_valid_non_open_encryption() {
+        fn raw(status1: u32, encryption_valid: bool, encryption_type: u8) -> ReceivedFrame {
+            let mut bytes = vec![0; 2048];
+            bytes[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13)).to_le_bytes());
+            bytes[80..84].copy_from_slice(&status1.to_le_bytes());
+            bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+            let msdu_length = if encryption_type == 8 { 53_u32 } else { 45 };
+            bytes[96..100].copy_from_slice(&msdu_length.to_le_bytes());
+            bytes[168..172].copy_from_slice(&(u32::from(encryption_type) << 2).to_le_bytes());
+            if encryption_valid {
+                bytes[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+            }
+            bytes[388..390].copy_from_slice(&0x4008_u16.to_le_bytes());
+            bytes[420] = 9;
+            parse_received_buffer(&bytes).unwrap()
+        }
+
+        let mut open = raw(0, false, 0);
+        open.status.msdu_length = 28;
+        open.packet.bytes.truncate(28);
+        assert_eq!(
+            host_frame(open).unwrap().info.decrypt_status,
+            RxDecryptStatus::NotDecrypted
+        );
+        let encrypted = host_frame(raw(0, true, 6)).unwrap();
+        assert_eq!(encrypted.info.decrypt_status, RxDecryptStatus::Decrypted);
+        assert_eq!(encrypted.bytes.len(), 25);
+        assert_eq!(encrypted.bytes[1] & 0x40, 0);
+        let mut multicast = raw(0, true, 6);
+        multicast.status.multicast_broadcast = true;
+        let multicast = host_frame(multicast).unwrap();
+        assert_eq!(multicast.bytes.len(), 33);
+        assert_ne!(multicast.bytes[1] & 0x40, 0);
+        let ccmp256 = host_frame(raw(0, true, 8)).unwrap();
+        assert_eq!(ccmp256.bytes.len(), 25);
+        assert_eq!(
+            host_frame(raw(1 << 29, true, 6)),
+            Err(HostRxDropReason::Decrypt)
+        );
+        assert_eq!(
+            host_frame(raw(1 << 28, true, 4)),
+            Err(HostRxDropReason::TkipMic)
+        );
+    }
+
+    #[test]
+    fn native_wifi_delivery_restores_header_status_and_addresses() {
+        let mut bytes = vec![0; 2048];
+        bytes[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13)).to_le_bytes());
+        bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        bytes[96..100].copy_from_slice(&25_u32.to_le_bytes());
+        bytes[100..104].copy_from_slice(&(1_u32 << 8).to_le_bytes());
+        bytes[268..270].copy_from_slice(&0x0088_u16.to_le_bytes());
+        bytes[292] = 0x80; // A-MSDU present in original QoS control.
+        bytes[388..390].copy_from_slice(&0x0008_u16.to_le_bytes());
+        bytes[392..398].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        bytes[398..404].copy_from_slice(&[7, 8, 9, 10, 11, 12]);
+        bytes[412] = 0xaa;
+        let frame = host_frame(parse_received_buffer(&bytes).unwrap()).unwrap();
+        assert_eq!(&frame.bytes[4..10], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&frame.bytes[10..16], &[7, 8, 9, 10, 11, 12]);
+        assert_eq!(frame.bytes[24] & 0x80, 0);
+        assert_eq!(frame.bytes[26], 0xaa);
+
+        let mut non_first = parse_received_buffer(&bytes).unwrap();
+        non_first.status.first_msdu = false;
+        non_first.status.multicast_broadcast = true;
+        non_first.status.encryption_info_valid = true;
+        non_first.status.encryption_type = 6;
+        non_first.status.tid = 5;
+        non_first.status.mesh_control_present = true;
+        non_first.packet.bytes[1] |= 0x40;
+        non_first
+            .packet
+            .bytes
+            .splice(24..24, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let non_first = host_frame(non_first).unwrap();
+        assert_ne!(non_first.bytes[1] & 0x40, 0);
+        assert_ne!(
+            u16::from_le_bytes([non_first.bytes[24], non_first.bytes[25]]) & 0x100,
+            0
+        );
+        assert_eq!(&non_first.bytes[26..34], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&non_first.bytes[34..42], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -1685,6 +2478,7 @@ mod tests {
         first[390..].fill(0xaa);
         let mut last = vec![0; 2048];
         last[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
+        last[80..84].copy_from_slice(&((1_u32 << 29) | (1 << 2)).to_le_bytes());
         last[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         last[388..430].fill(0xbb);
         let fragments = [
@@ -1715,10 +2509,42 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xbb)
         );
-        assert_eq!(received.packet.peer, Some(crate::PeerId(12)));
+        assert_eq!(received.packet.peer, Some(crate::PeerId(0)));
+        assert!(received.status.decrypt_error);
+        assert_ne!(received.status.mpdu_errors, 0);
+        assert!(received.status.multicast_broadcast);
         assert_eq!(
             (received.status.sequence_number, received.status.tid),
-            (33, 5)
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn first_buffer_msdu_length_error_is_not_hidden_by_clean_last_buffer() {
+        let mut first = vec![0; 512];
+        first[80..84].copy_from_slice(&(1_u32 << 17).to_le_bytes());
+        first[96..100].copy_from_slice(&1_u32.to_le_bytes());
+        let mut last = vec![0; 512];
+        last[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13)).to_le_bytes());
+        last[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+        assert_eq!(
+            parse_received_chain(&[
+                RxFragment {
+                    bytes: first,
+                    continuation: true,
+                    peer: crate::PeerId(1),
+                    sequence_number: 1,
+                    tid: 0,
+                },
+                RxFragment {
+                    bytes: last,
+                    continuation: false,
+                    peer: crate::PeerId(1),
+                    sequence_number: 1,
+                    tid: 0,
+                },
+            ]),
+            Err(DpError::MalformedDescriptor)
         );
     }
 
@@ -1729,7 +2555,7 @@ mod tests {
         let mut image = vec![0; 2048];
         image[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
         image[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
-        image[96..100].copy_from_slice(&4_u32.to_le_bytes());
+        image[96..100].copy_from_slice(&8_u32.to_le_bytes());
         image[182..184].copy_from_slice(&9_u16.to_le_bytes());
         image[390..394].copy_from_slice(&[1, 2, 3, 4]);
         let source = TxBuffer::map(&device, &image).unwrap();
@@ -1769,11 +2595,66 @@ mod tests {
         let mut reo = ReoDestinationRing::new();
         reo.set_buffer_address(&refill);
         reo.set_push_reason(1).unwrap();
-        dp.rings_mut().completions.push_back(reo.into_descriptor());
-        let received = dp.receive_with_status().unwrap().unwrap();
-        assert_eq!(received.packet.bytes, [1, 2, 3, 4]);
-        assert!(operations.borrow().iter().any(
-            |operation| matches!(operation, Operation::SyncForCpu { range, .. } if range.len() == 2048)
-        ));
+        dp.rings_mut()
+            .ring_completions
+            .entry(2)
+            .or_default()
+            .push_back(reo.into_descriptor());
+        let mut tx_frame = vec![0; 24];
+        tx_frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        dp.submit_host_frame(&tx_frame, crate::PeerId(4), HostTxFlags::default())
+            .unwrap();
+        let mut release = WbmReleaseRing::new();
+        let mut address = RxdmaBufferRing::new();
+        address.set_software_cookie(1 << 19).unwrap();
+        release.set_buffer_address(&address);
+        release.set_release_source(3).unwrap();
+        let mut raw = *release.as_bytes();
+        raw[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        dp.rings_mut()
+            .ring_completions
+            .entry(3)
+            .or_default()
+            .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
+        operations.borrow_mut().clear();
+        struct RecordingHost {
+            frames: Vec<HostRxFrame>,
+            operations: Rc<RefCell<Vec<Operation>>>,
+            tx_completed: usize,
+        }
+        impl DpHost for RecordingHost {
+            fn receive(&mut self, frame: HostRxFrame) {
+                let operations = self.operations.borrow();
+                assert!(matches!(
+                    operations.as_slice(),
+                    [
+                        Operation::SyncForCpu { range: cpu, .. },
+                        Operation::SyncForDevice { range: device, .. }
+                    ] if cpu.len() == 2048 && cpu == device
+                ));
+                drop(operations);
+                self.frames.push(frame);
+            }
+            fn tx_complete(&mut self, _: TxResult) {
+                self.tx_completed += 1;
+            }
+        }
+        let mut host = RecordingHost {
+            frames: Vec::new(),
+            operations: operations.clone(),
+            tx_completed: 0,
+        };
+        let result = dp.service_host(1, 1, &mut host).unwrap();
+        assert_eq!(result.rx_delivered, 1);
+        assert_eq!(result.rx_dropped, HostRxDropCounters::default());
+        assert_eq!(host.frames[0].bytes, [1, 2, 3, 4]);
+        assert_eq!(host.frames[0].info.decap_type, RxDecapType::Raw);
+        assert_eq!(
+            host.frames[0].info.decrypt_status,
+            RxDecryptStatus::NotDecrypted
+        );
+        let result = dp.service_host(1, 1, &mut host).unwrap();
+        assert_eq!(result.tx_delivered, 1);
+        assert_eq!(host.tx_completed, 1);
     }
 }
