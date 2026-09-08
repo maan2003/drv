@@ -1129,9 +1129,11 @@ impl Host for RealHost {
                 diagnose_iommufd_open(&error)
             })
         })?;
-        let resources = vfio.validate_wcn6750_resources().map_err(|error| {
-            Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
-        })?;
+        let resources = vfio
+            .validate_wcn6750_resources(0, 0x20_0000)
+            .map_err(|error| {
+                Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
+            })?;
         if let Some(containment) = remoteproc_containment_for_resources(
             resources.reset_supported,
             Path::new(REMOTEPROC_CLASS),
@@ -1209,7 +1211,7 @@ impl Host for RealHost {
             action: "create WMI JSONL run record",
             source,
         })?;
-        let memory = ath11k_core::HardwareMemoryProvider::new(hardware.clone());
+        let memory = ath11k_core::HardwareMemoryProvider::new(hardware.clone(), 0);
         let qmi = ath11k_core::Wcn6750QmiSession::new(transport, assets, memory);
         let subsystems = ath11k_core::Wcn6750Subsystems::new(
             qmi,

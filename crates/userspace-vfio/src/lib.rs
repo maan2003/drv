@@ -122,11 +122,8 @@ fn validate_platform_info(info: &DeviceInfo) -> Result<(), String> {
     if info.flags & VFIO_DEVICE_FLAGS_PLATFORM == 0 || info.flags & VFIO_DEVICE_FLAGS_PCI != 0 {
         return Err("VFIO cdev is not a platform device".into());
     }
-    if info.num_regions != 1 {
-        return Err(format!(
-            "expected 1 VFIO region, found {}",
-            info.num_regions
-        ));
+    if info.num_regions == 0 {
+        return Err("VFIO platform device exposes no regions".into());
     }
     if info.num_irqs != 32 {
         return Err(format!("expected 32 VFIO IRQs, found {}", info.num_irqs));

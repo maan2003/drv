@@ -523,7 +523,7 @@ fn qmi_memory_provider_returns_only_allocation_derived_iovas() {
     };
     use drv_hardware_backends::DeterministicBackend;
 
-    let mut provider = HardwareMemoryProvider::new(DeterministicBackend::device());
+    let mut provider = HardwareMemoryProvider::new(DeterministicBackend::device(), 0);
     let responses = provider
         .provision(&[MemorySegment {
             size: 4096,
@@ -535,6 +535,29 @@ fn qmi_memory_provider_returns_only_allocation_derived_iovas() {
     assert_eq!(responses[0].address, 0x1000_0000);
     assert_eq!(responses[0].size, 4096);
     assert_eq!(responses[0].restore, 0);
+}
+
+#[test]
+fn qmi_memory_provider_uses_selected_exact_bar_window() {
+    use ath11k_qmi::MemoryProvider;
+    use drv_hardware_backends::DeterministicBackend;
+
+    let (device, _) = DeterministicBackend::recording_device_with_region_len(0x20_0000);
+    let mut provider = HardwareMemoryProvider::new(device, 0);
+    assert!(provider.map_device_bar(0x1000_0000, 0x20_0000).is_ok());
+    assert_eq!(provider.device_bar().unwrap().len(), 0x20_0000);
+
+    let (device, _) = DeterministicBackend::recording_device_with_region_len(0x10_0000);
+    let mut wrong_size = HardwareMemoryProvider::new(device, 0);
+    assert_eq!(
+        wrong_size.map_device_bar(0x1000_0000, 0x20_0000),
+        Err(ath11k_qmi::QmiError::Transport)
+    );
+    let mut wrong_index = HardwareMemoryProvider::new(DeterministicBackend::device(), 1);
+    assert_eq!(
+        wrong_index.map_device_bar(0x1000_0000, 0x10_0000),
+        Err(ath11k_qmi::QmiError::Transport)
+    );
 }
 
 #[test]

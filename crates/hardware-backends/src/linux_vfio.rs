@@ -122,21 +122,41 @@ impl LinuxVfio {
 
     pub fn validate_wcn6750_resources(
         &self,
+        register_region: u32,
+        expected_size: usize,
     ) -> std::result::Result<userspace_vfio::PlatformDeviceInfo, LinuxVfioError> {
         let device = userspace_vfio::validate_wcn6750_platform_cdev(&self.device)
             .map_err(LinuxVfioError::Setup)?;
-        self.probe_region_mapping(0)?;
+        if register_region >= device.num_regions {
+            return Err(LinuxVfioError::Setup(format!(
+                "VFIO register region {register_region} is absent (device exposes {})",
+                device.num_regions
+            )));
+        }
+        self.probe_region_mapping(register_region, expected_size)?;
         Ok(device)
     }
 
-    /// Prove that a VFIO region can be mapped and preserve all kernel-returned
-    /// facts in the diagnostic if the query, permission gate, or mmap fails.
-    pub fn probe_region_mapping(&self, index: u32) -> std::result::Result<(), LinuxVfioError> {
-        let info = userspace_vfio::region_info(&self.device, index).map_err(|error| {
+    /// Query one enumerated region while preserving the ioctl's exact error.
+    pub fn region_info(
+        &self,
+        index: u32,
+    ) -> std::result::Result<userspace_vfio::RegionInfo, LinuxVfioError> {
+        userspace_vfio::region_info(&self.device, index).map_err(|error| {
             LinuxVfioError::Setup(format!(
                 "VFIO region {index} GET_REGION_INFO failed: {error}"
             ))
-        })?;
+        })
+    }
+
+    /// Prove that a selected VFIO register window has the caller-required
+    /// exact size and can be mapped. Diagnostics preserve every returned fact.
+    pub fn probe_region_mapping(
+        &self,
+        index: u32,
+        expected_size: usize,
+    ) -> std::result::Result<(), LinuxVfioError> {
+        let info = self.region_info(index)?;
         let facts = format!(
             "VFIO region {index} flags={:#x} size={:#x} offset={:#x}",
             info.flags, info.size, info.offset
@@ -145,6 +165,11 @@ impl LinuxVfio {
             .map_err(|_| LinuxVfioError::Setup(format!("{facts}: size exceeds usize")))?;
         if len == 0 {
             return Err(LinuxVfioError::Setup(format!("{facts}: region is empty")));
+        }
+        if len != expected_size {
+            return Err(LinuxVfioError::Setup(format!(
+                "{facts}: expected register window size {expected_size:#x}"
+            )));
         }
         RegionMapping::map(&self.device, &info, 0, len, true)
             .map_err(|error| LinuxVfioError::Setup(format!("{facts}: {error}")))?;
@@ -899,7 +924,12 @@ mod tests {
                 Ok(ioas)
             })
             .unwrap();
-            backend.validate_wcn6750_resources().unwrap();
+            backend.validate_wcn6750_resources(0, PAGE).unwrap();
+            let mismatch = backend.probe_region_mapping(1, PAGE * 2).unwrap_err();
+            let mismatch = mismatch.to_string();
+            assert!(mismatch.contains("VFIO region 1 flags=0x7 size=0x1000 offset=0x1000"));
+            assert!(mismatch.contains("expected register window size 0x2000"));
+            backend.probe_region_mapping(1, PAGE).unwrap();
             let dma = backend
                 .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
                 .unwrap();
@@ -928,6 +958,8 @@ mod tests {
         expected.extend((0..32).map(Record::QueryIrq));
         expected.extend([
             Record::QueryRegion(0),
+            Record::QueryRegion(1),
+            Record::QueryRegion(1),
             Record::Map {
                 iova: FIRST_IOVA,
                 length: PAGE as u64,
@@ -960,7 +992,7 @@ mod tests {
             .unwrap();
             assert!(
                 !backend
-                    .validate_wcn6750_resources()
+                    .validate_wcn6750_resources(0, PAGE)
                     .unwrap()
                     .reset_supported
             );

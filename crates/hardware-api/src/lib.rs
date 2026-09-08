@@ -241,6 +241,19 @@ impl<B: Backend> Device<B> {
             len,
         })
     }
+
+    /// Open a caller-selected register window only when its complete exposed
+    /// size matches the hardware contract.
+    pub fn open_region_sized(&self, index: u8, expected_size: usize) -> Result<MmioRegion<B>> {
+        if expected_size == 0 {
+            return Err(Error::Invalid);
+        }
+        let region = self.open_region(index)?;
+        if region.len() != expected_size {
+            return Err(Error::OutOfBounds);
+        }
+        Ok(region)
+    }
     /// Allocate coherent DMA storage whose entire device-visible contents are
     /// zero before this function returns.
     pub fn alloc_coherent<D: Direction>(
