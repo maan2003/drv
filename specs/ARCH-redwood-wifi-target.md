@@ -7,8 +7,10 @@ association, DHCP, and proved Internet connectivity before production hardening.
 The QMI-only discovery run reported BAR address `0x61e00000` and size
 `0x200000`, then stopped before MMIO/CE/HTC/WMI. The DT-assisted region-selection
 runner is merged but not physically validated. Automatic recovery for that
-no-reset VFIO experiment is being corrected; the old rebind-only transaction
-script is not a valid recovery path for it.
+no-reset VFIO experiment now uses a process timeout plus a local forced-reboot
+deadline and reboots on runner exit instead of attempting a native-driver
+rebind. Its stalled-runner and successful-exit paths pass a host-only test;
+physical recovery validation remains pending.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

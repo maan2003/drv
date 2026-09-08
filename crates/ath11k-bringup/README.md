@@ -29,6 +29,27 @@ number of timers. The existing rebind-only
 no-reset VFIO experiment; its fake restore test does not model device ownership.
 The updated automatic recovery procedure must be established before that run.
 
+`scripts/redwood/redwood-wifi-transaction` supplies that procedure for the
+no-reset VFIO run. Launch it as the detached runner unit; it installs a local
+deadline reboot before starting the command, applies a process timeout even
+while the runner's independent heartbeat is advancing, and forces reboot on
+both success and failure. Keep the initrd watchdog armed throughout. For
+example, after setup has recorded `RUN` and discovered `CDEV`:
+
+```sh
+systemd-run --unit=redwood-ath11k-runB --collect \
+  /var/lib/ath11k-redwood-lab/stage10/redwood-wifi-transaction --run \
+  /bin/sh -c 'exec "$1" --vfio-device "$2" \
+    --containment remoteproc:remoteproc2 --register-region 1 --stop-after qmi \
+    --wmi-log "$3/runB.wmi.jsonl" >"$3/runB.log" 2>&1' \
+  sh /var/lib/ath11k-redwood-lab/stage10/ath11k-bringup-runB "$CDEV" "$RUN"
+```
+
+Do not append `redwood-lab-watchdog stop`: this no-reset transaction ends in
+automatic reboot, and reboot is the cleanup that releases VFIO/WPSS state.
+Run the host-only recovery check with
+`scripts/redwood/redwood-wifi-transaction --self-test`.
+
 Start with the fully fake-backed path. It opens no VFIO/QRTR resources and
 does not read firmware. It writes a deterministic WMI command/event fixture to
 the selected `--wmi-log` path:
@@ -40,8 +61,9 @@ cargo run -p ath11k-bringup -- --dry-run
 Real mode acquires exclusive VFIO ownership first, then AF_QIPCRTR. The default
 opens the supplied VFIO cdev, binds it to `/dev/iommu`, allocates and attaches
 an IOAS, and uses the coherent mapping path selected for kernel #3's first
-hardware run. `--broker` explicitly selects the narrowed default-domain broker
-once that kernel patch exists. Use `--stop-after` to bound execution:
+hardware run. `--broker` explicitly selects the experimental DMA-broker backend
+and requires compatible kernel support; the admitted coherent polling path does
+not need it. Use `--stop-after` to bound execution:
 
 Before any staged run, arm the initrd userspace watchdog, then execute the inert
 fail-closed host preflight. It checks the VFIO cdev/sysfs identity, the 32

@@ -1,66 +1,98 @@
 #!/usr/bin/env bash
 set -euo pipefail
-device=${REDWOOD_WIFI_DEVICE:-17a10040.wifi}
-driver_dir=${REDWOOD_DRIVER_DIR:-/sys/bus/platform/drivers/ath11k}
+
 report_dir=${REDWOOD_REPORT_DIR:-/var/lib/ath11k-redwood-lab}
-systemctl_cmd=${REDWOOD_SYSTEMCTL:-systemctl}
+systemd_run=${REDWOOD_SYSTEMD_RUN:-systemd-run}
 inhibit_cmd=${REDWOOD_SYSTEMD_INHIBIT:-systemd-inhibit}
-ip_cmd=${REDWOOD_IP:-ip}
+timeout_cmd=${REDWOOD_TIMEOUT:-timeout}
+sysrq_trigger=${REDWOOD_SYSRQ_TRIGGER:-/proc/sysrq-trigger}
+reboot_cmd=${REDWOOD_REBOOT:-reboot}
 deadline=${REDWOOD_DEADLINE_SECONDS:-120}
-restore() {
+
+recover() {
+  reason=${1:-unspecified}
   mkdir -p "$report_dir"
-  { date -Ins; echo "RESTORE_BEGIN device=$device"; } >>"$report_dir/restore.log"
-  if [[ ! -e "$driver_dir/$device" ]]; then printf '%s' "$device" >"$driver_dir/bind"; fi
-  "$systemctl_cmd" restart iwd
-  for _ in $(seq 1 60); do
-    if "$ip_cmd" -4 -o address show dev wlan0 scope global | grep -q .; then
-      echo "RESTORE_OK" >>"$report_dir/restore.log"; return 0
-    fi
-    sleep 1
-  done
-  echo "RESTORE_FAILED" >>"$report_dir/restore.log"; return 1
+  { date -Ins; echo "RECOVERY_BEGIN reason=$reason action=forced_reboot"; } \
+    >>"$report_dir/recovery.log"
+  sync
+  if ! printf b >"$sysrq_trigger"; then
+    "$reboot_cmd" -f
+  fi
 }
+
 case ${1-} in
- --restore) restore; exit;;
- --self-test)
-   t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
-   mkdir -p "$t/driver" "$t/report" "$t/bin"
-   : >"$t/driver/bind"
-   cat >"$t/bin/systemctl" <<'SH'
+  --recover)
+    recover "${2:-deadline}"
+    exit
+    ;;
+  --self-test)
+    t=$(mktemp -d)
+    trap 'rm -rf "$t"' EXIT
+    mkdir -p "$t/bin" "$t/report"
+    : >"$t/sysrq-trigger"
+    cat >"$t/bin/systemd-run" <<'SH'
 #!/bin/sh
-echo "$*" >>"$REDWOOD_TEST_LOG"
+printf '%s\n' "$*" >>"$REDWOOD_TEST_ACTIONS"
 SH
-   cat >"$t/bin/ip" <<'SH'
+    cat >"$t/bin/systemd-inhibit" <<'SH'
 #!/bin/sh
-echo '1: wlan0 inet 192.0.2.2/24 scope global wlan0'
+while [ "$#" -gt 0 ]; do
+  case $1 in --what=*|--mode=*|--why=*) shift;; *) break;; esac
+done
+exec "$@"
 SH
-   chmod +x "$t/bin/"*
-   REDWOOD_WIFI_DEVICE=test.wifi REDWOOD_DRIVER_DIR="$t/driver" \
-    REDWOOD_REPORT_DIR="$t/report" REDWOOD_SYSTEMCTL="$t/bin/systemctl" \
-    REDWOOD_IP="$t/bin/ip" REDWOOD_TEST_LOG="$t/actions" "$0" --restore
-   grep -qx test.wifi "$t/driver/bind"
-   grep -qx 'restart iwd' "$t/actions"
-   grep -qx RESTORE_OK "$t/report/restore.log"
-   echo SELF_TEST_RESTORE_OK
-   exit;;
- --plan)
-   echo "PLAN device=$device deadline_seconds=$deadline local_systemd_restore=true sleep_inhibited=true durable_report=$report_dir"
-   exit;;
- --run) shift;;
- *) echo "usage: $0 --plan|--self-test|--restore|--run COMMAND..." >&2; exit 2;;
+    chmod +x "$t/bin/"*
+    REDWOOD_REPORT_DIR="$t/report" REDWOOD_SYSTEMD_RUN="$t/bin/systemd-run" \
+      REDWOOD_SYSTEMD_INHIBIT="$t/bin/systemd-inhibit" REDWOOD_TIMEOUT=timeout \
+    REDWOOD_SYSRQ_TRIGGER="$t/sysrq-trigger" REDWOOD_REBOOT=false \
+      REDWOOD_DEADLINE_SECONDS=1 REDWOOD_TEST_ACTIONS="$t/actions" \
+      REDWOOD_TEST_MODE=1 \
+      "$0" --run sh -c 'sleep 10' || test "$?" -eq 124
+    grep -q -- '--on-active=1s' "$t/actions"
+    grep -q -- '--recover deadline' "$t/actions"
+    grep -q 'RECOVERY_BEGIN reason=runner_exit_124 action=forced_reboot' \
+      "$t/report/recovery.log"
+    test "$(cat "$t/sysrq-trigger")" = b
+    : >"$t/sysrq-trigger"
+    REDWOOD_REPORT_DIR="$t/report" REDWOOD_SYSTEMD_RUN="$t/bin/systemd-run" \
+      REDWOOD_SYSTEMD_INHIBIT="$t/bin/systemd-inhibit" REDWOOD_TIMEOUT=timeout \
+      REDWOOD_SYSRQ_TRIGGER="$t/sysrq-trigger" REDWOOD_REBOOT=false \
+      REDWOOD_DEADLINE_SECONDS=5 REDWOOD_TEST_ACTIONS="$t/actions" \
+      REDWOOD_TEST_MODE=1 \
+      "$0" --run true
+    grep -q 'RECOVERY_BEGIN reason=runner_exit_0 action=forced_reboot' \
+      "$t/report/recovery.log"
+    test "$(cat "$t/sysrq-trigger")" = b
+    echo SELF_TEST_RUNNER_RECOVERY_OK
+    exit
+    ;;
+  --plan)
+    echo "PLAN deadline_seconds=$deadline local_systemd_reboot=true sleep_inhibited=true durable_report=$report_dir"
+    exit
+    ;;
+  --run)
+    shift
+    ;;
+  *)
+    echo "usage: $0 --plan|--self-test|--recover [REASON]|--run COMMAND..." >&2
+    exit 2
+    ;;
 esac
-[[ $EUID -eq 0 ]] || { echo root-required >&2; exit 1; }
+
+[[ $EUID -eq 0 || ${REDWOOD_TEST_MODE:-} == 1 ]] || { echo root-required >&2; exit 1; }
 [[ $# -gt 0 ]] || { echo missing-command >&2; exit 2; }
 mkdir -p "$report_dir"
-unit=ath11k-redwood-restore
-systemd-run --quiet --unit="$unit" --on-active="${deadline}s" \
-  "$(readlink -f "$0")" --restore
-cleanup() {
-  rc=$?
-  restore || true
-  systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
-  exit "$rc"
-}
-trap cleanup EXIT HUP INT TERM
+unit=ath11k-redwood-reboot
+"$systemd_run" --quiet --unit="$unit" --on-active="${deadline}s" \
+  "$(readlink -f "$0")" --recover deadline
+
+set +e
 "$inhibit_cmd" --what=sleep --mode=block --why="Redwood Wi-Fi lab transaction" \
-  timeout --signal=TERM --kill-after=10 "${deadline}s" "$@"
+  "$timeout_cmd" --signal=TERM --kill-after=10 "${deadline}s" "$@"
+rc=$?
+set -e
+
+# No-reset VFIO ownership is recovered only by reboot. In particular, a
+# successful runner must not disarm protection and continue in this kernel.
+recover "runner_exit_$rc"
+exit "$rc"
