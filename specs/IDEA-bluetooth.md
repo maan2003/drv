@@ -2,9 +2,11 @@
 
 ## Status
 
-This direction is adopted by [ARCH-bluetooth](ARCH-bluetooth.md). This file
-retains the original design discussion and does not supersede the hardware and
-isolation records, especially
+Fuchsia-derived Rust services and capability-scoped integration are adopted by
+[ARCH-bluetooth](ARCH-bluetooth.md). The earlier incremental C++ host proposal
+is not the production direction: [ARCH-drv](ARCH-drv.md) requires native Rust,
+not Wasm. This record does not supersede the hardware and isolation records,
+especially
 [ARCH-asahi-wifi-target](ARCH-asahi-wifi-target.md) and
 [REQ-isolation](REQ-isolation.md).
 
@@ -20,7 +22,7 @@ application-facing interfaces.
 project system UI and sandbox capability policy
         -> Rust Bluetooth coordinator and pairing
         -> Fuchsia-derived Rust profiles and services
-        -> Sapphire host stack, sandboxed initially and ported incrementally
+        -> native Rust host protocols informed by Sapphire tests
         -> safe Rust Apple HCI transport
         -> typed hardware crate and private IOMMU domain
         -> BCM4387 Bluetooth function
@@ -33,17 +35,16 @@ Zircon bindings would be replaced with project-owned capability interfaces.
 
 The core Sapphire host stack implements HCI, L2CAP, ATT, GATT, GAP, SDP,
 security management, SCO, and ISO. It is certified and production-proven, but
-is currently C++ and has moved from Fuchsia to Pigweed. It can provide the
-initial host implementation and behavioral oracle, but must run without raw
-device authority in a process sandbox. Host layers may then be ported to safe
-Rust independently while retaining Sapphire's protocol tests.
+is currently C++ and has moved from Fuchsia to Pigweed. It supplies hardware-independent protocol knowledge and potential offline
+oracles, not the production host implementation. Rust ports can retain its
+protocol tests.
 
 ## M2 hardware boundary
 
 The Apple-specific work remains below HCI. A safe Rust transport would preserve
 the behavior of Asahi's `hci_bcm4377` driver for PCI lifecycle, firmware,
 command, event, ACL, SCO, power, and reset. It would use the safe hardware crate
-described by [IDEA-rust-first-wifi-drivers](IDEA-rust-first-wifi-drivers.md),
+described by [ARCH-hardware-isolation](ARCH-hardware-isolation.md),
 with VFIO/iommufd on the initial Linux host.
 
 Wi-Fi and Bluetooth share one physical connectivity device on the M2 target but
@@ -81,8 +82,8 @@ legacy management APIs must be preserved.
 ## Security boundary
 
 The trusted safe Rust transport owns the hardware capability. Bluetooth packets
-and peer-controlled protocol state are hostile input, so the initial C++
-Sapphire process receives only bounded HCI packets and cannot access VFIO,
+and peer-controlled protocol state are hostile input, so native Rust protocol
+workers receive only scoped capabilities and must not gain unrelated VFIO,
 IOMMU configuration, firmware storage, or unrelated host services. Pairing,
 bond storage, microphone use, input injection, and application GATT access are
 separate capabilities controlled by system policy.
@@ -91,7 +92,7 @@ separate capabilities controlled by system policy.
 
 Adoption would remove BlueZ and its D-Bus object model from the target
 architecture. It requires an Apple HCI transport, a project Bluetooth API,
-Sapphire integration or Rust ports, direct media/input integration, persistent
+native Rust host protocols, direct media/input integration, persistent
 bond storage, and a vendored system UI. The smallest useful slice is virtual HCI
 plus discovery and pairing, followed by A2DP output through the proposed audio
 service.

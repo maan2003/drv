@@ -2,10 +2,13 @@
 
 ## Status
 
-The parallel-port interfaces and pinned source oracle exist. The native byte
-transcript is blocked because the running kernel has
-`CONFIG_ATH11K_TRACING` unset. No Wi-Fi handoff or kexec experiment has been
-run. VFIO-platform feasibility therefore remains unproven.
+Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
+association, DHCP, and proved Internet connectivity before production hardening.
+The latest reported physical run stopped in device probe with an empty WMI
+artifact. The live DT register resource is a zero-size doorbell placeholder;
+the merged QMI-first runner discovers the actual BAR through DeviceInfo before
+MMIO mapping. That corrected path is not yet physically validated. The empty
+WMI artifact alone establishes neither a firmware exchange nor a mapping error.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

@@ -1,37 +1,29 @@
-# REQ-application-compatibility: Preserve ordinary application interfaces
+# REQ-application-compatibility: Application integration without legacy plumbing lock-in
 
 ## Status
 
-The Linux kernel provider and native Netstack3 daemon implement ordinary remote
-IPv4/IPv6 UDP and TCP socket operations. Deterministic deployment testing covers
-offline socket setup, DHCP-bound UDP/TCP, live sockets across lease
-loss/reacquisition, static IPv4 without a DHCP server, and generation revocation
-on peer transport loss. Wildcard sockets currently select the remote provider
-stack rather than simultaneously listening on private Linux loopback. Real
-production connectivity still awaits the Wi-Fi Ethernet owner. Deferred
-offline UDP connect supports later sends, but peer-filtered receive and
-disconnect after deferred configuration remain incremental, as does the wider
-application compatibility requirement.
+Owned applications can use SOCKS through the MT7921 userspace Netstack3 path.
+A separate Linux socket-provider spike exercises transparent socket behavior
+against a deterministic Ethernet peer; it is not the required production
+handoff. Native application stream/datagram capabilities remain a destination.
 
-Source: project owner. Strength: mandatory for the mature system, incremental
-during device bring-up.
+Source: project owner. Strength: product scope and architectural requirement.
 
-Arbitrary ordinary unprivileged applications must continue using the established
-interfaces they depend on, including Wayland, PipeWire client APIs, Mesa
-GL/EGL/Vulkan, and eventually normal Internet socket behavior. Applications
-that require Bluetooth device access use a project capability API; BlueZ D-Bus
-compatibility is not required.
+All Internet-facing applications are assumed owned and modifiable. All system
+and desktop userspace may be replaced, including shells, settings, portals,
+policy daemons, network managers, and compatibility servers. They may adopt
+project-native capability interfaces. Transparent compatibility with arbitrary
+unmodified Internet applications and Linux socket plumbing is not a production
+prerequisite.
 
-Replaceable host plumbing is not compatibility surface. Implementations may fork
-or replace wpa_supplicant, iwd, BlueZ, PipeWire, and host-kernel facilities such
-as cfg80211, nl80211, kernel HCI, ALSA, and TAP. Compatibility services validate
-client identity, object ownership, shared-memory descriptors, state, and bounds;
-they never delegate unrestricted device or DMA capabilities.
+Useful established application interfaces such as Wayland, PipeWire client
+APIs, and Mesa GL/EGL/Vulkan may be retained; their existence does not make the
+underlying system implementation or management APIs immutable. Replacing
+cfg80211, nl80211, iwd, BlueZ, kernel HCI, ALSA, or TAP is permitted. Bluetooth
+applications use explicit capabilities rather than requiring BlueZ D-Bus.
 
-Desktop shells, settings panels, pairing agents, policy daemons, portals, and
-other system-management components are vendored parts of the system rather than
-compatibility targets. They may use project-native capability APIs and will
-evolve with future application sandboxing.
-
-Potential native replacements are recorded in
-[IDEA-audio](IDEA-audio.md) and [ARCH-bluetooth](ARCH-bluetooth.md).
+Application and desktop integration must preserve identity, object ownership,
+shared-memory bounds, and capability scoping. Owning an application does not
+make its network input trusted. No application API delegates unrestricted
+device or DMA authority. This scope supports the secure-laptop goal in
+[ARCH-drv](ARCH-drv.md) without weakening [REQ-isolation](REQ-isolation.md).

@@ -2,7 +2,8 @@
 
 ## Status
 
-The component contract contains no Linux types; only a deterministic host exists.
+The portable native hardware API and deterministic and Linux VFIO backends
+exist. Host-specific service bindings remain separate from portable contracts.
 
 Source: project owner. Strength: architectural requirement.
 

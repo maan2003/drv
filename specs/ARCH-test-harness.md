@@ -2,15 +2,12 @@
 
 ## Status
 
-The in-memory broker runs the production Wasm probe through BAR programming,
-device DMA, interrupt, bounds failure, reset, and stale-handle checks. A QEMU
-VM suite covers `edu` enumeration, IOMMU grouping, exclusive `vfio-pci`
-binding, the iommufd device interface, region and IRQ discovery, DMA mapping,
-teardown, and clean shutdown. The `no-plastic` physical smoke path now covers
-transactional `mt7921e` handoff, VFIO cdev and iommufd attachment, a private
-low-IOVA DMA map/unmap, explicit IOAS teardown, deadline recovery, and automatic
-kernel-driver and iwd restoration without device MMIO. Virtual Wi-Fi and
-device-specific physical Wi-Fi behavior remain unimplemented.
+Native deterministic driver tests, randomized lifecycle rigs, and pinned C
+protocol oracles coexist with the legacy Wasm probe. The latter is not the
+production artifact. A QEMU `edu` suite covers VFIO/iommufd mechanisms; physical
+MT7921 tests have demonstrated association and Internet traffic. These do not
+substitute for production containment, recovery, suspend/resume, or power
+validation. Redwood remains a physical bring-up target.
 A deterministic Bluetooth transport oracle covers bounded HCI event framing,
 command-credit handling, duplicate discovery reports, malformed discovery
 input, and cleanup planning against pinned Sapphire fixture shapes. The
@@ -19,13 +16,14 @@ through an exclusive Linux HCI user channel, root-only structured reporting,
 exact initial controller-flag restoration, and post-run exclusive
 reacquisition while Wi-Fi remains active.
 
-The production Wasm binary runs unchanged against deterministic and native
-brokers. The deterministic model owns virtual time and scripted BAR, DMA,
+The same production Rust driver implementation runs against deterministic and
+native backends through the typed hardware interface. Lab entrypoints and
+oracles do not substitute a second production implementation. The deterministic model owns virtual time and scripted BAR, DMA,
 interrupt, reset, and fault behavior. It rejects unexpected operations and
-supports malformed data, missing or repeated interrupts, timeouts, traps,
+supports malformed data, missing or repeated interrupts, timeouts, worker failures,
 generation changes, and out-of-range access.
 
-QEMU's `edu` PCI device will exercise real VFIO/iommufd mechanics; a later
+QEMU's `edu` PCI device exercises real VFIO/iommufd mechanics; a later
 `vfio-user` model may combine those mechanics with BCM-specific behavior.
 Cuttlefish's virtio `mac80211_hwsim`, wmediumd, and OpenWRT are optional peers for
 scan and authentication behavior. They model SoftMAC radio behavior and cannot

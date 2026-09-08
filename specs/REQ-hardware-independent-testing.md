@@ -2,19 +2,21 @@
 
 ## Status
 
-The deterministic component path covers BAR bounds, DMA bounds and mutation,
-interrupt delivery, reset, and handle revocation. A QEMU `edu` suite covers
-native VFIO/IOMMU mechanics without physical hardware. Broader fault, network,
-and physical suites remain unimplemented.
+Deterministic native tests cover hardware bounds and lifecycle behavior, with
+randomized driver rigs and pinned-source protocol oracles. A QEMU `edu` suite
+covers native VFIO/IOMMU mechanics. Physical MT7921 connectivity is demonstrated;
+model coverage and laptop recovery evidence remain incremental.
 
 Source: project owner. Strength: mandatory development requirement.
 
 Most driver and service development must run deterministically without root,
-physical hardware, or network access. The exact production Wasm artifact must run
-against both the model and native broker so tests do not mock inside the driver.
+physical hardware, or network access. The same production Rust driver implementation must run
+against deterministic and native hardware backends through the shared typed
+interface. Tests must not substitute a second driver implementation or mock
+inside the driver.
 
 Automated tests must cover DMA bounds, interrupt delivery, timeout, reset,
 generation revocation, malformed device responses, worker failure, and clean
 restart. Native VM and lab tests separately cover VFIO/IOMMU mechanics. No model
-is proof of BCM4387 behavior; physical tests remain required before claiming
+is proof of physical device behavior; physical tests remain required before claiming
 hardware support.

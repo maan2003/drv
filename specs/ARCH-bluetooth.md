@@ -2,15 +2,12 @@
 
 ## Status
 
-Sapphire is the initial host stack and all Sapphire C++ executes inside one
-least-authority WebAssembly instance in a dedicated sandboxed worker process.
-A native Rust supervisor owns the controller and external service capabilities.
-The current implementation is limited to a deterministic and
-physically verified Linux HCI transport oracle; it does not yet execute
-Sapphire or the Fuchsia-derived service layer. This architecture does not
-supersede the hardware and isolation records, especially
-[ARCH-asahi-wifi-target](ARCH-asahi-wifi-target.md) and
-[REQ-isolation](REQ-isolation.md).
+The current implementation is a deterministic and physically verified Linux
+HCI transport oracle plus legacy Sapphire/Wasm scaffolding, not a production
+Bluetooth service. Under [ARCH-drv](ARCH-drv.md), native Rust and strong process
+sandboxing replace the previously proposed Sapphire Wasm execution direction.
+The complete Rust host-stack implementation remains future work; this decision
+does not claim a completed Sapphire port.
 
 ## Architecture
 
@@ -20,61 +17,25 @@ Bluetooth management APIs are not compatibility surfaces. Ordinary applications
 receive audio, input, and explicit Bluetooth capabilities through their normal
 application-facing interfaces.
 
-```text
-project system UI and sandbox capability policy
-        -> native Rust Bluetooth supervisor
-             -> Rust coordinator, profiles, and policy tasks
-             -> native Rust bounded HCI controller broker
-             -> bounded framed IPC
-                  -> sandboxed Wasmtime worker process
-                       -> one least-authority Sapphire C++ WebAssembly instance
-        -> safe Rust Apple HCI transport
-        -> typed hardware crate and private IOMMU domain
-        -> BCM4387 Bluetooth function
-```
+Fuchsia supplies architectural inspiration, Rust coordination/profile code,
+and protocol tests. Portable components use project-owned capability bindings
+rather than FIDL/Zircon host plumbing. Native Rust services separate persistent
+pairing policy and credentials from hostile Bluetooth protocol input and
+hardware authority. Exact host/profile process cuts remain to be determined;
+this record does not prescribe a replacement microservice graph.
 
-Fuchsia supplies Rust GAP coordination, common Bluetooth libraries, A2DP,
-AVRCP, HFP, HID, RFCOMM, Fast Pair, test harnesses, a virtual HCI controller,
-mock piconets, fuzz targets, and Pandora/conformance integration. Their FIDL and
-Zircon bindings would be replaced with project-owned capability interfaces.
-
-The core Sapphire host stack implements HCI, L2CAP, ATT, GATT, GAP, SDP,
-security management, SCO, and ISO. It is certified and production-proven, but
-is currently C++ and has moved from Fuchsia to Pigweed. It provides the initial
-host implementation and behavioral oracle inside WebAssembly; Sapphire C++
-never executes natively. Host layers may then be ported to safe Rust
-independently while retaining Sapphire's protocol tests.
-
-The WASM boundary is a stable copied C/WIT-style ABI rather than a C++ ABI or
-shared pointers. Standard WASI Preview 2 monotonic-clock, timer/poll, and secure
-random interfaces provide safe platform primitives. Project imports are
-limited to bounded HCI command, ACL, SCO, and ISO packet delivery; logs and
-metrics; and identity-keyed persistence requests. Wasmtime implements the
-project imports in the worker by forwarding bounded copied messages over framed Unix
-`SOCK_SEQPACKET` IPC to the native Rust supervisor. The same transport carries
-bounded high-level host operations and multiplexed HCI command/event, ACL, SCO,
-and ISO planes. The raw controller descriptor,
-lifecycle and reset operations, USB or VFIO authority, firmware, unrestricted
-storage, audio, input injection, and external application APIs are never
-available to WASM.
-
-The worker receives no HCI, device, filesystem, or network descriptors. It is
-linked only to the selected WASI interfaces, not a broadly configured
-`WasiCtx`; filesystem preopens, sockets, environment, arguments, process/exec,
-terminal, wall-clock, and device interfaces remain absent. The component import
-allowlist verifies those exclusions. The worker is additionally constrained with seccomp, Landlock,
-namespaces, and resource limits. Worker exit or protocol failure makes the
-supervisor cancel outstanding operations and clean up or reset the controller.
-Discovery and representative ACL, SCO/audio, and ISO loads are benchmarked
-before considering shared-memory rings or eventfd; those mechanisms are added
-only if the framed copied transport is measurably inadequate.
+Sapphire's C++ protocol knowledge and tests may inform Rust ports and offline
+oracles. Sapphire-in-Wasm is not a production path. Monotonic time, secure
+randomness, HCI frames, persistence requests, audio, and input are explicit
+bounded capabilities, not ambient access. Worker failure requires cancellation
+and bounded controller cleanup/recovery by the resource owner.
 
 ## M2 hardware boundary
 
 The Apple-specific work remains below HCI. A safe Rust transport would preserve
 the behavior of Asahi's `hci_bcm4377` driver for PCI lifecycle, firmware,
 command, event, ACL, SCO, power, and reset. It would use the safe hardware crate
-described by [IDEA-rust-first-wifi-drivers](IDEA-rust-first-wifi-drivers.md),
+described by [ARCH-hardware-isolation](ARCH-hardware-isolation.md),
 with VFIO/iommufd on the initial Linux host.
 
 Wi-Fi and Bluetooth share one physical connectivity device on the M2 target but
@@ -111,20 +72,19 @@ legacy management APIs must be preserved.
 
 ## Security boundary
 
-The trusted safe Rust supervisor and transport own the hardware capability.
-Bluetooth packets and peer-controlled protocol state are hostile input, so the
-sandboxed Sapphire worker receives only explicit bounded copied capabilities
-and the selected monotonic-clock, poll, and secure-random WASI interfaces. It
-cannot access native descriptors or pointers, ambient WASI facilities, VFIO,
-IOMMU configuration, firmware storage, or unrelated host services. Pairing,
-bond storage, microphone use, input injection, and application GATT access are
-separate capabilities controlled by system policy.
+Native Rust hardware owners use the typed resource boundary. Bluetooth packets
+and peer-controlled protocol state remain hostile input. Strong process
+sandboxing and bounded capability interfaces must prevent a compromised parser
+from reaching unrelated devices, filesystem state, applications, or the kernel.
+Pairing, bond storage, microphone use, input injection, and application GATT
+access are distinct policy-controlled capabilities. Rust safety complements,
+rather than replaces, process and IOMMU confinement.
 
 ## Adoption consequences
 
 Adoption would remove BlueZ and its D-Bus object model from the target
 architecture. It requires an Apple HCI transport, a project Bluetooth API,
-Sapphire integration or Rust ports, direct media/input integration, persistent
+native Rust protocol implementation, direct media/input integration, persistent
 bond storage, and a vendored system UI. The smallest useful slice is virtual HCI
 plus discovery and pairing, followed by A2DP output through the proposed audio
 service.

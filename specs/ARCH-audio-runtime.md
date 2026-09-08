@@ -10,7 +10,7 @@ disabled until the protection envelope and watchdog have passed review and an
 explicit hardware window is granted.
 
 This architecture realizes the audio direction in [IDEA-audio](IDEA-audio.md)
-while retaining the ordinary-client compatibility required by
+while retaining its chosen PipeWire client integration within the scope of
 [REQ-application-compatibility](REQ-application-compatibility.md).
 
 ## Process and real-time boundaries

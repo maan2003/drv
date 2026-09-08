@@ -12,7 +12,9 @@ frame channel. The netstack process has an empty filesystem root, a private
 network namespace, no capabilities or device-backed mappings, and a seccomp
 allowlist; its run-state descriptors are only standard streams, the frame
 channel, the pre-bound SOCKS listener, and accepted clients. The separate DNS
-and policy processes in the mature topology below remain future work. The
+and wlancfg policy processes in the mature topology below remain future work,
+as does full Wi-Fi process sandboxing. The typed hardware-resource migration
+is incomplete; production mechanics still share the lab runner. The
 current MT7921 path deliberately leaves BCNFT disabled, retains
 `MT_WF_RFCR_DROP_OTHER_BEACON`, and keeps the MLME's host lost-BSS monitor
 active: firmware beacon-loss event `0x13` is recognized but not yet routed into
@@ -30,16 +32,18 @@ for the Wi-Fi data path, and is constrained by [REQ-isolation](REQ-isolation.md)
 
 ## Process topology
 
-The mature system is four capability-scoped processes. Each dangerous capability
-(DMA, filesystem, secrets, Internet parsing) lives in a different process from
-every other, and only the stateless processes touch the untrusted world.
+The immediate production boundary is three capability-scoped services: Wi-Fi,
+wlancfg policy, and networking. Separate DNS is a later refinement. Persistent
+credential storage stays out of the Wi-Fi process, and device/DMA authority
+stays out of Internet parsers. The Wi-Fi process necessarily receives active
+connection authentication material and session keys; it is not secret-free.
 
 | Process | Owns | fs | secrets | hardware | Internet parser | lifecycle |
 |---|---|---|---|---|---|---|
-| driver + MLME + SME + RSN | VFIO/DMA, 802.11 control, SAE, 4-way handshake, keys | no | no | yes | no | ephemeral |
+| driver + MLME + SME + RSN | VFIO/DMA, 802.11 control, SAE, 4-way handshake, keys | no | active connection only | yes | no | ephemeral |
 | netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | ephemeral |
-| dns | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
-| policy (wlancfg) | saved networks, config, credentials, supervision | yes | yes | no | no | stateful |
+| dns (later separate process) | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
+| policy (wlancfg) | saved networks, config, credentials, connection policy | yes | yes | no | no | stateful |
 
 The netstack remains one service and is not split by DNS domain, remote address,
 or connection, per [ARCH-network-service](ARCH-network-service.md). Per-app
@@ -90,20 +94,53 @@ no filesystem, and no host network, connected to the driver only by a dumb,
 Fuchsia, because they are chatty, latency-sensitive, and parse only local-air
 802.11. A further cut at the WlanSoftmac seam (driver alone) is available later
 as pure hardening; it is not required for the isolation goal. A compromised
-netstack may reveal ciphertext, metadata, or availability but cannot reach
+netstack may reveal ciphertext and metadata for encrypted flows, plaintext for
+unencrypted flows, or affect availability, but must not reach
 application memory, device resources, DMA, or the host kernel, per
 [REQ-isolation](REQ-isolation.md) and [ARCH-network-service](ARCH-network-service.md).
 
 ## Application handoff
 
-Owned applications (the vendored Chromium fork, rho) reach the netstack over
-**SOCKS** on a local endpoint. This is the near-term handoff and is sufficient
-for applications the project controls. The transparent socket-compatibility host
-adapter of [ARCH-network-service](ARCH-network-service.md) remains the path for
-arbitrary unmodified applications and for the mandatory ordinary-socket surface
-of [REQ-application-compatibility](REQ-application-compatibility.md); the two are
-complementary, not exclusive. UDP/QUIC is planned as a native path rather than
-SOCKS5 UDP-associate, since the applications are owned.
+All Internet-facing applications and desktop/system components are owned and
+modifiable. Applications currently reach Netstack3 through **SOCKS**; native
+capability-scoped streams and datagrams are the destination. Transparent Linux
+socket compatibility is optional, not a prerequisite, per
+[REQ-application-compatibility](REQ-application-compatibility.md). System UI
+controls Wi-Fi through wlancfg's project-native interface, not a required
+NetworkManager, iwd, or nl80211 interface.
+
+## Policy and device lifecycle
+
+A separate wlancfg-like process owns saved networks, persistent credentials,
+network selection, and reconnect/roaming policy. It requests connections and
+observes status through a narrow interface, supplying only the selected
+connection's authentication material. Fuchsia SME/RSN and MLME retain their
+protocol state machines; wlancfg does not duplicate authentication or association
+logic. Reuse the Fuchsia selection components and rewrite host bindings.
+
+The Wi-Fi service retains driver, MLME, SME, and RSN together. A narrow
+supervisor/host binding owns privileged device assignment and recovery, not
+network-selection policy. The Wi-Fi process does not launch the network service
+or receive general filesystem, host-network, or unrelated device access.
+
+## Crate ownership
+
+Crates enforce dependency boundaries; they do not themselves provide process
+isolation. `mt76-core` / `mt7921-core`, the chip SoftMAC adapters, and
+`wlan-softmac-host` retain hardware protocol, chip effects, and shared WLAN
+runtime responsibilities respectively. `userspace-vfio` and the typed hardware
+API/backends retain generic resource mechanics without device protocol policy.
+
+Remaining production transport mechanics move out of the lab binary into their
+library owner; production and lab entrypoints instantiate the same driver.
+The lab runner owns experiments and reporting, not an alternate implementation.
+Netstack3 binding, SOCKS, and network-service startup belong outside
+`wlan-softmac-host`, connected by the small existing Ethernet contract rather
+than a dependency from Wi-Fi runtime to Internet parsing. wlancfg owns the
+policy service. Large implementations can use modules without creating a crate
+per mechanism. Oracles and test-only implementations stay outside production
+dependencies. Shared sandbox code may implement host mechanics, but each
+service declares its own authority rather than inheriting a broad default.
 
 ## Fuchsia reuse
 
@@ -149,19 +186,23 @@ drop; FreeBSD `cap_enter`+`cap_rights_limit`; a capability microkernel needs
 little). No ambient authority: a service starts from an empty namespace and holds
 only the capabilities (fds) explicitly passed to it.
 
-systemd is the interim launcher and is not trusted for the sandbox. It is
+systemd is the interim launcher; confinement is established by each service
+rather than delegated to unit settings. It is
 replaceable by a small project-owned supervisor doing the same launch + fd-pass +
 restart, because the scope is a fixed handful of services, not
 `component_manager`'s dynamic generality.
 
 ## Persistence and restart
 
-Restart is natural and designed for. Only the policy process has filesystem
-access and holds secrets; the driver, netstack, and dns processes are ephemeral
-and fully reconstructible. On (re)start, configuration flows down from the policy
-process; the association, DHCP lease, and connection tables are treated as
-reconstructible, not precious. Driver and netstack are independently restartable
-units.
+Restart is natural and designed for. Only the policy service stores saved
+networks and long-lived credentials; the driver, netstack, and dns processes
+are ephemeral and reconstructible. On (re)start, configuration flows down from
+policy. Association, DHCP leases, and connection tables are reconstructible,
+but ordinary lease or DNS changes do not themselves require destroying live
+sockets. Production startup is valid offline: external DNS/HTTP proof and lab
+deadlines are not service availability conditions. Suspend/resume, reconnect,
+bounded recovery, and power-efficient event-driven operation are laptop
+requirements. Driver and netstack are independently restartable units.
 
 ## Kernel portability
 

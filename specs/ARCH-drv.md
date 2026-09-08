@@ -1,25 +1,56 @@
-# ARCH-drv: Isolated userspace device stacks
+# ARCH-drv: Secure Linux through isolated Rust userspace stacks
 
 ## Status
 
-One no-WASI probe component runs against the deterministic broker through the
-project WIT contract. Native VFIO and Wi-Fi behavior are not implemented.
+MT7921 has demonstrated userspace Wi-Fi association and Internet connectivity
+through Fuchsia WLAN components and a separately sandboxed Netstack3 service.
+Its hardware ownership migration and full Wi-Fi process sandbox remain
+incomplete. Redwood WCN6750 is in physical bring-up, not production hardening.
+Legacy Wasm/WIT probes and Bluetooth scaffolding remain in the tree; they are
+not the production direction and are not extended by this architecture.
 
-The system moves complete device stacks out of the host kernel without placing
-them in a VM. Its dependency direction is:
+## Direction
+
+The project owner's goal is a secure, dependable Linux laptop, built from the
+bottom up by moving device drivers and protocol stacks out of the kernel,
+without putting them in a VM. Drivers are native Rust, not Wasm. Strong process
+sandboxing, safe Rust capability boundaries, and IOMMU confinement complement
+one another; none replaces the others.
 
 ```text
-applications -> compatibility services -> network/control components
-             -> Wasm hardware driver -> native resource broker -> IOMMU/device
+owned applications and desktop
+        -> capability-scoped policy and network services
+        -> sandboxed native Rust device service
+        -> typed hardware API / private native backend
+        -> kernel IOMMU, DMA, interrupt and lifecycle mechanisms / device
 ```
 
-Application-facing protocols remain compatible where required, while internal
-interfaces are project-owned and versioned. Sandboxed components own device and
-protocol policy. The native broker owns resource safety and host integration but
-does not interpret device commands.
-
-Components receive only adjacent capabilities. Portable components do not see
-host file descriptors, ioctls, pointers, VFIO, or Linux network abstractions.
-The architecture is constrained by [REQ-isolation](REQ-isolation.md),
-[REQ-application-compatibility](REQ-application-compatibility.md), and
+Fuchsia is the primary architectural and component-reuse inspiration: reuse
+Netstack3 and WLAN MLME/SME/RSN cores and their behavioral contracts, replacing
+host bindings rather than duplicating protocol state machines. Linux is the
+initial product substrate; portable contracts retain the host independence of
 [REQ-host-portability](REQ-host-portability.md).
+
+All system and desktop userspace is replaceable, and Internet-facing
+applications are owned and modifiable. Existing Linux management APIs are not
+the design boundary; see
+[REQ-application-compatibility](REQ-application-compatibility.md).
+
+Native backends own resource safety and host integration, not device protocol
+policy. Portable driver code sees bounded device resources rather than host
+file descriptors, unrestricted mappings, or ambient I/O. Process boundaries
+separate hardware authority, Internet parsing, and persistent policy, as refined
+by [ARCH-hardware-isolation](ARCH-hardware-isolation.md) and
+[ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md).
+
+## Product maturity
+
+MT7921's goal is everyday laptop production readiness, beyond its already
+proved Internet path: containment, dependable recovery and reconnect,
+suspend/resume, power efficiency, supported Wi-Fi behavior, sustained
+performance, and application integration. Connectivity alone is not acceptance.
+
+Redwood's current goal is physical testing that discovers driver-port bugs and
+reaches scan, association, DHCP, and proved Internet connectivity. Production
+hardening follows that milestone. Lab recovery and hardware safety constraints
+apply throughout; see [ARCH-redwood-wifi-target](ARCH-redwood-wifi-target.md).

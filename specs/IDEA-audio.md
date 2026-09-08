@@ -13,8 +13,9 @@ The mature system would use a project-owned Rust media core derived from
 Fuchsia's audio hardware, timing, mixer, registry, and testing designs. PipeWire
 would become an application compatibility personality rather than the internal
 architecture. Significant forks or a protocol-compatible Rust replacement are
-acceptable as long as ordinary application clients retain the required public
-behavior.
+acceptable. Preserving the selected client protocols is this proposed audio
+integration strategy, not a requirement to retain existing desktop plumbing;
+see [REQ-application-compatibility](REQ-application-compatibility.md).
 
 ```text
 PipeWire, PulseAudio, JACK, and ALSA application clients

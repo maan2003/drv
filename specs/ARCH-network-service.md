@@ -2,28 +2,38 @@
 
 ## Status
 
-A native Netstack3 IP/transport service and Linux kernel socket adapter now run
-as a deployment-tested spike against a deterministic Ethernet peer. They remain
-independently replaceable and production external connectivity still awaits the
-Wi-Fi Ethernet owner. The spike currently combines the service and host-adapter
-binding in one daemon, so the mature process-isolation boundary described below
-is not yet complete. Provider availability follows the attached data-plane
-transport rather than DHCP state: address/route/DNS loss changes reachability
-without destroying application sockets, while transport loss revokes the
-generation.
+The MT7921 path runs Netstack3, DHCP, DNS, and SOCKS in a separate self-sandboxed
+process connected to the Wi-Fi service by bounded Ethernet frames. Its startup
+still requires external DHCP/DNS/TCP proof and its lifetime is bounded: these
+are lab behavior, not the mature service contract. The service implementation
+currently lives in `wlan-softmac-host`; it is to be separated from Wi-Fi runtime
+ownership. A Linux socket-provider spike also exists but is not the required
+application path.
 
-One sandboxed portable service owns externally reachable Ethernet, ARP/NDP, IP,
-fragmentation, ICMP, UDP, TCP, routing, and network policy. Splitting it by DNS
-domain, remote address, or connection is not part of the architecture: those are
-unstable identities and add coordination without protecting application keys.
+One sandboxed portable network service owns Ethernet, ARP/NDP, IP,
+fragmentation, ICMP, UDP, TCP, and routing. It is not split by DNS domain, remote
+address, or connection. Wi-Fi selection and credential policy belong to wlancfg,
+not the network service. DNS currently shares this process; the separate DNS
+service described in [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md)
+remains a later boundary.
 
-Applications retain authenticated-encryption keys and plaintext. Compromise of
-the network service may reveal ciphertext and metadata or control availability,
-but must not reach application memory, device resources, or the host kernel.
+Applications retain authenticated-encryption keys and plaintext for encrypted
+connections. The network service sees ciphertext and metadata for those flows;
+unencrypted application traffic is not confidential from it. Compromise must
+not confer access to application memory, device resources, or the host kernel.
 
-A small host adapter preserves process-bound socket behavior such as descriptors,
-inheritance, polling, cancellation, credentials, and descriptor passing. It is
-protocol-agnostic and never parses packets or implements transport state. Linux
-may require a kernel patch; another host kernel may provide a cleaner adapter.
-This refines [REQ-application-compatibility](REQ-application-compatibility.md)
-without weakening [REQ-host-portability](REQ-host-portability.md).
+Owned applications initially use SOCKS; native capability-scoped stream and
+datagram interfaces are the destination. A transparent host socket adapter is
+optional, not a prerequisite. Such an adapter, if retained, owns descriptor and
+process semantics rather than packet parsing or transport state.
+
+The production service starts offline and remains available through address,
+route, and DNS loss. Captive portals or failed external probes change reported
+reachability, not permission to start serving applications. Actual transport
+loss revokes the affected generation; ordinary lease changes do not themselves
+destroy application sockets. The network service and Wi-Fi service are
+independently restartable.
+
+This refines [REQ-application-compatibility](REQ-application-compatibility.md),
+[REQ-isolation](REQ-isolation.md), and
+[REQ-host-portability](REQ-host-portability.md).
