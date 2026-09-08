@@ -89,6 +89,7 @@ pub struct Cli {
     pub stop_after: Stage,
     pub broker: bool,
     pub vfio_device: Option<PathBuf>,
+    pub register_region: Option<u8>,
     pub board: PathBuf,
     pub regdb: PathBuf,
     pub wmi_log: Option<PathBuf>,
@@ -104,6 +105,7 @@ impl Default for Cli {
             stop_after: Stage::DpPoll,
             broker: false,
             vfio_device: None,
+            register_region: None,
             board: DEFAULT_BOARD.into(),
             regdb: DEFAULT_REGDB.into(),
             wmi_log: Some("ath11k-wmi-run.jsonl".into()),
@@ -139,6 +141,13 @@ impl Cli {
                 }
                 "--vfio-device" => {
                     cli.vfio_device = Some(value("--vfio-device", &mut arguments)?.into())
+                }
+                "--register-region" => {
+                    cli.register_region = Some(
+                        value("--register-region", &mut arguments)?
+                            .parse()
+                            .map_err(|_| "--register-region must be an integer from 0 to 255")?,
+                    )
                 }
                 "--board" => cli.board = value("--board", &mut arguments)?.into(),
                 "--regdb" => cli.regdb = value("--regdb", &mut arguments)?.into(),
@@ -186,7 +195,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -969,6 +978,7 @@ pub struct RealHost {
     qrtr: Option<QrtrTransport>,
     firmware: Option<ath11k_core::Wcn6750FirmwareAssets>,
     vfio_regions: Vec<VfioRegion>,
+    register_region: Option<u8>,
     wmi_log: Option<PathBuf>,
     device: Option<LiveDevice>,
     vdev: Option<ath11k_core::VdevId>,
@@ -1122,6 +1132,7 @@ impl Host for RealHost {
         self.waiter = Some(waiter);
         self.dp_interrupts = Some(dp_interrupts);
         self.qrtr = Some(qrtr);
+        self.register_region = config.register_region;
         self.wmi_log = config.wmi_log.clone();
         Ok(())
     }
@@ -1158,7 +1169,11 @@ impl Host for RealHost {
             .firmware
             .take()
             .ok_or(Error::Unsupported("QMI requested before firmware loading"))?;
-        let memory = ath11k_core::HardwareMemoryProvider::discover_device_bar(hardware);
+        let memory = if let Some(region) = self.register_region {
+            ath11k_core::HardwareMemoryProvider::new(hardware, region)
+        } else {
+            ath11k_core::HardwareMemoryProvider::discover_device_bar(hardware)
+        };
         let mut qmi = ath11k_core::Wcn6750QmiSession::new(transport, assets, memory);
         qmi.discover_device_bar().map_err(|error| {
             Error::Hardware(format!("QMI server/device-info exchange failed: {error:?}"))
@@ -1168,17 +1183,35 @@ impl Host for RealHost {
             .device_bar_request()
             .ok_or_else(|| Error::Hardware("QMI DeviceInfo did not publish a BAR".into()))?;
         println!("qmi_device_info bar_addr={bar_address:#x} bar_size={bar_size:#x}");
-        if let Some(region) = self
+        let matching_region = self
             .vfio_regions
             .iter()
-            .find(|region| region.size == u64::from(bar_size))
-        {
+            .find(|region| region.size == u64::from(bar_size));
+        if let Some(region) = matching_region {
             println!(
                 "qmi_device_bar_vfio_match index={} flags={:#x} size={:#x} offset={:#x}",
                 region.index, region.flags, region.size, region.offset
             );
         } else {
             println!("qmi_device_bar_vfio_match unavailable; stopping before MMIO/CE/HTC");
+        }
+        if let Some(selected) = self.register_region {
+            let region = matching_region.filter(|region| region.index == u32::from(selected));
+            let mapped = qmi.take_device_bar().ok_or_else(|| {
+                Error::Hardware(format!(
+                    "QMI DeviceInfo did not map selected VFIO region {selected}"
+                ))
+            })?;
+            let region = region.ok_or_else(|| {
+                Error::Hardware(format!(
+                    "selected VFIO region {selected} does not exactly match QMI BAR size {bar_size:#x}"
+                ))
+            })?;
+            println!(
+                "qmi_device_bar_mapped index={} size={:#x}; stopping before BDF/MMIO/CE/HTC",
+                region.index,
+                mapped.len()
+            );
         }
         Ok(())
     }
@@ -1414,12 +1447,17 @@ mod tests {
         assert!(cli.dry_run);
         assert!(!cli.broker);
         assert_eq!(cli.stop_after, Stage::Qmi);
+        assert_eq!(cli.register_region, None);
         assert_eq!(cli.board, PathBuf::from("/b"));
         assert_eq!(cli.regdb, PathBuf::from(DEFAULT_REGDB));
         assert!(Cli::parse(["--stop-after", "unknown"]).is_err());
         assert!(Cli::parse([] as [&str; 0]).is_err());
         assert!(Cli::parse(["--dry-run", "--broker"]).is_err());
         assert!(Cli::parse(["--coherent"]).is_err());
+        let selected =
+            Cli::parse(["--dry-run", "--register-region", "1", "--stop-after", "qmi"]).unwrap();
+        assert_eq!(selected.register_region, Some(1));
+        assert!(Cli::parse(["--dry-run", "--register-region", "256"]).is_err());
         let preflight =
             Cli::parse(["preflight", "--vfio-device", "/dev/vfio/devices/vfio7"]).unwrap();
         assert!(preflight.preflight);

@@ -51,11 +51,13 @@ restart fails, rather than fabricating a device reset.
 
 The first physical `qmi` run is deliberately BAR-discovery-only. It waits for
 the QRTR server, completes indication registration, host capability, target
-capability, QMI DeviceInfo and fixed-memory BDF download in pinned source
-order, then prints `bar_addr` and `bar_size`. If no enumerated VFIO region has
-that exact size, it exits successfully before MMIO, CE, HTC, or WMI. A later
+capability and QMI DeviceInfo in pinned source order, then prints `bar_addr`
+and `bar_size`. It stops before the fixed-memory BDF download. If no enumerated
+VFIO region has that exact size, it exits successfully before MMIO, CE, HTC,
+or WMI. A later
 DT-assisted run must expose the QMI-selected 2 MiB aperture as a distinct VFIO
-region and select it explicitly; region 0 is never a fallback.
+region and select it explicitly with `--register-region <index>`; DeviceInfo
+then opens that region at the exact reported size. Region 0 is never a fallback.
 
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
