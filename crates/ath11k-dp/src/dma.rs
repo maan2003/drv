@@ -4,6 +4,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use ath11k_platform_backend::{Backend, Device, FromDevice, StreamingDma, ToDevice};
+use dma_pool::{DmaPool, DmaSegment};
 
 use crate::DpError;
 
@@ -43,17 +44,12 @@ impl<B: Backend> TxBuffer<B> {
 /// An RX mapping made at the `dma_map_single(..., DMA_FROM_DEVICE)` refill
 /// boundary. It remains owned until REO/WBM returns its cookie.
 pub struct RxBuffer<B: Backend> {
-    dma: StreamingDma<B, FromDevice>,
+    dma: DmaSegment<B, FromDevice>,
 }
 
 impl<B: Backend> RxBuffer<B> {
-    pub fn replenish(device: &Device<B>, size: usize) -> Result<Self, DpError> {
-        let dma = device
-            // DP_RX_BUFFER_ALIGN_SIZE. Linux over-allocates an skb and pulls
-            // its data pointer to this boundary; the capability API can ask
-            // the allocator for that boundary directly.
-            .alloc_streaming::<FromDevice>(size, 128)
-            .map_err(|_| DpError::NoResources)?;
+    pub fn replenish(pool: &DmaPool<B, FromDevice>) -> Result<Self, DpError> {
+        let dma = pool.allocate().map_err(|_| DpError::NoResources)?;
         Ok(Self { dma })
     }
 
@@ -83,6 +79,14 @@ impl<B: Backend> RxBuffer<B> {
             .map_err(|_| DpError::DeviceFault)?;
         Ok(bytes)
     }
+
+    /// Return a CPU-consumed RX segment to device ownership before placing it
+    /// back in the pool for a replacement descriptor.
+    pub fn prepare_for_device(&mut self) -> Result<(), DpError> {
+        self.dma
+            .prepare_for_device()
+            .map_err(|_| DpError::DeviceFault)
+    }
 }
 
 #[cfg(test)]
@@ -97,7 +101,8 @@ mod tests {
         assert_eq!(tx.length(), 4);
         tx.device_address().unwrap();
 
-        let mut rx = RxBuffer::replenish(&device, 64).unwrap();
+        let pool = DmaPool::new(device, 64, 128, 64, 2).unwrap();
+        let mut rx = RxBuffer::replenish(&pool).unwrap();
         assert_eq!(rx.len(), 64);
         rx.device_address().unwrap();
         // The model rejects the wrong directional sync internally. Reaching
@@ -116,11 +121,11 @@ mod tests {
                 },
                 Operation::SyncForDevice {
                     dma: 2,
-                    range: 0..64,
+                    range: 0..128,
                 },
                 Operation::SyncForCpu {
                     dma: 2,
-                    range: 0..4,
+                    range: 64..68,
                 },
             ]
         );
@@ -129,7 +134,8 @@ mod tests {
     #[test]
     fn rx_completion_length_is_bounded_without_panicking() {
         let device = DeterministicBackend::device();
-        let mut rx = RxBuffer::replenish(&device, 32).unwrap();
+        let pool = DmaPool::new(device, 32, 64, 32, 2).unwrap();
+        let mut rx = RxBuffer::replenish(&pool).unwrap();
         assert_eq!(rx.sync_and_read(33), Err(DpError::DeviceFault));
     }
 }

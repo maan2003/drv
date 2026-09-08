@@ -6,7 +6,8 @@ use ath11k_hal::descriptors::{
     ReoDestinationRing, RxdmaBufferRing, TclDataCommand, TxCommandInfo, WbmReleaseRing,
 };
 use ath11k_hal::{RingId, Rings};
-use ath11k_platform_backend::{Backend, Device};
+use ath11k_platform_backend::{Backend, Device, FromDevice};
+use dma_pool::DmaPool;
 
 use crate::dma::{RxBuffer, TxBuffer};
 use crate::htt::TxCompletion;
@@ -17,6 +18,10 @@ use crate::{DataPath, DataRings, DpError, RxPacket, TxPacket};
 
 // idr_alloc(..., 0, DP_TX_IDR_SIZE - 1) uses an exclusive upper bound.
 const MAX_MSDU_ID: u32 = 32_766;
+const RX_BUFFER_SIZE: usize = 2_048;
+const RX_POOL_PAGE_SIZE: usize = 4_096;
+const RX_BUFFER_ALIGNMENT: usize = 128;
+const RX_POOL_HIGH_WATERMARK: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -126,6 +131,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     pending: Vec<PendingTx<B>>,
     rxdma: Option<RxdmaConfig>,
     next_rx_cookie: u32,
+    rx_pool: DmaPool<B, FromDevice>,
     rx_buffers: Vec<PendingRx<B>>,
     monitor_status_buffers: Vec<PendingRx<B>>,
     rx_chain: Vec<RxFragment>,
@@ -144,6 +150,12 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         tx: ClientTxConfig,
     ) -> Result<Self, DpAllocationError<B, R>> {
         let mut ring_resources = Wcn6750DpRings::default();
+        let rx_pool = match make_rx_pool(device.clone()) {
+            Ok(pool) => pool,
+            Err(error) => {
+                return Err(DpAllocationError::new(error, device, rings, ring_resources));
+            }
+        };
         if let Err(error) = ring_resources.allocate_common(&device, &mut rings) {
             return Err(DpAllocationError::new(error, device, rings, ring_resources));
         }
@@ -156,6 +168,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             pending: Vec::new(),
             rxdma: None,
             next_rx_cookie: 1,
+            rx_pool,
             rx_buffers: Vec::new(),
             monitor_status_buffers: Vec::new(),
             rx_chain: Vec::new(),
@@ -168,6 +181,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
 
     #[cfg(test)]
     fn without_allocated_rings(device: Device<B>, rings: R, tx: ClientTxConfig) -> Self {
+        let rx_pool = make_rx_pool(device.clone()).expect("static RX pool configuration is valid");
         Self {
             device,
             rings,
@@ -177,6 +191,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             pending: Vec::new(),
             rxdma: None,
             next_rx_cookie: 1,
+            rx_pool,
             rx_buffers: Vec::new(),
             monitor_status_buffers: Vec::new(),
             rx_chain: Vec::new(),
@@ -296,18 +311,18 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             ring,
             pdev_id: 0,
             return_buffer_manager: 4,
-            buffer_size: 2_048,
+            buffer_size: RX_BUFFER_SIZE,
         };
         let allocation = self
             .ath11k_dp_rxbufs_replenish(config, 4_095)
             .and_then(|()| {
                 replenish_pool(
-                    &self.device,
+                    &self.rx_pool,
                     &mut self.rings,
                     monitor_ring,
                     0,
                     4,
-                    2_048,
+                    RX_BUFFER_SIZE,
                     1_023,
                     &mut self.next_monitor_cookie,
                     &mut self.monitor_status_buffers,
@@ -453,6 +468,10 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                 .ok_or(DpError::MalformedDescriptor)?;
             let mut entry = self.rx_buffers.swap_remove(position);
             let bytes = entry.buffer.sync_and_read(entry.buffer.len())?;
+            entry.buffer.prepare_for_device()?;
+            // Return the completed segment before replenishment so the pool
+            // can reuse it for the replacement descriptor.
+            drop(entry);
             // The C NAPI path replenishes every buffer reaped from the ring,
             // including buffers dropped for a non-routing push reason.
             self.replenish_one()?;
@@ -480,7 +499,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
     fn replenish_one(&mut self) -> Result<(), DpError> {
         let config = self.rxdma.ok_or(DpError::NoResources)?;
         replenish_pool(
-            &self.device,
+            &self.rx_pool,
             &mut self.rings,
             config.ring,
             config.pdev_id,
@@ -525,7 +544,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
 
 #[allow(clippy::too_many_arguments)]
 fn replenish_pool<B: Backend, R: Rings<B>>(
-    device: &Device<B>,
+    pool: &DmaPool<B, FromDevice>,
     rings: &mut R,
     ring: RingId,
     pdev_id: u8,
@@ -535,6 +554,9 @@ fn replenish_pool<B: Backend, R: Rings<B>>(
     next_cookie: &mut u32,
     buffers: &mut Vec<PendingRx<B>>,
 ) -> Result<(), DpError> {
+    if buffer_size != pool.segment_size() {
+        return Err(DpError::NoResources);
+    }
     for _ in 0..count {
         let buffer_id = *next_cookie & 0x3_ffff;
         let cookie = buffer_id | ((u32::from(pdev_id) & 7) << 18);
@@ -543,7 +565,7 @@ fn replenish_pool<B: Backend, R: Rings<B>>(
         } else {
             buffer_id + 1
         };
-        let buffer = RxBuffer::replenish(device, buffer_size)?;
+        let buffer = RxBuffer::replenish(pool)?;
         let descriptor =
             RxdmaBufferRing::for_buffer(&buffer.device_address()?, cookie, return_buffer_manager);
         rings
@@ -552,6 +574,19 @@ fn replenish_pool<B: Backend, R: Rings<B>>(
         buffers.push(PendingRx { cookie, buffer });
     }
     Ok(())
+}
+
+fn make_rx_pool<B: Backend>(device: Device<B>) -> Result<DmaPool<B, FromDevice>, DpError> {
+    // Pinned `dp_rx.c:ath11k_dp_rxbufs_replenish` uses 2 KiB buffers aligned
+    // to DP_RX_BUFFER_ALIGN_SIZE (128). Two segments share each 4 KiB mapping.
+    DmaPool::new(
+        device,
+        RX_BUFFER_SIZE,
+        RX_POOL_PAGE_SIZE,
+        RX_BUFFER_ALIGNMENT,
+        RX_POOL_HIGH_WATERMARK,
+    )
+    .map_err(|_| DpError::NoResources)
 }
 
 impl<B: Backend, R: DpRingOps<B>> DataPath for ClientDataPath<B, R> {
@@ -1349,6 +1384,168 @@ mod tests {
     }
 
     #[test]
+    fn rx_refill_pools_segments_and_preserves_cookie_mapping() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        dp.ath11k_dp_rxbufs_replenish(
+            RxdmaConfig {
+                ring: RingId(4),
+                pdev_id: 2,
+                return_buffer_manager: 3,
+                buffer_size: RX_BUFFER_SIZE,
+            },
+            3,
+        )
+        .unwrap();
+
+        let infos = dp
+            .rings()
+            .published
+            .iter()
+            .map(|(_, descriptor)| {
+                RxdmaBufferRing::from_bytes(descriptor.bytes())
+                    .unwrap()
+                    .info()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            infos.iter().map(|info| info.cookie).collect::<Vec<_>>(),
+            vec![(2 << 18) | 1, (2 << 18) | 2, (2 << 18) | 3]
+        );
+        assert_eq!(
+            infos[0].address.abs_diff(infos[1].address),
+            RX_BUFFER_SIZE as u64
+        );
+        assert_eq!(dp.rx_buffers.len(), dp.rings().published.len());
+
+        let completed_address = infos[0].address;
+        let completed = dp
+            .rx_buffers
+            .iter()
+            .position(|entry| entry.cookie == infos[0].cookie)
+            .unwrap();
+        drop(dp.rx_buffers.swap_remove(completed));
+        dp.replenish_one().unwrap();
+        let replacement =
+            RxdmaBufferRing::from_bytes(dp.rings().published.last().unwrap().1.bytes())
+                .unwrap()
+                .info();
+        assert_eq!(replacement.cookie, (2 << 18) | 4);
+        assert_eq!(replacement.address, completed_address);
+    }
+
+    #[test]
+    fn reused_rx_segment_prepares_before_publish_and_discards_prepare_failure() {
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
+        let pool = make_rx_pool(device).unwrap();
+        let mut rings = ModelRings::default();
+        let mut cookie = 1;
+        let mut buffers = Vec::new();
+        replenish_pool(
+            &pool,
+            &mut rings,
+            RingId(4),
+            0,
+            3,
+            RX_BUFFER_SIZE,
+            1,
+            &mut cookie,
+            &mut buffers,
+        )
+        .unwrap();
+
+        let mut completed = buffers.pop().unwrap();
+        let completed_address = completed.buffer.device_address().unwrap().bits();
+        operations.borrow_mut().clear();
+        completed.buffer.sync_and_read(RX_BUFFER_SIZE).unwrap();
+        completed.buffer.prepare_for_device().unwrap();
+        drop(completed);
+        replenish_pool(
+            &pool,
+            &mut rings,
+            RingId(4),
+            0,
+            3,
+            RX_BUFFER_SIZE,
+            1,
+            &mut cookie,
+            &mut buffers,
+        )
+        .unwrap();
+        let replacement = RxdmaBufferRing::from_bytes(rings.published.last().unwrap().1.bytes())
+            .unwrap()
+            .info();
+        assert_eq!(replacement.address, completed_address);
+        let operations = operations.borrow();
+        let [
+            Operation::SyncForCpu {
+                dma: cpu_dma,
+                range: cpu_range,
+            },
+            Operation::SyncForDevice {
+                dma: device_dma,
+                range: device_range,
+            },
+        ] = operations.as_slice()
+        else {
+            panic!("unexpected ownership order: {operations:?}");
+        };
+        assert_eq!((device_dma, device_range), (cpu_dma, cpu_range));
+        drop(operations);
+
+        let (device, failures) = DeterministicBackend::noncoherent_device_with_failures();
+        let pool = make_rx_pool(device).unwrap();
+        let mut rings = ModelRings::default();
+        let mut cookie = 1;
+        let mut buffers = Vec::new();
+        replenish_pool(
+            &pool,
+            &mut rings,
+            RingId(4),
+            0,
+            3,
+            RX_BUFFER_SIZE,
+            1,
+            &mut cookie,
+            &mut buffers,
+        )
+        .unwrap();
+        let mut completed = buffers.pop().unwrap();
+        let failed_address = completed.buffer.device_address().unwrap().bits();
+        completed.buffer.sync_and_read(RX_BUFFER_SIZE).unwrap();
+        failures.fail_next_sync_for_device();
+        assert_eq!(
+            completed.buffer.prepare_for_device(),
+            Err(DpError::DeviceFault)
+        );
+        assert_eq!(rings.published.len(), 1);
+        drop(completed);
+        replenish_pool(
+            &pool,
+            &mut rings,
+            RingId(4),
+            0,
+            3,
+            RX_BUFFER_SIZE,
+            1,
+            &mut cookie,
+            &mut buffers,
+        )
+        .unwrap();
+        let after_failure = RxdmaBufferRing::from_bytes(rings.published.last().unwrap().1.bytes())
+            .unwrap()
+            .info();
+        assert_ne!(after_failure.address, failed_address);
+    }
+
+    #[test]
     fn client_tx_syncs_then_publishes_exact_tcl_command() {
         let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let mut dp =
@@ -1535,7 +1732,7 @@ mod tests {
         let received = dp.receive_with_status().unwrap().unwrap();
         assert_eq!(received.packet.bytes, [1, 2, 3, 4]);
         assert!(operations.borrow().iter().any(
-            |operation| matches!(operation, Operation::SyncForCpu { range, .. } if range == &(0..2048))
+            |operation| matches!(operation, Operation::SyncForCpu { range, .. } if range.len() == 2048)
         ));
     }
 }
