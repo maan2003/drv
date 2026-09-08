@@ -374,7 +374,9 @@ type MlmeTimerAction = wlan_mlme::common::timer::Event<wlan_mlme::client::TimedE
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectError {
     Timeout,
-    Failed,
+    /// The exact terminal result reported by SME. Policy needs the credential
+    /// classification to decide whether a fresh attempt is permitted.
+    Failed(fidl_sme::ConnectResult),
     Driver(DriverError),
     Containment,
 }
@@ -388,6 +390,7 @@ pub enum DriverError {
     EventStreamClosed,
     ConnectTransactionClosed,
     ConnectStateMismatch,
+    RetryCleanup,
     ControlBudgetExhausted,
     Stopped,
     UpcallOverflow,
@@ -776,8 +779,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
-        let result = self.connect_inner(request, deadline).await;
-        if result == Err(ConnectError::Failed) && !self.revoked {
+        let mut result = self.connect_inner(request, deadline).await;
+        if matches!(result, Err(ConnectError::Failed(_))) && !self.revoked {
             // A completed SME failure is retryable only when both owners can
             // prove quiescence. Keep the data plane closed before asking the
             // device to revoke and drain its attempt, then discard callbacks
@@ -795,6 +798,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             if device_quiescent && drain_completed_attempt(&self.upcalls) {
                 return result;
             }
+            result = Err(ConnectError::Driver(DriverError::RetryCleanup));
         }
         if result.is_err() && !self.revoked {
             self.revoked = true;
@@ -820,10 +824,25 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 match transaction.try_recv() {
                     Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
                         result,
-                        ..
+                        is_reconnect,
                     }) => {
-                        if result != wlan_sme::client::ConnectResult::Success {
-                            return Err(ConnectError::Failed);
+                        match result {
+                            wlan_sme::client::ConnectResult::Success => {}
+                            wlan_sme::client::ConnectResult::Canceled => {
+                                return Err(ConnectError::Failed(fidl_sme::ConnectResult {
+                                    code: fidl_ieee80211::StatusCode::Canceled,
+                                    is_credential_rejected: false,
+                                    is_reconnect,
+                                }));
+                            }
+                            wlan_sme::client::ConnectResult::Failed(failure) => {
+                                return Err(ConnectError::Failed(fidl_sme::ConnectResult {
+                                    code: failure.status_code(),
+                                    is_credential_rejected: failure
+                                        .likely_due_to_credential_rejected(),
+                                    is_reconnect,
+                                }));
+                            }
                         }
                         self.pump_once().await?;
                         return self
@@ -1491,13 +1510,19 @@ mod tests {
         let mut runtime = runtime_with_device_info(fake, retry_device_info());
         let ethernet = runtime.take_ethernet_device().unwrap();
 
-        assert_eq!(
-            futures::executor::block_on(runtime.connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )),
-            Err(ConnectError::Failed)
-        );
+        let failure = futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ConnectError::Failed(fidl_sme::ConnectResult {
+                code: fidl_ieee80211::StatusCode::RefusedReasonUnspecified,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            })
+        ));
         assert!(!runtime.revoked);
         assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
         assert!(ethernet.properties().is_some());
@@ -1597,7 +1622,7 @@ mod tests {
                 connect_request(),
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             )),
-            Err(ConnectError::Failed)
+            Err(ConnectError::Driver(DriverError::RetryCleanup))
         );
         assert!(runtime.revoked);
         let state = effects.lock().unwrap();
