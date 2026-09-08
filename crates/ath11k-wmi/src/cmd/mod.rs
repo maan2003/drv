@@ -495,6 +495,35 @@ pub struct PeerSetParam {
     pub param_id: u32,
     pub param_value: u32,
 }
+
+/// Typed `WMI_PEER_AUTHORIZE` operation used when completing association.
+const WMI_PEER_AUTHORIZE_PARAM: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerAuthorize {
+    pub vdev_id: u32,
+    pub peer_addr: [u8; 6],
+    pub authorized: bool,
+}
+
+impl EncodeCommand for PeerAuthorize {
+    fn trace_fields(&self, sink: &mut dyn TraceSink) {
+        trace_field(sink, "PeerAuthorize.vdev_id", self.vdev_id);
+        trace_field(sink, "PeerAuthorize.peer_addr", mac_value(&self.peer_addr));
+        trace_branch(sink, "PeerAuthorize.authorized", self.authorized);
+    }
+
+    fn encode_command(&self) -> Result<Command, WmiError> {
+        PeerSetParam {
+            vdev_id: self.vdev_id,
+            peer_addr: self.peer_addr,
+            param_id: WMI_PEER_AUTHORIZE_PARAM,
+            param_value: u32::from(self.authorized),
+        }
+        .encode_command()
+    }
+}
+
 impl EncodeCommand for PeerSetParam {
     fn trace_fields(&self, sink: &mut dyn TraceSink) {
         trace_field(sink, "PeerSetParam.vdev_id", self.vdev_id);
@@ -864,6 +893,26 @@ mod tests {
         let c = r.encode_command().unwrap();
         assert_eq!(c.tlvs().len(), 128);
         assert_eq!(&c.tlvs()[125..], &[0; 3])
+    }
+
+    #[test]
+    fn connect_authorize_and_vdev_down_use_typed_wire_values() {
+        let authorize = PeerAuthorize {
+            vdev_id: 7,
+            peer_addr: [0, 1, 2, 3, 4, 5],
+            authorized: true,
+        }
+        .encode_command()
+        .unwrap();
+        assert_eq!(authorize.id, WMI_PEER_SET_PARAM_CMDID);
+        assert_eq!(
+            &authorize.tlvs()[4..],
+            &[7, 0, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0]
+        );
+
+        let down = VdevDown { vdev_id: 7 }.encode_command().unwrap();
+        assert_eq!(down.id, WMI_VDEV_DOWN_CMDID);
+        assert_eq!(down.tlvs(), &[4, 0, 0x5e, 0, 7, 0, 0, 0]);
     }
 }
 
