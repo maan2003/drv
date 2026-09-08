@@ -9,4 +9,5 @@ drv-hardware = { path = "../hardware-api" }
 userspace-vfio = { path = "../userspace-vfio" }
 
 [dev-dependencies]
+proptest = "1"
 userspace-vfio = { path = "../userspace-vfio", features = ["test-support"] }

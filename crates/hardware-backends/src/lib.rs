@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 
 use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
-use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    rc::Rc,
+};
 
 #[cfg(target_os = "linux")]
 mod linux_vfio;
@@ -40,6 +45,47 @@ pub enum Operation {
     },
 }
 pub type OperationLog = Rc<RefCell<Vec<Operation>>>;
+
+/// All externally chosen response data consumed by a deterministic device
+/// model. Tests normally start with a known handshake input and vary these
+/// fields with proptest.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeviceResponseInput {
+    pub register_reads: Vec<u32>,
+    pub response_bytes: Vec<u8>,
+    pub completions_per_poll: Vec<usize>,
+    pub completion_order: Vec<usize>,
+    pub stays_silent: bool,
+}
+
+#[derive(Clone)]
+pub struct DeviceModel(Rc<RefCell<DeviceModelState>>);
+
+struct DeviceModelState {
+    register_reads: VecDeque<u32>,
+    response_bytes: Vec<u8>,
+    completions_per_poll: VecDeque<usize>,
+    completion_order: Vec<usize>,
+    stays_silent: bool,
+}
+
+impl DeviceModel {
+    fn new(input: DeviceResponseInput) -> Self {
+        Self(Rc::new(RefCell::new(DeviceModelState {
+            register_reads: input.register_reads.into(),
+            response_bytes: input.response_bytes,
+            completions_per_poll: input.completions_per_poll.into(),
+            completion_order: input.completion_order,
+            stays_silent: input.stays_silent,
+        })))
+    }
+
+    /// Number of response decisions not yet consumed by the driver.
+    pub fn remaining_decisions(&self) -> usize {
+        let state = self.0.borrow();
+        state.register_reads.len() + state.completions_per_poll.len()
+    }
+}
 
 #[derive(Default)]
 struct DoorbellDependency {
@@ -100,6 +146,7 @@ pub struct DeterministicBackend {
     cache_coherent: bool,
     failures: Option<FailureInjection>,
     region_len: usize,
+    device_model: Option<DeviceModel>,
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +176,7 @@ impl Default for DeterministicBackend {
             cache_coherent: true,
             failures: None,
             region_len: 0x10_0000,
+            device_model: None,
         }
     }
 }
@@ -178,6 +226,21 @@ impl DeterministicBackend {
             ..Self::default()
         };
         (Device::from_backend(backend), operations)
+    }
+    /// Recording noncoherent backend whose register, DMA-response, and
+    /// interrupt decisions come only from `input`.
+    pub fn recording_noncoherent_device_with_model(
+        input: DeviceResponseInput,
+    ) -> (Device<Self>, OperationLog, DeviceModel) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let model = DeviceModel::new(input);
+        let backend = Self {
+            operations: Some(operations.clone()),
+            cache_coherent: false,
+            device_model: Some(model.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations, model)
     }
     pub fn recording_device_with_ordering_checks()
     -> (Device<Self>, OperationLog, OrderingAssertions) {
@@ -246,10 +309,19 @@ impl Backend for DeterministicBackend {
         self.region_len
     }
     fn read_u32(&mut self, region: &u8, offset: usize) -> Result<u32> {
-        let value = match offset {
-            0x24 => self.pending.into(),
-            _ => 0,
-        };
+        let value = self
+            .device_model
+            .as_ref()
+            .and_then(|model| {
+                let mut state = model.0.borrow_mut();
+                (!state.stays_silent)
+                    .then(|| state.register_reads.pop_front())
+                    .flatten()
+            })
+            .unwrap_or_else(|| match offset {
+                0x24 => self.pending.into(),
+                _ => 0,
+            });
         if let Some(log) = &self.operations {
             log.borrow_mut().push(Operation::ReadU32 {
                 region: *region,
@@ -305,11 +377,25 @@ impl Backend for DeterministicBackend {
                         return Err(Error::OutOfBounds);
                     }
                     self.device_accessible(destination.0, destination.1..end)?;
+                    let mut response = self.edu_buffer[..self.count].to_vec();
+                    if let Some(model) = &self.device_model {
+                        let state = model.0.borrow();
+                        if !state.stays_silent && !state.response_bytes.is_empty() {
+                            for (index, byte) in response.iter_mut().enumerate() {
+                                let choice = state
+                                    .completion_order
+                                    .get(index % state.completion_order.len().max(1))
+                                    .copied()
+                                    .unwrap_or(index);
+                                *byte = state.response_bytes[choice % state.response_bytes.len()];
+                            }
+                        }
+                    }
                     self.dmas
                         .get_mut(&destination.0)
                         .ok_or(Error::StaleHandle)?
                         .bytes[destination.1..end]
-                        .copy_from_slice(&self.edu_buffer[..self.count]);
+                        .copy_from_slice(&response);
                     if !self.cache_coherent {
                         let dma = self
                             .dmas
@@ -558,6 +644,22 @@ impl Backend for DeterministicBackend {
     }
     fn wait_interrupt(&mut self, i: &u32, deadline: u64) -> Result<Option<IrqEvent>> {
         self.now = self.now.max(deadline);
+        if let Some(model) = &self.device_model {
+            let mut state = model.0.borrow_mut();
+            if state.stays_silent {
+                return Ok(None);
+            }
+            let count = state.completions_per_poll.pop_front().unwrap_or(0);
+            if count != 0 && *i == 0 {
+                self.pending = false;
+                return Ok(Some(IrqEvent {
+                    vector: *i,
+                    count: u64::try_from(count).unwrap_or(u64::MAX),
+                    at_ns: self.now,
+                }));
+            }
+            return Ok(None);
+        }
         if self.pending && *i == 0 {
             self.pending = false;
             Ok(Some(IrqEvent {
