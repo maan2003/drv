@@ -14682,6 +14682,62 @@ impl Mt7921ClientEffects for LiveClientEffects {
         });
         Ok(())
     }
+    fn finish_failed_connect_attempt(
+        &mut self,
+        io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        // Poison all attempt-derived RX/TX authority before the first
+        // fallible firmware operation. Any later error is terminally reset by
+        // ClientRuntime rather than reopening the old attempt.
+        self.invalidate_association_rx();
+        self.firmware
+            .set_controlled_port(false)
+            .map_err(|_| zx::Status::BAD_STATE)?;
+        self.abort_join_roc(io)?;
+        let io = std::cell::RefCell::new(io);
+        self.firmware
+            .teardown(
+                |cid, command| {
+                    io.borrow_mut()
+                        .submit_uni(cid, command)
+                        .map_err(|status| status.to_string())
+                },
+                |command| {
+                    io.borrow_mut()
+                        .submit_ce_no_ack(command)
+                        .map_err(|status| status.to_string())
+                },
+            )
+            .map_err(|_| zx::Status::IO)?;
+        self.peer_wcid = None;
+        self.post_association_data_wait = None;
+        self.eapol_start_deadline = None;
+        self.eapol_start_emitted = false;
+        self.target_beacon_tim = TargetBeaconTimTelemetry::default();
+
+        // BSS/key teardown prevents new attempt traffic. Drain the bounded RX
+        // ring before certifying quiescence so no already-completed descriptor
+        // can become an old-attempt callback on the next runtime pump.
+        const MAX_STALE_RX: usize = 256;
+        for drained in 0..=MAX_STALE_RX {
+            match io.borrow_mut().next_client_rx()? {
+                None => {
+                    record_sae_stage(&format!(
+                        "client_attempt_cleanup result=complete stale_rx_drained={drained} keys=false port_open=false"
+                    ));
+                    return Ok(());
+                }
+                Some(_) if drained < MAX_STALE_RX => {}
+                Some(_) => {
+                    record_sae_stage(
+                        "client_attempt_cleanup result=error reason=rx_drain_bound",
+                    );
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
+                }
+            }
+        }
+        unreachable!("bounded stale RX drain returns from every branch")
+    }
     fn next_rx(
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
@@ -21446,14 +21502,16 @@ mod tests {
         effects
             .send_wlan_frame(&data, fidl_softmac::WlanTxInfoFlags::PROTECTED, &mut io)
             .unwrap();
-        effects
-            .clear_association(
-                &fidl_softmac::WlanSoftmacBaseClearAssociationRequest {
-                    peer_addr: Some(peer),
-                },
-                &mut io,
-            )
-            .unwrap();
+        io.rx.push_back(ClientRxFrame {
+            bytes: association_response,
+            status: rx_status,
+            security: None,
+        });
+        effects.finish_failed_connect_attempt(&mut io).unwrap();
+        // Completed-attempt cleanup is idempotent and the first successful
+        // return drained the old descriptor rather than exposing it later.
+        effects.finish_failed_connect_attempt(&mut io).unwrap();
+        assert!(io.rx.is_empty());
         assert_eq!(io.uni.len(), 10);
         assert_eq!(
             io.tx,
@@ -21466,6 +21524,9 @@ mod tests {
             ]
         );
         assert!(effects.firmware.association.is_none());
+        assert!(!effects.firmware.ptk_installed);
+        assert!(effects.firmware.gtk.is_none());
+        assert!(!effects.firmware.controlled_port_open);
 
         let mut physically_unbound = LiveClientEffects {
             state: Arc::new(Mutex::new(LiveClientState::default())),

@@ -531,6 +531,16 @@ pub trait Mt7921ClientEffects {
         io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
+    /// Revoke one completed failed connection attempt and drain every
+    /// device-side callback source belonging to it. `Ok(())` certifies that
+    /// keys, data admission, and link state are clear and that later polls
+    /// cannot produce an old-attempt callback.
+    fn finish_failed_connect_attempt(
+        &mut self,
+        _: &mut dyn Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        Err(zx::Status::NOT_SUPPORTED)
+    }
     fn next_rx(&mut self, io: &mut dyn Mt7921ClientIo) -> Result<ClientRxPoll, zx::Status>;
 
     /// Begin one device-owned passive scan transaction.
@@ -1276,6 +1286,26 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::ClientRunti
         Ok(())
     }
 
+    fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        // Revoke adapter TX authority before entering any fallible device
+        // cleanup. A failed cleanup therefore remains terminally contained by
+        // the runtime's reset fallback.
+        backend.authorization.invalidate_scan();
+        let result = {
+            let ComposedBackend { effects, scan, .. } = &mut *backend;
+            effects.finish_failed_connect_attempt(scan)
+        };
+        if result.is_ok() {
+            // The selected-BSS lease remains valid across a completed failed
+            // attempt. Reopen only the adapter-local TX gate after device
+            // cleanup has certified quiescence.
+            backend.authorization.authorize_scan();
+            backend.association_activation_failure = None;
+        }
+        result
+    }
+
     fn reset(&mut self) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         backend.authorization.invalidate_lifecycle();
@@ -1805,6 +1835,8 @@ mod tests {
         rx_integrity_failures: usize,
         fail_on: Option<&'static str>,
         reuse_channel: bool,
+        retry_cleanup_supported: bool,
+        scan_revoked: bool,
     }
 
     // Deliberately redacted: frames and keys may contain SAE/RSN material.
@@ -1836,7 +1868,9 @@ mod tests {
     }
 
     impl Mt7921ClientEffects for FakeEffects {
-        fn revoke_scan(&mut self) {}
+        fn revoke_scan(&mut self) {
+            self.scan_revoked = true;
+        }
 
         fn revoke_lifecycle(&mut self) {}
 
@@ -1918,6 +1952,21 @@ mod tests {
         fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
             self.hit(if up { "link-up" } else { "link-down" })?;
             self.link_up = Some(up);
+            Ok(())
+        }
+
+        fn finish_failed_connect_attempt(
+            &mut self,
+            _: &mut dyn Mt7921ClientIo,
+        ) -> Result<(), zx::Status> {
+            if !self.retry_cleanup_supported {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            self.hit("retry-revoke")?;
+            self.association = None;
+            self.key = None;
+            self.link_up = Some(false);
+            self.rx.clear();
             Ok(())
         }
 
@@ -2127,6 +2176,57 @@ mod tests {
         });
         assert_eq!(device.drive(), Err(zx::Status::BAD_STATE));
         assert_eq!(&*received.lock().unwrap(), &[vec![0x08, 0, 1, 2]]);
+    }
+
+    #[test]
+    fn failed_attempt_cleanup_preserves_retry_authority_and_discards_old_rx() {
+        use wlan_softmac_host::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
+
+        struct Upcalls(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl wlan_softmac_host::WlanSoftmacUpcalls for Upcalls {
+            fn recv(&mut self, bytes: Vec<u8>, _: fidl_softmac::WlanRxInfo) {
+                self.0.lock().unwrap().push(bytes);
+            }
+            fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+            fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
+        }
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut effects = FakeEffects {
+            retry_cleanup_supported: true,
+            association: Some(fidl_softmac::WlanAssociationConfig {
+                bssid: Some(BSSID),
+                ..Default::default()
+            }),
+            key: Some(fidl_softmac::WlanKeyConfiguration {
+                peer_addr: Some(BSSID),
+                key_idx: Some(0),
+                key: Some(FAKE_KEY.to_vec()),
+                ..Default::default()
+            }),
+            link_up: Some(true),
+            ..Default::default()
+        };
+        effects.rx.push_back(ClientRxFrame {
+            bytes: vec![0x08, 0, 1, 2],
+            status: rx_status(-42),
+            security: None,
+        });
+        let mut device = Mt7921ClientDevice::new_offline_fake(effects, support());
+        device.start(Box::new(Upcalls(received.clone()))).unwrap();
+
+        device.finish_failed_connect_attempt().unwrap();
+
+        let backend = device.backend();
+        assert!(backend.authorization.permits_tx());
+        assert!(!backend.effects.scan_revoked);
+        assert!(backend.effects.association.is_none());
+        assert!(backend.effects.key.is_none());
+        assert_eq!(backend.effects.link_up, Some(false));
+        assert!(backend.effects.rx.is_empty());
+        drop(backend);
+        assert!(!device.drive().unwrap());
+        assert!(received.lock().unwrap().is_empty());
     }
 
     fn channel(number: u8) -> fidl_ieee80211::ChannelNumber {
