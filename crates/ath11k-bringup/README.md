@@ -53,8 +53,12 @@ reset before candidate entry from a candidate failure before USB. Do not treat
 the first hop as reproducible or proceed from a degraded system. A diagnostic
 retry from `running` userspace also failed to return USB and required a manual
 power-cycle; its exact inputs and successful `kexec_loaded` transition do not
-show whether the candidate kernel began executing. Require a 16-byte Wi-Fi
-`reg` and live-FDT SHA-256
+show whether the candidate kernel began executing. The pinned initrd contains
+a 120-second `boot-watchdog.service` that writes diagnostics to `/dev/pmsg0`,
+tries its embedded rescue kexec, and finally forces a reboot. No diagnostic was
+retained after the failed retry, and USB did not return, so neither candidate
+entry nor rescue execution is proved. Require a 16-byte Wi-Fi `reg` and
+live-FDT SHA-256
 `d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
 After the approved stdin-only unlock and return to `#9` userspace, make the
 second hop with the legacy syscall forced:
