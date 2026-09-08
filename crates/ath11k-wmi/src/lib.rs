@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 pub mod cmd;
 pub mod event;
 pub mod tags;
+pub mod trace;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
