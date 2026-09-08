@@ -394,10 +394,17 @@ pub enum DriverError {
     ConnectTransactionClosed,
     ConnectStateMismatch,
     AlreadyConnected,
+    ConnectInProgress,
+    NoConnectInProgress,
     RetryCleanup,
     ControlBudgetExhausted,
     Stopped,
     UpcallOverflow,
+}
+
+struct ConnectAttempt {
+    transaction: wlan_sme::client::ConnectTransactionStream,
+    deadline: std::time::Instant,
 }
 
 /// Bounded production owner for SME, MLME, RSN, timers, device events, and
@@ -413,6 +420,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
     mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
     timer_runtime: tokio::runtime::Runtime,
+    connect_attempt: Option<ConnectAttempt>,
     connection: Option<wlan_sme::client::ConnectTransactionStream>,
     revoked: bool,
 }
@@ -519,6 +527,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             sme_timers,
             mlme_timers,
             timer_runtime,
+            connect_attempt: None,
             connection: None,
             revoked: false,
         })
@@ -540,6 +549,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     /// and a later call retries only the device stop operation.
     pub fn stop(&mut self) -> Result<(), zx::Status> {
         self.revoked = true;
+        self.connect_attempt = None;
         self.connection = None;
         revoke_and_drain(&self.upcalls);
         self.io.lock().unwrap().ethernet.teardown();
@@ -791,45 +801,55 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         request: fidl_sme::ConnectRequest,
         deadline: std::time::Instant,
     ) -> Result<fidl_sme::ConnectResult, ConnectError> {
+        self.begin_connect(request, deadline)?;
+        loop {
+            if let Some(result) = self.drive_connect_once().await? {
+                return Ok(result);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Start one policy-selected connect attempt while retaining its SME
+    /// transaction in the runtime. This permits a service loop to keep
+    /// processing control requests without dropping an in-flight attempt.
+    pub fn begin_connect(
+        &mut self,
+        request: fidl_sme::ConnectRequest,
+        deadline: std::time::Instant,
+    ) -> Result<(), ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
         if self.connection.is_some() {
             return Err(ConnectError::Driver(DriverError::AlreadyConnected));
         }
-        let mut result = self.connect_inner(request, deadline).await;
-        if matches!(result, Err(ConnectError::Failed(_))) && !self.revoked {
-            // A completed SME failure is retryable only when both owners can
-            // prove quiescence. Keep the data plane closed before asking the
-            // device to revoke and drain its attempt, then discard callbacks
-            // that raced with that device-side drain.
-            self.io.lock().unwrap().ethernet.set_link(false);
-            let sme_quiescent = sme_is_retry_quiescent(&self.sme.status());
-            let device_quiescent = sme_quiescent
-                && self
-                    .device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .finish_failed_connect_attempt()
-                    .is_ok();
-            if device_quiescent && drain_completed_attempt(&self.upcalls) {
-                return result;
-            }
-            result = Err(ConnectError::Driver(DriverError::RetryCleanup));
+        if self.connect_attempt.is_some() {
+            return Err(ConnectError::Driver(DriverError::ConnectInProgress));
         }
-        if result.is_err() && !self.revoked {
-            self.revoked = true;
-            revoke_and_drain(&self.upcalls);
-            self.io.lock().unwrap().ethernet.teardown();
-            self.device
-                .lock()
-                .unwrap()
-                .device
-                .reset()
-                .map_err(|_| ConnectError::Containment)?;
+        self.connect_attempt = Some(ConnectAttempt {
+            transaction: self.sme.on_connect_command(request),
+            deadline,
+        });
+        Ok(())
+    }
+
+    /// Advance the retained connect attempt once. `Ok(None)` means the
+    /// service should continue driving it; a returned error has already
+    /// completed retry cleanup or terminal containment as appropriate.
+    pub async fn drive_connect_once(
+        &mut self,
+    ) -> Result<Option<fidl_sme::ConnectResult>, ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
         }
-        result
+        if self.connect_attempt.is_none() {
+            return Err(ConnectError::Driver(DriverError::NoConnectInProgress));
+        }
+        match self.drive_connect_once_inner().await {
+            Ok(result) => Ok(result),
+            Err(error) => Err(self.finish_connect_error(error)),
+        }
     }
 
     /// Request a policy-owned disconnect and drive the pinned SME/MLME until
@@ -842,6 +862,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     ) -> Result<(), ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connect_attempt.is_some() {
+            return Err(ConnectError::Driver(DriverError::ConnectInProgress));
         }
         if self.connection.is_none() && sme_is_retry_quiescent(&self.sme.status()) {
             return Ok(());
@@ -862,77 +885,194 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
-        if result.is_err() && !self.revoked {
-            self.revoked = true;
-            self.connection = None;
-            revoke_and_drain(&self.upcalls);
-            self.io.lock().unwrap().ethernet.teardown();
-            self.device
-                .lock()
-                .unwrap()
-                .device
-                .reset()
-                .map_err(|_| ConnectError::Containment)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if !self.revoked => Err(self.contain_error(error)),
+            Err(error) => Err(error),
         }
-        result
     }
 
-    async fn connect_inner(
+    /// Cancel an in-flight connect without dropping its transaction. Success
+    /// is acknowledged only after SME Idle and either its terminal result or
+    /// the transaction closure used by SME for command cancellation are
+    /// observed; ambiguous termination is contained.
+    pub async fn cancel_connect(
         &mut self,
-        request: fidl_sme::ConnectRequest,
+        reason: fidl_sme::UserDisconnectReason,
         deadline: std::time::Instant,
     ) -> Result<fidl_sme::ConnectResult, ConnectError> {
-        let mut transaction = self.sme.on_connect_command(request);
-        loop {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connect_attempt.is_none() {
+            return Err(ConnectError::Driver(DriverError::NoConnectInProgress));
+        }
+        self.sme.on_disconnect_command(reason, Default::default());
+        let mut terminal = None;
+        let mut transaction_closed = false;
+        let result = loop {
             if std::time::Instant::now() >= deadline {
-                return Err(ConnectError::Timeout);
+                break Err(ConnectError::Timeout);
             }
-            let progressed = self.pump_once().await?;
+            let progressed = match self.pump_once().await {
+                Ok(progressed) => progressed,
+                Err(error) => break Err(error),
+            };
             loop {
-                match transaction.try_recv() {
+                let event = self
+                    .connect_attempt
+                    .as_mut()
+                    .expect("connect attempt checked above")
+                    .transaction
+                    .try_recv();
+                match event {
                     Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
                         result,
                         is_reconnect,
                     }) => {
-                        match result {
-                            wlan_sme::client::ConnectResult::Success => {}
-                            wlan_sme::client::ConnectResult::Canceled => {
-                                return Err(ConnectError::Failed(fidl_sme::ConnectResult {
-                                    code: fidl_ieee80211::StatusCode::Canceled,
-                                    is_credential_rejected: false,
-                                    is_reconnect,
-                                }));
+                        terminal = Some(
+                            wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
+                                result,
+                                is_reconnect,
                             }
-                            wlan_sme::client::ConnectResult::Failed(failure) => {
-                                return Err(ConnectError::Failed(fidl_sme::ConnectResult {
-                                    code: failure.status_code(),
-                                    is_credential_rejected: failure
-                                        .likely_due_to_credential_rejected(),
-                                    is_reconnect,
-                                }));
-                            }
-                        }
-                        self.pump_once().await?;
-                        if !self.sme.status().is_connected() {
-                            return Err(ConnectError::Driver(DriverError::ConnectStateMismatch));
-                        }
-                        self.connection = Some(transaction);
-                        return Ok(fidl_sme::ConnectResult {
-                            code: fidl_ieee80211::StatusCode::Success,
-                            is_credential_rejected: false,
-                            is_reconnect,
-                        });
+                            .into_fidl(),
+                        );
                     }
                     Ok(_) => {}
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Closed) => {
-                        return Err(ConnectError::Driver(DriverError::ConnectTransactionClosed));
+                        transaction_closed = true;
+                        break;
                     }
                 }
+            }
+            if (terminal.is_some() || transaction_closed)
+                && sme_is_retry_quiescent(&self.sme.status())
+            {
+                break Ok(());
             }
             if !progressed {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+        };
+        if let Err(error) = result {
+            return Err(if self.revoked {
+                error
+            } else {
+                self.contain_error(error)
+            });
+        }
+        self.connect_attempt = None;
+        self.io.lock().unwrap().ethernet.set_link(false);
+        if !self.finish_failed_attempt_cleanup() {
+            return Err(self.contain_error(ConnectError::Driver(DriverError::RetryCleanup)));
+        }
+        let terminal = terminal.unwrap_or(fidl_sme::ConnectTransactionEvent::OnConnectResult {
+            result: fidl_sme::ConnectResult {
+                code: fidl_ieee80211::StatusCode::Canceled,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            },
+        });
+        let fidl_sme::ConnectTransactionEvent::OnConnectResult { result } = terminal else {
+            unreachable!("only connect results are retained as terminal")
+        };
+        Ok(result)
+    }
+
+    async fn drive_connect_once_inner(
+        &mut self,
+    ) -> Result<Option<fidl_sme::ConnectResult>, ConnectError> {
+        if std::time::Instant::now()
+            >= self
+                .connect_attempt
+                .as_ref()
+                .expect("connect attempt checked by caller")
+                .deadline
+        {
+            return Err(ConnectError::Timeout);
+        }
+        self.pump_once().await?;
+        loop {
+            let event = self
+                .connect_attempt
+                .as_mut()
+                .expect("connect attempt checked by caller")
+                .transaction
+                .try_recv();
+            match event {
+                Ok(event @ wlan_sme::client::ConnectTransactionEvent::OnConnectResult { .. }) => {
+                    let fidl_sme::ConnectTransactionEvent::OnConnectResult { result } =
+                        event.into_fidl()
+                    else {
+                        unreachable!("matched connect result")
+                    };
+                    if result.code != fidl_ieee80211::StatusCode::Success {
+                        return Err(ConnectError::Failed(result));
+                    }
+                    self.pump_once().await?;
+                    if !self.sme.status().is_connected() {
+                        return Err(ConnectError::Driver(DriverError::ConnectStateMismatch));
+                    }
+                    let attempt = self
+                        .connect_attempt
+                        .take()
+                        .expect("connect attempt retained");
+                    self.connection = Some(attempt.transaction);
+                    return Ok(Some(result));
+                }
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::TryRecvError::Closed) => {
+                    return Err(ConnectError::Driver(DriverError::ConnectTransactionClosed));
+                }
+            }
+        }
+    }
+
+    fn finish_connect_error(&mut self, error: ConnectError) -> ConnectError {
+        self.connect_attempt = None;
+        if self.revoked {
+            return error;
+        }
+        if matches!(error, ConnectError::Failed(_)) && self.finish_failed_attempt_cleanup() {
+            return error;
+        }
+        let error = if matches!(error, ConnectError::Failed(_)) {
+            ConnectError::Driver(DriverError::RetryCleanup)
+        } else {
+            error
+        };
+        self.contain_error(error)
+    }
+
+    fn finish_failed_attempt_cleanup(&mut self) -> bool {
+        // A completed SME failure is retryable only when both owners can
+        // prove quiescence. Keep the data plane closed before asking the
+        // device to revoke and drain its attempt, then discard callbacks
+        // that raced with that device-side drain.
+        self.io.lock().unwrap().ethernet.set_link(false);
+        let sme_quiescent = sme_is_retry_quiescent(&self.sme.status());
+        let device_quiescent = sme_quiescent
+            && self
+                .device
+                .lock()
+                .unwrap()
+                .device
+                .finish_failed_connect_attempt()
+                .is_ok();
+        device_quiescent && drain_completed_attempt(&self.upcalls)
+    }
+
+    fn contain_error(&mut self, error: ConnectError) -> ConnectError {
+        self.revoked = true;
+        self.connect_attempt = None;
+        self.connection = None;
+        revoke_and_drain(&self.upcalls);
+        self.io.lock().unwrap().ethernet.teardown();
+        match self.device.lock().unwrap().device.reset() {
+            Ok(()) => error,
+            Err(_) => ConnectError::Containment,
         }
     }
 
@@ -1004,6 +1144,7 @@ mod tests {
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
         simulate_ap: bool,
+        suppress_auth_response: bool,
         reject_next_auth: bool,
         pending_rx: VecDeque<Vec<u8>>,
         retry_cleanup: bool,
@@ -1203,7 +1344,9 @@ mod tests {
                         } else {
                             0
                         };
-                        effects.pending_rx.push_back(auth_response(status));
+                        if !effects.suppress_auth_response {
+                            effects.pending_rx.push_back(auth_response(status));
+                        }
                     }
                     Some(0x00) => effects.pending_rx.push_back(association_response()),
                     Some(0xc0) => {}
@@ -1706,6 +1849,98 @@ mod tests {
                 },
             })
         ));
+    }
+
+    #[test]
+    fn retained_connect_attempt_can_be_canceled_and_reused() {
+        let (fake, effects) = Fake::new(0);
+        {
+            let mut state = effects.lock().unwrap();
+            state.simulate_ap = true;
+            state.suppress_auth_response = true;
+            state.retry_cleanup = true;
+        }
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        runtime
+            .begin_connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.begin_connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(ConnectError::Driver(DriverError::ConnectInProgress))
+        );
+
+        let result = futures::executor::block_on(runtime.cancel_connect(
+            fidl_sme::UserDisconnectReason::FailedToConnect,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert_eq!(
+            result,
+            fidl_sme::ConnectResult {
+                code: fidl_ieee80211::StatusCode::Canceled,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            }
+        );
+        assert!(sme_is_retry_quiescent(&runtime.sme().status()));
+        assert!(!runtime.revoked);
+        assert!(
+            effects
+                .lock()
+                .unwrap()
+                .calls
+                .contains(&"finish_failed_connect_attempt")
+        );
+
+        effects.lock().unwrap().suppress_auth_response = false;
+        runtime
+            .begin_connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let result = loop {
+            if let Some(result) = futures::executor::block_on(runtime.drive_connect_once()).unwrap()
+            {
+                break result;
+            }
+        };
+        assert_eq!(result.code, fidl_ieee80211::StatusCode::Success);
+    }
+
+    #[test]
+    fn canceled_connect_without_certified_cleanup_is_contained() {
+        let (fake, effects) = Fake::new(0);
+        {
+            let mut state = effects.lock().unwrap();
+            state.simulate_ap = true;
+            state.suppress_auth_response = true;
+        }
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        runtime
+            .begin_connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(
+            futures::executor::block_on(runtime.cancel_connect(
+                fidl_sme::UserDisconnectReason::FailedToConnect,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )),
+            Err(ConnectError::Driver(DriverError::RetryCleanup))
+        );
+        assert!(runtime.revoked);
+        let state = effects.lock().unwrap();
+        assert!(state.calls.contains(&"finish_failed_connect_attempt"));
+        assert!(state.calls.contains(&"reset"));
     }
 
     #[test]

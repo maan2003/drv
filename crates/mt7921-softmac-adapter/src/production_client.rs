@@ -16,6 +16,21 @@ use std::time::Instant;
 
 trait RuntimeOwner {
     fn take_ethernet_device(&mut self) -> Option<HostEthernetDevice>;
+    fn begin_connect(
+        &mut self,
+        request: fidl_sme::ConnectRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError>;
+    fn drive_connect_once(
+        &mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<fidl_sme::ConnectResult>, PinnedConnectError>> + '_>,
+    >;
+    fn cancel_connect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>;
     fn connect<'a>(
         &'a mut self,
         request: fidl_sme::ConnectRequest,
@@ -42,6 +57,31 @@ where
 {
     fn take_ethernet_device(&mut self) -> Option<HostEthernetDevice> {
         self.take_ethernet_device()
+    }
+
+    fn begin_connect(
+        &mut self,
+        request: fidl_sme::ConnectRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError> {
+        self.begin_connect(request, deadline)
+    }
+
+    fn drive_connect_once(
+        &mut self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<fidl_sme::ConnectResult>, PinnedConnectError>> + '_>,
+    > {
+        Box::pin(self.drive_connect_once())
+    }
+
+    fn cancel_connect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>
+    {
+        Box::pin(self.cancel_connect(reason, deadline))
     }
 
     fn next_connection_event(
@@ -150,6 +190,33 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
         self.runtime.connect(request, deadline).await
     }
 
+    /// Retain a new connect attempt in the runtime so the service loop can
+    /// continue accepting policy requests while it is in flight.
+    pub fn begin_connect(
+        &mut self,
+        request: fidl_sme::ConnectRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError> {
+        self.runtime.begin_connect(request, deadline)
+    }
+
+    pub async fn drive_connect_once(
+        &mut self,
+    ) -> Result<Option<fidl_sme::ConnectResult>, PinnedConnectError> {
+        self.runtime.drive_connect_once().await
+    }
+
+    /// Cancel a retained attempt and return its exact policy result only after
+    /// SME has reached Idle and cleanup is certified. SME transaction closure
+    /// after the disconnect command is classified as `Canceled`.
+    pub async fn cancel_connect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<fidl_sme::ConnectResult, PinnedConnectError> {
+        self.runtime.cancel_connect(reason, deadline).await
+    }
+
     pub async fn drive_once(&mut self) -> Result<bool, PinnedConnectError> {
         self.runtime.drive_once().await
     }
@@ -190,6 +257,40 @@ mod tests {
         fn take_ethernet_device(&mut self) -> Option<HostEthernetDevice> {
             self.calls.push("take");
             None
+        }
+        fn begin_connect(
+            &mut self,
+            _: fidl_sme::ConnectRequest,
+            _: Instant,
+        ) -> Result<(), PinnedConnectError> {
+            self.calls.push("begin_connect");
+            Ok(())
+        }
+        fn drive_connect_once(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<fidl_sme::ConnectResult>, PinnedConnectError>>
+                    + '_,
+            >,
+        > {
+            self.calls.push("drive_connect");
+            Box::pin(async { Ok(None) })
+        }
+        fn cancel_connect(
+            &mut self,
+            _: fidl_sme::UserDisconnectReason,
+            _: Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>
+        {
+            self.calls.push("cancel_connect");
+            Box::pin(async {
+                Ok(fidl_sme::ConnectResult {
+                    code: fidl_fuchsia_wlan_ieee80211::StatusCode::Canceled,
+                    is_credential_rejected: false,
+                    is_reconnect: false,
+                })
+            })
         }
         fn connect<'a>(
             &'a mut self,
