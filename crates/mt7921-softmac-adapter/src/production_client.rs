@@ -23,7 +23,7 @@ trait RuntimeOwner {
     ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + 'a>>;
     fn next_connection_event(
         &mut self,
-    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError>;
+    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, PinnedConnectError>;
     fn disconnect(
         &mut self,
         reason: fidl_sme::UserDisconnectReason,
@@ -46,7 +46,7 @@ where
 
     fn next_connection_event(
         &mut self,
-    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, PinnedConnectError> {
         self.next_connection_event()
     }
 
@@ -158,7 +158,7 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
     /// applying policy. Call [`Self::drive_once`] separately to make progress.
     pub fn next_connection_event(
         &mut self,
-    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, PinnedConnectError> {
         self.runtime.next_connection_event()
     }
 
@@ -214,7 +214,7 @@ mod tests {
         }
         fn next_connection_event(
             &mut self,
-        ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, PinnedConnectError> {
+        ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, PinnedConnectError> {
             self.calls.push("event");
             Ok(None)
         }

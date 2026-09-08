@@ -940,7 +940,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     /// progress remains explicit through [`Self::pump_associated_once`].
     pub fn next_connection_event(
         &mut self,
-    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, ConnectError> {
+    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
@@ -956,7 +956,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 ) {
                     self.connection = None;
                 }
-                Ok(Some(event))
+                Ok(Some(event.into_fidl()))
             }
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Closed) => {
@@ -1689,7 +1689,7 @@ mod tests {
 
         assert!(matches!(
             runtime.next_connection_event().unwrap(),
-            Some(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+            Some(fidl_sme::ConnectTransactionEvent::OnDisconnect {
                 info: fidl_sme::DisconnectInfo {
                     is_sme_reconnecting: true,
                     ..
@@ -1698,9 +1698,12 @@ mod tests {
         ));
         assert!(matches!(
             runtime.next_connection_event().unwrap(),
-            Some(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
-                result: wlan_sme::client::ConnectResult::Success,
-                is_reconnect: true,
+            Some(fidl_sme::ConnectTransactionEvent::OnConnectResult {
+                result: fidl_sme::ConnectResult {
+                    code: fidl_ieee80211::StatusCode::Success,
+                    is_credential_rejected: false,
+                    is_reconnect: true,
+                },
             })
         ));
     }
@@ -1731,7 +1734,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runtime.next_connection_event().unwrap(),
-            Some(wlan_sme::client::ConnectTransactionEvent::OnDisconnect { .. })
+            Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
         ));
         assert!(sme_is_retry_quiescent(&runtime.sme().status()));
 
