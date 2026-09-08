@@ -154,8 +154,9 @@ struct CHttCompletion { status: u8, reinject_reason: u8, ack_rssi: i8,
 #[derive(Clone, Copy, Default)]
 struct CQcnRx { first_msdu: u8, last_msdu: u8, l3_padding: u8, msdu_done: u8,
     msdu_length_error: u8, fcs_error: u8, decrypt_error: u8, tkip_mic_error: u8,
+    mpdu_errors: u8, ip_checksum_failed: u8, l4_checksum_failed: u8,
     multicast_broadcast: u8, decrypted: u8, msdu_length: u16, decap_type: u8,
-    ldpc: u8, sgi: u8, mcs: u8, bandwidth: u8, packet_type: u8,
+    mesh_control_present: u8, ldpc: u8, sgi: u8, mcs: u8, bandwidth: u8, packet_type: u8,
     spatial_stream_bitmap: u8, nss: u8, frequency: u32, tid: u8, peer: u16,
     sequence_valid: u8, frame_valid: u8, sequence_number: u16,
     encryption_valid: u8, encryption_type: u8, phy_ppdu_id: u16 }
@@ -269,6 +270,8 @@ unsafe extern "C" {
     fn oracle_htt_completion_decode(bytes: *const u8, len: usize, out: *mut CHttCompletion) -> c_int;
     #[cfg(test)]
     fn oracle_qcn9074_rx_decode(bytes: *const u8, len: usize, out: *mut CQcnRx) -> c_int;
+    #[cfg(test)]
+    fn oracle_reo_msdu_continuation(bytes: *const u8, len: usize) -> c_int;
     fn oracle_qmi_ind_register_encode(input: *const CIndicationRegister, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_respond_memory_encode(input: *const CRespondMemory, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_bdf_download_encode(input: *const CBdfDownload, out: *mut u8, capacity: usize) -> c_int;
@@ -807,6 +810,7 @@ mod tests {
         SrngRingType, SrngSetup, TxCompletion, version_request};
     use ath11k_dp::{HttTargetMessage, PeerId};
     use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
+    use ath11k_hal::descriptors::ReoDestinationRing;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event { Tlv { tag: u8, len: usize, offset: usize }, Field(String, u64), Branch(String) }
@@ -1385,10 +1389,15 @@ mod tests {
                 rust.msdu_length_error, rust.fcs_error, rust.decrypt_error, rust.tkip_mic_error),
                 (c.first_msdu != 0, c.last_msdu != 0, c.l3_padding, c.msdu_done != 0,
                 c.msdu_length_error != 0, c.fcs_error != 0, c.decrypt_error != 0, c.tkip_mic_error != 0));
+            prop_assert_eq!((rust.mpdu_errors, rust.ip_checksum_failed,
+                rust.l4_checksum_failed), (c.mpdu_errors, c.ip_checksum_failed != 0,
+                c.l4_checksum_failed != 0));
             prop_assert_eq!((rust.multicast_broadcast, rust.decrypted, rust.msdu_length,
-                rust.decap_type, rust.ldpc, rust.short_guard_interval, rust.mcs, rust.bandwidth),
+                rust.decap_type, rust.mesh_control_present, rust.ldpc,
+                rust.short_guard_interval, rust.mcs, rust.bandwidth),
                 (c.multicast_broadcast != 0, c.decrypted != 0, c.msdu_length,
-                c.decap_type, c.ldpc != 0, c.sgi, c.mcs, c.bandwidth));
+                c.decap_type, c.mesh_control_present != 0, c.ldpc != 0,
+                c.sgi, c.mcs, c.bandwidth));
             prop_assert_eq!((rust.packet_type, rust.spatial_stream_bitmap, rust.nss,
                 rust.frequency, rust.tid, rust.peer.0),
                 (c.packet_type, c.spatial_stream_bitmap, c.nss, c.frequency, c.tid, c.peer));
@@ -1396,6 +1405,14 @@ mod tests {
                 rust.sequence_number, rust.encryption_info_valid, rust.encryption_type,
                 rust.phy_ppdu_id), (c.sequence_valid != 0, c.frame_valid != 0,
                 c.sequence_number, c.encryption_valid != 0, c.encryption_type, c.phy_ppdu_id));
+        }
+
+        #[test]
+        fn reo_msdu_continuation_matches_c(bytes: [u8; 64]) {
+            let rust = ReoDestinationRing::from_bytes(&bytes).unwrap().msdu().continuation();
+            // SAFETY: `bytes` is an exact REO destination descriptor.
+            let c = unsafe { oracle_reo_msdu_continuation(bytes.as_ptr(), bytes.len()) };
+            prop_assert_eq!(rust, c != 0);
         }
 
         #[test]

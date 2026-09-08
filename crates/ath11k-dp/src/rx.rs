@@ -38,10 +38,14 @@ pub struct RxDescriptorStatus {
     pub fcs_error: bool,
     pub decrypt_error: bool,
     pub tkip_mic_error: bool,
+    pub mpdu_errors: u8,
+    pub ip_checksum_failed: bool,
+    pub l4_checksum_failed: bool,
     pub multicast_broadcast: bool,
     pub decrypted: bool,
     pub msdu_length: u16,
     pub decap_type: u8,
+    pub mesh_control_present: bool,
     pub ldpc: bool,
     pub short_guard_interval: u8,
     pub mcs: u8,
@@ -98,6 +102,14 @@ impl<'a> Wcn6750RxDescriptor<'a> {
         let msdu3 = self.u32(MSDU_START_INFO3);
         let mpdu9 = self.u32(MPDU_START_INFO9);
         let mpdu11 = self.u32(MPDU_START_INFO11);
+        let encryption_info_valid = mpdu11 & (1 << 9) != 0;
+        let mpdu_errors = u8::from(attention1 & (1 << 31) != 0)
+            | (u8::from(attention1 & (1 << 29) != 0) << 1)
+            | (u8::from(attention1 & (1 << 28) != 0) << 2)
+            | (u8::from(attention1 & (1 << 12) != 0) << 3)
+            | (u8::from(attention1 & (1 << 16) != 0) << 4)
+            | (u8::from(attention1 & (1 << 17) != 0) << 5)
+            | (u8::from(attention1 & (1 << 27) != 0) << 6);
         RxDescriptorStatus {
             first_msdu: end4 & (1 << 12) != 0,
             last_msdu: end4 & (1 << 13) != 0,
@@ -107,10 +119,14 @@ impl<'a> Wcn6750RxDescriptor<'a> {
             fcs_error: attention1 & (1 << 31) != 0,
             decrypt_error: attention1 & (1 << 29) != 0,
             tkip_mic_error: attention1 & (1 << 28) != 0,
+            mpdu_errors,
+            ip_checksum_failed: attention1 & (1 << 19) != 0,
+            l4_checksum_failed: attention1 & (1 << 18) != 0,
             multicast_broadcast: attention1 & (1 << 2) != 0,
             decrypted: ((attention2 >> 10) & 7) == 0,
             msdu_length: (msdu1 & 0x3fff) as u16,
             decap_type: ((msdu2 >> 8) & 3) as u8,
+            mesh_control_present: msdu2 & (1 << 22) != 0,
             ldpc: msdu2 & (1 << 23) != 0,
             short_guard_interval: ((msdu3 >> 13) & 3) as u8,
             mcs: ((msdu3 >> 15) & 0xf) as u8,
@@ -124,8 +140,14 @@ impl<'a> Wcn6750RxDescriptor<'a> {
             sequence_control_valid: mpdu11 & (1 << 6) != 0,
             frame_control_valid: mpdu11 & 1 != 0,
             sequence_number: ((mpdu11 >> 20) & 0xfff) as u16,
-            encryption_info_valid: mpdu11 & (1 << 9) != 0,
-            encryption_type: ((mpdu9 >> 2) & 0xf) as u8,
+            encryption_info_valid,
+            // `ath11k_dp_rx_h_mpdu_start_enctype` maps invalid encryption
+            // metadata to OPEN rather than consuming the stale type bits.
+            encryption_type: if encryption_info_valid {
+                ((mpdu9 >> 2) & 0xf) as u8
+            } else {
+                7
+            },
             phy_ppdu_id: self.u16(MPDU_START_PHY_PPDU_ID),
         }
     }
