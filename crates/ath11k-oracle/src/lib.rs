@@ -130,6 +130,100 @@ impl Default for CWlanConfig {
 #[derive(Clone, Copy, Default)]
 struct CWlanIni { valid: u8, value: u8 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CWmiCapture { id: u32, len: usize, bytes: [u8; 8192] }
+impl Default for CWmiCapture {
+    fn default() -> Self { Self { id: 0, len: 0, bytes: [0; 8192] } }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WmiCapture { pub id: u32, pub bytes: Vec<u8> }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CWmiTlv { tag: u16, len: u16, offset: usize }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WmiTlv { pub tag: u16, pub len: usize, pub offset: usize }
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WmiEventKind {
+    ServiceReady,
+    ServiceReadyExt,
+    ServiceReadyExt2,
+    ServiceAvailable,
+    Ready,
+    Scan,
+    VdevStartResponse,
+    VdevStopped,
+    VdevDeleteResponse,
+    PeerAssocConfirmation,
+    PeerDeleteResponse,
+    InstallKeyCompletion,
+    MgmtRx,
+    MgmtTxCompletion,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CWmiTraceField {
+    name: u16,
+    value: u64,
+}
+#[repr(C)]
+struct CWmiEventParse {
+    fields: [u64; 192],
+    field_count: usize,
+    tlvs: [CWmiTlv; 64],
+    tlv_count: usize,
+    trace_fields: [CWmiTraceField; 16],
+    trace_field_count: usize,
+}
+impl Default for CWmiEventParse {
+    fn default() -> Self {
+        Self {
+            fields: [0; 192],
+            field_count: 0,
+            tlvs: [CWmiTlv::default(); 64],
+            tlv_count: 0,
+            trace_fields: [CWmiTraceField::default(); 16],
+            trace_field_count: 0,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WmiEventTrace {
+    Tlv { tag: u16, len: usize, offset: usize },
+    Field { name: &'static str, value: u64 },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WmiEventParse {
+    pub fields: Vec<u64>,
+    pub trace: Vec<WmiEventTrace>,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CWmiVdevStart {
+    restart: u8, hidden: u8, pmf: u8, crypto_disabled: u8,
+    vdev_id: u32, beacon_interval: u32, dtim_period: u32, ssid_len: u32,
+    ssid: [u8; 32], bcn_tx_rate: u32, noa: u32, tx: u32, rx: u32,
+    he_ops: u32, cac: u32, regdomain: u32, mbssid_flags: u32,
+    mbssid_tx_vdev_id: u32, channel: [u32; 6],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CInitChunk { request_id: u32, address: u32, size: u32 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CInitBand { pdev_id: u32, start_freq: u32, end_freq: u32 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CWmiInit { words: [u32; 72], chunk_len: u32, chunks: [CInitChunk; 32],
+    mode_valid: u8, mode: u32, band_len: u32, bands: [CInitBand; 3] }
+impl Default for CWmiInit {
+    fn default() -> Self { Self { words: [0; 72], chunk_len: 0,
+        chunks: [CInitChunk::default(); 32], mode_valid: 0, mode: 0, band_len: 0,
+        bands: [CInitBand::default(); 3] } }
+}
+
 unsafe extern "C" {
     fn oracle_qmi_host_cap_encode(input: *const CHostCapability, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_ind_register_encode(input: *const CIndicationRegister, out: *mut u8, capacity: usize) -> c_int;
@@ -142,6 +236,214 @@ unsafe extern "C" {
     fn oracle_qmi_empty_encode(kind: c_uint, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_decode_reencode(body: *const u8, body_len: usize, kind: c_uint,
         output: *mut u8, output_len: usize, encoded: *mut u8, capacity: usize) -> c_int;
+    fn oracle_wmi_vdev_id(kind: u32, vdev_id: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_pdev_set_param(pdev_id: u32, param_id: u32, value: u32,
+        out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_peer(kind: u32, vdev_id: u32, address: *const u8, peer_type: u32,
+        param_id: u32, value: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_vdev_up(vdev_id: u32, assoc_id: u32, bssid: *const u8,
+        tx_bssid: *const u8, profile_idx: u32, profile_cnt: u32,
+        out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_tlv_iter(bytes: *const u8, length: usize, events: *mut CWmiTlv,
+        event_count: *mut usize) -> c_int;
+    fn oracle_wmi_vdev_create(vdev_id: u32, kind: u32, subtype: u32,
+        address: *const u8, pdev_id: u32, mbssid_flags: u32, mbssid_tx_vdev_id: u32,
+        tx2: u32, rx2: u32, tx5: u32, rx5: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_vdev_start(input: *const CWmiVdevStart, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_scan_stop(requester: u32, scan_id: u32, cancel_type: u32,
+        vdev_id: u32, pdev_id: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_install_key(vdev_id: u32, address: *const u8, key_idx: u32,
+        key_flags: u32, cipher: u32, rsc_low: u32, rsc_high: u32, key: *const u8,
+        key_len: usize, txmic: u32, rxmic: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_mgmt_send(vdev_id: u32, desc_id: u32, freq: u32, paddr: u64,
+        frame: *const u8, frame_len: usize, params_valid: u8, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_init(input: *const CWmiInit, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_event_parse(
+        kind: u32,
+        bytes: *const u8,
+        length: usize,
+        out: *mut CWmiEventParse,
+    ) -> c_int;
+}
+
+pub fn c_wmi_event_parse(kind: WmiEventKind, bytes: &[u8]) -> Result<WmiEventParse, i32> {
+    let mut out = CWmiEventParse::default();
+    // SAFETY: `bytes` is readable for `len`, and `out` matches the writable C layout.
+    let result =
+        unsafe { oracle_wmi_event_parse(kind as u32, bytes.as_ptr(), bytes.len(), &mut out) };
+    if result < 0 {
+        return Err(result);
+    }
+    let mut trace = out.tlvs[..out.tlv_count]
+        .iter()
+        .map(|tlv| WmiEventTrace::Tlv {
+            tag: tlv.tag,
+            len: usize::from(tlv.len),
+            offset: tlv.offset,
+        })
+        .collect::<Vec<_>>();
+    trace.extend(
+        out.trace_fields[..out.trace_field_count]
+            .iter()
+            .map(|field| WmiEventTrace::Field {
+                name: wmi_trace_field_name(kind, field.name),
+                value: field.value,
+            }),
+    );
+    Ok(WmiEventParse {
+        fields: out.fields[..out.field_count].to_vec(),
+        trace,
+    })
+}
+
+fn wmi_trace_field_name(kind: WmiEventKind, id: u16) -> &'static str {
+    const NAMES: &[&str] = &[
+        "wmi.ServiceReadyFixed.phy_capability",
+        "wmi.ServiceReadyFixed.max_supported_macs",
+        "wmi.ServiceReadyFixed.num_dbs_hw_modes",
+        "wmi.ServiceReadyExt.array_groups.len",
+        "wmi.ServiceReadyExt.hw_modes.len",
+        "wmi.ServiceReadyExt2.dma_ring_capabilities.len",
+        "wmi.Ready.extra_mac_addresses.len",
+        "wmi.Ready.status",
+        "wmi.Scan.event_type",
+        "wmi.Scan.reason",
+        "wmi.Scan.channel_freq",
+        "wmi.Scan.scan_request_id",
+        "wmi.Scan.scan_id",
+        "wmi.Scan.vdev_id",
+        "wmi.Scan.tsf_timestamp",
+        "wmi.VdevStartResponse.vdev_id",
+        "wmi.VdevStartResponse.requestor_id",
+        "wmi.VdevStartResponse.response_type",
+        "wmi.VdevStartResponse.status",
+        "wmi.VdevStartResponse.chain_mask",
+        "wmi.VdevStartResponse.smps_mode",
+        "wmi.VdevStartResponse.mac_id",
+        "wmi.VdevStartResponse.configured_tx_streams",
+        "wmi.VdevStartResponse.configured_rx_streams",
+        "wmi.VdevStartResponse.max_allowed_tx_power",
+        "wmi.VdevStopped.vdev_id",
+        "wmi.MgmtTxCompletion.descriptor_id",
+        "wmi.MgmtTxCompletion.status",
+        "wmi.MgmtTxCompletion.pdev_id",
+        "wmi.MgmtTxCompletion.ppdu_id",
+        "wmi.MgmtTxCompletion.ack_rssi",
+    ];
+    if id == 25 && kind == WmiEventKind::VdevDeleteResponse {
+        "wmi.VdevDeleteResponse.vdev_id"
+    } else {
+        NAMES[usize::from(id)]
+    }
+}
+
+fn wmi_capture(call: impl FnOnce(*mut CWmiCapture) -> c_int) -> Result<WmiCapture, i32> {
+    let mut capture = CWmiCapture::default();
+    let result = call(&mut capture);
+    if result < 0 { return Err(result); }
+    Ok(WmiCapture { id: capture.id, bytes: capture.bytes[..capture.len].to_vec() })
+}
+pub fn c_wmi_vdev_id(kind: u32, vdev_id: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: `out` points to the writable capture owned by `wmi_capture`.
+        unsafe { oracle_wmi_vdev_id(kind, vdev_id, out) }
+    })
+}
+pub fn c_wmi_pdev_set_param(pdev_id: u32, param_id: u32, value: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: `out` points to the writable capture owned by `wmi_capture`.
+        unsafe { oracle_wmi_pdev_set_param(pdev_id, param_id, value, out) }
+    })
+}
+pub fn c_wmi_peer(kind: u32, vdev_id: u32, address: &[u8; 6], peer_type: u32,
+    param_id: u32, value: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: the address is readable for six bytes and `out` is writable.
+        unsafe { oracle_wmi_peer(kind, vdev_id, address.as_ptr(), peer_type, param_id, value, out) }
+    })
+}
+pub fn c_wmi_vdev_up(vdev_id: u32, assoc_id: u32, bssid: &[u8; 6],
+    tx_bssid: Option<&[u8; 6]>, profile_idx: u32, profile_cnt: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: both present addresses are readable for six bytes and `out` is writable.
+        unsafe { oracle_wmi_vdev_up(vdev_id, assoc_id, bssid.as_ptr(),
+            tx_bssid.map_or(core::ptr::null(), |x| x.as_ptr()), profile_idx, profile_cnt, out) }
+    })
+}
+pub fn c_wmi_tlv_iter(bytes: &[u8]) -> Result<Vec<WmiTlv>, i32> {
+    let mut events = [CWmiTlv::default(); 64];
+    let mut count = events.len();
+    // SAFETY: the input is readable and the event allocation is writable for
+    // the supplied lengths; C checks its event capacity before every write.
+    let result = unsafe { oracle_wmi_tlv_iter(bytes.as_ptr(), bytes.len(),
+        events.as_mut_ptr(), &mut count) };
+    if result < 0 { return Err(result); }
+    Ok(events[..count].iter().map(|event| WmiTlv { tag: event.tag,
+        len: usize::from(event.len), offset: event.offset }).collect())
+}
+#[allow(clippy::too_many_arguments)]
+pub fn c_wmi_vdev_create(vdev_id: u32, kind: u32, subtype: u32, address: &[u8; 6],
+    pdev_id: u32, mbssid_flags: u32, mbssid_tx_vdev_id: u32,
+    tx2: u32, rx2: u32, tx5: u32, rx5: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: `address` is readable for six bytes and `out` is writable.
+        unsafe { oracle_wmi_vdev_create(vdev_id, kind, subtype, address.as_ptr(), pdev_id,
+            mbssid_flags, mbssid_tx_vdev_id, tx2, rx2, tx5, rx5, out) }
+    })
+}
+pub fn c_wmi_vdev_start(input: &ath11k_wmi::cmd::VdevStart) -> Result<WmiCapture, i32> {
+    let mut c = CWmiVdevStart { restart: u8::from(input.restart), hidden: u8::from(input.hidden_ssid),
+        pmf: u8::from(input.pmf_enabled), crypto_disabled: u8::from(input.hw_crypto_disabled),
+        vdev_id: input.vdev_id, beacon_interval: input.beacon_interval, dtim_period: input.dtim_period,
+        ssid_len: input.ssid.as_ref().map_or(0, |ssid| ssid.len() as u32), bcn_tx_rate: input.bcn_tx_rate,
+        noa: input.num_noa_descriptors, tx: input.preferred_tx_streams, rx: input.preferred_rx_streams,
+        he_ops: input.he_ops, cac: input.cac_duration_ms, regdomain: input.regdomain,
+        mbssid_flags: input.mbssid_flags, mbssid_tx_vdev_id: input.mbssid_tx_vdev_id,
+        channel: [input.channel.mhz, input.channel.band_center_freq1, input.channel.band_center_freq2,
+            input.channel.info, input.channel.reg_info_1, input.channel.reg_info_2], ..Default::default() };
+    if let Some(ssid) = &input.ssid { c.ssid[..ssid.len()].copy_from_slice(ssid); }
+    wmi_capture(|out| {
+        // SAFETY: both pointers refer to valid matching C-layout objects.
+        unsafe { oracle_wmi_vdev_start(&c, out) }
+    })
+}
+pub fn c_wmi_scan_stop(requester: u32, scan_id: u32, cancel_type: u32,
+    vdev_id: u32, pdev_id: u32) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: `out` points to the writable capture owned by `wmi_capture`.
+        unsafe { oracle_wmi_scan_stop(requester, scan_id, cancel_type, vdev_id, pdev_id, out) }
+    })
+}
+pub fn c_wmi_install_key(input: &ath11k_wmi::cmd::VdevInstallKey) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: address/key are readable for their stated lengths and `out` is writable.
+        unsafe { oracle_wmi_install_key(input.vdev_id, input.peer_addr.as_ptr(), input.key_idx,
+            input.key_flags, input.key_cipher, input.key_rsc_counter.low,
+            input.key_rsc_counter.high, input.key_data.as_ptr(), input.key_data.len(),
+            input.key_txmic_len, input.key_rxmic_len, out) }
+    })
+}
+pub fn c_wmi_mgmt_send(input: &ath11k_wmi::cmd::MgmtSend) -> Result<WmiCapture, i32> {
+    wmi_capture(|out| {
+        // SAFETY: frame is readable for its stated length and `out` is writable.
+        unsafe { oracle_wmi_mgmt_send(input.vdev_id, input.desc_id, input.channel_freq,
+            input.paddr, input.frame.as_ptr(), input.frame.len(), u8::from(input.tx_params_valid), out) }
+    })
+}
+pub fn c_wmi_init(input: &ath11k_wmi::cmd::Init) -> Result<WmiCapture, i32> {
+    let mut c = CWmiInit { words: input.resource_config.words(),
+        chunk_len: input.memory_chunks.len() as u32, mode_valid: u8::from(input.hardware_mode.is_some()),
+        mode: input.hardware_mode.unwrap_or(0), band_len: input.bands.len() as u32, ..Default::default() };
+    for (out, chunk) in c.chunks.iter_mut().zip(&input.memory_chunks) {
+        *out = CInitChunk { request_id: chunk.request_id, address: chunk.physical_address, size: chunk.size };
+    }
+    for (out, band) in c.bands.iter_mut().zip(&input.bands) {
+        *out = CInitBand { pdev_id: band.pdev_id, start_freq: band.start_freq, end_freq: band.end_freq };
+    }
+    wmi_capture(|out| {
+        // SAFETY: both pointers refer to valid matching C-layout objects.
+        unsafe { oracle_wmi_init(&c, out) }
+    })
 }
 
 fn option<T: Copy + Default>(value: Option<T>) -> (u8, T) {
@@ -314,6 +616,16 @@ mod tests {
     use proptest::collection::vec;
     use proptest::option;
     use proptest::prelude::*;
+    use ath11k_wmi::cmd::{CommandStrategy, EncodeCommand, Init, PdevSetParam, PeerCreate, PeerDelete, PeerSetParam,
+        Channel as WmiChannel, KeySeqCounter, MgmtSend, ScanCancelType, ScanStop, TxRxStreams, VdevCreate,
+        VdevDelete, VdevDown, VdevInstallKey, VdevStart, VdevStop, VdevUp};
+    use ath11k_wmi::trace::{TraceEvent as WmiTraceEvent, TraceSink as WmiTraceSink};
+    use ath11k_wmi::event::{
+        Decoder as WmiDecoder, InstallKeyCompletion, MgmtRx, MgmtTxCompletion,
+        PeerAssocConfirmation, PeerDeleteResponse, ReadyDecoder, Scan, ServiceAvailable,
+        ServiceReadyDecoder, ServiceReadyExt2Decoder, ServiceReadyExtDecoder, VdevDeleteResponse,
+        VdevStartResponse, VdevStopped,
+    };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event { Tlv { tag: u8, len: usize, offset: usize }, Field(String, u64), Branch(String) }
@@ -339,6 +651,405 @@ mod tests {
     fn direction(value: u8) -> PipeDirection {
         match value % 4 { 0 => PipeDirection::None, 1 => PipeDirection::In,
             2 => PipeDirection::Out, _ => PipeDirection::InOut }
+    }
+
+    fn rust_wmi(command: &impl EncodeCommand) -> WmiCapture {
+        let command = command.encode_command().unwrap();
+        WmiCapture { id: command.id.0, bytes: command.tlvs().to_vec() }
+    }
+    #[derive(Default)]
+    struct WmiSink(Vec<WmiTraceEvent>);
+    impl WmiTraceSink for WmiSink {
+        fn record(&mut self, event: WmiTraceEvent) { self.0.push(event); }
+    }
+    fn assert_wmi(command: &impl EncodeCommand, c: WmiCapture) {
+        let mut sink = WmiSink::default();
+        let command = command.encode_command_with_trace(&mut sink).unwrap();
+        let rust = WmiCapture { id: command.id.0, bytes: command.tlvs().to_vec() };
+        assert_eq!(rust, c);
+        let rust_tlvs: Vec<_> = sink.0.into_iter().filter_map(|event| match event {
+            WmiTraceEvent::Tlv { tag, len, offset } => Some(WmiTlv { tag, len, offset }),
+            WmiTraceEvent::Reject { .. } => panic!("valid command produced rejection trace"),
+            WmiTraceEvent::Field { .. } | WmiTraceEvent::Branch { .. } => None,
+        }).collect();
+        assert_eq!(rust_tlvs, c_wmi_tlv_iter(&c.bytes).unwrap());
+    }
+
+    fn words(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
+        values.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+    fn event_tlv(tag: u16, value: &[u8]) -> Vec<u8> {
+        assert_eq!(value.len() % 4, 0);
+        let mut out = words([u32::from(tag) << 16 | value.len() as u32]);
+        out.extend_from_slice(value);
+        out
+    }
+    fn event(id: ath11k_wmi::EventId, bytes: &[u8]) -> ath11k_wmi::Event {
+        ath11k_wmi::Event::from_tlvs(id, bytes.to_vec()).unwrap()
+    }
+    fn mac_value(mac: [u8; 6]) -> u64 {
+        mac.into_iter()
+            .enumerate()
+            .fold(0, |value, (i, byte)| value | (u64::from(byte) << (8 * i)))
+    }
+    fn assert_event(kind: WmiEventKind, bytes: &[u8], fields: Vec<u64>, trace: WmiSink) {
+        let rust_trace = trace
+            .0
+            .into_iter()
+            .filter_map(|event| match event {
+                WmiTraceEvent::Tlv { tag, len, offset } => {
+                    Some(WmiEventTrace::Tlv { tag, len, offset })
+                }
+                WmiTraceEvent::Field { name, value } => Some(WmiEventTrace::Field { name, value }),
+                WmiTraceEvent::Branch { .. } => None,
+                WmiTraceEvent::Reject { .. } => panic!("well-formed fixture was rejected"),
+            })
+            .collect::<Vec<_>>();
+        let c = c_wmi_event_parse(kind, bytes).unwrap();
+        assert_eq!(c.fields, fields, "typed fields for {kind:?}");
+        assert_eq!(c.trace, rust_trace, "normalized trace for {kind:?}");
+    }
+
+    #[test]
+    fn client_bringup_lifecycle_events_match_c() {
+        use ath11k_wmi::tags::*;
+        let fixed_words: Vec<u32> = (1..=32).collect();
+        let mut bytes = event_tlv(WMI_TAG_SERVICE_READY_EVENT.0, &words(fixed_words));
+        bytes.extend(event_tlv(WMI_TAG_ARRAY_UINT32.0, &words(101..=132)));
+        let mut trace = WmiSink::default();
+        let decoded = ServiceReadyDecoder
+            .decode_with_trace(event(WMI_SERVICE_READY_EVENTID, &bytes), Some(&mut trace))
+            .unwrap();
+        let fixed = decoded.fixed.unwrap();
+        let mut fields = vec![1, u64::from(fixed.firmware_build)];
+        fields.extend(fixed.firmware_abi.map(u64::from));
+        fields.extend(
+            [
+                fixed.phy_capability,
+                fixed.max_fragment_entries,
+                fixed.num_rf_chains,
+                fixed.ht_capability,
+                fixed.vht_capability,
+                fixed.vht_supported_mcs,
+                fixed.hw_min_tx_power,
+                fixed.hw_max_tx_power,
+                fixed.system_capability,
+                fixed.max_beacon_ie_size,
+                fixed.num_memory_requests,
+                fixed.max_scan_channels,
+                fixed.max_supported_macs,
+                fixed.firmware_subfeature_caps,
+                fixed.num_dbs_hw_modes,
+                fixed.txrx_chainmask,
+                fixed.default_dbs_hw_mode_index,
+                fixed.num_msdu_descriptors,
+            ]
+            .map(u64::from),
+        );
+        fields.push(1);
+        fields.extend(decoded.service_bitmap.unwrap().map(u64::from));
+        assert_event(WmiEventKind::ServiceReady, &bytes, fields, trace);
+
+        let mut bytes = event_tlv(WMI_TAG_SERVICE_READY_EXT_EVENT.0, &words(201..=219));
+        bytes.extend(event_tlv(
+            WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS.0,
+            &words([1, 0]),
+        ));
+        bytes.extend(event_tlv(WMI_TAG_SOC_HAL_REG_CAPABILITIES.0, &words([1])));
+        let hw_mode = event_tlv(WMI_TAG_HW_MODE_CAPABILITIES.0, &words([11, 3, 7]));
+        bytes.extend(event_tlv(WMI_TAG_ARRAY_STRUCT.0, &hw_mode));
+        let mut trace = WmiSink::default();
+        let decoded = ServiceReadyExtDecoder
+            .decode_with_trace(
+                event(WMI_SERVICE_READY_EXT_EVENTID, &bytes),
+                Some(&mut trace),
+            )
+            .unwrap();
+        let fixed = decoded.fixed.unwrap();
+        let mut fields = vec![
+            1,
+            fixed.default_concurrent_scan_config.into(),
+            fixed.default_firmware_config.into(),
+        ];
+        fields.extend(fixed.ppe_threshold.map(u64::from));
+        fields.extend(
+            [
+                fixed.he_capability,
+                fixed.mpdu_density,
+                fixed.max_bssid_rx_filters,
+                fixed.firmware_build_ext,
+                fixed.max_nlo_ssids,
+                fixed.max_bssid_indicator,
+                fixed.he_capability_ext,
+            ]
+            .map(u64::from),
+        );
+        fields.extend([
+            1,
+            decoded.num_hw_modes.unwrap().into(),
+            1,
+            decoded.num_phys.unwrap().into(),
+        ]);
+        for mode in &decoded.hw_modes {
+            fields.extend([
+                u64::from(mode.hw_mode_id),
+                u64::from(mode.phy_id_map),
+                u64::from(mode.config_type),
+            ]);
+        }
+        fields.extend([
+            decoded.array_groups.len() as u64,
+            decoded.hw_modes.len() as u64,
+        ]);
+        assert_event(WmiEventKind::ServiceReadyExt, &bytes, fields, trace);
+
+        let ring = event_tlv(WMI_TAG_DMA_RING_CAPABILITIES.0, &words([4, 1, 32, 2048, 8]));
+        let bytes = event_tlv(WMI_TAG_ARRAY_STRUCT.0, &ring);
+        let mut trace = WmiSink::default();
+        let decoded = ServiceReadyExt2Decoder
+            .decode_with_trace(
+                event(WMI_SERVICE_READY_EXT2_EVENTID, &bytes),
+                Some(&mut trace),
+            )
+            .unwrap();
+        let mut fields = vec![decoded.dma_ring_capabilities.len() as u64];
+        for cap in &decoded.dma_ring_capabilities {
+            fields.extend(
+                cap.value
+                    .chunks_exact(4)
+                    .map(|v| u64::from(u32::from_le_bytes(v.try_into().unwrap()))),
+            );
+        }
+        assert_event(WmiEventKind::ServiceReadyExt2, &bytes, fields, trace);
+
+        let mut bytes = event_tlv(WMI_TAG_SERVICE_AVAILABLE_EVENT.0, &words([64, 1, 2, 3, 4]));
+        bytes.extend(event_tlv(WMI_TAG_ARRAY_UINT32.0, &words([5, 6, 7, 8])));
+        let mut trace = WmiSink::default();
+        let decoded = WmiDecoder::<ServiceAvailable>::new(WMI_SERVICE_AVAILABLE_EVENTID)
+            .decode_with_trace(
+                event(WMI_SERVICE_AVAILABLE_EVENTID, &bytes),
+                Some(&mut trace),
+            )
+            .unwrap();
+        let mut fields = vec![decoded.segment_offset.into()];
+        fields.extend(decoded.bitmap.map(u64::from));
+        fields.push(1);
+        fields.extend(decoded.ext2_bitmap.unwrap().map(u64::from));
+        assert_event(WmiEventKind::ServiceAvailable, &bytes, fields, trace);
+
+        let primary = [2, 4, 6, 8, 10, 12];
+        let extras = [[1, 3, 5, 7, 9, 11], [12, 10, 8, 6, 4, 2]];
+        let mut ready = vec![0; 60];
+        ready[24..30].copy_from_slice(&primary);
+        ready[32..36].copy_from_slice(&9u32.to_le_bytes());
+        ready[40..44].copy_from_slice(&2u32.to_le_bytes());
+        ready[56..60].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
+        let mut bytes = event_tlv(WMI_TAG_READY_EVENT.0, &ready);
+        bytes.extend(event_tlv(
+            WMI_TAG_ARRAY_FIXED_STRUCT.0,
+            &extras
+                .into_iter()
+                .flat_map(|mac| mac.into_iter().chain([0, 0]))
+                .collect::<Vec<_>>(),
+        ));
+        let mut trace = WmiSink::default();
+        let decoded = ReadyDecoder
+            .decode_with_trace(event(WMI_READY_EVENTID, &bytes), Some(&mut trace))
+            .unwrap();
+        let fields = vec![
+            1,
+            mac_value(decoded.mac_addr.unwrap()),
+            decoded.status.unwrap().into(),
+            1,
+            decoded.pktlog_defs_checksum.unwrap().into(),
+            decoded.extra_mac_addresses.len() as u64,
+            mac_value(decoded.extra_mac_addresses[0]),
+            mac_value(decoded.extra_mac_addresses[1]),
+        ];
+        assert_event(WmiEventKind::Ready, &bytes, fields, trace);
+    }
+
+    #[test]
+    fn client_bringup_operation_events_match_c() {
+        use ath11k_wmi::tags::*;
+        macro_rules! fixed_event {
+            ($kind:ident, $id:ident, $tag:ident, $ty:ty, $values:expr, $fields:expr) => {{
+                let bytes = event_tlv($tag.0, &words($values));
+                let mut trace = WmiSink::default();
+                let value = WmiDecoder::<$ty>::new($id)
+                    .decode_with_trace(event($id, &bytes), Some(&mut trace))
+                    .unwrap();
+                assert_event(WmiEventKind::$kind, &bytes, ($fields)(value), trace);
+            }};
+        }
+        fixed_event!(
+            Scan,
+            WMI_SCAN_EVENTID,
+            WMI_TAG_SCAN_EVENT,
+            Scan,
+            [1, 2, 5180, 4, 5, 6, 7],
+            |v: Scan| vec![
+                v.event_type,
+                v.reason,
+                v.channel_freq,
+                v.scan_request_id,
+                v.scan_id,
+                v.vdev_id,
+                v.tsf_timestamp
+            ]
+            .into_iter()
+            .map(u64::from)
+            .collect()
+        );
+        fixed_event!(
+            VdevStartResponse,
+            WMI_VDEV_START_RESP_EVENTID,
+            WMI_TAG_VDEV_START_RESPONSE_EVENT,
+            VdevStartResponse,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 0xffff_ffd0],
+            |v: VdevStartResponse| vec![
+                v.vdev_id,
+                v.requestor_id,
+                v.response_type,
+                v.status,
+                v.chain_mask,
+                v.smps_mode,
+                v.mac_id,
+                v.configured_tx_streams,
+                v.configured_rx_streams,
+                v.max_allowed_tx_power
+            ]
+            .into_iter()
+            .map(u64::from)
+            .collect()
+        );
+        fixed_event!(
+            VdevStopped,
+            WMI_VDEV_STOPPED_EVENTID,
+            WMI_TAG_VDEV_STOPPED_EVENT,
+            VdevStopped,
+            [17],
+            |v: VdevStopped| vec![v.vdev_id.into()]
+        );
+        fixed_event!(
+            VdevDeleteResponse,
+            WMI_VDEV_DELETE_RESP_EVENTID,
+            WMI_TAG_VDEV_DELETE_RESP_EVENT,
+            VdevDeleteResponse,
+            [18],
+            |v: VdevDeleteResponse| vec![v.vdev_id.into()]
+        );
+
+        let peer = [0, 17, 34, 51, 68, 85];
+        for (kind, id, tag) in [
+            (
+                WmiEventKind::PeerAssocConfirmation,
+                WMI_PEER_ASSOC_CONF_EVENTID,
+                WMI_TAG_PEER_ASSOC_CONF_EVENT,
+            ),
+            (
+                WmiEventKind::PeerDeleteResponse,
+                WMI_PEER_DELETE_RESP_EVENTID,
+                WMI_TAG_PEER_DELETE_RESP_EVENT,
+            ),
+        ] {
+            let mut value = words([19]);
+            value.extend(peer);
+            value.extend([0, 0]);
+            let bytes = event_tlv(tag.0, &value);
+            let mut trace = WmiSink::default();
+            let fields = if kind == WmiEventKind::PeerAssocConfirmation {
+                let v = WmiDecoder::<PeerAssocConfirmation>::new(id)
+                    .decode_with_trace(event(id, &bytes), Some(&mut trace))
+                    .unwrap();
+                vec![v.vdev_id.into(), mac_value(v.peer_mac)]
+            } else {
+                let v = WmiDecoder::<PeerDeleteResponse>::new(id)
+                    .decode_with_trace(event(id, &bytes), Some(&mut trace))
+                    .unwrap();
+                vec![v.vdev_id.into(), mac_value(v.peer_mac)]
+            };
+            assert_event(kind, &bytes, fields, trace);
+        }
+
+        let mut key = words([20]);
+        key.extend(peer);
+        key.extend([0, 0]);
+        key.extend(words([3, 0x40, 0]));
+        let bytes = event_tlv(WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT.0, &key);
+        let mut trace = WmiSink::default();
+        let v = WmiDecoder::<InstallKeyCompletion>::new(WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID)
+            .decode_with_trace(
+                event(WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID, &bytes),
+                Some(&mut trace),
+            )
+            .unwrap();
+        assert_event(
+            WmiEventKind::InstallKeyCompletion,
+            &bytes,
+            vec![
+                v.vdev_id.into(),
+                mac_value(v.peer_mac),
+                v.key_index.into(),
+                v.key_flags.into(),
+                v.status.into(),
+            ],
+            trace,
+        );
+
+        let frame = [0x40, 0, 1, 2, 3, 4, 5, 6];
+        let rx = words([
+            2412,
+            31,
+            6,
+            2,
+            frame.len() as u32,
+            0,
+            1,
+            2,
+            3,
+            4,
+            0x10,
+            (-42i32) as u32,
+            77,
+            0,
+            0,
+            1,
+            2412,
+        ]);
+        let mut bytes = event_tlv(WMI_TAG_MGMT_RX_HDR.0, &rx);
+        bytes.extend(event_tlv(WMI_TAG_ARRAY_BYTE.0, &frame));
+        let mut trace = WmiSink::default();
+        let v = WmiDecoder::<MgmtRx>::new(WMI_MGMT_RX_EVENTID)
+            .decode_with_trace(event(WMI_MGMT_RX_EVENTID, &bytes), Some(&mut trace))
+            .unwrap();
+        let mut fields = vec![
+            v.channel.into(),
+            v.snr.into(),
+            v.rate.into(),
+            v.phy_mode.into(),
+            v.status.into(),
+            v.flags.into(),
+            u64::from(v.rssi as u32),
+            v.tsf_delta.into(),
+            v.pdev_id.into(),
+            v.channel_freq.into(),
+            v.frame.len() as u64,
+        ];
+        fields.extend(v.frame.iter().copied().map(u64::from));
+        assert_event(WmiEventKind::MgmtRx, &bytes, fields, trace);
+
+        fixed_event!(
+            MgmtTxCompletion,
+            WMI_MGMT_TX_COMPLETION_EVENTID,
+            WMI_TAG_MGMT_TX_COMPL_EVENT,
+            MgmtTxCompletion,
+            [21, 0, 1, 22, 0xffff_ffd8],
+            |v: MgmtTxCompletion| vec![v.descriptor_id, v.status, v.pdev_id, v.ppdu_id, v.ack_rssi]
+                .into_iter()
+                .map(u64::from)
+                .collect()
+        );
     }
 
     proptest! {
@@ -445,10 +1156,104 @@ mod tests {
             prop_assert_eq!(&rust, &c);
             prop_assert_eq!(trace.0, c_trace(MessageId::WlanConfig, &c));
         }
+
+        #[test]
+        fn fixed_wmi_command_builders_match_c(vdev_id: u32, pdev_id: u32,
+            param_id: u32, value: u32, assoc_id: u32, address: [u8; 6],
+            tx_address in option::of(any::<[u8; 6]>()), peer_type: u32,
+            profile_idx: u32, profile_cnt: u32, subtype: u32, mbssid_flags: u32,
+            mbssid_tx_vdev_id: u32, tx2: u32, rx2: u32, tx5: u32, rx5: u32,
+            cancel in 0_u32..3) {
+            assert_wmi(&PdevSetParam { pdev_id, param_id, param_value: value },
+                c_wmi_pdev_set_param(pdev_id, param_id, value).unwrap());
+            assert_wmi(&VdevDelete { vdev_id }, c_wmi_vdev_id(0, vdev_id).unwrap());
+            assert_wmi(&VdevStop { vdev_id }, c_wmi_vdev_id(1, vdev_id).unwrap());
+            assert_wmi(&VdevDown { vdev_id }, c_wmi_vdev_id(2, vdev_id).unwrap());
+            assert_wmi(&PeerCreate { vdev_id, peer_addr: address, peer_type },
+                c_wmi_peer(0, vdev_id, &address, peer_type, 0, 0).unwrap());
+            assert_wmi(&PeerDelete { vdev_id, peer_addr: address },
+                c_wmi_peer(1, vdev_id, &address, 0, 0, 0).unwrap());
+            assert_wmi(&PeerSetParam { vdev_id, peer_addr: address, param_id, param_value: value },
+                c_wmi_peer(2, vdev_id, &address, 0, param_id, value).unwrap());
+            assert_wmi(&VdevUp { vdev_id, assoc_id, bssid: address,
+                tx_bssid: tx_address, nontx_profile_idx: profile_idx,
+                nontx_profile_cnt: profile_cnt }, c_wmi_vdev_up(vdev_id, assoc_id,
+                &address, tx_address.as_ref(), profile_idx, profile_cnt).unwrap());
+            assert_wmi(&VdevCreate { vdev_id, vdev_type: peer_type, vdev_subtype: subtype,
+                mac_addr: address, pdev_id, mbssid_flags, mbssid_tx_vdev_id,
+                band_2ghz: TxRxStreams { tx: tx2, rx: rx2 },
+                band_5ghz: TxRxStreams { tx: tx5, rx: rx5 } },
+                c_wmi_vdev_create(vdev_id, peer_type, subtype, &address, pdev_id,
+                    mbssid_flags, mbssid_tx_vdev_id, tx2, rx2, tx5, rx5).unwrap());
+            let cancel_type = match cancel { 0 => ScanCancelType::PdevAll,
+                1 => ScanCancelType::VdevAll, _ => ScanCancelType::Single };
+            assert_wmi(&ScanStop { requester: param_id, scan_id: value,
+                cancel_type, vdev_id, pdev_id },
+                c_wmi_scan_stop(param_id, value, cancel, vdev_id, pdev_id).unwrap());
+        }
+
+        #[test]
+        fn vdev_start_builder_matches_c(restart: bool, vdev_id: u32, beacon_interval: u32,
+            dtim_period: u32, hidden_ssid: bool, pmf_enabled: bool, hw_crypto_disabled: bool,
+            ssid in option::of(vec(any::<u8>(), 0..=32)), bcn_tx_rate: u32,
+            noa: u32, tx: u32, rx: u32, he_ops: u32, cac: u32, regdomain: u32,
+            mbssid_flags: u32, mbssid_tx_vdev_id: u32, channel: [u32; 6]) {
+            let command = VdevStart { restart, vdev_id, beacon_interval, dtim_period, hidden_ssid,
+                pmf_enabled, hw_crypto_disabled, ssid, bcn_tx_rate,
+                num_noa_descriptors: noa, preferred_tx_streams: tx, preferred_rx_streams: rx,
+                he_ops, cac_duration_ms: cac, regdomain, mbssid_flags, mbssid_tx_vdev_id,
+                channel: WmiChannel { mhz: channel[0], band_center_freq1: channel[1],
+                    band_center_freq2: channel[2], info: channel[3], reg_info_1: channel[4],
+                    reg_info_2: channel[5] } };
+            assert_wmi(&command, c_wmi_vdev_start(&command).unwrap());
+        }
+
+        #[test]
+        fn install_key_builder_matches_c(vdev_id: u32, address: [u8; 6], key_idx: u32,
+            key_flags: u32, key_cipher: u32, low: u32, high: u32,
+            key_data in vec(any::<u8>(), 0..=256), txmic: u32, rxmic: u32) {
+            let command = VdevInstallKey { vdev_id, peer_addr: address, key_idx, key_flags,
+                key_cipher, key_rsc_counter: KeySeqCounter { low, high }, key_data,
+                key_txmic_len: txmic, key_rxmic_len: rxmic };
+            assert_wmi(&command, c_wmi_install_key(&command).unwrap());
+        }
+
+        #[test]
+        fn management_send_builder_matches_c(vdev_id: u32, desc_id: u32, freq: u32,
+            paddr: u64, frame in vec(any::<u8>(), 0..=512), tx_params_valid: bool) {
+            let command = MgmtSend { vdev_id, desc_id, channel_freq: freq, paddr, frame,
+                tx_params_valid };
+            // The pinned builder deliberately advertises the unpadded frame
+            // length while reserving padding, so the generic TLV iterator is
+            // not applicable to this command body.
+            prop_assert_eq!(rust_wmi(&command), c_wmi_mgmt_send(&command).unwrap());
+        }
     }
 
     fn response(id: MessageId, body: &[u8]) -> Response {
         Response::checked(TransactionId::new(1), id, body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn init_resource_config_generated_messages_match_c() {
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner.run(&Init::strategy(), |command| {
+            assert_eq!(rust_wmi(&command), c_wmi_init(&command).unwrap());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn init_memory_chunk_trace_difference_is_explicit() {
+        use ath11k_wmi::cmd::{HostMemoryChunk, ResourceConfig};
+        let command = Init { resource_config: ResourceConfig::default(),
+            memory_chunks: vec![HostMemoryChunk { request_id: 0, physical_address: 0, size: 0 }],
+            hardware_mode: None, bands: vec![] };
+        assert_eq!(rust_wmi(&command), c_wmi_init(&command).unwrap());
+        let mut sink = WmiSink::default();
+        command.encode_command_with_trace(&mut sink).unwrap();
+        assert!(sink.0.contains(&WmiTraceEvent::Reject {
+            reason: ath11k_wmi::trace::RejectReason::Truncated, offset: 332 }));
     }
 
     #[test]
