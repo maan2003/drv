@@ -22935,9 +22935,12 @@ mod tests {
         assert!(derive < iw && iw < address && address < export && export < handoff);
         assert!(supervisor.contains("multiple connected target Wi-Fi interfaces"));
         assert!(supervisor.contains("target Wi-Fi interface is not connected"));
+        assert!(supervisor.contains("connected_ssid=$ssid"));
+        assert!(supervisor.contains("connected_ssid != ajay"));
         assert!(supervisor.contains("DRV_SAE_CLIENT_MAC=$session_client_mac"));
         assert!(supervisor.contains("connected_client_mac != \"$native_client_mac\""));
         assert!(supervisor.contains("local unicast VIF address"));
+        assert!(!supervisor.contains("02:d3:b9:dd:c3:d0"));
         let pre_handoff = &supervisor[..handoff];
         for forbidden in ["passphrase", "password", ".psk", "/var/lib/iwd"] {
             assert!(!pre_handoff.contains(forbidden), "{forbidden}");

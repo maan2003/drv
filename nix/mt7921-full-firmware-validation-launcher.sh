@@ -59,6 +59,8 @@ case "$#:${1-}" in
     : "${DRV_IOMMU_GROUP:?missing canonical IOMMU group}"
     : "${DRV_VFIO_DEVICE:?missing canonical VFIO device}"
     : "${DRV_LAB_SAFETY_STATE:?missing canonical lab safety state}"
+    : "${DRV_SAE_BSSID:?missing supervisor-captured SAE BSSID}"
+    : "${DRV_SAE_CHANNEL:?missing supervisor-captured SAE channel}"
     prepare_snapshot
     prepare_credential
     exec @env@ -i \
@@ -70,8 +72,8 @@ case "$#:${1-}" in
       DRV_DAEMON_MAX_SECONDS="${DRV_DAEMON_MAX_SECONDS-360}" \
       DRV_NETSTACK_BINARY=@netstack@ \
       DRV_ACTIVE_CLIENT=1 \
-      DRV_SAE_BSSID=02:d3:b9:dd:c3:d0 \
-      DRV_SAE_CHANNEL=149 \
+      DRV_SAE_BSSID="$DRV_SAE_BSSID" \
+      DRV_SAE_CHANNEL="$DRV_SAE_CHANNEL" \
       DRV_SAE_SSID=ajay \
       DRV_SAE_CLIENT_MAC=@session_client_mac@ \
       DRV_SAE_CREDENTIAL_FD=3 \

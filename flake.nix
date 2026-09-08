@@ -621,10 +621,27 @@
               work/launcher --artifact-identity | grep -F '"artifact_identity":"mt7921-driver-v11"'
               env -i DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
                 DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
-                DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety work/launcher
+                DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                DRV_SAE_BSSID=9a:8e:39:9c:8f:74 DRV_SAE_CHANNEL=36 \
+                DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a work/launcher
               grep -Fx 'DRV_ACTIVE_CLIENT=1' transcript
+              grep -Fx 'DRV_SAE_BSSID=9a:8e:39:9c:8f:74' transcript
+              grep -Fx 'DRV_SAE_CHANNEL=36' transcript
               grep -Fx 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' transcript
               grep -Fx 'ARGV <--run-one-shot-sae-auth>' transcript
+              for missing in DRV_SAE_BSSID DRV_SAE_CHANNEL; do
+                rm -f transcript
+                if env -i DRV_PCI_BDF=0000:05:00.0 DRV_IOMMU_GROUP=17 \
+                  DRV_VFIO_DEVICE=/dev/vfio/devices/vfio17 \
+                  DRV_LAB_SAFETY_STATE=/run/wifi-driver-lab/fixed.state.safety \
+                  DRV_SAE_BSSID=9a:8e:39:9c:8f:74 DRV_SAE_CHANNEL=36 \
+                  DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a \
+                  ${pkgs.coreutils}/bin/env -u "$missing" work/launcher; then
+                  echo "launcher accepted missing supervisor target field $missing" >&2
+                  exit 1
+                fi
+                test ! -e transcript
+              done
               touch "$out"
             '';
 
@@ -651,10 +668,11 @@
                 --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
-              grep -F 'connected Wi-Fi target drifted from fixed ajay validation policy' \
+              grep -F 'connected Wi-Fi target does not match packaged ajay/native-identity policy' \
                 "$out/bin/mt7921-full-firmware-validation-supervisor"
-              grep -F 'bdf=%s timeout_seconds=300 watchdog_owner=' "$out/bin/mt7921-full-firmware-validation-supervisor"
-              grep -Fx '"$wifi_driver_lab" "$bdf" 300 -- "$@" &' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -F 'connected_ssid=$ssid' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -F 'bdf=%s timeout_seconds=420 watchdog_owner=' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -Fx '"$wifi_driver_lab" "$bdf" 420 -- "$@" &' "$out/bin/mt7921-full-firmware-validation-supervisor"
               identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"association_request_contract":"client-mlme+device-query+pinned-regdb"' "$identity"
               grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$identity"

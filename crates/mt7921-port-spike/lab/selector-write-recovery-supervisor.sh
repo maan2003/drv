@@ -94,12 +94,14 @@ trap cleanup EXIT
 device_path=$(readlink -f "$sys_root/bus/pci/devices/$bdf")
 connected_bssid=
 connected_frequency=
+connected_ssid=
 connected_client_mac=
 for net in "$sys_root"/class/net/*; do
   [[ -e $net/device && $(readlink -f "$net/device") == "$device_path" ]] || continue
   link=$(timeout 2 iw dev "$(basename "$net")" link 2>/dev/null) || continue
   bssid=$(awk '/^Connected to / { print $3; exit }' <<< "$link")
   frequency=$(awk '/^[[:space:]]*freq:/ { print $2; exit }' <<< "$link")
+  ssid=$(awk '/^[[:space:]]*SSID:/ { sub(/^[[:space:]]*SSID:[[:space:]]*/, ""); print; exit }' <<< "$link")
   [[ $bssid =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
   frequency=$(normalize_iw_frequency "$frequency") || continue
   client_mac=$(cat "$net/address" 2>/dev/null) || continue
@@ -115,6 +117,7 @@ for net in "$sys_root"/class/net/*; do
   }
   connected_bssid=$bssid
   connected_frequency=$frequency
+  connected_ssid=$ssid
   connected_client_mac=$client_mac
 done
 [[ -n $connected_bssid ]] || {
@@ -135,10 +138,8 @@ case $connected_frequency in
     exit 1
     ;;
 esac
-if [[ $connected_bssid != 02:d3:b9:dd:c3:d0 \
-   || $connected_channel != 149 \
-   || $connected_client_mac != "$native_client_mac" ]]; then
-  echo "connected Wi-Fi target drifted from fixed ajay validation policy" >&2
+if [[ $connected_ssid != ajay || $connected_client_mac != "$native_client_mac" ]]; then
+  echo "connected Wi-Fi target does not match packaged ajay/native-identity policy" >&2
   exit 1
 fi
 export DRV_SAE_BSSID=$connected_bssid DRV_SAE_CHANNEL=$connected_channel \
