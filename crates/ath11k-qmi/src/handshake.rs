@@ -57,6 +57,7 @@ pub struct HandshakeConfig {
     pub m3_support: bool,
     pub cold_boot_calibration: bool,
     pub timeout_ns: u64,
+    pub cold_boot_timeout_ns: u64,
 }
 
 impl Default for HandshakeConfig {
@@ -71,6 +72,7 @@ impl Default for HandshakeConfig {
             m3_support: false,
             cold_boot_calibration: true,
             timeout_ns: 10_000_000_000,
+            cold_boot_timeout_ns: 60_000_000_000,
         }
     }
 }
@@ -229,10 +231,18 @@ impl<'a> Wcn6750Handshake<'a> {
         &mut self,
         transport: &mut dyn Transport,
     ) -> Result<DriverEvent, QmiError> {
+        self.process_next_event_with_timeout(transport, self.config.timeout_ns)
+    }
+
+    fn process_next_event_with_timeout(
+        &mut self,
+        transport: &mut dyn Transport,
+        timeout_ns: u64,
+    ) -> Result<DriverEvent, QmiError> {
         if !self.pending.is_empty() {
-            return self.process_indication(transport);
+            return self.process_indication(transport, timeout_ns);
         }
-        match transport.receive(self.config.timeout_ns)? {
+        match transport.receive(timeout_ns)? {
             Incoming::ServerArrived => {
                 self.server_arrived(transport)?;
                 Ok(DriverEvent::ServerArrived)
@@ -240,7 +250,7 @@ impl<'a> Wcn6750Handshake<'a> {
             Incoming::ServerExited => Ok(DriverEvent::ServerExited),
             Incoming::Indication(indication) => {
                 self.pending.push(indication);
-                self.process_indication(transport)
+                self.process_indication(transport, timeout_ns)
             }
             Incoming::Response(_) => Err(QmiError::Malformed),
         }
@@ -256,8 +266,9 @@ impl<'a> Wcn6750Handshake<'a> {
     fn process_indication(
         &mut self,
         transport: &mut dyn Transport,
+        timeout_ns: u64,
     ) -> Result<DriverEvent, QmiError> {
-        match self.next_indication(transport)? {
+        match self.next_indication(transport, timeout_ns)? {
             Indication::RequestMemory(request) => {
                 let segments = self.memory.provision(&request.segments)?;
                 self.exchange(transport, RespondMemoryRequest { segments }.encode()?)?;
@@ -426,9 +437,13 @@ impl<'a> Wcn6750Handshake<'a> {
         Ok(())
     }
 
-    fn next_indication(&mut self, transport: &mut dyn Transport) -> Result<Indication, QmiError> {
+    fn next_indication(
+        &mut self,
+        transport: &mut dyn Transport,
+        timeout_ns: u64,
+    ) -> Result<Indication, QmiError> {
         let raw = if self.pending.is_empty() {
-            let deadline = transport.now_ns().saturating_add(self.config.timeout_ns);
+            let deadline = transport.now_ns().saturating_add(timeout_ns);
             loop {
                 let remaining = deadline.saturating_sub(transport.now_ns());
                 if remaining == 0 {
@@ -462,14 +477,29 @@ impl Handshake for Wcn6750Handshake<'_> {
                 _ => {}
             }
         }
+        let mut cold_boot_deadline: Option<u64> = None;
         loop {
-            match self.process_next_event(transport)? {
+            let timeout = if let Some(deadline) = cold_boot_deadline {
+                let remaining = deadline.saturating_sub(transport.now_ns());
+                if remaining == 0 {
+                    return Err(QmiError::Timeout);
+                }
+                remaining
+            } else {
+                self.config.timeout_ns
+            };
+            match self.process_next_event_with_timeout(transport, timeout)? {
                 DriverEvent::FirmwareReady(ready) => return Ok(ready),
                 DriverEvent::FirmwareInitDone(ready) => {
                     if self.config.cal_done || !self.config.cold_boot_calibration {
                         return Ok(ready);
                     }
                     self.start_cold_boot_calibration(transport)?;
+                    cold_boot_deadline = Some(
+                        transport
+                            .now_ns()
+                            .saturating_add(self.config.cold_boot_timeout_ns),
+                    );
                 }
                 DriverEvent::ServerExited => return Err(QmiError::Transport),
                 _ => {}
@@ -525,6 +555,7 @@ mod tests {
         sent: Vec<MessageId>,
         service: Option<(u32, u32)>,
         next_transaction: u16,
+        received_timeouts: Vec<u64>,
     }
     impl Transport for MockTransport {
         fn start_service(&mut self, version: u32, instance: u32) -> Result<(), QmiError> {
@@ -542,7 +573,8 @@ mod tests {
         fn now_ns(&self) -> u64 {
             1
         }
-        fn receive(&mut self, _: u64) -> Result<Incoming, QmiError> {
+        fn receive(&mut self, timeout_ns: u64) -> Result<Incoming, QmiError> {
+            self.received_timeouts.push(timeout_ns);
             self.incoming.pop_front().ok_or(QmiError::Timeout)
         }
     }
@@ -592,6 +624,7 @@ mod tests {
             sent: Vec::new(),
             service: None,
             next_transaction: 0,
+            received_timeouts: Vec::new(),
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
@@ -599,6 +632,7 @@ mod tests {
             Wcn6750Handshake::new(HandshakeConfig::default(), &mut assets, &mut memory);
         let ready = handshake.start(&mut transport).unwrap();
         assert_eq!(ready.firmware_version, 0x11223344);
+        assert_eq!(transport.received_timeouts.last(), Some(&60_000_000_000));
         assert!(handshake.config.cal_done);
         assert_eq!(transport.service, Some((1, 3)));
         assert_eq!(
@@ -629,6 +663,7 @@ mod tests {
             sent: Vec::new(),
             service: None,
             next_transaction: 0,
+            received_timeouts: Vec::new(),
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
@@ -667,6 +702,7 @@ mod tests {
             sent: Vec::new(),
             service: None,
             next_transaction: 0,
+            received_timeouts: Vec::new(),
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
@@ -684,6 +720,7 @@ mod tests {
             sent: Vec::new(),
             service: None,
             next_transaction: 0,
+            received_timeouts: Vec::new(),
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
