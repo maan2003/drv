@@ -98,3 +98,4 @@ fixtures are source-derived from pinned C packed layouts.
 | ath11k_wmi_pdev_set_bios_geo_table_param | cmd::BiosGeoTable | encoded | wow fixtures |
 | ath11k_wmi_sta_keepalive | cmd::StaKeepalive | encoded | wow fixtures |
 | AP/deferred builders | cmd::ap::* | encoded | cmd/AP-PORT-MAP.md |
+| ath11k_wmi_send_vdev_set_tpc_power | cmd::VdevSetTpcPower | encoded | source-derived nested TLV |
