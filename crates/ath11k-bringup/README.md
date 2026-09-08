@@ -19,6 +19,21 @@ an IOAS, and uses the coherent mapping path selected for kernel #3's first
 hardware run. `--broker` explicitly selects the narrowed default-domain broker
 once that kernel patch exists. Use `--stop-after` to bound execution:
 
+Before any staged run, execute the inert fail-closed host preflight. It checks
+the VFIO cdev/sysfs identity, the 32 edge-rising SPI descriptions, `/dev/iommu`,
+and the Qualcomm watchdog device, driver, and live-FDT status. It does not open
+the VFIO or watchdog cdev, bind iommufd, or access device registers:
+
+```sh
+cargo run -p ath11k-bringup -- preflight \
+  --vfio-device /dev/vfio/devices/vfioN
+```
+
+The resources stage performs the necessarily state-changing iommufd bind under
+the armed watchdog, then fails closed unless VFIO reports the WCN6750 platform
+flags, one region, and 32 single-vector edge-triggered eventfd IRQs. Successful
+bind is the stock-kernel cache-coherency admission check.
+
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
   --stop-after resources

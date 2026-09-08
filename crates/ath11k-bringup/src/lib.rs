@@ -10,8 +10,9 @@ use drv_hardware_backends::LinuxVfio;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
@@ -28,6 +29,14 @@ const REGDB_SHA256: [u8; 32] = [
     0x2f, 0xe6, 0xb7, 0x9e, 0x6d, 0x36, 0xe1, 0x90, 0xf3, 0x9e, 0x89, 0x16, 0xbe, 0xe5, 0xae, 0x4c,
     0xf9, 0x7a, 0xb5, 0xe7, 0x15, 0x19, 0xaf, 0x5a, 0xf8, 0x92, 0x0b, 0xb7, 0x57, 0x74, 0x0d, 0xd9,
 ];
+const EXPECTED_VFIO_DEVICE: &str = "17a10040.wifi";
+const EXPECTED_VFIO_DRIVER: &str = "vfio-platform";
+const EXPECTED_WATCHDOG_DRIVER: &str = "qcom_wdt";
+const WATCHDOG_DEVICE: &str = "/dev/watchdog";
+const WATCHDOG_CLASS: &str = "/sys/class/watchdog/watchdog0";
+const WATCHDOG_MISC_CLASS: &str = "/sys/class/misc/watchdog";
+const IOMMU_DEVICE: &str = "/dev/iommu";
+const IOMMU_CLASS: &str = "/sys/class/misc/iommu";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Stage {
@@ -74,6 +83,7 @@ impl FromStr for Stage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cli {
+    pub preflight: bool,
     pub dry_run: bool,
     pub stop_after: Stage,
     pub broker: bool,
@@ -87,6 +97,7 @@ pub struct Cli {
 impl Default for Cli {
     fn default() -> Self {
         Self {
+            preflight: false,
             dry_run: false,
             stop_after: Stage::ScanResults,
             broker: false,
@@ -114,6 +125,7 @@ impl Cli {
                     .ok_or_else(|| format!("{name} requires a value"))
             };
             match argument.as_str() {
+                "preflight" => cli.preflight = true,
                 "--dry-run" => cli.dry_run = true,
                 "--coherent" => {
                     return Err("--coherent is now the default; omit it or use --broker".into());
@@ -133,6 +145,9 @@ impl Cli {
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
         }
+        if cli.preflight && (cli.dry_run || cli.broker) {
+            return Err("preflight cannot be combined with --dry-run or --broker".into());
+        }
         if cli.dry_run && cli.broker {
             return Err("--broker has no effect with --dry-run".into());
         }
@@ -147,7 +162,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -162,6 +177,7 @@ pub enum Error {
     InvalidAsset(&'static str),
     Unsupported(&'static str),
     SsidNotFound(Vec<u8>),
+    Preflight(String),
 }
 
 impl fmt::Display for Error {
@@ -176,11 +192,278 @@ impl fmt::Display for Error {
             Self::SsidNotFound(ssid) => {
                 write!(f, "no BSS matched SSID {:?}", String::from_utf8_lossy(ssid))
             }
+            Self::Preflight(message) => write!(f, "preflight failed: {message}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+fn trimmed_file(path: impl AsRef<Path>) -> Result<String, Error> {
+    let bytes = fs::read(path).map_err(|source| Error::Io {
+        action: "read preflight identity",
+        source,
+    })?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .trim_end_matches(['\0', '\n', '\r'])
+        .to_owned())
+}
+
+fn symlink_basename(path: impl AsRef<Path>) -> Result<String, Error> {
+    let target = fs::canonicalize(path).map_err(|source| Error::Io {
+        action: "resolve preflight sysfs link",
+        source,
+    })?;
+    target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Preflight("sysfs link has no UTF-8 basename".into()))
+}
+
+fn device_number(device: u64) -> (u64, u64) {
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
+    (major, minor)
+}
+
+fn parse_device_number(value: &str) -> Result<(u64, u64), Error> {
+    let (major, minor) = value
+        .split_once(':')
+        .ok_or_else(|| Error::Preflight(format!("invalid sysfs dev value {value:?}")))?;
+    Ok((
+        major
+            .parse()
+            .map_err(|_| Error::Preflight(format!("invalid sysfs dev major {major:?}")))?,
+        minor
+            .parse()
+            .map_err(|_| Error::Preflight(format!("invalid sysfs dev minor {minor:?}")))?,
+    ))
+}
+
+fn require_mapped_char_device(path: &Path, sysfs_dev: &Path) -> Result<(), Error> {
+    let metadata = fs::metadata(path).map_err(|source| Error::Io {
+        action: "stat preflight character device",
+        source,
+    })?;
+    if !metadata.file_type().is_char_device() {
+        return Err(Error::Preflight(format!(
+            "{} is not a character device",
+            path.display()
+        )));
+    }
+    let expected = parse_device_number(&trimmed_file(sysfs_dev)?)?;
+    if device_number(metadata.rdev()) != expected {
+        return Err(Error::Preflight(format!(
+            "{} rdev does not match {}",
+            path.display(),
+            sysfs_dev.display()
+        )));
+    }
+    Ok(())
+}
+
+fn valid_vfio_cdev_name(name: &str) -> bool {
+    name.strip_prefix("vfio").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn interrupt_facts(bytes: &[u8]) -> Result<(usize, bool), Error> {
+    const GIC_CELLS: usize = 3;
+    const CELL_BYTES: usize = 4;
+    const SPI: u32 = 0;
+    const EDGE_RISING: u32 = 1;
+    let tuple_bytes = GIC_CELLS * CELL_BYTES;
+    if !bytes.len().is_multiple_of(tuple_bytes) {
+        return Err(Error::Preflight(format!(
+            "Wi-Fi FDT interrupts has {} bytes, not 3-cell GIC tuples",
+            bytes.len()
+        )));
+    }
+    let interrupts = bytes
+        .chunks_exact(tuple_bytes)
+        .map(|tuple| {
+            let kind = u32::from_be_bytes(tuple[0..4].try_into().unwrap());
+            let flags = u32::from_be_bytes(tuple[8..12].try_into().unwrap());
+            (kind, flags)
+        })
+        .collect::<Vec<_>>();
+    let all_edge_rising = interrupts
+        .iter()
+        .all(|&(kind, flags)| kind == SPI && flags & 0xf == EDGE_RISING);
+    Ok((interrupts.len(), all_edge_rising))
+}
+
+#[derive(Clone, Copy)]
+struct PreflightIdentity<'a> {
+    device_name: &'a str,
+    driver: &'a str,
+    watchdog: &'a str,
+    watchdog_driver: &'a str,
+    watchdog_node: &'a str,
+    watchdog_status: &'a str,
+    irq_count: usize,
+    irqs_edge_rising: bool,
+}
+
+fn validate_preflight_identity(facts: PreflightIdentity<'_>) -> Result<(), Error> {
+    if facts.device_name != EXPECTED_VFIO_DEVICE {
+        return Err(Error::Preflight(format!(
+            "expected VFIO device {EXPECTED_VFIO_DEVICE}, found {}",
+            facts.device_name
+        )));
+    }
+    if facts.driver != EXPECTED_VFIO_DRIVER {
+        return Err(Error::Preflight(format!(
+            "expected sole driver {EXPECTED_VFIO_DRIVER}, found {}",
+            facts.driver
+        )));
+    }
+    if facts.watchdog != EXPECTED_WATCHDOG_DRIVER {
+        return Err(Error::Preflight(format!(
+            "expected watchdog driver {EXPECTED_WATCHDOG_DRIVER}, found {}",
+            facts.watchdog
+        )));
+    }
+    if facts.watchdog_driver != EXPECTED_WATCHDOG_DRIVER {
+        return Err(Error::Preflight(format!(
+            "expected watchdog platform driver {EXPECTED_WATCHDOG_DRIVER}, found {}",
+            facts.watchdog_driver
+        )));
+    }
+    if facts.watchdog_node != "watchdog@17c10000" {
+        return Err(Error::Preflight(format!(
+            "expected watchdog FDT node watchdog@17c10000, found {}",
+            facts.watchdog_node
+        )));
+    }
+    if facts.watchdog_status != "okay" && facts.watchdog_status != "ok" {
+        return Err(Error::Preflight(format!(
+            "watchdog FDT status is {:?}, not okay",
+            facts.watchdog_status
+        )));
+    }
+    if facts.irq_count != 32 {
+        return Err(Error::Preflight(format!(
+            "expected 32 Wi-Fi SPI interrupts, found {}",
+            facts.irq_count
+        )));
+    }
+    if !facts.irqs_edge_rising {
+        return Err(Error::Preflight(
+            "Wi-Fi FDT interrupts are not all SPI EDGE_RISING".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run the inert host-resource gate. This does not open the VFIO or watchdog
+/// cdev and never binds, maps, resets, or accesses the Wi-Fi device.
+pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
+    let path = config
+        .vfio_device
+        .as_ref()
+        .ok_or(Error::Unsupported("preflight requires --vfio-device"))?;
+    let cdev_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Preflight("VFIO cdev path has no UTF-8 basename".into()))?;
+    if !valid_vfio_cdev_name(cdev_name) {
+        return Err(Error::Preflight(format!(
+            "VFIO cdev basename {cdev_name:?} is not vfio followed by digits"
+        )));
+    }
+    let class = PathBuf::from("/sys/class/vfio-dev").join(cdev_name);
+    let class_device = class.join("device");
+    require_mapped_char_device(path, &class.join("dev"))?;
+    let physical_device = fs::canonicalize(&class_device).map_err(|source| Error::Io {
+        action: "resolve VFIO platform device",
+        source,
+    })?;
+    let expected_device = fs::canonicalize(format!(
+        "/sys/bus/platform/devices/{EXPECTED_VFIO_DEVICE}"
+    ))
+    .map_err(|source| Error::Io {
+        action: "resolve expected Wi-Fi platform device",
+        source,
+    })?;
+    if physical_device != expected_device {
+        return Err(Error::Preflight(format!(
+            "VFIO class device resolves to {}, not {}",
+            physical_device.display(),
+            expected_device.display()
+        )));
+    }
+    let device_name = symlink_basename(&class_device)?;
+    let driver = symlink_basename(class_device.join("driver"))?;
+    let interrupts =
+        fs::read(class_device.join("of_node/interrupts")).map_err(|source| Error::Io {
+            action: "read Wi-Fi FDT interrupts",
+            source,
+        })?;
+    let (irq_count, irqs_edge_rising) = interrupt_facts(&interrupts)?;
+    let unsafe_noiommu = Path::new("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode");
+    if unsafe_noiommu.exists() && trimmed_file(unsafe_noiommu)? != "N" {
+        return Err(Error::Preflight(
+            "VFIO unsafe no-IOMMU mode is enabled".into(),
+        ));
+    }
+
+    require_mapped_char_device(
+        Path::new(WATCHDOG_DEVICE),
+        &Path::new(WATCHDOG_MISC_CLASS).join("dev"),
+    )?;
+    let watchdog_device =
+        fs::canonicalize(Path::new(WATCHDOG_CLASS).join("device")).map_err(|source| Error::Io {
+            action: "resolve watchdog0 platform device",
+            source,
+        })?;
+    let misc_watchdog_device = fs::canonicalize(Path::new(WATCHDOG_MISC_CLASS).join("device"))
+        .map_err(|source| Error::Io {
+            action: "resolve legacy watchdog platform device",
+            source,
+        })?;
+    if watchdog_device != misc_watchdog_device {
+        return Err(Error::Preflight(format!(
+            "{WATCHDOG_DEVICE} and watchdog0 do not map to the same device"
+        )));
+    }
+    let watchdog = trimmed_file(Path::new(WATCHDOG_CLASS).join("identity"))?;
+    let watchdog_driver = symlink_basename(watchdog_device.join("driver"))?;
+    let watchdog_node = symlink_basename(watchdog_device.join("of_node"))?;
+    let watchdog_status = trimmed_file(watchdog_device.join("of_node/status"))?;
+    validate_preflight_identity(PreflightIdentity {
+        device_name: &device_name,
+        driver: &driver,
+        watchdog: &watchdog,
+        watchdog_driver: &watchdog_driver,
+        watchdog_node: &watchdog_node,
+        watchdog_status: &watchdog_status,
+        irq_count,
+        irqs_edge_rising,
+    })?;
+
+    require_mapped_char_device(Path::new(IOMMU_DEVICE), &Path::new(IOMMU_CLASS).join("dev"))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(IOMMU_DEVICE)
+        .map_err(|source| Error::Io {
+            action: "open /dev/iommu for preflight",
+            source,
+        })?;
+    Ok(vec![
+        format!("vfio_device={device_name}"),
+        format!("vfio_driver={driver}"),
+        format!("wifi_spi_irqs={irq_count}"),
+        format!("wifi_irqs_edge_rising={irqs_edge_rising}"),
+        "iommu_open=true".into(),
+        format!("watchdog_device={WATCHDOG_DEVICE}"),
+        format!("watchdog_driver={watchdog}"),
+        format!("watchdog_fdt_status={watchdog_status}"),
+    ])
+}
 
 pub trait Host {
     fn resources(&mut self, config: &Cli) -> Result<(), Error>;
@@ -663,6 +946,9 @@ impl Host for RealHost {
             ))?)
         }
         .map_err(|error| Error::Hardware(error.to_string()))?;
+        vfio.validate_wcn6750_resources().map_err(|error| {
+            Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
+        })?;
         // Open QRTR only after exclusive VFIO acquisition succeeded (fail closed).
         let qrtr = QrtrTransport::open().map_err(|source| Error::Io {
             action: "open AF_QIPCRTR socket",
@@ -956,6 +1242,85 @@ mod tests {
         assert!(Cli::parse([] as [&str; 0]).is_err());
         assert!(Cli::parse(["--dry-run", "--broker"]).is_err());
         assert!(Cli::parse(["--coherent"]).is_err());
+        let preflight =
+            Cli::parse(["preflight", "--vfio-device", "/dev/vfio/devices/vfio7"]).unwrap();
+        assert!(preflight.preflight);
+    }
+
+    #[test]
+    fn preflight_identity_gate_rejects_every_mismatch() {
+        let valid = PreflightIdentity {
+            device_name: EXPECTED_VFIO_DEVICE,
+            driver: EXPECTED_VFIO_DRIVER,
+            watchdog: EXPECTED_WATCHDOG_DRIVER,
+            watchdog_driver: EXPECTED_WATCHDOG_DRIVER,
+            watchdog_node: "watchdog@17c10000",
+            watchdog_status: "okay",
+            irq_count: 32,
+            irqs_edge_rising: true,
+        };
+        assert!(validate_preflight_identity(valid).is_ok());
+        for facts in [
+            PreflightIdentity {
+                device_name: "wrong.wifi",
+                ..valid
+            },
+            PreflightIdentity {
+                driver: "ath11k_ahb",
+                ..valid
+            },
+            PreflightIdentity {
+                watchdog: "softdog",
+                ..valid
+            },
+            PreflightIdentity {
+                watchdog_driver: "softdog",
+                ..valid
+            },
+            PreflightIdentity {
+                watchdog_node: "watchdog@wrong",
+                ..valid
+            },
+            PreflightIdentity {
+                watchdog_status: "reserved",
+                ..valid
+            },
+            PreflightIdentity {
+                irq_count: 31,
+                ..valid
+            },
+            PreflightIdentity {
+                irqs_edge_rising: false,
+                ..valid
+            },
+        ] {
+            assert!(validate_preflight_identity(facts).is_err());
+        }
+    }
+
+    #[test]
+    fn interrupt_parser_requires_32_edge_rising_spis() {
+        let mut bytes = Vec::new();
+        for irq in 0..32_u32 {
+            bytes.extend_from_slice(&0_u32.to_be_bytes());
+            bytes.extend_from_slice(&irq.to_be_bytes());
+            bytes.extend_from_slice(&1_u32.to_be_bytes());
+        }
+        assert_eq!(interrupt_facts(&bytes).unwrap(), (32, true));
+        bytes[8..12].copy_from_slice(&4_u32.to_be_bytes());
+        assert_eq!(interrupt_facts(&bytes).unwrap(), (32, false));
+        assert!(interrupt_facts(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn preflight_rejects_unsafe_cdev_names_and_bad_device_numbers() {
+        assert!(valid_vfio_cdev_name("vfio0"));
+        assert!(valid_vfio_cdev_name("vfio123"));
+        assert!(!valid_vfio_cdev_name("vfio"));
+        assert!(!valid_vfio_cdev_name("noiommu-vfio0"));
+        assert!(!valid_vfio_cdev_name("vfio0x"));
+        assert_eq!(parse_device_number("10:130").unwrap(), (10, 130));
+        assert!(parse_device_number("10").is_err());
     }
 
     #[test]
