@@ -113,6 +113,30 @@ void oracle_hal_reo_update_rx_queue(u8 out[40], u16 number, u64 address,
     memcpy(out, &d, sizeof(d));
 }
 
+int oracle_hal_reo_status(const u8 input[104], u16 *number, u16 *execution_time,
+                          u8 *status, u32 *timestamp) {
+    u32 tlv, header;
+    memcpy(&tlv, input, sizeof(tlv));
+    switch (GET(0x000003fe, tlv)) {
+    case 153:
+    case 311:
+    case 312:
+    case 313:
+    case 314:
+    case 342:
+    case 345:
+        break;
+    default:
+        return -1;
+    }
+    memcpy(&header, input + 4, sizeof(header));
+    *number = GET(0x0000ffff, header);
+    *execution_time = GET(0x03ff0000, header);
+    *status = GET(0x0c000000, header);
+    memcpy(timestamp, input + 8, sizeof(*timestamp));
+    return GET(0x000003fe, tlv);
+}
+
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
     struct buffer_addr d;
     set_addr(&d, address, cookie, manager);

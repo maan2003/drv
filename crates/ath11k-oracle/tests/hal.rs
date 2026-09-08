@@ -1,5 +1,8 @@
 use ath11k_hal::descriptors::*;
-use ath11k_hal::{ReoCommand, ReoCommandKind, ReoCommandParams, ReoResources};
+use ath11k_hal::{
+    Descriptor, HalError, ReoCommand, ReoCommandKind, ReoCommandParams, ReoResources, ReoStatus,
+    ReoStatusKind,
+};
 use ath11k_oracle as _;
 use ath11k_platform_backend::{FromDevice, ToDevice};
 use drv_hardware_backends::DeterministicBackend;
@@ -128,6 +131,13 @@ unsafe extern "C" {
         ba_window: u16,
         pn_size: u8,
     );
+    fn oracle_hal_reo_status(
+        input: *const u8,
+        number: *mut u16,
+        execution_time: *mut u16,
+        status: *mut u8,
+        timestamp: *mut u32,
+    ) -> i32;
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -234,6 +244,48 @@ proptest! {
             flags, update0, update1, update2, pn.as_ptr(), rxq, ba_window, pn_size) };
         let rust = rust.into_descriptor();
         prop_assert_eq!(rust.bytes(), &c);
+    }
+
+    #[test]
+    fn reo_status_matches_pinned_c(
+        mut bytes in any::<[u8; 104]>(), tag in 0u16..=511, number in any::<u16>(),
+        execution_time in 0u16..=0x3ff, status in 0u8..=3, timestamp in any::<u32>(),
+    ) {
+        let tlv = u32::from(tag) << 1 | 100 << 10;
+        let header = u32::from(number) | u32::from(execution_time) << 16 |
+            u32::from(status) << 26;
+        bytes[0..4].copy_from_slice(&tlv.to_le_bytes());
+        bytes[4..8].copy_from_slice(&header.to_le_bytes());
+        bytes[8..12].copy_from_slice(&timestamp.to_le_bytes());
+        let descriptor = Descriptor::new(bytes.to_vec(), bytes.len()).unwrap();
+        let rust = ReoStatus::decode(&descriptor);
+        let (mut c_number, mut c_execution_time, mut c_status, mut c_timestamp) =
+            (0, 0, 0, 0);
+        // SAFETY: exact input size and valid writable scalar outputs.
+        let c_tag = unsafe { oracle_hal_reo_status(bytes.as_ptr(), &mut c_number,
+            &mut c_execution_time, &mut c_status, &mut c_timestamp) };
+        match rust {
+            Ok(rust) => {
+                let rust_tag = match rust.kind {
+                    ReoStatusKind::UpdateRxQueue => 153,
+                    ReoStatusKind::QueueStats => 311,
+                    ReoStatusKind::FlushQueue => 312,
+                    ReoStatusKind::FlushCache => 313,
+                    ReoStatusKind::UnblockCache => 314,
+                    ReoStatusKind::FlushTimeoutList => 342,
+                    ReoStatusKind::DescriptorThreshold => 345,
+                };
+                prop_assert_eq!(rust_tag, c_tag);
+                prop_assert_eq!(rust.header.command_number, c_number);
+                prop_assert_eq!(rust.header.execution_time_us, c_execution_time);
+                prop_assert_eq!(rust.header.execution_status, c_status);
+                prop_assert_eq!(rust.header.timestamp, c_timestamp);
+            }
+            Err(error) => {
+                prop_assert_eq!(error, HalError::Unsupported);
+                prop_assert_eq!(c_tag, -1);
+            }
+        }
     }
 
     #[test]
