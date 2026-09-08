@@ -818,6 +818,10 @@ mod tests {
         TargetPipeConfig,
     };
     use ath11k_qmi::{Response, TransactionId};
+    use ath11k_qmi::strategies::{
+        device_info_response_input_strategy, indication_register_response_input_strategy,
+        request_memory_indication_input_strategy, standard_response_input_strategy,
+    };
     use ath11k_qmi::trace::{self, TraceEvent as QmiTraceEvent, TraceSink};
     use proptest::collection::vec;
     use proptest::option;
@@ -1685,6 +1689,47 @@ mod tests {
             let c = c_respond_memory(&message).unwrap();
             prop_assert_eq!(&rust, &c);
             prop_assert_eq!(trace.0, c_trace(MessageId::RespondMemory, &c));
+        }
+
+        #[test]
+        fn pre_mmio_qmi_responses_decode_match_c(
+            host in standard_response_input_strategy(),
+            registration in indication_register_response_input_strategy(),
+            device in device_info_response_input_strategy(),
+            memory in request_memory_indication_input_strategy(),
+        ) {
+            let c = c_decode_reencode(0, host.bytes()).unwrap();
+            prop_assert_eq!(host.bytes(), &c);
+            let rust = StandardResponse::decode(&host).unwrap();
+            let c_decoded = StandardResponse::decode(
+                &response(MessageId::HostCapability, &c),
+            ).unwrap();
+            prop_assert_eq!(rust.response, c_decoded.response);
+
+            let c = c_decode_reencode(1, registration.bytes()).unwrap();
+            prop_assert_eq!(registration.bytes(), &c);
+            let rust = IndicationRegisterResponse::decode(&registration).unwrap();
+            let c_decoded = IndicationRegisterResponse::decode(
+                &response(MessageId::IndicationRegister, &c),
+            ).unwrap();
+            prop_assert_eq!(rust.response, c_decoded.response);
+            prop_assert_eq!(rust.firmware_status, c_decoded.firmware_status);
+
+            let c = c_decode_reencode(3, device.bytes()).unwrap();
+            prop_assert_eq!(device.bytes(), &c);
+            let rust = DeviceInfoResponse::decode(&device).unwrap();
+            let c_decoded = DeviceInfoResponse::decode(
+                &response(MessageId::DeviceInfo, &c),
+            ).unwrap();
+            prop_assert_eq!(rust.response, c_decoded.response);
+            prop_assert_eq!(rust.bar_address, c_decoded.bar_address);
+            prop_assert_eq!(rust.bar_size, c_decoded.bar_size);
+
+            let c = c_decode_reencode(4, memory.bytes()).unwrap();
+            prop_assert_eq!(memory.bytes(), &c);
+            let rust = RequestMemoryIndication::decode(memory.bytes()).unwrap();
+            let c_decoded = RequestMemoryIndication::decode(&c).unwrap();
+            prop_assert_eq!(rust, c_decoded);
         }
 
         #[test]

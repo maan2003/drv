@@ -693,6 +693,58 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_bus_rejects_invalid_device_bar_information() {
+        fn device_info(address: Option<u64>, size: Option<u32>) -> Vec<u8> {
+            let mut body = vec![2, 4, 0, 0, 0, 0, 0];
+            if let Some(address) = address {
+                body.extend_from_slice(&[0x10, 8, 0]);
+                body.extend_from_slice(&address.to_le_bytes());
+            }
+            if let Some(size) = size {
+                body.extend_from_slice(&[0x11, 4, 0]);
+                body.extend_from_slice(&size.to_le_bytes());
+            }
+            body
+        }
+
+        for (address, size) in [
+            (None, Some(DEVICE_BAR_SIZE)),
+            (Some(0x1000_0000), None),
+            (Some(0), Some(DEVICE_BAR_SIZE)),
+            (Some(0x1000_0000), Some(DEVICE_BAR_SIZE - 1)),
+            (Some(0x1000_0000), Some(DEVICE_BAR_SIZE + 1)),
+        ] {
+            let mut transport = MockTransport {
+                incoming: VecDeque::from(vec![
+                    success(1, MessageId::Capability),
+                    Incoming::Response(
+                        Response::checked(
+                            crate::TransactionId::new(2),
+                            MessageId::DeviceInfo,
+                            device_info(address, size),
+                        )
+                        .unwrap(),
+                    ),
+                ]),
+                sent: Vec::new(),
+                service: None,
+                next_transaction: 0,
+                received_timeouts: Vec::new(),
+            };
+            let mut assets = Assets;
+            let mut memory = Memory::default();
+            let mut handshake =
+                Wcn6750Handshake::new(HandshakeConfig::default(), &mut assets, &mut memory);
+            assert!(matches!(
+                handshake.capabilities(&mut transport),
+                Err(QmiError::Malformed)
+            ));
+            drop(handshake);
+            assert_eq!(memory.mapped, None);
+        }
+    }
+
+    #[test]
     fn firmware_start_and_stop_order() {
         let mut transport = MockTransport {
             incoming: VecDeque::from(vec![
