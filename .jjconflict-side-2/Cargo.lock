@@ -93,6 +93,7 @@ dependencies = [
  "ath11k-qmi",
  "ath11k-wmi",
  "cc",
+ "proptest",
 ]
 
 [[package]]

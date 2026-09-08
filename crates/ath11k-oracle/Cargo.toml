@@ -6,8 +6,11 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-ath11k-qmi = { path = "../ath11k-qmi" }
+ath11k-qmi = { path = "../ath11k-qmi", features = ["trace"] }
 ath11k-wmi = { path = "../ath11k-wmi" }
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+proptest = "1"
