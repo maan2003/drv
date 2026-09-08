@@ -153,6 +153,13 @@ impl<B: Backend> Clone for Shared<B> {
 pub struct Device<B: Backend> {
     shared: Shared<B>,
 }
+impl<B: Backend> Clone for Device<B> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
 impl<B: Backend> Device<B> {
     #[doc(hidden)]
     pub fn from_backend(backend: B) -> Self {

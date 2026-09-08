@@ -1,192 +1,128 @@
-# ath11k QMI port map
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 
-The source oracle is `drivers/net/wireless/ath/ath11k/qmi.[ch]` at
-`sc7280-mainline/linux` commit
-`509ce3d952d550f93b544c8d94c99e798f09a9b4`, materialized with
-`nix build .#ath11k-reference-source`. This inventory covers every type and
-function defined by those two files and every static `qmi_elem_info` table.
-Protocol layouts are implemented in `src/wire.rs`; lifecycle transitions are in `src/handshake.rs`.
-
-Status vocabulary follows the crate inventory convention: **stub** is present
-only as scaffolding or wholly unimplemented, **ported** is implemented,
-**oracle-checked** has byte-exact source fixtures, and **hardware-checked** has
-been exercised against the target. **replaced** is a deliberate project
-boundary rather than code to translate; **deferred** is a Linux/device
-integration path not owned by this protocol crate. Source-derived fixtures cover representative scalar, array, nested, response, and empty-indication tables; live hardware checking remains pending.
-
-## Current Rust surface
-
-| Rust item | Status | C responsibility |
-|---|---|---|
-| `Request` / `Response` / `RawIndication` | **ported** | Message-ID-bearing, bounded checked QMI TLV bodies; responses retain the QMI transaction ID. |
-| `FirmwareReady` / `DriverEvent` | **ported** | Typed lifecycle outcomes after firmware-ready/init-done. |
-| `QmiError` | **ported** | Transport, malformed input, timeout, and QMI result/error. |
-| `Transport` | **ported/replaced** | Event-driven service discovery, transaction-correlated send/response, monotonic timeout accounting, and unsolicited indication boundary; AF_QIPCRTR stays outside. |
-| `Wcn6750Handshake` | **ported** | Registration, host/target capabilities, memory/BDF/caldata/M3 exchange, start/stop, and readiness sequencing. |
-| `MemoryProvider` / `FirmwareAssets` | **replaced** | Caller-owned DMA/MMIO and firmware lookup without upward dependencies. |
-
-## C enums
-
-| C enum | Intended Rust item | Status / disposition |
-|---|---|---|
-| `ath11k_qmi_file_type` | `FileType` (board, calibration, EEPROM download selection) | **ported** |
-| `ath11k_qmi_bdf_type` | `BdfType` (BIN, ELF, regdb wire value) | **ported** |
-| `ath11k_qmi_event_type` | `DriverEvent` | **ported**; Linux-only queue mechanics are replaced, but its reachable state transitions are required |
-| `qmi_wlanfw_mem_type_enum_v01` | `MemoryType` wire enum | **ported** |
-| `qmi_wlanfw_pipedir_enum_v01` | `PipeDirection` wire enum, populated from the CE configuration boundary | **ported** |
-| `qmi_wlanfw_cal_temp_id_enum_v01` | `CalibrationTemperatureId`/checked raw wire value | **ported** |
-
-## C structs
-
-### Driver state and integration structs
-
-| C struct | Intended Rust item | Status / disposition |
-|---|---|---|
-| `ath11k_qmi_driver_event` | `DriverEvent` | **ported**; `list_head`, allocation, spinlock and workqueue are **replaced** by the eventual Rust state machine |
-| `ath11k_qmi_ce_cfg` | `WlanConfigRequest` | **ported**; source data is supplied by core/CE rather than Linux pointers |
-| `ath11k_qmi_event_msg` | none | **deferred**; unused in pinned `qmi.[ch]` |
-| `target_mem_chunk` | `MemorySegmentResponse` from `MemoryProvider` | **replaced**; raw DMA addresses, `__iomem` pointers and allocation are **replaced** by the platform boundary |
-| `target_info` | private capability state projected into `FirmwareReady` | **ported** |
-| `m3_mem_region` | `MemoryRegion` from `MemoryProvider` | **replaced**; M3 firmware acquisition/allocation belongs to core/platform |
-| `ath11k_qmi` | `Wcn6750Handshake` | **ported**; qmi handle/socket/workqueue/list/locks are **replaced**, protocol state is still required |
-
-### Wire structs
-
-| C struct | Intended Rust wire item | Status / disposition |
-|---|---|---|
-| `qmi_wlanfw_host_cap_req_msg_v01` | `HostCapabilityRequest` | **ported** |
-| `qmi_wlanfw_host_cap_resp_msg_v01` | `HostCapabilityResponse` | **ported** |
-| `qmi_wlanfw_ind_register_req_msg_v01` | `IndicationRegisterRequest` | **ported** |
-| `qmi_wlanfw_ind_register_resp_msg_v01` | `IndicationRegisterResponse` | **ported** |
-| `qmi_wlanfw_mem_cfg_s_v01` | `MemoryConfig` | **ported** |
-| `qmi_wlanfw_mem_seg_s_v01` | `MemorySegmentRequest` | **ported** |
-| `qmi_wlanfw_request_mem_ind_msg_v01` | `RequestMemoryIndication` | **ported** |
-| `qmi_wlanfw_mem_seg_resp_s_v01` | `MemorySegmentResponse` | **ported** |
-| `qmi_wlanfw_respond_mem_req_msg_v01` | `RespondMemoryRequest` | **ported** |
-| `qmi_wlanfw_respond_mem_resp_msg_v01` | `RespondMemoryResponse` | **ported** |
-| `qmi_wlanfw_fw_mem_ready_ind_msg_v01` | `FirmwareMemoryReadyIndication` (empty payload) | **ported** |
-| `qmi_wlanfw_fw_ready_ind_msg_v01` | `FirmwareReadyIndication` (empty payload) | **ported**; not equivalent to current summary `FirmwareReady` |
-| `qmi_wlanfw_fw_cold_cal_done_ind_msg_v01` | `ColdCalibrationDoneIndication` (empty payload) | **ported** |
-| `qmi_wlfw_fw_init_done_ind_msg_v01` | `FirmwareInitDoneIndication` (empty payload) | **ported** |
-| `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01` | `TargetPipeConfig` | **ported** |
-| `qmi_wlanfw_ce_svc_pipe_cfg_s_v01` | `ServicePipeConfig` | **ported** |
-| `qmi_wlanfw_shadow_reg_cfg_s_v01` | `ShadowRegisterConfig` | **ported**; source currently sends v1 as invalid |
-| `qmi_wlanfw_shadow_reg_v2_cfg_s_v01` | `ShadowRegisterV2Config` | **ported** |
-| `qmi_wlanfw_memory_region_info_s_v01` | `MemoryRegionInfo` | **deferred**; defined but unused and has no element-info table in pinned `qmi.c` |
-| `qmi_wlanfw_rf_chip_info_s_v01` | `RfChipInfo` | **ported** |
-| `qmi_wlanfw_rf_board_info_s_v01` | `RfBoardInfo` | **ported** |
-| `qmi_wlanfw_soc_info_s_v01` | `SocInfo` | **ported** |
-| `qmi_wlanfw_fw_version_info_s_v01` | `FirmwareVersionInfo` | **ported**; only the destination projection `FirmwareReady.firmware_version` exists |
-| `qmi_wlanfw_cap_resp_msg_v01` | `CapabilityResponse` | **ported** |
-| `qmi_wlanfw_cap_req_msg_v01` | `CapabilityRequest` (empty payload) | **ported** |
-| `qmi_wlanfw_device_info_req_msg_v01` | `DeviceInfoRequest` (empty payload) | **ported**; hybrid-bus-only path |
-| `qmi_wlanfw_device_info_resp_msg_v01` | `DeviceInfoResponse` | **ported**; BAR mapping is **replaced** by platform/core |
-| `qmi_wlanfw_bdf_download_req_msg_v01` | `BdfDownloadRequest` | **ported** |
-| `qmi_wlanfw_bdf_download_resp_msg_v01` | `BdfDownloadResponse` | **ported** |
-| `qmi_wlanfw_m3_info_req_msg_v01` | `M3InfoRequest` | **ported** |
-| `qmi_wlanfw_m3_info_resp_msg_v01` | `M3InfoResponse` | **ported** |
-| `qmi_wlanfw_wlan_mode_req_msg_v01` | `WlanModeRequest` | **ported** |
-| `qmi_wlanfw_wlan_mode_resp_msg_v01` | `WlanModeResponse` | **ported** |
-| `qmi_wlanfw_wlan_cfg_req_msg_v01` | `WlanConfigRequest` | **ported** |
-| `qmi_wlanfw_wlan_cfg_resp_msg_v01` | `WlanConfigResponse` | **ported** |
-| `qmi_wlanfw_wlan_ini_req_msg_v01` | `WlanIniRequest` | **ported**; optional diagnostic-event path |
-| `qmi_wlanfw_wlan_ini_resp_msg_v01` | `WlanIniResponse` | **ported** |
-
-`struct ath11k_base` is only forward-declared here, not defined by these files;
-its QMI-relevant inputs become arguments/configuration, while device lifecycle,
-firmware lookup, MMIO, DMA, recovery and logging stay outside this crate.
-
-## Static `qmi_elem_info` tables
-
-Each table below is the pinned C schema for the corresponding typed TLV codec.
-All are **ported**. Empty indication tables are recognized and require empty payloads. Empty indication tables still matter because their message IDs must be
-recognized and their payload must be validated as empty.
-
-| C table | Intended Rust codec | Status |
-|---|---|---|
-| `qmi_wlanfw_host_cap_req_msg_v01_ei` | encode `HostCapabilityRequest` | **ported** |
-| `qmi_wlanfw_host_cap_resp_msg_v01_ei` | decode `HostCapabilityResponse` | **ported** |
-| `qmi_wlanfw_ind_register_req_msg_v01_ei` | encode `IndicationRegisterRequest` | **ported** |
-| `qmi_wlanfw_ind_register_resp_msg_v01_ei` | decode `IndicationRegisterResponse` | **ported** |
-| `qmi_wlanfw_mem_cfg_s_v01_ei` | nested `MemoryConfig` codec | **ported** |
-| `qmi_wlanfw_mem_seg_s_v01_ei` | nested `MemorySegmentRequest` codec | **ported** |
-| `qmi_wlanfw_request_mem_ind_msg_v01_ei` | decode `RequestMemoryIndication` | **ported** |
-| `qmi_wlanfw_mem_seg_resp_s_v01_ei` | nested `MemorySegmentResponse` codec | **ported** |
-| `qmi_wlanfw_respond_mem_req_msg_v01_ei` | encode `RespondMemoryRequest` | **ported** |
-| `qmi_wlanfw_respond_mem_resp_msg_v01_ei` | decode `RespondMemoryResponse` | **ported** |
-| `qmi_wlanfw_cap_req_msg_v01_ei` | encode empty `CapabilityRequest` | **ported** |
-| `qmi_wlanfw_device_info_req_msg_v01_ei` | encode empty `DeviceInfoRequest` | **ported** |
-| `qmi_wlfw_device_info_resp_msg_v01_ei` | decode `DeviceInfoResponse` (pinned spelling differs from its struct) | **ported** |
-| `qmi_wlanfw_rf_chip_info_s_v01_ei` | nested `RfChipInfo` codec | **ported** |
-| `qmi_wlanfw_rf_board_info_s_v01_ei` | nested `RfBoardInfo` codec | **ported** |
-| `qmi_wlanfw_soc_info_s_v01_ei` | nested `SocInfo` codec | **ported** |
-| `qmi_wlanfw_fw_version_info_s_v01_ei` | nested `FirmwareVersionInfo` codec | **ported** |
-| `qmi_wlanfw_cap_resp_msg_v01_ei` | decode `CapabilityResponse` | **ported** |
-| `qmi_wlanfw_bdf_download_req_msg_v01_ei` | encode `BdfDownloadRequest` | **ported** |
-| `qmi_wlanfw_bdf_download_resp_msg_v01_ei` | decode `BdfDownloadResponse` | **ported** |
-| `qmi_wlanfw_m3_info_req_msg_v01_ei` | encode `M3InfoRequest` | **ported** |
-| `qmi_wlanfw_m3_info_resp_msg_v01_ei` | decode `M3InfoResponse` | **ported** |
-| `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01_ei` | nested `TargetPipeConfig` codec | **ported** |
-| `qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei` | nested `ServicePipeConfig` codec | **ported** |
-| `qmi_wlanfw_shadow_reg_cfg_s_v01_ei` | nested `ShadowRegisterConfig` codec | **ported** |
-| `qmi_wlanfw_shadow_reg_v2_cfg_s_v01_ei` | nested `ShadowRegisterV2Config` codec | **ported** |
-| `qmi_wlanfw_wlan_mode_req_msg_v01_ei` | encode `WlanModeRequest` | **ported** |
-| `qmi_wlanfw_wlan_mode_resp_msg_v01_ei` | decode `WlanModeResponse` | **ported** |
-| `qmi_wlanfw_wlan_cfg_req_msg_v01_ei` | encode `WlanConfigRequest` | **ported** |
-| `qmi_wlanfw_wlan_cfg_resp_msg_v01_ei` | decode `WlanConfigResponse` | **ported** |
-| `qmi_wlanfw_mem_ready_ind_msg_v01_ei` | decode empty `FirmwareMemoryReadyIndication` | **ported** |
-| `qmi_wlanfw_fw_ready_ind_msg_v01_ei` | decode empty `FirmwareReadyIndication` | **ported** |
-| `qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei` | decode empty `ColdCalibrationDoneIndication` | **ported** |
-| `qmi_wlanfw_wlan_ini_req_msg_v01_ei` | encode `WlanIniRequest` | **ported** |
-| `qmi_wlanfw_wlan_ini_resp_msg_v01_ei` | decode `WlanIniResponse` | **ported** |
-| `qmi_wlfw_fw_init_done_ind_msg_v01_ei` | decode empty `FirmwareInitDoneIndication` | **ported** |
-The other static protocol dispatch objects are
-`ath11k_qmi_msg_handlers` (five indication IDs/callbacks) and
-`ath11k_qmi_ops` (server arrival/removal). Their protocol behavior is **ported**; socket registration itself is **replaced** by the caller-supplied transport.
-
-## C functions
-
-| C function | Intended Rust owner/item | Status / disposition |
-|---|---|---|
-| `ath11k_qmi_host_cap_send` | handshake host-capability transaction | **ported** |
-| `ath11k_qmi_fw_ind_register_send` | handshake indication-registration transaction | **ported** |
-| `ath11k_qmi_respond_fw_mem_request` | handshake memory-response transaction | **ported**; DMA addresses come from platform tokens |
-| `ath11k_qmi_free_target_mem_chunk` | platform/core memory lifecycle | **replaced** |
-| `ath11k_qmi_alloc_target_mem_chunk` | platform DMA allocation policy | **replaced**; retry/delayed-response semantics remain handshake inputs |
-| `ath11k_qmi_assign_target_mem_chunk` | platform reserved-memory assignment | **replaced/deferred**; DT, `ioremap` and physical addresses cannot enter this crate |
-| `ath11k_qmi_request_device_info` | handshake device-info transaction | **ported** for protocol; hybrid BAR validation/mapping is **deferred** to platform/core |
-| `ath11k_qmi_request_target_cap` | handshake capability transaction and `TargetInfo` projection | **ported**; only destination field `FirmwareReady.firmware_version` exists |
-| `ath11k_qmi_load_file_target_mem` | segmented BDF/caldata/EEPROM download transactions | **ported**; fixed-address copy is **deferred** to platform |
-| `ath11k_qmi_load_bdf_qmi` | core firmware selection plus handshake BDF/regdb download | protocol send **ported**; file/board discovery **deferred** to core |
-| `ath11k_qmi_m3_load` | core firmware acquisition plus platform DMA allocation | **deferred** |
-| `ath11k_qmi_m3_free` | platform/core M3 memory lifecycle | **replaced/deferred** |
-| `ath11k_qmi_wlanfw_m3_info_send` | handshake M3-info transaction | **ported** |
-| `ath11k_qmi_wlanfw_mode_send` | handshake WLAN-mode transaction | **ported** |
-| `ath11k_qmi_wlanfw_wlan_cfg_send` | handshake CE/service/shadow configuration transaction | **ported** |
-| `ath11k_qmi_wlanfw_wlan_ini_send` | optional handshake diagnostic initialization transaction | **ported** |
-| `ath11k_qmi_firmware_stop` | lifecycle stop using WLAN mode-off | **ported**; no Rust stop contract exists |
-| `ath11k_qmi_firmware_start` | lifecycle start tail (optional INI, WLAN config, mode) | **ported**; intended beneath `Handshake::start`/core lifecycle |
-| `ath11k_qmi_fwreset_from_cold_boot` | core/platform reset orchestration | **deferred**; QMI only reports calibration completion |
-| `ath11k_qmi_process_coldboot_calibration` | `start_cold_boot_calibration` plus indication processing | **ported**; any post-calibration reset remains platform/core-owned |
-| `ath11k_qmi_driver_event_post` | private handshake event enqueue | **ported**; Linux list/spinlock/workqueue mechanics **replaced** |
-| `ath11k_qmi_event_mem_request` | handshake memory-request transition | **ported** |
-| `ath11k_qmi_event_load_bdf` | handshake capability/device-info/BDF transition | **ported** |
-| `ath11k_qmi_event_server_arrive` | handshake registration/host-cap transition | **ported**; discovery/connect supplied by transport |
-| `ath11k_qmi_msg_mem_request_cb` | decode and handle request-memory indication | **ported**; allocation delegated to platform |
-| `ath11k_qmi_msg_mem_ready_cb` | handle firmware-memory-ready indication | **ported** |
-| `ath11k_qmi_msg_fw_ready_cb` | handle firmware-ready indication | **ported** |
-| `ath11k_qmi_msg_cold_boot_cal_done_cb` | handle calibration-done indication | **ported** |
-| `ath11k_qmi_msg_fw_init_done_cb` | handle firmware-init-done indication | **ported** |
-| `ath11k_qmi_ops_new_server` | transport service-arrival notification | protocol transition **ported**; AF_QIPCRTR `kernel_connect` **replaced** |
-| `ath11k_qmi_ops_del_server` | transport service-loss notification/recovery signal | protocol transition **ported**; Linux recovery flags **deferred** to core |
-| `ath11k_qmi_driver_event_work` | ordered handshake state-machine dispatch | **ported**; Linux workqueue/flags/recovery calls **replaced/deferred** |
-| `ath11k_qmi_init_service` | construct handshake and register WLFW service/indications | **ported**; `qmi_handle`, lookup and workqueue setup **replaced** |
-| `ath11k_qmi_deinit_service` | cancel handshake and release protocol-owned resources | **ported**; socket/workqueue/DMA teardown **replaced** by owners |
-| `ath11k_qmi_free_resource` | release target/M3 memory | **replaced/deferred** to platform/core |
-
-## Known oracle limitation
-
-The pinned source contains no PHY-capability QMI message or element-info table; the
-`0x0024` target-capability transaction is the capability step ported here. Native
-kernel tracepoints do not expose QMI payload bytes, so hardware-check status remains
-pending a live firmware integration; source-derived TLV fixtures are the current oracle.
+| C symbol | C file:lines | Rust item | status | note |
+|---|---|---|---|---|
+| `ath11k_base` | `qmi.h:43-43` | — | kernel-substrate | Only forward-declared here; device lifecycle, MMIO, DMA, recovery, firmware lookup, and logging remain driver-owned. Range verified against oracle commit 509ce3d952d550f93b544c8d94c99e798f09a9b4, materialized with nix build .#ath11k-reference-source. |
+| `ath11k_qmi_file_type` | `qmi.h:45-50` | `src/wire.rs::FileType` | ported | BDF/caldata/EEPROM selection. |
+| `ath11k_qmi_bdf_type` | `qmi.h:52-56` | `src/wire.rs::BdfType` | ported | BIN, ELF, and regdb wire values. |
+| `ath11k_qmi_event_type` | `qmi.h:58-74` | `src/handshake.rs::DriverEvent` | ported | Reachable protocol events are represented; Linux-only events stay with the driver owner. |
+| `ath11k_qmi_driver_event` | `qmi.h:76-80` | `src/handshake.rs::DriverEvent` | local-seam | Rust state-machine events replace list allocation and workqueue plumbing. |
+| `ath11k_qmi_ce_cfg` | `qmi.h:82-91` | `src/wire.rs::WlanConfigRequest` | local-seam | Core/CE supplies owned configuration instead of Linux pointers. |
+| `ath11k_qmi_event_msg` | `qmi.h:93-96` | — | deferred | Unused in the pinned source. |
+| `target_mem_chunk` | `qmi.h:98-109` | `src/handshake.rs::MemoryProvider; src/wire.rs::MemorySegmentResponse` | local-seam | The platform owns DMA/MMIO storage; QMI carries the resulting segment metadata. |
+| `target_info` | `qmi.h:111-121` | `src/wire.rs::CapabilityResponse; src/lib.rs::FirmwareReady` | ported | Capability fields are decoded and the externally needed result is projected into FirmwareReady. |
+| `m3_mem_region` | `qmi.h:123-127` | `src/handshake.rs::MemoryRegion` | local-seam | MemoryProvider owns M3 allocation and addresses. |
+| `ath11k_qmi` | `qmi.h:129-147` | `src/handshake.rs::Wcn6750Handshake` | local-seam | Protocol state is retained; QRTR, workqueue, locks, DMA, and device ownership stay outside the crate. |
+| `qmi_wlanfw_host_cap_req_msg_v01` | `qmi.h:161-189` | `src/wire.rs::HostCapabilityRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_host_cap_resp_msg_v01` | `qmi.h:191-193` | `src/wire.rs::HostCapabilityResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_ind_register_req_msg_v01` | `qmi.h:201-226` | `src/wire.rs::IndicationRegisterRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_ind_register_resp_msg_v01` | `qmi.h:228-232` | `src/wire.rs::IndicationRegisterResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_mem_cfg_s_v01` | `qmi.h:242-246` | `src/wire.rs::MemoryConfig` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_mem_type_enum_v01` | `qmi.h:248-257` | `src/wire.rs::MemoryType` | ported | Unknown wire values are preserved. |
+| `qmi_wlanfw_mem_seg_s_v01` | `qmi.h:259-264` | `src/wire.rs::MemorySegment` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_request_mem_ind_msg_v01` | `qmi.h:266-269` | `src/wire.rs::RequestMemoryIndication` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_mem_seg_resp_s_v01` | `qmi.h:271-276` | `src/wire.rs::MemorySegmentResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_respond_mem_req_msg_v01` | `qmi.h:278-281` | `src/wire.rs::RespondMemoryRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_respond_mem_resp_msg_v01` | `qmi.h:283-285` | `src/wire.rs::RespondMemoryResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_fw_mem_ready_ind_msg_v01` | `qmi.h:287-289` | `src/wire.rs::Indication::FirmwareMemoryReady` | ported | Empty indication payload. |
+| `qmi_wlanfw_fw_ready_ind_msg_v01` | `qmi.h:291-293` | `src/wire.rs::Indication::FirmwareReady` | ported | Empty indication payload. |
+| `qmi_wlanfw_fw_cold_cal_done_ind_msg_v01` | `qmi.h:295-297` | `src/wire.rs::Indication::ColdBootCalibrationDone` | ported | Empty indication payload. |
+| `qmi_wlfw_fw_init_done_ind_msg_v01` | `qmi.h:299-301` | `src/wire.rs::Indication::FirmwareInitDone` | ported | Empty indication payload. |
+| `qmi_wlanfw_pipedir_enum_v01` | `qmi.h:310-315` | `src/wire.rs::PipeDirection` | ported | CE configuration wire direction. |
+| `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01` | `qmi.h:317-323` | `src/wire.rs::TargetPipeConfig` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_ce_svc_pipe_cfg_s_v01` | `qmi.h:325-329` | `src/wire.rs::ServicePipeConfig` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_shadow_reg_cfg_s_v01` | `qmi.h:331-334` | `src/wire.rs::ShadowRegister` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_shadow_reg_v2_cfg_s_v01` | `qmi.h:336-338` | `src/wire.rs::ShadowRegister` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_memory_region_info_s_v01` | `qmi.h:340-344` | `src/wire.rs::MemoryRegionInfo` | deferred | Defined but unused and has no element-info table in the pinned qmi.c. |
+| `qmi_wlanfw_rf_chip_info_s_v01` | `qmi.h:346-349` | `src/wire.rs::ChipInfo` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_rf_board_info_s_v01` | `qmi.h:351-353` | `src/wire.rs::CapabilityResponse::board_id` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_soc_info_s_v01` | `qmi.h:355-357` | `src/wire.rs::CapabilityResponse::soc_id` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_fw_version_info_s_v01` | `qmi.h:359-362` | `src/wire.rs::FirmwareVersion` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_cal_temp_id_enum_v01` | `qmi.h:364-371` | `src/wire.rs::CalibrationTemperatureId` | ported | Checked raw wire value. |
+| `qmi_wlanfw_cap_resp_msg_v01` | `qmi.h:373-395` | `src/wire.rs::CapabilityResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_cap_req_msg_v01` | `qmi.h:397-399` | `src/wire.rs::CapabilityRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_device_info_req_msg_v01` | `qmi.h:401-403` | `src/wire.rs::DeviceInfoRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_device_info_resp_msg_v01` | `qmi.h:405-411` | `src/wire.rs::DeviceInfoResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_bdf_download_req_msg_v01` | `qmi.h:420-436` | `src/wire.rs::BdfDownloadRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_bdf_download_resp_msg_v01` | `qmi.h:438-440` | `src/wire.rs::BdfDownloadResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_m3_info_req_msg_v01` | `qmi.h:447-450` | `src/wire.rs::M3InfoRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_m3_info_resp_msg_v01` | `qmi.h:452-454` | `src/wire.rs::M3InfoResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_mode_req_msg_v01` | `qmi.h:472-476` | `src/wire.rs::WlanModeRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_mode_resp_msg_v01` | `qmi.h:478-480` | `src/wire.rs::WlanModeResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_cfg_req_msg_v01` | `qmi.h:482-501` | `src/wire.rs::WlanConfigRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_cfg_resp_msg_v01` | `qmi.h:503-505` | `src/wire.rs::WlanConfigResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_ini_req_msg_v01` | `qmi.h:507-511` | `src/wire.rs::WlanIniRequest` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_wlan_ini_resp_msg_v01` | `qmi.h:513-515` | `src/wire.rs::WlanIniResponse` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_host_cap_req_msg_v01_ei` | `qmi.c:33-282` | `src/wire.rs::HostCapabilityRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_host_cap_resp_msg_v01_ei` | `qmi.c:284-299` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_ind_register_req_msg_v01_ei` | `qmi.c:301-524` | `src/wire.rs::IndicationRegisterRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_ind_register_resp_msg_v01_ei` | `qmi.c:526-560` | `src/wire.rs::IndicationRegisterResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_mem_cfg_s_v01_ei` | `qmi.c:562-592` | `src/wire.rs::MemoryConfig` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_mem_seg_s_v01_ei` | `qmi.c:594-634` | `src/wire.rs::MemorySegment` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_request_mem_ind_msg_v01_ei` | `qmi.c:636-661` | `src/wire.rs::RequestMemoryIndication::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_mem_seg_resp_s_v01_ei` | `qmi.c:663-701` | `src/wire.rs::MemorySegmentResponse` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_respond_mem_req_msg_v01_ei` | `qmi.c:703-728` | `src/wire.rs::RespondMemoryRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_respond_mem_resp_msg_v01_ei` | `qmi.c:730-746` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_cap_req_msg_v01_ei` | `qmi.c:748-754` | `src/wire.rs::CapabilityRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_device_info_req_msg_v01_ei` | `qmi.c:756-762` | `src/wire.rs::DeviceInfoRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlfw_device_info_resp_msg_v01_ei` | `qmi.c:764-816` | `src/wire.rs::DeviceInfoResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_rf_chip_info_s_v01_ei` | `qmi.c:818-842` | `src/wire.rs::ChipInfo` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_rf_board_info_s_v01_ei` | `qmi.c:844-859` | `src/wire.rs::CapabilityResponse::board_id` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_soc_info_s_v01_ei` | `qmi.c:861-875` | `src/wire.rs::CapabilityResponse::soc_id` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_fw_version_info_s_v01_ei` | `qmi.c:877-901` | `src/wire.rs::FirmwareVersion` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_cap_resp_msg_v01_ei` | `qmi.c:903-1102` | `src/wire.rs::CapabilityResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_bdf_download_req_msg_v01_ei` | `qmi.c:1104-1237` | `src/wire.rs::BdfDownloadRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_bdf_download_resp_msg_v01_ei` | `qmi.c:1239-1255` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_m3_info_req_msg_v01_ei` | `qmi.c:1257-1279` | `src/wire.rs::M3InfoRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_m3_info_resp_msg_v01_ei` | `qmi.c:1281-1296` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01_ei` | `qmi.c:1298-1349` | `src/wire.rs::TargetPipeConfig` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei` | `qmi.c:1351-1384` | `src/wire.rs::ServicePipeConfig` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_shadow_reg_cfg_s_v01_ei` | `qmi.c:1386-1408` | `src/wire.rs::ShadowRegister` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_shadow_reg_v2_cfg_s_v01_ei` | `qmi.c:1410-1425` | `src/wire.rs::ShadowRegister` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_mode_req_msg_v01_ei` | `qmi.c:1427-1460` | `src/wire.rs::WlanModeRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_mode_resp_msg_v01_ei` | `qmi.c:1462-1478` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_wlan_cfg_req_msg_v01_ei` | `qmi.c:1480-1617` | `src/wire.rs::WlanConfigRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_cfg_resp_msg_v01_ei` | `qmi.c:1619-1634` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlanfw_mem_ready_ind_msg_v01_ei` | `qmi.c:1636-1641` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_fw_ready_ind_msg_v01_ei` | `qmi.c:1643-1648` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei` | `qmi.c:1650-1655` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_ini_req_msg_v01_ei` | `qmi.c:1657-1681` | `src/wire.rs::WlanIniRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_ini_resp_msg_v01_ei` | `qmi.c:1683-1699` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented. C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
+| `qmi_wlfw_fw_init_done_ind_msg_v01_ei` | `qmi.c:1701-1706` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `ath11k_qmi_host_cap_send` | `qmi.c:1710-1791` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Host-capability transaction. |
+| `ath11k_qmi_fw_ind_register_send` | `qmi.c:1793-1870` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Indication-registration transaction. |
+| `ath11k_qmi_respond_fw_mem_request` | `qmi.c:1872-1954` | `src/handshake.rs::Wcn6750Handshake::process_indication` | ported | Memory-response transaction; addresses come from MemoryProvider. |
+| `ath11k_qmi_free_target_mem_chunk` | `qmi.c:1956-1977` | `src/handshake.rs::MemoryProvider` | kernel-substrate | DMA/MMIO release is platform-owned. |
+| `ath11k_qmi_alloc_target_mem_chunk` | `qmi.c:1979-2037` | `src/handshake.rs::MemoryProvider::provision` | local-seam | Platform allocation policy is injected. |
+| `ath11k_qmi_assign_target_mem_chunk` | `qmi.c:2039-2118` | `src/handshake.rs::MemoryProvider::provision` | wcn6750-specific | WCN6750 fixed reserved-memory assignment is supplied by the platform seam. |
+| `ath11k_qmi_request_device_info` | `qmi.c:2120-2195` | `src/wire.rs::DeviceInfoRequest; src/wire.rs::DeviceInfoResponse` | deferred | Hybrid-bus BAR validation/mapping is not used by the WCN6750 handshake. |
+| `ath11k_qmi_request_target_cap` | `qmi.c:2197-2295` | `src/handshake.rs::Wcn6750Handshake::capabilities` | ported | The pinned source has no PHY-capability message; the 0x0024 target-capability transaction is the capability step. |
+| `ath11k_qmi_load_file_target_mem` | `qmi.c:2297-2411` | `src/handshake.rs::Wcn6750Handshake::download` | ported | Segmented BDF/caldata/EEPROM download; fixed-address copying remains platform-owned. |
+| `ath11k_qmi_load_bdf_qmi` | `qmi.c:2413-2509` | `src/handshake.rs::Wcn6750Handshake::load_bdf` | ported | FirmwareAssets supplies file and board discovery. |
+| `ath11k_qmi_m3_load` | `qmi.c:2511-2564` | `src/handshake.rs::FirmwareAssets::m3_firmware; src/handshake.rs::MemoryProvider::load_m3` | local-seam | Firmware acquisition and memory allocation are injected. |
+| `ath11k_qmi_m3_free` | `qmi.c:2566-2577` | `src/handshake.rs::MemoryProvider` | kernel-substrate | M3 DMA release is platform-owned. |
+| `ath11k_qmi_wlanfw_m3_info_send` | `qmi.c:2581-2638` | `src/handshake.rs::Wcn6750Handshake::load_bdf` | ported | M3-info transaction. |
+| `ath11k_qmi_wlanfw_mode_send` | `qmi.c:2640-2693` | `src/wire.rs::WlanModeRequest::encode` | ported | WLAN-mode transaction. |
+| `ath11k_qmi_wlanfw_wlan_cfg_send` | `qmi.c:2695-2784` | `src/wire.rs::WlanConfigRequest::encode` | ported | CE/service/shadow configuration transaction. |
+| `ath11k_qmi_wlanfw_wlan_ini_send` | `qmi.c:2786-2826` | `src/wire.rs::WlanIniRequest::encode` | ported | Optional diagnostic initialization transaction. |
+| `ath11k_qmi_firmware_stop` | `qmi.c:2828-2839` | `src/handshake.rs::Wcn6750Handshake::firmware_stop` | ported | Mode-off lifecycle transaction. |
+| `ath11k_qmi_firmware_start` | `qmi.c:2841-2869` | `src/handshake.rs::Wcn6750Handshake::firmware_start` | ported | Optional INI, WLAN configuration, and mode-on sequence. |
+| `ath11k_qmi_fwreset_from_cold_boot` | `qmi.c:2871-2895` | — | replaced-by-fuchsia-mlme | Post-calibration device reset orchestration belongs to the driver lifecycle owner. |
+| `ath11k_qmi_process_coldboot_calibration` | `qmi.c:2898-2922` | `src/handshake.rs::Wcn6750Handshake::start_cold_boot_calibration` | ported | Calibration start and completion wait; reset remains with the lifecycle owner. |
+| `ath11k_qmi_driver_event_post` | `qmi.c:2925-2945` | `src/handshake.rs::Wcn6750Handshake::process_next_event` | local-seam | Direct Rust state transitions replace list/spinlock/workqueue enqueueing. |
+| `ath11k_qmi_event_mem_request` | `qmi.c:2947-2959` | `src/handshake.rs::Wcn6750Handshake::process_indication` | ported | Memory-request transition. |
+| `ath11k_qmi_event_load_bdf` | `qmi.c:2961-2989` | `src/handshake.rs::Wcn6750Handshake::load_bdf` | ported | Capability and BDF-loading transition. |
+| `ath11k_qmi_event_server_arrive` | `qmi.c:2991-3019` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Registration and host-capability transition. |
+| `ath11k_qmi_msg_mem_request_cb` | `qmi.c:3021-3065` | `src/handshake.rs::Wcn6750Handshake::process_indication` | ported | Request-memory indication handling; allocation is delegated. |
+| `ath11k_qmi_msg_mem_ready_cb` | `qmi.c:3067-3077` | `src/wire.rs::Indication::FirmwareMemoryReady` | ported | Firmware-memory-ready handling. |
+| `ath11k_qmi_msg_fw_ready_cb` | `qmi.c:3079-3095` | `src/wire.rs::Indication::FirmwareReady` | ported | Firmware-ready handling. |
+| `ath11k_qmi_msg_cold_boot_cal_done_cb` | `qmi.c:3097-3109` | `src/wire.rs::Indication::ColdBootCalibrationDone` | ported | Cold-calibration-done handling. |
+| `ath11k_qmi_msg_fw_init_done_cb` | `qmi.c:3111-3122` | `src/wire.rs::Indication::FirmwareInitDone` | ported | Firmware-init-done handling. |
+| `ath11k_qmi_msg_handlers` | `qmi.c:3124-3165` | `src/wire.rs::MessageId; src/wire.rs::Indication::decode` | ported | Five indication IDs dispatch to typed decoding. |
+| `ath11k_qmi_ops_new_server` | `qmi.c:3167-3190` | `src/lib.rs::Transport::start_service; src/handshake.rs::Wcn6750Handshake::server_arrived` | local-seam | Transport supplies discovery/connect; protocol arrival handling is retained. |
+| `ath11k_qmi_ops_del_server` | `qmi.c:3192-3200` | `src/lib.rs::Transport` | replaced-by-fuchsia-mlme | Transport reports service loss; recovery policy belongs to the driver lifecycle owner. |
+| `ath11k_qmi_ops` | `qmi.c:3202-3205` | `src/lib.rs::Transport` | local-seam | Caller-supplied transport replaces qmi_ops registration. |
+| `ath11k_qmi_driver_event_work` | `qmi.c:3207-3316` | `src/handshake.rs::Wcn6750Handshake::process_next_event` | ported | Ordered protocol dispatch is retained; Linux workqueue and recovery actions are not. |
+| `ath11k_qmi_init_service` | `qmi.c:3318-3354` | `src/handshake.rs::Wcn6750Handshake::init_service` | local-seam | Constructs protocol state through the caller-supplied transport. |
+| `ath11k_qmi_deinit_service` | `qmi.c:3356-3363` | `src/handshake.rs::Wcn6750Handshake::deinit_service` | local-seam | Cancels protocol activity; socket/workqueue/DMA teardown stays with owners. |
+| `ath11k_qmi_free_resource` | `qmi.c:3366-3370` | `src/handshake.rs::MemoryProvider` | kernel-substrate | Target and M3 memory release is platform-owned. |

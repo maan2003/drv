@@ -99,6 +99,14 @@ name = "ath11k-qmi"
 version = "0.1.0"
 
 [[package]]
+name = "ath11k-qmi-qrtr"
+version = "0.1.0"
+dependencies = [
+ "ath11k-qmi",
+ "qrtr-socket",
+]
+
+[[package]]
 name = "ath11k-wmi"
 version = "0.1.0"
 dependencies = [
@@ -410,6 +418,7 @@ name = "drv-hardware-backends"
 version = "0.1.0"
 dependencies = [
  "drv-hardware",
+ "userspace-vfio",
 ]
 
 [[package]]
@@ -908,6 +917,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "qrtr-socket"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
