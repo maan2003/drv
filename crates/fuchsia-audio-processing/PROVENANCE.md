@@ -8,10 +8,14 @@ The files are governed by `LICENSE.fuchsia` (BSD 2-Clause).
 
 The Cargo manifest, include facades, build script, and C ABI bridge are host
 packaging for drv. No upstream line is patched. The bridge adapts interleaved
-signed 16-bit host PCM to unchanged Fuchsia `media_audio::ChannelStrip`,
-`media_audio::PositionManager`, `media_audio::MixSample`,
+signed 16-bit host PCM to unchanged Fuchsia `media_audio::PositionManager`, `media_audio::MixSample`,
 `media_audio::DbToScale`, and `media_audio::ApplyGain<GainType::kNonUnity>`
 calls.
+
+The real-time bridge variants accept caller-provided mixing output and a
+caller-precomputed linear gain. They still invoke the pinned `MixSample` and
+`ApplyGain` primitives, but avoid `ChannelStrip`'s vector allocation and
+`DbToScale`'s libm call on the processing thread.
 
 For 44.1 kHz to 48 kHz point resampling, the unchanged `PositionManager` owns
 the source offset, exact 13-bit fixed-point stride, residual modulo, and frame

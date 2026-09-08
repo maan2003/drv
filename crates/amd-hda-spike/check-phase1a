@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$root"
+
+cargo test -p drv-fuchsia-audio-processing -p drv-fuchsia-audio-timeline \
+  -p drv-audio-pipewire-spike -p amd-hda-spike
+cargo build -p amd-hda-spike --bin amd-hda-rt-daemon
+cargo run -q -p amd-hda-spike --bin amd-hda-rt-daemon -- --virtual-audit 10000
+./crates/amd-hda-spike/audit-rt-ffi
+
+daemon_log=$(mktemp)
+daemon_pid=
+cleanup() {
+  [[ -n ${daemon_pid:-} ]] && kill "$daemon_pid" 2>/dev/null || true
+  rm -f "$daemon_log"
+}
+trap cleanup EXIT
+cargo run -q -p amd-hda-spike --bin amd-hda-rt-daemon -- --virtual-daemon >"$daemon_log" &
+daemon_pid=$!
+for _ in {1..100}; do
+  grep -q 'virtual daemon process ready' "$daemon_log" && break
+  sleep .01
+done
+grep -q 'virtual daemon process ready' "$daemon_log"
+kill "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+daemon_pid=
+
+rt=crates/amd-hda-spike/src/rt.rs
+if rg -n 'Mutex|RwLock|mpsc|UnixStream|File::|println!|eprintln!|thread::|Vec<|Box<|fs::|libc::|syscall' "$rt"; then
+  echo "forbidden allocating, locking, logging, filesystem, IPC, or syscall surface in $rt" >&2
+  exit 1
+fi

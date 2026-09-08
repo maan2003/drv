@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "drv-audio-pipewire-spike",
  "drv-fuchsia-audio-processing",
+ "drv-fuchsia-audio-timeline",
 ]
 
 [[package]]

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$root"
+
+messages=$(mktemp)
+trap 'rm -f "$messages"' EXIT
+cargo build -p amd-hda-spike --bin amd-hda-rt-daemon --message-format=json >"$messages"
+out_dir() {
+  sed -n "/build-script-executed.*crates\\/$1#/s/.*\"out_dir\":\"\([^\"]*\)\".*/\1/p" \
+    "$messages" | tail -1
+}
+processing=$(out_dir fuchsia-audio-processing)/libfuchsia_audio_processing.a
+timeline=$(out_dir fuchsia-audio-timeline)/libfuchsia_audio_timeline.a
+[[ -f $processing && -f $timeline ]] || {
+  echo "Cargo did not report the expected Fuchsia audio bridge archives" >&2
+  exit 1
+}
+
+for symbol in drv_fuchsia_apply_gain_scale_s16 drv_fuchsia_mix_stereo_s16; do
+  body=$(objdump -drC "$processing" | sed -n "/<$symbol>:/,/^$/p")
+  [[ -n $body ]] || { echo "missing RT FFI symbol $symbol" >&2; exit 1; }
+  if grep -Eq '[[:space:]]call[q]?[[:space:]]' <<<"$body"; then
+    echo "RT FFI symbol $symbol contains an out-of-line call" >&2
+    printf '%s\n' "$body" >&2
+    exit 1
+  fi
+done
+
+# Timeline apply intentionally calls pinned TimelineRate/TimelineFunction code.
+# Its transitive archive may use compiler 128-bit division helpers and startup
+# iostream initialization, but the RT call graph must not import these
+# allocation, locking, IPC, or syscall surfaces.
+if nm -uC "$timeline" | grep -Ei \
+  '(^|[^[:alnum:]_])(malloc|calloc|realloc|free|operator new|operator delete|pthread_|futex|syscall|socket|send|recv|write|open)([^[:alnum:]_]|$)'; then
+  echo "timeline RT archive imports a forbidden runtime surface" >&2
+  exit 1
+fi
+
+echo "RT FFI audit: gain/mix call-free; timeline has no allocation/lock/IPC/syscall imports"
