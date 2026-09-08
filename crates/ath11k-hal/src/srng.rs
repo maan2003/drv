@@ -562,6 +562,35 @@ impl<B: Backend> Srng<B> {
         self.reap_head = next;
         Some(offset)
     }
+    /// Port of `ath11k_hal_srng_src_reap_next`.
+    pub fn source_reap_next(&mut self) -> Option<usize> {
+        if self.direction != RingDirection::Source {
+            return None;
+        }
+        let next = (self.reap_head + self.entry_words) % self.ring_words;
+        if next == self.cached_hardware_pointer {
+            return None;
+        }
+        self.reap_head = next;
+        Some(next as usize * 4)
+    }
+    /// Port of `ath11k_hal_srng_src_get_next_reaped`.
+    pub fn source_next_reaped(&mut self) -> Option<usize> {
+        if self.direction != RingDirection::Source || self.head == self.reap_head {
+            return None;
+        }
+        let offset = self.head as usize * 4;
+        self.head = (self.head + self.entry_words) % self.ring_words;
+        Some(offset)
+    }
+    /// Port of `ath11k_hal_srng_src_next_peek`.
+    pub fn source_next_peek(&self) -> Option<usize> {
+        if self.direction != RingDirection::Source {
+            return None;
+        }
+        let next = (self.head + self.entry_words) % self.ring_words;
+        (next != self.cached_hardware_pointer).then_some(next as usize * 4)
+    }
     pub fn destination_next(&mut self) -> Option<usize> {
         if self.direction != RingDirection::Destination || self.tail == self.cached_hardware_pointer
         {
@@ -774,5 +803,10 @@ mod tests {
         assert_eq!(s.source_next(), Some(16));
         assert_eq!(s.source_next(), Some(32));
         assert_eq!(s.source_next(), None);
+        s.cached_hardware_pointer = s.entry_words;
+        s.reap_head = s.ring_words - s.entry_words;
+        s.head = s.entry_words * 2;
+        assert_eq!(s.source_reap_next(), Some(0));
+        assert_eq!(s.source_next_reaped(), Some(32));
     }
 }

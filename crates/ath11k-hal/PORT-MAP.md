@@ -41,3 +41,6 @@ oracle-checked, or hardware-checked.
 | hal_tx.c:`ath11k_hal_tx_cmd_desc_setup` | `descriptors::TclDataCommand::for_transmit`, `TxCommandInfo` | oracle-checked | `tcl_data_command_is_byte_exact_and_checked`; WCN6750 QCN9074 mesh bit |
 | hal_tx.c:`ath11k_hal_tx_set_dscp_tid_map` | `descriptors::program_dscp_tid_map` | ported | source-derived bitstream/register sequence |
 | hal_desc.h:`struct hal_wbm_release_ring` | `descriptors::WbmReleaseRing` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
+| hal.c:`ath11k_hal_srng_src_reap_next` | `Srng::source_reap_next` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
+| hal.c:`ath11k_hal_srng_src_get_next_reaped` | `Srng::source_next_reaped` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
+| hal.c:`ath11k_hal_srng_src_next_peek` | `Srng::source_next_peek` | ported | source-derived arithmetic |
