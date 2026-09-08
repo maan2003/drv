@@ -350,6 +350,14 @@ impl<B: Backend> PeerRxTids<B> {
         {
             return Err(DpError::WrongState);
         }
+        if self.pending_delete.iter().any(|entry| {
+            entry.vdev_id == vdev_id && entry.peer_addr == peer_addr && entry.tid.tid == tid
+        }) {
+            // The old queue can still be device-visible until its invalidate
+            // status succeeds. Do not publish a replacement whose ownership
+            // would become ambiguous if that status later reports failure.
+            return Err(DpError::WrongState);
+        }
         if let Some(active) = self.tids.iter_mut().find(|active| {
             active.vdev_id == vdev_id && active.peer_addr == peer_addr && active.tid.tid == tid
         }) {
@@ -1442,6 +1450,20 @@ mod tests {
         peers
             .ath11k_peer_rx_tid_delete(&mut reo, &mut rings, 1, [8; 6], 3)
             .unwrap();
+        assert_eq!(
+            peers.ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                1,
+                [8; 6],
+                3,
+                64,
+                0,
+                PacketNumberType::None,
+            ),
+            Err(DpError::WrongState)
+        );
         rings.status.push_back(status(1, 153, 2));
         peers
             .ath11k_dp_rx_tid_del_func(&mut reo, &mut rings, 0)
