@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::tags::{
     WMI_READY_EVENTID, WMI_SERVICE_AVAILABLE_EVENTID, WMI_SERVICE_READY_EVENTID,
-    WMI_SERVICE_READY_EXT_EVENTID, WMI_SERVICE_READY_EXT2_EVENTID, WMI_TAG_ARRAY_STRUCT,
+    WMI_SERVICE_READY_EXT2_EVENTID, WMI_SERVICE_READY_EXT_EVENTID, WMI_TAG_ARRAY_STRUCT,
     WMI_TAG_ARRAY_UINT32, WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT,
     WMI_TAG_HW_MODE_CAPABILITIES, WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT,
     WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
@@ -13,7 +13,7 @@ use crate::tags::{
 use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, Transport, WmiError};
 
-use super::{EventDecoder, Ready, ReadyDecoder, TlvIter, word};
+use super::{word, EventDecoder, Ready, ReadyDecoder, TlvIter};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceReadyFixed {
@@ -365,9 +365,10 @@ impl EventDecoder for ServiceReadyExt2Decoder {
             return Err(WmiError::Malformed);
         }
         let mut out = ServiceReadyExt2::default();
+        let mut dma_ring_cap_done = false;
         for tlv in TlvIter::new(event.tlvs()) {
             let tlv = tlv?;
-            if tlv.tag == WMI_TAG_ARRAY_STRUCT.0 && out.dma_ring_capabilities.is_empty() {
+            if tlv.tag == WMI_TAG_ARRAY_STRUCT.0 && !dma_ring_cap_done {
                 for nested in TlvIter::new(tlv.value) {
                     let nested = nested?;
                     if nested.tag != WMI_TAG_DMA_RING_CAPABILITIES.0
@@ -381,6 +382,7 @@ impl EventDecoder for ServiceReadyExt2Decoder {
                         value: nested.value.to_vec(),
                     });
                 }
+                dma_ring_cap_done = true;
             }
         }
         Ok(out)
