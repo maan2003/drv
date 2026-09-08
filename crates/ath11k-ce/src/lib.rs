@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use ath11k_hal::{
     Descriptor, RingFlags, RingId, RingMemory, RingType, Srng, SrngParams,
     descriptors::{
@@ -14,6 +14,7 @@ use ath11k_hal::{
 use ath11k_platform_backend::{
     Backend, Bidirectional, CoherentDma, Device, FromDevice, MmioRegion, StreamingDma, ToDevice,
 };
+use core::cell::RefCell;
 
 pub const CE_COUNT: usize = 9;
 pub const HTC_ENDPOINT_COUNT: usize = 9;
@@ -607,39 +608,6 @@ pub trait HtcServiceTransport {
     fn receive_payload(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
 }
 
-/// A service-specific view of the frozen multiplexed CE transport floor.
-pub struct BoundService<T> {
-    transport: T,
-    service: ServiceId,
-}
-
-impl<T> BoundService<T> {
-    pub const fn new(transport: T, service: ServiceId) -> Self {
-        Self { transport, service }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.transport
-    }
-}
-
-impl<T: Transport> HtcServiceTransport for BoundService<T> {
-    fn send_payload(&mut self, payload: &[u8]) -> Result<(), CeError> {
-        self.transport.send(TxFrame {
-            service: self.service,
-            bytes: payload.to_vec(),
-        })
-    }
-
-    fn receive_payload(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
-        match self.transport.receive(deadline_ns)? {
-            Some(frame) if frame.service == self.service => Ok(Some(frame.bytes)),
-            Some(_) => Err(CeError::InvalidFrame),
-            None => Ok(None),
-        }
-    }
-}
-
 /// Raw CE packet operations beneath HTC framing. `pipe` is the WCN6750 CE
 /// number selected by the service map, and `transfer_id` is the HTC endpoint.
 pub trait HtcPacketIo {
@@ -1012,6 +980,131 @@ impl<I: HtcPacketIo> Transport for HtcTransport<I> {
             Some(frame) => self.htc.receive(&frame),
             None => Ok(None),
         }
+    }
+}
+
+struct HtcRouterCore<I> {
+    transport: HtcTransport<I>,
+    endpoint_queues: [VecDeque<Vec<u8>>; HTC_ENDPOINT_COUNT],
+}
+
+/// Single owner of HTC/CE state with independently clonable endpoint handles.
+/// Core calls `service_receive` from its CE interrupt/poll path, mirroring
+/// `ath11k_htc_rx_completion_handler`; that method routes by endpoint before a
+/// WMI or HTT consumer observes the payload.
+pub struct HtcRouter<I> {
+    core: Rc<RefCell<HtcRouterCore<I>>>,
+}
+
+impl<I> Clone for HtcRouter<I> {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+        }
+    }
+}
+
+impl<I: HtcPacketIo> HtcRouter<I> {
+    pub fn new(transport: HtcTransport<I>) -> Self {
+        Self {
+            core: Rc::new(RefCell::new(HtcRouterCore {
+                transport,
+                endpoint_queues: core::array::from_fn(|_| VecDeque::new()),
+            })),
+        }
+    }
+
+    /// Issue a handle after `Htc::connect_service` has assigned the endpoint.
+    pub fn endpoint(&self, service: ServiceId) -> Result<BoundService<I>, CeError> {
+        let endpoint = self
+            .core
+            .try_borrow()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .htc()
+            .endpoint_for_service(service)
+            .map(|endpoint| endpoint.endpoint)
+            .ok_or(CeError::InvalidFrame)?;
+        Ok(BoundService {
+            core: self.core.clone(),
+            service,
+            endpoint,
+        })
+    }
+
+    pub fn bind_service(
+        &self,
+        service: ServiceId,
+        tx: RingId,
+        rx: RingId,
+    ) -> Result<BoundService<I>, CeError> {
+        self.core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .bind_service(service, tx, rx)?;
+        self.endpoint(service)
+    }
+
+    /// Drain currently completed CE frames and route each HTC payload to the
+    /// queue belonging to its connected endpoint.
+    pub fn service_receive(&self, deadline_ns: u64) -> Result<usize, CeError> {
+        let mut core = self
+            .core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?;
+        let mut routed = 0;
+        while let Some(frame) = core.transport.receive(deadline_ns)? {
+            let endpoint = core
+                .transport
+                .htc()
+                .endpoint_for_service(frame.service)
+                .map(|endpoint| endpoint.endpoint as usize)
+                .ok_or(CeError::InvalidFrame)?;
+            core.endpoint_queues[endpoint].push_back(frame.bytes);
+            routed += 1;
+        }
+        Ok(routed)
+    }
+}
+
+/// Clonable service-specific endpoint handle. Multiple WMI and HTT wrappers
+/// share one `HtcRouter` without duplicating endpoint credit or CE state.
+pub struct BoundService<I> {
+    core: Rc<RefCell<HtcRouterCore<I>>>,
+    service: ServiceId,
+    endpoint: u8,
+}
+
+impl<I> Clone for BoundService<I> {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            service: self.service,
+            endpoint: self.endpoint,
+        }
+    }
+}
+
+impl<I: HtcPacketIo> HtcServiceTransport for BoundService<I> {
+    fn send_payload(&mut self, payload: &[u8]) -> Result<(), CeError> {
+        self.core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .send(TxFrame {
+                service: self.service,
+                bytes: payload.to_vec(),
+            })
+    }
+
+    fn receive_payload(&mut self, _deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+        Ok(self
+            .core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .endpoint_queues[self.endpoint as usize]
+            .pop_front())
     }
 }
 
@@ -1519,7 +1612,7 @@ mod tests {
     #[derive(Default)]
     struct PacketIo {
         sent: Vec<(u8, u16, Vec<u8>)>,
-        receive: Option<Vec<u8>>,
+        receive: VecDeque<Vec<u8>>,
         fail_send: bool,
     }
 
@@ -1533,7 +1626,7 @@ mod tests {
         }
 
         fn receive_htc(&mut self, _: u64) -> Result<Option<Vec<u8>>, CeError> {
-            Ok(self.receive.take())
+            Ok(self.receive.pop_front())
         }
     }
 
@@ -1548,34 +1641,53 @@ mod tests {
         htc
     }
 
-    #[test]
-    fn service_transport_frames_and_demultiplexes_wmi() {
-        let mut received = Vec::from(
+    fn htc_frame(endpoint: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::from(
             HtcHeader {
-                endpoint: 1,
+                endpoint,
                 flags: 0,
-                payload_len: 2,
+                payload_len: payload.len() as u16,
                 control_byte_0: 0,
                 control_byte_1: 0,
             }
             .encode(),
         );
-        received.extend_from_slice(&[9, 8]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn service_transport_frames_and_demultiplexes_wmi() {
+        let mut htc = connected_wmi_htc();
+        htc.connect_service(
+            ServiceId::HTT_DATA_MSG,
+            &[3, 0, 0, 3, 0, 2, 0, 8, 0, 0, 0, 0],
+        )
+        .unwrap();
         let io = PacketIo {
-            receive: Some(received),
+            receive: VecDeque::from([htc_frame(1, &[9, 8]), htc_frame(2, &[7, 6])]),
             ..PacketIo::default()
         };
-        let mut multiplexed = HtcTransport::new(connected_wmi_htc(), io);
-        multiplexed
+        let router = HtcRouter::new(HtcTransport::new(htc, io));
+        let mut wmi = router
             .bind_service(ServiceId::WMI_CONTROL, RingId(35), RingId(58))
             .unwrap();
-        let mut service = BoundService::new(multiplexed, ServiceId::WMI_CONTROL);
-        service.send_payload(&[1, 2, 3]).unwrap();
-        assert_eq!(service.receive_payload(10), Ok(Some(vec![9, 8])));
-        let multiplexed = service.into_inner();
-        let (_, io) = multiplexed.into_parts();
-        assert_eq!((io.sent[0].0, io.sent[0].1), (3, 1));
-        assert_eq!(&io.sent[0].2[HTC_HEADER_LEN..], &[1, 2, 3]);
+        let mut htt = router.endpoint(ServiceId::HTT_DATA_MSG).unwrap();
+        wmi.send_payload(&[1, 2, 3]).unwrap();
+        htt.send_payload(&[4, 5]).unwrap();
+        assert_eq!(router.service_receive(10), Ok(2));
+        // Each independent consumer sees only its endpoint's routed queue.
+        assert_eq!(htt.receive_payload(10), Ok(Some(vec![7, 6])));
+        assert_eq!(wmi.receive_payload(10), Ok(Some(vec![9, 8])));
+        let core = router.core.borrow();
+        assert_eq!(
+            (core.transport.io.sent[0].0, core.transport.io.sent[0].1),
+            (3, 1)
+        );
+        assert_eq!(
+            (core.transport.io.sent[1].0, core.transport.io.sent[1].1),
+            (4, 2)
+        );
     }
 
     #[test]
