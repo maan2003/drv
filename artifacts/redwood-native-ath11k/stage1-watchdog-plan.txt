@@ -1,0 +1,9 @@
+STAGE1 WATCHDOG PROOF PLAN
+hardware_state_changed=false (plan only)
+USB_ECM=unavailable; phone absent from np USB sysfs
+RESIDUAL_RISK=watchdog node and driver are not yet proven; a kexec kernel hang needs user hands
+RECOVERY=hold POCO X5 Pro power button continuously for 15 seconds (or until display goes black/vibrates), release it, then press Power normally if it does not auto-start; the unchanged flashed native slot boots and rejoins ajay; do not press Volume buttons, enter fastboot, flash, or change slots
+KERNEL=native config plus CONFIG_QCOM_WDT=y and DT watchdog@17c10000 only
+CMDLINE_APPEND=panic=10 oops=panic
+GATE=after SSH returns over Wi-Fi, require /dev/watchdog0; arm only after SSH; stop feeding deliberately; require SoC reset and native Wi-Fi SSH return
+STAGE2_PROHIBITED_UNTIL_GATE=true
