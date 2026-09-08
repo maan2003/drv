@@ -91,6 +91,7 @@ dependencies = [
  "ath11k-ce",
  "ath11k-hal",
  "ath11k-platform-backend",
+ "dma-pool",
  "drv-hardware-backends",
 ]
 
