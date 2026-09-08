@@ -31,8 +31,8 @@ misreported as replaced code.
 | `ath11k_pcic_ext_irq_config` | `pcic.c:573-660` | `ahb::WCN6750_DP_INTERRUPT_ROUTES` / `Wcn6750DpInterrupts::enable` | ported | Nonempty WCN6750 ring-mask groups map to DP base vector 10 plus group; opening all routes is transactional. |
 | `ath11k_pcic_ext_irq_enable` / `ath11k_pcic_ext_irq_disable` | `pcic.c:435-521` | `Wcn6750DpInterrupts::{enable,disable}` | ported-corrected | The portable backend has no kernel IRQ masking primitive, so enable opens routes and disable drops them physically; no NAPI policy crosses the seam. |
 | `ath11k_ahb_get_window_start_wcn6750` | `ahb.c:151-164` | `ahb::RegisterWindow::for_offset` | wcn6750-specific | Static DP/CE window selection. |
-| `ath11k_ahb_window_write32_wcn6750` | `ahb.c:167-176` | `ahb::RegisterWindow::mapped_offset` | wcn6750-specific | Bounded MMIO performs the write. |
-| `ath11k_ahb_window_read32_wcn6750` | `ahb.c:178-189` | `ahb::RegisterWindow::mapped_offset` | wcn6750-specific | Bounded MMIO performs the read. |
+| `ath11k_ahb_window_write32_wcn6750` | `ahb.c:167-176` | `ahb::wcn6750_register_offset` / `MmioRegion::map_offsets` | wcn6750-specific | The QMI-discovered 2 MiB aperture translates every bounded CE/HAL/DP write. |
+| `ath11k_ahb_window_read32_wcn6750` | `ahb.c:178-189` | `ahb::wcn6750_register_offset` / `MmioRegion::map_offsets` | wcn6750-specific | The QMI-discovered 2 MiB aperture translates every bounded CE/HAL/DP read. |
 | `ath11k_ahb_start` | `ahb.c:365-371` | `Operation::HifStart` / CE `rx_post_buf` | ported | Normative lifecycle transcript plus real CE API. |
 | `ath11k_ahb_stop` | `ahb.c:394-402` | `Operation::HifStop` | ported | Crash-flush distinction retained. |
 | `ath11k_pcic_ce_interrupt_handler` / `ath11k_pcic_ce_tasklet` | `pcic.c:406-432` | `Wcn6750CeInterrupts::wait_any` / `ahb::service_ce_interrupt` | ported | WCN6750 hybrid-bus delivery is typed by CE engine and directly dispatches real CE service. |
@@ -46,7 +46,7 @@ misreported as replaced code.
 | `ath11k_core_start` | `core.c:2133-2242` | `Device::core_start` | ported | Exact WMI/HTC/HIF/HTT/DP ordering and fall-through unwind asserted. |
 | `ath11k_core_stop` | `core.c:1973-1983` | `Device::core_stop` | ported | Crash flush suppresses QMI firmware-stop only. |
 | `ath11k_core_start_firmware` | `core.c:2244-2259` | `Wcn6750QmiSession::firmware_start` | ported | Real event-driven QMI session. |
-| `ath11k_core_qmi_firmware_ready` | `core.c:2261-2327` | `Device::attach_firmware` | ported | CE/DP/core/pdev/IRQ order asserted. |
+| `ath11k_core_qmi_firmware_ready` | `core.c:2261-2327` | `Device::attach_firmware` / `Wcn6750Subsystems::wait_for_firmware_ready` | ported | The validated DEVICE_INFO aperture transfers from QMI to HIF before CE/DP register access; CE/DP/core/pdev/IRQ order is asserted. |
 | `ath11k_core_pdev_create` | `core.c:2029-2084` | `DpPdevAllocate` / `MacRegister` operations | ported | Thermal/spectral/CFR branches classified separately. |
 | `ath11k_core_pdev_destroy` | `core.c:2121-2131` | `Device::stop` pdev phase | ported | Includes WCN6750 pdev suspend before IRQ disable. |
 | `ath11k_core_pre_reconfigure_recovery` | `core.c:2417-2464` | `Device::firmware_crashed` | ported | Quiesces outstanding waits without panic. |

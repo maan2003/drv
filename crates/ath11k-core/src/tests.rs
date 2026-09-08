@@ -76,6 +76,30 @@ fn wcn6750_parameters_and_static_windows_match_source() {
         RegisterWindow::CopyEngine.mapped_offset(0x01b8_1234),
         0x0010_1234
     );
+    // Direct HIF, REO/TCL/WBM DP, and the complete CE0..CE11 register
+    // ranges used by the current HAL/CE/DP implementations must fit the
+    // exact 2 MiB aperture returned by QMI DEVICE_INFO.
+    for raw in [
+        0x0000_0000,
+        0x0007_fffc,
+        0x00a3_4000,
+        0x00a3_b028,
+        0x00a4_4000,
+        0x00a4_49fc,
+        0x01b8_0000,
+        0x01b9_7058,
+    ] {
+        assert!(wcn6750_register_offset(raw).unwrap() < 0x20_0000);
+    }
+    assert_eq!(wcn6750_register_offset(0x0007_fffc), Some(0x0007_fffc));
+    assert_eq!(wcn6750_register_offset(0x00a3_8000), Some(0x000b_8000));
+    assert_eq!(wcn6750_register_offset(0x01b8_0000), Some(0x0010_0000));
+    assert_eq!(
+        usize::try_from(0x1_0000_0000_u64)
+            .ok()
+            .and_then(wcn6750_register_offset),
+        None
+    );
     assert_eq!(WCN6750_INTERRUPT_ROUTES.len(), 16);
     assert!(
         WCN6750_INTERRUPT_ROUTES[..7]

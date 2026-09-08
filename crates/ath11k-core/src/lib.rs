@@ -19,6 +19,7 @@ pub use ahb::{
     WCN6750_DP_INTERRUPT_ROUTES, WCN6750_INTERRUPT_ROUTES, Wcn6750CeWaiter, Wcn6750DpInterrupts,
     Wcn6750InterruptService, Wcn6750InterruptServiceError, Wcn6750Interrupts, Wcn6750Irq,
     dispatch_wcn6750_interrupt, service_ce_interrupt, service_dp_external_group,
+    wcn6750_register_offset,
 };
 pub use events::{EventSink, WlanEvent};
 pub use hw::{FirmwareLayout, HardwareParams, RingMask, WCN6750, Wcn6750};

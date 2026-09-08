@@ -356,21 +356,21 @@ const fn control_budget_has_room(consumed: usize, budget: usize) -> bool {
 
 /// Real subsystem owner. Every resource moves forward through an explicit
 /// option; no raw descriptor, DMA address, or backend handle crosses this seam.
-pub struct Wcn6750Subsystems<B, Q, A, M, W, D, S = NoWmiTrace>
+pub struct Wcn6750Subsystems<B, Q, A, W, D, S = NoWmiTrace>
 where
     B: Backend,
     Q: QmiTransport,
     A: ath11k_qmi::FirmwareAssets,
-    M: ath11k_qmi::MemoryProvider,
     W: CeCompletionWait,
     D: FnMut() -> u64,
     S: WmiTraceSink,
 {
-    qmi: Wcn6750QmiSession<Q, A, M>,
+    qmi: Wcn6750QmiSession<Q, A, crate::HardwareMemoryProvider<B>>,
     device: Device<B>,
     waiter: Option<W>,
     dp_interrupts: crate::Wcn6750DpInterrupts<B>,
     mmio: Option<MmioRegion<B>>,
+    dp_mmio: Option<MmioRegion<B>>,
     rdp: Option<CoherentDma<B, Bidirectional>>,
     allocated: Option<CeAllocatedPipes<B>>,
     pipes: Option<CePipes<B>>,
@@ -386,18 +386,17 @@ where
     pending_mgmt_tx: Vec<(u32, StreamingDma<B, ToDevice>)>,
 }
 
-impl<B, Q, A, M, W, D, S> Wcn6750Subsystems<B, Q, A, M, W, D, S>
+impl<B, Q, A, W, D, S> Wcn6750Subsystems<B, Q, A, W, D, S>
 where
     B: Backend,
     Q: QmiTransport,
     A: ath11k_qmi::FirmwareAssets,
-    M: ath11k_qmi::MemoryProvider,
     W: CeCompletionWait,
     D: FnMut() -> u64,
     S: WmiTraceSink,
 {
     pub fn new(
-        qmi: Wcn6750QmiSession<Q, A, M>,
+        qmi: Wcn6750QmiSession<Q, A, crate::HardwareMemoryProvider<B>>,
         device: Device<B>,
         waiter: W,
         dp_interrupts: crate::Wcn6750DpInterrupts<B>,
@@ -410,6 +409,7 @@ where
             waiter: Some(waiter),
             dp_interrupts,
             mmio: None,
+            dp_mmio: None,
             rdp: None,
             allocated: None,
             pipes: None,
@@ -599,12 +599,11 @@ where
     }
 }
 
-impl<B, Q, A, M, W, D, S> Subsystems for Wcn6750Subsystems<B, Q, A, M, W, D, S>
+impl<B, Q, A, W, D, S> Subsystems for Wcn6750Subsystems<B, Q, A, W, D, S>
 where
     B: Backend,
     Q: QmiTransport,
     A: ath11k_qmi::FirmwareAssets,
-    M: ath11k_qmi::MemoryProvider,
     W: CeCompletionWait,
     D: FnMut() -> u64,
     S: WmiTraceSink,
@@ -648,9 +647,24 @@ where
     }
 
     fn wait_for_firmware_ready(&mut self) -> Result<FirmwareReady, CoreError> {
-        self.qmi
+        let ready = self
+            .qmi
             .wait_for_firmware_ready()
-            .map_err(|_| CoreError::Protocol)
+            .map_err(|_| CoreError::Protocol)?;
+        let mmio = self.qmi.take_device_bar().ok_or(CoreError::Protocol)?;
+        let dp_mmio = mmio
+            .slice(0, mmio.len())
+            .map_err(|_| CoreError::DeviceFault)?;
+        self.mmio = Some(
+            mmio.map_offsets(crate::wcn6750_register_offset)
+                .map_err(|_| CoreError::DeviceFault)?,
+        );
+        self.dp_mmio = Some(
+            dp_mmio
+                .map_offsets(crate::wcn6750_register_offset)
+                .map_err(|_| CoreError::DeviceFault)?,
+        );
+        Ok(ready)
     }
 
     fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
@@ -759,11 +773,6 @@ where
                 Ok(())
             }
             Operation::HifPowerUp => {
-                self.mmio = Some(
-                    self.device
-                        .open_region(0)
-                        .map_err(|_| CoreError::DeviceFault)?,
-                );
                 self.rdp = Some(
                     self.device
                         .alloc_coherent::<Bidirectional>(RDP_BYTES, 8)
@@ -1094,7 +1103,9 @@ where
                 Ok(())
             }
             Operation::DpAllocate => {
-                let rings = HalDpRings::new(&self.device, &[]).map_err(Self::dp_error)?;
+                let rings =
+                    HalDpRings::new(&self.device, Self::protocol(self.dp_mmio.take())?, &[])
+                        .map_err(Self::dp_error)?;
                 let dp = ClientDataPath::ath11k_dp_alloc(
                     self.device.clone(),
                     rings,
@@ -1271,7 +1282,6 @@ mod tests {
             drv_hardware_backends::DeterministicBackend,
             DummyQmi,
             DummyAssets,
-            DummyMemory,
             ath11k_ce::NoCompletionWait,
             fn() -> u64,
         >::qmi_config();
@@ -1341,22 +1351,6 @@ mod tests {
             Ok(None)
         }
     }
-    struct DummyMemory;
-    impl ath11k_qmi::MemoryProvider for DummyMemory {
-        fn provision(
-            &mut self,
-            _: &[ath11k_qmi::wire::MemorySegment],
-        ) -> Result<Vec<ath11k_qmi::wire::MemorySegmentResponse>, ath11k_qmi::QmiError> {
-            Ok(Vec::new())
-        }
-        fn load_m3(&mut self, _: &[u8]) -> Result<ath11k_qmi::MemoryRegion, ath11k_qmi::QmiError> {
-            Err(ath11k_qmi::QmiError::Transport)
-        }
-        fn map_device_bar(&mut self, _: u64, _: u32) -> Result<(), ath11k_qmi::QmiError> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn exact_control_budget_defers_the_routed_wmi_event() {
         // The bounded event loop must return after routing the final allowed

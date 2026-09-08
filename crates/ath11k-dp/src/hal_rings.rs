@@ -44,7 +44,11 @@ impl<B: Backend> HalDpRings<B> {
     /// An empty MSI table selects the polling-first mode required by
     /// `specs/ARCH-dma-broker.md`; a nonempty table selects MSI mode and must
     /// cover every interrupt-bearing ring.
-    pub fn new(device: &Device<B>, msi: &[DpRingMsi]) -> Result<Self, DpError> {
+    pub fn new(
+        device: &Device<B>,
+        mmio: MmioRegion<B>,
+        msi: &[DpRingMsi],
+    ) -> Result<Self, DpError> {
         for (index, entry) in msi.iter().enumerate() {
             if entry.address == 0 {
                 return Err(DpError::WrongState);
@@ -64,7 +68,7 @@ impl<B: Backend> HalDpRings<B> {
             .alloc_coherent(write_pointer_bytes, 8)
             .map_err(|_| DpError::NoResources)?;
         Ok(Self {
-            mmio: device.open_region(0).map_err(|_| DpError::DeviceFault)?,
+            mmio,
             remote_read_pointers,
             remote_write_pointers,
             msi: msi.to_vec(),

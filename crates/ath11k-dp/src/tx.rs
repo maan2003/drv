@@ -1754,7 +1754,7 @@ mod tests {
         let fail_mmio_write = backend.fail_mmio_write_once.clone();
         let device = Device::from_backend(backend);
         // Polling-first mode from specs/ARCH-dma-broker.md has no MSI records.
-        let rings = crate::HalDpRings::new(&device, &[]).unwrap();
+        let rings = crate::HalDpRings::new(&device, device.open_region(0).unwrap(), &[]).unwrap();
         assert!(
             memory
                 .borrow()
@@ -1915,14 +1915,19 @@ mod tests {
         let mut zero_address = msi_config();
         zero_address[0].address = 0;
         assert!(matches!(
-            crate::HalDpRings::new(&device, &zero_address),
+            crate::HalDpRings::new(&device, device.open_region(0).unwrap(), &zero_address),
             Err(DpError::WrongState)
         ));
 
         let mut missing_reo_exception = msi_config();
         missing_reo_exception.retain(|msi| msi.ring_type != ath11k_hal::RingType::ReoException);
         let device = Device::from_backend(AggregateBackend::default());
-        let rings = crate::HalDpRings::new(&device, &missing_reo_exception).unwrap();
+        let rings = crate::HalDpRings::new(
+            &device,
+            device.open_region(0).unwrap(),
+            &missing_reo_exception,
+        )
+        .unwrap();
         let error = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
             Ok(_) => panic!("missing REO-exception MSI was accepted"),
             Err(error) => error,
@@ -1930,7 +1935,8 @@ mod tests {
         assert_eq!(error.cause(), DpError::NoResources);
 
         let device = Device::from_backend(AggregateBackend::default());
-        let rings = crate::HalDpRings::new(&device, &msi_config()).unwrap();
+        let rings =
+            crate::HalDpRings::new(&device, device.open_region(0).unwrap(), &msi_config()).unwrap();
         let mut dp = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
             Ok(dp) => dp,
             Err(_) => panic!("complete MSI configuration was rejected"),

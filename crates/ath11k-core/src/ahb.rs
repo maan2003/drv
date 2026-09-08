@@ -34,6 +34,15 @@ impl RegisterWindow {
     }
 }
 
+/// Translate a WCN6750 register address into its fixed 2 MiB QMI aperture.
+pub const fn wcn6750_register_offset(offset: usize) -> Option<usize> {
+    if offset > u32::MAX as usize {
+        return None;
+    }
+    let offset = offset as u32;
+    Some(RegisterWindow::for_offset(offset).mapped_offset(offset) as usize)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MsiUser {
     CopyEngine,

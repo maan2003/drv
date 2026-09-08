@@ -973,6 +973,80 @@ mod tests {
     }
 
     #[test]
+    fn translated_mmio_maps_every_operation_and_fails_closed() {
+        fn translate(offset: usize) -> Option<usize> {
+            match offset {
+                0x100 => Some(0x100),
+                0x1000 => Some(0x200),
+                0x2000 => Some(0x400),
+                0x3000 => None,
+                0x4000 => Some(1),
+                0x5000 => Some(0x2000),
+                _ => Some(offset),
+            }
+        }
+
+        let (device, operations) = DeterministicBackend::recording_device_with_region_len(0x2000);
+        let raw = device.open_region(0).unwrap();
+        assert!(matches!(
+            raw.slice(0, raw.len())
+                .unwrap()
+                .map_offsets(translate)
+                .unwrap()
+                .map_offsets(translate),
+            Err(Error::Invalid)
+        ));
+        let translated = raw
+            .slice(0, raw.len())
+            .unwrap()
+            .map_offsets(translate)
+            .unwrap();
+        let dma = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(64, 8)
+            .unwrap();
+
+        translated.write_u32(0x100, 1).unwrap();
+        translated.write_u32(0x1000, 2).unwrap();
+        translated.write_u32(0x2000, 3).unwrap();
+        translated
+            .write_device_address(0x1000, Some(0x2000), dma.device_address(0).unwrap())
+            .unwrap();
+        assert_eq!(translated.write_u32(0x3000, 4), Err(Error::OutOfBounds));
+        assert_eq!(translated.write_u32(0x4000, 4), Err(Error::Invalid));
+        assert_eq!(translated.write_u32(0x5000, 4), Err(Error::OutOfBounds));
+        assert_eq!(translated.slice(0, 4).err(), Some(Error::Invalid));
+        assert_eq!(
+            operations.borrow().as_slice(),
+            &[
+                Operation::WriteU32 {
+                    region: 0,
+                    offset: 0x100,
+                    value: 1,
+                },
+                Operation::WriteU32 {
+                    region: 0,
+                    offset: 0x200,
+                    value: 2,
+                },
+                Operation::WriteU32 {
+                    region: 0,
+                    offset: 0x400,
+                    value: 3,
+                },
+                Operation::WriteDeviceAddress {
+                    region: 0,
+                    low: 0x200,
+                    high: Some(0x400),
+                    value: FIRST_IOVA,
+                },
+            ]
+        );
+
+        device.reset().unwrap();
+        assert_eq!(translated.write_u32(0x100, 5), Err(Error::StaleHandle));
+    }
+
+    #[test]
     fn dma_splits_preserve_one_backend_allocation_and_contiguous_addresses() {
         let device = DeterministicBackend::device();
         let coherent = device

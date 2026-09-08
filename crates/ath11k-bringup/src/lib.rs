@@ -969,7 +969,6 @@ type LiveSubsystems = ath11k_core::Wcn6750Subsystems<
     LinuxVfio,
     QrtrTransport,
     ath11k_core::Wcn6750FirmwareAssets,
-    ath11k_core::HardwareMemoryProvider<LinuxVfio>,
     ath11k_core::Wcn6750CeWaiter<LinuxVfio>,
     fn() -> u64,
     JsonTrace,

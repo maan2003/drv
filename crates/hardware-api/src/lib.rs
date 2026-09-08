@@ -239,6 +239,7 @@ impl<B: Backend> Device<B> {
             generation,
             offset: 0,
             len,
+            offset_mapper: None,
         })
     }
 
@@ -361,6 +362,7 @@ pub struct MmioRegion<B: Backend> {
     generation: u64,
     offset: usize,
     len: usize,
+    offset_mapper: Option<fn(usize) -> Option<usize>>,
 }
 impl<B: Backend> MmioRegion<B> {
     pub fn len(&self) -> usize {
@@ -372,6 +374,9 @@ impl<B: Backend> MmioRegion<B> {
     /// Return an independently owned view bounded to a sub-window of this
     /// mapping. The backend mapping is released after the last view is dropped.
     pub fn slice(&self, offset: usize, len: usize) -> Result<Self> {
+        if self.offset_mapper.is_some() {
+            return Err(Error::Invalid);
+        }
         let range = checked_range(offset, len, self.len)?;
         current(&self.allocation.shared, self.generation)?;
         Ok(Self {
@@ -382,10 +387,21 @@ impl<B: Backend> MmioRegion<B> {
                 .checked_add(range.start)
                 .ok_or(Error::OutOfBounds)?,
             len: range.len(),
+            offset_mapper: None,
         })
     }
+    /// Apply a device register-address translation to this complete physical
+    /// mapping. Slice first when multiple independently owned views are
+    /// required; slicing a translated view fails closed.
+    pub fn map_offsets(mut self, mapper: fn(usize) -> Option<usize>) -> Result<Self> {
+        if self.offset_mapper.is_some() {
+            return Err(Error::Invalid);
+        }
+        self.offset_mapper = Some(mapper);
+        Ok(self)
+    }
     pub fn read_u32(&self, offset: usize) -> Result<u32> {
-        self.check(offset, 4)?;
+        let offset = self.mapped_offset(offset, 4)?;
         self.allocation.shared.0.borrow_mut().read_u32(
             self.allocation.token.as_ref().unwrap(),
             self.offset + offset,
@@ -393,7 +409,7 @@ impl<B: Backend> MmioRegion<B> {
     }
     /// Perform one checked MMIO store. `Err` means no store occurred.
     pub fn write_u32(&self, offset: usize, value: u32) -> Result<()> {
-        self.check(offset, 4)?;
+        let offset = self.mapped_offset(offset, 4)?;
         self.allocation.shared.0.borrow_mut().write_u32(
             self.allocation.token.as_ref().unwrap(),
             self.offset + offset,
@@ -406,10 +422,10 @@ impl<B: Backend> MmioRegion<B> {
         high: Option<usize>,
         address: DeviceAddress<'_, B, D>,
     ) -> Result<()> {
-        self.check(low, 4)?;
-        if let Some(h) = high {
-            self.check(h, 4)?;
-        }
+        let low = self.mapped_offset(low, 4)?;
+        let high = high
+            .map(|offset| self.mapped_offset(offset, 4))
+            .transpose()?;
         if !Rc::ptr_eq(&self.allocation.shared.0, &address.dma.allocation.shared.0) {
             return Err(Error::Invalid);
         }
@@ -422,12 +438,20 @@ impl<B: Backend> MmioRegion<B> {
             address.offset,
         )
     }
-    fn check(&self, o: usize, n: usize) -> Result<()> {
+    fn mapped_offset(&self, offset: usize, width: usize) -> Result<usize> {
         current(&self.allocation.shared, self.generation)?;
-        if !o.is_multiple_of(4) {
+        if !offset.is_multiple_of(4) {
             return Err(Error::Invalid);
         }
-        checked_range(o, n, self.len).map(|_| ())
+        let mapped = match self.offset_mapper {
+            Some(mapper) => mapper(offset).ok_or(Error::OutOfBounds)?,
+            None => offset,
+        };
+        if !mapped.is_multiple_of(4) {
+            return Err(Error::Invalid);
+        }
+        checked_range(mapped, width, self.len)?;
+        Ok(mapped)
     }
 }
 struct DmaAllocation<B: Backend> {
