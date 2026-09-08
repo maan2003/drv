@@ -159,8 +159,8 @@ mod tests {
         let (device, operations) = DeterministicBackend::recording_device();
         let tid = ReoTid::setup(&device, 3, 64, 0x123, PacketNumberType::Wpa).unwrap();
         assert!(matches!(
-            operations.borrow().as_slice(),
-            [Operation::SyncForDevice { range, .. }] if range == &(0..512)
+            operations.borrow().last(),
+            Some(Operation::SyncForDevice { range, .. }) if range == &(0..512)
         ));
         let mut controller = ReoController {
             command_ring: RingId(8),

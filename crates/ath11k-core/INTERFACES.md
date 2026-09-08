@@ -91,7 +91,12 @@ Protocol crates never depend on core. HAL depends directly on the shared `drv-ha
   HAL's `Rings<B>` plus DP's additive `DpRingOps<B>` setup/teardown operations,
   which carry the full ring type/number/MAC specification into the HAL owner.
   HAL retains descriptor/SRNG mechanics and core retains the shared HTC
-  endpoint and interrupt handles.
+  endpoint and interrupt handles. Production uses `HalDpRings<B>`, which owns
+  a DP-only MMIO view and coherent RDP/WRP arrays for ring IDs 0–9, 16–25,
+  104–110, and 128–135; CE separately owns IDs 32–91, so their
+  pointer/register writers are disjoint. `ClientDataPath::configure_htt` borrows the bound HTT endpoint
+  while `HalDpRings` is live and sends, rather than exposes, firmware-visible
+  DMA addresses.
 - **core:** `Lifecycle`, typed pdev/vdev IDs and `RadioControl`. The latter
   is intentionally narrower than mac80211 and implements WlanSoftmac effects.
 
