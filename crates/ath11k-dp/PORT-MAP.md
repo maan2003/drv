@@ -51,8 +51,8 @@ Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
 | Native HTT golden artifact verifier | `trace.h:36-121` | `parse_jsonl`, `verify_trace`, `golden::GoldenRecord` | local-seam | Parses `artifacts/redwood-native-ath11k/htt/ordered.jsonl`, validates dynamic-array lengths/lower hex, reports exact/unmapped/first differing offset/decode failure, and runs RX descriptors through the real parser. |
 | Link-descriptor error paths | `dp_rx.c:3380-3480` | — | deferred | HAL codecs exist in `ath11k-hal`; common STA REO destination path receives direct MSDU buffers. |
 | Link-descriptor release paths | `dp_rx.c:3780-3885` | — | deferred | HAL codecs exist in `ath11k-hal`; common STA REO destination path receives direct MSDU buffers. |
-| `ath11k_dp_tx_htt_h2t_ppdu_stats_req` | `dp_tx.c:1036-1069` | — | deferred | PPDU telemetry is not required for client bring-up. |
-| `ath11k_dp_tx_htt_h2t_ext_stats_req` | `dp_tx.c:1152-1185` | — | deferred | Debugfs extended statistics. |
+| `ath11k_dp_tx_htt_h2t_ppdu_stats_req` | `dp_tx.c:1036-1069` | `htt::PpduStatsConfig::encode` | ported | Exact four-byte request encoding is covered by generated C differential; callers retain transport and per-RXDMA iteration policy. |
+| `ath11k_dp_tx_htt_h2t_ext_stats_req` | `dp_tx.c:1152-1185` | `htt::ExtStatsConfig::encode` | ported | Exact 32-byte request encoding, including reserved zero and correlation cookie, is covered by generated C differential; callers retain transport policy. |
 | `ath11k_dp_tx_htt_monitor_mode_ring_config` | `dp_tx.c:1187-1267` | — | deferred | Monitor mode. |
 | `ath11k_dp_tx_htt_rx_full_mon_setup` | `dp_tx.c:1269-1305` | — | deferred | Full monitor mode. |
 | `ath11k_htt_pull_ppdu_stats` and helpers | `dp_rx.c:1224-1602` | — | deferred | PPDU telemetry; native golden capture harness is prepared separately. |

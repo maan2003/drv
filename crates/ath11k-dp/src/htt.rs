@@ -8,6 +8,8 @@ use crate::{DpError, HttControl, HttHostMessage, HttTargetMessage, PeerId};
 const VERSION_REQ: u8 = 0;
 const SRING_SETUP: u8 = 0x0b;
 const RX_RING_SELECTION_CFG: u8 = 0x0c;
+const EXT_STATS_CFG: u8 = 0x10;
+const PPDU_STATS_CFG: u8 = 0x11;
 
 pub const TARGET_VERSION_MAJOR: u8 = 3;
 
@@ -128,6 +130,49 @@ impl RxRingSelection {
             self.filter.control,
             self.filter.data,
             self.filter.tlvs,
+        ];
+        HttHostMessage(words_to_bytes(&words))
+    }
+}
+
+/// One `htt_ppdu_stats_cfg_cmd` for a selected set of physical devices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PpduStatsConfig {
+    pub pdev_mask: u8,
+    pub tlv_mask: u16,
+}
+
+impl PpduStatsConfig {
+    pub fn encode(self) -> HttHostMessage {
+        let word = u32::from(PPDU_STATS_CFG)
+            | (u32::from(self.pdev_mask & 0x7f) << 9)
+            | (u32::from(self.tlv_mask) << 16);
+        HttHostMessage(word.to_le_bytes().to_vec())
+    }
+}
+
+/// `htt_ext_stats_cfg_cmd`, including the opaque response-correlation cookie.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtStatsConfig {
+    pub pdev_mask: u8,
+    pub stats_type: u8,
+    pub parameters: [u32; 4],
+    pub cookie: u64,
+}
+
+impl ExtStatsConfig {
+    pub fn encode(self) -> HttHostMessage {
+        let words = [
+            u32::from(EXT_STATS_CFG)
+                | (u32::from(self.pdev_mask) << 8)
+                | (u32::from(self.stats_type) << 16),
+            self.parameters[0],
+            self.parameters[1],
+            self.parameters[2],
+            self.parameters[3],
+            0,
+            self.cookie as u32,
+            (self.cookie >> 32) as u32,
         ];
         HttHostMessage(words_to_bytes(&words))
     }

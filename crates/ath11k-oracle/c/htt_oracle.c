@@ -42,6 +42,17 @@ void oracle_htt_rx_select_encode(const struct oracle_htt_rx_select *in, u8 *out)
         in->management_0, in->management_1, in->control, in->data, in->tlvs };
     words(out, w, 7);
 }
+void oracle_htt_ppdu_stats_encode(u8 pdev_mask, u16 tlv_mask, u8 out[4]) {
+    u32 w = 0x11 | (((u32)pdev_mask & 0x7f) << 9) | ((u32)tlv_mask << 16);
+    words(out, &w, 1);
+}
+void oracle_htt_ext_stats_encode(u8 pdev_mask, u8 stats_type,
+                                 const u32 params[4], u64 cookie, u8 out[32]) {
+    u32 w[8] = { 0x10 | ((u32)pdev_mask << 8) | ((u32)stats_type << 16),
+        params[0], params[1], params[2], params[3], 0,
+        (u32)cookie, (u32)(cookie >> 32) };
+    words(out, w, 8);
+}
 int oracle_htt_event_decode(const u8 *bytes, size_t len, struct oracle_htt_event *out) {
     u32 w[4] = {0}; if (len < 4) return -22; memcpy(w, bytes, len < 16 ? len : 16);
     u8 type = w[0]; memset(out, 0, sizeof(*out)); out->kind = type;

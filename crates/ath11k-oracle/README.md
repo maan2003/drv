@@ -16,6 +16,9 @@ result-ath11k`, or set `ATH11K_REFERENCE_DIR` to its
 `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4` directory, then run
 `cargo test -p ath11k-oracle`.
 
+The HTT suite compares exact host-to-target bytes for version, SRNG setup,
+RX ring selection, PPDU statistics, and extended-statistics requests.
+
 The HAL differential suite uses the descriptor layouts and masks from the same
 pinned `hal_desc.h`, `hal_rx.h`, `hal_rx.c`, `hal_tx.c`, and `hal.c`. It covers
 every WCN6750 ring's entry size, capacity, and ID geometry; the complete ordered
