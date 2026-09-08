@@ -1,0 +1,4 @@
+MT76_ORACLE v=1 seq=1 kind=mcu_source cmd=0x4001d payload_len=44 wait=0
+MT76_ORACLE v=1 seq=2 kind=mcu_source cmd=0x400a1 payload_len=8 wait=0
+MT76_ORACLE v=1 seq=3 kind=mcu_source cmd=0x20003 payload_len=60 wait=1
+MT76_ORACLE v=1 seq=4 kind=mcu_source cmd=0x20027 payload_len=16 wait=0

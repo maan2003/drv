@@ -1,0 +1,26 @@
+[package]
+name = "mt7921-port-spike"
+description = "MT7921 userspace adapter, CLI, and lab orchestration"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+driver-runtime = { path = "../driver-runtime" }
+mt7921-core = { path = "../mt7921-core" }
+userspace-vfio = { path = "../userspace-vfio" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mt7921-scan"
+path = "src/bin/scan.rs"
+
+[[bin]]
+name = "mt7921-vfio-read"
+path = "src/bin/vfio_read.rs"
+
+[[bin]]
+name = "mt7921-firmware-inspect"
+path = "src/bin/firmware_inspect.rs"

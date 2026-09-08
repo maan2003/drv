@@ -1,0 +1,11 @@
+[package]
+name = "netstack3_macros"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[lib]
+proc-macro = true
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

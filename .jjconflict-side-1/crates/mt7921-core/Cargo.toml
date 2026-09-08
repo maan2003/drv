@@ -1,0 +1,16 @@
+[package]
+name = "mt7921-core"
+description = "Linux v7.1 MT76/MT7921 hardware core for userspace drivers"
+edition.workspace = true
+license = "GPL-2.0-only"
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+driver-runtime = { path = "../driver-runtime" }
+mt76-core = { path = "../mt76-core" }
+
+[dev-dependencies]
+sha2 = "=0.10.9"

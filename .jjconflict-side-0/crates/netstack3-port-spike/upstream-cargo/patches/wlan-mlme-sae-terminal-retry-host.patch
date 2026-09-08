@@ -1,0 +1,64 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
+@@ -102,6 +102,7 @@
+ enum AuthProgress {
+     Complete,
+     InProgress,
++    RetryableTxFailure,
+     Failed,
+ }
+ 
+@@ -208,7 +209,15 @@
+                 Err(_) => "send_error",
+             }
+         ));
+-        self.akm_state_update_notify_sme(sta, state).await
++        match state {
++            Err(error) => {
++                crate::sae_disposition(format_args!(
++                    "result=akm_sme_sae_tx category=terminal_failure retry_owner=sme error={error}"
++                ));
++                AuthProgress::RetryableTxFailure
++            }
++            state => self.akm_state_update_notify_sme(sta, state).await,
++        }
+     }
+ 
+     /// Processes an inbound deauthentication frame.
+@@ -1271,6 +1280,7 @@
+                 {
+                     AuthProgress::Complete => state.transition_to(Associating::default()).into(),
+                     AuthProgress::InProgress => state.into(),
++                    AuthProgress::RetryableTxFailure => state.into(),
+                     AuthProgress::Failed => state.transition_to(Joined).into(),
+                 },
+                 mac::MgmtBody::Deauthentication { deauth_hdr, .. } => {
+@@ -1504,6 +1514,7 @@
+                 MlmeReq::SaeHandshakeResp(resp) => match state.on_sme_sae_resp(sta, resp).await {
+                     AuthProgress::Complete => state.transition_to(Associating::default()).into(),
+                     AuthProgress::InProgress => state.into(),
++                    AuthProgress::RetryableTxFailure => state.into(),
+                     AuthProgress::Failed => state.transition_to(Joined).into(),
+                 },
+                 MlmeReq::SaeFrameTx(frame) => {
+@@ -1524,6 +1535,7 @@
+                         match progress {
+                             AuthProgress::Complete => "complete",
+                             AuthProgress::InProgress => "in_progress",
++                            AuthProgress::RetryableTxFailure => "retryable_tx_failure",
+                             AuthProgress::Failed => "failed",
+                         }
+                     ));
+@@ -1550,6 +1562,12 @@
+                             ));
+                             state.into()
+                         }
++                        AuthProgress::RetryableTxFailure => {
++                            crate::sae_disposition(format_args!(
++                                "transition=sae_tx_terminal_failure before=authenticating after=authenticating retry_owner=sme connect_conf=not_emitted association_clear=false"
++                            ));
++                            state.into()
++                        }
+                         AuthProgress::Failed => {
+                             crate::sae_disposition(format_args!(
+                                 "next_state=joined reason=auth_failed"

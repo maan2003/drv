@@ -1,0 +1,13 @@
+[package]
+name = "fidl-fuchsia-wlan-common"
+workspace = "../../../src/connectivity/network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fidl_fuchsia_wlan_common"
+path = "src/lib.rs"
+
+[dependencies]
+fidl-fuchsia-wlan-ieee80211 = { path = "../fuchsia.wlan.ieee80211" }

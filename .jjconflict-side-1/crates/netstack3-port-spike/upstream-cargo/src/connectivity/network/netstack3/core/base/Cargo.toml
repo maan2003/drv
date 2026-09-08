@@ -1,0 +1,34 @@
+[package]
+name = "netstack3_base"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[features]
+instrumented = []
+testutils = ["instrumented", "netstack3_sync/testutils"]
+[dependencies]
+arc-swap.workspace = true
+arrayvec.workspace = true
+bitflags.workspace = true
+derivative.workspace = true
+diagnostics_traits.workspace = true
+either.workspace = true
+explicit.workspace = true
+log.workspace = true
+net_types.workspace = true
+netstack3_hashmap.workspace = true
+netstack3_sync.workspace = true
+packet.workspace = true
+packet_formats.workspace = true
+rand.workspace = true
+smallvec.workspace = true
+static_assertions.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+criterion.workspace = true
+net_declare.workspace = true
+rand_xorshift.workspace = true
+teststd.workspace = true
+assert_matches.workspace = true

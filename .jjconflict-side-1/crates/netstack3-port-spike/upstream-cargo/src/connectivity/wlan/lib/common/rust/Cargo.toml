@@ -1,0 +1,44 @@
+[package]
+name = "wlan-common"
+workspace = "../../../../network/netstack3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wlan_common"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[[test]]
+name = "host-timer"
+path = "host_tests/timer.rs"
+
+[features]
+benchmark = []
+host_test_utils = []
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+derivative.workspace = true
+fidl = { path = "../../../../../lib/fidl/rust/fidl" }
+fidl-fuchsia-wlan-common = { path = "../../../../../../sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../../sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../../../../../../sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-mlme = { path = "../../../../../../sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-sme = { path = "../../../../../../sdk/fidl/fuchsia.wlan.sme" }
+fidl-fuchsia-wlan-softmac = { path = "../../../../../../sdk/fidl/fuchsia.wlan.softmac" }
+futures.workspace = true
+hex.workspace = true
+ieee80211.workspace = true
+nom.workspace = true
+num.workspace = true
+paste.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+wlan_bitfield.workspace = true
+zerocopy.workspace = true
+zx = { path = "../../../../../../sdk/rust/zx" }
+tokio.workspace = true

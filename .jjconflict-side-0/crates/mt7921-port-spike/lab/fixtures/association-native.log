@@ -1,0 +1,21 @@
+MT7921 native association oracle v3 (Linux 6.18.40)
+private report=/var/lib/wifi-driver-lab/reports/20260814T111237Z-linux-oracle-0000_05_00.0.log
+frame_len=204
+frame_sha256=5f874111da00a75fa0b90dfce8ea0250e617a0d13544d1a6ad497411871d3ede
+normalized_sequence_sha256=6a80b1b8631d70447f20b1be45a35564a806bc8913848d9fdb51c3404ddf4755
+capability=0x1111
+listen_interval=5
+ie_order=0:3,1:8,33:2,36:56,48:20,70:5,45:26,127:10,191:12,255:2,244:1,221:7
+ie0_ssid=706831
+ie1_supported_rates=0c1218243048606c
+ie33_power_capability=0014
+ie36_supported_channels=240128012c013001340138013c014001640168016c017001740178017c018001840188018c019001950199019d01a101a501a901ad01b101
+ie48_rsn=0100000fac040100000fac040100000fac088000
+ie70_rm_enabled=7000000000
+ie45_ht=ff0903ffff000000000000000000000100000000000000000000
+ie127_extended_capabilities=04000800010000400001
+ie191_vht=b2718033faff0000faff0020
+ie255_extension=061a
+ie244_rsnxe=20
+ie221_wmm=0050f202000100
+owners=SSID/AP selection; rates+HT+VHT/device capability; IE33+IE36/authoritative regdb snapshot; RSN/SME station PMF+replay policy intersected with AP; IE70+IE127+IE255/implemented station behaviors; RSNXE/AP H2E evidence; WMM/ClientMlme

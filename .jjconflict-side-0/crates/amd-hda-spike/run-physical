@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+watchdog_seconds=${DRV_HDA_WATCHDOG_SECONDS:-20}
+fail() { printf 'amd-hda physical guard: %s\n' "$*" >&2; exit 2; }
+[[ $(hostname -s) == no-plastic ]] || fail "physical experiments require hostname no-plastic (current: $(hostname -s))"
+
+printf 'amd-hda: current class-0403 functions on no-plastic:\n' >&2
+for audio in /sys/bus/pci/devices/*; do
+  [[ -r $audio/class && $(cat "$audio/class") == 0x0403* ]] || continue
+  printf '  %s %s:%s subsystem %s:%s driver=%s group=%s\n' \
+    "${audio##*/}" "$(cat "$audio/vendor")" "$(cat "$audio/device")" \
+    "$(cat "$audio/subsystem_vendor")" "$(cat "$audio/subsystem_device")" \
+    "$(basename "$(readlink -f "$audio/driver")" 2>/dev/null || printf none)" \
+    "$(basename "$(readlink -f "$audio/iommu_group")" 2>/dev/null || printf none)" >&2
+done
+
+# PCI numbering and IOMMU group numbers are not stable across boots. Select by
+# the complete hardware identity and class on every invocation.
+matches=()
+for candidate in /sys/bus/pci/devices/*; do
+  [[ -r $candidate/class && -r $candidate/vendor && -r $candidate/device ]] || continue
+  class=$(cat "$candidate/class")
+  [[ ${class%??} == 0x0403 ]] || continue
+  [[ $(cat "$candidate/vendor") == 0x1022 && $(cat "$candidate/device") == 0x15e3 ]] || continue
+  [[ $(cat "$candidate/subsystem_vendor") == 0x1043 && $(cat "$candidate/subsystem_device") == 0x1513 ]] || continue
+  matches+=("$candidate")
+done
+[[ ${#matches[@]} == 1 ]] || fail "expected exactly one 0403/1022:15e3/1043:1513 function; found ${#matches[@]}"
+dev=${matches[0]}
+bdf=${dev##*/}
+class=$(cat "$dev/class")
+[[ ${class%??} != 0x0280 ]] || fail "refusing Wi-Fi-class function $bdf"
+
+group=$(readlink -f "$dev/iommu_group")
+[[ -n $group && -d $group/devices ]] || fail "$bdf has no IOMMU group"
+mapfile -t members < <(find "$group/devices" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+for member in "${members[@]}"; do
+  member_class=$(cat "/sys/bus/pci/devices/$member/class")
+  [[ ${member_class%??} != 0x0280 ]] || fail "IOMMU group ${group##*/} contains Wi-Fi function $member"
+done
+[[ ${#members[@]} == 1 && ${members[0]} == "$bdf" ]] || fail "IOMMU group ${group##*/} is not isolated: ${members[*]}"
+[[ $(basename "$(readlink -f "$dev/driver")") == snd_hda_intel ]] || fail 'snd_hda_intel does not own the function'
+
+# Correlate the analog codec through the sound children of this exact PCI
+# function before detaching it. HDMI HDA controllers cannot satisfy this gate.
+shopt -s nullglob
+codec_matches=()
+for card_path in "$dev"/sound/card*; do
+  [[ -e $card_path ]] || continue
+  codec="/proc/asound/${card_path##*/}/codec#0"
+  [[ -r $codec ]] || continue
+  grep -q '^Codec: Realtek ALC256$' "$codec" || continue
+  grep -qi '^Vendor Id: 0x10ec0256$' "$codec" || continue
+  codec_matches+=("$codec")
+done
+[[ ${#codec_matches[@]} == 1 ]] || fail "$bdf does not expose exactly one correlated Realtek ALC256 codec#0 (found ${#codec_matches[@]})"
+printf 'amd-hda: selected analog target %s group=%s codec=%s\n' "$bdf" "${group##*/}" "${codec_matches[0]}" >&2
+[[ $EUID == 0 ]] || fail "selected $bdf in isolated group ${group##*/}; rerun as root"
+
+# iommufd can be modular. Only diagnose the device node after trying to load it.
+modprobe iommufd || fail 'cannot load iommufd (kernel CONFIG_IOMMUFD/module unavailable)'
+[[ -c /dev/iommu ]] || fail '/dev/iommu did not appear after modprobe iommufd; check CONFIG_IOMMUFD and device-node policy'
+
+binary=${DRV_HDA_BINARY:-target/debug/amd-hda-enumerate}
+if [[ ! -x $binary ]]; then
+  cargo build -p amd-hda-spike --bin amd-hda-enumerate
+  binary=target/debug/amd-hda-enumerate
+fi
+modprobe vfio-pci
+watchdog_pid=
+restore() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -n ${watchdog_pid:-} ]]; then kill "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; fi
+  if [[ -e $dev/driver && $(basename "$(readlink -f "$dev/driver")") == vfio-pci ]]; then echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind || true; fi
+  echo snd_hda_intel > "$dev/driver_override" || true
+  modprobe snd_hda_intel || true
+  echo "$bdf" > /sys/bus/pci/drivers/snd_hda_intel/bind || true
+  printf '\n' > "$dev/driver_override" || true
+  if [[ ! -e $dev/driver || $(basename "$(readlink -f "$dev/driver")") != snd_hda_intel ]]; then
+    printf 'amd-hda: native driver restoration failed; reboot is required\n' >&2
+    status=1
+  else
+    printf 'amd-hda: verified native restore of %s to snd_hda_intel\n' "$bdf"
+  fi
+  exit "$status"
+}
+trap restore EXIT INT TERM
+
+# The independent watchdog first attempts native recovery. If the process and
+# EXIT trap are wedged and VFIO still owns this no-FLR function, force reboot.
+(
+  sleep "$watchdog_seconds"
+  printf 'amd-hda: watchdog expired; attempting native recovery\n' >&2
+  if [[ -e $dev/driver && $(basename "$(readlink -f "$dev/driver")") == vfio-pci ]]; then
+    echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo snd_hda_intel > "$dev/driver_override" 2>/dev/null || true
+    modprobe snd_hda_intel 2>/dev/null || true
+    echo "$bdf" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
+  fi
+  sleep 2
+  if [[ ! -e $dev/driver || $(basename "$(readlink -f "$dev/driver")") != snd_hda_intel ]]; then
+    systemctl reboot --force --force
+  fi
+) & watchdog_pid=$!
+
+echo vfio-pci > "$dev/driver_override"
+echo "$bdf" > "$dev/driver/unbind"
+echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/bind
+for _ in {1..50}; do
+  cdev=$(find "$dev/vfio-dev" -mindepth 1 -maxdepth 1 -printf '%f' 2>/dev/null || true)
+  [[ -n $cdev && -c /dev/vfio/devices/$cdev ]] && break
+  sleep .02
+done
+[[ -n ${cdev:-} && -c /dev/vfio/devices/$cdev ]] || fail 'VFIO device cdev did not appear'
+
+operation=()
+[[ ${DRV_HDA_PLAYBACK:-0} == 1 ]] && operation=(--play-test-tone)
+[[ ${DRV_HDA_PHYSICAL_DAEMON:-0} == 1 ]] && operation=(--physical-daemon)
+timeout --signal=TERM "$((watchdog_seconds - 2))" "$binary" "${operation[@]}" "/dev/vfio/devices/$cdev"
