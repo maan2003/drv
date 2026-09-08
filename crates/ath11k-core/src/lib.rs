@@ -327,7 +327,10 @@ impl<B: Subsystems> RadioControl for Device<B> {
         );
         self.op(Operation::WmiVdevCreate { vdev: id, mac })?;
         let configuration = [
-            Operation::WmiVdevSetNss { vdev: id, nss: 1 },
+            Operation::WmiVdevSetNss {
+                vdev: id,
+                nss: self.backend.client_nss()?,
+            },
             Operation::WmiStaPsRxWake { vdev: id },
             Operation::WmiStaPsTxWake { vdev: id },
             Operation::WmiStaPsPollCount { vdev: id },

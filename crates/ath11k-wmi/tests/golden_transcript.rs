@@ -143,7 +143,7 @@ fn validates_native_event_decoders_and_command_envelopes_when_present() {
     );
     assert_eq!(
         unknown.len(),
-        6,
+        0,
         "review newly typed or newly unknown native events"
     );
     assert_eq!(

@@ -20,6 +20,34 @@ u32_command!(PdevSetRegdomain, WMI_TAG_PDEV_SET_REGDOMAIN_CMD,
     WMI_PDEV_SET_REGDOMAIN_CMDID, { pdev_id, reg_domain, reg_domain_2g,
     reg_domain_5g, conformance_test_limit_2g, conformance_test_limit_5g, dfs_domain });
 
+#[cfg(test)]
+mod reorder_queue_tests {
+    use super::*;
+
+    #[test]
+    fn remove_matches_pinned_c_layout() {
+        let command = PeerReorderQueueRemove {
+            vdev_id: 7,
+            peer_addr: [0x02, 0xd3, 0xb9, 0xdd, 0xc3, 0xd0],
+            tid_mask: 0x102,
+        }
+        .encode_command()
+        .unwrap();
+        assert_eq!(command.id, WMI_PEER_REORDER_QUEUE_REMOVE_CMDID);
+        assert_eq!(
+            command.tlvs(),
+            &[
+                0x10, 0x00, 0x26, 0x02, 0x07, 0x00, 0x00, 0x00, 0x02, 0xd3, 0xb9, 0xdd, 0xc3, 0xd0,
+                0x00, 0x00, 0x02, 0x01, 0x00, 0x00,
+            ]
+        );
+        let reversed = crate::cmd::golden::reverse_map_semantic_command(command.id, command.tlvs())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reversed.encode_command().unwrap(), command);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PeerFlushTids {
     pub vdev_id: u32,

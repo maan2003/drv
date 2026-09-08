@@ -741,6 +741,10 @@ impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
                     &mut self.remote_read_pointers,
                     pipe,
                 )? {
+                    // The completion consumes one destination slot. Refill it
+                    // before exposing the frame so a sustained WMI/HTT stream
+                    // cannot exhaust the finite CE receive ring.
+                    self.rx_post_buf()?;
                     return Ok(Some(frame));
                 }
             }
@@ -2216,6 +2220,13 @@ mod tests {
             .unwrap();
         state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
         assert_eq!(packet_io.receive_htc(99), Ok(Some(b"hello".to_vec())));
+        assert!(
+            packet_io
+                .pipes
+                .pipes
+                .iter()
+                .all(|pipe| pipe.rx_buffers_needed == 0)
+        );
         assert!(state.borrow().operations.iter().any(
             |op| matches!(op, LargeOperation::SyncCpu(id, range) if *id == rx_id && range == &(0..64))
         ));

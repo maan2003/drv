@@ -115,6 +115,11 @@ fn policy_min_len(tag: u16) -> Option<usize> {
         x if x == tags::WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT.0 => 20,
         x if x == tags::WMI_TAG_P2P_NOA_INFO.0 => 68,
         x if x == tags::WMI_TAG_P2P_NOA_EVENT.0 => 4,
+        x if x == tags::WMI_TAG_UPDATE_FW_MEM_DUMP.0 => 8,
+        x if x == tags::WMI_TAG_AVOID_FREQ_RANGES_EVENT.0 => 4,
+        x if x == tags::WMI_TAG_AVOID_FREQ_RANGE_DESC.0 => 8,
+        x if x == tags::WMI_TAG_PEER_CREATE_CONF_EVENT.0 => 16,
+        x if x == tags::WMI_TAG_ROAM_CAPABILITY_REPORT_EVENT.0 => 4,
         _ => return None,
     })
 }
@@ -305,6 +310,12 @@ words_event!(Scan, WMI_TAG_SCAN_EVENT.0, 28, {
     scan_id: 16, vdev_id: 20, tsf_timestamp: 24
 });
 words_event!(Roam, WMI_TAG_ROAM_EVENT.0, 12, { vdev_id: 0, reason: 4, rssi: 8 });
+words_event!(FirmwareMemoryDumpComplete, tags::WMI_TAG_UPDATE_FW_MEM_DUMP.0, 8, {
+    request_id: 0, fw_mem_dump_complete: 4
+});
+words_event!(RoamCapabilityReport, tags::WMI_TAG_ROAM_CAPABILITY_REPORT_EVENT.0, 4, {
+    scoring_capability_bitmap: 0
+});
 words_event!(ChannelInfo, WMI_TAG_CHAN_INFO_EVENT.0, 56, {
     error_code: 0, freq: 4, command_flags: 8, noise_floor: 12,
     rx_clear_count: 16, cycle_count: 20, tx_power_range: 24,
@@ -740,6 +751,9 @@ pub fn validate_known_event(event: Event) -> Result<&'static str, WmiError> {
         tags::WMI_SCAN_EVENTID => fixed!(Scan, "Scan"),
         tags::WMI_PEER_STA_KICKOUT_EVENTID => fixed!(PeerStaKickout, "PeerStaKickout"),
         tags::WMI_ROAM_EVENTID => fixed!(Roam, "Roam"),
+        tags::WMI_ROAM_CAPABILITY_REPORT_EVENTID => {
+            fixed!(RoamCapabilityReport, "RoamCapabilityReport")
+        }
         tags::WMI_CHAN_INFO_EVENTID => fixed!(ChannelInfo, "ChannelInfo"),
         tags::WMI_PDEV_BSS_CHAN_INFO_EVENTID => fixed!(PdevBssChannelInfo, "PdevBssChannelInfo"),
         tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID => {
@@ -747,6 +761,13 @@ pub fn validate_known_event(event: Event) -> Result<&'static str, WmiError> {
         }
         tags::WMI_SERVICE_AVAILABLE_EVENTID => fixed!(ServiceAvailable, "ServiceAvailable"),
         tags::WMI_PEER_ASSOC_CONF_EVENTID => fixed!(PeerAssocConfirmation, "PeerAssocConfirmation"),
+        tags::WMI_PEER_CREATE_CONF_EVENTID => {
+            fixed!(PeerCreateConfirmation, "PeerCreateConfirmation")
+        }
+        tags::WMI_UPDATE_FW_MEM_DUMP_EVENTID => {
+            fixed!(FirmwareMemoryDumpComplete, "FirmwareMemoryDumpComplete")
+        }
+        tags::WMI_WLAN_FREQ_AVOID_EVENTID => fixed!(WlanFrequencyAvoid, "WlanFrequencyAvoid"),
         tags::WMI_UPDATE_STATS_EVENTID => fixed!(UpdateStats, "UpdateStats"),
         tags::WMI_PDEV_CTL_FAILSAFE_CHECK_EVENTID => {
             fixed!(PdevCtlFailsafeCheck, "PdevCtlFailsafeCheck")
@@ -837,6 +858,9 @@ pub fn validate_known_event_with_trace(
         tags::WMI_SCAN_EVENTID => fixed!(Scan, "Scan"),
         tags::WMI_PEER_STA_KICKOUT_EVENTID => fixed!(PeerStaKickout, "PeerStaKickout"),
         tags::WMI_ROAM_EVENTID => fixed!(Roam, "Roam"),
+        tags::WMI_ROAM_CAPABILITY_REPORT_EVENTID => {
+            fixed!(RoamCapabilityReport, "RoamCapabilityReport")
+        }
         tags::WMI_CHAN_INFO_EVENTID => fixed!(ChannelInfo, "ChannelInfo"),
         tags::WMI_PDEV_BSS_CHAN_INFO_EVENTID => fixed!(PdevBssChannelInfo, "PdevBssChannelInfo"),
         tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID => {
@@ -844,6 +868,13 @@ pub fn validate_known_event_with_trace(
         }
         tags::WMI_SERVICE_AVAILABLE_EVENTID => fixed!(ServiceAvailable, "ServiceAvailable"),
         tags::WMI_PEER_ASSOC_CONF_EVENTID => fixed!(PeerAssocConfirmation, "PeerAssocConfirmation"),
+        tags::WMI_PEER_CREATE_CONF_EVENTID => {
+            fixed!(PeerCreateConfirmation, "PeerCreateConfirmation")
+        }
+        tags::WMI_UPDATE_FW_MEM_DUMP_EVENTID => {
+            fixed!(FirmwareMemoryDumpComplete, "FirmwareMemoryDumpComplete")
+        }
+        tags::WMI_WLAN_FREQ_AVOID_EVENTID => fixed!(WlanFrequencyAvoid, "WlanFrequencyAvoid"),
         tags::WMI_UPDATE_STATS_EVENTID => fixed!(UpdateStats, "UpdateStats"),
         tags::WMI_PDEV_CTL_FAILSAFE_CHECK_EVENTID => {
             fixed!(PdevCtlFailsafeCheck, "PdevCtlFailsafeCheck")
@@ -1040,6 +1071,58 @@ impl WireEvent for InstallKeyCompletion {
 pub struct PeerDeleteResponse {
     pub vdev_id: u32,
     pub peer_mac: [u8; 6],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerCreateConfirmation {
+    pub vdev_id: u32,
+    pub peer_mac: [u8; 6],
+    pub status: u32,
+}
+impl WireEvent for PeerCreateConfirmation {
+    const TAG: u16 = tags::WMI_TAG_PEER_CREATE_CONF_EVENT.0;
+    const MIN_LEN: usize = 16;
+    fn parse(v: &[u8], _: &[u8]) -> Result<Self, WmiError> {
+        Ok(Self {
+            vdev_id: word(v, 0)?,
+            peer_mac: mac(v, 4)?,
+            status: word(v, 12)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AvoidFrequencyRange {
+    pub start_freq: u32,
+    pub end_freq: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WlanFrequencyAvoid {
+    pub ranges: Vec<AvoidFrequencyRange>,
+}
+impl WireEvent for WlanFrequencyAvoid {
+    const TAG: u16 = tags::WMI_TAG_AVOID_FREQ_RANGES_EVENT.0;
+    const MIN_LEN: usize = 4;
+    fn parse(v: &[u8], all: &[u8]) -> Result<Self, WmiError> {
+        let count = usize::try_from(word(v, 0)?).map_err(|_| WmiError::Malformed)?;
+        let array = find_tlv(all, tags::WMI_TAG_ARRAY_STRUCT.0)?.ok_or(WmiError::Malformed)?;
+        let mut ranges = Vec::new();
+        for item in TlvIter::new(array) {
+            let item = item?;
+            if item.tag != tags::WMI_TAG_AVOID_FREQ_RANGE_DESC.0 || item.value.len() < 8 {
+                return Err(WmiError::Malformed);
+            }
+            ranges.push(AvoidFrequencyRange {
+                start_freq: word(item.value, 0)?,
+                end_freq: word(item.value, 4)?,
+            });
+        }
+        if ranges.len() != count {
+            return Err(WmiError::Malformed);
+        }
+        Ok(Self { ranges })
+    }
 }
 impl WireEvent for PeerDeleteResponse {
     const TAG: u16 = WMI_TAG_PEER_DELETE_RESP_EVENT.0;
@@ -1330,6 +1413,50 @@ mod tests {
         let value: Vec<_> = [0u32; 7].into_iter().flat_map(u32::to_le_bytes).collect();
         let event = Event::from_tlvs(tags::WMI_SCAN_EVENTID, tlv(Scan::TAG, &value)).unwrap();
         assert_eq!(validate_known_event(event), Ok("Scan"));
+    }
+
+    #[test]
+    fn frequency_avoid_decodes_nested_range_descriptors() {
+        let mut fixed = Vec::new();
+        fixed.extend_from_slice(&2u32.to_le_bytes());
+        let mut array = tlv(
+            tags::WMI_TAG_AVOID_FREQ_RANGE_DESC.0,
+            &[0x6c, 0x09, 0, 0, 0x94, 0x09, 0, 0],
+        );
+        array.extend(tlv(
+            tags::WMI_TAG_AVOID_FREQ_RANGE_DESC.0,
+            &[0x24, 0x14, 0, 0, 0x88, 0x14, 0, 0],
+        ));
+        let mut bytes = tlv(WlanFrequencyAvoid::TAG, &fixed);
+        bytes.extend(tlv(tags::WMI_TAG_ARRAY_STRUCT.0, &array));
+        let event = Event::from_tlvs(tags::WMI_WLAN_FREQ_AVOID_EVENTID, bytes).unwrap();
+        assert_eq!(
+            Decoder::<WlanFrequencyAvoid>::new(tags::WMI_WLAN_FREQ_AVOID_EVENTID)
+                .decode(event)
+                .unwrap()
+                .ranges,
+            [
+                AvoidFrequencyRange {
+                    start_freq: 2412,
+                    end_freq: 2452
+                },
+                AvoidFrequencyRange {
+                    start_freq: 5156,
+                    end_freq: 5256
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn frequency_avoid_rejects_range_count_mismatch() {
+        let mut bytes = tlv(WlanFrequencyAvoid::TAG, &1u32.to_le_bytes());
+        bytes.extend(tlv(tags::WMI_TAG_ARRAY_STRUCT.0, &[]));
+        let event = Event::from_tlvs(tags::WMI_WLAN_FREQ_AVOID_EVENTID, bytes).unwrap();
+        assert_eq!(
+            Decoder::<WlanFrequencyAvoid>::new(tags::WMI_WLAN_FREQ_AVOID_EVENTID).decode(event),
+            Err(WmiError::Malformed)
+        );
     }
 
     #[test]

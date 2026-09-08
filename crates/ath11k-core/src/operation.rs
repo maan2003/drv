@@ -290,6 +290,9 @@ pub trait Subsystems {
 
     /// Receive the next hardware event consumed by the WlanSoftmac half.
     fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError>;
+
+    /// Station spatial streams advertised by firmware for vdev setup.
+    fn client_nss(&self) -> Result<u8, CoreError>;
 }
 
 /// Deterministic subsystem model used before transports are attached and by
@@ -339,5 +342,9 @@ impl Subsystems for ModelSubsystems {
         } else {
             Ok(Some(self.events.remove(0)))
         }
+    }
+
+    fn client_nss(&self) -> Result<u8, CoreError> {
+        Ok(2)
     }
 }
