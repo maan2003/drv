@@ -24,10 +24,11 @@ event route, enable BCNFT and firmware connection-monitor offload, and suppress
 the host monitor as Linux `IEEE80211_HW_CONNECTION_MONITOR` does; those changes
 must land together. The selected-connection command boundary exists, but a
 separate wlancfg process does not yet. Failed connections currently revoke the
-runtime and reset the device; retry-safe per-attempt cleanup and callback
-quarantine remain incomplete. Ordinary rejection should eventually permit
-policy-driven retry without a privileged restart, while device/containment
-faults remain terminal.
+runtime unless the SME is idle and the driver certifies per-attempt cleanup and
+callback quiescence. MT7921 implements that retry contract while preserving
+selected-BSS authority; timeouts and device/containment faults remain terminal.
+The production policy loop does not yet drive retries, and the corrected retry
+path still needs renewed physical acceptance.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
