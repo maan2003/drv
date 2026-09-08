@@ -31,8 +31,9 @@ descriptor addresses, MSDU link setup/parsing, REO queue descriptors and
 command-ring initialization, all three
 source-supported REO commands, every REO status tag, WCN6750 REO register
 setup, CE
-source/destination/status descriptors, and the WCN6750 monitor
-MPDU and PPDU-duration fields. All generated values are within the hardware
+source/destination/status descriptors, and the client RX scalar fields,
+MPDU-start tag, and address-2 path selected by the WCN6750 QCN9074 operations
+table. All generated values are within the hardware
 field widths. `ath11k-hal` has no descriptor `TraceSink`; where a Rust builder
 is not public, the suite compares a normalized sequence of parsed fields from
 the valid C-built descriptor instead.

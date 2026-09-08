@@ -159,7 +159,8 @@ struct CQcnRx { first_msdu: u8, last_msdu: u8, l3_padding: u8, msdu_done: u8,
     mesh_control_present: u8, ldpc: u8, sgi: u8, mcs: u8, bandwidth: u8, packet_type: u8,
     spatial_stream_bitmap: u8, nss: u8, frequency: u32, tid: u8, peer: u16,
     sequence_valid: u8, frame_valid: u8, sequence_number: u16,
-    encryption_valid: u8, encryption_type: u8, phy_ppdu_id: u16 }
+    encryption_valid: u8, encryption_type: u8, phy_ppdu_id: u16,
+    mpdu_start_valid: u8, address2_valid: u8, address2: [u8; 6] }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1446,18 +1447,11 @@ mod tests {
         }
 
         #[test]
-        fn qcn9074_rx_ops_selected_by_wcn6750_match_c(end4: u16, attention1: u32,
-            attention2: u32, msdu1: u32, msdu2: u32, msdu3: u32, frequency: u32,
-            mpdu9: u32, phy_ppdu_id: u16, peer: u16, mpdu11: u32) {
-            let mut bytes = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
-            bytes[46..48].copy_from_slice(&end4.to_le_bytes());
-            for (offset, value) in [(80, attention1), (84, attention2), (96, msdu1),
-                (100, msdu2), (112, msdu3), (120, frequency), (168, mpdu9), (184, mpdu11)] {
-                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            }
-            bytes[178..180].copy_from_slice(&phy_ppdu_id.to_le_bytes());
-            bytes[182..184].copy_from_slice(&peer.to_le_bytes());
-            let rust = Wcn6750RxDescriptor::parse(&bytes).unwrap().status();
+        fn qcn9074_rx_ops_selected_by_wcn6750_match_c(
+            bytes in prop::collection::vec(any::<u8>(), WCN6750_RX_DESCRIPTOR_BYTES)
+        ) {
+            let descriptor = Wcn6750RxDescriptor::parse(&bytes).unwrap();
+            let rust = descriptor.status();
             let c = c_qcn_rx(&bytes).unwrap();
             prop_assert_eq!((rust.first_msdu, rust.last_msdu, rust.l3_padding, rust.msdu_done,
                 rust.msdu_length_error, rust.fcs_error, rust.decrypt_error, rust.tkip_mic_error),
@@ -1479,6 +1473,9 @@ mod tests {
                 rust.sequence_number, rust.encryption_info_valid, rust.encryption_type,
                 rust.phy_ppdu_id), (c.sequence_valid != 0, c.frame_valid != 0,
                 c.sequence_number, c.encryption_valid != 0, c.encryption_type, c.phy_ppdu_id));
+            prop_assert_eq!(descriptor.mpdu_start_valid(), c.mpdu_start_valid != 0);
+            prop_assert_eq!(descriptor.address2(),
+                (c.address2_valid != 0).then_some(c.address2));
         }
 
         #[test]
