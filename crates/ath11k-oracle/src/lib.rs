@@ -264,6 +264,9 @@ unsafe extern "C" {
     fn oracle_htt_version(out: *mut u8);
     fn oracle_htt_srng_encode(input: *const CHttSrng, out: *mut u8);
     fn oracle_htt_rx_select_encode(input: *const CHttRxSelect, out: *mut u8);
+    fn oracle_htt_ppdu_stats_encode(pdev_mask: u8, tlv_mask: u16, out: *mut u8);
+    fn oracle_htt_ext_stats_encode(pdev_mask: u8, stats_type: u8, parameters: *const u32,
+        cookie: u64, out: *mut u8);
     #[cfg(test)]
     fn oracle_htt_event_decode(bytes: *const u8, len: usize, out: *mut CHttEvent) -> c_int;
     #[cfg(test)]
@@ -613,6 +616,19 @@ pub fn c_htt_rx_selection(input: ath11k_dp::htt::RxRingSelection) -> [u8; 28] {
     unsafe { oracle_htt_rx_select_encode(&c, bytes.as_mut_ptr()) };
     bytes
 }
+pub fn c_htt_ppdu_stats(input: ath11k_dp::htt::PpduStatsConfig) -> [u8; 4] {
+    let mut bytes = [0; 4];
+    // SAFETY: output is writable for the fixed message size.
+    unsafe { oracle_htt_ppdu_stats_encode(input.pdev_mask, input.tlv_mask, bytes.as_mut_ptr()) };
+    bytes
+}
+pub fn c_htt_ext_stats(input: ath11k_dp::htt::ExtStatsConfig) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    // SAFETY: parameters has four readable words and output has the exact message size.
+    unsafe { oracle_htt_ext_stats_encode(input.pdev_mask, input.stats_type,
+        input.parameters.as_ptr(), input.cookie, bytes.as_mut_ptr()) };
+    bytes
+}
 #[cfg(test)]
 fn c_htt_event(bytes: &[u8]) -> Result<CHttEvent, i32> {
     let mut out = CHttEvent::default();
@@ -817,8 +833,9 @@ mod tests {
         ServiceReadyDecoder, ServiceReadyExt2Decoder, ServiceReadyExtDecoder, VdevDeleteResponse,
         VdevStartResponse, VdevStopped, WlanFrequencyAvoid,
     };
-    use ath11k_dp::htt::{HttEvent, RxRingFilter, RxRingSelection, SrngFlags, SrngRingId,
-        SrngRingType, SrngSetup, TxCompletion, version_request};
+    use ath11k_dp::htt::{ExtStatsConfig, HttEvent, PpduStatsConfig, RxRingFilter,
+        RxRingSelection, SrngFlags, SrngRingId, SrngRingType, SrngSetup, TxCompletion,
+        version_request};
     use ath11k_dp::{HttTargetMessage, PeerId};
     use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
     use ath11k_dp::tx::{TxCompletionDisposition, encap_native_wifi_frame,
@@ -1380,6 +1397,15 @@ mod tests {
                 buffer_size, filter: RxRingFilter { tlvs, management_0, management_1, control, data } };
             prop_assert_eq!(selection.encode().0, c_htt_rx_selection(selection));
             prop_assert_eq!(version_request().0, c_htt_version());
+        }
+
+        #[test]
+        fn htt_statistics_requests_match_c(pdev_mask: u8, tlv_mask: u16,
+            stats_type: u8, parameters: [u32; 4], cookie: u64) {
+            let ppdu = PpduStatsConfig { pdev_mask, tlv_mask };
+            prop_assert_eq!(ppdu.encode().0, c_htt_ppdu_stats(ppdu));
+            let ext = ExtStatsConfig { pdev_mask, stats_type, parameters, cookie };
+            prop_assert_eq!(ext.encode().0, c_htt_ext_stats(ext));
         }
 
         #[test]
