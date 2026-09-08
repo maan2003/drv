@@ -100,6 +100,7 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
         0x005001 => ("vdev-create", NO_MASKS),
         0x005002 => ("vdev-delete", NO_MASKS),
         0x005003 => ("vdev-start", NO_MASKS),
+        0x005004 => ("vdev-restart", NO_MASKS),
         0x005005 => ("vdev-up", NO_MASKS),
         0x005006 => ("vdev-stop", NO_MASKS),
         0x005007 => ("vdev-down", NO_MASKS),
@@ -427,7 +428,7 @@ pub fn reverse_map_semantic_command(
                 _ => return Err(WmiError::Malformed),
             }
         }
-        0x005003 => {
+        0x005003 | 0x005004 => {
             let tlvs = semantic_tlvs(id, bytes)?;
             if tlvs.len() != 3
                 || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_START_REQUEST_CMD.0
@@ -446,7 +447,7 @@ pub fn reverse_map_semantic_command(
             }
             let flags = fixed[4];
             SemanticRequest::VdevStart(super::VdevStart {
-                restart: false,
+                restart: id.0 == 0x005004,
                 vdev_id: fixed[0],
                 beacon_interval: fixed[2],
                 dtim_period: fixed[3],
@@ -687,7 +688,7 @@ pub fn reverse_map_semantic_command(
         }
         0x003001 => {
             let tlvs = semantic_tlvs(id, bytes)?;
-            if tlvs.len() != 5
+            if !(5..=7).contains(&tlvs.len())
                 || tlvs[0].tag != crate::tags::WMI_TAG_START_SCAN_CMD.0
                 || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_UINT32.0
                 || tlvs[2].tag != crate::tags::WMI_TAG_ARRAY_FIXED_STRUCT.0
@@ -732,6 +733,62 @@ pub fn reverse_map_semantic_command(
             }
             let flags = fixed[14];
             let bit = |mask| flags & mask != 0;
+            let optional = &tlvs[5..];
+            if optional
+                .iter()
+                .any(|tlv| tlv.tag != crate::tags::WMI_TAG_ARRAY_FIXED_STRUCT.0)
+            {
+                return Err(WmiError::Malformed);
+            }
+            let (short_bytes, bssid_bytes) = match optional {
+                [] => (&[][..], &[][..]),
+                [only]
+                    if !only.value.is_empty()
+                        && only.value.len().is_multiple_of(8)
+                        && only.value.len() / 8 <= 10 =>
+                {
+                    (&only.value[..], &[][..])
+                }
+                [only] if !only.value.is_empty() && only.value.len().is_multiple_of(12) => {
+                    (&[][..], &only.value[..])
+                }
+                [short, bssid] if !short.value.is_empty() && !bssid.value.is_empty() => {
+                    (&short.value[..], &bssid.value[..])
+                }
+                _ => return Err(WmiError::Malformed),
+            };
+            if !short_bytes.len().is_multiple_of(8)
+                || short_bytes.len() / 8 > 10
+                || !bssid_bytes.len().is_multiple_of(12)
+                || bssid_bytes.len() / 12 > 10
+            {
+                return Err(WmiError::Malformed);
+            }
+            let short_ssid_hints = short_bytes
+                .chunks_exact(8)
+                .map(|hint| {
+                    let fields = words::<2>(hint)?;
+                    Ok(super::ScanShortSsidHint {
+                        freq_flags: fields[0],
+                        short_ssid: fields[1],
+                    })
+                })
+                .collect::<Result<Vec<_>, WmiError>>()?;
+            let bssid_hints = bssid_bytes
+                .chunks_exact(12)
+                .map(|hint| {
+                    // The pinned encoder preserves zero here because its C
+                    // ether_addr_copy arguments are reversed. Nonzero bytes
+                    // therefore have no typed encoder preimage.
+                    if hint[4..12] != [0; 8] {
+                        return Err(WmiError::Malformed);
+                    }
+                    Ok(super::ScanBssidHint {
+                        freq_flags: words::<3>(hint)?[0],
+                        bssid: [0; 6],
+                    })
+                })
+                .collect::<Result<Vec<_>, WmiError>>()?;
             SemanticRequest::ScanStart(super::ScanStart {
                 scan_id: fixed[0],
                 scan_requester_id: fixed[1],
@@ -782,8 +839,8 @@ pub fn reverse_map_semantic_command(
                 ssids,
                 bssids,
                 extra_ie: tlvs[4].value[..ie_len].to_vec(),
-                short_ssid_hints: Vec::new(),
-                bssid_hints: Vec::new(),
+                short_ssid_hints,
+                bssid_hints,
             })
         }
         0x004003 | 0x005008 => {

@@ -1055,6 +1055,17 @@ mod strategies {
                 .boxed()
         }
     }
+    impl CommandStrategy for PeerAuthorize {
+        fn strategy() -> BoxedStrategy<Self> {
+            any::<(u32, [u8; 6], bool)>()
+                .prop_map(|(vdev_id, peer_addr, authorized)| Self {
+                    vdev_id,
+                    peer_addr,
+                    authorized,
+                })
+                .boxed()
+        }
+    }
     impl CommandStrategy for VdevStart {
         fn strategy() -> BoxedStrategy<Self> {
             (
