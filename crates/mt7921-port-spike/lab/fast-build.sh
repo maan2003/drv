@@ -84,7 +84,6 @@ rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/libexec" "$OUT/share/mt7921-full-firmwa
 install -m0755 "$driver" "$OUT/libexec/mt7921-full-firmware-validation"
 install -m0755 "$netstack" "$OUT/libexec/mt7921-netstack"
 "$OUT/libexec/mt7921-full-firmware-validation" --artifact-identity > "$OUT/share/mt7921-full-firmware-validation/artifact-identity.json"
-cp "$last"/share/mt7921-full-firmware-validation/mock-ph1.psk "$OUT/share/mt7921-full-firmware-validation/"
 sed "s|$last|$OUT|g" "$last/bin/mt7921-full-firmware-validation" \
   | awk -v out="$OUT" '{ print; if ($0 ~ /DRV_LAB_SAFETY_STATE="\$DRV_LAB_SAFETY_STATE"/) { \
       print "      DRV_SOCKS5_LISTEN=\"${DRV_SOCKS5_LISTEN-127.0.0.1:1080}\" \\"; \

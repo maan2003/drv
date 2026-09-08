@@ -10,9 +10,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 cfg=$HOME/.ssh/lab.conf
 t0=$(date +%s)
-# np is "np" over tailscale when it has internet (ajay), else "npj" via the
-# redwood jump to its ph1 LAN address (see np-ssh.sh).
-if ssh -n -F "$cfg" -o ConnectTimeout=8 np true 2>/dev/null; then target=np; else target=npj; fi
+# np is reachable over Tailscale only when its sole network, ajay, is up.
+target=np
 echo "target=$target"
 rsync -az --delete --exclude target --exclude .jj --exclude .git --exclude 'result*' --exclude reference \
   -e "ssh -F $cfg -o ConnectTimeout=15" \

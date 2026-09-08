@@ -7,8 +7,7 @@ wd=/run/current-system/sw/bin/wifi-lab-watchdog
 launcher=/data/persist/drvlab/active-launcher.sh
 ret=/data/persist/drvlab/return-net.sh
 # Target: ajay (the phone hotspot). It does its own NAT to the internet, so the
-# whole run only needs this host + the phone -- no redwood AP, NAT, firewall, or
-# hostapd deauth guard.
+# whole run only needs this host + the phone.
 ap_ssid=ajay
 ap_bssid=02:d3:b9:dd:c3:d0
 out=/data/persist/drvlab/active-run-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$out"; cd "$out"
@@ -19,7 +18,8 @@ lab_seconds=$((DRV_DAEMON_MAX_SECONDS + 60))
 exec > run.log 2>&1
 echo "start $(date -u +%FT%TZ) bdf=$bdf target=$ap_ssid/$ap_bssid"
 wdev(){ for d in /sys/class/net/wl*; do [ -e "$d/wireless" ] && { basename "$d"; return 0; }; done; return 1; }
-# safety net: userspace recovery fires at 480s regardless (dynamic dev, ajay->ph1 fallback)
+# Safety net: retry ajay recovery at 480s regardless. If that fails, the
+# still-armed hardware watchdog reboots and iwd autoconnects to ajay.
 systemd-run --on-active=480 --unit=drvlab-active-return-$$ "$ret" >/dev/null 2>&1
 journalctl -f -o short-precise --no-tail _TRANSPORT=kernel + _SYSTEMD_UNIT=iwd.service > kernel-iwd-journal.log 2>&1 & jpid=$!
 sudo -n iw event -t -f > iw-event.log 2>&1 & iwpid=$!
@@ -75,12 +75,13 @@ echo "report=$R"; sudo -n cp "$R" "$out/report.log" 2>/dev/null; sudo -n chmod a
 echo "return net $(date -u +%T.%N)"; "$ret"; rc=$?; echo "return rc=$rc"
 # confirm reachable state before disarming; if not reachable, leave watchdog to reboot.
 # retry up to ~120s (the heartbeat keeps feeding the watchdog during this loop).
-# Checks: internet ping (ajay NATs), OR ph1 LAN fallback address, OR iwctl connected.
+# Checks are ajay-only: Internet reachability, its DHCP subnet, or iwd's
+# connected state. Failure deliberately leaves the watchdog armed to reboot.
 confirmed=0
 for i in $(seq 1 24); do
   d=$(wdev || echo wlan0)
   if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 \
-     || ip -4 -o addr show dev "$d" 2>/dev/null | grep -qE " (172\.20\.10|10\.77\.0)\." \
+     || ip -4 -o addr show dev "$d" 2>/dev/null | grep -qE " 172\.20\.10\." \
      || iwctl station "$d" show 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | grep -qiE "^ *State +connected"; then
     echo "network confirmed after $((i*5))s (dev=$d)"; confirmed=1; break; fi
   sleep 5

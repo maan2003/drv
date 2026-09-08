@@ -2,8 +2,7 @@
 # Launch one active-client run on np with the given fast-build/nix store path.
 #
 # Target is ajay (the phone hotspot), which does its own NAT to the internet,
-# so a run needs only np + the phone. No redwood AP, firewall, NAT, or hostapd
-# deauth guard is involved (that machinery existed only for the ph1/redwood AP).
+# so a run needs only np + the phone.
 set -u
 store="${1:?store path}"
 here=$(dirname "$0")

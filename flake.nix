@@ -483,7 +483,7 @@
               printf snapshot-ok
               EOF
               chmod +x work/bin/driver work/bin/snapshot
-              printf 'Passphrase=eight-by\n' > work/var/ph1.psk
+              printf 'Passphrase=eight-by\n' > work/var/ajay.psk
               : > work/var/regulatory.db
               printf '%s\n' '{"artifact_identity":"mt7921-driver-v11","flavor":"full-firmware-production","enabled_operation":"run-one-shot-sae-auth","bss_wire_contract":"connac2-bss-wire-v1","active_capable":true}' > work/var/identity
               substitute ${./nix/mt7921-full-firmware-validation-launcher.sh} work/launcher \
@@ -492,7 +492,7 @@
                 --subst-var-by snapshot_generator "$PWD/work/bin/snapshot" \
                 --subst-var-by regulatory_db "$PWD/work/var/regulatory.db" \
                 --subst-var-by regulatory_source_sha256 0000000000000000000000000000000000000000000000000000000000000000 \
-                --subst-var-by credential_file "$PWD/work/var/ph1.psk" \
+                --subst-var-by credential_file "$PWD/work/var/ajay.psk" \
                 --subst-var-by artifact_identity "$PWD/work/var/identity" \
                 --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
                 --subst-var-by cat ${pkgs.coreutils}/bin/cat \

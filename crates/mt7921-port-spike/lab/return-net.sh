@@ -20,13 +20,5 @@ for attempt in 1 2 3; do
   for j in $(seq 1 20); do sleep 1; ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && { log "ajay OK internet up attempt=$attempt dev=$d"; exit 0; }; done
   log "ajay attempt=$attempt no internet; retry"
 done
-log "ajay failed 3x; fallback ph1 for LAN access dev=$d"
-join "$d" ph1
-# wait for the ph1 association + DHCP address (SAE+DHCP can take >30s)
-for k in $(seq 1 60); do
-  sleep 1
-  a=$(ip -4 -o addr show dev "$d" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-  case "$a" in 10.77.0.*) log "on ph1 fallback after ${k}s; reachable via redwood LAN $a"; exit 2;; esac
-done
-log "ph1 fallback: no LAN address after 60s dev=$d"
-exit 3
+log "ajay failed 3x; watchdog-owned reboot remains the recovery path dev=$d"
+exit 1
