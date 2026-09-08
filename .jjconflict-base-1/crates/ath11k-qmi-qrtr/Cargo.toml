@@ -1,0 +1,9 @@
+[package]
+name = "ath11k-qmi-qrtr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ath11k-qmi = { path = "../ath11k-qmi" }
+qrtr-socket = { path = "../qrtr-socket" }

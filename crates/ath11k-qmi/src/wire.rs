@@ -39,6 +39,29 @@ pub enum MessageId {
     DeviceInfo = 0x004c,
 }
 
+impl MessageId {
+    pub fn from_u16(value: u16) -> Result<Self, QmiError> {
+        match value {
+            0x0020 => Ok(Self::IndicationRegister),
+            0x0021 => Ok(Self::FirmwareReady),
+            0x0022 => Ok(Self::WlanMode),
+            0x0023 => Ok(Self::WlanConfig),
+            0x0024 => Ok(Self::Capability),
+            0x0025 => Ok(Self::BdfDownload),
+            0x002f => Ok(Self::WlanIni),
+            0x0034 => Ok(Self::HostCapability),
+            0x0035 => Ok(Self::RequestMemory),
+            0x0036 => Ok(Self::RespondMemory),
+            0x0037 => Ok(Self::FirmwareMemoryReady),
+            0x0038 => Ok(Self::FirmwareInitDone),
+            0x003c => Ok(Self::M3Info),
+            0x003e => Ok(Self::ColdBootCalibrationDone),
+            0x004c => Ok(Self::DeviceInfo),
+            _ => Err(QmiError::Malformed),
+        }
+    }
+}
+
 /// The C QMI decoder accepts the full signed-enum range; named constants are
 /// the values currently defined by WLFW v01.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -699,7 +722,7 @@ impl Indication {
                     MessageId::RequestMemory,
                     message.encode().bytes().to_vec(),
                 )
-                .expect("a decoded indication remains valid")
+                .expect("a decoded indication remains valid");
             }
             Self::FirmwareMemoryReady => (MessageId::FirmwareMemoryReady, Vec::new()),
             Self::FirmwareReady => (MessageId::FirmwareReady, Vec::new()),
@@ -906,10 +929,11 @@ mod tests {
         }
         .encode()
         .unwrap();
-        assert!(r
-            .bytes()
-            .windows(8)
-            .any(|w| w == [0x13, 5, 0, 3, 0, 1, 2, 3]));
+        assert!(
+            r.bytes()
+                .windows(8)
+                .any(|w| w == [0x13, 5, 0, 3, 0, 1, 2, 3])
+        );
     }
     #[test]
     fn memory_indication_round_trip() {
@@ -954,7 +978,9 @@ mod tests {
         let request = IndicationRegisterRequest::wcn6750().encode().unwrap();
         assert_eq!(
             request.bytes(),
-            [0x10, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b, 0x18, 1, 0, 1, 0x1b, 1, 0, 1,]
+            [
+                0x10, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b, 0x18, 1, 0, 1, 0x1b, 1, 0, 1,
+            ]
         );
     }
 

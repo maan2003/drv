@@ -40,8 +40,12 @@ ath11k-core ──▶ ath11k-qmi
 
 Protocol crates never depend on core. HAL depends directly on the shared `drv-hardware` model re-exported by the platform crate, while
 the composition root supplies implementations; higher layers cannot reach raw
-host resources. Every crate forbids unsafe code. When a concrete OS adapter is
-added, unsafe is permitted only in that adapter, never in these protocol crates.
+host resources. Protocol and driver crates forbid unsafe code. Linux QRTR is
+split so `ath11k-qmi-qrtr` remains safe and platform-free while the leaf
+`qrtr-socket` crate alone owns the audited `AF_QIPCRTR` syscall/address ABI;
+each unsafe block documents its pointer, layout, length, and fd-ownership
+invariant. No protocol crate contains unsafe code. A future VFIO adapter follows
+the same OS-leaf exception rather than moving unsafe into a driver crate.
 
 ## Public API contract
 
