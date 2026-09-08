@@ -107,6 +107,7 @@ unsafe extern "C" {
         cookies: *mut u32,
         manager: *mut u8,
     );
+    fn oracle_hal_link_descriptor(out: *mut u8, address: u64, cookie: u32);
     fn oracle_hal_ce_source(out: *mut u8, address: u64, len: u32, id: u32, swap: u8);
     fn oracle_hal_ce_destination(out: *mut u8, address: u64);
     fn oracle_hal_ce_status_take_length(inout: *mut u8) -> u32;
@@ -505,6 +506,20 @@ proptest! {
         prop_assert_eq!(rust.count, count);
         prop_assert_eq!(rust.cookies, cookies);
         prop_assert_eq!(rust.return_buffer_manager, manager);
+    }
+
+    #[test]
+    fn link_descriptor_address_matches_pinned_c(
+        offset in 0usize..4096, cookie in any::<u32>(),
+    ) {
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(4096, 8).unwrap();
+        let address = dma.device_address(offset).unwrap();
+        let rust = WbmLinkDescriptor::new_at(&address, cookie);
+        let mut c = [0; 8];
+        // SAFETY: exact output size and typed scalar arguments.
+        unsafe { oracle_hal_link_descriptor(c.as_mut_ptr(), address.bits(), cookie) };
+        prop_assert_eq!(rust.as_bytes(), &c);
     }
 
     #[test]

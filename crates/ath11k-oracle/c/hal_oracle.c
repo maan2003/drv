@@ -297,6 +297,12 @@ void oracle_hal_rx_msdu_link_info(const u8 input[128], u8 *count,
     }
 }
 
+void oracle_hal_link_descriptor(u8 out[8], u64 address, u32 cookie) {
+    struct buffer_addr descriptor;
+    set_addr(&descriptor, address, cookie, 1);
+    memcpy(out, &descriptor, sizeof(descriptor));
+}
+
 void oracle_hal_ce_source(u8 out[16], u64 address, u32 len, u32 id, u8 swap) {
     struct ce_source d = {0};
     d.addr_lo = (u32)address;
