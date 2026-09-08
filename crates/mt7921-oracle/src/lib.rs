@@ -121,6 +121,15 @@ mod tests {
         at_us: u64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CResetEvent {
+        kind: u8,
+        register: u8,
+        pad: u16,
+        value: u32,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -282,6 +291,16 @@ mod tests {
             events: *mut CPowerEvent,
             event_count: *mut usize,
             elapsed_us: *mut u64,
+        ) -> i32;
+        fn oracle_mt7921_reset(
+            busy_reads: u8,
+            global_config: u32,
+            ext0: u32,
+            dmashdl: u32,
+            reset: u32,
+            events: *mut CResetEvent,
+            event_count: *mut usize,
+            final_registers: *mut u32,
         ) -> i32;
         fn oracle_download_command(
             kind: u8,
@@ -1066,6 +1085,91 @@ mod tests {
             self.trace.push((1, PCIE_LPCR_HOST_SET_OWN));
             Ok(())
         }
+    }
+
+    fn c_reset(busy_reads: u8, registers: [u32; 4]) -> (Vec<CResetEvent>, [u32; 4]) {
+        let _guard = C_ORACLE_LOCK.lock().unwrap();
+        let mut events = [CResetEvent::default(); 160];
+        let mut count = 0;
+        let mut final_registers = [0; 4];
+        // SAFETY: all pointers refer to fixed live arrays. The wrapper rejects
+        // invalid retry counts and its source-bounded trace fits 160 entries.
+        let result = unsafe {
+            oracle_mt7921_reset(
+                busy_reads,
+                registers[0],
+                registers[1],
+                registers[2],
+                registers[3],
+                events.as_mut_ptr(),
+                &mut count,
+                final_registers.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        assert!(count <= events.len());
+        (events[..count].to_vec(), final_registers)
+    }
+
+    proptest! {
+        #[test]
+        fn pinned_wpdma_reset_preserves_ordered_rmw_results_for_valid_register_states(
+            busy_reads in 1u8..=101,
+            global_config in prop::sample::select(vec![
+                0, 1, 4, 5, 0xf, 0x5020_b870, 0x5020_b875,
+            ]),
+            ext0 in prop::sample::select(vec![0, 1 << 6]),
+            dmashdl in prop::sample::select(vec![0, 1 << 28]),
+            reset in prop::sample::select(vec![0, 1 << 4, 1 << 5, (1 << 4) | (1 << 5)]),
+        ) {
+            let (events, final_registers) =
+                c_reset(busy_reads, [global_config, ext0, dmashdl, reset]);
+            let disable = (1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) |
+                (1 << 27) | (1 << 28);
+            let configure = (1 << 6) | (1 << 12) | (1 << 30) | (1 << 28) |
+                (3 << 4) | (1 << 11) | (1 << 13) | (1 << 15) | (1 << 21);
+            prop_assert_eq!(final_registers[0], (global_config & !disable) | configure | 5);
+            prop_assert_eq!(final_registers[1], ext0 & !(1 << 6));
+            prop_assert_eq!(final_registers[2], dmashdl | (1 << 28));
+            prop_assert_eq!(
+                final_registers[3],
+                reset | (1 << 4) | (1 << 5),
+            );
+
+            let positions = |register| events.iter().enumerate()
+                .filter_map(|(index, event)| (event.register == register).then_some(index))
+                .collect::<Vec<_>>();
+            let global = positions(6);
+            prop_assert_eq!(global.len(), usize::from(busy_reads) + 3);
+            prop_assert_eq!(events[global[0]].kind, 3); // disable before poll
+            prop_assert!(global[1..global.len() - 2]
+                .iter()
+                .all(|index| events[*index].kind == 5));
+            prop_assert_eq!(events[global[global.len() - 2]].kind, 4); // configure
+            prop_assert_eq!(events[global[global.len() - 1]].value & 5, 5); // enable last
+            prop_assert!(positions(30)[0] < global[global.len() - 2]); // DTX reset before restore
+            prop_assert!(global[global.len() - 1] < positions(2)[1]); // DMA before IRQ
+        }
+    }
+
+    #[test]
+    fn mac_reset_reacquires_driver_ownership_without_restoring_firmware_ownership() {
+        let (linux, _) = c_reset(1, [0, 0, 0, 0]);
+        let connac_driver = linux.iter().position(|event| event.register == 1).unwrap();
+        let wpdma = linux.iter().position(|event| event.register == 4).unwrap();
+        let top_driver = linux.iter().position(|event| event.register == 35).unwrap();
+        let firmware_reload = linux.iter().position(|event| event.register == 36).unwrap();
+        assert!(connac_driver < wpdma && wpdma < top_driver && top_driver < firmware_reload);
+        assert!(!linux.iter().any(|event| event.register == 37));
+
+        // The only public combined ownership primitive restores a firmware-owned
+        // snapshot with SET_OWN. It therefore cannot stand in for reset recovery,
+        // which must remain driver-owned while firmware is reloaded.
+        let mut rust = PowerTransport::new(1, 1);
+        rust.restore_attempt = 1;
+        rust.restore_read = 1;
+        assert!(round_trip_driver_ownership(&mut rust, false, |_| {}).is_ok());
+        assert!(rust.trace.contains(&(1, PCIE_LPCR_HOST_SET_OWN)));
     }
 
     proptest! {

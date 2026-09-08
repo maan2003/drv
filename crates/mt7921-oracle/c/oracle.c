@@ -4,6 +4,96 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+/* Normalized register/branch operations from pinned mt7921e_mac_reset and
+ * mt792x_wpdma_reset -> mt792x_dma_{disable,enable}.  build.rs independently
+ * requires these operations in this order in the immutable v7.1.5 source.
+ * Queue/NAPI mechanics are branches; register values preserve exact RMW
+ * effects.  MT7921 takes the non-MT7925/non-MT7902 prefetch branch. */
+struct oracle_reset_event {
+    uint8_t kind; /* 1 branch, 2 write, 3 clear, 4 set, 5 read */
+    uint8_t reg;
+    uint16_t pad;
+    uint32_t value;
+};
+
+static void oracle_reset_push(struct oracle_reset_event *events, size_t *count,
+                              uint8_t kind, uint8_t reg, uint32_t value)
+{
+    events[(*count)++] =
+        (struct oracle_reset_event){ kind, reg, 0, value };
+}
+
+int oracle_mt7921_reset(uint8_t busy_reads,
+                        uint32_t global_config, uint32_t ext0,
+                        uint32_t dmashdl, uint32_t reset,
+                        struct oracle_reset_event *events, size_t *event_count,
+                        uint32_t final_registers[4])
+{
+    static const uint16_t prefetch[] = {
+        0x000, 0x040, 0x080, 0x0c0, 0x100,
+        0x140, 0x180, 0x1c0, 0x200, 0x240, 0x280, 0x2c0, 0x340, 0x380,
+    };
+    const uint32_t disable = BIT(0) | BIT(2) | BIT(15) | BIT(21) |
+                             BIT(27) | BIT(28);
+    const uint32_t configure = BIT(6) | BIT(12) | BIT(30) | BIT(28) |
+                               FIELD_PREP(GENMASK(5, 4), 3) | BIT(11) |
+                               BIT(13) | BIT(15) | BIT(21);
+    size_t i, count = 0;
+
+    if (!events || !event_count || !final_registers || !busy_reads ||
+        busy_reads > 101)
+        return -1;
+
+    oracle_reset_push(events, &count, 1, 1, 0); /* conn-on driver own */
+    oracle_reset_push(events, &count, 2, 2, 0); /* host IRQ disable */
+    oracle_reset_push(events, &count, 2, 3, 0); /* PCI MAC IRQ disable */
+    oracle_reset_push(events, &count, 1, 4, 1); /* forced WPDMA reset */
+    oracle_reset_push(events, &count, 1, 5, 1); /* WFSYS reset */
+
+    global_config &= ~disable;
+    oracle_reset_push(events, &count, 3, 6, global_config);
+    for (i = 1; i <= busy_reads; i++)
+        oracle_reset_push(events, &count, 5, 6,
+                          i == busy_reads ? global_config & ~(BIT(1) | BIT(3))
+                                          : global_config | BIT(1));
+    ext0 &= ~BIT(6);
+    oracle_reset_push(events, &count, 3, 7, ext0);
+    dmashdl |= BIT(28);
+    oracle_reset_push(events, &count, 4, 8, dmashdl);
+    reset &= ~(BIT(4) | BIT(5));
+    oracle_reset_push(events, &count, 3, 9, reset);
+    reset |= BIT(4) | BIT(5);
+    oracle_reset_push(events, &count, 4, 9, reset);
+
+    oracle_reset_push(events, &count, 1, 10, 1); /* queue reset */
+    for (i = 0; i < ARRAY_SIZE(prefetch); i++)
+        oracle_reset_push(events, &count, 2, (uint8_t)(16 + i),
+                          ((uint32_t)prefetch[i] << 16) | 4);
+    oracle_reset_push(events, &count, 2, 30, UINT32_MAX); /* DTX ptr */
+    oracle_reset_push(events, &count, 2, 31, 0); /* delay interrupt */
+    global_config |= configure;
+    oracle_reset_push(events, &count, 4, 6, global_config);
+    global_config |= BIT(0) | BIT(2);
+    oracle_reset_push(events, &count, 4, 6, global_config);
+    oracle_reset_push(events, &count, 4, 32, BIT(1)); /* NEED_REINIT */
+    oracle_reset_push(events, &count, 4, 2, 1); /* ring IRQ masks */
+    oracle_reset_push(events, &count, 4, 33, BIT(0)); /* MCU wake IRQ */
+    oracle_reset_push(events, &count, 1, 34, 1); /* RX refill */
+
+    oracle_reset_push(events, &count, 2, 2, 1); /* host IRQ restore */
+    oracle_reset_push(events, &count, 2, 3, 0xff);
+    oracle_reset_push(events, &count, 1, 35, 1); /* top driver own */
+    oracle_reset_push(events, &count, 1, 36, 1); /* firmware reload */
+    /* mt7921e_mac_reset does not request firmware ownership here. */
+
+    final_registers[0] = global_config;
+    final_registers[1] = ext0;
+    final_registers[2] = dmashdl;
+    final_registers[3] = reset;
+    *event_count = count;
+    return 0;
+}
+
 int oracle_power_control(bool firmware, bool aspm, uint8_t success_attempt,
                          uint8_t success_read,
                          struct oracle_power_event *events, size_t *event_count,
