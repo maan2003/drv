@@ -7,7 +7,7 @@
 
 use crate::Descriptor;
 use alloc::vec::Vec;
-use ath11k_platform_backend::{Backend, DeviceAddress, Direction};
+use ath11k_platform_backend::{Backend, DeviceAddress, Direction, FromDevice, ToDevice};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutError {
@@ -372,6 +372,27 @@ impl WbmReleaseRing {
 // `struct hal_ce_srng_src_desc`.
 fixed_descriptor!(CeSourceDescriptor, 16);
 impl CeSourceDescriptor {
+    /// Port of `ath11k_hal_ce_src_set_desc`. Linux accepts `u32` values and
+    /// `FIELD_PREP` retains the low 16 bits of length and transfer id.
+    pub fn for_transfer<B: Backend>(
+        address: &DeviceAddress<'_, B, ToDevice>,
+        length: u32,
+        transfer_id: u32,
+        byte_swap_data: bool,
+    ) -> Self {
+        let mut descriptor = Self::new();
+        descriptor
+            .set_address_bits(address.bits())
+            .expect("40-bit CE address");
+        let address_high = field(&descriptor.0, 1, 0xff);
+        write_word(
+            &mut descriptor.0,
+            1,
+            address_high | u32::from(byte_swap_data) << 9 | (length & 0xffff) << 16,
+        );
+        write_word(&mut descriptor.0, 2, transfer_id & 0xffff);
+        descriptor
+    }
     pub fn address(&self) -> u64 {
         u64::from(read_word(&self.0, 0)) | (u64::from(field(&self.0, 1, 0xff)) << 32)
     }
@@ -401,6 +422,14 @@ impl CeSourceDescriptor {
 // `struct hal_ce_srng_dest_desc`.
 fixed_descriptor!(CeDestinationDescriptor, 8);
 impl CeDestinationDescriptor {
+    /// Port of `ath11k_hal_ce_dst_set_desc`.
+    pub fn from_address<B: Backend>(address: &DeviceAddress<'_, B, FromDevice>) -> Self {
+        let mut descriptor = Self::new();
+        descriptor
+            .set_address_bits(address.bits())
+            .expect("40-bit CE address");
+        descriptor
+    }
     pub fn address(&self) -> u64 {
         u64::from(read_word(&self.0, 0)) | (u64::from(field(&self.0, 1, 0xff)) << 32)
     }
@@ -439,6 +468,14 @@ impl CeDestinationStatusDescriptor {
     field_accessors!(metadata, set_metadata, 3, 0xffff, u16);
     field_accessors!(ring_id, set_ring_id, 3, 0x0ff0_0000, u8);
     field_accessors!(looping_count, set_looping_count, 3, 0xf000_0000, u8);
+
+    /// Port of `ath11k_hal_ce_dst_status_get_length`: return and clear LEN.
+    pub fn take_length(&mut self) -> u16 {
+        let length = self.length();
+        let flags = read_word(&self.0, 0) & !0xffff_0000;
+        write_word(&mut self.0, 0, flags);
+        length
+    }
 }
 
 // `struct hal_rx_ppdu_start`.
@@ -571,8 +608,8 @@ mod tests {
         assert_eq!(
             cmd.as_bytes(),
             &[
-                0x67, 0x45, 0x23, 0x01, 0xab, 0xed, 0xe6, 0xd5, 0x08, 0xd0, 0x34, 0x12, 0x78, 0x56,
-                0xa1, 0x80, 0x78, 0x56, 0xac, 0x09, 0x2a, 0x95, 0x21, 0x36, 0x00, 0x00, 0xa0, 0xc5,
+                0x67, 0x45, 0x23, 0x01, 0xab, 0xf5, 0xe6, 0xd5, 0x08, 0xd0, 0x34, 0x12, 0x78, 0x56,
+                0xa1, 0x80, 0x78, 0x56, 0x6c, 0x0a, 0x2a, 0x95, 0x1d, 0x36, 0x00, 0x00, 0xa0, 0xc5,
             ]
         );
         assert_eq!(
@@ -620,7 +657,7 @@ mod tests {
         assert_eq!(
             &dest.as_bytes()[24..36],
             &[
-                0x78, 0x56, 0x34, 0x12, 0x55, 0xed, 0xef, 0xbe, 0xd5, 0x0f, 0, 0
+                0x78, 0x56, 0x34, 0x12, 0x55, 0xed, 0xef, 0xbe, 0xf5, 0x0f, 0, 0
             ]
         );
         assert_eq!(&dest.as_bytes()[60..], &[0, 0, 0x30, 0xe3]);
@@ -703,7 +740,7 @@ mod tests {
         header.set_tag(0x155).unwrap();
         header.set_length(0x4567).unwrap();
         header.set_user_id(0x2a).unwrap();
-        assert_eq!(header.as_bytes(), &[0xaa, 0x9d, 0x15, 0xa9]);
+        assert_eq!(header.as_bytes(), &[0xaa, 0x9e, 0x15, 0xa9]);
         assert_eq!(header.tag(), 0x155);
         assert_eq!(header.length(), 0x4567);
         assert_eq!(header.user_id(), 0x2a);

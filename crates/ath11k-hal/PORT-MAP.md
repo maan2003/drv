@@ -20,3 +20,6 @@ oracle-checked, or hardware-checked.
 | hal.c:`ath11k_hal_srng_{src,dst}_peek` | `Srng::peek` | ported | source-derived unit arithmetic |
 | hal.c:`ath11k_hal_srng_access_begin` | `Srng::access_begin` | ported | `read_u32` acquire maps READ_ONCE + dma_rmb |
 | hal.c:`ath11k_hal_srng_access_end` | `Srng::access_end` | ported | ordered `write_u32` release maps dma_wmb/mb + pointer write |
+| hal.c:`ath11k_hal_ce_src_set_desc` | `descriptors::CeSourceDescriptor::for_transfer` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
+| hal.c:`ath11k_hal_ce_dst_set_desc` | `descriptors::CeDestinationDescriptor::from_address` | oracle-checked | checked 8-byte layout fixture |
+| hal.c:`ath11k_hal_ce_dst_status_get_length` | `descriptors::CeDestinationStatusDescriptor::take_length` | oracle-checked | checked 16-byte layout fixture |
