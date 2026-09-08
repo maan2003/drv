@@ -36,15 +36,17 @@ pub enum Stage {
     Qmi,
     Core,
     PassiveScan,
+    ScanResults,
 }
 
 impl Stage {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Resources,
         Self::Firmware,
         Self::Qmi,
         Self::Core,
         Self::PassiveScan,
+        Self::ScanResults,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -54,6 +56,7 @@ impl Stage {
             Self::Qmi => "qmi",
             Self::Core => "core",
             Self::PassiveScan => "passive-scan",
+            Self::ScanResults => "scan-results",
         }
     }
 }
@@ -65,7 +68,7 @@ impl FromStr for Stage {
         Self::ALL
             .into_iter()
             .find(|stage| stage.as_str() == value)
-            .ok_or_else(|| format!("unknown stage {value:?}; expected resources, firmware, qmi, core, or passive-scan"))
+            .ok_or_else(|| format!("unknown stage {value:?}; expected resources, firmware, qmi, core, passive-scan, or scan-results"))
     }
 }
 
@@ -78,18 +81,20 @@ pub struct Cli {
     pub board: PathBuf,
     pub regdb: PathBuf,
     pub wmi_log: Option<PathBuf>,
+    pub ssid: Option<Vec<u8>>,
 }
 
 impl Default for Cli {
     fn default() -> Self {
         Self {
             dry_run: false,
-            stop_after: Stage::PassiveScan,
+            stop_after: Stage::ScanResults,
             broker: false,
             vfio_device: None,
             board: DEFAULT_BOARD.into(),
             regdb: DEFAULT_REGDB.into(),
             wmi_log: Some("ath11k-wmi-run.jsonl".into()),
+            ssid: None,
         }
     }
 }
@@ -123,6 +128,7 @@ impl Cli {
                 "--board" => cli.board = value("--board", &mut arguments)?.into(),
                 "--regdb" => cli.regdb = value("--regdb", &mut arguments)?.into(),
                 "--wmi-log" => cli.wmi_log = Some(value("--wmi-log", &mut arguments)?.into()),
+                "--ssid" => cli.ssid = Some(value("--ssid", &mut arguments)?.into_bytes()),
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -141,7 +147,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
+    "usage: ath11k-bringup [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -155,6 +161,7 @@ pub enum Error {
     Core(ath11k_core::CoreError),
     InvalidAsset(&'static str),
     Unsupported(&'static str),
+    SsidNotFound(Vec<u8>),
 }
 
 impl fmt::Display for Error {
@@ -166,6 +173,9 @@ impl fmt::Display for Error {
             Self::Core(error) => write!(f, "ath11k core lifecycle failed: {error:?}"),
             Self::InvalidAsset(message) => write!(f, "firmware asset validation failed: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
+            Self::SsidNotFound(ssid) => {
+                write!(f, "no BSS matched SSID {:?}", String::from_utf8_lossy(ssid))
+            }
         }
     }
 }
@@ -178,6 +188,7 @@ pub trait Host {
     fn qmi(&mut self) -> Result<(), Error>;
     fn core(&mut self) -> Result<(), Error>;
     fn passive_scan(&mut self) -> Result<(), Error>;
+    fn scan_results(&mut self, ssid: Option<&[u8]>) -> Result<(), Error>;
 }
 
 pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
@@ -189,6 +200,7 @@ pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
             Stage::Qmi => host.qmi()?,
             Stage::Core => host.core()?,
             Stage::PassiveScan => host.passive_scan()?,
+            Stage::ScanResults => host.scan_results(config.ssid.as_deref())?,
         }
         completed.push(stage);
         if stage == config.stop_after {
@@ -198,9 +210,227 @@ pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
     Ok(completed)
 }
 
+const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BssResult {
+    pub ssid: Vec<u8>,
+    pub bssid: [u8; 6],
+    pub channel: u16,
+    pub channel_mhz: u32,
+    pub rssi_dbm: i32,
+    pub rsn: bool,
+    pub rsnxe: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScanSummary {
+    pub bsses: Vec<BssResult>,
+    pub selected: Option<BssResult>,
+}
+
+impl fmt::Display for BssResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ssid={:?} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} channel={} frequency_mhz={} rssi_dbm={} rsn={} rsnxe={}",
+            String::from_utf8_lossy(&self.ssid),
+            self.bssid[0],
+            self.bssid[1],
+            self.bssid[2],
+            self.bssid[3],
+            self.bssid[4],
+            self.bssid[5],
+            self.channel,
+            self.channel_mhz,
+            self.rssi_dbm,
+            self.rsn,
+            self.rsnxe
+        )
+    }
+}
+
+/// Minimal diagnostic parser used only until the chip-neutral SoftMAC host
+/// binds its canonical Fuchsia BSS-description conversion to ath11k.
+fn parse_bss(frame: &[u8], channel_mhz: u32, rssi_dbm: i32) -> Option<BssResult> {
+    let fixed = frame.get(..36)?;
+    let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
+    if !matches!(frame_control & 0x00fc, 0x0080 | 0x0050) {
+        return None;
+    }
+    let bssid = fixed[16..22].try_into().ok()?;
+    let mut ssid = None;
+    let mut channel = None;
+    let mut rsn = false;
+    let mut rsnxe = false;
+    let mut ies = &frame[36..];
+    while !ies.is_empty() {
+        let header = ies.get(..2)?;
+        let len = usize::from(header[1]);
+        let body = ies.get(2..2 + len)?;
+        match header[0] {
+            0 if ssid.is_none() && len <= 32 => ssid = Some(body.to_vec()),
+            3 if !body.is_empty() => channel = Some(u16::from(body[0])),
+            48 => rsn = true,
+            61 if channel.is_none() && !body.is_empty() => channel = Some(u16::from(body[0])),
+            244 => rsnxe = true,
+            _ => {}
+        }
+        ies = &ies[2 + len..];
+    }
+    let channel = channel.or_else(|| frequency_channel(channel_mhz))?;
+    Some(BssResult {
+        ssid: ssid?,
+        bssid,
+        channel,
+        channel_mhz,
+        rssi_dbm,
+        rsn,
+        rsnxe,
+    })
+}
+
+fn frequency_channel(frequency_mhz: u32) -> Option<u16> {
+    match frequency_mhz {
+        2484 => Some(14),
+        2412..=2472 if (frequency_mhz - 2407).is_multiple_of(5) => {
+            u16::try_from((frequency_mhz - 2407) / 5).ok()
+        }
+        5005..=5895 if (frequency_mhz - 5000).is_multiple_of(5) => {
+            u16::try_from((frequency_mhz - 5000) / 5).ok()
+        }
+        5955..=7115 if (frequency_mhz - 5950).is_multiple_of(5) => {
+            u16::try_from((frequency_mhz - 5950) / 5).ok()
+        }
+        _ => None,
+    }
+}
+
+fn collect_scan_results<B: ath11k_core::Subsystems>(
+    device: &mut ath11k_core::Device<B>,
+    selected_ssid: Option<&[u8]>,
+) -> Result<ScanSummary, Error> {
+    use ath11k_core::EventSource as _;
+    let mut bsses: Vec<BssResult> = Vec::new();
+    loop {
+        match device.next_wlan_event().map_err(Error::Core)? {
+            Some(ath11k_core::WlanEvent::ManagementReceived {
+                channel_mhz,
+                rssi,
+                frame,
+                ..
+            }) => {
+                if let Some(candidate) = parse_bss(&frame, channel_mhz, rssi) {
+                    if let Some(existing) =
+                        bsses.iter_mut().find(|bss| bss.bssid == candidate.bssid)
+                    {
+                        if candidate.rssi_dbm > existing.rssi_dbm {
+                            *existing = candidate;
+                        }
+                    } else {
+                        bsses.push(candidate);
+                    }
+                }
+            }
+            Some(ath11k_core::WlanEvent::Scan {
+                event_type,
+                reason,
+                scan_id: 1,
+                ..
+            }) if event_type & SCAN_EVENT_COMPLETED != 0 => {
+                if reason != 0 {
+                    return Err(Error::Core(ath11k_core::CoreError::Protocol));
+                }
+                break;
+            }
+            Some(_) => {}
+            None => return Err(Error::Core(ath11k_core::CoreError::Protocol)),
+        }
+    }
+    bsses.sort_by(|a, b| b.rssi_dbm.cmp(&a.rssi_dbm).then(a.bssid.cmp(&b.bssid)));
+    let selected = match selected_ssid {
+        Some(ssid) => Some(
+            bsses
+                .iter()
+                .find(|bss| bss.ssid == ssid)
+                .cloned()
+                .ok_or_else(|| Error::SsidNotFound(ssid.to_vec()))?,
+        ),
+        None => None,
+    };
+    Ok(ScanSummary { bsses, selected })
+}
+
+fn diagnostic_beacon(bssid: [u8; 6], ssid: &[u8], channel: u8) -> Vec<u8> {
+    let mut frame = vec![0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&[0; 14]);
+    frame.extend_from_slice(&[0, ssid.len() as u8]);
+    frame.extend_from_slice(ssid);
+    frame.extend_from_slice(&[3, 1, channel, 48, 2, 1, 0, 244, 1, 0x20]);
+    frame
+}
+
+fn diagnostic_wmi_events() -> Vec<(u32, Vec<u8>)> {
+    use ath11k_wmi::tags::{
+        WMI_MGMT_RX_EVENTID, WMI_SCAN_EVENTID, WMI_TAG_ARRAY_BYTE, WMI_TAG_MGMT_RX_HDR,
+        WMI_TAG_SCAN_EVENT,
+    };
+    let tlv = |tag: u16, value: &[u8]| {
+        let mut bytes = Vec::with_capacity(4 + value.len());
+        bytes.extend_from_slice(&((u32::from(tag) << 16) | value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    };
+    let envelope = |id: u32, tlvs: Vec<u8>| {
+        let mut bytes = Vec::with_capacity(4 + tlvs.len());
+        bytes.extend_from_slice(&(id & 0x00ff_ffff).to_le_bytes());
+        bytes.extend(tlvs);
+        bytes
+    };
+
+    let frame = diagnostic_beacon([0x02, 0, 0, 0, 0, 6], b"dry-run", 6);
+    let mut header = [0u8; 68];
+    header[0..4].copy_from_slice(&6u32.to_le_bytes());
+    header[4..8].copy_from_slice(&44u32.to_le_bytes());
+    header[16..20].copy_from_slice(&(frame.len() as u32).to_le_bytes());
+    header[44..48].copy_from_slice(&(-42i32).to_le_bytes());
+    header[64..68].copy_from_slice(&2437u32.to_le_bytes());
+    let mut frame_tlv = frame;
+    frame_tlv.resize(frame_tlv.len().next_multiple_of(4), 0);
+    let mut mgmt_tlvs = tlv(WMI_TAG_MGMT_RX_HDR.0, &header);
+    mgmt_tlvs.extend(tlv(WMI_TAG_ARRAY_BYTE.0, &frame_tlv));
+
+    let words = [SCAN_EVENT_COMPLETED, 0, 0, 1, 1, 0, 0];
+    let scan_fixed: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    vec![
+        (
+            WMI_MGMT_RX_EVENTID.0,
+            envelope(WMI_MGMT_RX_EVENTID.0, mgmt_tlvs),
+        ),
+        (
+            WMI_SCAN_EVENTID.0,
+            envelope(WMI_SCAN_EVENTID.0, tlv(WMI_TAG_SCAN_EVENT.0, &scan_fixed)),
+        ),
+    ]
+}
+
+fn dry_scan_config(vdev: ath11k_core::VdevId) -> ath11k_core::ScanConfig {
+    ath11k_core::ScanConfig {
+        vdev,
+        id: ath11k_core::ScanId(1),
+        active: false,
+        channels_mhz: vec![2412, 2437, 2462],
+        ssids: Vec::new(),
+    }
+}
+
 pub struct DryRunHost {
     device: Option<ath11k_core::Device<ath11k_core::ModelSubsystems>>,
     vdev: Option<ath11k_core::VdevId>,
+    summary: Option<ScanSummary>,
+    wmi_log: Option<WmiJsonl<BufWriter<File>>>,
 }
 
 impl Default for DryRunHost {
@@ -208,12 +438,22 @@ impl Default for DryRunHost {
         Self {
             device: Some(ath11k_core::WCN6750.device(Default::default())),
             vdev: None,
+            summary: None,
+            wmi_log: None,
         }
     }
 }
 
 impl Host for DryRunHost {
-    fn resources(&mut self, _: &Cli) -> Result<(), Error> {
+    fn resources(&mut self, config: &Cli) -> Result<(), Error> {
+        if let Some(path) = &config.wmi_log {
+            self.wmi_log = Some(WmiJsonl::new(BufWriter::new(File::create(path).map_err(
+                |source| Error::Io {
+                    action: "create deterministic dry-run WMI JSONL",
+                    source,
+                },
+            )?)));
+        }
         Ok(())
     }
     fn firmware(&mut self, _: &Path, _: &Path) -> Result<(), Error> {
@@ -233,6 +473,7 @@ impl Host for DryRunHost {
                 .create_client_vdev([0x02, 0, 0, 0, 0, 1])
                 .map_err(Error::Core)?,
         );
+        self.record_client_vdev_commands()?;
         Ok(())
     }
     fn passive_scan(&mut self) -> Result<(), Error> {
@@ -240,16 +481,120 @@ impl Host for DryRunHost {
         self.device
             .as_mut()
             .unwrap()
-            .start_scan(ath11k_core::ScanConfig {
-                vdev: self
-                    .vdev
+            .start_scan(dry_scan_config(
+                self.vdev
                     .ok_or(Error::Unsupported("scan requested before vdev creation"))?,
-                id: ath11k_core::ScanId(1),
-                active: false,
-                channels_mhz: vec![2412, 2437, 2462],
-                ssids: Vec::new(),
-            })
-            .map_err(Error::Core)
+            ))
+            .map_err(Error::Core)?;
+        self.record_scan_start()
+    }
+
+    fn scan_results(&mut self, ssid: Option<&[u8]>) -> Result<(), Error> {
+        self.record_scan_fixture()?;
+        let device = self.device.as_mut().unwrap();
+        device
+            .backend_mut()
+            .push_event(ath11k_core::WlanEvent::ManagementReceived {
+                pdev_id: 0,
+                channel_mhz: 2437,
+                snr: 44,
+                rssi: -42,
+                flags: 0,
+                frame: diagnostic_beacon([0x02, 0, 0, 0, 0, 6], b"dry-run", 6),
+            });
+        device
+            .backend_mut()
+            .push_event(ath11k_core::WlanEvent::Scan {
+                event_type: SCAN_EVENT_COMPLETED,
+                reason: 0,
+                request_id: 1,
+                scan_id: 1,
+                vdev_id: u32::from(self.vdev.unwrap().0),
+                channel_mhz: 0,
+            });
+        self.summary = Some(collect_scan_results(device, ssid)?);
+        Ok(())
+    }
+}
+
+impl DryRunHost {
+    pub fn scan_summary(&self) -> Option<&ScanSummary> {
+        self.summary.as_ref()
+    }
+
+    fn record_command(
+        &mut self,
+        command: &impl ath11k_wmi::cmd::EncodeCommand,
+    ) -> Result<(), Error> {
+        let command = command
+            .encode_command()
+            .map_err(|_| Error::Core(ath11k_core::CoreError::Protocol))?;
+        let mut bytes = Vec::with_capacity(4 + command.tlvs().len());
+        bytes.extend_from_slice(&(command.id.0 & 0x00ff_ffff).to_le_bytes());
+        bytes.extend_from_slice(command.tlvs());
+        if let Some(log) = &mut self.wmi_log {
+            log.record_deterministic(WmiKind::Command, command.id.0, &bytes)
+                .map_err(|source| Error::Io {
+                    action: "write deterministic dry-run WMI command",
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn record_client_vdev_commands(&mut self) -> Result<(), Error> {
+        use ath11k_wmi::cmd::{
+            StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevSetParam,
+        };
+        let vdev_id = u32::from(self.vdev.unwrap().0);
+        self.record_command(&VdevCreate {
+            vdev_id,
+            vdev_type: 0,
+            vdev_subtype: 0,
+            mac_addr: [0x02, 0, 0, 0, 0, 1],
+            pdev_id: 0,
+            mbssid_flags: 0,
+            mbssid_tx_vdev_id: 0,
+            band_2ghz: TxRxStreams { tx: 1, rx: 1 },
+            band_5ghz: TxRxStreams { tx: 1, rx: 1 },
+        })?;
+        self.record_command(&VdevSetParam {
+            vdev_id,
+            param_id: 0x22,
+            param_value: 1,
+        })?;
+        for (param, value) in [(0, 0), (1, 1), (2, 0)] {
+            self.record_command(&StaPowerSaveParameter {
+                vdev_id,
+                param,
+                value,
+            })?;
+        }
+        self.record_command(&StaPowerSaveMode { vdev_id, mode: 0 })?;
+        self.record_command(&VdevSetParam {
+            vdev_id,
+            param_id: 1,
+            param_value: 2347,
+        })
+    }
+
+    fn record_scan_start(&mut self) -> Result<(), Error> {
+        self.record_command(&ath11k_core::wcn6750_scan_start(dry_scan_config(
+            self.vdev.unwrap(),
+        )))
+    }
+
+    fn record_scan_fixture(&mut self) -> Result<(), Error> {
+        for (id, bytes) in diagnostic_wmi_events() {
+            if let Some(log) = &mut self.wmi_log {
+                log.record_deterministic(WmiKind::Event, id, &bytes)
+                    .map_err(|source| Error::Io {
+                        action: "write deterministic dry-run WMI event",
+                        source,
+                    })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -303,6 +648,7 @@ pub struct RealHost {
     wmi_log: Option<PathBuf>,
     device: Option<LiveDevice>,
     vdev: Option<ath11k_core::VdevId>,
+    summary: Option<ScanSummary>,
 }
 
 impl Host for RealHost {
@@ -419,16 +765,27 @@ impl Host for RealHost {
         self.device
             .as_mut()
             .ok_or(Error::Unsupported("scan requested before core startup"))?
-            .start_scan(ath11k_core::ScanConfig {
-                vdev: self
-                    .vdev
+            .start_scan(dry_scan_config(
+                self.vdev
                     .ok_or(Error::Unsupported("scan requested before vdev creation"))?,
-                id: ath11k_core::ScanId(1),
-                active: false,
-                channels_mhz: vec![2412, 2437, 2462],
-                ssids: Vec::new(),
-            })
+            ))
             .map_err(Error::Core)
+    }
+
+    fn scan_results(&mut self, ssid: Option<&[u8]>) -> Result<(), Error> {
+        self.summary = Some(collect_scan_results(
+            self.device.as_mut().ok_or(Error::Unsupported(
+                "scan results requested before core startup",
+            ))?,
+            ssid,
+        )?);
+        Ok(())
+    }
+}
+
+impl RealHost {
+    pub fn scan_summary(&self) -> Option<&ScanSummary> {
+        self.summary.as_ref()
     }
 }
 
@@ -503,6 +860,10 @@ impl<W: Write> WmiJsonl<W> {
         self.record_at(timestamp, kind, id, bytes)
     }
 
+    fn record_deterministic(&mut self, kind: WmiKind, id: u32, bytes: &[u8]) -> io::Result<()> {
+        self.record_at(self.next_seq, kind, id, bytes)
+    }
+
     pub fn record_at(
         &mut self,
         ts_ns: u64,
@@ -567,6 +928,9 @@ mod tests {
         fn passive_scan(&mut self) -> Result<(), Error> {
             self.visit(Stage::PassiveScan)
         }
+        fn scan_results(&mut self, _: Option<&[u8]>) -> Result<(), Error> {
+            self.visit(Stage::ScanResults)
+        }
     }
 
     #[test]
@@ -628,11 +992,18 @@ mod tests {
             vfio_device: Some("/does/not/exist".into()),
             board: "/does/not/exist".into(),
             regdb: "/does/not/exist".into(),
+            wmi_log: None,
+            ssid: Some(b"dry-run".to_vec()),
             ..Cli::default()
         };
         let mut host = DryRunHost::default();
         let completed = run(&cli, &mut host).unwrap();
-        assert_eq!(completed.last(), Some(&Stage::PassiveScan));
+        assert_eq!(completed.last(), Some(&Stage::ScanResults));
+        assert_eq!(host.scan_summary().unwrap().bsses[0].ssid, b"dry-run");
+        assert_eq!(
+            host.scan_summary().unwrap().selected.as_ref().unwrap().ssid,
+            b"dry-run"
+        );
         assert!(
             host.device
                 .as_ref()
@@ -641,5 +1012,32 @@ mod tests {
                 .operations()
                 .contains(&ath11k_core::Operation::DpPdevAllocate)
         );
+    }
+
+    #[test]
+    fn native_probe_response_extracts_diagnostic_bss_fields() {
+        // First probe response in the checked-in Redwood native WMI capture.
+        let hex = "50003a010284f8caacc6160808f37916160808f379167085e8332a8c01000000640011000011494f54352d4d322d34353933323030393001088b9682840c1830600301010706434e00010d1432046c122448dd0918fe3403010000000030180100000fac020200000fac04000fac020100000fac020000";
+        let frame: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let bss = parse_bss(&frame, 2412, -55).unwrap();
+        assert_eq!(bss.ssid, b"IOT5-M2-459320090");
+        assert_eq!(bss.bssid, [0x16, 0x08, 0x08, 0xf3, 0x79, 0x16]);
+        assert_eq!(bss.channel, 1);
+        assert!(bss.rsn);
+        assert!(!bss.rsnxe);
+        assert_eq!(bss.rssi_dbm, -55);
+    }
+
+    #[test]
+    fn diagnostic_ie_walker_rejects_truncation_and_detects_rsnxe() {
+        let mut frame = diagnostic_beacon([1; 6], b"test", 6);
+        let bss = parse_bss(&frame, 2437, -40).unwrap();
+        assert!(bss.rsn && bss.rsnxe);
+        frame.pop();
+        assert_eq!(parse_bss(&frame, 2437, -40), None);
     }
 }

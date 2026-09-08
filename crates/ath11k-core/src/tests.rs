@@ -24,6 +24,10 @@ impl Subsystems for Model {
             target_mem_mode: 0,
         })
     }
+
+    fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
+        Ok(None)
+    }
 }
 
 fn ready_device() -> Device<Model> {
