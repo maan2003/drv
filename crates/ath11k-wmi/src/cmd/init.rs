@@ -265,7 +265,17 @@ impl EncodeCommand for Init {
             w.u32(self.memory_chunks.len() as u32);
         })?;
         w.tlv(WMI_TAG_RESOURCE_CONFIG, |w| {
-            for value in self.resource_config.words() {
+            let mut words = self.resource_config.words();
+            // ath11k_wmi_copy_resource_config copies only this pinned subset
+            // into a zeroed wire struct.
+            for index in [
+                44usize, 45, 46, 47, 48, 49, 50, 54, 55, 60, 61, 62, 63, 64, 65, 66, 69,
+            ] {
+                words[index] = 0;
+            }
+            words[67] = 1 << 9; // WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET
+            words[68] &= 1 << 4; // only REG_CC_EXT is copied by the C builder
+            for value in words {
                 w.u32(value);
             }
         })?;
@@ -282,9 +292,11 @@ impl EncodeCommand for Init {
         // When any chunk exists Linux allocates WMI_MAX_MEM_REQS entries,
         // although the array TLV names only the live entries. The zero tail is
         // part of skb->len and therefore part of the command bytes.
-        if !self.memory_chunks.is_empty() {
-            w.zeros((32usize.saturating_sub(self.memory_chunks.len())) * 16);
-        }
+        let reserved_chunk_tail = if self.memory_chunks.is_empty() {
+            0
+        } else {
+            (32 - self.memory_chunks.len()) * 16
+        };
 
         if let Some(mode) = self.hardware_mode {
             w.tlv(WMI_TAG_PDEV_SET_HW_MODE_CMD, |w| {
@@ -302,6 +314,10 @@ impl EncodeCommand for Init {
                 }
             })?;
         }
+        // The C allocation reserves 32 chunk entries but advances past only
+        // live chunks before writing optional hw-mode TLVs, leaving this tail
+        // at the very end of the skb.
+        w.zeros(reserved_chunk_tail);
         w.finish(WMI_INIT_CMDID)
     }
 }
@@ -309,6 +325,57 @@ impl EncodeCommand for Init {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn resource_copy_zeroes_omitted_fields_and_forces_flags() {
+        let command = Init {
+            resource_config: ResourceConfig::from_words([u32::MAX; 72]),
+            memory_chunks: Vec::new(),
+            hardware_mode: None,
+            bands: Vec::new(),
+        }
+        .encode_command()
+        .unwrap();
+        let payload = &command.tlvs()[36..324];
+        let words: Vec<u32> = payload
+            .chunks_exact(4)
+            .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+            .collect();
+        for i in [
+            44usize, 45, 46, 47, 48, 49, 50, 54, 55, 60, 61, 62, 63, 64, 65, 66, 69,
+        ] {
+            assert_eq!(words[i], 0);
+        }
+        assert_eq!(words[67], 1 << 9);
+        assert_eq!(words[68], 1 << 4);
+    }
+
+    #[test]
+    fn hardware_mode_precedes_reserved_chunk_tail() {
+        let command = Init {
+            resource_config: ResourceConfig::default(),
+            memory_chunks: vec![HostMemoryChunk {
+                request_id: 1,
+                physical_address: 2,
+                size: 3,
+            }],
+            hardware_mode: Some(4),
+            bands: vec![BandToMac {
+                pdev_id: 0,
+                start_freq: 2400,
+                end_freq: 2500,
+            }],
+        }
+        .encode_command()
+        .unwrap();
+        // Fixed init + resource + chunk-array header + one chunk = 344.
+        assert_eq!(
+            u32::from_le_bytes(command.tlvs()[344..348].try_into().unwrap()),
+            (u32::from(WMI_TAG_PDEV_SET_HW_MODE_CMD.0) << 16) | 12
+        );
+        assert!(command.tlvs()[384..].iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn single_pdev_init_matches_fixed_c_layout() {
@@ -325,6 +392,10 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(command.tlvs()[32..36].try_into().unwrap()),
             (u32::from(WMI_TAG_RESOURCE_CONFIG.0) << 16) | 288
+        );
+        assert_eq!(
+            u32::from_le_bytes(command.tlvs()[304..308].try_into().unwrap()),
+            1 << 9
         );
     }
 }
