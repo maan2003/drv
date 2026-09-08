@@ -328,15 +328,12 @@ impl Backend for DeterministicBackend {
         }
     }
     fn open_interrupt(&mut self, vector: u32) -> Result<u32> {
-        if vector != 0 {
-            return Err(Error::Invalid);
-        }
         self.live_irqs += 1;
         Ok(vector)
     }
     fn wait_interrupt(&mut self, i: &u32, deadline: u64) -> Result<Option<IrqEvent>> {
         self.now = self.now.max(deadline);
-        if self.pending {
+        if self.pending && *i == 0 {
             self.pending = false;
             Ok(Some(IrqEvent {
                 vector: *i,
@@ -346,6 +343,18 @@ impl Backend for DeterministicBackend {
         } else {
             Ok(None)
         }
+    }
+    fn wait_any(&mut self, interrupts: &[&u32], deadline: u64) -> Result<Vec<IrqEvent>> {
+        if interrupts.is_empty() {
+            return Err(Error::Invalid);
+        }
+        let Some(interrupt) = interrupts.iter().find(|interrupt| ***interrupt == 0) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .wait_interrupt(interrupt, deadline)?
+            .into_iter()
+            .collect())
     }
     fn reset(&mut self) -> Result<u64> {
         self.generation += 1;
@@ -522,5 +531,30 @@ mod tests {
             ),
             Err(Error::Limit)
         ));
+    }
+
+    #[test]
+    fn wait_any_identifies_ready_vector_and_rejects_foreign_sets() {
+        let device = DeterministicBackend::device();
+        let other = DeterministicBackend::device();
+        let unrelated = device.open_interrupt(4).unwrap();
+        let ready = device.open_interrupt(0).unwrap();
+        let foreign = other.open_interrupt(0).unwrap();
+        let bar = device.open_region(0).unwrap();
+        let mut dma = device
+            .alloc_streaming::<drv_hardware::ToDevice>(4, 4)
+            .unwrap();
+        dma.write(0, &[1]).unwrap();
+        dma.sync_for_device(0, 1).unwrap();
+        bar.write_device_address(0x80, Some(0x84), dma.device_address(0).unwrap())
+            .unwrap();
+        bar.write_u32(0x90, 1).unwrap();
+        bar.write_u32(0x98, 1 | 4).unwrap();
+        let set = drv_hardware::Interrupt::wait_any(&[&unrelated, &ready], 10).unwrap();
+        assert_eq!(set.events()[0].vector, 0);
+        assert_eq!(
+            drv_hardware::Interrupt::wait_any(&[&ready, &foreign], 10),
+            Err(Error::Invalid)
+        );
     }
 }

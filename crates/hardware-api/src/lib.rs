@@ -137,6 +137,13 @@ pub trait Backend {
         interrupt: &Self::Interrupt,
         deadline_ns: u64,
     ) -> Result<Option<IrqEvent>>;
+    /// Wait for any of several interrupts with one absolute monotonic
+    /// deadline. Implementations must not serialize blocking waits.
+    fn wait_any(
+        &mut self,
+        interrupts: &[&Self::Interrupt],
+        deadline_ns: u64,
+    ) -> Result<Vec<IrqEvent>>;
     fn reset(&mut self) -> Result<u64>;
     fn release_region(&mut self, region: Self::Region);
     fn release_dma(&mut self, dma: Self::Dma);
@@ -501,6 +508,18 @@ pub struct IrqEvent {
     pub count: u64,
     pub at_ns: u64,
 }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InterruptSet {
+    events: Vec<IrqEvent>,
+}
+impl InterruptSet {
+    pub fn events(&self) -> &[IrqEvent] {
+        &self.events
+    }
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
 pub struct Interrupt<B: Backend> {
     shared: Shared<B>,
     token: Option<B::Interrupt>,
@@ -513,6 +532,21 @@ impl<B: Backend> Interrupt<B> {
             .0
             .borrow_mut()
             .wait_interrupt(self.token.as_ref().unwrap(), deadline_ns)
+    }
+    pub fn wait_any(interrupts: &[&Self], deadline_ns: u64) -> Result<InterruptSet> {
+        let first = interrupts.first().ok_or(Error::Invalid)?;
+        for interrupt in interrupts {
+            if !Rc::ptr_eq(&first.shared.0, &interrupt.shared.0) {
+                return Err(Error::Invalid);
+            }
+            current(&interrupt.shared, interrupt.generation)?;
+        }
+        let tokens = interrupts
+            .iter()
+            .map(|interrupt| interrupt.token.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        let events = first.shared.0.borrow_mut().wait_any(&tokens, deadline_ns)?;
+        Ok(InterruptSet { events })
     }
 }
 impl<B: Backend> Drop for Interrupt<B> {
