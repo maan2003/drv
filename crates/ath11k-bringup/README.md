@@ -17,6 +17,59 @@ NixOS system configuration lives in `~/src/nixos` (locally
 np access with the MT7921/substrate owner. Kernel/DTB experiments are kexec-only:
 no flashing, partition/slot changes, or encryption-key changes.
 
+### Run B starting-kernel precondition
+
+The 32-byte region-1 DT has only booted through a two-hop sequence. A direct
+flashed `7.2.0 #1` to forced-legacy candidate hop is **not validated** and most
+recently failed to return USB; do not retry it. This is a validation gap, not a
+proved kernel root cause. The observed sequence used these exact inputs:
+
+- `stage3/Image`, SHA-256
+  `97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885`
+- `stage7/initrd-watchdog`, SHA-256
+  `654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f`
+- `stage10/runB-region1.fdt`, SHA-256
+  `8a5d019f7c258b654dffa180215f5d17cb5d95d04561a59a470d27cf33707b67`
+- `stage7/kexec-transaction/command-line`, exactly 1540 bytes.
+
+From unlocked, running flashed `#1`, hop first in auto mode:
+
+```sh
+set -e
+kexec -l /var/lib/ath11k-redwood-lab/stage3/Image \
+  --initrd=/var/lib/ath11k-redwood-lab/stage7/initrd-watchdog \
+  --dtb=/var/lib/ath11k-redwood-lab/stage10/runB-region1.fdt \
+  --command-line="$(cat /var/lib/ath11k-redwood-lab/stage7/kexec-transaction/command-line)"
+sync
+kexec -e
+```
+
+That hop reaches `7.2.0+ #9` but ignores the DTB argument: require a 16-byte
+Wi-Fi `reg` and live-FDT SHA-256
+`d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
+After the approved stdin-only unlock and return to `#9` userspace, make the
+second hop with the legacy syscall forced:
+
+```sh
+set -e
+test ! -e /run/redwood-lab-watchdog/armed
+kexec -u || true
+kexec -c -l /var/lib/ath11k-redwood-lab/stage3/Image \
+  --initrd=/var/lib/ath11k-redwood-lab/stage7/initrd-watchdog \
+  --dtb=/var/lib/ath11k-redwood-lab/stage10/runB-region1.fdt \
+  --command-line="$(cat /var/lib/ath11k-redwood-lab/stage7/kexec-transaction/command-line)"
+sync
+kexec -e
+```
+
+Before unlocking the second hop, require `#9`, a 146776-byte live FDT, and the
+exact 32-byte Wi-Fi `reg` ending in `61 e0 00 00 ... 00 20 00 00`. The staged
+candidate proof is on np at
+`/var/lib/poco-linux/redwood/work/artifacts/runB-dtb-20260908T221230Z`.
+The first hop's ignored DTB and the successful second hop are observed facts;
+neither hop accessed VFIO or QMI. Do not infer that another starting kernel or
+memory context is safe.
+
 ## Safe use
 
 Verify USB control before a stateful run. The complete experiment must have a
