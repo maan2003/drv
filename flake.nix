@@ -1139,12 +1139,12 @@
               closure = pkgs.closureInfo { rootPaths = [ package supervisorPackage ]; };
             in pkgs.runCommand "mt7921-full-firmware-validation-manifest"
               { nativeBuildInputs = [ pkgs.coreutils pkgs.gnugrep pkgs.gnused ]; } ''
-                identity=$package/share/mt7921-full-firmware-validation/artifact-identity.json
+                identity=${package}/share/mt7921-full-firmware-validation/artifact-identity.json
                 get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$identity"; }
                 cat > "$out" <<EOF
-                PACKAGE=$package
-                LAUNCHER=$package/bin/mt7921-full-firmware-validation
-                ELF=$package/bin/mt7921-full-firmware-validation-driver
+                PACKAGE=${package}
+                LAUNCHER=${package}/bin/mt7921-full-firmware-validation
+                ELF=${package}/bin/mt7921-full-firmware-validation-driver
                 ARTIFACT_IDENTITY=$identity
                 SOURCE_IDENTITY_SHA256=$(get source_identity_sha256)
                 PROJECT_CORE_SOURCE_SHA256=$(get project_core_source_sha256)
@@ -1153,7 +1153,7 @@
                 FLAVOR=full-firmware-production
                 ACTIVE_CAPABLE=true
                 FD_CONTRACT=credential-fd3+snapshot-fd4+immediate-eof
-                SUPERVISOR=$supervisorPackage/bin/mt7921-full-firmware-validation-supervisor
+                SUPERVISOR=${supervisorPackage}/bin/mt7921-full-firmware-validation-supervisor
                 CLOSURE_SHA256=$(sort ${closure}/store-paths | sha256sum | cut -d ' ' -f1)
                 PCI_BDF=0000:05:00.0
                 TIMEOUT_SECONDS=420
