@@ -28,9 +28,11 @@ the device driver above them:
   exposes only fenced MMIO, DMA and interrupts. WCN6750 has no upstream
   vfio-platform reset handler; pinned ath11k AHB contains the firmware through
   the WPSS remoteproc lifecycle instead. A no-RESET cdev is admitted only for
-  the polling diagnostic when the operator names a running WPSS remoteproc and
-  the stop-on-failure watchdog guarantees reboot. Production still requires a
-  proved remoteproc restart/reset ownership contract.
+  the polling diagnostic after the supervisor/operator externally restarts
+  WPSS before DMA, names that now-running remoteproc to the read-only runner,
+  and arms a watchdog to reboot on run or restart failure. The runner never
+  controls remoteproc. Production still requires a proved remoteproc
+  restart/reset ownership contract.
 
 Everything ath11k-specific moves to userspace: QMI WLAN handshake, WMI, HTC/CE,
 HTT, HAL descriptors/registers/SRNG, TCL/REO/WBM data path, and hardware-facing

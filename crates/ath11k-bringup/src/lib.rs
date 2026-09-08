@@ -152,13 +152,7 @@ impl Cli {
                     let name = containment.strip_prefix("remoteproc:").ok_or_else(|| {
                         "--containment must be remoteproc:<sysfs-name>".to_string()
                     })?;
-                    if name.is_empty()
-                        || name == "."
-                        || name == ".."
-                        || !name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-                    {
+                    if !valid_remoteproc_name(name) {
                         return Err(
                             "remoteproc containment name is not a safe sysfs basename".into()
                         );
@@ -183,6 +177,15 @@ impl Cli {
         }
         Ok(cli)
     }
+}
+
+fn valid_remoteproc_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
 pub const fn usage() -> &'static str {
@@ -1054,6 +1057,11 @@ struct RemoteprocContainment {
 }
 
 fn verify_remoteproc_containment(root: &Path, name: &str) -> Result<RemoteprocContainment, Error> {
+    if !valid_remoteproc_name(name) {
+        return Err(Error::Hardware(
+            "remoteproc containment name is not a safe sysfs basename".into(),
+        ));
+    }
     let remoteproc = root.join(name);
     let read = |path: PathBuf| {
         fs::read(path)
@@ -1086,6 +1094,22 @@ fn verify_remoteproc_containment(root: &Path, name: &str) -> Result<RemoteprocCo
     })
 }
 
+fn remoteproc_containment_for_resources(
+    reset_supported: bool,
+    root: &Path,
+    name: Option<&str>,
+) -> Result<Option<RemoteprocContainment>, Error> {
+    if reset_supported {
+        return Ok(None);
+    }
+    let name = name.ok_or_else(|| {
+        Error::Hardware(
+            "VFIO reset is unavailable; pass --containment remoteproc:<sysfs-name>".into(),
+        )
+    })?;
+    verify_remoteproc_containment(root, name).map(Some)
+}
+
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
         let vfio = if config.broker {
@@ -1108,13 +1132,11 @@ impl Host for RealHost {
         let resources = vfio.validate_wcn6750_resources().map_err(|error| {
             Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
         })?;
-        if !resources.reset_supported {
-            let name = config.containment_remoteproc.as_deref().ok_or_else(|| {
-                Error::Hardware(
-                    "VFIO reset is unavailable; pass --containment remoteproc:<sysfs-name>".into(),
-                )
-            })?;
-            let containment = verify_remoteproc_containment(Path::new(REMOTEPROC_CLASS), name)?;
+        if let Some(containment) = remoteproc_containment_for_resources(
+            resources.reset_supported,
+            Path::new(REMOTEPROC_CLASS),
+            config.containment_remoteproc.as_deref(),
+        )? {
             println!(
                 "remoteproc_containment name={:?} state={:?} firmware={:?}",
                 containment.name, containment.state, containment.firmware
@@ -1547,25 +1569,41 @@ mod tests {
     }
 
     #[test]
-    fn no_reset_containment_requires_a_named_running_remoteproc() {
+    fn reset_admission_requires_a_safe_running_remoteproc_with_firmware() {
         let root = std::env::temp_dir().join(format!(
             "ath11k-remoteproc-test-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let remoteproc = root.join("remoteproc3");
         fs::create_dir_all(&remoteproc).unwrap();
+
+        assert_eq!(
+            remoteproc_containment_for_resources(true, &root, None).unwrap(),
+            None
+        );
+        assert!(remoteproc_containment_for_resources(false, &root, None).is_err());
+        assert!(
+            remoteproc_containment_for_resources(false, &root, Some("../remoteproc3")).is_err()
+        );
+
         fs::write(remoteproc.join("state"), "offline\n").unwrap();
         fs::write(remoteproc.join("firmware"), "qcom/wpss.mdt\n").unwrap();
-        assert!(verify_remoteproc_containment(&root, "remoteproc3").is_err());
+        assert!(remoteproc_containment_for_resources(false, &root, Some("remoteproc3")).is_err());
         fs::write(remoteproc.join("state"), "running\n").unwrap();
+        fs::write(remoteproc.join("firmware"), "\n").unwrap();
+        assert!(remoteproc_containment_for_resources(false, &root, Some("remoteproc3")).is_err());
+        fs::write(remoteproc.join("firmware"), "qcom/wpss.mdt\n").unwrap();
         assert_eq!(
-            verify_remoteproc_containment(&root, "remoteproc3").unwrap(),
-            RemoteprocContainment {
+            remoteproc_containment_for_resources(false, &root, Some("remoteproc3")).unwrap(),
+            Some(RemoteprocContainment {
                 name: "remoteproc3".into(),
                 state: "running".into(),
                 firmware: "qcom/wpss.mdt".into(),
-            }
+            })
         );
         fs::remove_dir_all(root).unwrap();
     }
