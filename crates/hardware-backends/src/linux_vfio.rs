@@ -547,7 +547,9 @@ impl Backend for LinuxVfio {
 
     fn dma_write(&mut self, dma: &u64, range: Range<usize>, bytes: &[u8]) -> Result<()> {
         let dma = self.dma_mut(dma)?;
-        if dma.direction == DmaDirection::FromDevice || range.len() != bytes.len() {
+        // The safe API also uses this primitive to zero-initialize fresh
+        // device-to-CPU allocations; typed handles prevent later CPU writes.
+        if range.len() != bytes.len() {
             return Err(Error::Invalid);
         }
         if range.start > range.end || range.end > dma.len {
@@ -585,9 +587,6 @@ impl Backend for LinuxVfio {
 
     fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let dma = self.dma(dma)?;
-        if dma.direction == DmaDirection::FromDevice {
-            return Err(Error::Invalid);
-        }
         if range.start > range.end || range.end > dma.len {
             return Err(Error::OutOfBounds);
         }
