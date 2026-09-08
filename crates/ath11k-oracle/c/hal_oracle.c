@@ -328,6 +328,53 @@ void oracle_hal_wbm_msdu_link(u8 out[32], const u8 source[32], u8 action) {
     memcpy(out, &d, sizeof(d));
 }
 
+void oracle_hal_fragment_link_return(u8 out[32], const u8 source[64], u8 action) {
+    struct reo_destination s;
+    struct wbm_release d = {0};
+    memcpy(&s, source, sizeof(s));
+    d.addr = s.addr;
+    d.addr.info1 = (d.addr.info1 & ~RBM) | PREP(RBM, 1);
+    d.info0 = PREP(0x7, 4) | PREP(0x38, action) | PREP(0x1c0, 1);
+    memcpy(out, &d, sizeof(d));
+}
+
+void oracle_hal_fragment_reo_entrance(u8 out[32], const u8 source[64],
+                                      u16 sequence, u8 destination) {
+    struct reo_destination s;
+    struct reo_entrance d = {0};
+    memcpy(&s, source, sizeof(s));
+    d.addr = s.addr;
+    d.addr.info1 = (d.addr.info1 & ~RBM) | PREP(RBM, 1);
+    d.mpdu[0] = PREP(0xff, 1) | PREP(0x000fff00, sequence) |
+                (1u << 24) | (1u << 25) | (1u << 27) | (1u << 30);
+    d.mpdu[1] = s.mpdu[1];
+    d.queue_lo = s.queue_lo;
+    d.info0 = (s.info0 & 0xff) | PREP(0x07c00000, destination);
+    memcpy(out, &d, sizeof(d));
+}
+
+void oracle_hal_fragment_msdu_slot(u8 out[128], const u8 source[128],
+                                   u64 address, u32 cookie, u8 manager,
+                                   u16 length, u8 destination, u8 index) {
+    memcpy(out, source, 128);
+    u8 *slot = out + 32 + index * 16;
+    memset(slot, 0, 16);
+    struct buffer_addr addr;
+    set_addr(&addr, address, cookie, manager);
+    memcpy(slot, &addr, sizeof(addr));
+    u32 msdu = 1 | 2 | PREP(0x0001fff8, length) |
+               PREP(0x003e0000, destination) | (1u << 23) | (1u << 25);
+    memcpy(slot + 8, &msdu, sizeof(msdu));
+}
+
+void oracle_dp_wcn6750_set_msdu_length(u8 out[388], const u8 source[388],
+                                       u16 length) {
+    memcpy(out, source, 388);
+    u32 info = get_u32(out + 96);
+    info = (info & ~0x3fffu) | PREP(0x3fff, length);
+    memcpy(out + 96, &info, sizeof(info));
+}
+
 void oracle_hal_rx_msdu_link_info(const u8 input[128], u8 *count,
                                   u32 cookies[6], u8 *manager) {
     *count = 6;
