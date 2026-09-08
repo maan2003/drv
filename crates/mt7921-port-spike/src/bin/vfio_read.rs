@@ -17540,6 +17540,7 @@ fn install_vfio_irq(device: &Arc<File>, capability: PciIrqCapability) -> Result<
             index,
             count: capability.count,
             eventfd: capability.eventfd,
+            automasked: false,
         },
     )
 }
