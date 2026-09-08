@@ -122,6 +122,33 @@
           '';
         };
 
+      checks.x86_64-linux.mt7921-production-client =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "mt7921-production-client-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/mt7921-production-client";
+          buildAndTestSubdir = "crates/mt7921-production-client";
+          cargoLock.lockFile = ./crates/mt7921-production-client/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/mt7921-production-client
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets --no-deps -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       packages = forAllSystems (
         system:
         let

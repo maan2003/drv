@@ -114,6 +114,7 @@ impl OrderingAssertions {
 }
 
 const FIRST_IOVA: u64 = 0x1000_0000;
+const DETERMINISTIC_MAX_DMA_ALLOCATION: usize = 1024 * 1024;
 struct Dma {
     bytes: Vec<u8>,
     iova: u64,
@@ -147,6 +148,60 @@ pub struct DeterministicBackend {
     failures: Option<FailureInjection>,
     region_len: usize,
     device_model: Option<DeviceModel>,
+    resource_probe: Option<DeterministicResourceProbe>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeterministicRelease {
+    Interrupt,
+    Dma,
+    Region,
+}
+
+#[derive(Default)]
+struct DeterministicResourceState {
+    attempts: usize,
+    fail_at: Option<usize>,
+    live_regions: usize,
+    live_dmas: usize,
+    live_interrupts: usize,
+    releases: Vec<DeterministicRelease>,
+}
+
+/// Observer and acquisition-failure control for deterministic ownership tests.
+#[derive(Clone, Default)]
+pub struct DeterministicResourceProbe(Rc<RefCell<DeterministicResourceState>>);
+
+impl DeterministicResourceProbe {
+    pub fn attempts(&self) -> usize {
+        self.0.borrow().attempts
+    }
+
+    pub fn live_regions(&self) -> usize {
+        self.0.borrow().live_regions
+    }
+
+    pub fn live_dmas(&self) -> usize {
+        self.0.borrow().live_dmas
+    }
+
+    pub fn live_interrupts(&self) -> usize {
+        self.0.borrow().live_interrupts
+    }
+
+    pub fn releases(&self) -> Vec<DeterministicRelease> {
+        self.0.borrow().releases.clone()
+    }
+
+    fn acquire(&self) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        state.attempts += 1;
+        if state.fail_at == Some(state.attempts) {
+            Err(Error::DeviceFault)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -177,12 +232,24 @@ impl Default for DeterministicBackend {
             failures: None,
             region_len: 0x10_0000,
             device_model: None,
+            resource_probe: None,
         }
     }
 }
 impl DeterministicBackend {
     pub fn device() -> Device<Self> {
         Device::from_backend(Self::default())
+    }
+    pub fn device_with_resource_probe(
+        fail_at: Option<usize>,
+    ) -> (Device<Self>, DeterministicResourceProbe) {
+        let probe = DeterministicResourceProbe::default();
+        probe.0.borrow_mut().fail_at = fail_at;
+        let backend = Self {
+            resource_probe: Some(probe.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), probe)
     }
     pub fn noncoherent_device() -> Device<Self> {
         Device::from_backend(Self {
@@ -301,6 +368,10 @@ impl Backend for DeterministicBackend {
     fn open_region(&mut self, index: u8) -> Result<u8> {
         if index != 0 {
             return Err(Error::Invalid);
+        }
+        if let Some(probe) = &self.resource_probe {
+            probe.acquire()?;
+            probe.0.borrow_mut().live_regions += 1;
         }
         self.live_regions += 1;
         Ok(index)
@@ -488,8 +559,12 @@ impl Backend for DeterministicBackend {
         direction: DmaDirection,
         coherent: bool,
     ) -> Result<u64> {
-        if size > 4096 {
+        if size > DETERMINISTIC_MAX_DMA_ALLOCATION {
             return Err(Error::Limit);
+        }
+        if let Some(probe) = &self.resource_probe {
+            probe.acquire()?;
+            probe.0.borrow_mut().live_dmas += 1;
         }
         let mask = (align as u64) - 1;
         self.next = self
@@ -639,6 +714,10 @@ impl Backend for DeterministicBackend {
         }
     }
     fn open_interrupt(&mut self, vector: u32) -> Result<u32> {
+        if let Some(probe) = &self.resource_probe {
+            probe.acquire()?;
+            probe.0.borrow_mut().live_interrupts += 1;
+        }
         self.live_irqs += 1;
         Ok(vector)
     }
@@ -690,12 +769,27 @@ impl Backend for DeterministicBackend {
         Ok(self.generation)
     }
     fn release_region(&mut self, _: u8) {
+        if let Some(probe) = &self.resource_probe {
+            let mut state = probe.0.borrow_mut();
+            state.live_regions -= 1;
+            state.releases.push(DeterministicRelease::Region);
+        }
         self.live_regions -= 1
     }
     fn release_dma(&mut self, id: u64) {
+        if let Some(probe) = &self.resource_probe {
+            let mut state = probe.0.borrow_mut();
+            state.live_dmas -= 1;
+            state.releases.push(DeterministicRelease::Dma);
+        }
         self.dmas.remove(&id);
     }
     fn release_interrupt(&mut self, _: u32) {
+        if let Some(probe) = &self.resource_probe {
+            let mut state = probe.0.borrow_mut();
+            state.live_interrupts -= 1;
+            state.releases.push(DeterministicRelease::Interrupt);
+        }
         self.live_irqs -= 1
     }
 }

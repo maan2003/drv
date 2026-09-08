@@ -1,0 +1,22 @@
+[package]
+name = "mt7921-production-client"
+description = "Owned physical MT7921 session for the production SoftMAC client"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
+mt7921-core = { path = "../mt7921-core" }
+mt7921-softmac-adapter = { path = "../mt7921-softmac-adapter" }
+
+[dev-dependencies]
+drv-hardware-backends = { path = "../hardware-backends" }
+
+[patch.crates-io]
+trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
+trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }
