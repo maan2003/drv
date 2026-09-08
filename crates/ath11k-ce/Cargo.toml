@@ -1,0 +1,7 @@
+[package]
+name="ath11k-ce"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+[dependencies]
+ath11k-hal={path="../ath11k-hal"}

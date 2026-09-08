@@ -49,6 +49,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "ath11k-ce"
+version = "0.1.0"
+dependencies = [
+ "ath11k-hal",
+]
+
+[[package]]
+name = "ath11k-core"
+version = "0.1.0"
+dependencies = [
+ "ath11k-ce",
+ "ath11k-dp",
+ "ath11k-hal",
+ "ath11k-platform-backend",
+ "ath11k-qmi",
+ "ath11k-wmi",
+]
+
+[[package]]
+name = "ath11k-dp"
+version = "0.1.0"
+dependencies = [
+ "ath11k-ce",
+ "ath11k-hal",
+]
+
+[[package]]
+name = "ath11k-hal"
+version = "0.1.0"
+dependencies = [
+ "ath11k-platform-backend",
+]
+
+[[package]]
+name = "ath11k-platform-backend"
+version = "0.1.0"
+dependencies = [
+ "drv-hardware",
+]
+
+[[package]]
+name = "ath11k-qmi"
+version = "0.1.0"
+
+[[package]]
+name = "ath11k-wmi"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
