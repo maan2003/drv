@@ -600,6 +600,7 @@ impl<B: Backend> CeRxBuffer<B> {
 
 pub trait Transport {
     fn bind_service(&mut self, service: ServiceId, tx: RingId, rx: RingId) -> Result<(), CeError>;
+    /// On `Err`, the frame has not been made visible to firmware and may be retried.
     fn send(&mut self, frame: TxFrame) -> Result<(), CeError>;
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError>;
 }
@@ -607,6 +608,7 @@ pub trait Transport {
 /// Endpoint-bound payload seam consumed by protocol adapters in WMI and DP.
 /// Implementations own HTC framing; callers see only their service payload.
 pub trait HtcServiceTransport {
+    /// On `Err`, the payload has not been made visible to firmware and may be retried.
     fn send_payload(&mut self, payload: &[u8]) -> Result<(), CeError>;
     fn receive_payload(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
 }
@@ -614,6 +616,7 @@ pub trait HtcServiceTransport {
 /// Raw CE packet operations beneath HTC framing. `pipe` is the WCN6750 CE
 /// number selected by the service map, and `transfer_id` is the HTC endpoint.
 pub trait HtcPacketIo {
+    /// On `Err`, the frame has not been made visible to firmware and may be retried.
     fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError>;
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
 }
@@ -1462,20 +1465,28 @@ impl<B: Backend> CePipes<B> {
     ) -> Result<(), CeError> {
         let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
         let ring = pipe.source.as_mut().ok_or(CeError::DeviceFault)?;
+        let descriptor = buffer
+            .descriptor_before_sync(transfer_id, pipe.config.flags & CE_ATTR_BYTE_SWAP_DATA != 0)?;
         ring.access_begin_remote(remote_read_pointers)?;
+        let checkpoint = ring.checkpoint();
         let Some(offset) = ring.source_next_reaped() else {
             ring.access_end(mmio)?;
             return Err(CeError::NoCredits);
         };
-        let descriptor = buffer
-            .descriptor_before_sync(transfer_id, pipe.config.flags & CE_ATTR_BYTE_SWAP_DATA != 0)?;
-        ring.memory.dma.write(offset, descriptor.bytes())?;
-        // The packet sync is deliberately between the coherent descriptor
-        // write and access_end's release head-pointer store.
-        buffer.sync_written_for_device()?;
         let slot = offset / ring.entry_size();
-        pipe.source_slots[slot] = Some(buffer);
-        ring.access_end(mmio).map_err(Into::into)
+        let result = (|| {
+            ring.memory.dma.write(offset, descriptor.bytes())?;
+            // The packet sync is deliberately between the coherent descriptor
+            // write and access_end's release head-pointer store.
+            buffer.sync_written_for_device()?;
+            pipe.source_slots[slot] = Some(buffer);
+            ring.access_end(mmio).map_err(CeError::from)
+        })();
+        if result.is_err() {
+            ring.restore(checkpoint);
+            pipe.source_slots[slot].take();
+        }
+        result
     }
 
     pub fn completed_send_next(
@@ -1869,12 +1880,13 @@ mod tests {
 
     #[test]
     fn streaming_buffers_use_hal_addresses_and_hardware_syncs() {
-        let (device, operations) = DeterministicBackend::recording_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let mut tx = CeTxBuffer::allocate(&device, 64).unwrap();
+        let mut rx = CeRxBuffer::allocate(&device, 64).unwrap();
+        operations.borrow_mut().clear();
         tx.write(&[1, 2, 3, 4]).unwrap();
         let source = tx.descriptor(1, false).unwrap();
         assert_eq!(&source.bytes()[..4], &[0, 0, 0, 0x10]);
-        let mut rx = CeRxBuffer::allocate(&device, 64).unwrap();
         let destination = rx.descriptor().unwrap();
         assert_eq!(&destination.bytes()[..4], &[0x40, 0, 0, 0x10]);
         assert_eq!(rx.complete(4).unwrap(), [0, 0, 0, 0]);
@@ -1902,12 +1914,20 @@ mod tests {
         SyncCpu(u64, Range<usize>),
     }
 
+    #[derive(Clone, Copy)]
+    enum InjectedSendFailure {
+        DescriptorWrite,
+        PacketSync,
+        Publication,
+    }
+
     #[derive(Default)]
     struct LargeState {
         next_id: u64,
         mmio: BTreeMap<usize, u32>,
         dmas: BTreeMap<u64, Vec<u8>>,
         operations: Vec<LargeOperation>,
+        send_failure: Option<InjectedSendFailure>,
     }
 
     struct LargeModel {
@@ -1921,6 +1941,9 @@ mod tests {
 
         fn generation(&self) -> u64 {
             1
+        }
+        fn is_cache_coherent(&self) -> bool {
+            false
         }
         fn open_region(&mut self, index: u8) -> Result<(), Error> {
             if index == 0 {
@@ -1939,6 +1962,10 @@ mod tests {
         }
         fn write_u32(&mut self, _: &(), offset: usize, value: u32) -> Result<(), Error> {
             let mut state = self.state.borrow_mut();
+            if matches!(state.send_failure, Some(InjectedSendFailure::Publication)) {
+                state.send_failure = None;
+                return Err(Error::DeviceFault);
+            }
             state.mmio.insert(offset, value);
             state.operations.push(LargeOperation::Write(offset, value));
             Ok(())
@@ -2003,6 +2030,13 @@ mod tests {
         }
         fn dma_write(&mut self, dma: &u64, range: Range<usize>, bytes: &[u8]) -> Result<(), Error> {
             let mut state = self.state.borrow_mut();
+            if matches!(
+                state.send_failure,
+                Some(InjectedSendFailure::DescriptorWrite)
+            ) {
+                state.send_failure = None;
+                return Err(Error::DeviceFault);
+            }
             state
                 .dmas
                 .get_mut(dma)
@@ -2021,8 +2055,12 @@ mod tests {
             Ok(())
         }
         fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<(), Error> {
-            self.state
-                .borrow_mut()
+            let mut state = self.state.borrow_mut();
+            if matches!(state.send_failure, Some(InjectedSendFailure::PacketSync)) {
+                state.send_failure = None;
+                return Err(Error::DeviceFault);
+            }
+            state
                 .operations
                 .push(LargeOperation::SyncDevice(*dma, range));
             Ok(())
@@ -2046,6 +2084,79 @@ mod tests {
         fn release_region(&mut self, _: ()) {}
         fn release_dma(&mut self, _: u64) {}
         fn release_interrupt(&mut self, _: ()) {}
+    }
+
+    fn initialized_large_packet_io(state: Rc<RefCell<LargeState>>) -> CePipesPacketIo<LargeModel> {
+        let device = Device::from_backend(LargeModel { state });
+        let mmio = device.open_region(0).unwrap();
+        let rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
+        let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
+        let pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
+        CePipesPacketIo::new(device, mmio, rdp, pipes)
+    }
+
+    fn assert_failed_send_is_retryable(failure: InjectedSendFailure) {
+        const SOURCE_HP: usize = 0x01b8_0400;
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let mut packet_io = initialized_large_packet_io(state.clone());
+        let mut first = CeTxBuffer::allocate(&packet_io.device, 16).unwrap();
+        first.write(&[0x11; 16]).unwrap();
+        state.borrow_mut().operations.clear();
+        state.borrow_mut().send_failure = Some(failure);
+
+        assert_eq!(
+            packet_io.pipes.send(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                0,
+                first,
+                1,
+            ),
+            Err(CeError::DeviceFault)
+        );
+        assert!(!state.borrow().operations.iter().any(
+            |operation| matches!(operation, LargeOperation::Write(SOURCE_HP, value) if *value != 0)
+        ));
+        assert_eq!(state.borrow().mmio.get(&SOURCE_HP), Some(&0));
+        assert!(packet_io.pipes.pipes[0].source_slots[0].is_none());
+
+        let mut retry = CeTxBuffer::allocate(&packet_io.device, 16).unwrap();
+        retry.write(&[0x22; 16]).unwrap();
+        packet_io
+            .pipes
+            .send(
+                &packet_io.mmio,
+                &mut packet_io.remote_read_pointers,
+                0,
+                retry,
+                2,
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .borrow()
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, LargeOperation::Write(SOURCE_HP, 4)))
+        );
+        assert!(packet_io.pipes.pipes[0].source_slots[0].is_some());
+        assert!(packet_io.pipes.pipes[0].source_slots[1].is_none());
+    }
+
+    #[test]
+    fn descriptor_write_failure_does_not_advance_source_cursor() {
+        assert_failed_send_is_retryable(InjectedSendFailure::DescriptorWrite);
+    }
+
+    #[test]
+    fn packet_sync_failure_does_not_advance_source_cursor() {
+        assert_failed_send_is_retryable(InjectedSendFailure::PacketSync);
+    }
+
+    #[test]
+    fn publication_failure_does_not_advance_source_cursor() {
+        assert_failed_send_is_retryable(InjectedSendFailure::Publication);
     }
 
     #[test]
