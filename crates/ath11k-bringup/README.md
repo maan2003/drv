@@ -82,10 +82,18 @@ transition nor the final journal line locates the failure within the handoff.
 Do not repeat this path without a phase-discriminating change. The retained
 journal, post-return state, and pstore snapshot are on np at
 `/var/lib/poco-linux/redwood/work/artifacts/redwood-bootdiag-kexec-20260909T031206Z`.
+A subsequent one-variable experiment kept the same stock file-load inputs but
+used sleep-inhibited `systemctl kexec`. The retained stock journal proves that
+PID 1 stopped userspace, unmounted filesystems, reached `kexec.target`, and shut
+down; it then reached `#9` with the expected 16-byte Wi-Fi `reg`. This shows the
+orderly path can work from a fully running flashed `#1`, but does not locate the
+failure within the earlier direct handoff. Exact commands and results are on np
+at
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-kexec-orderly-20260908T215500Z`.
 Require a 16-byte Wi-Fi `reg` and live-FDT SHA-256
 `d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
-After the approved stdin-only unlock and return to `#9` userspace, make the
-second hop with the legacy syscall forced:
+After the approved stdin-only unlock and return to `#9` userspace, the exact
+legacy second hop that was observed to succeed once was:
 
 ```sh
 set -e
@@ -98,6 +106,14 @@ kexec -c -l /var/lib/ath11k-redwood-lab/stage3/Image \
 sync
 kexec -e
 ```
+
+A later exact repetition from the verified `#9`, 16-byte-reg state loaded the
+legacy image successfully and entered `kexec -e`, but USB did not return before
+the 120-second watchdog deadline and subsequent recovery allowance. It did not
+reach Run B and requires a manual power-cycle. Do not repeat this second hop
+without a new discriminator. Its preflight, exact command, and host-side output
+are on np at
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-runB-hop2-20260908T220000Z`.
 
 Before unlocking the second hop, require `#9`, a 146776-byte live FDT with
 SHA-256
