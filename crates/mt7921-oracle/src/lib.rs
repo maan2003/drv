@@ -5,7 +5,10 @@
 #[cfg(test)]
 mod tests {
     use mt76_core::DmaDescriptor as Mt76Descriptor;
-    use mt7921_core::{DmaDescriptor as Mt7921Descriptor, DmaSegment};
+    use mt7921_core::{
+        DmaDescriptor as Mt7921Descriptor, DmaSegment, Low32RingMemory, RingAllocation,
+        RingPublisher, WfdmaRing,
+    };
     use mt7921_core::{DownloadCommand, encode_download_command};
     use proptest::prelude::*;
 
@@ -51,6 +54,17 @@ mod tests {
         pn: [u8; 6],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CDmaQueueState {
+        tail: u32,
+        queued: u32,
+        returned_index: u32,
+        entry_cleared: u32,
+        released_buffers: u32,
+        rx_head_cleared: u32,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -70,6 +84,19 @@ mod tests {
             output: *mut CDescriptor,
         ) -> i32;
         fn oracle_dma_rx_descriptor(address: u64, length: u16, output: *mut CDescriptor) -> i32;
+        fn oracle_dma_dequeue_bookkeeping(
+            descriptor_count: u32,
+            tail: u32,
+            queued: u32,
+            dma_done: bool,
+            output: *mut CDmaQueueState,
+        ) -> i32;
+        fn oracle_dma_rx_cleanup_bookkeeping(
+            descriptor_count: u32,
+            tail: u32,
+            queued: u32,
+            output: *mut CDmaQueueState,
+        ) -> i32;
         fn oracle_mcu_parse_response(
             input: *const u8,
             input_len: usize,
@@ -367,6 +394,85 @@ mod tests {
         output
     }
 
+    fn c_dma_dequeue(count: u16, tail: u16, queued: u16, done: bool) -> CDmaQueueState {
+        let mut output = CDmaQueueState::default();
+        // SAFETY: `output` is a live C-compatible object; the scalar state is
+        // constrained to the wrapper's bounded queue arrays.
+        let result = unsafe {
+            oracle_dma_dequeue_bookkeeping(
+                u32::from(count),
+                u32::from(tail),
+                u32::from(queued),
+                done,
+                &mut output,
+            )
+        };
+        assert_eq!(result, 0);
+        output
+    }
+
+    fn c_dma_rx_cleanup(count: u16, tail: u16, queued: u16) -> CDmaQueueState {
+        let mut output = CDmaQueueState::default();
+        // SAFETY: `output` is a live C-compatible object; the scalar state is
+        // constrained to the wrapper's bounded queue arrays.
+        let result = unsafe {
+            oracle_dma_rx_cleanup_bookkeeping(
+                u32::from(count),
+                u32::from(tail),
+                u32::from(queued),
+                &mut output,
+            )
+        };
+        assert_eq!(result, 0);
+        output
+    }
+
+    struct OracleMemory {
+        freed: bool,
+    }
+
+    impl Low32RingMemory for OracleMemory {
+        type Error = ();
+
+        fn allocate_low32(
+            &mut self,
+            size: usize,
+            _align: usize,
+        ) -> Result<RingAllocation, Self::Error> {
+            Ok(RingAllocation {
+                id: 1,
+                iova: 0x1000_0000,
+                len: size,
+            })
+        }
+
+        fn free(&mut self, _allocation: RingAllocation) {
+            self.freed = true;
+        }
+    }
+
+    struct OraclePublisher;
+
+    impl RingPublisher for OraclePublisher {
+        type Error = ();
+
+        fn write_descriptor(
+            &mut self,
+            _index: u16,
+            _descriptor: Mt7921Descriptor,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn release_fence(&mut self) {}
+
+        fn publish_producer(&mut self, _index: u16) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn acquire_fence(&mut self) {}
+    }
+
     fn c_response(bytes: &[u8], command: DownloadCommand, sequence: u8) -> CMcuResponse {
         let mut output = CMcuResponse::default();
         // SAFETY: `bytes` and `output` remain live for the call and the C
@@ -590,6 +696,58 @@ mod tests {
                 (first.iova, first.len), second.map(|s| (s.iova, s.len)), info));
             let rust = Mt7921Descriptor::rx(first).unwrap();
             prop_assert_eq!(words(rust.to_le_bytes()), c_dma_rx((u64::from(address0), length0)));
+        }
+
+        #[test]
+        fn wfdma_reclaim_matches_mt76_dequeue_bookkeeping(
+            count in 2u16..=32,
+            queued_seed in 0u16..=32,
+            done: bool,
+        ) {
+            let queued = queued_seed % (count + 1);
+            let mut memory = OracleMemory { freed: false };
+            let mut publisher = OraclePublisher;
+            let mut ring = WfdmaRing::allocate(&mut memory, count).unwrap();
+            for index in 0..queued {
+                ring.enqueue(
+                    &mut publisher,
+                    DmaSegment {
+                        iova: 0x2000_0000 + u64::from(index) * 0x1000,
+                        len: 64,
+                    },
+                    None,
+                    u32::from(index),
+                ).unwrap();
+            }
+            if done && queued != 0 {
+                prop_assert!(ring.complete(0));
+            }
+
+            let c = c_dma_dequeue(count, 0, queued, done);
+            let reclaimed = ring.reclaim_one(&mut publisher);
+            prop_assert_eq!(c.tail, u32::from(ring.consumer()));
+            prop_assert_eq!(c.queued, u32::from(ring.queued()));
+            prop_assert_eq!(
+                c.returned_index,
+                reclaimed.map(u32::from).unwrap_or(u32::MAX),
+            );
+            prop_assert_eq!(c.entry_cleared != 0, reclaimed.is_some());
+        }
+
+        #[test]
+        fn mt76_rx_cleanup_releases_every_owned_queue_entry(
+            count in 2u16..=32,
+            tail_seed in 0u16..=31,
+            queued_seed in 0u16..=32,
+        ) {
+            let tail = tail_seed % count;
+            let queued = queued_seed % (count + 1);
+            let c = c_dma_rx_cleanup(count, tail, queued);
+            prop_assert_eq!(c.tail, u32::from((tail + queued) % count));
+            prop_assert_eq!(c.queued, 0);
+            prop_assert_eq!(c.entry_cleared, u32::from(queued));
+            prop_assert_eq!(c.released_buffers, u32::from(queued));
+            prop_assert_eq!(c.rx_head_cleared, 1);
         }
 
         #[test]
