@@ -1350,7 +1350,7 @@ mod tests {
 
     #[test]
     fn client_tx_syncs_then_publishes_exact_tcl_command() {
-        let (device, operations) = DeterministicBackend::recording_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let mut dp =
             ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
         dp.configure(DataRings {
@@ -1486,7 +1486,7 @@ mod tests {
 
     #[test]
     fn model_reo_completion_syncs_before_rx_descriptor_parse() {
-        let (device, operations) = DeterministicBackend::recording_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let bar = device.open_region(0).unwrap();
         let mut image = vec![0; 2048];
         image[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());

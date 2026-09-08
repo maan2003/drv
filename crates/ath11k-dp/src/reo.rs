@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn tid_descriptor_is_synced_before_reo_command_publication() {
-        let (device, operations) = DeterministicBackend::recording_device();
+        let (device, operations) = DeterministicBackend::recording_noncoherent_device();
         let tid = ReoTid::setup(&device, 3, 64, 0x123, PacketNumberType::Wpa).unwrap();
         assert!(matches!(
             operations.borrow().last(),
