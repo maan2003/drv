@@ -7,8 +7,8 @@ Cut 2 should replace the MT7961 physical path's handwritten VFIO ownership in
 `drv_hardware::Device<drv_hardware_backends::LinuxVfio>`, constructed by
 `LinuxVfio::open_pci_coherent`. It should not create another HAL or move
 MT7921 register, ring, interrupt-source, or reset policy out of
-`mt7921-core`. This inventory reflects master `00c21084` and the physical
-capabilities already recorded in the port-spike README.
+`mt7921-core`. This inventory describes the current master implementation and
+the physical capabilities already recorded in the port-spike README.
 
 The target reported RESET and PCI device flags, nine VFIO regions, and five
 IRQ indices. Its usable register aperture is PCI BAR0. IRQ discovery reported

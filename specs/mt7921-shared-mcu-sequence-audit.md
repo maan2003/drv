@@ -27,4 +27,4 @@ Envelope, size, ring ownership, cancellation, and required MMIO checks happen be
 - Production source lint requires all five client publication paths (CE no-ACK, UNI no-ACK, UNI ACK, passive, and rate-power) to call the physical stamper and forbids mechanics-side loader assignment or ROC reservation.
 - The lifecycle model starts at 0, 7, and 14, injects local and uncertain failure at every command, verifies relative order and wrap, and verifies all teardown commands are attempted.
 - Existing byte/header goldens remain exact; sequence assertions are relative to the prior cursor rather than phase constants.
-- Physical build and packaged integration cover the feature-complete source composition. Hardware observations are permitted only after independent review explicitly approves this audit.
+- Physical build and packaged integration cover the feature-complete source composition. That evidence does not itself grant a hardware window: existing authorization, exact-revision review, and containment requirements still govern physical runs, with review scaled to the run's risk.

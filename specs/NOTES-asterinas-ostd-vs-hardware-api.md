@@ -15,18 +15,18 @@ services role. OSTD is a real kernel (it owns page tables, IOMMU, TLB), we sit o
 so their *implementation* is not borrowable, but their *safe-API shapes* are, and they
 have been validated by a working virtio/net stack in safe Rust.
 
-## DMA: what they do that we do not
+## DMA comparison
 
 | OSTD | hardware-api today | Verdict |
 |---|---|---|
 | `DmaCoherent` / `DmaStream<D>` split | `CoherentDma<B,D>` / `StreamingDma<B,D>` | Same. Keep. |
 | `DmaDirection` sealed trait with `const CAN_READ_FROM_DEVICE / CAN_WRITE_TO_DEVICE` and `const { assert!(..) }` in `alloc`/`sync_*` | sealed marker traits `CpuRead/CpuWrite/DeviceRead/DeviceWrite` | Equivalent; ours is finer-grained. Keep ours. |
-| `is_cache_coherent: bool` **per allocation**; non-coherent => uncacheable KVA mapping, or cache-maintenance when the arch can (`can_sync_dma()`), else bounce copy (`Inner::Both`) | coherency is a backend-wide property (broker vs coherent flavour) | **Borrow the idea**: expose `Device::is_cache_coherent()` (measured on redwood) and let `StreamingDma::sync_*` be a no-op on coherent backends, so the same driver code is correct on np (coherent PCI) and redwood (non-coherent). We already do this implicitly; make it explicit and test both paths in the deterministic backend. |
-| `Split` (page-aligned split of a DMA object into two owned objects) | none; we allocate per ring | **Borrow**: `CoherentDma::split_at(offset)` lets the DP aggregate carve TCL/WBM/REO rings from one allocation the way ath11k C does (`dp_srng` from one `dma_alloc_coherent`), keeping addresses contiguous for descriptors that assume it. Cheap to add, no unsafe outside the backend. |
-| Access only via `VmReader/VmWriter` + `read_val::<T: Pod>` / `write_val`; **no `&T` into DMA memory ever** | `read(offset,&mut [u8])`/`write(offset,&[u8])` bytes only; typed descriptors are built in HAL via byte codecs | Same discipline, ours via bytes. Their `Pod` + `read_val`/`write_val` is the ergonomic version. **Borrow**: `read_pod::<T: FromBytes+AsBytes>` / `write_pod` on both DMA types, with `PodOnce` (single non-tearing access) for descriptor words the device may update concurrently (WBM/REO head-pointer words, CE ring indices). |
-| `VmIoOnce::read_once/write_once` = single non-tearing load/store, alignment-checked | `read_u32` only on MMIO; DMA reads are memcpy | **Borrow** for DMA: HAL SRNG head/tail-pointer reads in host memory (`hp_addr` shadow) must be single accesses, not memcpy, or the C ordering contract is not reproduced. |
-| Explicit `fence(SeqCst)` in the virtqueue between descriptor write and avail-index publish | our ordering contract lives in MMIO (`write_u32` = release, `read_u32` = acquire) but DMA writes have no documented ordering vs a later doorbell | **Borrow the doc, not the code**: state in `hardware-api` that `CoherentDma::write` is ordered before a subsequent `MmioRegion::write_u32` on the same thread (backend must guarantee: release store or `dma_wmb` equivalent). Add a deterministic-backend check that a doorbell write observed before the descriptor write is a recorded violation. |
-| `DmaPool<D>` (safe crate): fixed-size sub-page streaming segments, refcounted pages, returned on drop, `deny(unsafe_code)` | DP allocates one `StreamingDma` per packet | **Borrow as a crate** (`crates/dma-pool`, safe, generic over `Backend`): RX refill for 1024-entry RXDMA ring with per-packet `alloc_streaming` is the wrong cost model. Same shape as their `DmaPool`/`DmaSegment`, mapping to our `StreamingDma<B,FromDevice>` + offset slices. |
+| `is_cache_coherent: bool` **per allocation**; non-coherent => uncacheable KVA mapping, or cache-maintenance when the arch can (`can_sync_dma()`), else bounce copy (`Inner::Both`) | `Device::is_cache_coherent()` reports the backend property; streaming ownership transitions are no-ops on coherent backends and call backend synchronization on non-coherent backends. Deterministic tests exercise both paths. | Same portable driver shape, with coherency selected per backend rather than per allocation. |
+| `Split` (page-aligned split of a DMA object into two owned objects) | `CoherentDma::split_at` and `StreamingDma::split_at` create alignment-checked owned suballocations that share the underlying mapping. | Same ownership shape. |
+| Access only via `VmReader/VmWriter` + `read_val::<T: Pod>` / `write_val`; **no `&T` into DMA memory ever** | Both DMA types provide byte access and alignment-checked `read_pod`/`write_pod`; they do not expose references into device memory. | Same discipline. |
+| `VmIoOnce::read_once/write_once` = single non-tearing load/store, alignment-checked | Both DMA types provide alignment-checked `read_once`/`write_once` for sealed 32-bit `PodOnce` values. | Same single-access shape for device-shared words. |
+| Explicit `fence(SeqCst)` in the virtqueue between descriptor write and avail-index publish | The backend contract makes MMIO writes release-ordered after coherent DMA writes and completed streaming handoffs, and MMIO reads acquire-order later coherent DMA reads. The deterministic backend can reject a declared descriptor-before-doorbell violation. | Equivalent ordering is explicit at the publication boundary. |
+| `DmaPool<D>` (safe crate): fixed-size sub-page streaming segments, refcounted pages, returned on drop, `deny(unsafe_code)` | `crates/dma-pool` is a safe crate generic over `Backend`; it splits streaming pages into direction-typed segments, bounds retained free segments, and is used by ath11k DP RX/REO paths. | Borrowed. MT7921 adoption remains a driver-local decision. |
 | `SafePtr<T, M: VmIo, Rights>` typed pointer into a `VmIo` object with static rights (`Dup`, `Write`), `field_ptr!` macro | typed descriptor codecs in ath11k-hal | Do **not** borrow the rights machinery (heavy). Borrow `field_ptr!`-style offset projection only if HAL codecs get painful. |
 | Constructors require IRQs enabled (documented), drop allowed in IRQ context | n/a (userspace) | n/a. |
 | CVM/TDX shared-page handling | n/a | n/a. |
@@ -51,31 +51,28 @@ there beyond confirming the design.
 
 | OSTD | hardware-api today | Verdict |
 |---|---|---|
-| `IoMem` acquired from a global allocator that has *removed* system-owned ranges; range-checked; `slice(range)` sub-windows sharing the mapping (`Arc<KVirtArea>`) | `MmioRegion<B>` from `Device::open_region(index)`, range-checked | **Borrow `slice`**: `MmioRegion::slice(offset, len) -> MmioRegion` so CE/HAL/DP each get a window bounded to their register block (CE_n base, TCL/REO/WBM blocks) instead of the whole BAR. Cheap, no unsafe outside backend, and it turns "wrong register block" into a range error in the deterministic backend. |
+| `IoMem` acquired from a global allocator that has *removed* system-owned ranges; range-checked; `slice(range)` sub-windows sharing the mapping (`Arc<KVirtArea>`) | `MmioRegion<B>` from `Device::open_region(index)` is range-checked; `slice(offset, len)` creates independently owned bounded subwindows sharing the mapping and generation. | Same bounded-view shape; VFIO withholds system-owned ranges. |
 | `IoMem<Sensitive>` marker: security-sensitive MMIO (IOMMU, interrupt controller) only reachable with unsafe inside OSTD | n/a; VFIO already withholds those | n/a. |
 | `read_once/write_once` typed `PodOnce`, alignment checked | `read_u32/write_u32` | Add `read_u64/write_u64` when a device needs it; otherwise same. |
 | Cache policy per mapping (`Uncacheable` default) | backend-decided | n/a. |
 
-## Concrete borrow list (ordered by payoff, all safe-API additions to `hardware-api`)
+## Borrowed surface now present
 
-1. `MmioRegion::slice(offset, len)` sub-windows. Small; improves DP/CE/HAL isolation.
-2. `CoherentDma::split_at(offset)` / `StreamingDma::split_at` (page/alignment-checked) for
-   the DP aggregate's one-allocation ring carving.
-3. `read_pod/write_pod<T: FromBytes+AsBytes>` and `read_once/write_once<T: PodOnce>` on
-   DMA objects; HAL SRNG shadow pointers use the `_once` forms.
-4. Documented ordering: DMA write → later MMIO write on the same thread is release-ordered;
-   deterministic backend records violations.
-5. `crates/dma-pool` (safe, generic over `Backend`) modelled on Asterinas `dma-pool`, for
-   RX refill and TX packet buffers in ath11k-dp and mt7921.
-6. Explicit `Device::is_cache_coherent()` with both paths exercised in `DeterministicBackend`.
+The safe API now includes bounded `MmioRegion` slices, owned coherent and
+streaming DMA splits, typed POD and single-access operations, explicit
+DMA/MMIO publication ordering, backend coherency reporting with deterministic
+coherent/non-coherent coverage, and the safe generic `crates/dma-pool`. The
+pool is integrated into ath11k DP; this note does not require every driver to
+adopt it.
 
 Not borrowed: callback-based `IrqLine`, `SafePtr` rights system, top/bottom-half
 machinery, CVM handling, RfL `Devres`/`Revocable` (our generation handles already cover it).
 
 ## Longer-term relevance
 
-If this program ever moves the drivers into a kernel, OSTD is the substrate whose safe
-surface is closest to `hardware-api` (both are "capability handles, bytes/Pod in DMA,
-no references into device memory"). Keeping our `Backend` trait shaped so that an OSTD
-backend (`DmaCoherent`/`DmaStream`/`IoMem`/`IrqLine`) could implement it is cheap and
-worth preserving as a constraint when the trait changes.
+OSTD remains useful prior art because its safe surface is close to
+`hardware-api`: capability handles, byte/POD DMA access, and no references into
+device memory. It does not create a requirement to preserve an OSTD backend or
+an in-kernel-driver path. [REQ-host-portability](REQ-host-portability.md) still
+requires host-portable resource mechanisms, independent of any particular
+kernel substrate.
