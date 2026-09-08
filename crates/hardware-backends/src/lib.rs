@@ -529,6 +529,31 @@ mod tests {
     }
 
     #[test]
+    fn mmio_slices_share_mapping_and_enforce_nested_bounds() {
+        let (device, operations) = DeterministicBackend::recording_device();
+        let bar = device.open_region(0).unwrap();
+        let block = bar.slice(0x200, 0x40).unwrap();
+        let register = block.slice(0x10, 4).unwrap();
+
+        register.write_u32(0, 7).unwrap();
+        assert_eq!(register.write_u32(4, 8), Err(Error::OutOfBounds));
+        assert!(matches!(bar.slice(bar.len(), 1), Err(Error::OutOfBounds)));
+        assert_eq!(
+            operations.borrow().as_slice(),
+            &[Operation::WriteU32 {
+                region: 0,
+                offset: 0x210,
+                value: 7,
+            }]
+        );
+
+        drop(bar);
+        register.write_u32(0, 9).unwrap();
+        device.reset().unwrap();
+        assert_eq!(register.write_u32(0, 10), Err(Error::StaleHandle));
+    }
+
+    #[test]
     fn constrained_dma_enforces_address_alignment_and_segment_limits() {
         let device = DeterministicBackend::device();
         let low32 = DmaConstraints {
