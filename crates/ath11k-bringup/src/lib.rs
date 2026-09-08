@@ -37,6 +37,7 @@ const WATCHDOG_CLASS: &str = "/sys/class/watchdog/watchdog0";
 const WATCHDOG_MISC_CLASS: &str = "/sys/class/misc/watchdog";
 const IOMMU_DEVICE: &str = "/dev/iommu";
 const IOMMU_CLASS: &str = "/sys/class/misc/iommu";
+const REMOTEPROC_CLASS: &str = "/sys/class/remoteproc";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Stage {
@@ -95,6 +96,7 @@ pub struct Cli {
     pub regdb: PathBuf,
     pub wmi_log: Option<PathBuf>,
     pub ssid: Option<Vec<u8>>,
+    pub containment_remoteproc: Option<String>,
 }
 
 impl Default for Cli {
@@ -109,6 +111,7 @@ impl Default for Cli {
             regdb: DEFAULT_REGDB.into(),
             wmi_log: Some("ath11k-wmi-run.jsonl".into()),
             ssid: None,
+            containment_remoteproc: None,
         }
     }
 }
@@ -144,6 +147,24 @@ impl Cli {
                 "--regdb" => cli.regdb = value("--regdb", &mut arguments)?.into(),
                 "--wmi-log" => cli.wmi_log = Some(value("--wmi-log", &mut arguments)?.into()),
                 "--ssid" => cli.ssid = Some(value("--ssid", &mut arguments)?.into_bytes()),
+                "--containment" => {
+                    let containment = value("--containment", &mut arguments)?;
+                    let name = containment.strip_prefix("remoteproc:").ok_or_else(|| {
+                        "--containment must be remoteproc:<sysfs-name>".to_string()
+                    })?;
+                    if name.is_empty()
+                        || name == "."
+                        || name == ".."
+                        || !name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                    {
+                        return Err(
+                            "remoteproc containment name is not a safe sysfs basename".into()
+                        );
+                    }
+                    cli.containment_remoteproc = Some(name.into());
+                }
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -165,7 +186,7 @@ impl Cli {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--broker]"
 }
 
 #[derive(Debug)]
@@ -1025,6 +1046,46 @@ fn diagnose_iommufd_open(error: &str) -> String {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct RemoteprocContainment {
+    name: String,
+    state: String,
+    firmware: String,
+}
+
+fn verify_remoteproc_containment(root: &Path, name: &str) -> Result<RemoteprocContainment, Error> {
+    let remoteproc = root.join(name);
+    let read = |path: PathBuf| {
+        fs::read(path)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .trim_end_matches(['\0', '\n', '\r'])
+                    .to_owned()
+            })
+            .map_err(|source| Error::Io {
+                action: "read remoteproc containment",
+                source,
+            })
+    };
+    let state = read(remoteproc.join("state"))?;
+    if state != "running" {
+        return Err(Error::Hardware(format!(
+            "remoteproc containment {name} is {state:?}, expected running"
+        )));
+    }
+    let firmware = read(remoteproc.join("firmware"))?;
+    if firmware.is_empty() {
+        return Err(Error::Hardware(format!(
+            "remoteproc containment {name} has no firmware identity"
+        )));
+    }
+    Ok(RemoteprocContainment {
+        name: name.into(),
+        state,
+        firmware,
+    })
+}
+
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
         let vfio = if config.broker {
@@ -1044,9 +1105,24 @@ impl Host for RealHost {
                 diagnose_iommufd_open(&error)
             })
         })?;
-        vfio.validate_wcn6750_resources().map_err(|error| {
+        let resources = vfio.validate_wcn6750_resources().map_err(|error| {
             Error::Hardware(format!("validate WCN6750 VFIO resources: {error}"))
         })?;
+        if !resources.reset_supported {
+            let name = config.containment_remoteproc.as_deref().ok_or_else(|| {
+                Error::Hardware(
+                    "VFIO reset is unavailable; pass --containment remoteproc:<sysfs-name>".into(),
+                )
+            })?;
+            let containment = verify_remoteproc_containment(Path::new(REMOTEPROC_CLASS), name)?;
+            println!(
+                "remoteproc_containment name={:?} state={:?} firmware={:?}",
+                containment.name, containment.state, containment.firmware
+            );
+            println!(
+                "vfio_reset unavailable; containment requires WPSS remoteproc restart plus watchdog reboot on failure"
+            );
+        }
         // Open QRTR only after exclusive VFIO acquisition succeeded (fail closed).
         let qrtr = QrtrTransport::open().map_err(|source| Error::Io {
             action: "open AF_QIPCRTR socket",
@@ -1468,6 +1544,37 @@ mod tests {
         assert!(message.contains("iommu_group_has_isolated_msi()"));
         assert!(message.contains("iommufd.allow_unsafe_interrupts=1"));
         assert!(message.contains("before installing software MSI"));
+    }
+
+    #[test]
+    fn no_reset_containment_requires_a_named_running_remoteproc() {
+        let root = std::env::temp_dir().join(format!(
+            "ath11k-remoteproc-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let remoteproc = root.join("remoteproc3");
+        fs::create_dir_all(&remoteproc).unwrap();
+        fs::write(remoteproc.join("state"), "offline\n").unwrap();
+        fs::write(remoteproc.join("firmware"), "qcom/wpss.mdt\n").unwrap();
+        assert!(verify_remoteproc_containment(&root, "remoteproc3").is_err());
+        fs::write(remoteproc.join("state"), "running\n").unwrap();
+        assert_eq!(
+            verify_remoteproc_containment(&root, "remoteproc3").unwrap(),
+            RemoteprocContainment {
+                name: "remoteproc3".into(),
+                state: "running".into(),
+                firmware: "qcom/wpss.mdt".into(),
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn containment_cli_accepts_only_a_safe_remoteproc_name() {
+        let cli = Cli::parse(["--dry-run", "--containment", "remoteproc:remoteproc3"]).unwrap();
+        assert_eq!(cli.containment_remoteproc.as_deref(), Some("remoteproc3"));
+        assert!(Cli::parse(["--dry-run", "--containment", "remoteproc:../state"]).is_err());
     }
 
     #[test]

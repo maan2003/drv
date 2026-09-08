@@ -32,7 +32,13 @@ cargo run -p ath11k-bringup -- preflight \
 The resources stage performs the necessarily state-changing iommufd bind under
 the armed watchdog, then fails closed unless VFIO reports the WCN6750 platform
 flags, one region, and 32 single-vector edge-triggered eventfd IRQs. Successful
-bind is the stock-kernel cache-coherency admission check.
+bind is the stock-kernel cache-coherency admission check. Redwood's
+vfio-platform device has no reset handler, so that target additionally requires
+`--containment remoteproc:<sysfs-name>`; the stage verifies the named
+remoteproc is `running`, records its name/state/firmware, and records that
+VFIO reset is unavailable. This polling-only run stops on failure and relies on
+WPSS remoteproc restart plus the watchdog reboot, not a fabricated device
+reset. The runner does not stop or start remoteproc.
 
 ```sh
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \

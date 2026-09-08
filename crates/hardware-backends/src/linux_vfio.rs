@@ -734,7 +734,11 @@ impl Backend for LinuxVfio {
     }
 
     fn reset(&mut self) -> Result<u64> {
-        userspace_vfio::reset_device_supported(&self.device).map_err(|_| Error::DeviceFault)?;
+        match userspace_vfio::device_reset_supported(&self.device) {
+            Ok(true) => {}
+            Ok(false) => return Err(Error::Unsupported),
+            Err(_) => return Err(Error::DeviceFault),
+        }
         let next_generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
         // From this point cleanup mutates live resources, so all issued handles
         // must become stale even if cleanup or the reset ioctl later fails.
@@ -788,7 +792,7 @@ mod tests {
     };
     use userspace_vfio::test_support::{
         Failure, FakeIrq, Record, signal_eventfd, with_fake_automasked_io, with_fake_io,
-        with_fake_io_failure, with_fake_pci_io,
+        with_fake_io_failure, with_fake_no_reset_io, with_fake_pci_io,
     };
 
     fn fake_device() -> (Arc<File>, std::path::PathBuf) {
@@ -914,6 +918,30 @@ mod tests {
             Record::DestroyIoas(7),
         ]);
         assert_eq!(records, expected);
+    }
+
+    #[test]
+    fn platform_without_vfio_reset_reports_typed_unsupported() {
+        let (device, path) = fake_device();
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        let (result, _) = with_fake_no_reset_io(|| {
+            let backend = LinuxVfio::initialize_coherent(device, iommu, |device, iommu| {
+                userspace_vfio::bind_iommufd(device, iommu)?;
+                let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                userspace_vfio::attach_ioas(device, ioas.id())?;
+                Ok(ioas)
+            })
+            .unwrap();
+            assert!(
+                !backend
+                    .validate_wcn6750_resources()
+                    .unwrap()
+                    .reset_supported
+            );
+            drv_hardware::Device::from_backend(backend).reset()
+        });
+        assert_eq!(result, Err(Error::Unsupported));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
