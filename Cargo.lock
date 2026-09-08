@@ -106,9 +106,13 @@ dependencies = [
 name = "ath11k-oracle"
 version = "0.1.0"
 dependencies = [
+ "ath11k-dp",
+ "ath11k-hal",
+ "ath11k-platform-backend",
  "ath11k-qmi",
  "ath11k-wmi",
  "cc",
+ "drv-hardware-backends",
  "proptest",
 ]
 

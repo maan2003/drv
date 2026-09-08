@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 ath11k-qmi = { path = "../ath11k-qmi", features = ["trace"] }
 ath11k-wmi = { path = "../ath11k-wmi" }
+ath11k-dp = { path = "../ath11k-dp" }
 
 [build-dependencies]
 cc = "1"
@@ -15,3 +16,6 @@ cc = "1"
 [dev-dependencies]
 proptest = "1"
 ath11k-wmi = { path = "../ath11k-wmi", features = ["proptest"] }
+ath11k-hal = { path = "../ath11k-hal" }
+ath11k-platform-backend = { path = "../ath11k-platform-backend" }
+drv-hardware-backends = { path = "../hardware-backends" }
