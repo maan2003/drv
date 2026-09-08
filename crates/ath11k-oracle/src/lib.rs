@@ -191,6 +191,10 @@ pub enum WmiEventKind {
     InstallKeyCompletion,
     MgmtRx,
     MgmtTxCompletion,
+    FirmwareMemoryDumpComplete,
+    RoamCapabilityReport,
+    PeerCreateConfirmation,
+    WlanFrequencyAvoid,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -291,9 +295,19 @@ unsafe extern "C" {
     fn oracle_wmi_vdev_start(input: *const CWmiVdevStart, out: *mut CWmiCapture) -> c_int;
     fn oracle_wmi_scan_stop(requester: u32, scan_id: u32, cancel_type: u32,
         vdev_id: u32, pdev_id: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_scan_start(values: *const u32, event_flags: u32, control_inputs: u32,
+        adaptive_dwell: u32, mac_addr: *const u8, mac_mask: *const u8,
+        channels: *const u32, channel_len: usize, ssid_lengths: *const u8,
+        ssids: *const u8, ssid_len: usize, bssids: *const u8, bssid_len: usize,
+        extra_ie: *const u8, extra_ie_len: usize, short_hints: *const u32,
+        short_hint_len: usize, bssid_hint_freqs: *const u32, bssid_hint_len: usize,
+        out: *mut CWmiCapture) -> c_int;
     fn oracle_wmi_install_key(vdev_id: u32, address: *const u8, key_idx: u32,
         key_flags: u32, cipher: u32, rsc_low: u32, rsc_high: u32, key: *const u8,
         key_len: usize, txmic: u32, rxmic: u32, out: *mut CWmiCapture) -> c_int;
+    fn oracle_wmi_peer_assoc(values: *const u32, address: *const u8, ppet: *const u32,
+        legacy: *const u8, legacy_len: usize, ht: *const u8, ht_len: usize,
+        he: *const u32, he_len: usize, flags: u32, out: *mut CWmiCapture) -> c_int;
     fn oracle_wmi_mgmt_send(vdev_id: u32, desc_id: u32, freq: u32, paddr: u64,
         frame: *const u8, frame_len: usize, params_valid: u8, out: *mut CWmiCapture) -> c_int;
     fn oracle_wmi_init(input: *const CWmiInit, out: *mut CWmiCapture) -> c_int;
@@ -368,6 +382,9 @@ fn wmi_trace_field_name(kind: WmiEventKind, id: u16) -> &'static str {
         "wmi.MgmtTxCompletion.pdev_id",
         "wmi.MgmtTxCompletion.ppdu_id",
         "wmi.MgmtTxCompletion.ack_rssi",
+        "wmi.FirmwareMemoryDumpComplete.request_id",
+        "wmi.FirmwareMemoryDumpComplete.fw_mem_dump_complete",
+        "wmi.RoamCapabilityReport.scoring_capability_bitmap",
     ];
     if id == 25 && kind == WmiEventKind::VdevDeleteResponse {
         "wmi.VdevDeleteResponse.vdev_id"
@@ -453,6 +470,44 @@ pub fn c_wmi_scan_stop(requester: u32, scan_id: u32, cancel_type: u32,
         unsafe { oracle_wmi_scan_stop(requester, scan_id, cancel_type, vdev_id, pdev_id, out) }
     })
 }
+pub fn c_wmi_scan_start(input: &ath11k_wmi::cmd::ScanStart) -> Result<WmiCapture, i32> {
+    let v = [input.scan_id, input.scan_requester_id, input.vdev_id, input.scan_priority,
+        input.notify_scan_events, input.dwell_time_active, input.dwell_time_passive,
+        input.min_rest_time, input.max_rest_time, input.repeat_probe_time,
+        input.probe_spacing_time, input.idle_time, input.max_scan_time, input.probe_delay,
+        input.burst_duration, input.n_probes, input.control_flags_ext,
+        input.dwell_time_active_2ghz, input.dwell_time_active_6ghz,
+        input.dwell_time_passive_6ghz];
+    let e = input.event_flags;
+    let event_flags = [e.started, e.completed, e.bss_channel, e.foreign_channel, e.dequeued,
+        e.preempted, e.start_failed, e.restarted, e.foreign_channel_exit, e.suspended, e.resumed]
+        .iter().enumerate().fold(0, |bits, (i, set)| bits | (u32::from(*set) << i));
+    let c = input.control_flags;
+    let control_inputs = [c.passive, c.strict_passive, c.promiscuous, c.capture_phy_error,
+        c.half_rate, c.quarter_rate, c.cck_rates, c.ofdm_rates, c.channel_stat_event,
+        c.filter_probe_request, c.broadcast_probe, c.offchannel_mgmt_tx, c.offchannel_data_tx,
+        c.force_active_dfs, c.add_tpc_ie, c.add_ds_ie, c.spoofed_mac, c.random_sequence,
+        c.ie_whitelist].iter().enumerate().fold(0, |bits, (i, set)|
+            bits | (u32::from(*set) << i));
+    let ssid_lengths = input.ssids.iter().map(|ssid| ssid.len() as u8).collect::<Vec<_>>();
+    let mut ssids = vec![0; input.ssids.len() * 32];
+    for (slot, ssid) in ssids.chunks_exact_mut(32).zip(&input.ssids) {
+        slot[..ssid.len()].copy_from_slice(ssid);
+    }
+    let bssids = input.bssids.iter().flatten().copied().collect::<Vec<_>>();
+    let short_hints = input.short_ssid_hints.iter().flat_map(|hint|
+        [hint.freq_flags, hint.short_ssid]).collect::<Vec<_>>();
+    let bssid_hint_freqs = input.bssid_hints.iter().map(|hint| hint.freq_flags).collect::<Vec<_>>();
+    wmi_capture(|out| {
+        // SAFETY: all slices remain alive and readable for the supplied lengths.
+        unsafe { oracle_wmi_scan_start(v.as_ptr(), event_flags, control_inputs,
+            c.adaptive_dwell_mode, input.mac_addr.as_ptr(), input.mac_mask.as_ptr(),
+            input.channels.as_ptr(), input.channels.len(), ssid_lengths.as_ptr(), ssids.as_ptr(),
+            input.ssids.len(), bssids.as_ptr(), input.bssids.len(), input.extra_ie.as_ptr(),
+            input.extra_ie.len(), short_hints.as_ptr(), input.short_ssid_hints.len(),
+            bssid_hint_freqs.as_ptr(), input.bssid_hints.len(), out) }
+    })
+}
 pub fn c_wmi_install_key(input: &ath11k_wmi::cmd::VdevInstallKey) -> Result<WmiCapture, i32> {
     wmi_capture(|out| {
         // SAFETY: address/key are readable for their stated lengths and `out` is writable.
@@ -460,6 +515,33 @@ pub fn c_wmi_install_key(input: &ath11k_wmi::cmd::VdevInstallKey) -> Result<WmiC
             input.key_flags, input.key_cipher, input.key_rsc_counter.low,
             input.key_rsc_counter.high, input.key_data.as_ptr(), input.key_data.len(),
             input.key_txmic_len, input.key_rxmic_len, out) }
+    })
+}
+pub fn c_wmi_peer_assoc(input: &ath11k_wmi::cmd::PeerAssoc) -> Result<WmiCapture, i32> {
+    let p = &input.params;
+    let values = [p.vdev_id, p.peer_new_assoc, p.peer_associd, p.peer_rate_caps,
+        p.peer_caps, p.peer_listen_intval, p.peer_ht_caps, p.peer_max_mpdu,
+        p.peer_mpdu_density, p.peer_vht_caps, p.peer_phymode, p.peer_nss,
+        p.peer_bw_rxnss_override, p.rx_max_rate, p.rx_mcs_set, p.tx_max_rate,
+        p.tx_mcs_set, u32::from(p.min_data_rate), p.peer_he_cap_macinfo[0],
+        p.peer_he_cap_macinfo[1], p.peer_he_cap_macinfo_internal, p.peer_he_caps_6ghz,
+        p.peer_he_ops, p.peer_he_cap_phyinfo[0], p.peer_he_cap_phyinfo[1],
+        p.peer_he_cap_phyinfo[2], p.peer_ppet.numss_m1, p.peer_ppet.ru_bit_mask];
+    let bools = [p.vht_capable, p.is_pmf_enabled, p.is_wme_set, p.qos_flag, p.apsd_flag,
+        p.ht_flag, p.bw_40, p.bw_80, p.bw_160, p.stbc_flag, p.ldpc_flag,
+        p.static_mimops_flag, p.dynamic_mimops_flag, p.spatial_mux_flag, p.vht_flag,
+        p.he_flag, p.twt_requester, p.twt_responder, p.auth_flag, p.need_ptk_4_way,
+        p.need_gtk_2_way, p.safe_mode_enabled, p.is_assoc, input.hw_crypto_disabled];
+    let flags = bools.iter().enumerate().fold(0, |bits, (index, set)|
+        bits | (u32::from(*set) << index));
+    let he = p.peer_he_mcs.iter().flat_map(|rate|
+        [rate.rx_mcs_set, rate.tx_mcs_set]).collect::<Vec<_>>();
+    wmi_capture(|out| {
+        // SAFETY: all slices remain alive and readable for the supplied lengths.
+        unsafe { oracle_wmi_peer_assoc(values.as_ptr(), p.peer_mac.as_ptr(),
+            p.peer_ppet.ppet16_ppet8_ru3_ru0.as_ptr(), p.peer_legacy_rates.as_ptr(),
+            p.peer_legacy_rates.len(), p.peer_ht_rates.as_ptr(), p.peer_ht_rates.len(),
+            he.as_ptr(), p.peer_he_mcs.len(), flags, out) }
     })
 }
 pub fn c_wmi_mgmt_send(input: &ath11k_wmi::cmd::MgmtSend) -> Result<WmiCapture, i32> {
@@ -709,15 +791,17 @@ mod tests {
     use proptest::collection::vec;
     use proptest::option;
     use proptest::prelude::*;
-    use ath11k_wmi::cmd::{CommandStrategy, EncodeCommand, Init, PdevSetParam, PeerCreate, PeerDelete, PeerSetParam,
+    use ath11k_wmi::cmd::{CommandStrategy, EncodeCommand, Init, PdevSetParam, PeerAssoc,
+        PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, ScanStart,
         Channel as WmiChannel, KeySeqCounter, MgmtSend, ScanCancelType, ScanStop, TxRxStreams, VdevCreate,
         VdevDelete, VdevDown, VdevInstallKey, VdevStart, VdevStop, VdevUp};
     use ath11k_wmi::trace::{TraceEvent as WmiTraceEvent, TraceSink as WmiTraceSink};
     use ath11k_wmi::event::{
         Decoder as WmiDecoder, InstallKeyCompletion, MgmtRx, MgmtTxCompletion,
-        PeerAssocConfirmation, PeerDeleteResponse, ReadyDecoder, Scan, ServiceAvailable,
+        FirmwareMemoryDumpComplete, PeerAssocConfirmation, PeerCreateConfirmation,
+        PeerDeleteResponse, ReadyDecoder, RoamCapabilityReport, Scan, ServiceAvailable,
         ServiceReadyDecoder, ServiceReadyExt2Decoder, ServiceReadyExtDecoder, VdevDeleteResponse,
-        VdevStartResponse, VdevStopped,
+        VdevStartResponse, VdevStopped, WlanFrequencyAvoid,
     };
     use ath11k_dp::htt::{HttEvent, RxRingFilter, RxRingSelection, SrngFlags, SrngRingId,
         SrngRingType, SrngSetup, TxCompletion, version_request};
@@ -1149,6 +1233,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn newly_typed_connect_events_match_c() {
+        use ath11k_wmi::tags::*;
+
+        for (kind, id, tag, values) in [
+            (
+                WmiEventKind::FirmwareMemoryDumpComplete,
+                WMI_UPDATE_FW_MEM_DUMP_EVENTID,
+                WMI_TAG_UPDATE_FW_MEM_DUMP,
+                vec![0x1234, 1],
+            ),
+            (
+                WmiEventKind::RoamCapabilityReport,
+                WMI_ROAM_CAPABILITY_REPORT_EVENTID,
+                WMI_TAG_ROAM_CAPABILITY_REPORT_EVENT,
+                vec![0xa5a5_5a5a],
+            ),
+        ] {
+            let bytes = event_tlv(tag.0, &words(values.clone()));
+            let mut trace = WmiSink::default();
+            let fields = if kind == WmiEventKind::FirmwareMemoryDumpComplete {
+                let value = WmiDecoder::<FirmwareMemoryDumpComplete>::new(id)
+                    .decode_with_trace(event(id, &bytes), Some(&mut trace))
+                    .unwrap();
+                vec![value.request_id.into(), value.fw_mem_dump_complete.into()]
+            } else {
+                let value = WmiDecoder::<RoamCapabilityReport>::new(id)
+                    .decode_with_trace(event(id, &bytes), Some(&mut trace))
+                    .unwrap();
+                vec![value.scoring_capability_bitmap.into()]
+            };
+            assert_event(kind, &bytes, fields, trace);
+        }
+
+        let peer = [0, 17, 34, 51, 68, 85];
+        let mut value = words([7]);
+        value.extend(peer);
+        value.extend([0, 0]);
+        value.extend(words([3]));
+        let bytes = event_tlv(WMI_TAG_PEER_CREATE_CONF_EVENT.0, &value);
+        let mut trace = WmiSink::default();
+        let decoded = WmiDecoder::<PeerCreateConfirmation>::new(WMI_PEER_CREATE_CONF_EVENTID)
+            .decode_with_trace(event(WMI_PEER_CREATE_CONF_EVENTID, &bytes), Some(&mut trace))
+            .unwrap();
+        assert_event(
+            WmiEventKind::PeerCreateConfirmation,
+            &bytes,
+            vec![decoded.vdev_id.into(), mac_value(decoded.peer_mac), decoded.status.into()],
+            trace,
+        );
+
+        let ranges = [(2412, 2437), (5180, 5240)];
+        let mut nested = Vec::new();
+        for (start, end) in ranges {
+            nested.extend(event_tlv(WMI_TAG_AVOID_FREQ_RANGE_DESC.0, &words([start, end])));
+        }
+        let mut bytes = event_tlv(WMI_TAG_AVOID_FREQ_RANGES_EVENT.0, &words([ranges.len() as u32]));
+        bytes.extend(event_tlv(WMI_TAG_ARRAY_STRUCT.0, &nested));
+        let mut trace = WmiSink::default();
+        let decoded = WmiDecoder::<WlanFrequencyAvoid>::new(WMI_WLAN_FREQ_AVOID_EVENTID)
+            .decode_with_trace(event(WMI_WLAN_FREQ_AVOID_EVENTID, &bytes), Some(&mut trace))
+            .unwrap();
+        let mut fields = vec![decoded.ranges.len() as u64];
+        for range in decoded.ranges {
+            fields.extend([u64::from(range.start_freq), u64::from(range.end_freq)]);
+        }
+        assert_event(WmiEventKind::WlanFrequencyAvoid, &bytes, fields, trace);
+    }
+
     proptest! {
         #[test]
         fn htt_host_messages_match_c(pdev_id: u8, ring in 0_u8..8, kind in 0_u8..3,
@@ -1411,6 +1564,16 @@ mod tests {
         }
 
         #[test]
+        fn peer_assoc_builder_matches_c(command in PeerAssoc::strategy()) {
+            assert_wmi(&command, c_wmi_peer_assoc(&command).unwrap());
+        }
+
+        #[test]
+        fn scan_start_builder_matches_c(command in ScanStart::strategy()) {
+            assert_wmi(&command, c_wmi_scan_start(&command).unwrap());
+        }
+
+        #[test]
         fn management_send_builder_matches_c(vdev_id: u32, desc_id: u32, freq: u32,
             paddr: u64, frame in vec(any::<u8>(), 0..=512), tx_params_valid: bool) {
             let command = MgmtSend { vdev_id, desc_id, channel_freq: freq, paddr, frame,
@@ -1419,6 +1582,53 @@ mod tests {
             // length while reserving padding, so the generic TLV iterator is
             // not applicable to this command body.
             prop_assert_eq!(rust_wmi(&command), c_wmi_mgmt_send(&command).unwrap());
+        }
+
+        #[test]
+        fn typed_vdev_create_strategy_matches_c(command in VdevCreate::strategy()) {
+            assert_wmi(&command, c_wmi_vdev_create(command.vdev_id, command.vdev_type,
+                command.vdev_subtype, &command.mac_addr, command.pdev_id, command.mbssid_flags,
+                command.mbssid_tx_vdev_id, command.band_2ghz.tx, command.band_2ghz.rx,
+                command.band_5ghz.tx, command.band_5ghz.rx).unwrap());
+        }
+
+        #[test]
+        fn typed_vdev_start_strategy_matches_c(command in VdevStart::strategy().prop_map(|mut command| {
+            command.restart = false;
+            command
+        })) {
+            assert_wmi(&command, c_wmi_vdev_start(&command).unwrap());
+        }
+
+        #[test]
+        fn typed_vdev_restart_strategy_matches_c(command in VdevStart::strategy().prop_map(|mut command| {
+            command.restart = true;
+            command
+        })) {
+            assert_wmi(&command, c_wmi_vdev_start(&command).unwrap());
+        }
+
+        #[test]
+        fn typed_vdev_up_strategy_matches_c(command in VdevUp::strategy()) {
+            assert_wmi(&command, c_wmi_vdev_up(command.vdev_id, command.assoc_id,
+                &command.bssid, command.tx_bssid.as_ref(), command.nontx_profile_idx,
+                command.nontx_profile_cnt).unwrap());
+        }
+
+        #[test]
+        fn typed_vdev_down_strategy_matches_c(command in VdevDown::strategy()) {
+            assert_wmi(&command, c_wmi_vdev_id(2, command.vdev_id).unwrap());
+        }
+
+        #[test]
+        fn typed_peer_authorize_strategy_matches_c(command in PeerAuthorize::strategy()) {
+            assert_wmi(&command, c_wmi_peer(2, command.vdev_id, &command.peer_addr, 0, 3,
+                u32::from(command.authorized)).unwrap());
+        }
+
+        #[test]
+        fn typed_install_key_strategy_matches_c(command in VdevInstallKey::strategy()) {
+            assert_wmi(&command, c_wmi_install_key(&command).unwrap());
         }
     }
 
