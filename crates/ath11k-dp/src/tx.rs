@@ -1219,35 +1219,51 @@ fn make_tcl_descriptor<B: Backend>(
     msdu_id: u32,
     config: ClientTxConfig,
 ) -> Result<TclDataCommand, DpError> {
+    Ok(TclDataCommand::for_transmit(
+        &buffer.device_address()?,
+        client_tx_command_info(msdu_id, buffer.length() as u32, config),
+    ))
+}
+
+/// Pure per-packet TCL field selection used by the generated C differential.
+#[doc(hidden)]
+pub fn client_tx_command_info(
+    msdu_id: u32,
+    data_length: u32,
+    config: ClientTxConfig,
+) -> TxCommandInfo {
     let cookie = u32::from(config.mac_id) | (msdu_id << 2) | (u32::from(config.pool_id) << 19);
     let checksum_flags = if config.checksum_offload && config.encapsulation != EncapType::Raw {
         (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
     } else {
         0
     };
-    Ok(TclDataCommand::for_transmit(
-        &buffer.device_address()?,
-        TxCommandInfo {
-            metadata_flags: config.metadata,
-            descriptor_id: cookie,
-            descriptor_type: 0,
-            encapsulation_type: config.encapsulation as u8,
-            data_length: buffer.length() as u32,
-            packet_offset: 0,
-            encryption_type: 0,
-            flags0: checksum_flags,
-            flags1: 1 << 21,
-            address_search_flags: u16::from(config.address_search_enable),
-            bss_ast_hash: u16::from(config.ast_hash),
-            bss_ast_index: config.ast_index,
-            tid: config.tid,
-            search_type: config.search_type,
-            lmac_id: config.lmac_id,
-            dscp_tid_table: 0,
-            mesh_enable: false,
-            return_buffer_manager: config.return_buffer_manager,
+    TxCommandInfo {
+        metadata_flags: config.metadata,
+        descriptor_id: cookie,
+        descriptor_type: 0,
+        encapsulation_type: config.encapsulation as u8,
+        data_length,
+        packet_offset: 0,
+        // With no host cipher metadata, Linux selects OPEN for raw frames.
+        // Other encapsulations ignore this field and retain zero initialization.
+        encryption_type: if config.encapsulation == EncapType::Raw {
+            7
+        } else {
+            0
         },
-    ))
+        flags0: checksum_flags,
+        flags1: 1 << 21,
+        address_search_flags: u16::from(config.address_search_enable),
+        bss_ast_hash: u16::from(config.ast_hash),
+        bss_ast_index: config.ast_index,
+        tid: config.tid,
+        search_type: config.search_type,
+        lmac_id: config.lmac_id,
+        dscp_tid_table: 0,
+        mesh_enable: false,
+        return_buffer_manager: config.return_buffer_manager,
+    }
 }
 
 /// `ath11k_dp_tx_encap_nwifi`: remove the QoS control and clear QoS subtype.

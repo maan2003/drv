@@ -1,3 +1,4 @@
+use ath11k_dp::tx::{ClientTxConfig, EncapType, client_tx_command_info};
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
     Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
@@ -31,6 +32,24 @@ unsafe extern "C" {
         dscp: u8,
         mesh: u8,
         manager: u8,
+    );
+    fn oracle_dp_client_tx(
+        out: *mut u8,
+        address: u64,
+        msdu_id: u32,
+        length: u32,
+        manager: u8,
+        pool_id: u8,
+        mac_id: u8,
+        lmac_id: u8,
+        metadata: u16,
+        encap: u8,
+        address_search: u8,
+        search_type: u8,
+        ast_index: u16,
+        ast_hash: u8,
+        tid: u8,
+        checksum_offload: u8,
     );
     fn oracle_hal_dscp_tid_map(table: *const u8, out: *mut u8);
     fn oracle_hal_rx_buffer(out: *mut u8, address: u64, cookie: u32, manager: u8);
@@ -201,6 +220,38 @@ proptest! {
         unsafe { oracle_hal_tx_setup(c.as_mut_ptr(), address.bits(), metadata, id, kind,
             encap, encrypt, u32::from(len), offset, flags0, flags1, addr_flags,
             u32::from(ast_index), ast_hash, tid, search, lmac, dscp, mesh.into(), manager) };
+        prop_assert_eq!(rust.as_bytes(), &c);
+    }
+
+    #[test]
+    fn client_tx_field_selection_matches_pinned_c(
+        msdu_id in 0u32..=32_766, data_length in any::<u32>(),
+        manager in 0u8..=7, pool_id in 0u8..=3, mac_id in 0u8..=3,
+        lmac_id in 0u8..=3, metadata in any::<u16>(), encap in 0u8..=2,
+        address_search in 0u8..=3, search_type in 0u8..=3,
+        ast_index in any::<u16>(), ast_hash in 0u8..=15, tid in 0u8..=15,
+        checksum_offload in any::<bool>(),
+    ) {
+        let encapsulation = match encap {
+            0 => EncapType::Raw,
+            1 => EncapType::NativeWifi,
+            _ => EncapType::Ethernet,
+        };
+        let config = ClientTxConfig {
+            return_buffer_manager: manager, pool_id, mac_id, lmac_id, metadata,
+            encapsulation, address_search_enable: address_search, search_type,
+            ast_index, ast_hash, tid, checksum_offload,
+        };
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(1, 1).unwrap();
+        let address = dma.device_address(0).unwrap();
+        let rust = TclDataCommand::for_transmit(&address,
+            client_tx_command_info(msdu_id, data_length, config));
+        let mut c = [0; 28];
+        // SAFETY: valid high-level DP fields and exact output size.
+        unsafe { oracle_dp_client_tx(c.as_mut_ptr(), address.bits(), msdu_id, data_length,
+            manager, pool_id, mac_id, lmac_id, metadata, encap, address_search,
+            search_type, ast_index, ast_hash, tid, checksum_offload.into()) };
         prop_assert_eq!(rust.as_bytes(), &c);
     }
 

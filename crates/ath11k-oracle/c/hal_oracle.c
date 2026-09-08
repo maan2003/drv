@@ -57,6 +57,19 @@ void oracle_hal_tx_setup(u8 out[28], u64 address, u16 metadata, u32 id,
     memcpy(out, &d, sizeof(d));
 }
 
+void oracle_dp_client_tx(u8 out[28], u64 address, u32 msdu_id, u32 length,
+                         u8 manager, u8 pool_id, u8 mac_id, u8 lmac_id,
+                         u16 metadata, u8 encap, u8 address_search,
+                         u8 search_type, u16 ast_index, u8 ast_hash, u8 tid,
+                         u8 checksum_offload) {
+    u32 cookie = mac_id | (msdu_id << 2) | ((u32)pool_id << 19);
+    u32 checksum = checksum_offload && encap != 0 ? 0x1f0000 : 0;
+    u8 encryption = encap == 0 ? 7 : 0;
+    oracle_hal_tx_setup(out, address, metadata, cookie, 0, encap, encryption,
+                        length, 0, checksum, 1 << 21, address_search, ast_index,
+                        ast_hash, tid, search_type, lmac_id, 0, 0, manager);
+}
+
 void oracle_hal_dscp_tid_map(const u8 table[64], u8 out[24]) {
     u32 value;
     for (u32 group = 0; group < 8; group++) {
