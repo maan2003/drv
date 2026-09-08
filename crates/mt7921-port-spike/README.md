@@ -615,16 +615,16 @@ select one eventfd-capable VFIO vector, install it, require its nonblocking
 counter to remain empty while the device mask is zero, explicitly disable it,
 and VFIO-reset. It never writes the device interrupt mask or enables DMA.
 
-`teardown_pinned_dma` makes reset ordering explicit for the future active path:
-mask and disable are attempted, TX busy is polled for at most 100 ms, and VFIO
-function reset is issued while every IOVA remains pinned regardless of the poll
-result. Mappings are released only after reset succeeds. A reset failure never
-calls unmap, so the external reboot watchdog remains the containment boundary.
+`teardown_dma` makes reset ordering explicit for the future active path: mask
+and disable are attempted, TX busy is polled for at most 100 ms, every mapping
+is released, and only then is VFIO function reset issued. An unmap failure
+stops before reset rather than silently losing authority. Post-reset MMIO
+checks must reopen BAR0 because reset invalidates all prior handles.
 The native backend has an active-operation signal guard for
 SIGHUP, SIGINT, and SIGTERM which performs only an atomic cancellation request
 in the handler and restores previous handlers on drop. The future physical
 control loop checks that request throughout command, scatter, and readiness
-waits and enters the same reset-while-pinned containment path.
+waits and enters the same unmap-before-reset containment path.
 
 ## Verified against pinned Linux 7.2-rc5 source
 
