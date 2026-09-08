@@ -7,7 +7,9 @@
 
 use crate::Descriptor;
 use alloc::vec::Vec;
-use ath11k_platform_backend::{Backend, DeviceAddress, Direction, FromDevice, ToDevice};
+use ath11k_platform_backend::{
+    Backend, DeviceAddress, Direction, FromDevice, MmioRegion, ToDevice,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutError {
@@ -202,7 +204,83 @@ impl RxMsduDescriptor {
 // `struct hal_tcl_data_cmd` (seven little-endian dwords).
 fixed_descriptor!(TclDataCommand, 28);
 
+/// Source-shaped arguments to `ath11k_hal_tx_cmd_desc_setup`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TxCommandInfo {
+    pub metadata_flags: u16,
+    pub descriptor_id: u32,
+    pub descriptor_type: u8,
+    pub encapsulation_type: u8,
+    pub data_length: u32,
+    pub packet_offset: u32,
+    pub encryption_type: u8,
+    pub flags0: u32,
+    pub flags1: u32,
+    pub address_search_flags: u16,
+    pub bss_ast_hash: u16,
+    pub bss_ast_index: u16,
+    pub tid: u8,
+    pub search_type: u8,
+    pub lmac_id: u8,
+    pub dscp_tid_table: u8,
+    pub mesh_enable: bool,
+    pub return_buffer_manager: u8,
+}
+
 impl TclDataCommand {
+    /// Port of `ath11k_hal_tx_cmd_desc_setup`, including WCN6750's QCN9074
+    /// mesh-enable bit in info3[31:30].
+    pub fn for_transmit<B: Backend>(
+        address: &DeviceAddress<'_, B, ToDevice>,
+        info: TxCommandInfo,
+    ) -> Self {
+        let mut command = Self::new();
+        let mut buffer = RxdmaBufferRing::new();
+        buffer
+            .set_address_bits(address.bits())
+            .expect("40-bit TCL address");
+        // FIELD_PREP masks its inputs in the C implementation.
+        let high_address = read_word(&buffer.0, 1);
+        write_word(
+            &mut buffer.0,
+            1,
+            high_address
+                | (u32::from(info.return_buffer_manager) & 7) << 8
+                | (info.descriptor_id & 0x1f_ffff) << 11,
+        );
+        command.set_buffer_address(&buffer);
+        write_word(
+            &mut command.0,
+            2,
+            u32::from(info.descriptor_type) & 1
+                | (u32::from(info.encapsulation_type) & 3) << 2
+                | (u32::from(info.encryption_type) & 15) << 4
+                | (u32::from(info.search_type) & 3) << 12
+                | (u32::from(info.address_search_flags) & 3) << 14
+                | u32::from(info.metadata_flags) << 16,
+        );
+        write_word(
+            &mut command.0,
+            3,
+            info.flags0 | (info.data_length & 0xffff) | (info.packet_offset & 0x1ff) << 23,
+        );
+        write_word(
+            &mut command.0,
+            4,
+            info.flags1 | (u32::from(info.tid) & 15) << 22 | (u32::from(info.lmac_id) & 3) << 26,
+        );
+        let mesh = if info.mesh_enable { 1 << 30 } else { 0 };
+        write_word(
+            &mut command.0,
+            5,
+            (u32::from(info.dscp_tid_table) & 0x3f)
+                | (u32::from(info.bss_ast_index) & 0xfffff) << 6
+                | (u32::from(info.bss_ast_hash) & 15) << 26
+                | mesh,
+        );
+        write_word(&mut command.0, 6, 0);
+        command
+    }
     pub fn buffer_address(&self) -> RxdmaBufferRing {
         RxdmaBufferRing::from_bytes(&self.0[..8]).expect("embedded fixed layout")
     }
@@ -253,6 +331,46 @@ impl TclDataCommand {
     field_accessors!(cache_set, set_cache_set, 5, 0x3c00_0000, u8);
     field_accessors!(ring_id, set_ring_id, 6, 0x0ff0_0000, u8);
     field_accessors!(looping_count, set_looping_count, 6, 0xf000_0000, u8);
+}
+
+/// Port of `ath11k_hal_tx_set_dscp_tid_map`. The exact C read/write sequence
+/// is retained so firmware never observes a partially enabled table update.
+pub fn program_dscp_tid_map<B: Backend>(
+    mmio: &MmioRegion<B>,
+    table_id: usize,
+) -> Result<(), crate::HalError> {
+    const CONTROL: usize = 0x00a4_4014;
+    const MAP: usize = 0x00a4_402c;
+    let control = mmio
+        .read_u32(CONTROL)
+        .map_err(|_| crate::HalError::DeviceFault)?;
+    mmio.write_u32(CONTROL, control | 1 << 17)
+        .map_err(|_| crate::HalError::DeviceFault)?;
+    let base = MAP + 24 * table_id;
+    // Eight equal three-bit values pack into each three-byte group; two
+    // groups form each little-endian register word in the Linux byte array.
+    for word in 0..6 {
+        // Direct construction below is clearer and exactly packs DSCP/8.
+        let mut value = 0_u32;
+        for byte in 0..4 {
+            let packed_bit = word * 32 + byte * 8;
+            for bit in 0..8 {
+                let stream_bit = packed_bit + bit;
+                let dscp_index = stream_bit / 3;
+                if dscp_index < 64 {
+                    value |=
+                        ((((dscp_index / 8) >> (stream_bit % 3)) & 1) as u32) << (byte * 8 + bit);
+                }
+            }
+        }
+        mmio.write_u32(base + word * 4, value)
+            .map_err(|_| crate::HalError::DeviceFault)?;
+    }
+    let control = mmio
+        .read_u32(CONTROL)
+        .map_err(|_| crate::HalError::DeviceFault)?;
+    mmio.write_u32(CONTROL, control & !(1 << 17))
+        .map_err(|_| crate::HalError::DeviceFault)
 }
 
 // `struct hal_reo_entrance_ring` (RXDMA destination ring entry).

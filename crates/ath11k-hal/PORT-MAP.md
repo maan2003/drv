@@ -23,3 +23,6 @@ oracle-checked, or hardware-checked.
 | hal.c:`ath11k_hal_ce_src_set_desc` | `descriptors::CeSourceDescriptor::for_transfer` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
 | hal.c:`ath11k_hal_ce_dst_set_desc` | `descriptors::CeDestinationDescriptor::from_address` | oracle-checked | checked 8-byte layout fixture |
 | hal.c:`ath11k_hal_ce_dst_status_get_length` | `descriptors::CeDestinationStatusDescriptor::take_length` | oracle-checked | checked 16-byte layout fixture |
+| hal_tx.c:`ath11k_hal_tx_cmd_desc_setup` | `descriptors::TclDataCommand::for_transmit`, `TxCommandInfo` | oracle-checked | `tcl_data_command_is_byte_exact_and_checked`; WCN6750 QCN9074 mesh bit |
+| hal_tx.c:`ath11k_hal_tx_set_dscp_tid_map` | `descriptors::program_dscp_tid_map` | ported | source-derived bitstream/register sequence |
+| hal_desc.h:`struct hal_wbm_release_ring` | `descriptors::WbmReleaseRing` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
