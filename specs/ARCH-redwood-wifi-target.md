@@ -9,8 +9,10 @@ The QMI-only discovery run reported BAR address `0x61e00000` and size
 runner is merged but not physically validated. Automatic recovery for that
 no-reset VFIO experiment now uses a process timeout plus a local forced-reboot
 deadline and reboots on runner exit instead of attempting a native-driver
-rebind. Its stalled-runner and successful-exit paths pass a host-only test;
-physical recovery validation remains pending.
+rebind. Its stalled-runner and successful-exit paths pass a host-only test. An
+ordinary pre-release runner failure physically forced reboot to the unchanged
+Linux 7.2.0 #1 system, which was unlocked and reached running state over the
+healthy USB control path. The QMI region-selection path remains unvalidated.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

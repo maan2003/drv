@@ -1,5 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
+PATH=/run/current-system/sw/bin:/bin:/sbin
+export PATH
 
 report_dir=${REDWOOD_REPORT_DIR:-/var/lib/ath11k-redwood-lab}
 systemd_run=${REDWOOD_SYSTEMD_RUN:-systemd-run}
@@ -79,8 +81,11 @@ SH
     ;;
 esac
 
-[[ $EUID -eq 0 || ${REDWOOD_TEST_MODE:-} == 1 ]] || { echo root-required >&2; exit 1; }
-[[ $# -gt 0 ]] || { echo missing-command >&2; exit 2; }
+if [ "$(id -u)" -ne 0 ] && [ "${REDWOOD_TEST_MODE:-}" != 1 ]; then
+  echo root-required >&2
+  exit 1
+fi
+[ "$#" -gt 0 ] || { echo missing-command >&2; exit 2; }
 mkdir -p "$report_dir"
 unit=ath11k-redwood-reboot
 "$systemd_run" --quiet --unit="$unit" --on-active="${deadline}s" \
