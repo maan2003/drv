@@ -88,6 +88,7 @@ where
     qmi: Wcn6750QmiSession<Q, A, M>,
     device: Device<B>,
     waiter: Option<W>,
+    dp_interrupts: crate::Wcn6750DpInterrupts<B>,
     mmio: Option<MmioRegion<B>>,
     rdp: Option<CoherentDma<B, Bidirectional>>,
     allocated: Option<CeAllocatedPipes<B>>,
@@ -116,6 +117,7 @@ where
         qmi: Wcn6750QmiSession<Q, A, M>,
         device: Device<B>,
         waiter: W,
+        dp_interrupts: crate::Wcn6750DpInterrupts<B>,
         deadline: D,
         trace: S,
     ) -> Self {
@@ -123,6 +125,7 @@ where
             qmi,
             device,
             waiter: Some(waiter),
+            dp_interrupts,
             mmio: None,
             rdp: None,
             allocated: None,
@@ -521,9 +524,20 @@ where
                 bssid_hints: Vec::new(),
             }),
             Operation::WmiDetach => self.teardown_transport(),
+            // The first hardware run intentionally polls DP ring shadows. Do
+            // not enable DP eventfds until an MSI doorbell mapping exists.
+            Operation::HifIrqEnable => {
+                if self.dp_interrupts.is_enabled() {
+                    Err(CoreError::WrongState)
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::HifIrqDisable => {
+                self.dp_interrupts.disable();
+                Ok(())
+            }
             Operation::HifStop
-            | Operation::HifIrqEnable
-            | Operation::HifIrqDisable
             | Operation::DpAllocate
             | Operation::DpPdevPreAllocate
             | Operation::DpReoSetup

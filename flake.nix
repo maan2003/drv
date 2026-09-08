@@ -173,6 +173,36 @@
             ];
           };
 
+          ath11k-bringup-aarch64 =
+            let
+              cross = pkgs.pkgsCross.aarch64-multiplatform;
+            in
+            cross.pkgsStatic.rustPlatform.buildRustPackage {
+              pname = "ath11k-bringup-aarch64";
+              version = "0.1.0";
+              src = builtins.path {
+                path = ./.;
+                name = "drv-source";
+              };
+              cargoLock.lockFile = ./Cargo.lock;
+              cargoBuildFlags = [
+                "-p"
+                "ath11k-bringup"
+                "--bin"
+                "ath11k-bringup"
+              ];
+              doCheck = false;
+              postInstall = ''
+                test -x "$out/bin/ath11k-bringup"
+                ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -h \
+                  "$out/bin/ath11k-bringup" | grep -F 'Machine:' | grep -F 'AArch64'
+                ! ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -l \
+                  "$out/bin/ath11k-bringup" | grep -F 'Requesting program interpreter'
+              '';
+              nativeBuildInputs = [ pkgs.gnugrep ];
+              meta.mainProgram = "ath11k-bringup";
+            };
+
           mt7921-patch-table-gate = pkgs.stdenv.mkDerivation {
             pname = "mt7921-patch-table-gate";
             version = "0.1.0";
