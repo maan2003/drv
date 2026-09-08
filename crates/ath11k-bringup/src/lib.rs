@@ -629,5 +629,13 @@ mod tests {
         let mut host = DryRunHost::default();
         let completed = run(&cli, &mut host).unwrap();
         assert_eq!(completed.last(), Some(&Stage::PassiveScan));
+        assert!(
+            host.device
+                .as_ref()
+                .unwrap()
+                .backend()
+                .operations()
+                .contains(&ath11k_core::Operation::DpPdevAllocate)
+        );
     }
 }
