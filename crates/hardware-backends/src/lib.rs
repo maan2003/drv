@@ -3,6 +3,11 @@
 use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
+#[cfg(target_os = "linux")]
+mod linux_vfio;
+#[cfg(target_os = "linux")]
+pub use linux_vfio::{LinuxVfio, LinuxVfioError};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     ReadU32 {
