@@ -1,7 +1,0 @@
-package wasi:random@0.2.12;
-
-/// Cryptographically secure random data. The worker host bounds request sizes.
-interface random {
-  get-random-bytes: func(len: u64) -> list<u8>;
-  get-random-u64: func() -> u64;
-}

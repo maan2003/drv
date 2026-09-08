@@ -1,8 +1,0 @@
-[package]
-name = "drv-fuchsia-audio-processing"
-version.workspace = true
-edition.workspace = true
-license = "BSD-2-Clause"
-
-[build-dependencies]
-cc = "1"

@@ -1,7 +1,0 @@
-[package]
-name = "userspace-vfio"
-description = "Fail-closed Linux VFIO cdev and iommufd ownership primitives"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-

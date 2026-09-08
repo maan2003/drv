@@ -1,6 +1,0 @@
-[package]
-name = "netstack3_hashmap"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-

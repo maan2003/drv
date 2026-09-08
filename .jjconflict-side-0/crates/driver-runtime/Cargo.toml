@@ -1,6 +1,0 @@
-[package]
-name = "driver-runtime"
-description = "Device-neutral lifecycle primitives for bounded userspace drivers"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
