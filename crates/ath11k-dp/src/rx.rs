@@ -38,6 +38,7 @@ pub struct RxDescriptorStatus {
     pub fcs_error: bool,
     pub decrypt_error: bool,
     pub tkip_mic_error: bool,
+    /// Pinned `ath11k_dp_rx_h_attn_mpdu_err` seven-class error map.
     pub mpdu_errors: u8,
     pub ip_checksum_failed: bool,
     pub l4_checksum_failed: bool,

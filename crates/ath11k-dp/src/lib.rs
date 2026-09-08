@@ -45,6 +45,7 @@ pub enum DpError {
     UnsupportedVersion,
     InvalidFrame,
     UnsupportedDescriptor,
+    UnsupportedTxFlags,
     Timeout,
     NoResources,
     DeviceFault,

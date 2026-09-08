@@ -93,3 +93,60 @@ int oracle_reo_msdu_continuation(const u8 *b, size_t len) {
     if (len < 64) return -22;
     return (get32(b + 16) >> 2) & 1;
 }
+
+static size_t oracle_80211_hdrlen(const u8 *b, size_t len) {
+    u16 fc;
+    if (len < 24) return 0;
+    fc = get16(b);
+    size_t hdrlen = (fc & 0x0300) == 0x0300 ? 30 : 24;
+    if ((fc & 0x008c) == 0x0088) hdrlen += 2 + ((fc & 0x8000) ? 4 : 0);
+    return len >= hdrlen ? hdrlen : 0;
+}
+
+static void oracle_address_offsets(u16 fc, size_t *da, size_t *sa) {
+    switch (fc & 0x0300) {
+    case 0x0000: *da = 4; *sa = 10; break;
+    case 0x0100: *da = 16; *sa = 10; break;
+    case 0x0200: *da = 4; *sa = 16; break;
+    default: *da = 16; *sa = 24; break;
+    }
+}
+
+int oracle_undecap_nwifi(const u8 *b, size_t len, const u8 *first_hdr,
+                         size_t first_len, u8 first, u8 tid, u8 mesh,
+                         u8 enctype, u8 decrypted, u8 *out, size_t capacity) {
+    size_t native_len = oracle_80211_hdrlen(b, len), hdrlen, da, sa, out_da, out_sa;
+    size_t crypto = (!decrypted && (enctype == 2 || enctype == 4 || enctype == 6 ||
+        enctype == 8 || enctype == 9 || enctype == 10)) ? 8 : 0;
+    u16 fc, qos;
+    if (!native_len) return -22;
+    if (!first) {
+        if (capacity < len + 2 + crypto) return -28;
+        memcpy(out, b, native_len);
+        fc = (get16(out) | 0x0080) & ~0x8000;
+        if (decrypted) fc &= ~0x4000;
+        memcpy(out, &fc, 2);
+        qos = tid | (mesh ? 0x0100 : 0);
+        memcpy(out + native_len, &qos, 2);
+        memcpy(out + native_len + 2, b + native_len, crypto);
+        memcpy(out + native_len + 2 + crypto, b + native_len, len - native_len);
+        return len + 2 + crypto;
+    }
+    hdrlen = oracle_80211_hdrlen(first_hdr, first_len);
+    if (!hdrlen || first_len < hdrlen + crypto ||
+        capacity < hdrlen + crypto + len - native_len) return -22;
+    memcpy(out, first_hdr, hdrlen);
+    fc = get16(out);
+    if ((fc & 0x008c) == 0x0088) {
+        size_t qos_offset = (fc & 0x0300) == 0x0300 ? 30 : 24;
+        out[qos_offset] &= ~0x80;
+    }
+    oracle_address_offsets(get16(b), &da, &sa);
+    oracle_address_offsets(fc, &out_da, &out_sa);
+    memcpy(out + out_da, b + da, 6);
+    memcpy(out + out_sa, b + sa, 6);
+    if (decrypted) out[1] &= ~0x40;
+    memcpy(out + hdrlen, first_hdr + hdrlen, crypto);
+    memcpy(out + hdrlen + crypto, b + native_len, len - native_len);
+    return hdrlen + crypto + len - native_len;
+}
