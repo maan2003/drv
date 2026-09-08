@@ -32,6 +32,12 @@ proved kernel root cause. The observed sequence used these exact inputs:
   `8a5d019f7c258b654dffa180215f5d17cb5d95d04561a59a470d27cf33707b67`
 - `stage7/kexec-transaction/command-line`, exactly 1540 bytes.
 
+The successful observation started after Run A on `#9`: the operator forced a
+SysRq reboot, unlocked the returned flashed `#1`, waited for userspace to report
+`running`, and then made hop one. Run A's earlier no-`--dtb` boot into `#9` is
+inherited context without its original transcript. Neither history establishes
+a generally reproducible starting state.
+
 From unlocked, running flashed `#1`, hop first in auto mode:
 
 ```sh
@@ -75,9 +81,13 @@ sync
 kexec -e
 ```
 
-Before unlocking the second hop, require `#9`, a 146776-byte live FDT, and the
-exact 32-byte Wi-Fi `reg` ending in `61 e0 00 00 ... 00 20 00 00`. The staged
-candidate proof is on np at
+Before unlocking the second hop, require `#9`, a 146776-byte live FDT with
+SHA-256
+`99b5b3161106ac79a06f252607598e1de995610b72095044ff914f9f99365cfb`,
+and the exact 32-byte Wi-Fi `reg` ending in
+`61 e0 00 00 ... 00 20 00 00`. This runtime FDT hash is not the staged file's
+`8a5d...` hash because kexec updates `/chosen`. The staged candidate proof is
+on np at
 `/var/lib/poco-linux/redwood/work/artifacts/runB-dtb-20260908T221230Z`.
 The first hop's ignored DTB and the successful second hop are observed facts;
 neither hop accessed VFIO or QMI. Do not infer that another starting kernel or
