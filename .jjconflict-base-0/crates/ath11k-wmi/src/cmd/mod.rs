@@ -3,6 +3,11 @@ use crate::tags::*;
 use crate::{Command, WmiError};
 use alloc::vec::Vec;
 
+mod peer_assoc;
+mod scan;
+pub use peer_assoc::*;
+pub use scan::*;
+
 pub trait CommandEncoder {
     type Request;
     fn encode(&self, request: &Self::Request) -> Result<Command, WmiError>;
