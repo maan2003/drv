@@ -71,6 +71,7 @@ dependencies = [
  "ath11k-hal",
  "ath11k-platform-backend",
  "drv-hardware-backends",
+ "proptest",
 ]
 
 [[package]]

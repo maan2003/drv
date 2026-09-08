@@ -1744,6 +1744,8 @@ mod tests {
     use drv_hardware_backends::{DeterministicBackend, Operation};
     use std::{cell::RefCell, collections::BTreeMap, ops::Range, rc::Rc};
 
+    mod stateful_tests;
+
     #[test]
     fn wcn6750_tables_match_qca6390_c_oracle() {
         let target_words: Vec<[u32; 6]> = WCN6750_TARGET_CE_CONFIG
