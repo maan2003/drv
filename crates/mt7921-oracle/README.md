@@ -23,12 +23,18 @@ management TXWI/TXP encoding, Connac2 normal/authentication RX descriptors,
 passive HW scan start/cancel, station BSS/initial STA_REC, and KEY_V2 install
 and disable requests. The remaining connect checkpoint covers pre-key EAPOL
 ordering through PTK/GTK STA_REC commands, the post-association interface
-STA_REC update, and uniform conservative SET_RATE_TX_POWER batches.
+STA_REC update, and uniform conservative SET_RATE_TX_POWER batches. TX status
+coverage executes the pinned `mt7921_mac_add_txs`,
+`mt76_connac2_mac_add_txs_skb`, and `mt76_connac2_mac_fill_txs` bodies with a
+minimal station/status-queue stub. It compares MPDU ACK/PID/WCID behavior and
+exercises the rate mode, MCS, NSS/STBC, bandwidth, legacy, and HE fields read
+by Linux.
 
-The MAC TX/RX consumers are too coupled to mac80211, station/vif, PHY, and skb
-state to extract usefully. Their oracle wrappers therefore use the pinned
+Most MAC TX/RX consumers are too coupled to mac80211, station/vif, PHY, and
+skb state to extract usefully. Their oracle wrappers therefore use pinned
 macros and exact descriptor assignments with those inputs fixed to the public
-MT7921 client seam. RX comparison is normalized to the group walk, payload
+MT7921 client seam; TXS is the exception described above. RX comparison is
+normalized to the group walk, payload
 offset, channel, two-chain signal, and GROUP1 PN retained by
 `parse_connac2_rx_frame`; unrelated Linux status/radiotap bookkeeping is not
 modeled. TX comparison assumes the associated 802.3 path is WME and uses the

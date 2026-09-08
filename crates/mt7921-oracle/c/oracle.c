@@ -4,6 +4,76 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+struct oracle_txs_result {
+    uint8_t skb_completed;
+    uint8_t acked;
+    uint8_t ampdu_len;
+    uint8_t ampdu_ack_len;
+    int32_t skb_rate_index;
+    uint8_t polled;
+    uint8_t rate_mcs;
+    uint8_t rate_nss;
+    uint8_t rate_flags;
+    uint8_t rate_bw;
+    uint8_t rate_he_gi;
+    uint8_t rate_he_dcm;
+    uint16_t rate_legacy;
+};
+
+/* Executes the pinned mt7921_mac_add_txs ->
+ * mt76_connac2_mac_add_txs_skb -> mt76_connac2_mac_fill_txs path.  The
+ * surrounding station, skb-status queue, and band tables are the minimum
+ * state those source bodies read. */
+int oracle_mt7921_add_txs(const uint32_t txs[8], bool pending_skb,
+                          uint8_t band, uint8_t prior_rate_flags,
+                          uint8_t prior_he_gi,
+                          struct oracle_txs_result *out)
+{
+    struct mt792x_dev dev = {0};
+    struct mt792x_link_sta link = {0};
+    struct ieee80211_channel channel = { .band = band };
+    struct sk_buff skb = {0};
+    struct ieee80211_tx_info *info = IEEE80211_SKB_CB(&skb);
+    unsigned int i;
+
+    if (!txs || !out || band > NL80211_BAND_6GHZ)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    info->status.rates[0].idx = 0;
+    link.wcid.sta = (void *)1;
+    link.wcid.rate.flags = prior_rate_flags;
+    link.wcid.rate.he_gi = prior_he_gi;
+    dev.mt76.phy.dev = &dev.mt76;
+    dev.mt76.phy.chandef.chan = &channel;
+    for (i = 0; i < ARRAY_SIZE(dev.mt76.phy.sband_2g.sband.bitrates); i++) {
+        dev.mt76.phy.sband_2g.sband.bitrates[i].bitrate = (i + 1) * 10;
+        dev.mt76.phy.sband_5g.sband.bitrates[i].bitrate = (i + 1) * 10;
+        dev.mt76.phy.sband_6g.sband.bitrates[i].bitrate = (i + 1) * 10;
+    }
+    dev.wcids[FIELD_GET(MT_TXS2_WCID, txs[2]) % MT792x_WTBL_SIZE] = &link;
+    oracle_status_skb = pending_skb ? &skb : NULL;
+    oracle_status_done = false;
+    oracle_polled = false;
+
+    mt7921_mac_add_txs(&dev, (__le32 *)txs);
+
+    out->skb_completed = oracle_status_done;
+    out->acked = !!(info->flags & IEEE80211_TX_STAT_ACK);
+    out->ampdu_len = info->status.ampdu_len;
+    out->ampdu_ack_len = info->status.ampdu_ack_len;
+    out->skb_rate_index = info->status.rates[0].idx;
+    out->polled = oracle_polled;
+    out->rate_mcs = link.wcid.rate.mcs;
+    out->rate_nss = link.wcid.rate.nss;
+    out->rate_flags = link.wcid.rate.flags;
+    out->rate_bw = link.wcid.rate.bw;
+    out->rate_he_gi = link.wcid.rate.he_gi;
+    out->rate_he_dcm = link.wcid.rate.he_dcm;
+    out->rate_legacy = link.wcid.rate.legacy;
+    oracle_status_skb = NULL;
+    return 0;
+}
+
 /* Source-exact request assignments from mt76_connac_mcu_hw_scan and
  * mt76_connac_mcu_cancel_hw_scan.  The omitted mac80211 inputs are fixed to
  * the passive, single-channel shape exposed by PassiveMcuCommand. */
