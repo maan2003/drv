@@ -1308,6 +1308,8 @@ mod tests {
     };
     use drv_hardware_backends::{DeterministicBackend, Operation};
 
+    mod stateful_tests;
+
     type DmaWrites = Rc<RefCell<Vec<(u64, Range<usize>)>>>;
 
     #[derive(Default)]

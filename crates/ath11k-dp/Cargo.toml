@@ -12,3 +12,4 @@ dma-pool={path="../dma-pool"}
 
 [dev-dependencies]
 drv-hardware-backends={path="../hardware-backends"}
+proptest="1"
