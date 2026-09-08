@@ -583,6 +583,34 @@ mod tests {
     }
 
     #[test]
+    fn trace_accepts_host_memory_chunk_struct_length() {
+        let init = Init {
+            resource_config: ResourceConfig::default(),
+            memory_chunks: vec![HostMemoryChunk {
+                request_id: 0,
+                physical_address: 0,
+                size: 0,
+            }],
+            hardware_mode: None,
+            bands: Vec::new(),
+        };
+        let mut trace = Trace::default();
+        init.encode_command_with_trace(&mut trace).unwrap();
+
+        assert!(trace.0.contains(&TraceEvent::Tlv {
+            tag: WMI_TAG_WLAN_HOST_MEMORY_CHUNK.0,
+            len: 16,
+            offset: 328,
+        }));
+        assert!(
+            !trace
+                .0
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Reject { .. }))
+        );
+    }
+
+    #[test]
     fn trace_uses_stable_full_paths_for_nested_init_data() {
         let init = Init {
             resource_config: ResourceConfig {

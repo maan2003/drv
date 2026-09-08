@@ -71,8 +71,15 @@ fn trace_tlvs(bytes: &[u8], base: usize, sink: &mut dyn TraceSink) {
             len,
             offset: base + offset,
         });
-        let padded = len.div_ceil(4) * 4;
-        let Some(value) = bytes.get(offset + 4..offset + 4 + len) else {
+        // Pinned ath11k wmi.c:ath11k_wmi_init_cmd_send() sets this length to
+        // sizeof(struct wlan_host_mem_chunk), including the four-byte header.
+        let value_len = if tag == WMI_TAG_WLAN_HOST_MEMORY_CHUNK.0 && len == 16 {
+            len - 4
+        } else {
+            len
+        };
+        let padded = value_len.div_ceil(4) * 4;
+        let Some(value) = bytes.get(offset + 4..offset + 4 + value_len) else {
             sink.record(TraceEvent::Reject {
                 reason: RejectReason::Truncated,
                 offset: base + offset + 4,
