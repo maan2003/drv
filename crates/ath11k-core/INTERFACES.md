@@ -76,7 +76,13 @@ Protocol crates never depend on core. HAL depends directly on the shared `drv-ha
   management commands used by the core lifecycle.
 
 - **DP/HTT:** `HttHostMessage`/`HttTargetMessage`, `HttControl`,
-  `DataRings`, typed packets/peer IDs, and `DataPath`.
+  `DataRings`, typed packets/peer IDs, and `DataPath`. The concrete
+  `ClientDataPath<B, R>` is the single DP resource aggregate: it owns the
+  WCN6750 TCL/WBM/REO/RXDMA allocation phases and packet DMA. `R` implements
+  HAL's `Rings<B>` plus DP's additive `DpRingOps<B>` setup/teardown operations,
+  which carry the full ring type/number/MAC specification into the HAL owner.
+  HAL retains descriptor/SRNG mechanics and core retains the shared HTC
+  endpoint and interrupt handles.
 - **core:** `Lifecycle`, typed pdev/vdev IDs and `RadioControl`. The latter
   is intentionally narrower than mac80211 and implements WlanSoftmac effects.
 

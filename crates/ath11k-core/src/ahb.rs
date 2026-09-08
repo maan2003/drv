@@ -171,7 +171,10 @@ pub fn service_ce_interrupt<B: ath11k_platform_backend::Backend>(
 }
 
 /// Hardware-facing NAPI poll body of `ath11k_ahb_ext_grp_napi_poll`.
-pub fn service_dp_external_group<B: ath11k_platform_backend::Backend, R: ath11k_hal::Rings<B>>(
+pub fn service_dp_external_group<
+    B: ath11k_platform_backend::Backend,
+    R: ath11k_dp::DpRingOps<B>,
+>(
     data_path: &mut ath11k_dp::tx::ClientDataPath<B, R>,
     budget: usize,
 ) -> Result<ath11k_dp::tx::ServiceResult, ath11k_dp::DpError> {
