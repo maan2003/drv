@@ -48,6 +48,7 @@ transformations, but not an independently linked invocation of those symbols.
 Status: Open.
 
 The TX C oracle is a wire-level transcription of `ath11k_hal_tx_cmd_desc_setup`,
+`ath11k_hal_tx_set_dscp_tid_map`,
 `ath11k_hal_reo_cmd_queue_stats`, `ath11k_hal_reo_cmd_flush_cache`,
 `ath11k_hal_reo_cmd_update_rx_queue`, `ath11k_hal_reo_process_status`,
 `ath11k_hal_reo_qdesc_setup`, `ath11k_hal_reo_init_cmd_ring`,

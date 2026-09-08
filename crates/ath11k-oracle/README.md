@@ -18,7 +18,8 @@ result-ath11k`, or set `ATH11K_REFERENCE_DIR` to its
 
 The HAL differential suite uses the descriptor layouts and masks from the same
 pinned `hal_desc.h`, `hal_rx.h`, `hal_rx.c`, `hal_tx.c`, and `hal.c`. It covers
-the WCN6750 client-path TCL command (including the QCN9074 mesh bit), RX buffer
+the WCN6750 client-path TCL command (including the QCN9074 mesh bit), every
+DSCP-to-TID map entry, RX buffer
 address setup/get, REO entrance and destination parsing, WBM release and MSDU
 link setup, REO queue descriptors and command-ring initialization, all three
 source-supported REO commands and every REO status tag, CE

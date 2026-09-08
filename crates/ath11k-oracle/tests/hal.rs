@@ -32,6 +32,7 @@ unsafe extern "C" {
         mesh: u8,
         manager: u8,
     );
+    fn oracle_hal_dscp_tid_map(table: *const u8, out: *mut u8);
     fn oracle_hal_rx_buffer(out: *mut u8, address: u64, cookie: u32, manager: u8);
     fn oracle_hal_rx_buffer_get(
         input: *const u8,
@@ -187,6 +188,16 @@ proptest! {
             encap, encrypt, u32::from(len), offset, flags0, flags1, addr_flags,
             u32::from(ast_index), ast_hash, tid, search, lmac, dscp, mesh.into(), manager) };
         prop_assert_eq!(rust.as_bytes(), &c);
+    }
+
+    #[test]
+    fn dscp_tid_map_matches_pinned_c(table in any::<[u8; 64]>()) {
+        let rust = dscp_tid_map_words(&table);
+        let rust = rust.map(u32::to_le_bytes).concat();
+        let mut c = [0; 24];
+        // SAFETY: exact 64-byte input and 24-byte output.
+        unsafe { oracle_hal_dscp_tid_map(table.as_ptr(), c.as_mut_ptr()) };
+        prop_assert_eq!(rust, c);
     }
 
     #[test]

@@ -57,6 +57,16 @@ void oracle_hal_tx_setup(u8 out[28], u64 address, u16 metadata, u32 id,
     memcpy(out, &d, sizeof(d));
 }
 
+void oracle_hal_dscp_tid_map(const u8 table[64], u8 out[24]) {
+    u32 value;
+    for (u32 group = 0; group < 8; group++) {
+        value = 0;
+        for (u32 entry = 0; entry < 8; entry++)
+            value |= PREP(7u << (entry * 3), table[group * 8 + entry]);
+        memcpy(out + group * 3, &value, 3);
+    }
+}
+
 static u32 reo_tlv(u32 tag) {
     return PREP(0x000003fe, tag) | PREP(0x03fffc00, 36);
 }
