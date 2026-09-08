@@ -4,6 +4,109 @@ _Static_assert(sizeof(struct mt76_desc) == 16, "DMA descriptor layout changed");
 _Static_assert(sizeof(struct mt76_connac2_mcu_rxd) == 36,
                "MCU RXD layout changed");
 
+/* Source-exact request assignments from mt76_connac_mcu_hw_scan and
+ * mt76_connac_mcu_cancel_hw_scan.  The omitted mac80211 inputs are fixed to
+ * the passive, single-channel shape exposed by PassiveMcuCommand. */
+int oracle_passive_hw_scan(uint8_t scan_sequence, uint8_t band,
+                           uint8_t channel, uint8_t out[1186])
+{
+    memset(out, 0, 1186);
+    out[0] = scan_sequence;
+    out[3] = BIT(0);             /* wildcard SSID */
+    out[6] = BIT(5);             /* SCAN_FUNC_SPLIT_SCAN */
+    out[7] = 1;                  /* version */
+    out[158] = 4;                /* specified channels */
+    out[159] = 1;
+    out[160] = band;
+    out[161] = channel;
+    return 0;
+}
+
+int oracle_cancel_hw_scan(uint8_t scan_sequence, uint8_t out[4])
+{
+    memset(out, 0, 4);
+    out[0] = scan_sequence;
+    return 0;
+}
+
+/* mt76_connac_mcu_uni_add_bss station-mode BASIC+QBSS assignments. */
+int oracle_client_bss(uint8_t bss_index, const uint8_t bssid[6],
+                      uint16_t channel, uint16_t beacon_interval,
+                      uint8_t dtim_period, bool qos, bool enable,
+                      uint8_t out[44])
+{
+    uint32_t conn_type = cpu_to_le32(0x00010001);
+    uint16_t value;
+    memset(out, 0, 44);
+    out[0] = bss_index;
+    out[4] = 0; out[5] = 0; out[6] = 32; out[7] = 0;
+    out[8] = 1;                  /* source keeps station BSS deactivated */
+    memcpy(out + 12, &conn_type, sizeof(conn_type));
+    out[16] = !enable;
+    memcpy(out + 18, bssid, 6);
+    value = cpu_to_le16(19);
+    memcpy(out + 24, &value, sizeof(value));
+    value = cpu_to_le16(beacon_interval);
+    memcpy(out + 26, &value, sizeof(value));
+    out[28] = dtim_period;
+    out[29] = channel <= 14 ? 0x4e : 0xb1;
+    value = cpu_to_le16(19);
+    memcpy(out + 30, &value, sizeof(value));
+    value = cpu_to_le16(channel <= 14 ? 0x53 : 0x78);
+    memcpy(out + 32, &value, sizeof(value));
+    out[36] = 15; out[38] = 8;
+    out[40] = qos;
+    return 0;
+}
+
+/* mt76_connac_mcu_sta_basic_tlv followed by the empty reset-and-set WTBL
+ * emitted by the first mt7921_mac_sta_add transition. */
+int oracle_initial_peer_sta(uint8_t bss_index, uint8_t wcid,
+                            const uint8_t peer[6], uint8_t out[40])
+{
+    uint32_t conn_type = cpu_to_le32(0x00010002);
+    uint16_t value;
+    memset(out, 0, 40);
+    out[0] = bss_index; out[1] = wcid; out[2] = 2; out[4] = 1;
+    out[8] = 0; out[10] = 20;
+    memcpy(out + 12, &conn_type, sizeof(conn_type));
+    memcpy(out + 20, peer, 6);
+    value = cpu_to_le16(1);      /* EXTRA_INFO_VER */
+    memcpy(out + 26, &value, sizeof(value));
+    out[28] = 13; out[30] = 12;
+    out[32] = wcid; out[33] = 1;
+    return 0;
+}
+
+/* mt76_connac_mcu_sta_key_tlv, including Linux's fixed two-key allocation
+ * and shortened TLV length for a one-key CCMP install. */
+int oracle_key_v2(uint8_t bss_index, uint8_t wcid, uint8_t muar_index,
+                  uint8_t key_id, const uint8_t key[16], bool retained,
+                  uint8_t retained_id, const uint8_t retained_key[16],
+                  bool remove, uint8_t out[88])
+{
+    memset(out, 0, 88);
+    out[0] = bss_index; out[1] = wcid; out[2] = 1;
+    out[4] = 1; out[5] = muar_index;
+    out[8] = 17;                /* STA_REC_KEY_V2 */
+    if (remove) {
+        out[10] = 8;
+        out[12] = 1;            /* DISABLE_KEY */
+        return 0;
+    }
+    out[10] = retained ? 80 : 44;
+    out[13] = retained ? 2 : 1;
+    out[16] = 5; out[17] = 36;
+    out[18] = retained ? retained_id : key_id;
+    out[19] = 16;
+    memcpy(out + 20, retained ? retained_key : key, 16);
+    if (retained) {
+        out[52] = 10; out[53] = 36; out[54] = key_id; out[55] = 16;
+        memcpy(out + 56, key, 16);
+    }
+    return 0;
+}
+
 struct oracle_mcu_response {
     int32_t result;
     uint32_t payload_offset;

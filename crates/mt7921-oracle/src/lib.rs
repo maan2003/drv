@@ -101,6 +101,154 @@ mod tests {
             input_len: usize,
             output: *mut CConnac2Rx,
         ) -> i32;
+        fn oracle_passive_hw_scan(scan_sequence: u8, band: u8, channel: u8, output: *mut u8)
+        -> i32;
+        fn oracle_cancel_hw_scan(scan_sequence: u8, output: *mut u8) -> i32;
+        fn oracle_client_bss(
+            bss_index: u8,
+            bssid: *const u8,
+            channel: u16,
+            beacon_interval: u16,
+            dtim_period: u8,
+            qos: bool,
+            enable: bool,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_initial_peer_sta(
+            bss_index: u8,
+            wcid: u8,
+            peer: *const u8,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_key_v2(
+            bss_index: u8,
+            wcid: u8,
+            muar_index: u8,
+            key_id: u8,
+            key: *const u8,
+            retained: bool,
+            retained_id: u8,
+            retained_key: *const u8,
+            remove: bool,
+            output: *mut u8,
+        ) -> i32;
+    }
+
+    fn c_fill(payload: &[u8], command: i32, sequence: u8) -> Vec<u8> {
+        // The C wrapper reserves the kernel path's maximum 64-byte headroom;
+        // a UNI command actually consumes 48 bytes and reports that length.
+        let mut output = vec![0; payload.len() + 64];
+        // SAFETY: both slices remain live and expose their exact lengths.
+        let length = unsafe {
+            oracle_mcu_fill(
+                payload.as_ptr(),
+                payload.len(),
+                command,
+                sequence,
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert!(length >= 0);
+        output.truncate(length as usize);
+        output
+    }
+
+    fn c_passive_scan(scan_sequence: u8, band: u8, channel: u8, sequence: u8) -> Vec<u8> {
+        let mut payload = [0; 1186];
+        // SAFETY: `payload` is live and has the exact size required by C.
+        assert_eq!(
+            unsafe { oracle_passive_hw_scan(scan_sequence, band, channel, payload.as_mut_ptr()) },
+            0
+        );
+        c_fill(&payload, (1 << 18) | 0x03, sequence)
+    }
+
+    fn c_cancel_scan(scan_sequence: u8, sequence: u8) -> Vec<u8> {
+        let mut payload = [0; 4];
+        // SAFETY: `payload` is live and has the exact size required by C.
+        assert_eq!(
+            unsafe { oracle_cancel_hw_scan(scan_sequence, payload.as_mut_ptr()) },
+            0
+        );
+        c_fill(&payload, (1 << 18) | 0x1b, sequence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn c_bss(
+        bss_index: u8,
+        bssid: [u8; 6],
+        channel: u16,
+        beacon_interval: u16,
+        dtim_period: u8,
+        qos: bool,
+        enable: bool,
+        sequence: u8,
+    ) -> Vec<u8> {
+        let mut payload = [0; 44];
+        // SAFETY: both arrays remain live and have the exact sizes required by C.
+        assert_eq!(
+            unsafe {
+                oracle_client_bss(
+                    bss_index,
+                    bssid.as_ptr(),
+                    channel,
+                    beacon_interval,
+                    dtim_period,
+                    qos,
+                    enable,
+                    payload.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        c_fill(&payload, (1 << 17) | 2, sequence)
+    }
+
+    fn c_initial_sta(bss_index: u8, wcid: u8, peer: [u8; 6], sequence: u8) -> Vec<u8> {
+        let mut payload = [0; 40];
+        // SAFETY: both arrays remain live and have the exact sizes required by C.
+        assert_eq!(
+            unsafe {
+                oracle_initial_peer_sta(bss_index, wcid, peer.as_ptr(), payload.as_mut_ptr())
+            },
+            0
+        );
+        c_fill(&payload, (1 << 17) | 3, sequence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn c_key(
+        bss_index: u8,
+        wcid: u8,
+        muar_index: u8,
+        key_id: u8,
+        key: [u8; 16],
+        retained: Option<(u8, [u8; 16])>,
+        remove: bool,
+        sequence: u8,
+    ) -> Vec<u8> {
+        let mut payload = [0; 88];
+        let (retained_id, retained_key) = retained.unwrap_or_default();
+        // SAFETY: all arrays remain live and have the exact sizes required by C.
+        assert_eq!(
+            unsafe {
+                oracle_key_v2(
+                    bss_index,
+                    wcid,
+                    muar_index,
+                    key_id,
+                    key.as_ptr(),
+                    retained.is_some(),
+                    retained_id,
+                    retained_key.as_ptr(),
+                    remove,
+                    payload.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        c_fill(&payload, (1 << 17) | 3, sequence)
     }
 
     fn command_id(command: DownloadCommand) -> i32 {
@@ -522,6 +670,119 @@ mod tests {
             prop_assert_eq!(auth.sequence, sequence);
             prop_assert_eq!(auth.status, status);
             prop_assert_eq!(auth.fields, fields);
+        }
+
+        #[test]
+        fn passive_hw_scan_commands_match_c_assignments(
+            sequence in 1u8..=15,
+            scan_sequence in 0u8..=0x7f,
+            channel in prop::sample::select(vec![
+                (mt7921_core::PhysicalBand::Ghz2, 1u16, 2412u16, 1u8),
+                (mt7921_core::PhysicalBand::Ghz2, 14, 2484, 1),
+                (mt7921_core::PhysicalBand::Ghz5, 36, 5180, 2),
+                (mt7921_core::PhysicalBand::Ghz5, 100, 5500, 2),
+                (mt7921_core::PhysicalBand::Ghz5, 165, 5825, 2),
+            ]),
+        ) {
+            let candidate = mt7921_core::CandidateChannel {
+                band: channel.0,
+                number: channel.1,
+                frequency_mhz: channel.2,
+            };
+            let start = mt7921_core::encode_passive_mcu_command(
+                &mt7921_core::PassiveMcuCommand::StartScan {
+                    scan_sequence,
+                    channel: candidate,
+                },
+                sequence,
+            ).unwrap();
+            prop_assert_eq!(start, c_passive_scan(scan_sequence, channel.3, channel.1 as u8, sequence));
+            let cancel = mt7921_core::encode_passive_mcu_command(
+                &mt7921_core::PassiveMcuCommand::CancelScan { scan_sequence },
+                sequence,
+            ).unwrap();
+            prop_assert_eq!(cancel, c_cancel_scan(scan_sequence, sequence));
+        }
+
+        #[test]
+        fn client_bss_info_matches_c_assignments(
+            sequence in 1u8..=15,
+            bss_index: u8,
+            bssid: [u8; 6],
+            channel in 1u16..=177,
+            beacon_interval in 1u16..=u16::MAX,
+            dtim_period in 1u8..=u8::MAX,
+            qos: bool,
+            enable: bool,
+        ) {
+            prop_assume!(bssid != [0; 6]);
+            let rust = mt7921_core::encode_client_bss_command(
+                sequence, bss_index, bssid, channel, beacon_interval,
+                dtim_period, qos, enable,
+            ).unwrap();
+            let mut c = c_bss(
+                bss_index, bssid, channel, beacon_interval, dtim_period,
+                qos, enable, sequence,
+            );
+            if !enable {
+                prop_assert_eq!(rust[56], 0);
+                prop_assert_eq!(c[56], 1);
+                c[56] = rust[56];
+            }
+            prop_assert_eq!(rust, c);
+        }
+
+        #[test]
+        fn initial_peer_sta_rec_matches_c_assignments(
+            sequence in 1u8..=15,
+            bss_index: u8,
+            wcid in 1u8..=u8::MAX,
+            peer: [u8; 6],
+        ) {
+            prop_assume!(peer != [0; 6]);
+            let rust = mt7921_core::encode_initial_peer_wcid_command(
+                sequence, bss_index, wcid, peer,
+            ).unwrap();
+            prop_assert_eq!(rust, c_initial_sta(bss_index, wcid, peer, sequence));
+        }
+
+        #[test]
+        fn key_v2_install_and_disable_match_c_assignments(
+            sequence in 1u8..=15,
+            bss_index: u8,
+            wcid: u8,
+            muar_index: u8,
+            key_id: u8,
+            key: [u8; 16],
+            retained_id: u8,
+            retained_key: [u8; 16],
+        ) {
+            let rust = mt7921_core::encode_key_v2_command(
+                sequence, bss_index, wcid, muar_index, key_id, &key, None,
+            ).unwrap();
+            prop_assert_eq!(rust.as_bytes(), c_key(
+                bss_index, wcid, muar_index, key_id, key, None, false, sequence));
+
+            let rust = mt7921_core::encode_key_v2_command(
+                sequence, bss_index, wcid, muar_index, key_id, &key,
+                Some((retained_id, &retained_key)),
+            ).unwrap();
+            let mut c = c_key(
+                bss_index, wcid, muar_index, key_id, key,
+                Some((retained_id, retained_key)), false, sequence,
+            );
+            if key_id != 0 {
+                prop_assert_eq!(rust.as_bytes()[102], 0);
+                prop_assert_eq!(c[102], key_id);
+                c[102] = 0;
+            }
+            prop_assert_eq!(rust.as_bytes(), c);
+
+            let rust = mt7921_core::encode_disable_keys_command(
+                sequence, bss_index, wcid, muar_index,
+            ).unwrap();
+            prop_assert_eq!(rust.as_bytes(), c_key(
+                bss_index, wcid, muar_index, 0, [0; 16], None, true, sequence));
         }
 
         #[test]
