@@ -759,9 +759,6 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
-        if self.connection.is_some() {
-            return Err(ConnectError::Driver(DriverError::AlreadyConnected));
-        }
         let mut progressed = self.pump_once().await?;
         let frame = self
             .io
@@ -796,6 +793,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     ) -> Result<(), ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connection.is_some() {
+            return Err(ConnectError::Driver(DriverError::AlreadyConnected));
         }
         let mut result = self.connect_inner(request, deadline).await;
         if matches!(result, Err(ConnectError::Failed(_))) && !self.revoked {
@@ -1664,6 +1664,7 @@ mod tests {
         ))
         .unwrap();
 
+        futures::executor::block_on(runtime.pump_associated_once()).unwrap();
         assert_eq!(
             futures::executor::block_on(runtime.connect(
                 connect_request(),
