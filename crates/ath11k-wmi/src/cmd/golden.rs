@@ -112,6 +112,7 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
         0x006004 => ("peer-set-param", NO_MASKS),
         0x006005 => ("peer-assoc", NO_MASKS),
         0x006013 => ("peer-reorder-queue-setup", REORDER_MASKS),
+        0x006014 => ("peer-reorder-queue-remove", NO_MASKS),
         0x007008 => ("mgmt-tx-send", MGMT_TX_MASKS),
         0x00700c => ("bss-color-change-enable", NO_MASKS),
         0x009001 => ("sta-powersave-mode", NO_MASKS),
@@ -261,6 +262,7 @@ enum SemanticRequest {
     PeerCreate(super::PeerCreate),
     PeerDelete(super::PeerDelete),
     PeerReorderQueueSetup(super::PeerReorderQueueSetup),
+    PeerReorderQueueRemove(super::PeerReorderQueueRemove),
     PeerSetParam(super::PeerSetParam),
     PdevSetParam(super::PdevSetParam),
     ScanChannelList(super::ScanChannelList),
@@ -299,6 +301,7 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::PeerCreate(request) => request.encode_command(),
             SemanticRequest::PeerDelete(request) => request.encode_command(),
             SemanticRequest::PeerReorderQueueSetup(request) => request.encode_command(),
+            SemanticRequest::PeerReorderQueueRemove(request) => request.encode_command(),
             SemanticRequest::PeerSetParam(request) => request.encode_command(),
             SemanticRequest::PdevSetParam(request) => request.encode_command(),
             SemanticRequest::ScanChannelList(request) => request.encode_command(),
@@ -976,6 +979,18 @@ pub fn reverse_map_semantic_command(
                 queue_address: 0,
                 ba_window_size_valid: u8::try_from(fixed[7]).map_err(|_| WmiError::Malformed)?,
                 ba_window_size: fixed[8],
+            })
+        }
+        0x006014 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_REORDER_QUEUE_REMOVE_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<4>(&tlvs[0].value)?;
+            SemanticRequest::PeerReorderQueueRemove(super::PeerReorderQueueRemove {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+                tid_mask: fixed[3],
             })
         }
         0x009001 => {
