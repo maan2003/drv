@@ -170,7 +170,10 @@ pub fn reverse_map_command_envelope(
     }
 
     let mut masked_ranges = Vec::new();
-    if id.0 == 0x007008 {
+    if id.0 == 0x006013 {
+        // Envelope (4), fixed TLV header (4), vdev (4), peer MAC (8), tid (4).
+        masked_ranges.push(24..32);
+    } else if id.0 == 0x007008 {
         // Envelope (4), fixed TLV header (4), then vdev/desc/frequency (12).
         masked_ranges.push(20..28);
         // The byte-array TLV follows the 36-byte fixed TLV.  Its declared

@@ -4,6 +4,7 @@ use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Command, WmiError};
 use alloc::vec::Vec;
 
+pub mod comparison;
 mod control;
 mod device;
 pub mod golden;
