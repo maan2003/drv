@@ -1,0 +1,16 @@
+[package]
+name = "mt7921-oracle"
+version.workspace = true
+edition.workspace = true
+license = "GPL-2.0-only"
+build = "build.rs"
+
+[dependencies]
+mt76-core = { path = "../mt76-core" }
+mt7921-core = { path = "../mt7921-core" }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"

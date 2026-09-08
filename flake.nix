@@ -85,9 +85,11 @@
           '';
           mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
           ath11kReferenceSource = pkgs.callPackage ./nix/ath11k-reference-source.nix { };
+          mt76ReferenceSource = pkgs.callPackage ./nix/mt76-reference-source.nix { };
         in
         rec {
           ath11k-reference-source = ath11kReferenceSource;
+          mt76-reference-source = mt76ReferenceSource;
           mt7921-fuchsia-source = mt7921FuchsiaSource;
           mt7921-fuchsia-source-negative-tests = pkgs.runCommand
             "mt7921-fuchsia-source-negative-tests"

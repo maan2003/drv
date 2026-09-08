@@ -1,0 +1,158 @@
+use std::env;
+use std::path::{Path, PathBuf};
+
+const TAG: &str = "v7.1.5";
+const COMMIT: &str = "155b42bec9cbb6b8cdc47dd9bd09503a81fbe493";
+
+fn main() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let root = env::var_os("MT76_REFERENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("../../result-mt76/reference/linux-v7.1.5"));
+    if !root.join("COMMIT").is_file() {
+        panic!(
+            "pinned mt76 source is missing at {}; run `nix build .#mt76-reference-source --out-link result-mt76` or set MT76_REFERENCE_DIR",
+            root.display()
+        );
+    }
+    assert_identity(&root);
+    let generated = generate_oracle(&root, &manifest);
+    cc::Build::new()
+        .file(generated)
+        .warnings(true)
+        .flag_if_supported("-std=gnu11")
+        .compile("mt76_c_oracle");
+    println!("cargo:rerun-if-env-changed=MT76_REFERENCE_DIR");
+    println!("cargo:rerun-if-changed=c/oracle.c");
+    println!("cargo:rerun-if-changed={}", root.join("COMMIT").display());
+    println!("cargo:rerun-if-changed={}", root.join("TAG").display());
+}
+
+fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
+    let mt76 = root.join("drivers/net/wireless/mediatek/mt76");
+    let mcu = std::fs::read_to_string(mt76.join("mt76_connac_mcu.c")).expect("read MCU C");
+    let dma = std::fs::read_to_string(mt76.join("dma.c")).expect("read DMA C");
+    let mcu_function = item(
+        &mcu,
+        "int mt76_connac2_mcu_fill_message(",
+        "EXPORT_SYMBOL_GPL(mt76_connac2_mcu_fill_message);",
+    );
+    let dma_function = item(
+        &dma,
+        "static int\nmt76_dma_add_buf(",
+        "static void\nmt76_dma_tx_cleanup_idx",
+    );
+    let dma_rx_function = item(
+        &dma,
+        "static int\nmt76_dma_add_rx_buf(",
+        "static int\nmt76_dma_add_buf(",
+    );
+    let wrapper = std::fs::read_to_string(manifest.join("c/oracle.c")).expect("read wrapper");
+    let generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("mt76_oracle.c");
+    std::fs::write(
+        &generated,
+        format!(
+            "{}\n{mcu_function}\n{dma_rx_function}\n{dma_function}\n{wrapper}",
+            prelude()
+        ),
+    )
+    .expect("write generated oracle");
+    generated
+}
+
+fn item<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let start = text
+        .find(start)
+        .unwrap_or_else(|| panic!("pinned source lost {start}"));
+    let end = text[start..]
+        .find(end)
+        .map(|n| start + n)
+        .unwrap_or_else(|| panic!("pinned source lost {end}"));
+    &text[start..end]
+}
+
+fn assert_identity(root: &Path) {
+    let commit = std::fs::read_to_string(root.join("COMMIT")).expect("read COMMIT");
+    let tag = std::fs::read_to_string(root.join("TAG")).expect("read TAG");
+    assert_eq!(commit.trim(), COMMIT, "wrong mt76 reference commit");
+    assert_eq!(tag.trim(), TAG, "wrong mt76 reference tag");
+}
+
+fn prelude() -> &'static str {
+    r#"#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint16_t __le16; typedef uint32_t __le32; typedef uint64_t dma_addr_t;
+#define __packed __attribute__((packed))
+#define __aligned(x) __attribute__((aligned(x)))
+#define BIT(n) (1U << (n))
+#define GENMASK(h, l) (((~0U) << (l)) & (~0U >> (31 - (h))))
+#define __bf_shf(x) (__builtin_ffs((unsigned int)(x)) - 1)
+#define FIELD_PREP(mask, val) (((u32)(val) << __bf_shf(mask)) & (mask))
+#define FIELD_GET(mask, val) (((u32)(val) & (mask)) >> __bf_shf(mask))
+#define cpu_to_le16(x) ((u16)(x))
+#define cpu_to_le32(x) ((u32)(x))
+#define WRITE_ONCE(x, val) ((x) = (val))
+#define HZ 1000
+#define CONFIG_ARCH_DMA_ADDR_T_64BIT 1
+#define __MCU_CMD_FIELD_ID GENMASK(7, 0)
+#define __MCU_CMD_FIELD_EXT_ID GENMASK(15, 8)
+#define __MCU_CMD_FIELD_QUERY BIT(16)
+#define __MCU_CMD_FIELD_UNI BIT(17)
+#define __MCU_CMD_FIELD_CE BIT(18)
+#define __MCU_CMD_FIELD_WA BIT(19)
+#define MCU_CMD_FW_SCATTER 0xee
+#define MCU_CMD(x) MCU_CMD_##x
+#define MT_TXD0_Q_IDX GENMASK(31, 25)
+#define MT_TXD0_PKT_FMT GENMASK(24, 23)
+#define MT_TXD0_TX_BYTES GENMASK(15, 0)
+#define MT_TXD1_LONG_FORMAT BIT(31)
+#define MT_TXD1_HDR_FORMAT GENMASK(17, 16)
+#define MT_TX_TYPE_CMD 2
+#define MT_TX_MCU_PORT_RX_Q0 0x20
+#define MT_HDR_FORMAT_CMD 1
+#define MT_TX_PORT_IDX_MCU 1
+#define MCU_PQ_ID(p, q) (((p) << 15) | ((q) << 10))
+#define MCU_PKT_ID 0xa0
+#define MCU_CMD_UNI_EXT_ACK 7
+enum { MCU_Q_QUERY, MCU_Q_SET, MCU_Q_RESERVED, MCU_Q_NA };
+enum { MCU_S2D_H2N, MCU_S2D_C2N, MCU_S2D_H2C, MCU_S2D_H2N_AND_H2C };
+struct mt76_connac2_mcu_txd { __le32 txd[8]; __le16 len; __le16 pq_id; u8 cid; u8 pkt_type; u8 set_query; u8 seq; u8 uc_d2b0_rev; u8 ext_cid; u8 s2d_index; u8 ext_cid_ack; u32 rsv[5]; } __packed __aligned(4);
+struct mt76_connac2_mcu_uni_txd { __le32 txd[8]; __le16 len; __le16 cid; u8 rsv; u8 pkt_type; u8 frag_n; u8 seq; __le16 checksum; u8 s2d_index; u8 option; u8 rsv1[4]; } __packed __aligned(4);
+struct sk_buff { u8 *data; unsigned int len; };
+static inline void *skb_push(struct sk_buff *skb, unsigned int len) { skb->data -= len; skb->len += len; memset(skb->data, 0, len); return skb->data; }
+struct mt76_queue;
+struct mt76_dev;
+struct mt76_driver_ops { int (*rx_rro_add_msdu_page)(struct mt76_dev *, struct mt76_queue *, dma_addr_t, void *); };
+struct mt76_dev { struct { unsigned int timeout; u8 msg_seq; } mcu; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; };
+struct mt76_desc { __le32 buf0; __le32 ctrl; __le32 buf1; __le32 info; } __packed __aligned(4);
+struct mt76_wed_rro_desc { __le32 buf0; __le32 buf1; };
+struct mt76_txwi_cache { int qid; };
+struct mt76_queue_buf { dma_addr_t addr; u16 len; bool skip_unmap; };
+struct mt76_queue_entry { bool skip_buf0, skip_buf1; dma_addr_t dma_addr[2]; u16 dma_len[2]; void *txwi; void *skb; void *buf; u16 wcid; };
+struct mt76_queue { int head, ndesc, queued; u32 flags, magic_cnt; struct mt76_desc *desc; struct mt76_queue_entry *entry; };
+static inline bool mt76_queue_is_wed_rro_ind(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_rxdmad_c(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rx(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_data(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_msdu_pg(struct mt76_queue *q) { (void)q; return false; }
+static inline struct mt76_txwi_cache *mt76_get_rxwi(struct mt76_dev *d) { (void)d; return NULL; }
+static inline int mt76_rx_token_consume(struct mt76_dev *d, void *a, void *b, dma_addr_t c) { (void)d; (void)a; (void)b; (void)c; return -1; }
+static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p; }
+#define ENOMEM 12
+#define MT_QFLAG_WED_RRO_EN BIT(0)
+#define MT_DMA_CTL_TOKEN GENMASK(31, 16)
+#define MT_DMA_CTL_TO_HOST BIT(8)
+#define MT_DMA_MAGIC_MASK GENMASK(3, 0)
+#define MT_DMA_MAGIC_CNT 16
+#define DMA_DUMMY_DATA ((void *)1)
+#define MT_DMA_CTL_SD_LEN0 GENMASK(29, 16)
+#define MT_DMA_CTL_LAST_SEC0 BIT(30)
+#define MT_DMA_CTL_SD_LEN1 GENMASK(13, 0)
+#define MT_DMA_CTL_LAST_SEC1 BIT(14)
+#define MT_DMA_CTL_SDP0_H GENMASK(3, 0)
+#define MT_DMA_CTL_SDP1_H GENMASK(19, 16)
+"#
+}
