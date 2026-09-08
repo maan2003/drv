@@ -6,25 +6,25 @@
 //! policy. The effect implementation is injected; this crate has no physical
 //! transport implementation.
 
+#[cfg(test)]
 use fdf::ArenaStaticBox;
 use fidl_fuchsia_wlan_common as fidl_common;
 use fidl_fuchsia_wlan_driver as fidl_driver;
 use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
+#[cfg(test)]
 use fidl_fuchsia_wlan_mlme as fidl_mlme;
-use fidl_fuchsia_wlan_sme as fidl_sme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
+#[cfg(test)]
 use futures::channel::mpsc;
-use futures::{FutureExt, Stream, StreamExt};
-use std::pin::Pin;
 #[cfg(test)]
 use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex};
-use wlan_mlme::MlmeImpl;
+#[cfg(test)]
 use wlan_mlme::device::{DeviceOps, LinkStatus};
-use wlan_sme::Station;
 use wlan_softmac_class_support::{LifecycleAuthorization, PublicWlanIdentity};
 
 use crate::Mt7921SoftmacAdapter;
+#[cfg(test)]
 use crate::ethernet::{
     DriverEthernetPort, EthernetIngressError, EthernetPortConfigError, Mt7921EthernetDevice,
     ethernet_port,
@@ -252,10 +252,6 @@ fn safe_auth_stage(bytes: &[u8]) -> Option<SafeAuthStage> {
     })
 }
 
-fn safe_sae_group(frame: &fidl_mlme::SaeFrame) -> Option<u16> {
-    (frame.seq_num == 1 && frame.sae_fields.len() >= 2)
-        .then(|| u16::from_le_bytes([frame.sae_fields[0], frame.sae_fields[1]]))
-}
 
 /// Immutable values reported through the pinned `DeviceOps` query seams.
 #[derive(Clone)]
@@ -574,6 +570,7 @@ pub enum ClientRuntimeScanState {
 }
 
 trait Mt7921ClientScan: Mt7921ClientIo {
+    #[cfg(test)]
     fn connection_monitor_offload(&self) -> bool {
         false
     }
@@ -592,6 +589,7 @@ trait Mt7921ClientScan: Mt7921ClientIo {
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status>;
+    fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, zx::Status>;
 }
 
 struct NoClientScan;
@@ -639,9 +637,13 @@ impl Mt7921ClientScan for NoClientScan {
     ) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
     }
+    fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, zx::Status> {
+        Ok(None)
+    }
 }
 
 impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter<T> {
+    #[cfg(test)]
     fn connection_monitor_offload(&self) -> bool {
         // MCU_EVENT_BSS_BEACON_LOSS is not yet routed into MLME teardown, so
         // the host lost-BSS monitor remains the sole complete liveness path.
@@ -671,6 +673,9 @@ impl<T: crate::Mt7921PassiveTransport> Mt7921ClientScan for Mt7921SoftmacAdapter
         request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
         SoftmacHardware::cancel_scan(self, request).map_err(|_| zx::Status::IO)
+    }
+    fn next_scan_event(&mut self) -> Result<Option<HardwareScanEvent>, zx::Status> {
+        SoftmacHardware::next_scan_event(self).map_err(|_| zx::Status::IO)
     }
 }
 
@@ -731,6 +736,74 @@ pub struct Mt7921ScanRunner<E, T> {
     backend: Arc<Mutex<ComposedBackend<E, Mt7921SoftmacAdapter<T>>>>,
 }
 
+fn poll_scan<E: Mt7921ClientEffects, S: Mt7921ClientScan>(
+    backend: &mut ComposedBackend<E, S>,
+) -> Result<Option<HardwareScanEvent>, zx::Status> {
+    let event = match backend.scan.next_scan_event() {
+        Ok(event) => event,
+        Err(status) => {
+            backend.authorization.invalidate_scan();
+            backend.effects.revoke_scan();
+            if let Some(scan_id) = backend.active_scan_id.take() {
+                let _ = backend.effects.complete_passive_scan(scan_id, false);
+            }
+            return Err(status);
+        }
+    };
+    if let Some(event) = &event {
+        match event {
+            HardwareScanEvent::Observation(observation) => {
+                let Some(scan_id) = backend.active_scan_id else {
+                    backend.authorization.invalidate_scan();
+                    backend.effects.revoke_scan();
+                    return Err(zx::Status::BAD_STATE);
+                };
+                if let Err(status) = backend.effects.observe_passive_scan(scan_id, observation)
+                {
+                    backend.authorization.invalidate_scan();
+                    backend.effects.revoke_scan();
+                    backend.active_scan_id = None;
+                    let _ = backend.effects.complete_passive_scan(scan_id, false);
+                    return Err(status);
+                }
+            }
+            HardwareScanEvent::Complete { scan_id, success } => {
+                if backend.active_scan_id != Some(*scan_id) {
+                    backend.authorization.invalidate_scan();
+                    backend.effects.revoke_scan();
+                    return Err(zx::Status::BAD_STATE);
+                }
+                if !success {
+                    backend.authorization.invalidate_scan();
+                    backend.effects.revoke_scan();
+                }
+                if let Err(status) = backend.effects.complete_passive_scan(*scan_id, *success) {
+                    backend.authorization.invalidate_scan();
+                    backend.effects.revoke_scan();
+                    backend.active_scan_id = None;
+                    return Err(status);
+                }
+                backend.active_scan_id = None;
+                if *success {
+                    backend.authorization.authorize_scan();
+                } else {
+                    backend.authorization.invalidate_scan();
+                }
+                if !backend.authorization.permits_tx() {
+                    backend.effects.revoke_scan();
+                }
+                if let Some(upcalls) = backend.upcalls.as_mut() {
+                    upcalls.notify_scan_complete(
+                        if *success { zx::Status::OK } else { zx::Status::IO },
+                        *scan_id,
+                    );
+                }
+            }
+        }
+    }
+    Ok(event)
+}
+
 impl<E, T> Clone for Mt7921ScanRunner<E, T> {
     fn clone(&self) -> Self {
         Self {
@@ -741,6 +814,7 @@ impl<E, T> Clone for Mt7921ScanRunner<E, T> {
 
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<E, T> {
     /// Borrow the already-connected pinned MLME as the associated data plane.
+    #[cfg(test)]
     pub fn associated_data_pump<'a>(
         &'a self,
         mlme: &'a mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
@@ -750,6 +824,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
 
     /// Take one driver-bound frame without retaining the backend lock across
     /// the caller's MLME TX entry point.
+    #[cfg(test)]
     pub(crate) fn take_ethernet_transmit(
         &self,
     ) -> Result<Option<netstack3_port_spike::EthernetFrame>, zx::Status> {
@@ -775,63 +850,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     }
     pub fn poll(&self) -> Result<Option<HardwareScanEvent>, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
-        let event = match backend.scan.next_scan_event() {
-            Ok(event) => event,
-            Err(_) => {
-                backend.authorization.invalidate_scan();
-                backend.effects.revoke_scan();
-                if let Some(scan_id) = backend.active_scan_id.take() {
-                    let _ = backend.effects.complete_passive_scan(scan_id, false);
-                }
-                return Err(zx::Status::IO);
-            }
-        };
-        if let Some(event) = &event {
-            match event {
-                HardwareScanEvent::Observation(observation) => {
-                    let Some(scan_id) = backend.active_scan_id else {
-                        backend.authorization.invalidate_scan();
-                        backend.effects.revoke_scan();
-                        return Err(zx::Status::BAD_STATE);
-                    };
-                    if let Err(status) = backend.effects.observe_passive_scan(scan_id, observation)
-                    {
-                        backend.authorization.invalidate_scan();
-                        backend.effects.revoke_scan();
-                        backend.active_scan_id = None;
-                        let _ = backend.effects.complete_passive_scan(scan_id, false);
-                        return Err(status);
-                    }
-                }
-                HardwareScanEvent::Complete { scan_id, success } => {
-                    if backend.active_scan_id != Some(*scan_id) {
-                        backend.authorization.invalidate_scan();
-                        backend.effects.revoke_scan();
-                        return Err(zx::Status::BAD_STATE);
-                    }
-                    if !success {
-                        backend.authorization.invalidate_scan();
-                        backend.effects.revoke_scan();
-                    }
-                    if let Err(status) = backend.effects.complete_passive_scan(*scan_id, *success) {
-                        backend.authorization.invalidate_scan();
-                        backend.effects.revoke_scan();
-                        backend.active_scan_id = None;
-                        return Err(status);
-                    }
-                    backend.active_scan_id = None;
-                    if *success {
-                        backend.authorization.authorize_scan();
-                    } else {
-                        backend.authorization.invalidate_scan();
-                    }
-                    if !backend.authorization.permits_tx() {
-                        backend.effects.revoke_scan();
-                    }
-                }
-            }
-        }
-        Ok(event)
+        poll_scan(&mut backend)
     }
 
     /// Count of malformed, corrupt, or replayed RX frames discarded before
@@ -840,9 +859,59 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         self.backend.lock().unwrap().rx_integrity_drops
     }
 
+    /// Poll at most one scan event and one validated RX outcome into the
+    /// callbacks installed for the current lifecycle. No worker thread is
+    /// introduced, so hardware observation retains the existing call-site
+    /// ordering and timing.
+    #[cfg(test)]
+    pub fn pump_upcalls(&self) -> Result<bool, zx::Status> {
+        let scan_progressed = match self.poll()? {
+            Some(HardwareScanEvent::Complete { .. }) => true,
+            Some(HardwareScanEvent::Observation(_)) => true,
+            None => false,
+        };
+
+        let mut backend = self.backend.lock().unwrap();
+        if backend.upcalls.is_none() {
+            return Ok(scan_progressed);
+        }
+        if let Some(status) = backend.association_activation_failure {
+            return Err(status);
+        }
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        let frame = match effects.next_rx(scan)? {
+            ClientRxPoll::Frame(frame) => frame,
+            ClientRxPoll::IntegrityDrop => {
+                backend.rx_integrity_drops = backend.rx_integrity_drops.saturating_add(1);
+                println!(
+                    "client_rx_integrity_drop count={} disposition=drop_before_mlme continue=true",
+                    backend.rx_integrity_drops
+                );
+                return Ok(true);
+            }
+            ClientRxPoll::Idle => return Ok(scan_progressed),
+        };
+        let ClientRxFrame { bytes, status, .. } = frame;
+        let status = wlan_softmac_class_support::rx_carrier(&bytes, status, false)
+            .map_or(status, |carrier| carrier.status);
+        if let Some(auth) = safe_auth_stage(&bytes) {
+            println!(
+                "client_mlme_rx stage=adapter_return algorithm={} transaction={} status={} rejected_group={:?} band={:?} primary={}",
+                auth.algorithm, auth.transaction, auth.status, auth.rejected_group,
+                status.primary.band, status.primary.number
+            );
+        }
+        if bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
+            println!("client_eapol_stage=adapter_return controlled_port_independent=true");
+        }
+        backend.upcalls.as_mut().unwrap().recv(bytes, status);
+        Ok(true)
+    }
+
     /// Deliver at most one descriptor-validated raw 802.11 frame from the
     /// run-scoped effects owner into the pinned client MLME. This remains
     /// callable after `Mt7921ClientDevice` has moved into `ClientMlme`.
+    #[cfg(test)]
     pub async fn pump_client_rx(
         &self,
         mlme: &mut wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
@@ -909,6 +978,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         backend.authorization.invalidate_lifecycle();
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
+        #[cfg(test)]
         if let Some(ethernet) = backend.ethernet.as_mut() {
             ethernet.teardown();
         }
@@ -922,6 +992,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         backend.authorization.invalidate_lifecycle();
         backend.effects.revoke_lifecycle();
         backend.active_scan_id = None;
+        #[cfg(test)]
         if let Some(ethernet) = backend.ethernet.as_mut() {
             ethernet.teardown();
         }
@@ -929,329 +1000,11 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
     }
 }
 
-type SmeTimerAction = Box<dyn FnOnce(&mut wlan_sme::client::ClientSme)>;
-type MlmeTimerAction = wlan_mlme::common::timer::Event<wlan_mlme::client::TimedEvent>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PinnedConnectError {
-    Timeout,
-    Failed,
-    Driver(PinnedDriverError),
-    Containment,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PinnedDriverError {
-    MlmeRequest { name: &'static str, detail: String },
-    ClientRx(zx::Status),
-    Ethernet(zx::Status),
-    RequestStreamClosed,
-    EventStreamClosed,
-}
-
-/// Bounded production owner for SME, MLME, timers, device events, and MT7921
-/// RX. No host-portable association state can be attached to this runtime.
-pub struct PinnedClientRuntime<E, T> {
-    sme: wlan_sme::client::ClientSme,
-    mlme: wlan_mlme::client::ClientMlme<Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>>,
-    runner: Mt7921ScanRunner<E, T>,
-    requests: wlan_sme::MlmeStream,
-    events: mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>,
-    sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
-    mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
-    timer_runtime: tokio::runtime::Runtime,
-}
-
-impl<E, T> PinnedClientRuntime<E, T>
-where
-    E: Mt7921ClientEffects,
-    T: crate::Mt7921PassiveTransport,
-{
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        mut device: Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>,
-        runner: Mt7921ScanRunner<E, T>,
-        sme_config: wlan_sme::client::ClientConfig,
-        device_info: fidl_mlme::DeviceInfo,
-        security: fidl_common::SecuritySupport,
-        spectrum: fidl_common::SpectrumManagementSupport,
-        inspector: fuchsia_inspect::Inspector,
-    ) -> Result<Self, anyhow::Error> {
-        let events = device
-            .take_mlme_event_stream()
-            .ok_or_else(|| anyhow::anyhow!("MLME event stream was already taken"))?;
-        let (mlme_timer, mlme_timer_stream) = wlan_mlme::common::timer::create_timer();
-        let mlme =
-            wlan_mlme::client::ClientMlme::new(Default::default(), device, mlme_timer).await?;
-        let (sme, _sink, requests, sme_timer_stream) = wlan_sme::client::ClientSme::new(
-            sme_config,
-            device_info,
-            inspector.clone(),
-            inspector.root().create_child("sme"),
-            security,
-            spectrum,
-        );
-        let sme_timers = Box::pin(
-            wlan_mlme::common::timer::make_async_timed_event_stream(sme_timer_stream).map(
-                |event| {
-                    Box::new(move |sme: &mut wlan_sme::client::ClientSme| {
-                        Station::on_timeout(sme, event)
-                    }) as SmeTimerAction
-                },
-            ),
-        );
-        let mlme_timers = Box::pin(wlan_mlme::common::timer::make_async_timed_event_stream(
-            mlme_timer_stream,
-        ));
-        let timer_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?;
-        Ok(Self {
-            sme,
-            mlme,
-            runner,
-            requests,
-            events,
-            sme_timers,
-            mlme_timers,
-            timer_runtime,
-        })
-    }
-
-    pub fn sme(&self) -> &wlan_sme::client::ClientSme {
-        &self.sme
-    }
-
-    pub fn associated_data_pump(&mut self) -> crate::ethernet::PinnedAssociatedDataPump<'_, E, T> {
-        self.runner.associated_data_pump(&mut self.mlme)
-    }
-
-    async fn drain_control(&mut self, budget: usize) -> Result<(bool, bool), PinnedConnectError> {
-        let mut progressed = false;
-        for _ in 0..budget {
-            let mut cycle_progressed = false;
-            match self.requests.try_recv() {
-                Ok(request) => {
-                    let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
-                    let eapol_tx = matches!(&request, wlan_sme::MlmeRequest::Eapol(_));
-                    if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
-                        println!(
-                            "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
-                            frame.seq_num,
-                            frame.status_code.into_primitive(),
-                            safe_sae_group(frame)
-                        );
-                    }
-                    if eapol_tx {
-                        println!("client_eapol_stage=sme_tx_request");
-                    }
-                    let name = request.name();
-                    // Diagnostic: surface every MLME request the SME issues so the
-                    // post-4-way sequence (SetKeys GTK/IGTK, SetCtrlPort, Deauth) is
-                    // visible when the connect fails after PTK.
-                    println!("client_mlme_request name={name}");
-                    wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
-                        .await
-                        .map_err(|error| {
-                            PinnedConnectError::Driver(PinnedDriverError::MlmeRequest {
-                                name,
-                                // Pinned MLME errors contain status/contract names,
-                                // never request frame or credential bytes.
-                                detail: error.to_string(),
-                            })
-                        })?;
-                    if sae_frame_tx {
-                        println!(
-                            "client_sae_stage=mlme_request_complete state={}",
-                            self.mlme.sae_state_name()
-                        );
-                    }
-                    if eapol_tx {
-                        println!("client_eapol_stage=mlme_tx_request_complete");
-                    }
-                    progressed = true;
-                    cycle_progressed = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Closed) => {
-                    return Err(PinnedConnectError::Driver(
-                        PinnedDriverError::RequestStreamClosed,
-                    ));
-                }
-            }
-            match self.events.try_recv() {
-                Ok(event) => {
-                    if let fidl_mlme::MlmeEvent::OnSaeFrameRx { frame } = &event {
-                        println!(
-                            "client_sae_stage=mlme_sae_frame_rx algorithm=3 transaction={} status={} group={:?}",
-                            frame.seq_num,
-                            frame.status_code.into_primitive(),
-                            safe_sae_group(frame)
-                        );
-                    }
-                    let eapol_ind = matches!(&event, fidl_mlme::MlmeEvent::EapolInd { .. });
-                    if let fidl_mlme::MlmeEvent::EapolConf { resp } = &event {
-                        // MLME never propagates a failed EAPOL send as an
-                        // error; it only reports it here. Surface it so a
-                        // rejected M2 cannot hide behind a successful request.
-                        println!(
-                            "client_eapol_stage=mlme_eapol_confirm result={:?}",
-                            resp.result_code
-                        );
-                    }
-                    if eapol_ind {
-                        println!(
-                            "client_eapol_stage=mlme_indication_forwarded_to_sme controlled_port_closed_allowed=true"
-                        );
-                    }
-                    Station::on_mlme_event(&mut self.sme, event);
-                    progressed = true;
-                    cycle_progressed = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Closed) => {
-                    return Err(PinnedConnectError::Driver(
-                        PinnedDriverError::EventStreamClosed,
-                    ));
-                }
-            }
-            if !cycle_progressed {
-                return Ok((progressed, true));
-            }
-        }
-        Ok((progressed, false))
-    }
-
-    async fn pump_once(&mut self) -> Result<bool, PinnedConnectError> {
-        const CONTROL_BUDGET: usize = 64;
-
-        let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
-        if let Some(action) = self.timer_runtime.block_on(async {
-            tokio::task::yield_now().await;
-            self.sme_timers.as_mut().next().now_or_never().flatten()
-        }) {
-            action(&mut self.sme);
-            progressed = true;
-            control_quiescent = false;
-        }
-        if let Some(event) = self.timer_runtime.block_on(async {
-            tokio::task::yield_now().await;
-            self.mlme_timers.as_mut().next().now_or_never().flatten()
-        }) {
-            println!(
-                "client_mlme_timer stage=stream_dequeued timer_id={} event={:?}",
-                event.id, event.event
-            );
-            wlan_mlme::MlmeImpl::handle_timeout(&mut self.mlme, event.event).await;
-            progressed = true;
-            control_quiescent = false;
-        }
-
-        if !control_quiescent {
-            let (control_progressed, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
-            progressed |= control_progressed;
-            control_quiescent = quiescent;
-        }
-        if !control_quiescent {
-            println!(
-                "client_runtime_control stage=budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
-            );
-            return Ok(progressed);
-        }
-
-        if self
-            .runner
-            .pump_client_rx(&mut self.mlme)
-            .await
-            .map_err(|status| PinnedConnectError::Driver(PinnedDriverError::ClientRx(status)))?
-        {
-            progressed = true;
-            let (_, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
-            if !quiescent {
-                println!(
-                    "client_runtime_control stage=post_rx_budget_exhausted budget={CONTROL_BUDGET} rx_dequeued=false"
-                );
-            }
-        }
-        Ok(progressed)
-    }
-
-    /// Advance post-association SME/MLME control, timers, hardware RX, and one
-    /// driver-bound Ethernet frame. No backend lock is held across MLME TX.
-    pub async fn pump_associated_once(&mut self) -> Result<bool, PinnedConnectError> {
-        let mut progressed = self.pump_once().await?;
-        let frame = self.runner.take_ethernet_transmit().map_err(|status| {
-            println!("client_data_seam_error direction=netstack_to_driver status={status}");
-            PinnedConnectError::Driver(PinnedDriverError::Ethernet(status))
-        })?;
-        if let Some(frame) = frame {
-            if let Err(error) = wlan_mlme::MlmeImpl::handle_eth_frame_tx(
-                &mut self.mlme,
-                frame.as_bytes(),
-                fuchsia_trace::Id::new(),
-            ) {
-                println!(
-                    "client_data_tx_error stage=ethernet_pump kind=target_rejected error={error}"
-                );
-            }
-            progressed = true;
-        }
-        Ok(progressed)
-    }
-
-    pub async fn connect(
-        &mut self,
-        request: fidl_sme::ConnectRequest,
-        deadline: std::time::Instant,
-    ) -> Result<(), PinnedConnectError> {
-        let result = self.connect_inner(request, deadline).await;
-        if result.is_err() {
-            self.runner
-                .reset()
-                .map_err(|_| PinnedConnectError::Containment)?;
-        }
-        result
-    }
-
-    async fn connect_inner(
-        &mut self,
-        request: fidl_sme::ConnectRequest,
-        deadline: std::time::Instant,
-    ) -> Result<(), PinnedConnectError> {
-        let mut transaction = self.sme.on_connect_command(request);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                return Err(PinnedConnectError::Timeout);
-            }
-            let progressed = self.pump_once().await?;
-            loop {
-                match transaction.try_recv() {
-                    Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
-                        result,
-                        ..
-                    }) => {
-                        if result != wlan_sme::client::ConnectResult::Success {
-                            return Err(PinnedConnectError::Failed);
-                        }
-                        self.pump_once().await?;
-                        return self
-                            .sme
-                            .status()
-                            .is_connected()
-                            .then_some(())
-                            .ok_or(PinnedConnectError::Failed);
-                    }
-                    Ok(_) => {}
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Closed) => return Err(PinnedConnectError::Failed),
-                }
-            }
-            if !progressed {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        }
-    }
-}
+pub type PinnedConnectError = wlan_softmac_host::runtime::ConnectError;
+pub type PinnedDriverError = wlan_softmac_host::runtime::DriverError;
+pub type PinnedClientRuntime<E, T> = wlan_softmac_host::runtime::ClientRuntime<
+    Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>,
+>;
 
 /// One-way adapter from production `ClientMlme` effects to MT7921 mechanics.
 ///
@@ -1260,8 +1013,11 @@ where
 pub struct Mt7921ClientDevice<E, S> {
     backend: Arc<Mutex<ComposedBackend<E, S>>>,
     support: ClientSupport,
+    #[cfg(test)]
     event_sink: mpsc::UnboundedSender<fidl_mlme::MlmeEvent>,
+    #[cfg(test)]
     event_stream: Option<mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>>,
+    #[cfg(test)]
     minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
@@ -1272,17 +1028,23 @@ struct ComposedBackend<E, S> {
     authorization: LifecycleAuthorization,
     association_activation_failure: Option<zx::Status>,
     rx_integrity_drops: u64,
+    #[cfg(test)]
     ethernet: Option<DriverEthernetPort>,
+    upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
     fn from_parts(backend: Arc<Mutex<ComposedBackend<E, S>>>, support: ClientSupport) -> Self {
+        #[cfg(test)]
         let (event_sink, event_stream) = mpsc::unbounded();
         Self {
             backend,
             support,
+            #[cfg(test)]
             event_sink,
+            #[cfg(test)]
             event_stream: Some(event_stream),
+            #[cfg(test)]
             minstrel: None,
         }
     }
@@ -1304,7 +1066,9 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 authorization: LifecycleAuthorization::new(true),
                 association_activation_failure: None,
                 rx_integrity_drops: 0,
+                #[cfg(test)]
                 ethernet: None,
+                upcalls: None,
             })),
             support,
         )
@@ -1331,7 +1095,9 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             ),
             association_activation_failure: None,
             rx_integrity_drops: 0,
+            #[cfg(test)]
             ethernet: None,
+            upcalls: None,
         }));
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
@@ -1341,6 +1107,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
 
     /// Construct the production client boundary with the existing Netstack3
     /// Ethernet-II port attached. The query MAC is the single address source.
+    #[cfg(test)]
     pub fn new_with_ethernet(
         mut effects: E,
         scan: Mt7921SoftmacAdapter<T>,
@@ -1366,11 +1133,21 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
             association_activation_failure: None,
             rx_integrity_drops: 0,
             ethernet: Some(ethernet_sink),
+            upcalls: None,
         }));
         let runner = Mt7921ScanRunner {
             backend: backend.clone(),
         };
         Ok((Self::from_parts(backend, support), runner, ethernet_device))
+    }
+
+    /// Apply a pre-runtime channel request through the production SoftMAC
+    /// contract without exposing the host crate to binary-only consumers.
+    pub fn set_runtime_channel(
+        &mut self,
+        request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
+    ) -> Result<(), zx::Status> {
+        wlan_softmac_host::WlanSoftmac::set_channel(self, request)
     }
 }
 
@@ -1389,8 +1166,232 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientIo> Mt7921ClientDevice<E, S> {
             ClientRxPoll::Frame(frame) => Some(frame),
         })
     }
+
+    fn queue_tx_inner(
+        &mut self,
+        bytes: &[u8],
+        mut tx_flags: fidl_softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        if bytes.get(1).is_some_and(|byte| byte & 0x40 != 0) {
+            tx_flags |= fidl_softmac::WlanTxInfoFlags::PROTECTED;
+        }
+        let mut backend = self.backend.lock().unwrap();
+        if !backend.authorization.permits_tx() {
+            return Err(zx::Status::ACCESS_DENIED);
+        }
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        let tx_flags = wlan_softmac_class_support::tx_carrier(bytes, tx_flags, true)
+            .map_or(tx_flags, |carrier| carrier.flags);
+        let association =
+            prepare_association_wlan_frame_with_evidence(bytes, self.support.association.as_ref())?;
+        if let Some((frame, evidence)) = association.as_ref() {
+            effects.association_capability_transformation(evidence, frame);
+        }
+        effects.send_wlan_frame(
+            association.as_ref().map_or(bytes, |(frame, _)| frame.as_slice()),
+            tx_flags,
+            scan,
+        )
+    }
 }
 
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmacLifecycle
+    for Mt7921ClientDevice<E, S>
+{
+    fn start(
+        &mut self,
+        upcalls: Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>,
+    ) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        if backend.upcalls.is_some() || !backend.authorization.is_live() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        backend.upcalls = Some(upcalls);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.upcalls = None;
+        backend.authorization.invalidate_lifecycle();
+        backend.effects.revoke_lifecycle();
+        backend.active_scan_id = None;
+        #[cfg(test)]
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.teardown();
+        }
+        backend.effects.stop()
+    }
+}
+
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::ClientRuntimeDriver
+    for Mt7921ClientDevice<E, S>
+{
+    fn drive(&mut self) -> Result<bool, zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        if !backend.authorization.is_live() || backend.upcalls.is_none() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        if let Some(status) = backend.association_activation_failure {
+            return Err(status);
+        }
+        let scan_progressed = poll_scan(&mut backend)?.is_some();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        let frame = match effects.next_rx(scan)? {
+            ClientRxPoll::Frame(frame) => frame,
+            ClientRxPoll::IntegrityDrop => {
+                backend.rx_integrity_drops = backend.rx_integrity_drops.saturating_add(1);
+                println!(
+                    "client_rx_integrity_drop count={} disposition=drop_before_mlme continue=true",
+                    backend.rx_integrity_drops
+                );
+                return Ok(true);
+            }
+            ClientRxPoll::Idle => return Ok(scan_progressed),
+        };
+        let ClientRxFrame { bytes, status, .. } = frame;
+        let status = wlan_softmac_class_support::rx_carrier(&bytes, status, false)
+            .map_or(status, |carrier| carrier.status);
+        if let Some(auth) = safe_auth_stage(&bytes) {
+            println!(
+                "client_mlme_rx stage=adapter_return algorithm={} transaction={} status={} rejected_group={:?} band={:?} primary={}",
+                auth.algorithm, auth.transaction, auth.status, auth.rejected_group,
+                status.primary.band, status.primary.number
+            );
+        }
+        if bytes.windows(8).any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]) {
+            println!("client_eapol_stage=adapter_return controlled_port_independent=true");
+        }
+        backend.upcalls.as_mut().unwrap().recv(bytes, status);
+        Ok(true)
+    }
+
+    fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.effects.set_link_up(up)?;
+        #[cfg(test)]
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.set_link(up);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.authorization.invalidate_lifecycle();
+        backend.effects.revoke_lifecycle();
+        backend.active_scan_id = None;
+        #[cfg(test)]
+        if let Some(ethernet) = backend.ethernet.as_mut() {
+            ethernet.teardown();
+        }
+        backend.effects.reset()
+    }
+}
+
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
+    for Mt7921ClientDevice<E, S>
+{
+    fn query(&mut self) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
+        Ok(self.support.query.clone())
+    }
+    fn query_discovery_support(&mut self) -> Result<fidl_softmac::DiscoverySupport, zx::Status> {
+        Ok(self.support.discovery.clone())
+    }
+    fn query_mac_sublayer_support(&mut self) -> Result<fidl_common::MacSublayerSupport, zx::Status> {
+        Ok(self.support.mac_sublayer.clone())
+    }
+    fn query_security_support(&mut self) -> Result<fidl_common::SecuritySupport, zx::Status> {
+        Ok(self.support.security.clone())
+    }
+    fn query_spectrum_management_support(&mut self) -> Result<fidl_common::SpectrumManagementSupport, zx::Status> {
+        Ok(self.support.spectrum_management.clone())
+    }
+    fn set_channel(&mut self, request: fidl_softmac::WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status> {
+        let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
+        let bandwidth = request.bandwidth.ok_or(zx::Status::INVALID_ARGS)?;
+        let secondary = request.vht_secondary_80_channel.ok_or(zx::Status::INVALID_ARGS)?;
+        let mut backend = self.backend.lock().unwrap();
+        let current = backend.effects.ensure_channel(primary, bandwidth, secondary)?
+            == ClientChannelEnsure::Current;
+        if !current {
+            match backend.scan.set_channel(primary, bandwidth, secondary) {
+                Err(zx::Status::NOT_SUPPORTED) | Ok(()) => {}
+                Err(status) => return Err(status),
+            }
+        }
+        backend.effects.set_channel(primary, bandwidth, secondary)
+    }
+    fn join_bss(&mut self, request: fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
+        self.backend.lock().unwrap().effects.join_bss(&request)
+    }
+    fn install_key(&mut self, configuration: fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.install_key(&configuration, scan)
+    }
+    fn notify_association_complete(&mut self, configuration: fidl_softmac::WlanAssociationConfig) -> Result<(), zx::Status> {
+        let mut configuration = configuration;
+        if let Some(profile) = self.support.association.as_ref() {
+            configuration.ht_cap = Some(fidl_ieee80211::HtCapabilities {
+                bytes: profile.ht_capabilities.ok_or(zx::Status::BAD_STATE)?,
+            });
+            configuration.vht_cap = Some(fidl_ieee80211::VhtCapabilities {
+                bytes: profile.vht_capabilities.ok_or(zx::Status::BAD_STATE)?,
+            });
+        }
+        let mut backend = self.backend.lock().unwrap();
+        let result = {
+            let ComposedBackend { effects, scan, .. } = &mut *backend;
+            effects.notify_association_complete(&configuration, scan)
+        };
+        if let Err(status) = result {
+            backend.association_activation_failure = Some(status);
+            println!("client_runtime_control stage=association_activation_failed status={status} rx_dequeued=false");
+        }
+        result
+    }
+    fn clear_association(&mut self, request: fidl_softmac::WlanSoftmacBaseClearAssociationRequest) -> Result<(), zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        let ComposedBackend { effects, scan, .. } = &mut *backend;
+        effects.clear_association(&request, scan)
+    }
+    fn start_passive_scan(&mut self, request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
+        let mut backend = self.backend.lock().unwrap();
+        backend.authorization.invalidate_scan();
+        backend.effects.revoke_scan();
+        let response = backend.scan.start_passive_scan(request.clone())?;
+        let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
+        backend.active_scan_id = Some(scan_id);
+        if let Err(status) = backend.effects.begin_passive_scan(
+            scan_id,
+            request.channels.as_deref().unwrap_or_default(),
+        ) {
+            backend.authorization.invalidate_scan();
+            let _ = backend.scan.cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest { scan_id: Some(scan_id) });
+            let _ = backend.effects.complete_passive_scan(scan_id, false);
+            backend.active_scan_id = None;
+            return Err(status);
+        }
+        Ok(response)
+    }
+    fn start_active_scan(&mut self, request: fidl_softmac::WlanSoftmacStartActiveScanRequest) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
+        let _ = request;
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn cancel_scan(&mut self, request: fidl_softmac::WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
+        self.backend.lock().unwrap().scan.cancel_scan(request)
+    }
+    fn update_wmm_parameters(&mut self, request: fidl_softmac::WlanSoftmacBaseUpdateWmmParametersRequest) -> Result<(), zx::Status> {
+        let _ = request;
+        Err(zx::Status::NOT_SUPPORTED)
+    }
+    fn queue_tx(&mut self, bytes: &[u8], flags: fidl_softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+        self.queue_tx_inner(bytes, flags)
+    }
+}
+
+#[cfg(test)]
 impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevice<E, S> {
     fn connection_monitor_offload(&self) -> bool {
         self.backend.lock().unwrap().scan.connection_monitor_offload()
@@ -1441,46 +1442,17 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> DeviceOps for Mt7921ClientDevi
     fn send_wlan_frame(
         &mut self,
         buffer: ArenaStaticBox<[u8]>,
-        mut tx_flags: fidl_softmac::WlanTxInfoFlags,
+        tx_flags: fidl_softmac::WlanTxInfoFlags,
         _async_id: Option<fuchsia_trace::Id>,
     ) -> Result<(), zx::Status> {
-        // The Fuchsia `Device` wrapper (mlme device.rs `send_wlan_frame`) sets
-        // PROTECTED from the frame control Protected bit before handing the
-        // frame to the softmac; the MLME itself only passes FAVOR_RELIABILITY
-        // for EAPOL. This host device implements `DeviceOps` directly, so it
-        // has to derive the flag the same way or every encrypted data frame
-        // reaches the transport with empty flags.
-        if buffer.get(1).is_some_and(|byte| byte & 0x40 != 0) {
-            tx_flags |= fidl_softmac::WlanTxInfoFlags::PROTECTED;
-        }
-        let mut backend = self.backend.lock().unwrap();
-        if !backend.authorization.permits_tx() {
-            return Err(zx::Status::ACCESS_DENIED);
-        }
-        let associated = backend.authorization.permits_tx();
-        let ComposedBackend { effects, scan, .. } = &mut *backend;
-        let tx_flags = wlan_softmac_class_support::tx_carrier(&buffer, tx_flags, associated)
-            .map_or(tx_flags, |carrier| carrier.flags);
-        let association = prepare_association_wlan_frame_with_evidence(
-            &buffer,
-            self.support.association.as_ref(),
-        )?;
-        if let Some((frame, evidence)) = association.as_ref() {
-            effects.association_capability_transformation(evidence, frame);
-        }
-        effects.send_wlan_frame(
-            association
-                .as_ref()
-                .map_or(&buffer[..], |(frame, _)| frame.as_slice()),
-            tx_flags,
-            scan,
-        )
+        self.queue_tx_inner(&buffer, tx_flags)
     }
 
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         let up = status == LinkStatus::UP;
         backend.effects.set_link_up(up)?;
+        #[cfg(test)]
         if let Some(ethernet) = backend.ethernet.as_mut() {
             ethernet.set_link(up);
         }
@@ -1674,10 +1646,11 @@ mod tests {
         frame[0] = 0x08;
         assert!(safe_auth_stage(&frame).is_none());
     }
+    use fidl_fuchsia_wlan_sme as fidl_sme;
     use futures::StreamExt;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
     use wlan_mlme::MlmeImpl;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum PassiveCall {
@@ -2119,6 +2092,41 @@ mod tests {
             rssi_dbm,
             snr_dbh: 42,
         }
+    }
+
+    #[test]
+    fn softmac_lifecycle_routes_validated_rx_and_synchronously_revokes_callbacks() {
+        use wlan_softmac_host::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
+
+        struct Upcalls(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl wlan_softmac_host::WlanSoftmacUpcalls for Upcalls {
+            fn recv(&mut self, bytes: Vec<u8>, _: fidl_softmac::WlanRxInfo) {
+                self.0.lock().unwrap().push(bytes);
+            }
+            fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+            fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
+        }
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut effects = FakeEffects::default();
+        effects.rx.push_back(ClientRxFrame {
+            bytes: vec![0x08, 0, 1, 2],
+            status: rx_status(-42),
+            security: None,
+        });
+        let mut device = Mt7921ClientDevice::new_offline_fake(effects, support());
+        device.start(Box::new(Upcalls(received.clone()))).unwrap();
+        assert!(device.drive().unwrap());
+        assert_eq!(&*received.lock().unwrap(), &[vec![0x08, 0, 1, 2]]);
+
+        device.stop().unwrap();
+        device.backend().effects.rx.push_back(ClientRxFrame {
+            bytes: vec![0x08, 0, 3, 4],
+            status: rx_status(-43),
+            security: None,
+        });
+        assert_eq!(device.drive(), Err(zx::Status::BAD_STATE));
+        assert_eq!(&*received.lock().unwrap(), &[vec![0x08, 0, 1, 2]]);
     }
 
     fn channel(number: u8) -> fidl_ieee80211::ChannelNumber {
@@ -2756,9 +2764,10 @@ mod tests {
                 .hash_to_element_supported = Some(true);
             let mut sme_config = wlan_sme::client::ClientConfig::default();
             sme_config.wpa3_supported = true;
+            let backend = runner.backend.clone();
+            drop(runner);
             let mut runtime = PinnedClientRuntime::new(
                 device,
-                runner,
                 sme_config,
                 runtime_device_info(),
                 support_info.security,
@@ -2783,13 +2792,7 @@ mod tests {
             assert!(detail.contains("IO_REFUSED"), "{detail}");
             assert!(!detail.contains("synthetic-password"));
             assert!(
-                !runtime
-                    .runner
-                    .backend
-                    .lock()
-                    .unwrap()
-                    .authorization
-                    .is_live()
+                !backend.lock().unwrap().authorization.is_live()
             );
         });
     }

@@ -2504,8 +2504,10 @@ name = "wlan-softmac-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fdf",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
  "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",

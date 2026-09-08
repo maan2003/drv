@@ -16,6 +16,7 @@ use rand::SeedableRng as _;
 /// RX enters its raw MAC handler through the MT7921 runner. Consequently this
 /// type cannot be constructed around `OpenClientMlme` or an independently
 /// maintained association state.
+#[cfg(test)]
 pub struct PinnedAssociatedDataPump<'a, E, T> {
     mlme: &'a mut wlan_mlme::client::ClientMlme<
         crate::client_device::Mt7921ClientDevice<E, crate::Mt7921SoftmacAdapter<T>>,
@@ -23,12 +24,14 @@ pub struct PinnedAssociatedDataPump<'a, E, T> {
     runner: &'a crate::client_device::Mt7921ScanRunner<E, T>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub enum PinnedDataPumpError {
     Tx(anyhow::Error),
     Rx(zx::Status),
 }
 
+#[cfg(test)]
 impl std::fmt::Display for PinnedDataPumpError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -38,8 +41,10 @@ impl std::fmt::Display for PinnedDataPumpError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for PinnedDataPumpError {}
 
+#[cfg(test)]
 impl<'a, E, T> PinnedAssociatedDataPump<'a, E, T>
 where
     E: crate::client_device::Mt7921ClientEffects,
@@ -55,6 +60,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<E, T> AssociatedSoftmacTx for PinnedAssociatedDataPump<'_, E, T>
 where
     E: crate::client_device::Mt7921ClientEffects,
@@ -68,6 +74,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<E, T> AssociatedDataPump for PinnedAssociatedDataPump<'_, E, T>
 where
     E: crate::client_device::Mt7921ClientEffects,

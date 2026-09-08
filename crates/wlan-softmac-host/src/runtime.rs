@@ -5,7 +5,7 @@
 use crate::ethernet::{
     DriverEthernetPort, EthernetIngressError, HostEthernetDevice, ethernet_port,
 };
-use crate::{WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls};
+use crate::{ClientRuntimeDriver, WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls};
 use fdf::ArenaStaticBox;
 use fidl_fuchsia_wlan_common as fidl_common;
 use fidl_fuchsia_wlan_driver as fidl_driver;
@@ -155,7 +155,7 @@ impl<D> HostMlmeDevice<D> {
     }
 }
 
-impl<D: WlanSoftmac + WlanSoftmacLifecycle> DeviceOps for HostMlmeDevice<D> {
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for HostMlmeDevice<D> {
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
@@ -205,6 +205,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> DeviceOps for HostMlmeDevice<D> {
         self.device.lock().unwrap().device.queue_tx(&buffer, flags)
     }
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
+        self.device
+            .lock()
+            .unwrap()
+            .device
+            .set_link_up(status == LinkStatus::UP)?;
         self.io
             .lock()
             .unwrap()
@@ -350,7 +355,7 @@ pub enum DriverError {
 
 /// Bounded production owner for SME, MLME, RSN, timers, device events, and
 /// chip-supplied RX. No parallel association state is attached to this owner.
-pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle> {
+pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> {
     device: Arc<Mutex<StartedDevice<D>>>,
     upcalls: Arc<Mutex<UpcallQueue>>,
     io: Arc<Mutex<HostIo>>,
@@ -365,7 +370,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle> {
     revoked: bool,
 }
 
-impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<D> {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         device: D,
@@ -375,11 +380,26 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
         spectrum: fidl_common::SpectrumManagementSupport,
         inspector: fuchsia_inspect::Inspector,
     ) -> Result<Self, anyhow::Error> {
+        Self::new_with_ethernet_capacity(
+            device, sme_config, device_info, security, spectrum, inspector, ETHERNET_QUEUE_CAPACITY,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_ethernet_capacity(
+        device: D,
+        sme_config: wlan_sme::client::ClientConfig,
+        device_info: fidl_mlme::DeviceInfo,
+        security: fidl_common::SecuritySupport,
+        spectrum: fidl_common::SpectrumManagementSupport,
+        inspector: fuchsia_inspect::Inspector,
+        ethernet_queue_capacity: usize,
+    ) -> Result<Self, anyhow::Error> {
         let timer_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
         let (ethernet_device, ethernet) =
-            ethernet_port(device_info.sta_addr, ETHERNET_QUEUE_CAPACITY)
+            ethernet_port(device_info.sta_addr, ethernet_queue_capacity)
                 .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
         let upcalls = Arc::new(Mutex::new(UpcallQueue {
             live: true,
@@ -493,6 +513,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
                     }
                 }
                 Some(Upcall::Recv { bytes, info }) => {
+                    let auth = safe_auth_stage(&bytes);
+                    let eapol = bytes
+                        .windows(8)
+                        .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
                     MlmeImpl::handle_mac_frame_rx(
                         &mut self.mlme,
                         &bytes,
@@ -500,6 +524,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
                         fuchsia_trace::Id::new(),
                     )
                     .await;
+                    if let Some((algorithm, transaction, status, rejected_group)) = auth {
+                        println!(
+                            "client_mlme_rx stage=handle_complete algorithm={algorithm} transaction={transaction} status={status} rejected_group={rejected_group:?}"
+                        );
+                    }
+                    if eapol {
+                        println!("client_eapol_stage=mlme_handle_complete");
+                    }
                 }
                 None => break,
             }
@@ -629,8 +661,6 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
             control_quiescent = false;
         }
 
-        let upcall_progressed = self.pump_upcalls().await?;
-        progressed |= upcall_progressed;
         if !control_quiescent {
             let (control_progressed, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
             progressed |= control_progressed;
@@ -643,7 +673,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
             return Ok(progressed);
         }
 
-        if upcall_progressed {
+        let device_progressed = self
+            .device
+            .lock()
+            .unwrap()
+            .device
+            .drive()
+            .map_err(|status| ConnectError::Driver(DriverError::ClientRx(status)))?;
+        let upcall_progressed = self.pump_upcalls().await?;
+        progressed |= device_progressed || upcall_progressed;
+        if device_progressed || upcall_progressed {
             let (_, quiescent) = self.drain_control(CONTROL_BUDGET).await?;
             if !quiescent {
                 println!(
@@ -697,7 +736,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
         }
         let result = self.connect_inner(request, deadline).await;
         if result.is_err() && !self.revoked {
-            self.stop().map_err(|_| ConnectError::Containment)?;
+            self.revoked = true;
+            revoke_and_drain(&self.upcalls);
+            self.io.lock().unwrap().ethernet.teardown();
+            self.device.lock().unwrap().device.reset().map_err(|_| ConnectError::Containment)?;
         }
         result
     }
@@ -742,7 +784,23 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle> ClientRuntime<D> {
     }
 }
 
-impl<D: WlanSoftmac + WlanSoftmacLifecycle> Drop for ClientRuntime<D> {
+fn safe_auth_stage(bytes: &[u8]) -> Option<(u16, u16, u16, Option<u16>)> {
+    let control = u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?);
+    if control & 0x00fc != 0x00b0 {
+        return None;
+    }
+    let algorithm = u16::from_le_bytes(bytes.get(24..26)?.try_into().ok()?);
+    let transaction = u16::from_le_bytes(bytes.get(26..28)?.try_into().ok()?);
+    let status = u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?);
+    let rejected_group = if status == 77 {
+        Some(u16::from_le_bytes(bytes.get(30..32)?.try_into().ok()?))
+    } else {
+        None
+    };
+    Some((algorithm, transaction, status, rejected_group))
+}
+
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> Drop for ClientRuntime<D> {
     fn drop(&mut self) {
         // A preceding failed explicit stop is retried once here. There is no
         // callback or queue reactivation between attempts.
@@ -759,6 +817,7 @@ mod tests {
         calls: Vec<&'static str>,
         upcalls: Option<Box<dyn WlanSoftmacUpcalls>>,
         stop_failures: usize,
+        reset_failure: bool,
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
     }
@@ -789,6 +848,24 @@ mod tests {
             effects.calls.push("stop");
             if effects.stop_failures != 0 {
                 effects.stop_failures -= 1;
+                Err(zx::Status::IO)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ClientRuntimeDriver for Fake {
+        fn drive(&mut self) -> Result<bool, zx::Status> {
+            Ok(false)
+        }
+        fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<(), zx::Status> {
+            let mut effects = self.0.lock().unwrap();
+            effects.calls.push("reset");
+            if effects.reset_failure {
                 Err(zx::Status::IO)
             } else {
                 Ok(())
@@ -1169,6 +1246,57 @@ mod tests {
             .unwrap()
             .notify_scan_complete(zx::Status::OK, 1);
         assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+    }
+
+    #[test]
+    fn failed_connect_terminally_revokes_host_state_even_when_reset_fails() {
+        for reset_failure in [false, true] {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().reset_failure = reset_failure;
+            let mut runtime = runtime(fake);
+            let ethernet = runtime.take_ethernet_device().unwrap();
+            effects
+                .lock()
+                .unwrap()
+                .upcalls
+                .as_mut()
+                .unwrap()
+                .recv(vec![0, 0], rx_info());
+
+            let error = futures::executor::block_on(
+                runtime.connect(connect_request(), std::time::Instant::now()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                if reset_failure {
+                    ConnectError::Containment
+                } else {
+                    ConnectError::Timeout
+                }
+            );
+            assert!(runtime.revoked);
+            assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+            assert!(ethernet.properties().is_none());
+            assert_eq!(
+                futures::executor::block_on(
+                    runtime.connect(connect_request(), std::time::Instant::now()),
+                ),
+                Err(ConnectError::Driver(DriverError::Stopped))
+            );
+            assert_eq!(
+                futures::executor::block_on(runtime.pump_associated_once()),
+                Err(ConnectError::Driver(DriverError::Stopped))
+            );
+            effects
+                .lock()
+                .unwrap()
+                .upcalls
+                .as_mut()
+                .unwrap()
+                .notify_scan_complete(zx::Status::OK, 1);
+            assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+        }
     }
 
     #[test]
