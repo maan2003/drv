@@ -26,6 +26,15 @@ fixtures are source-derived from pinned C packed layouts.
 | ath11k_wmi_mgmt_send | cmd::MgmtSend | encoded | source-derived nested TLV |
 | ath11k_wmi_send_scan_stop_cmd | cmd::ScanStop | encoded | source-derived fixed TLV |
 | ath11k_init_cmd_send / ath11k_wmi_cmd_init | cmd::Init | encoded | cmd::init::tests::single_pdev_init_matches_fixed_c_layout |
-| ath11k_wmi_send_peer_assoc_cmd | cmd::PeerAssoc | typed | pending source fixture |
-| ath11k_wmi_send_scan_start_cmd | cmd::ScanStart | typed | pending source fixture |
-| ath11k_wmi_send_scan_chan_list_cmd | cmd::ScanChannelList | typed | pending source fixture |
+| ath11k_wmi_send_peer_assoc_cmd | cmd::PeerAssoc | encoded | cmd::peer_assoc source-derived layout |
+| ath11k_wmi_send_scan_start_cmd | cmd::ScanStart | encoded | cmd::scan source-derived layout |
+| ath11k_wmi_send_scan_chan_list_cmd | cmd::ScanChannelList | encoded | cmd::scan source-derived layout |
+| ath11k_wmi_set_peer_param | cmd::PeerSetParam | encoded | source-derived fixed TLV |
+| ath11k_wmi_pdev_suspend | cmd::PdevSuspend | encoded | source-derived fixed TLV |
+| ath11k_wmi_pdev_resume | cmd::PdevResume | encoded | source-derived fixed TLV |
+| ath11k_wmi_attach | cmd::Wmi::attach | encoded | lifecycle state test pending |
+| ath11k_wmi_pdev_attach | cmd::Wmi::pdev_attach | encoded | lifecycle state test pending |
+| ath11k_wmi_connect | cmd::Wmi::connect | encoded | lifecycle state test pending |
+| ath11k_wmi_wait_for_service_ready | cmd::Wmi::wait_for_service_ready | encoded | event lifecycle fixtures |
+| ath11k_wmi_wait_for_unified_ready | cmd::Wmi::wait_for_unified_ready | encoded | event lifecycle fixtures |
+| ath11k_wmi_detach | cmd::Wmi::detach | encoded | lifecycle state test pending |

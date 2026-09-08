@@ -1,7 +1,0 @@
-[package]
-name = "replace_with"
-workspace = "../../connectivity/network/netstack3"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-
