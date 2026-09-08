@@ -5,7 +5,22 @@ oracle-checked, or hardware-checked.
 
 | C file:symbol | Rust item | status | oracle artifact |
 |---|---|---|---|
-| — | — | stub | — |
+| `hal_desc.h:ath11k_buffer_addr` / `hal_wbm_buffer_ring` | `descriptors::RxdmaBufferRing` | oracle-checked | `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked` |
+| `hal_desc.h:rx_mpdu_desc` | `descriptors::RxMpduDescriptor` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
+| `hal_desc.h:rx_msdu_desc` | `descriptors::RxMsduDescriptor` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
+| `hal_desc.h:hal_tcl_data_cmd` | `descriptors::TclDataCommand` | oracle-checked | `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked` |
+| `hal_desc.h:hal_reo_entrance_ring` | `descriptors::ReoEntranceRing` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
+| `hal_desc.h:hal_reo_dest_ring` | `descriptors::ReoDestinationRing` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
+| `hal_desc.h:hal_wbm_release_ring` | `descriptors::WbmReleaseRing` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
+| `hal_desc.h:hal_ce_srng_src_desc` | `descriptors::CeSourceDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
+| `hal_desc.h:hal_ce_srng_dest_desc` | `descriptors::CeDestinationDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
+| `hal_desc.h:hal_ce_srng_dst_status_desc` | `descriptors::CeDestinationStatusDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
+| `hal_desc.h:hal_tlv_hdr` | `descriptors::RxMonitorTlvHeader` | oracle-checked | `tests/descriptors.rs::monitor_tlv_header_uses_linux_bit_positions` |
+| `hal_rx.h:hal_rx_ppdu_start` | `descriptors::RxPpduStart` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
+| `hal_rx.h:hal_rx_mpdu_info_ipq8074` | `descriptors::RxMpduInfoWcn6750` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle`; selected by `hw.c:wcn6750_ops.mpdu_info_get_peerid` |
+| `hal_rx.h:hal_rx_ppdu_end_duration` | `descriptors::RxPpduEndDuration` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
+| `hal_rx.h:hal_rx_ppdu_end_user_stats` | `descriptors::RxPpduEndUserStats` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
+| `hal_rx.h:hal_rx_ppdu_end_user_stats_ext` | `descriptors::RxPpduEndUserStatsExt` | oracle-checked | exact-length parser; the oracle declares no field masks |
 | hal.c:`hw_srng_config_template` | `srng::config`, `RingType`, `Wcn6750Registers` | oracle-checked | source-derived table/unit tests |
 | hw.c:`wcn6750_regs` | `Wcn6750Registers`, `srng::config` register bases/strides | oracle-checked | `wcn6750_table_matches_source` |
 | hal.c:`ath11k_hal_srng_get_ring_id` | `Wcn6750Registers::ring_id` | oracle-checked | `wcn6750_table_matches_source` |
