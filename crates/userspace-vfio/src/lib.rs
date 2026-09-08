@@ -901,6 +901,21 @@ impl AnonymousMapping {
         };
         Ok(())
     }
+    pub fn read_u32(&self, offset: usize) -> Result<u32, String> {
+        checked_memory_range(offset, 4, self.len)?;
+        if !offset.is_multiple_of(4) {
+            return Err("unaligned DMA word".into());
+        }
+        Ok(unsafe { std::ptr::read_volatile(self.ptr.as_ptr().add(offset).cast::<u32>()) })
+    }
+    pub fn write_u32(&mut self, offset: usize, value: u32) -> Result<(), String> {
+        checked_memory_range(offset, 4, self.len)?;
+        if !offset.is_multiple_of(4) {
+            return Err("unaligned DMA word".into());
+        }
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(offset).cast::<u32>(), value) };
+        Ok(())
+    }
     pub fn teardown(&mut self) -> Result<(), String> {
         if self.mapped && unsafe { munmap(self.ptr.as_ptr(), self.len) } != 0 {
             return Err(format!(
@@ -970,6 +985,21 @@ impl DeviceMapping {
                 bytes.len(),
             )
         };
+        Ok(())
+    }
+    pub fn read_u32(&self, offset: usize) -> Result<u32, String> {
+        checked_memory_range(offset, 4, self.len)?;
+        if !offset.is_multiple_of(4) {
+            return Err("unaligned DMA word".into());
+        }
+        Ok(unsafe { std::ptr::read_volatile(self.ptr.as_ptr().add(offset).cast::<u32>()) })
+    }
+    pub fn write_u32(&mut self, offset: usize, value: u32) -> Result<(), String> {
+        checked_memory_range(offset, 4, self.len)?;
+        if !offset.is_multiple_of(4) {
+            return Err("unaligned DMA word".into());
+        }
+        unsafe { std::ptr::write_volatile(self.ptr.as_ptr().add(offset).cast::<u32>(), value) };
         Ok(())
     }
     pub fn teardown(&mut self) -> Result<(), String> {

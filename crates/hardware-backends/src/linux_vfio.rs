@@ -563,6 +563,24 @@ impl Backend for LinuxVfio {
         .map_err(|_| Error::OutOfBounds)
     }
 
+    fn dma_read_once_u32(&mut self, dma: &u64, offset: usize) -> Result<u32> {
+        match &self.dma(dma)?.memory {
+            DmaMemory::Ioas(memory) => memory.read_u32(offset),
+            DmaMemory::BrokerCoherent(memory) => memory.read_u32(offset),
+            DmaMemory::BrokerStreaming(memory) => memory.read_u32(offset),
+        }
+        .map_err(|_| Error::OutOfBounds)
+    }
+
+    fn dma_write_once_u32(&mut self, dma: &u64, offset: usize, value: u32) -> Result<()> {
+        match &mut self.dma_mut(dma)?.memory {
+            DmaMemory::Ioas(memory) => memory.write_u32(offset, value),
+            DmaMemory::BrokerCoherent(memory) => memory.write_u32(offset, value),
+            DmaMemory::BrokerStreaming(memory) => memory.write_u32(offset, value),
+        }
+        .map_err(|_| Error::OutOfBounds)
+    }
+
     fn sync_for_cpu(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let dma = self.dma(dma)?;
         if dma.direction == DmaDirection::ToDevice {

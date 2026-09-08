@@ -465,6 +465,9 @@ dependencies = [
 [[package]]
 name = "drv-hardware"
 version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
 
 [[package]]
 name = "drv-hardware-backends"

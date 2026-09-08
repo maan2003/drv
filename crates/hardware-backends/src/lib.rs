@@ -305,6 +305,16 @@ impl Backend for DeterministicBackend {
         d.bytes[r].copy_from_slice(bytes);
         Ok(())
     }
+    fn dma_read_once_u32(&mut self, dma: &u64, offset: usize) -> Result<u32> {
+        let bytes: [u8; 4] = self.dma(dma)?.bytes[offset..offset + 4]
+            .try_into()
+            .map_err(|_| Error::OutOfBounds)?;
+        Ok(u32::from_ne_bytes(bytes))
+    }
+    fn dma_write_once_u32(&mut self, dma: &u64, offset: usize, value: u32) -> Result<()> {
+        self.dma_mut(dma)?.bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        Ok(())
+    }
     fn sync_for_cpu(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let d = self.dma(dma)?;
         if d.coherent || matches!(d.direction, DmaDirection::ToDevice) {
@@ -587,6 +597,29 @@ mod tests {
             .alloc_coherent::<drv_hardware::Bidirectional>(64, 16)
             .unwrap();
         assert!(matches!(unaligned.split_at(8), Err(Error::Invalid)));
+    }
+
+    #[test]
+    fn typed_and_once_dma_accesses_check_alignment_and_preserve_values() {
+        let device = DeterministicBackend::device();
+        let mut coherent = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        coherent.write_pod(4, 0x1122_3344_u32).unwrap();
+        assert_eq!(coherent.read_pod::<u32>(4).unwrap(), 0x1122_3344);
+        coherent.write_once(8, 0xaabb_ccdd_u32).unwrap();
+        assert_eq!(coherent.read_once::<u32>(8).unwrap(), 0xaabb_ccdd);
+        assert_eq!(coherent.read_pod::<u32>(2), Err(Error::Invalid));
+        assert_eq!(coherent.write_once(14, 1_u32), Err(Error::Invalid));
+
+        let mut streaming = device
+            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        streaming.write_pod(0, 0x1234_5678_u32).unwrap();
+        assert_eq!(streaming.read_pod::<u32>(0).unwrap(), 0x1234_5678);
+        streaming.sync_for_device(0, 4).unwrap();
+        streaming.write_once(4, 0x8765_4321_u32).unwrap();
+        assert_eq!(streaming.read_once::<u32>(4).unwrap(), 0x8765_4321);
     }
 
     #[test]
