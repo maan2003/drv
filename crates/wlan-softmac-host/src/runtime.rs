@@ -33,6 +33,9 @@ struct StartedDevice<D> {
 
 struct HostIo {
     ethernet: DriverEthernetPort,
+    pending_ethernet_devices: VecDeque<HostEthernetDevice>,
+    ethernet_mac_address: [u8; 6],
+    ethernet_queue_capacity: usize,
     minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
@@ -216,16 +219,39 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         self.device.lock().unwrap().device.queue_tx(&buffer, flags)
     }
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .set_link_up(status == LinkStatus::UP)?;
-        self.io
-            .lock()
-            .unwrap()
-            .ethernet
-            .set_link(status == LinkStatus::UP);
+        if status != LinkStatus::UP {
+            let mut io = self.io.lock().unwrap();
+            io.pending_ethernet_devices.clear();
+            io.ethernet.set_link(false);
+            drop(io);
+            return self.device.lock().unwrap().device.set_link_up(false);
+        }
+
+        let replacement = {
+            let mut io = self.io.lock().unwrap();
+            if io.ethernet.is_closed() {
+                io.pending_ethernet_devices.clear();
+                let (host, driver) =
+                    ethernet_port(io.ethernet_mac_address, io.ethernet_queue_capacity)
+                        .map_err(|_| zx::Status::NO_RESOURCES)?;
+                io.ethernet = driver;
+                Some(host)
+            } else {
+                None
+            }
+        };
+        if let Err(status) = self.device.lock().unwrap().device.set_link_up(true) {
+            let mut io = self.io.lock().unwrap();
+            io.pending_ethernet_devices.clear();
+            io.ethernet.teardown();
+            return Err(status);
+        }
+        let mut io = self.io.lock().unwrap();
+        io.ethernet.set_link(true);
+        if let Some(host) = replacement {
+            io.pending_ethernet_devices.clear();
+            io.pending_ethernet_devices.push_back(host);
+        }
         Ok(())
     }
     async fn set_channel(
@@ -373,7 +399,6 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     device: Arc<Mutex<StartedDevice<D>>>,
     upcalls: Arc<Mutex<UpcallQueue>>,
     io: Arc<Mutex<HostIo>>,
-    ethernet_device: Option<HostEthernetDevice>,
     sme: wlan_sme::client::ClientSme,
     mlme: wlan_mlme::client::ClientMlme<HostMlmeDevice<D>>,
     requests: wlan_sme::MlmeStream,
@@ -427,6 +452,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            pending_ethernet_devices: VecDeque::from([ethernet_device]),
+            ethernet_mac_address: device_info.sta_addr,
+            ethernet_queue_capacity,
             minstrel: None,
         }));
         let mut mlme_device = HostMlmeDevice::new(device.clone(), io.clone());
@@ -468,7 +496,6 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             device,
             upcalls,
             io,
-            ethernet_device: Some(ethernet_device),
             sme,
             mlme,
             requests,
@@ -484,11 +511,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         &self.sme
     }
 
-    /// Transfers the host side of the Ethernet seam to the network service.
-    /// The runtime retains the driver endpoint used by MLME and associated
-    /// data pumping.
+    /// Transfers the next Ethernet generation to the network service.
+    /// Link-down revokes the transferred descriptor with HUP; a later link-up
+    /// publishes a fresh descriptor while the runtime retains its driver peer.
     pub fn take_ethernet_device(&mut self) -> Option<HostEthernetDevice> {
-        self.ethernet_device.take()
+        self.io.lock().unwrap().pending_ethernet_devices.pop_front()
     }
 
     /// Revoke callbacks and queues before tearing down Ethernet and stopping
@@ -861,6 +888,7 @@ mod tests {
         pending_rx: VecDeque<Vec<u8>>,
         retry_cleanup: bool,
         stale_callback_during_cleanup: bool,
+        link_failure: bool,
     }
 
     #[derive(Clone)]
@@ -906,7 +934,11 @@ mod tests {
             Ok(true)
         }
         fn set_link_up(&mut self, _: bool) -> Result<(), zx::Status> {
-            Ok(())
+            if self.0.lock().unwrap().link_failure {
+                Err(zx::Status::IO)
+            } else {
+                Ok(())
+            }
         }
         fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
             let mut effects = self.0.lock().unwrap();
@@ -1074,6 +1106,9 @@ mod tests {
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            pending_ethernet_devices: VecDeque::new(),
+            ethernet_mac_address: [2, 0, 0, 0, 0, 1],
+            ethernet_queue_capacity: 4,
             minstrel: None,
         }));
         (HostMlmeDevice::new(device, io), effects)
@@ -1499,6 +1534,52 @@ mod tests {
         assert!(!sme_is_retry_quiescent(
             &wlan_sme::client::ClientSmeStatus::Roaming([1; 6].into())
         ));
+    }
+
+    #[test]
+    fn link_up_after_hup_publishes_a_fresh_ethernet_generation() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        let capacity = 3;
+        let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
+        let (fake, effects) = Fake::new(0);
+        let device = Arc::new(Mutex::new(StartedDevice {
+            device: fake,
+            stop_pending: false,
+        }));
+        let io = Arc::new(Mutex::new(HostIo {
+            ethernet,
+            pending_ethernet_devices: VecDeque::new(),
+            ethernet_mac_address: mac,
+            ethernet_queue_capacity: capacity,
+            minstrel: None,
+        }));
+        let mut host_device = HostMlmeDevice::new(device, io.clone());
+
+        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
+        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::DOWN)).unwrap();
+        assert!(io.lock().unwrap().ethernet.is_closed());
+        assert_eq!(old_host.properties().unwrap().mac_address, mac);
+
+        effects.lock().unwrap().link_failure = true;
+        assert_eq!(
+            futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)),
+            Err(zx::Status::IO)
+        );
+        assert!(io.lock().unwrap().ethernet.is_closed());
+        assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
+
+        effects.lock().unwrap().link_failure = false;
+        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
+        let mut state = io.lock().unwrap();
+        assert!(!state.ethernet.is_closed());
+        assert_eq!(state.pending_ethernet_devices.len(), 1);
+        assert_eq!(old_host.properties(), None);
+        let replacement = state.pending_ethernet_devices.pop_front().unwrap();
+        assert_eq!(replacement.properties().unwrap().mac_address, mac);
+        drop(state);
+
+        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
+        assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
     }
 
     #[test]

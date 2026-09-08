@@ -356,6 +356,10 @@ impl<D: wlan_mlme::device::DeviceOps> AssociatedSoftmacTx for wlan_mlme::client:
 }
 
 impl DriverEthernetPort {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.seam.fd.is_none()
+    }
+
     pub fn deliver(&mut self, bytes: &[u8]) -> Result<(), EthernetIngressError> {
         let frame =
             EthernetFrame::copy_from_slice(bytes).map_err(EthernetIngressError::InvalidFrame)?;
@@ -404,18 +408,22 @@ impl DriverEthernetPort {
 
     pub fn set_link(&mut self, up: bool) {
         let mut state = self.lifecycle.lock().unwrap();
-        if state.properties.is_some() && state.link_up != up {
-            state.link_up = up;
-            if !up {
-                self.seam.discard_frames();
-                self.seam.close();
-                state.events.retain(|event| {
-                    !matches!(
-                        event,
-                        EthernetDeviceEvent::ReceiveReady | EthernetDeviceEvent::TransmitReady
-                    )
-                });
-            }
+        if state.properties.is_none() {
+            return;
+        }
+        let changed = state.link_up != up;
+        state.link_up = up;
+        if !up {
+            self.seam.discard_frames();
+            self.seam.close();
+            state.events.retain(|event| {
+                !matches!(
+                    event,
+                    EthernetDeviceEvent::ReceiveReady | EthernetDeviceEvent::TransmitReady
+                )
+            });
+        }
+        if changed {
             push_event(&mut state.events, EthernetDeviceEvent::LinkStateChanged(up));
         }
     }
@@ -554,6 +562,14 @@ mod tests {
         assert_eq!(device.take_event(), None);
         assert_eq!(device.receive(), None);
         assert_eq!(sink.take_transmit(), Err(EthernetIngressError::LinkDown));
+    }
+
+    #[test]
+    fn link_down_revokes_an_already_down_generation() {
+        let (_, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        assert!(!sink.is_closed());
+        sink.set_link(false);
+        assert!(sink.is_closed());
     }
 
     #[test]
