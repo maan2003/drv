@@ -383,6 +383,68 @@ void oracle_hal_wbm_release(u8 out[32], u64 address, u32 cookie, u8 manager,
     memcpy(out, &d, sizeof(d));
 }
 
+int oracle_hal_wbm_parse_err(const u8 input[32], u32 out[7]) {
+    struct wbm_release d;
+    memcpy(&d, input, sizeof(d));
+    u32 type = GET(0x1c0, d.info0);
+    u32 source = GET(0x7, d.info0);
+    u32 manager = GET(RBM, d.addr.info1);
+    if (type != 0 || (source != 1 && source != 2) ||
+        (manager != 4 && manager != 6))
+        return -22;
+    out[0] = GET(COOKIE, d.addr.info1);
+    out[1] = source;
+    out[2] = source == 2 ? GET(0x03000000, d.info0) : GET(0x60000, d.info0);
+    out[3] = source == 2 ? GET(0x7c000000, d.info0) : GET(0xf80000, d.info0);
+    out[4] = GET(0x200, d.info2);
+    out[5] = GET(0x400, d.info2);
+    out[6] = manager;
+    return 0;
+}
+
+void oracle_hal_reo_destination_fields(const u8 input[64], u64 out[34]) {
+    u32 w[16];
+    memcpy(w, input, sizeof(w));
+    out[0] = (u64)w[0] | ((u64)GET(0xff, w[1]) << 32);
+    out[1] = GET(COOKIE, w[1]); out[2] = GET(RBM, w[1]);
+    out[3] = GET(0xff, w[2]); out[4] = GET(0x000fff00, w[2]);
+    out[5] = GET(1u << 20, w[2]); out[6] = GET(1u << 21, w[2]);
+    out[7] = GET(1u << 22, w[2]); out[8] = GET(1u << 23, w[2]);
+    out[9] = GET(1u << 24, w[2]); out[10] = GET(1u << 25, w[2]);
+    out[11] = GET(1u << 27, w[2]); out[12] = GET(1u << 30, w[2]);
+    out[13] = GET(0xffff, w[3]);
+    out[14] = GET(1, w[4]); out[15] = GET(2, w[4]); out[16] = GET(4, w[4]);
+    out[17] = GET(0x0001fff8, w[4]); out[18] = GET(0x003e0000, w[4]);
+    out[19] = GET(1u << 22, w[4]); out[20] = GET(1u << 23, w[4]);
+    out[21] = GET(1u << 25, w[4]); out[22] = 0;
+    out[23] = (u64)w[6] | ((u64)GET(0xff, w[7]) << 32);
+    out[24] = GET(0x100, w[7]); out[25] = GET(0x600, w[7]);
+    out[26] = GET(0xf800, w[7]); out[27] = GET(0xffff0000, w[7]);
+    out[28] = GET(1, w[8]); out[29] = GET(0x1e, w[8]);
+    out[30] = GET(0x1fe0, w[8]); out[31] = GET(0x0ff00000, w[15]);
+    out[32] = GET(0xf0000000, w[15]); out[33] = 0;
+}
+
+u8 oracle_hal_rx_msdu_list(const u8 input[128], u32 flags[6], u16 length[6],
+                           u32 cookie[6], u8 manager[6]) {
+    for (u8 i = 0; i < 6; i++) {
+        const u8 *slot = input + 32 + i * 16;
+        u32 address = get_u32(slot);
+        if (address == 0) {
+            if (i) flags[i - 1] |= 2;
+            return i;
+        }
+        u32 value = get_u32(slot + 8);
+        if (!i) value |= 1;
+        else if (i == 5) value |= 2;
+        flags[i] = value;
+        length[i] = GET(0x0001fff8, value);
+        cookie[i] = GET(COOKIE, get_u32(slot + 4));
+        manager[i] = GET(RBM, get_u32(slot + 4));
+    }
+    return 6;
+}
+
 void oracle_hal_wbm_msdu_link(u8 out[32], const u8 source[32], u8 action) {
     struct wbm_release d = {0}, s;
     memcpy(&s, source, sizeof(s));

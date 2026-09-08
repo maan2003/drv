@@ -121,6 +121,15 @@ unsafe extern "C" {
         ring: u8,
         looping: u8,
     );
+    fn oracle_hal_wbm_parse_err(input: *const u8, out: *mut u32) -> i32;
+    fn oracle_hal_reo_destination_fields(input: *const u8, out: *mut u64);
+    fn oracle_hal_rx_msdu_list(
+        input: *const u8,
+        flags: *mut u32,
+        length: *mut u16,
+        cookie: *mut u32,
+        manager: *mut u8,
+    ) -> u8;
     fn oracle_hal_wbm_msdu_link(out: *mut u8, source: *const u8, action: u8);
     fn oracle_hal_fragment_link_return(out: *mut u8, source: *const u8, action: u8);
     fn oracle_hal_fragment_reo_entrance(
@@ -732,6 +741,96 @@ proptest! {
         };
         let rust_linked = WbmReleaseRing::for_msdu_link(&rust, typed_action);
         prop_assert_eq!(rust_linked.as_bytes(), &linked);
+    }
+
+    #[test]
+    fn reo_destination_fields_match_pinned_c_on_arbitrary_bytes(
+        bytes in any::<[u8; 64]>(),
+    ) {
+        let descriptor = ReoDestinationRing::from_bytes(&bytes).unwrap();
+        let address = descriptor.buffer_address().info();
+        let mpdu = descriptor.mpdu();
+        let msdu = descriptor.msdu();
+        let rust = [
+            address.address, u64::from(address.cookie), u64::from(address.return_buffer_manager),
+            u64::from(mpdu.msdu_count()), u64::from(mpdu.sequence_number()),
+            u64::from(mpdu.fragment()), u64::from(mpdu.retry()), u64::from(mpdu.ampdu()),
+            u64::from(mpdu.bar_frame()), u64::from(mpdu.pn_valid()),
+            u64::from(mpdu.source_address_valid()), u64::from(mpdu.destination_address_valid()),
+            u64::from(mpdu.raw_mpdu()), u64::from(mpdu.peer_id()),
+            u64::from(msdu.first_in_mpdu()), u64::from(msdu.last_in_mpdu()),
+            u64::from(msdu.continuation()), u64::from(msdu.length()),
+            u64::from(msdu.reo_destination()), u64::from(msdu.drop()),
+            u64::from(msdu.source_address_valid()), u64::from(msdu.destination_address_valid()),
+            0, descriptor.queue_address(), u64::from(descriptor.buffer_type()),
+            u64::from(descriptor.push_reason()), u64::from(descriptor.error_code()),
+            u64::from(descriptor.rx_queue_number()), u64::from(descriptor.reorder_info_valid()),
+            u64::from(descriptor.reorder_opcode()), u64::from(descriptor.reorder_slot()),
+            u64::from(descriptor.ring_id()), u64::from(descriptor.looping_count()), 0,
+        ];
+        let mut c = [0; 34];
+        // SAFETY: exact descriptor input and exact output array.
+        unsafe { oracle_hal_reo_destination_fields(bytes.as_ptr(), c.as_mut_ptr()) };
+        prop_assert_eq!(rust, c);
+    }
+
+    #[test]
+    fn wbm_rx_error_parse_matches_pinned_c_on_arbitrary_bytes(
+        mut bytes in any::<[u8; 32]>(), valid_shape in any::<bool>(),
+    ) {
+        if valid_shape {
+            let mut address_info = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            address_info = (address_info & !(7 << 8)) | (4 + 2 * u32::from(bytes[0] & 1)) << 8;
+            bytes[4..8].copy_from_slice(&address_info.to_le_bytes());
+            let mut info0 = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            info0 = (info0 & !0x1c7) | (1 + u32::from(bytes[1] & 1));
+            bytes[8..12].copy_from_slice(&info0.to_le_bytes());
+        }
+        let descriptor = WbmReleaseRing::from_bytes(&bytes).unwrap();
+        let address = descriptor.buffer_address().info();
+        let valid = descriptor.descriptor_type() == 0
+            && matches!(descriptor.release_source(), 1 | 2)
+            && matches!(address.return_buffer_manager, 4 | 6);
+        let mut c = [0; 7];
+        // SAFETY: exact descriptor input and seven-element result array.
+        let result = unsafe { oracle_hal_wbm_parse_err(bytes.as_ptr(), c.as_mut_ptr()) };
+        prop_assert_eq!(result == 0, valid);
+        if valid {
+            let source = descriptor.release_source();
+            let rust = [
+                address.cookie, u32::from(source),
+                u32::from(if source == 2 { descriptor.reo_push_reason() }
+                    else { descriptor.rxdma_push_reason() }),
+                u32::from(if source == 2 { descriptor.reo_error_code() }
+                    else { descriptor.rxdma_error_code() }),
+                u32::from(descriptor.first_msdu()), u32::from(descriptor.last_msdu()),
+                u32::from(address.return_buffer_manager),
+            ];
+            prop_assert_eq!(rust, c);
+        }
+    }
+
+    #[test]
+    fn rx_msdu_list_matches_pinned_c_on_arbitrary_bytes(bytes in any::<[u8; 128]>()) {
+        let descriptor = RxMsduLink::from_bytes(&bytes).unwrap();
+        let mut c_flags = [0; 6];
+        let mut c_length = [0; 6];
+        let mut c_cookie = [0; 6];
+        let mut c_manager = [0; 6];
+        // SAFETY: exact descriptor input and six-element output arrays.
+        let count = unsafe { oracle_hal_rx_msdu_list(bytes.as_ptr(), c_flags.as_mut_ptr(),
+            c_length.as_mut_ptr(), c_cookie.as_mut_ptr(), c_manager.as_mut_ptr()) };
+        for index in 0..usize::from(count) {
+            let details = descriptor.msdu(index).unwrap();
+            let address = details.buffer_address().info();
+            let msdu = details.msdu();
+            let mut flags = u32::from_le_bytes(msdu.as_bytes()[..4].try_into().unwrap());
+            if index == 0 { flags |= 1; }
+            if index + 1 == usize::from(count) { flags |= 2; }
+            prop_assert_eq!((flags, msdu.length(), address.cookie,
+                address.return_buffer_manager),
+                (c_flags[index], c_length[index], c_cookie[index], c_manager[index]));
+        }
     }
 
     #[test]
