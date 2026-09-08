@@ -272,6 +272,10 @@ unsafe extern "C" {
     fn oracle_qcn9074_rx_decode(bytes: *const u8, len: usize, out: *mut CQcnRx) -> c_int;
     #[cfg(test)]
     fn oracle_reo_msdu_continuation(bytes: *const u8, len: usize) -> c_int;
+    #[cfg(test)]
+    fn oracle_undecap_nwifi(bytes: *const u8, len: usize, first_header: *const u8,
+        first_header_len: usize, first_msdu: u8, tid: u8, mesh: u8, encryption_type: u8,
+        decrypted: u8, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_ind_register_encode(input: *const CIndicationRegister, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_respond_memory_encode(input: *const CRespondMemory, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_bdf_download_encode(input: *const CBdfDownload, out: *mut u8, capacity: usize) -> c_int;
@@ -810,6 +814,7 @@ mod tests {
         SrngRingType, SrngSetup, TxCompletion, version_request};
     use ath11k_dp::{HttTargetMessage, PeerId};
     use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
+    use ath11k_dp::tx::normalize_native_wifi_frame;
     use ath11k_hal::descriptors::ReoDestinationRing;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1306,6 +1311,41 @@ mod tests {
         assert_event(WmiEventKind::WlanFrequencyAvoid, &bytes, fields, trace);
     }
 
+    #[test]
+    fn native_wifi_non_first_unstripped_crypto_matches_skb_push_layout() {
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        frame.extend(0xa0_u8..=0xa7);
+        frame.extend([0xde, 0xad]);
+        let header_status = [0; 120];
+        let mut descriptor = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
+        descriptor[168..172].copy_from_slice(&((6_u32 << 2) | (5 << 15)).to_le_bytes());
+        descriptor[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+        let status = Wcn6750RxDescriptor::parse(&descriptor).unwrap().status();
+
+        let mut expected = vec![0; 24];
+        expected[..2].copy_from_slice(&0x0088_u16.to_le_bytes());
+        expected.extend([5, 0]);
+        expected.extend(0xa0_u8..=0xa7);
+        expected.extend(0xa0_u8..=0xa7);
+        expected.extend([0xde, 0xad]);
+        assert_eq!(expected.len(), 44);
+
+        let mut c = vec![0; 64];
+        // SAFETY: all inputs are readable for their lengths and `c` is writable
+        // for its advertised capacity.
+        let c_len = unsafe { oracle_undecap_nwifi(frame.as_ptr(), frame.len(),
+            header_status.as_ptr(), header_status.len(), 0, 5, 0, 6, 0,
+            c.as_mut_ptr(), c.len()) };
+        assert_eq!(c_len, 44);
+        c.truncate(c_len as usize);
+        assert_eq!(c, expected);
+        assert_eq!(
+            normalize_native_wifi_frame(frame, &header_status, status, false).unwrap(),
+            expected,
+        );
+    }
+
     proptest! {
         #[test]
         fn htt_host_messages_match_c(pdev_id: u8, ring in 0_u8..8, kind in 0_u8..3,
@@ -1413,6 +1453,54 @@ mod tests {
             // SAFETY: `bytes` is an exact REO destination descriptor.
             let c = unsafe { oracle_reo_msdu_continuation(bytes.as_ptr(), bytes.len()) };
             prop_assert_eq!(rust, c != 0);
+        }
+
+        #[test]
+        fn native_wifi_undecap_matches_c(first_msdu: bool, direction in 0_u16..4,
+            original_direction in 0_u16..4, order: bool, protected: bool,
+            tid in 0_u8..16, mesh: bool, encryption_type in 0_u8..12,
+            decrypted: bool, native_seed: [u8; 30], header_seed: [u8; 44],
+            payload in vec(any::<u8>(), 0..=64)) {
+            let native_fc = 0x0008 | (direction << 8)
+                | if protected { 0x4000 } else { 0 };
+            let native_len = if direction == 3 { 30 } else { 24 };
+            let mut frame = native_seed[..native_len].to_vec();
+            frame[..2].copy_from_slice(&native_fc.to_le_bytes());
+            let crypto = usize::from(!decrypted
+                && matches!(encryption_type, 2 | 4 | 6 | 8 | 9 | 10)) * 8;
+            if !first_msdu {
+                frame.extend_from_slice(&header_seed[..crypto]);
+            }
+            frame.extend_from_slice(&payload);
+
+            let original_fc = 0x0088 | (original_direction << 8)
+                | if order { 0x8000 } else { 0 }
+                | if protected { 0x4000 } else { 0 };
+            let original_len = if original_direction == 3 { 32 } else { 26 }
+                + if order { 4 } else { 0 };
+            let mut header_status = vec![0; 120];
+            header_status[..header_seed.len()].copy_from_slice(&header_seed);
+            header_status[..2].copy_from_slice(&original_fc.to_le_bytes());
+
+            let mut descriptor = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
+            descriptor[46..48].copy_from_slice(&(u16::from(first_msdu) << 12).to_le_bytes());
+            descriptor[100..104].copy_from_slice(&(u32::from(mesh) << 22).to_le_bytes());
+            descriptor[168..172].copy_from_slice(&((u32::from(encryption_type) << 2)
+                | (u32::from(tid) << 15)).to_le_bytes());
+            descriptor[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+            let status = Wcn6750RxDescriptor::parse(&descriptor).unwrap().status();
+            let rust = normalize_native_wifi_frame(
+                frame.clone(), &header_status, status, decrypted).unwrap();
+
+            let mut c = vec![0; 256];
+            // SAFETY: all inputs are readable for their lengths and `c` is writable
+            // for its advertised capacity.
+            let c_len = unsafe { oracle_undecap_nwifi(frame.as_ptr(), frame.len(),
+                header_status.as_ptr(), original_len + 8, first_msdu.into(), tid,
+                mesh.into(), encryption_type, decrypted.into(), c.as_mut_ptr(), c.len()) };
+            prop_assert!(c_len >= 0);
+            c.truncate(c_len as usize);
+            prop_assert_eq!(rust, c);
         }
 
         #[test]
