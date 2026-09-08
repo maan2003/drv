@@ -171,6 +171,11 @@ u32 oracle_hal_reo_queue_descriptor(u8 out[512], u8 tid, u32 ba_window,
     return 512;
 }
 
+void oracle_hal_reo_init_cmd_ring(u8 *out, u16 entries, u16 entry_bytes) {
+    for (u32 entry = 0; entry < entries; entry++)
+        put_u32(out + entry * entry_bytes, 1, entry + 1);
+}
+
 void oracle_hal_rx_buffer(u8 out[8], u64 address, u32 cookie, u8 manager) {
     struct buffer_addr d;
     set_addr(&d, address, cookie, manager);

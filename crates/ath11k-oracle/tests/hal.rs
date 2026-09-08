@@ -1,10 +1,11 @@
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
     Descriptor, HalError, PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams,
-    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind,
+    ReoQueueDescriptor, ReoResources, ReoStatus, ReoStatusKind, RingMemory,
+    initialize_command_ring,
 };
 use ath11k_oracle as _;
-use ath11k_platform_backend::{FromDevice, ToDevice};
+use ath11k_platform_backend::{Bidirectional, FromDevice, ToDevice};
 use drv_hardware_backends::DeterministicBackend;
 use proptest::prelude::*;
 
@@ -145,6 +146,7 @@ unsafe extern "C" {
         start_sequence: u32,
         pn_type: u8,
     ) -> u32;
+    fn oracle_hal_reo_init_cmd_ring(out: *mut u8, entries: u16, entry_bytes: u16);
 }
 
 fn c_buffer(address: u64, cookie: u32, manager: u8) -> [u8; 8] {
@@ -313,6 +315,29 @@ proptest! {
             ba_window, start_sequence, pn_type) } as usize;
         prop_assert_eq!(rust.bytes().len(), c_length);
         prop_assert_eq!(rust.bytes(), &c[..c_length]);
+    }
+
+    #[test]
+    fn reo_command_ring_initialization_matches_pinned_c(
+        entries in 1u16..=102, initial in any::<u8>(),
+    ) {
+        const ENTRY_BYTES: u16 = 40;
+        let device = DeterministicBackend::device();
+        let byte_count = usize::from(entries) * usize::from(ENTRY_BYTES);
+        let mut memory = RingMemory {
+            dma: device.alloc_coherent::<Bidirectional>(byte_count, 8).unwrap(),
+            entries,
+            entry_bytes: ENTRY_BYTES,
+        };
+        let initial = vec![initial; byte_count];
+        memory.dma.write(0, &initial).unwrap();
+        initialize_command_ring(&mut memory).unwrap();
+        let mut rust = vec![0; byte_count];
+        memory.dma.read(0, &mut rust).unwrap();
+        let mut c = initial;
+        // SAFETY: output holds exactly entries * entry_bytes bytes.
+        unsafe { oracle_hal_reo_init_cmd_ring(c.as_mut_ptr(), entries, ENTRY_BYTES) };
+        prop_assert_eq!(rust, c);
     }
 
     #[test]
