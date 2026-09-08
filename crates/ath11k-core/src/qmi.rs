@@ -34,14 +34,16 @@ impl FirmwareAssets for Wcn6750FirmwareAssets {
 /// allocation-derived IOMMU addresses can be returned to firmware.
 pub struct HardwareMemoryProvider<B: Backend> {
     device: Device<B>,
+    device_bar_region: u8,
     firmware: Vec<CoherentDma<B, Bidirectional>>,
     device_bar: Option<MmioRegion<B>>,
 }
 
 impl<B: Backend> HardwareMemoryProvider<B> {
-    pub fn new(device: Device<B>) -> Self {
+    pub fn new(device: Device<B>, device_bar_region: u8) -> Self {
         Self {
             device,
+            device_bar_region,
             firmware: Vec::new(),
             device_bar: None,
         }
@@ -114,10 +116,10 @@ impl<B: Backend> MemoryProvider for HardwareMemoryProvider<B> {
     }
 
     fn map_device_bar(&mut self, _: u64, size: u32) -> Result<(), QmiError> {
-        let region = self.device.open_region(0).map_err(qmi_transport_error)?;
-        if region.len() < size as usize {
-            return Err(QmiError::Transport);
-        }
+        let region = self
+            .device
+            .open_region_sized(self.device_bar_region, size as usize)
+            .map_err(qmi_transport_error)?;
         self.device_bar = Some(region);
         Ok(())
     }
