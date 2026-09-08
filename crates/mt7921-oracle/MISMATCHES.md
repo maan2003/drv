@@ -9,16 +9,6 @@ All cases below use a complete 8-dword TXS record in a valid 40-byte
 `PKT_TYPE_TXS` envelope, an in-range MT7921 WCID, and a live matching status
 skb. They are not malformed-input tests.
 
-## PPDU status is reported by Rust but ignored by Linux
-
-For `MT_TXS_PPDU_FMT` (format 1), `mt7921_mac_add_txs` admits the record but
-`mt76_connac2_mac_add_txs_skb` returns before looking up or completing the
-skb. `parse_mt7921_tx_status` instead returns `Ok(Mt7921TxStatus)`.
-
-**Likely Rust port bug:** accepting this descriptor can turn a PPDU statistics
-record into a management-frame completion. Rust should restrict this
-completion seam to MPDU format 0.
-
 ## Reserved packet IDs are reported by Rust but ignored by Linux
 
 `mt7921_mac_add_txs` drops every TXS whose PID is below
