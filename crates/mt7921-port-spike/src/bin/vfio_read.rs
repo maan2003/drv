@@ -4,7 +4,7 @@
 
 #[cfg(feature = "fuchsia-passive")]
 use driver_runtime::{PublicationState, TranscriptEvent};
-use drv_hardware::{Backend, Device};
+use drv_hardware::{Backend, Bidirectional, CoherentDma, Device, DmaConstraints, ToDevice};
 use drv_hardware_backends::LinuxVfio;
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_common as fidl_common;
@@ -1984,6 +1984,167 @@ fn run_typed_fixed_read(vfio: &str, bdf: &str) -> Result<(), String> {
         status.rx_dma_enabled,
         status.rx_dma_busy,
     );
+    Ok(())
+}
+
+struct TypedDisabledFirmwareStage<'a, B: Backend> {
+    ring: &'a mut CoherentDma<B, Bidirectional>,
+    payload: &'a mut CoherentDma<B, ToDevice>,
+}
+
+impl<B: Backend> DisabledFirmwareStageTransport for TypedDisabledFirmwareStage<'_, B> {
+    type Error = String;
+
+    fn write_payload(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.payload
+            .write(0, bytes)
+            .map_err(|error| format!("write firmware payload: {error:?}"))
+    }
+
+    fn write_descriptor(&mut self, descriptor: DmaDescriptor) -> Result<(), Self::Error> {
+        self.ring
+            .write(0, &descriptor.to_le_bytes())
+            .map_err(|error| format!("write firmware descriptor: {error:?}"))
+    }
+
+    fn release_fence(&mut self) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release)
+    }
+
+    fn read_descriptor(&mut self) -> Result<DmaDescriptor, Self::Error> {
+        let mut bytes = [0; 16];
+        self.ring
+            .read(0, &mut bytes)
+            .map_err(|error| format!("read firmware descriptor: {error:?}"))?;
+        Ok(DmaDescriptor {
+            buf0: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            ctrl: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            buf1: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            info: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        })
+    }
+
+    fn reset_descriptor(&mut self) -> Result<(), Self::Error> {
+        self.write_descriptor(DmaDescriptor::reset())
+    }
+
+    fn zero_payload(&mut self, length: usize) -> Result<(), Self::Error> {
+        self.payload
+            .write(0, &vec![0; length])
+            .map_err(|error| format!("zero firmware payload: {error:?}"))
+    }
+}
+
+fn stage_disabled_firmware_on_device<B: Backend>(
+    device: &Device<B>,
+    chunk: &[u8],
+) -> Result<DmaDescriptor, String> {
+    let constraints = DmaConstraints {
+        alignment: PAGE,
+        max_device_address: u64::from(u32::MAX),
+        max_segment_size: PAGE,
+        max_segments: 1,
+    };
+    let stage = (|| {
+        // TX descriptors are bidirectional because hardware eventually writes
+        // completion state. Firmware payload is strictly device-readable.
+        let mut ring = device
+            .alloc_coherent_with_constraints::<Bidirectional>(PAGE, constraints)
+            .map_err(|error| format!("allocate firmware descriptor ring: {error:?}"))?;
+        let mut payload = device
+            .alloc_coherent_with_constraints::<ToDevice>(PAGE, constraints)
+            .map_err(|error| format!("allocate firmware payload: {error:?}"))?;
+        let payload_iova = payload
+            .device_address(0)
+            .map_err(|error| format!("resolve firmware payload address: {error:?}"))?
+            .bits();
+        let mut transport = TypedDisabledFirmwareStage {
+            ring: &mut ring,
+            payload: &mut payload,
+        };
+        stage_disabled_firmware_chunk(
+            &mut transport,
+            payload_iova,
+            chunk,
+            log_disabled_firmware_stage_event,
+        )
+        .map_err(|error| match error {
+            DisabledFirmwareStageError::InvalidPayload => "invalid firmware chunk".into(),
+            DisabledFirmwareStageError::InvalidIova => "invalid firmware payload IOVA".into(),
+            DisabledFirmwareStageError::Descriptor(error) => {
+                format!("firmware descriptor: {error:?}")
+            }
+            DisabledFirmwareStageError::Transport(error) => error,
+            DisabledFirmwareStageError::DescriptorReadback { expected, actual } => {
+                format!("descriptor readback mismatch expected={expected:?} actual={actual:?}")
+            }
+            DisabledFirmwareStageError::Reset(error) => format!("reset staged memory: {error}"),
+        })
+    })();
+    // Both scoped DMA handles have been released. Reset is mandatory even if
+    // allocation, staging, readback, or secure cleanup failed.
+    let reset = device
+        .reset()
+        .map_err(|error| format!("reset typed VFIO device: {error:?}"));
+    let descriptor = stage?;
+    reset?;
+    Ok(descriptor)
+}
+
+fn validate_disabled_firmware_state(global: u32, interrupt_enable: u32) -> Result<(), String> {
+    if global & 0x5 != 0 || interrupt_enable != 0 {
+        return Err(format!(
+            "refused active WFDMA state global={global:#010x} interrupts={interrupt_enable:#010x}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_typed_disabled_firmware_state<B: Backend>(
+    device: &Device<B>,
+) -> Result<(u32, u32), String> {
+    let bar0 = device
+        .open_region(0)
+        .map_err(|error| format!("open BAR0: {error:?}"))?;
+    let wfdma = bar0
+        .slice(0xd4000, PAGE)
+        .map_err(|error| format!("slice WFDMA BAR page: {error:?}"))?;
+    let global = wfdma
+        .read_u32(ReadRegister::WfdmaGlobalConfig.bar_offset() - 0xd4000)
+        .map_err(|error| format!("read WFDMA global config: {error:?}"))?;
+    let interrupt_enable = wfdma
+        .read_u32(0x204)
+        .map_err(|error| format!("read WFDMA interrupt enable: {error:?}"))?;
+    validate_disabled_firmware_state(global, interrupt_enable)?;
+    Ok((global, interrupt_enable))
+}
+
+fn run_typed_disabled_firmware_stage(vfio: &str, bdf: &str) -> Result<(), String> {
+    let config = format!("/sys/bus/pci/devices/{bdf}/config");
+    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+        .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
+    let (backend, _pci, attached) = opened.into_parts();
+    if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
+        return Err(format!(
+            "attached PCI identity is {:04x}:{:04x}, expected 14c3:7961",
+            attached.vendor_id(),
+            attached.device_id()
+        ));
+    }
+    let device = Device::from_backend(backend);
+    let (global, interrupt_enable) = verify_typed_disabled_firmware_state(&device)?;
+    println!(
+        "{{\"fwdl_stage_event\":\"disabled_state_verified\",\"global_config\":\"{global:#010x}\",\"interrupt_enable\":\"{interrupt_enable:#010x}\"}}"
+    );
+    let patch_bytes = decompress_patch()?;
+    let patch = Patch::parse(&patch_bytes).map_err(|error| format!("patch format: {error:?}"))?;
+    let section = patch.sections().next().ok_or("patch has no section")?;
+    let chunk = section
+        .payload
+        .get(..MT7921_FWDL_CHUNK_BYTES)
+        .ok_or("patch section is smaller than one firmware chunk")?;
+    stage_disabled_firmware_on_device(&device, chunk)?;
+    println!("{{\"fwdl_stage_event\":\"arenas_unmapped_and_vfio_device_reset\"}}");
     Ok(())
 }
 
@@ -4781,6 +4942,9 @@ fn run() -> Result<(), String> {
     verify_pci_identity(&bdf)?;
     if operation == Operation::ReadFixed {
         return run_typed_fixed_read(&vfio, &bdf);
+    }
+    if operation == Operation::StageDisabledFirmwareDescriptor {
+        return run_typed_disabled_firmware_stage(&vfio, &bdf);
     }
     let watchdog = operation
         .is_active_mcu()
@@ -19013,6 +19177,45 @@ mod tests {
                 ReadRegister::ConnOnMisc.bar_offset(),
             ]
         );
+    }
+
+    #[test]
+    fn typed_disabled_firmware_stage_uses_32_bit_directional_dma_then_resets() {
+        let device = drv_hardware_backends::DeterministicBackend::device();
+        let generation = device.generation();
+        let descriptor = stage_disabled_firmware_on_device(&device, b"firmware").unwrap();
+        assert_eq!(descriptor.buf0, 0x1000_1000);
+        assert_eq!(descriptor.buf1, 0);
+        assert_eq!(device.generation(), generation + 1);
+    }
+
+    #[test]
+    fn typed_disabled_firmware_stage_resets_after_staging_error() {
+        let device = drv_hardware_backends::DeterministicBackend::device();
+        let generation = device.generation();
+        assert_eq!(
+            stage_disabled_firmware_on_device(&device, &[]),
+            Err("invalid firmware chunk".into())
+        );
+        assert_eq!(device.generation(), generation + 1);
+    }
+
+    #[test]
+    fn typed_disabled_firmware_precondition_reads_and_rejects_active_state() {
+        let (device, operations) = drv_hardware_backends::DeterministicBackend::recording_device();
+        assert_eq!(verify_typed_disabled_firmware_state(&device), Ok((0, 0)));
+        let offsets = operations
+            .borrow()
+            .iter()
+            .filter_map(|operation| match operation {
+                drv_hardware_backends::Operation::ReadU32 { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [0xd4208, 0xd4204]);
+        assert!(validate_disabled_firmware_state(0x1, 0).is_err());
+        assert!(validate_disabled_firmware_state(0x4, 0).is_err());
+        assert!(validate_disabled_firmware_state(0, 0x1).is_err());
     }
 
     #[cfg(feature = "fuchsia-passive")]
