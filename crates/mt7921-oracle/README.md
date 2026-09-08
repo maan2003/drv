@@ -1,5 +1,8 @@
 # MT7921 C equivalence oracle
 
+Confirmed valid-input differences are detailed in `MISMATCHES.md` and indexed
+with ownership and follow-up status in `GAPS.md`.
+
 This GPL-2.0-only crate compares valid typed inputs accepted by `mt76-core` and
 `mt7921-core` with the corresponding code extracted at build time from Linux
 tag `v7.1.5` (commit `155b42bec9cbb6b8cdc47dd9bd09503a81fbe493`).
