@@ -1147,6 +1147,15 @@ impl<I: HtcPacketIo> HtcRouter<I> {
         }
         Ok(routed)
     }
+
+    /// Recover the sole transport for deterministic HIF/CE teardown after all
+    /// endpoint handles have been dropped.
+    pub fn try_into_transport(self) -> Result<HtcTransport<I>, Self> {
+        match Rc::try_unwrap(self.core) {
+            Ok(core) => Ok(core.into_inner().transport),
+            Err(core) => Err(Self { core }),
+        }
+    }
 }
 
 /// Clonable service-specific endpoint handle. Multiple WMI and HTT wrappers
