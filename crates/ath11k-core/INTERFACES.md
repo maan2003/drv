@@ -49,8 +49,14 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
 - **HAL:** `RingKind`, `RingMemory`, `RingId`, checked `Descriptor`, and
   `Rings`. Descriptor construction rejects a wrong layout length.
 - **CE:** `ServiceId`, `TxFrame`/`RxFrame`, and `Transport`.
-- **QMI:** bounded `Request`, `Response`, `Transport`, `Handshake`, and
-  `FirmwareReady`.
+- **QMI:** `MessageId`-bearing bounded `Request`/`Response`, checked
+  `RawIndication`, and an event-driven `Transport` that starts/stops WLFW
+  service discovery and sends/receives responses plus unsolicited indications.
+  `Wcn6750Handshake` exposes `init_service`/`deinit_service`,
+  `process_next_event`, and `firmware_start`/`firmware_stop`; it returns typed
+  `DriverEvent`/`FirmwareReady` outcomes. Caller-supplied `MemoryProvider` and
+  `FirmwareAssets` traits perform DMA/MMIO and firmware acquisition without a
+  dependency from QMI onto HAL, platform, or core.
 - **WMI:** `CommandId`/`EventId`, word-aligned checked TLV envelopes,
   `CommandEncoder`, `EventDecoder`, and `Transport`.
 - **DP/HTT:** `HttHostMessage`/`HttTargetMessage`, `HttControl`,
