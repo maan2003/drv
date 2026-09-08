@@ -96,6 +96,7 @@ dependencies = [
  "ath11k-wmi",
  "dma-pool",
  "drv-hardware-backends",
+ "proptest",
 ]
 
 [[package]]

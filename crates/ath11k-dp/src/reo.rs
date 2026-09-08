@@ -441,6 +441,8 @@ mod tests {
     use ath11k_hal::{Descriptor, HalError, RingKind, RingMemory};
     use drv_hardware_backends::{DeterministicBackend, Operation};
 
+    mod stateful_tests;
+
     #[derive(Default)]
     struct ModelRings {
         published: Vec<(RingId, Descriptor)>,
