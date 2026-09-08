@@ -7099,9 +7099,7 @@ pub fn client_data_mpdu_to_ethernet(mpdu: &[u8]) -> Result<Vec<u8>, String> {
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .ok_or("client data MPDU omitted frame control")?;
     if fc & 0x000c != 0x0008 || fc & 0x0300 != 0x0100 || fc & 0x8000 != 0 {
-        return Err(
-            "client data header translation requires a To-DS data MPDU without HTC".into(),
-        );
+        return Err("client data header translation requires a To-DS data MPDU without HTC".into());
     }
     if fc & 0x0040 != 0 {
         return Err("client data header translation requires a non-null data subtype".into());
@@ -9392,7 +9390,10 @@ mod tests {
         let mut plain = mpdu.clone();
         plain[0] = 0x08;
         plain.drain(24..26);
-        assert_eq!(super::client_data_mpdu_to_ethernet(&plain).unwrap(), ethernet);
+        assert_eq!(
+            super::client_data_mpdu_to_ethernet(&plain).unwrap(),
+            ethernet
+        );
 
         // QoS-null, From-DS, HTC and raw LLC shapes are refused.
         let mut null = mpdu.clone();
@@ -9409,9 +9410,11 @@ mod tests {
         assert!(super::client_data_mpdu_to_ethernet(&llc).is_err());
 
         // The 802.3 TXD carries the TID and PROTECT_FRAME, no fixed rate.
-        let txwi = super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
-            .unwrap();
-        let dw = |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
+        let txwi =
+            super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
+                .unwrap();
+        let dw =
+            |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
         assert_eq!(dw(1), 0x8060_8007);
         assert_eq!(dw(2), 0x28);
         assert_eq!(dw(3) & 0x8000_0002, 0x2);
