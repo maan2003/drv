@@ -366,8 +366,8 @@ impl Mt7921ClientEffects for ProductionBackend {
     fn next_rx(
         &mut self,
         _: &mut dyn crate::client_device::Mt7921ClientIo,
-    ) -> Result<Option<ClientRxFrame>, zx::Status> {
-        Ok(None)
+    ) -> Result<crate::client_device::ClientRxPoll, zx::Status> {
+        Ok(crate::client_device::ClientRxPoll::Idle)
     }
     fn begin_passive_scan(
         &mut self,

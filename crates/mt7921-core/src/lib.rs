@@ -7951,7 +7951,10 @@ impl ClientFirmwareEffectsState {
             &mut self.ptk_rx_pn.as_mut().ok_or("unicast RX lacks PTK ACK")?[usize::from(rx.tid)]
         };
         if pn <= *retained {
-            return Err("client RX replayed PN".into());
+            return Err(format!(
+                "client RX replayed PN tid={} pn={} retained={} group={}",
+                rx.tid, pn, *retained, rx.group
+            ));
         }
         *retained = pn;
         Ok(())

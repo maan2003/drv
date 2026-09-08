@@ -2232,7 +2232,8 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
     fn next_rx(
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
-    ) -> Result<Option<ClientRxFrame>, zx::Status> {
+    ) -> Result<mt7921_softmac_adapter::client_device::ClientRxPoll, zx::Status> {
+        use mt7921_softmac_adapter::client_device::ClientRxPoll;
         let frame = loop {
             let frame = io.next_client_rx()?;
             let protected_disconnect = frame.as_ref().is_some_and(|frame| {
@@ -2252,7 +2253,7 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
         if frame.is_some() {
             self.order.lock().unwrap().push("rx");
         }
-        Ok(frame)
+        Ok(frame.map_or(ClientRxPoll::Idle, ClientRxPoll::Frame))
     }
     fn begin_passive_scan(&mut self, _: u64, _: &[ChannelNumber]) -> Result<(), zx::Status> {
         Ok(())
@@ -2418,7 +2419,7 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
                     pid,
                     acked: true,
                 }))
-                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                .map_err(|_| zx::Status::IO)?;
             self.outstanding
                 .observe(MgmtTxCompletion::Free(Mt7921TxFree {
                     wcid: Some(19),
@@ -2429,7 +2430,7 @@ impl SourceExactPassiveMechanics for SaeCommittedSelfTestMechanics {
                     pair_word: None,
                     info_word: 0,
                 }))
-                .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                .map_err(|_| zx::Status::IO)?;
             println!("self_test_management_tx completion=paired token={token} pid={pid}");
         }
         Ok(self.rx.pop_front())
@@ -14093,7 +14094,8 @@ impl Mt7921ClientEffects for LiveClientEffects {
     fn next_rx(
         &mut self,
         io: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
-    ) -> Result<Option<ClientRxFrame>, zx::Status> {
+    ) -> Result<mt7921_softmac_adapter::client_device::ClientRxPoll, zx::Status> {
+        use mt7921_softmac_adapter::client_device::ClientRxPoll;
         if self
             .join_roc_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -14101,7 +14103,11 @@ impl Mt7921ClientEffects for LiveClientEffects {
             self.abort_join_roc(io)?;
         }
         // Drain a successfully committed retained M1 before timers or hardware IO.
-        let frame = io.next_client_rx()?;
+        let frame = match io.next_client_rx() {
+            Ok(frame) => frame,
+            Err(zx::Status::IO_DATA_INTEGRITY) => return Ok(ClientRxPoll::IntegrityDrop),
+            Err(status) => return Err(status),
+        };
         let Some(mut frame) = frame else {
             if let Some((deadline, generation)) = self.eapol_start_deadline {
                 if self.firmware.association_generation != Some(generation)
@@ -14139,8 +14145,9 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     record_sae_stage("eapol_liveness type=start timer=expired one_shot=completed");
                 }
             }
-            return Ok(None);
+            return Ok(ClientRxPoll::Idle);
         };
+        let outcome = (|| -> Result<Option<ClientRxFrame>, zx::Status> {
         let control = frame
             .bytes
             .get(..2)
@@ -14234,17 +14241,23 @@ impl Mt7921ClientEffects for LiveClientEffects {
                         pn: security.pn.unwrap_or([0; 6]),
                     })
                 });
-                if !decrypted
-                    || admitted.is_none()
-                    || self
-                        .firmware
-                        .deliver_protected_management_rx(admitted.unwrap())
-                        .is_err()
-                {
+                if !decrypted {
                     record_sae_stage(&format!(
-                        "client_rx_filtered reason=protected_unverified subtype={subtype}"
+                        "client_rx_integrity_validation result=drop reason=protected_not_decrypted subtype={subtype}"
+                    ));
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
+                }
+                let Some(admitted) = admitted else {
+                    record_sae_stage(&format!(
+                        "client_rx_filtered reason=protected_stale_or_unassociated subtype={subtype}"
                     ));
                     return Ok(None);
+                };
+                if let Err(reason) = self.firmware.deliver_protected_management_rx(admitted) {
+                    record_sae_stage(&format!(
+                        "client_rx_integrity_validation result=drop reason={reason} subtype={subtype}"
+                    ));
+                    return Err(zx::Status::IO_DATA_INTEGRITY);
                 }
                 // Connac2 leaves the CCMP header and MIC in an otherwise
                 // decrypted management MPDU. Strip them only after the
@@ -14521,7 +14534,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
                 drop("security_generation_gate");
                 zx::Status::ACCESS_DENIED
             })?;
-            self.firmware
+            let validation = self.firmware
                 .deliver_rx(ClientRxCandidate {
                     generation,
                     eapol,
@@ -14536,11 +14549,14 @@ impl Mt7921ClientEffects for LiveClientEffects {
                     mic_error: security.mic_error,
                     fcs_error: security.fcs_error,
                     pn: security.pn.unwrap_or([0; 6]),
-                })
-                .map_err(|_| {
-                    drop("security_replay_or_integrity");
-                    zx::Status::IO_DATA_INTEGRITY
-                })?;
+                });
+            if let Err(reason) = validation {
+                drop("security_replay_or_integrity");
+                record_sae_stage(&format!(
+                    "client_rx_integrity_validation result=drop reason={reason}"
+                ));
+                return Err(zx::Status::IO_DATA_INTEGRITY);
+            }
             let m1 = is_exact_target_eapol_candidate(&classification)
                 && is_authenticator_m1(&frame.bytes);
             if m1 {
@@ -14573,6 +14589,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
             println!(r#"{{"sae_peer_status":{{"sequence":{sequence},"status":{status}}}}}"#);
         }
         Ok(Some(frame))
+        })();
+        match outcome {
+            Ok(Some(frame)) => Ok(ClientRxPoll::Frame(frame)),
+            Ok(None) => Ok(ClientRxPoll::Idle),
+            Err(zx::Status::IO_DATA_INTEGRITY) => Ok(ClientRxPoll::IntegrityDrop),
+            Err(status) => Err(status),
+        }
     }
     fn begin_passive_scan(
         &mut self,
@@ -16063,7 +16086,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         let sequence = self.loader.sequence % 15 + 1;
         self.active_join_roc = None;
         let command = encode_client_join_roc_abort(sequence, 0, token)
-            .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            .map_err(|_| zx::Status::IO)?;
         self.loader.send_unacknowledged_uni_command(0x27, &command).map_err(|(error, _)| {
             record_sae_stage(&format!("join_roc_abort result=error token={token} generation={generation} reason={error}"));
             zx::Status::IO
@@ -16663,10 +16686,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             record_sae_stage(&format!(
                 "next_client_rx result=error stage=drain reason={error}"
             ));
-            zx::Status::IO_DATA_INTEGRITY
+            // Ring/provenance failure is a transport fault, not a discardable
+            // malformed-air-frame result.
+            zx::Status::IO
         })?;
         self.retire_mgmt_tx_completions()
-            .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+            .map_err(|_| zx::Status::IO)?;
         let Some(frame) = self.loader.mcu.normal_rx_frames.pop_front() else {
             // Idle polls are the bulk of the report; log every 1024th only.
             self.idle_rx_polls = self.idle_rx_polls.wrapping_add(1);
@@ -18680,6 +18705,15 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "fuchsia-passive")]
+    fn poll_option(poll: mt7921_softmac_adapter::client_device::ClientRxPoll) -> Option<ClientRxFrame> {
+        use mt7921_softmac_adapter::client_device::ClientRxPoll;
+        match poll {
+            ClientRxPoll::Frame(frame) => Some(frame),
+            ClientRxPoll::Idle | ClientRxPoll::IntegrityDrop => None,
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     #[derive(Default)]
     struct TestClientIo {
         uni: Vec<Vec<u8>>,
@@ -19079,7 +19113,7 @@ mod tests {
 
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
         effects.join_roc_deadline = Some(Instant::now());
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         effects.acquire_join_roc(&mut io, channel, 2_000).unwrap();
 
         assert_eq!(
@@ -19135,11 +19169,11 @@ mod tests {
             }
         };
         io.rx.push_back(auth(1, 30));
-        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_some());
         assert_eq!(io.roc, vec![(true, 1, 2_000)]);
 
         io.rx.push_back(auth(2, 0));
-        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_some());
         assert_eq!(io.roc, vec![(true, 1, 2_000), (false, 1, 0)]);
 
         let mut assoc = vec![0; 28];
@@ -19978,16 +20012,11 @@ mod tests {
                 })
                 .is_ok()
         );
-        assert!(
-            state
-                .install_ptk(
-                    &[1; 16],
-                    1 << 48,
-                    |_, _| panic!("invalid RSC submitted"),
-                    |_| Ok(())
-                )
-                .is_err()
-        );
+        // Reserved high RSC octets are masked before initializing CCMP PN.
+        state
+            .install_ptk(&[1; 16], 1 << 48, |_, _| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert_eq!(state.ptk_rx_pn, Some([0; 16]));
         state
             .install_ptk(&[1; 16], 5, |_, _| Ok(()), |_| Ok(()))
             .unwrap();
@@ -20013,6 +20042,31 @@ mod tests {
         };
         state.deliver_rx(normal).unwrap();
         assert!(state.deliver_rx(normal).is_err());
+        // CCMP replay state is independent for each QoS TID. A higher PN
+        // rejected for bad CCMP status is not consumed: the exact PN remains
+        // admissible after the status is corrected, for both PTK and GTK.
+        let mut other_tid = normal;
+        other_tid.tid = 4;
+        state.deliver_rx(other_tid).unwrap();
+        let mut rejected_ptk = normal;
+        rejected_ptk.pn[5] = 7;
+        rejected_ptk.mic_error = true;
+        assert!(state.deliver_rx(rejected_ptk).is_err());
+        rejected_ptk.mic_error = false;
+        state.deliver_rx(rejected_ptk).unwrap();
+        let mut group = normal;
+        group.group = true;
+        group.key_id = 2;
+        group.pn[5] = 10;
+        state.deliver_rx(group).unwrap();
+        group.tid = 4;
+        state.deliver_rx(group).unwrap();
+        group.tid = 3;
+        group.pn[5] = 11;
+        group.cm = true;
+        assert!(state.deliver_rx(group).is_err());
+        group.cm = false;
+        state.deliver_rx(group).unwrap();
         let mut sentinel_data = normal;
         sentinel_data.wcid = 1023;
         sentinel_data.pn[5] = 7;
@@ -20472,7 +20526,7 @@ mod tests {
             status: rx_status.clone(),
             security: None,
         });
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         assert!(effects.firmware.association.is_none());
 
         association_response[4..10].copy_from_slice(&effects.client);
@@ -20483,7 +20537,7 @@ mod tests {
             security: None,
         });
         assert_eq!(
-            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
             association_response
         );
         assert!(effects.firmware.association.is_none());
@@ -20496,7 +20550,7 @@ mod tests {
             security: None,
         });
         assert_eq!(
-            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
             association_response
         );
         assert!(effects.firmware.association.is_none());
@@ -20547,14 +20601,14 @@ mod tests {
         assert!(effects.firmware.ptk_rx_pn.is_none());
         let generation = effects.firmware.association_generation.unwrap();
         effects.eapol_start_deadline = Some((Instant::now(), generation));
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         assert_eq!(
             io.tx.last(),
             Some(&eapol_start_frame(effects.client, peer, true))
         );
         assert!(effects.eapol_start_emitted);
         let tx_after_start = io.tx.len();
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         assert_eq!(io.tx.len(), tx_after_start);
         let mut protected_disassociation = vec![0x5a; 42];
         protected_disassociation[0..2].copy_from_slice(&0x40a0u16.to_le_bytes());
@@ -20568,7 +20622,7 @@ mod tests {
             status: rx_status.clone(),
             security: None,
         });
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         let peer_security = ClientRxSecurity {
             wcid: 7,
             tid: 0,
@@ -20598,7 +20652,7 @@ mod tests {
             security: Some(peer_security),
         });
         assert_eq!(
-            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
             inbound_eapol
         );
         effects.eapol_start_deadline = Some((Instant::now(), generation));
@@ -20610,11 +20664,11 @@ mod tests {
             security: Some(peer_security),
         });
         assert_eq!(
-            effects.next_rx(&mut io).unwrap().unwrap().bytes,
+            poll_option(effects.next_rx(&mut io).unwrap()).unwrap().bytes,
             inbound_eapol
         );
         assert!(effects.eapol_start_deadline.is_none());
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         assert_eq!(io.tx.len(), tx_before_immediate_m1);
 
         let mut sentinel_data = inbound_eapol.clone();
@@ -20628,7 +20682,7 @@ mod tests {
             status: rx_status.clone(),
             security: Some(sentinel_security),
         });
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
 
         let mut eapol = vec![0x88, 0x01, 0, 0];
         eapol.extend_from_slice(&peer);
@@ -20667,7 +20721,7 @@ mod tests {
                 ..peer_security
             }),
         });
-        let admitted = effects.next_rx(&mut io).unwrap().unwrap();
+        let admitted = poll_option(effects.next_rx(&mut io).unwrap()).unwrap();
         assert_eq!(admitted.bytes.len(), 26);
         assert_eq!(&admitted.bytes[24..26], &9u16.to_le_bytes());
         // This association fixture does not negotiate MFP through FIDL; the
@@ -20943,21 +20997,21 @@ mod tests {
         };
         let mut io = TestClientIo::default();
         io.rx.push_back(auth(peer, &20u16.to_le_bytes(), channel));
-        assert!(effects.next_rx(&mut io).unwrap().is_some());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_some());
 
         let mut preassociation_data = auth(peer, &20u16.to_le_bytes(), channel);
         preassociation_data.bytes[0..2].copy_from_slice(&0x0208u16.to_le_bytes());
         io.rx.push_back(preassociation_data);
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
 
         io.rx.push_back(auth([9; 6], &20u16.to_le_bytes(), channel));
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         io.rx.push_back(auth(peer, &[20], channel));
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         let mut non_auth = auth(peer, &20u16.to_le_bytes(), channel);
         non_auth.bytes[0..2].copy_from_slice(&0x0080u16.to_le_bytes());
         io.rx.push_back(non_auth);
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         io.rx.push_back(auth(
             peer,
             &20u16.to_le_bytes(),
@@ -20966,10 +21020,10 @@ mod tests {
                 ..channel
             },
         ));
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
         effects.reset().unwrap();
         io.rx.push_back(auth(peer, &20u16.to_le_bytes(), channel));
-        assert!(effects.next_rx(&mut io).unwrap().is_none());
+        assert!(poll_option(effects.next_rx(&mut io).unwrap()).is_none());
     }
 
     #[cfg(feature = "fuchsia-passive")]

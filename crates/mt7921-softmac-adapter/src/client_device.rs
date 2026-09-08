@@ -281,6 +281,14 @@ pub struct ClientRxFrame {
     pub security: Option<ClientRxSecurity>,
 }
 
+/// One physical RX poll result. An integrity failure is a consumed,
+/// frame-local outcome rather than a transport failure.
+pub enum ClientRxPoll {
+    Idle,
+    Frame(ClientRxFrame),
+    IntegrityDrop,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientRxSecurity {
     pub wcid: u16,
@@ -527,8 +535,7 @@ pub trait Mt7921ClientEffects {
         io: &mut dyn Mt7921ClientIo,
     ) -> Result<(), zx::Status>;
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
-    fn next_rx(&mut self, io: &mut dyn Mt7921ClientIo)
-    -> Result<Option<ClientRxFrame>, zx::Status>;
+    fn next_rx(&mut self, io: &mut dyn Mt7921ClientIo) -> Result<ClientRxPoll, zx::Status>;
 
     /// Begin one device-owned passive scan transaction.
     fn begin_passive_scan(
@@ -827,6 +834,12 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
         Ok(event)
     }
 
+    /// Count of malformed, corrupt, or replayed RX frames discarded before
+    /// they can reach MLME or the Ethernet seam.
+    pub fn rx_integrity_drops(&self) -> u64 {
+        self.backend.lock().unwrap().rx_integrity_drops
+    }
+
     /// Deliver at most one descriptor-validated raw 802.11 frame from the
     /// run-scoped effects owner into the pinned client MLME. This remains
     /// callable after `Mt7921ClientDevice` has moved into `ClientMlme`.
@@ -839,11 +852,20 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport> Mt7921ScanRunner<
             return Err(status);
         }
         let ComposedBackend { effects, scan, .. } = &mut *backend;
-        let frame = effects.next_rx(scan)?;
-        drop(backend);
-        let Some(ClientRxFrame { bytes, status, .. }) = frame else {
-            return Ok(false);
+        let frame = match effects.next_rx(scan)? {
+            ClientRxPoll::Frame(frame) => frame,
+            ClientRxPoll::IntegrityDrop => {
+                backend.rx_integrity_drops = backend.rx_integrity_drops.saturating_add(1);
+                println!(
+                    "client_rx_integrity_drop count={} disposition=drop_before_mlme continue=true",
+                    backend.rx_integrity_drops
+                );
+                return Ok(true);
+            }
+            ClientRxPoll::Idle => return Ok(false),
         };
+        drop(backend);
+        let ClientRxFrame { bytes, status, .. } = frame;
         let status = wlan_softmac_class_support::rx_carrier(&bytes, status, false)
             .map_or(status, |carrier| carrier.status);
         if let Some(auth) = safe_auth_stage(&bytes) {
@@ -1249,6 +1271,7 @@ struct ComposedBackend<E, S> {
     active_scan_id: Option<u64>,
     authorization: LifecycleAuthorization,
     association_activation_failure: Option<zx::Status>,
+    rx_integrity_drops: u64,
     ethernet: Option<DriverEthernetPort>,
 }
 
@@ -1280,6 +1303,7 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
                 active_scan_id: None,
                 authorization: LifecycleAuthorization::new(true),
                 association_activation_failure: None,
+                rx_integrity_drops: 0,
                 ethernet: None,
             })),
             support,
@@ -1306,6 +1330,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
                 scan_state != ClientRuntimeScanState::Revoked,
             ),
             association_activation_failure: None,
+            rx_integrity_drops: 0,
             ethernet: None,
         }));
         let runner = Mt7921ScanRunner {
@@ -1339,6 +1364,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
                 scan_state != ClientRuntimeScanState::Revoked,
             ),
             association_activation_failure: None,
+            rx_integrity_drops: 0,
             ethernet: Some(ethernet_sink),
         }));
         let runner = Mt7921ScanRunner {
@@ -1353,7 +1379,15 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientIo> Mt7921ClientDevice<E, S> {
     pub fn next_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         let ComposedBackend { effects, scan, .. } = &mut *backend;
-        effects.next_rx(scan)
+        let outcome = effects.next_rx(scan)?;
+        Ok(match outcome {
+            ClientRxPoll::Idle => None,
+            ClientRxPoll::IntegrityDrop => {
+                backend.rx_integrity_drops = backend.rx_integrity_drops.saturating_add(1);
+                None
+            }
+            ClientRxPoll::Frame(frame) => Some(frame),
+        })
     }
 }
 
@@ -1795,6 +1829,7 @@ mod tests {
         link_up: Option<bool>,
         rx: VecDeque<ClientRxFrame>,
         rx_dequeued: usize,
+        rx_integrity_failures: usize,
         fail_on: Option<&'static str>,
         reuse_channel: bool,
     }
@@ -1916,7 +1951,11 @@ mod tests {
         fn next_rx(
             &mut self,
             _: &mut dyn Mt7921ClientIo,
-        ) -> Result<Option<ClientRxFrame>, zx::Status> {
+        ) -> Result<ClientRxPoll, zx::Status> {
+            if self.rx_integrity_failures != 0 {
+                self.rx_integrity_failures -= 1;
+                return Ok(ClientRxPoll::IntegrityDrop);
+            }
             if self.fail_on == Some("rx") {
                 return Err(zx::Status::IO_REFUSED);
             }
@@ -1925,7 +1964,7 @@ mod tests {
                 self.order.push("rx");
                 self.rx_dequeued += 1;
             }
-            Ok(frame)
+            Ok(frame.map_or(ClientRxPoll::Idle, ClientRxPoll::Frame))
         }
 
         fn begin_passive_scan(
@@ -2523,16 +2562,41 @@ mod tests {
     }
 
     #[test]
-    fn run_scoped_runner_pumps_rx_after_device_moves_into_mlme() {
+    fn run_scoped_runner_drops_integrity_error_and_pumps_subsequent_rx() {
+        const HT: [u8; 26] = [
+            0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0,
+        ];
+        const VHT: [u8; 12] = [
+            0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+        ];
         futures::executor::block_on(async {
-            let mut effects = FakeEffects::default();
-            effects.rx.push_back(ClientRxFrame {
-                // A deliberately incomplete data frame is enough to prove the
-                // ownership path; the pinned MLME safely rejects its payload.
-                bytes: vec![8, 1, 2, 3],
-                status: rx_status(-47),
-                security: None,
-            });
+            let client = nic().mac_address.unwrap();
+            let source = [2, 9, 8, 7, 6, 5];
+            let payload = b"accepted-after-integrity-drop";
+            let mut association_response = vec![0x10, 0x00, 0, 0];
+            association_response.extend_from_slice(&client);
+            association_response.extend_from_slice(&BSSID);
+            association_response.extend_from_slice(&BSSID);
+            association_response
+                .extend_from_slice(&[0, 0, 1, 0, 0, 0, 42, 0, 1, 2, 0x82, 0x84]);
+            let mut data = vec![0x08, 0x02, 0, 0];
+            data.extend_from_slice(&client);
+            data.extend_from_slice(&BSSID);
+            data.extend_from_slice(&source);
+            data.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+            data.extend_from_slice(payload);
+            let mut effects = FakeEffects {
+                rx_integrity_failures: 1,
+                ..Default::default()
+            };
+            for bytes in [association_response, data] {
+                effects.rx.push_back(ClientRxFrame {
+                    bytes,
+                    status: rx_status(-47),
+                    security: None,
+                });
+            }
             let transport = FakePassiveTransport::default();
             let capability = nic();
             let passive = Mt7921SoftmacAdapter::new(
@@ -2542,24 +2606,103 @@ mod tests {
                 vec![channel(36)],
             )
             .unwrap();
-            let (device, runner) = Mt7921ClientDevice::new(effects, passive, support());
+            let mut client_support = support();
+            client_support.query.sta_addr = nic().mac_address;
+            client_support.query.mac_role = Some(fidl_common::WlanMacRole::Client);
+            client_support.query.hardware_capability = Some(0);
+            client_support.query.band_caps = Some(vec![fidl_softmac::WlanSoftmacBandCapability {
+                band: Some(fidl_ieee80211::WlanBand::FiveGhz),
+                basic_rates: Some(vec![0x82, 0x84]),
+                ht_caps: Some(fidl_ieee80211::HtCapabilities { bytes: HT }),
+                vht_caps: Some(fidl_ieee80211::VhtCapabilities { bytes: VHT }),
+                primary_channels: Some(vec![channel(36)]),
+                ..Default::default()
+            }]);
+            client_support.association = Some(fuchsia_softmac_port::AssociationRequestProfile {
+                ht_capabilities: Some(HT),
+                vht_capabilities: Some(VHT),
+                ..Default::default()
+            });
+            let (mut device, runner, mut ethernet) =
+                Mt7921ClientDevice::new_with_ethernet(effects, passive, client_support, 4).unwrap();
+            runner.backend.lock().unwrap().authorization = LifecycleAuthorization::new(true);
+            let mut events = device.take_mlme_event_stream().unwrap();
             let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
             let mut mlme = wlan_mlme::client::ClientMlme::new(Default::default(), device, timer)
                 .await
                 .unwrap();
-
-            {
-                use crate::ethernet::{AssociatedDataPump, AssociatedSoftmacTx};
-                let mut pump = runner.associated_data_pump(&mut mlme);
-                assert!(pump.transmit_ethernet(&[0; 14]).is_err());
-                assert!(matches!(
-                    pump.pump_receive(std::time::Instant::now()),
-                    Err(crate::ethernet::PinnedDataPumpError::Rx(
-                        zx::Status::TIMED_OUT
-                    ))
-                ));
-            }
+            let mut selected_bss = open_connect_request().bss_description;
+            selected_bss.capability_info = 0x11;
+            selected_bss.ies.extend_from_slice(&[
+                48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+                0, 0x0f, 0xac, 8, 0xcc, 0,
+            ]);
+            selected_bss.ies.extend_from_slice(&[45, 26]);
+            selected_bss.ies.extend_from_slice(&HT);
+            selected_bss.ies.extend_from_slice(&[191, 12]);
+            selected_bss.ies.extend_from_slice(&VHT);
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::Connect(
+                fidl_mlme::ConnectRequest {
+                    selected_bss,
+                    connect_failure_timeout: 20,
+                    auth_type: fidl_mlme::AuthenticationTypes::Sae,
+                    sae_password: vec![],
+                    wep_key: None,
+                    security_ie: vec![
+                        48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
+                        0, 0x0f, 0xac, 8, 0xcc, 0,
+                    ],
+                    owe_public_key: None,
+                },
+            ))
+            .await
+            .unwrap();
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::SaeHandshakeResp(
+                fidl_mlme::SaeHandshakeResponse {
+                    peer_sta_address: BSSID,
+                    status_code: fidl_ieee80211::StatusCode::Success,
+                },
+            ))
+            .await
+            .unwrap();
+            // A consumed descriptor whose RX integrity validation fails is
+            // dropped before MLME/Ethernet and counts as forward progress.
             assert!(runner.pump_client_rx(&mut mlme).await.unwrap());
+            assert_eq!(runner.rx_integrity_drops(), 1);
+            {
+                use netstack3_port_spike::EthernetDevice;
+                assert!(ethernet.receive().is_none());
+            }
+            // Valid authentication and association responses after the drop
+            // still establish the MLME-controlled Ethernet link.
+            assert!(runner.pump_client_rx(&mut mlme).await.unwrap());
+            mlme.handle_mlme_request(wlan_sme::MlmeRequest::SetCtrlPort(
+                fidl_mlme::SetControlledPortRequest {
+                    peer_sta_address: BSSID,
+                    state: fidl_mlme::ControlledPortState::Open,
+                },
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                runner.backend.lock().unwrap().effects.link_up,
+                Some(true),
+                "events={:?}/{:?}",
+                events.try_recv(),
+                events.try_recv()
+            );
+            // The next valid AP-to-client MPDU must emerge as this exact
+            // Ethernet frame, proving both continuation and isolation.
+            assert!(runner.pump_client_rx(&mut mlme).await.unwrap());
+            assert_eq!(runner.rx_integrity_drops(), 1);
+            assert_eq!(runner.backend.lock().unwrap().effects.rx_dequeued, 2);
+            use netstack3_port_spike::EthernetDevice;
+            let delivered = ethernet.receive().expect("post-drop Ethernet frame");
+            let mut expected = Vec::from(client);
+            expected.extend_from_slice(&source);
+            expected.extend_from_slice(&[0x08, 0x00]);
+            expected.extend_from_slice(payload);
+            assert_eq!(delivered.as_bytes(), expected);
             assert!(!runner.pump_client_rx(&mut mlme).await.unwrap());
             runner.backend.lock().unwrap().effects.fail_on = Some("rx");
             assert_eq!(
