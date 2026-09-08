@@ -41,6 +41,33 @@
           ./crates/netstack3-port-spike/kernel-provider/boot-test.nix
           { };
 
+      checks.x86_64-linux.wlan-softmac-host =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "wlan-softmac-host-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/wlan-softmac-host";
+          buildAndTestSubdir = "crates/wlan-softmac-host";
+          cargoLock.lockFile = ./crates/wlan-softmac-host/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/wlan-softmac-host
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       packages = forAllSystems (
         system:
         let
