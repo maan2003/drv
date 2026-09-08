@@ -62,6 +62,8 @@ pub const fn ath11k_dp_htt_connect_service<T: HtcServiceTransport>(
 }
 
 impl<T: Transport> HttControl for HttTransport<T> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = true;
+
     fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
         self.transport
             .send(TxFrame {
@@ -81,6 +83,8 @@ impl<T: Transport> HttControl for HttTransport<T> {
 }
 
 impl<T: HtcServiceTransport> HttControl for HtcHttTransport<T> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = true;
+
     fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
         validate_htt_payload(&message.0)?;
         self.endpoint.send_payload(&message.0).map_err(map_ce_error)
@@ -157,6 +161,9 @@ mod tests {
 
     #[test]
     fn endpoint_adapter_forwards_complete_htt_words() {
+        const {
+            assert!(<HtcHttTransport<Endpoint> as HttControl>::SEND_ERROR_IS_NON_VISIBLE);
+        }
         let mut transport = ath11k_dp_htt_connect_service(Endpoint {
             received: Some(vec![0, 7, 3, 0]),
             ..Endpoint::default()
@@ -167,6 +174,31 @@ mod tests {
             transport.receive(1).unwrap(),
             Some(HttTargetMessage(vec![0, 7, 3, 0]))
         );
+    }
+
+    #[test]
+    fn ce_transport_adapters_guarantee_retry_safe_send_errors() {
+        const {
+            assert!(<HttTransport<TransportModel> as HttControl>::SEND_ERROR_IS_NON_VISIBLE);
+        }
+    }
+
+    struct TransportModel;
+    impl Transport for TransportModel {
+        fn bind_service(
+            &mut self,
+            _: ServiceId,
+            _: ath11k_hal::RingId,
+            _: ath11k_hal::RingId,
+        ) -> Result<(), CeError> {
+            Ok(())
+        }
+        fn send(&mut self, _: TxFrame) -> Result<(), CeError> {
+            Ok(())
+        }
+        fn receive(&mut self, _: u64) -> Result<Option<RxFrame>, CeError> {
+            Ok(None)
+        }
     }
 
     #[test]
