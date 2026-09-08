@@ -1386,4 +1386,13 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn service_ready_ext2_consumes_only_first_array_group() {
+        let mut bytes = tlv(tags::WMI_TAG_ARRAY_STRUCT.0, &[]);
+        bytes.extend(tlv(tags::WMI_TAG_ARRAY_STRUCT.0, &[8, 0, 0, 0, 0, 0, 0, 0]));
+        let event = Event::from_tlvs(tags::WMI_SERVICE_READY_EXT2_EVENTID, bytes).unwrap();
+        let decoded = ServiceReadyExt2Decoder.decode(event).unwrap();
+        assert!(decoded.dma_ring_capabilities.is_empty());
+    }
 }
