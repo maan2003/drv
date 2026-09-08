@@ -9,6 +9,7 @@ use std::{
     ops::Range,
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr::NonNull,
+    sync::atomic::{Ordering, fence},
 };
 
 const VFIO_TYPE: u64 = b';' as u64;
@@ -247,9 +248,12 @@ impl Backend for LinuxVfio {
         r.len
     }
     fn read_u32(&mut self, r: &Mapping, o: usize) -> Result<u32> {
-        Ok(unsafe { std::ptr::read_volatile(r.ptr.as_ptr().add(o).cast()) })
+        let value = unsafe { std::ptr::read_volatile(r.ptr.as_ptr().add(o).cast()) };
+        fence(Ordering::Acquire);
+        Ok(value)
     }
     fn write_u32(&mut self, r: &Mapping, o: usize, v: u32) -> Result<()> {
+        fence(Ordering::Release);
         unsafe { std::ptr::write_volatile(r.ptr.as_ptr().add(o).cast(), v) };
         Ok(())
     }
@@ -267,6 +271,11 @@ impl Backend for LinuxVfio {
             self.write_u32(r, h, (a >> 32) as u32)?;
         }
         Ok(())
+    }
+    fn dma_device_address(&self, dma: &Dma, offset: usize) -> Result<u64> {
+        dma.iova
+            .checked_add(offset as u64)
+            .ok_or(Error::OutOfBounds)
     }
     fn alloc_dma(
         &mut self,

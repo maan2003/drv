@@ -1,7 +1,36 @@
 #![forbid(unsafe_code)]
 
 use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
-use std::{collections::HashMap, ops::Range};
+use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Operation {
+    ReadU32 {
+        region: u8,
+        offset: usize,
+        value: u32,
+    },
+    WriteU32 {
+        region: u8,
+        offset: usize,
+        value: u32,
+    },
+    WriteDeviceAddress {
+        region: u8,
+        low: usize,
+        high: Option<usize>,
+        value: u64,
+    },
+    SyncForCpu {
+        dma: u64,
+        range: Range<usize>,
+    },
+    SyncForDevice {
+        dma: u64,
+        range: Range<usize>,
+    },
+}
+pub type OperationLog = Rc<RefCell<Vec<Operation>>>;
 
 const FIRST_IOVA: u64 = 0x1000_0000;
 struct Dma {
@@ -23,6 +52,7 @@ pub struct DeterministicBackend {
     destination: Option<(u64, usize)>,
     count: usize,
     edu_buffer: Vec<u8>,
+    operations: Option<OperationLog>,
 }
 impl Default for DeterministicBackend {
     fn default() -> Self {
@@ -39,12 +69,21 @@ impl Default for DeterministicBackend {
             destination: None,
             count: 0,
             edu_buffer: vec![0; 4096],
+            operations: None,
         }
     }
 }
 impl DeterministicBackend {
     pub fn device() -> Device<Self> {
         Device::from_backend(Self::default())
+    }
+    pub fn recording_device() -> (Device<Self>, OperationLog) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let backend = Self {
+            operations: Some(operations.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations)
     }
     fn dma(&self, id: &u64) -> Result<&Dma> {
         self.dmas.get(id).ok_or(Error::StaleHandle)
@@ -71,13 +110,28 @@ impl Backend for DeterministicBackend {
     fn region_len(&self, _: &u8) -> usize {
         0x10_0000
     }
-    fn read_u32(&mut self, _: &u8, offset: usize) -> Result<u32> {
-        match offset {
-            0x24 => Ok(self.pending.into()),
-            _ => Ok(0),
+    fn read_u32(&mut self, region: &u8, offset: usize) -> Result<u32> {
+        let value = match offset {
+            0x24 => self.pending.into(),
+            _ => 0,
+        };
+        if let Some(log) = &self.operations {
+            log.borrow_mut().push(Operation::ReadU32 {
+                region: *region,
+                offset,
+                value,
+            });
         }
+        Ok(value)
     }
-    fn write_u32(&mut self, _: &u8, offset: usize, value: u32) -> Result<()> {
+    fn write_u32(&mut self, region: &u8, offset: usize, value: u32) -> Result<()> {
+        if let Some(log) = &self.operations {
+            log.borrow_mut().push(Operation::WriteU32 {
+                region: *region,
+                offset,
+                value,
+            });
+        }
         match (offset, value) {
             (0x40000, value) => {
                 self.edu_buffer[..4].copy_from_slice(&value.to_le_bytes());
@@ -144,22 +198,37 @@ impl Backend for DeterministicBackend {
     }
     fn write_dma_address(
         &mut self,
-        _: &u8,
+        region: &u8,
         low: usize,
-        _: Option<usize>,
+        high: Option<usize>,
         dma: &u64,
         offset: usize,
     ) -> Result<()> {
         let d = self.dma(dma)?;
-        d.iova
+        let value = d
+            .iova
             .checked_add(offset as u64)
             .ok_or(Error::OutOfBounds)?;
+        if let Some(log) = &self.operations {
+            log.borrow_mut().push(Operation::WriteDeviceAddress {
+                region: *region,
+                low,
+                high,
+                value,
+            });
+        }
         match low {
             0x80 => self.source = Some((*dma, offset)),
             0x88 => self.destination = Some((*dma, offset)),
-            _ => return Err(Error::Invalid),
+            _ => {}
         }
         Ok(())
+    }
+    fn dma_device_address(&self, dma: &u64, offset: usize) -> Result<u64> {
+        self.dma(dma)?
+            .iova
+            .checked_add(offset as u64)
+            .ok_or(Error::OutOfBounds)
     }
     fn alloc_dma(
         &mut self,
@@ -229,19 +298,27 @@ impl Backend for DeterministicBackend {
         d.bytes[r].copy_from_slice(bytes);
         Ok(())
     }
-    fn sync_for_cpu(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+    fn sync_for_cpu(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let d = self.dma(dma)?;
         if d.coherent || matches!(d.direction, DmaDirection::ToDevice) {
             Err(Error::Invalid)
         } else {
+            if let Some(log) = &self.operations {
+                log.borrow_mut()
+                    .push(Operation::SyncForCpu { dma: *dma, range });
+            }
             Ok(())
         }
     }
-    fn sync_for_device(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+    fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let d = self.dma(dma)?;
         if d.coherent || matches!(d.direction, DmaDirection::FromDevice) {
             Err(Error::Invalid)
         } else {
+            if let Some(log) = &self.operations {
+                log.borrow_mut()
+                    .push(Operation::SyncForDevice { dma: *dma, range });
+            }
             Ok(())
         }
     }
@@ -366,6 +443,42 @@ mod tests {
         bar.write_device_address(0x88, Some(0x8c), dma.device_address(8).unwrap())
             .unwrap();
         assert_eq!(bar.write_u32(0x98, 1 | 2), Err(Error::OutOfBounds));
+    }
+
+    #[test]
+    fn recording_mode_accepts_and_orders_generic_register_operations() {
+        let (device, operations) = DeterministicBackend::recording_device();
+        let bar = device.open_region(0).unwrap();
+        let dma = device
+            .alloc_coherent::<drv_hardware::Bidirectional>(64, 64)
+            .unwrap();
+        bar.write_u32(0x100, 7).unwrap();
+        let address = dma.device_address_at(8).unwrap();
+        assert_eq!(address.bits(), FIRST_IOVA + 8);
+        assert_eq!(address.lo32(), (FIRST_IOVA + 8) as u32);
+        assert_eq!(address.hi32(), 0);
+        assert!(matches!(
+            dma.device_address_at(dma.len()),
+            Err(Error::OutOfBounds)
+        ));
+        bar.write_device_address(0x120, Some(0x124), address)
+            .unwrap();
+        assert_eq!(
+            operations.borrow().as_slice(),
+            &[
+                Operation::WriteU32 {
+                    region: 0,
+                    offset: 0x100,
+                    value: 7
+                },
+                Operation::WriteDeviceAddress {
+                    region: 0,
+                    low: 0x120,
+                    high: Some(0x124),
+                    value: FIRST_IOVA + 8,
+                },
+            ]
+        );
     }
 
     #[test]

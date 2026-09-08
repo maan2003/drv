@@ -87,8 +87,13 @@ pub trait Backend {
     fn generation(&self) -> u64;
     fn open_region(&mut self, index: u8) -> Result<Self::Region>;
     fn region_len(&self, region: &Self::Region) -> usize;
+    /// MMIO load with acquire ordering: subsequent CPU reads from coherent
+    /// DMA observe device writes completed before the register became visible.
     fn read_u32(&mut self, region: &Self::Region, offset: usize) -> Result<u32>;
+    /// MMIO store with release ordering relative to preceding CPU writes to
+    /// coherent DMA and preceding `sync_for_device` operations.
     fn write_u32(&mut self, region: &Self::Region, offset: usize, value: u32) -> Result<()>;
+    /// DMA-address store with the same release ordering as `write_u32`.
     fn write_dma_address(
         &mut self,
         region: &Self::Region,
@@ -97,6 +102,9 @@ pub trait Backend {
         dma: &Self::Dma,
         offset: usize,
     ) -> Result<()>;
+    /// Return the IOMMU-visible address for a checked offset in this backend's
+    /// own allocation. Callers cannot construct or register an address.
+    fn dma_device_address(&self, dma: &Self::Dma, offset: usize) -> Result<u64>;
     fn alloc_dma(
         &mut self,
         size: usize,
@@ -361,6 +369,19 @@ impl<B: Backend, D: Direction> Drop for DmaBuffer<B, D> {
 pub struct DeviceAddress<'a, B: Backend, D: Direction> {
     dma: &'a DmaBuffer<B, D>,
     offset: usize,
+    bits: u64,
+}
+impl<B: Backend, D: Direction> DeviceAddress<'_, B, D> {
+    /// The non-forgeable allocation-derived IOMMU-visible address.
+    pub fn bits(&self) -> u64 {
+        self.bits
+    }
+    pub fn lo32(&self) -> u32 {
+        self.bits as u32
+    }
+    pub fn hi32(&self) -> u32 {
+        (self.bits >> 32) as u32
+    }
 }
 pub struct CoherentDma<B: Backend, D: Direction>(DmaBuffer<B, D>);
 impl<B: Backend, D: Direction> CoherentDma<B, D> {
@@ -370,12 +391,24 @@ impl<B: Backend, D: Direction> CoherentDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
-    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
-        self.0.range(offset, 0)?;
+    pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        if offset >= self.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let bits = self
+            .0
+            .shared
+            .0
+            .borrow()
+            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
         Ok(DeviceAddress {
             dma: &self.0,
             offset,
+            bits,
         })
+    }
+    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        self.device_address_at(offset)
     }
 }
 impl<B: Backend, D: CpuWrite> CoherentDma<B, D> {
@@ -410,12 +443,24 @@ impl<B: Backend, D: Direction> StreamingDma<B, D> {
     pub fn is_empty(&self) -> bool {
         self.0.bytes.is_empty()
     }
-    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
-        self.0.range(offset, 0)?;
+    pub fn device_address_at(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        if offset >= self.len() {
+            return Err(Error::OutOfBounds);
+        }
+        let bits = self
+            .0
+            .shared
+            .0
+            .borrow()
+            .dma_device_address(self.0.token.as_ref().unwrap(), offset)?;
         Ok(DeviceAddress {
             dma: &self.0,
             offset,
+            bits,
         })
+    }
+    pub fn device_address(&self, offset: usize) -> Result<DeviceAddress<'_, B, D>> {
+        self.device_address_at(offset)
     }
 }
 impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {

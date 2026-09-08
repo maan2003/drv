@@ -38,7 +38,7 @@ impl Event {
     }
 }
 fn check_tlvs(bytes: &[u8]) -> Result<(), WmiError> {
-    if bytes.len() % 4 == 0 {
+    if bytes.len().is_multiple_of(4) {
         Ok(())
     } else {
         Err(WmiError::UnalignedTlv)

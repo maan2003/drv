@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-out=${1:?usage: capture-native-ath11k OUTDIR}
+out=${1:?usage: capture-native-ath11k OUTDIR COMMAND...}
+shift
 trace=/sys/kernel/tracing
 mkdir -p "$out"/{wmi,htt,qmi,hal}
 zgrep '^CONFIG_ATH11K_TRACING=y$' /proc/config.gz >"$out/kernel-config.txt" || {
