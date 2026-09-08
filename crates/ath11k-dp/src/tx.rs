@@ -83,6 +83,45 @@ pub struct TxResult {
     pub peer: Option<crate::PeerId>,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxCompletionDisposition {
+    Retain,
+    Free,
+    Complete(TxCompletion),
+}
+
+fn completion_disposition(release: &WbmReleaseRing) -> Result<TxCompletionDisposition, DpError> {
+    match release.release_source() {
+        0 => {
+            return Ok(TxCompletionDisposition::Complete(TxCompletion {
+                status: release.tqm_release_reason(),
+                reinject_reason: 0,
+                ack_rssi: release.ack_rssi() as i8,
+                peer: Some(crate::PeerId(release.peer_id())),
+            }));
+        }
+        3 => {}
+        _ => return Ok(TxCompletionDisposition::Retain),
+    }
+    let completion = TxCompletion::decode_wbm_release(release.as_bytes())?;
+    Ok(match completion.status {
+        0..=2 => TxCompletionDisposition::Complete(completion),
+        3 | 4 => TxCompletionDisposition::Free,
+        5 => TxCompletionDisposition::Retain,
+        // Unlike Linux, complete a matching owner as failed rather than
+        // stranding its DMA mapping on an unrecognized firmware status.
+        _ => TxCompletionDisposition::Complete(completion),
+    })
+}
+
+/// Pure completion-decision seam used by the generated C differential.
+#[doc(hidden)]
+pub fn tx_completion_disposition(bytes: &[u8]) -> Result<TxCompletionDisposition, DpError> {
+    let release = WbmReleaseRing::from_bytes(bytes).map_err(|_| DpError::MalformedDescriptor)?;
+    completion_disposition(&release)
+}
+
 /// Host-originated transmit attributes which must survive the chip boundary.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HostTxFlags {
@@ -564,23 +603,14 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                 malformed += 1;
                 continue;
             };
-            let htt = if release.release_source() == 3 {
-                match TxCompletion::decode_wbm_release(release.as_bytes()) {
-                    Ok(htt) => htt,
-                    Err(_) => {
-                        malformed += 1;
-                        continue;
-                    }
-                }
-            } else {
-                TxCompletion {
-                    status: release.tqm_release_reason(),
-                    reinject_reason: 0,
-                    ack_rssi: release.ack_rssi() as i8,
-                    peer: Some(crate::PeerId(release.peer_id())),
+            let disposition = match completion_disposition(&release) {
+                Ok(disposition) => disposition,
+                Err(_) => {
+                    malformed += 1;
+                    continue;
                 }
             };
-            if release.release_source() == 3 && htt.status == 5 {
+            if disposition == TxCompletionDisposition::Retain {
                 continue;
             }
             let msdu_id = (release.buffer_address().software_cookie() >> 2) & 0x1_ffff;
@@ -593,6 +623,9 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                 continue;
             };
             drop(self.pending.swap_remove(position));
+            let TxCompletionDisposition::Complete(htt) = disposition else {
+                continue;
+            };
             host.tx_complete(TxResult {
                 msdu_id,
                 status: htt.status,
@@ -656,21 +689,8 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
                 .map_err(|_| DpError::MalformedDescriptor)?;
             let cookie = release.buffer_address().software_cookie();
             let msdu_id = (cookie >> 2) & 0x1_ffff;
-            let htt = if release.release_source() == 3 {
-                TxCompletion::decode_wbm_release(release.as_bytes())?
-            } else {
-                TxCompletion {
-                    status: release.tqm_release_reason(),
-                    reinject_reason: 0,
-                    ack_rssi: release.ack_rssi() as i8,
-                    peer: Some(crate::PeerId(release.peer_id())),
-                }
-            };
-            // MEC notify (5) is WDS-only and owns no MSDU. Linux only warns
-            // for unknown statuses; the host path completes a matching live
-            // owner as failed instead so an untrusted status cannot strand a
-            // DMA mapping indefinitely.
-            if release.release_source() == 3 && htt.status == 5 {
+            let disposition = completion_disposition(&release)?;
+            if disposition == TxCompletionDisposition::Retain {
                 continue;
             }
             let position = self
@@ -681,6 +701,9 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             // Removing drops the streaming mapping at the same point as the
             // C completion handler's dma_unmap_single.
             drop(self.pending.swap_remove(position));
+            let TxCompletionDisposition::Complete(htt) = disposition else {
+                continue;
+            };
             results.push(TxResult {
                 msdu_id,
                 status: htt.status,
@@ -1249,6 +1272,14 @@ fn encap_native_wifi(frame: &mut Vec<u8>) -> Result<Option<u8>, DpError> {
     frame_control &= !0x0080;
     frame[..2].copy_from_slice(&frame_control.to_le_bytes());
     Ok(Some(tid))
+}
+
+/// Pure generated-frame oracle seam; production transmit uses the same
+/// native-WiFi transform before DMA mapping.
+#[doc(hidden)]
+pub fn encap_native_wifi_frame(mut frame: Vec<u8>) -> Result<(Vec<u8>, Option<u8>), DpError> {
+    let tid = encap_native_wifi(&mut frame)?;
+    Ok((frame, tid))
 }
 
 fn map_hal(error: ath11k_hal::HalError) -> DpError {
@@ -2170,6 +2201,70 @@ mod tests {
         let result = dp.service_tx_completions().unwrap().remove(0);
         assert!(result.acknowledged);
         assert!(dp.pending.is_empty());
+    }
+
+    #[test]
+    fn firmware_reinject_and_inspect_release_without_reporting() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        for _ in 0..2 {
+            dp.submit_host_frame(&frame, crate::PeerId(4), HostTxFlags::default())
+                .unwrap();
+        }
+        for (msdu_id, status) in [(0_u32, 3_u32), (1, 4)] {
+            let mut release = WbmReleaseRing::new();
+            let mut address = RxdmaBufferRing::new();
+            address
+                .set_software_cookie((1 << 19) | (msdu_id << 2))
+                .unwrap();
+            release.set_buffer_address(&address);
+            release.set_release_source(3).unwrap();
+            let mut raw = *release.as_bytes();
+            let info0 = u32::from_le_bytes(raw[8..12].try_into().unwrap()) | status << 9;
+            raw[8..12].copy_from_slice(&info0.to_le_bytes());
+            dp.rings_mut()
+                .completions
+                .push_back(Descriptor::new(raw.to_vec(), 32).unwrap());
+        }
+        assert!(dp.service_tx_completions().unwrap().is_empty());
+        assert!(dp.pending.is_empty());
+    }
+
+    #[test]
+    fn unsupported_completion_source_does_not_release_live_owner() {
+        let device = DeterministicBackend::device();
+        let mut dp =
+            ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
+        dp.configure(DataRings {
+            tcl: RingId(1),
+            reo: RingId(2),
+            wbm: RingId(3),
+        })
+        .unwrap();
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&0x0008_u16.to_le_bytes());
+        dp.submit_host_frame(&frame, crate::PeerId(4), HostTxFlags::default())
+            .unwrap();
+        let mut release = WbmReleaseRing::new();
+        let mut address = RxdmaBufferRing::new();
+        address.set_software_cookie(1 << 19).unwrap();
+        release.set_buffer_address(&address);
+        release.set_release_source(1).unwrap();
+        dp.rings_mut()
+            .completions
+            .push_back(release.into_descriptor());
+
+        assert!(dp.service_tx_completions().unwrap().is_empty());
+        assert_eq!(dp.pending.len(), 1);
     }
 
     #[test]

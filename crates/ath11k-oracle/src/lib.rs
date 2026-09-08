@@ -276,6 +276,13 @@ unsafe extern "C" {
     fn oracle_undecap_nwifi(bytes: *const u8, len: usize, first_header: *const u8,
         first_header_len: usize, first_msdu: u8, tid: u8, mesh: u8, encryption_type: u8,
         decrypted: u8, out: *mut u8, capacity: usize) -> c_int;
+    #[cfg(test)]
+    fn oracle_tx_encap_nwifi(bytes: *const u8, len: usize, priority: u8,
+        out: *mut u8, capacity: usize, tid: *mut u8) -> c_int;
+    #[cfg(test)]
+    fn oracle_tx_completion_decision(bytes: *const u8, len: usize, status: *mut u8,
+        acknowledged: *mut u8, ack_rssi: *mut i8, peer_valid: *mut u8,
+        peer: *mut u16) -> c_int;
     fn oracle_qmi_ind_register_encode(input: *const CIndicationRegister, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_respond_memory_encode(input: *const CRespondMemory, out: *mut u8, capacity: usize) -> c_int;
     fn oracle_qmi_bdf_download_encode(input: *const CBdfDownload, out: *mut u8, capacity: usize) -> c_int;
@@ -814,7 +821,8 @@ mod tests {
         SrngRingType, SrngSetup, TxCompletion, version_request};
     use ath11k_dp::{HttTargetMessage, PeerId};
     use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
-    use ath11k_dp::tx::normalize_native_wifi_frame;
+    use ath11k_dp::tx::{TxCompletionDisposition, encap_native_wifi_frame,
+        normalize_native_wifi_frame, tx_completion_disposition};
     use ath11k_hal::descriptors::ReoDestinationRing;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1501,6 +1509,79 @@ mod tests {
             prop_assert!(c_len >= 0);
             c.truncate(c_len as usize);
             prop_assert_eq!(rust, c);
+        }
+
+        #[test]
+        fn native_wifi_encap_matches_c(qos: bool, direction in 0_u16..4,
+            order: bool, tid in 0_u8..16, seed: [u8; 38],
+            payload in vec(any::<u8>(), 0..=64)) {
+            let fc = 0x0008 | (direction << 8) | if qos { 0x0080 } else { 0 }
+                | if qos && order { 0x8000 } else { 0 };
+            let base = if direction == 3 { 30 } else { 24 };
+            let header_len = base + if qos { 2 } else { 0 }
+                + if qos && order { 4 } else { 0 };
+            let mut frame = seed[..header_len].to_vec();
+            frame[..2].copy_from_slice(&fc.to_le_bytes());
+            if qos {
+                frame[base] = (frame[base] & 0xf0) | tid;
+            }
+            frame.extend_from_slice(&payload);
+            let (rust_bytes, rust_tid) = encap_native_wifi_frame(frame.clone()).unwrap();
+            let mut c = vec![0; frame.len()];
+            let mut c_tid = 0;
+            // SAFETY: input/output buffers and scalar output are valid for the
+            // supplied lengths.
+            let c_len = unsafe { oracle_tx_encap_nwifi(frame.as_ptr(), frame.len(), tid,
+                c.as_mut_ptr(), c.len(), &mut c_tid) };
+            prop_assert!(c_len >= 0);
+            c.truncate(c_len as usize);
+            prop_assert_eq!(rust_bytes, c);
+            prop_assert_eq!(rust_tid, if c_tid == 16 { None } else { Some(c_tid) });
+        }
+
+        #[test]
+        fn tx_completion_decision_matches_c(source in 0_u8..8, status in 0_u8..16,
+            reinject_reason in 0_u8..16, ack_rssi: i8, peer_valid: bool,
+            peer: u16) {
+            let firmware = source == 3;
+            let source = u32::from(source);
+            let mut bytes = vec![0; 32];
+            let info0 = source | if firmware {
+                (u32::from(status) << 9) | (u32::from(reinject_reason) << 13)
+            } else {
+                u32::from(status) << 13
+            };
+            bytes[8..12].copy_from_slice(&info0.to_le_bytes());
+            bytes[12..16].copy_from_slice(&(u32::from(ack_rssi as u8) << 24).to_le_bytes());
+            bytes[16..20].copy_from_slice(&(u32::from(ack_rssi as u8)
+                | (u32::from(peer_valid) << 21) | u32::from(peer)).to_le_bytes());
+            bytes[28..32].copy_from_slice(&u32::from(peer).to_le_bytes());
+            let mut c_status = 0;
+            let mut c_acked = 0;
+            let mut c_rssi = 0;
+            let mut c_peer_valid = 0;
+            let mut c_peer = 0;
+            // SAFETY: exact descriptor input and valid writable scalar outputs.
+            let action = unsafe { oracle_tx_completion_decision(bytes.as_ptr(), bytes.len(),
+                &mut c_status, &mut c_acked, &mut c_rssi, &mut c_peer_valid, &mut c_peer) };
+            let rust = tx_completion_disposition(&bytes).unwrap();
+            if firmware && status > 5 {
+                prop_assert_eq!(action, 0);
+                prop_assert!(matches!(rust, TxCompletionDisposition::Complete(_)));
+            } else {
+                let rust_action = match rust {
+                    TxCompletionDisposition::Retain => 0,
+                    TxCompletionDisposition::Free => 1,
+                    TxCompletionDisposition::Complete(completion) => {
+                        prop_assert_eq!((completion.status, completion.status == 0,
+                            completion.ack_rssi, completion.peer.map(|value| value.0)),
+                            (c_status, c_acked != 0, c_rssi,
+                                if c_peer_valid != 0 { Some(c_peer) } else { None }));
+                        2
+                    }
+                };
+                prop_assert_eq!(rust_action, action);
+            }
         }
 
         #[test]
