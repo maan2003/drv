@@ -1,5 +1,6 @@
 //! Production Linux VFIO platform backend.
 
+use crate::{PciConfigSnapshot, PciControl, PciControlError};
 use drv_hardware::{Backend, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{
     collections::HashMap,
@@ -26,6 +27,7 @@ pub enum LinuxVfioError {
     OpenIommufd(std::io::Error),
     Setup(String),
     DmaBrokerUnavailable(String),
+    PciControl(PciControlError),
 }
 impl fmt::Display for LinuxVfioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,10 +41,23 @@ impl fmt::Display for LinuxVfioError {
                     "VFIO device does not provide DMA broker feature: {error}"
                 )
             }
+            Self::PciControl(error) => write!(f, "PCI control: {error}"),
         }
     }
 }
 impl std::error::Error for LinuxVfioError {}
+
+pub struct OpenedPciCoherent {
+    backend: LinuxVfio,
+    pci: PciControl,
+    config: PciConfigSnapshot,
+}
+
+impl OpenedPciCoherent {
+    pub fn into_parts(self) -> (LinuxVfio, PciControl, PciConfigSnapshot) {
+        (self.backend, self.pci, self.config)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flavor {
@@ -111,7 +126,11 @@ impl LinuxVfio {
         userspace_vfio::validate_wcn6750_platform_cdev(&self.device).map_err(LinuxVfioError::Setup)
     }
 
-    pub fn open_pci_coherent(path: impl AsRef<Path>) -> std::result::Result<Self, LinuxVfioError> {
+    pub fn open_pci_coherent(
+        path: impl AsRef<Path>,
+        pci_config_path: impl AsRef<Path>,
+    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
+        let pci = PciControl::open(pci_config_path).map_err(LinuxVfioError::PciControl)?;
         let device = Arc::new(open_device(path)?);
         let iommu = Arc::new(
             OpenOptions::new()
@@ -120,11 +139,30 @@ impl LinuxVfio {
                 .open("/dev/iommu")
                 .map_err(LinuxVfioError::OpenIommufd)?,
         );
-        Self::initialize_pci_coherent(device, iommu, |device, iommu| {
+        Self::initialize_pci_controlled(pci, device, iommu, |device, iommu| {
             userspace_vfio::bind_iommufd(device, iommu)?;
             let ioas = userspace_vfio::allocate_ioas(iommu)?;
             userspace_vfio::attach_ioas(device, ioas.id())?;
             Ok(ioas)
+        })
+    }
+
+    fn initialize_pci_controlled(
+        mut pci: PciControl,
+        device: Arc<File>,
+        iommu: Arc<File>,
+        setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
+    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
+        pci.verify_dma_disabled()
+            .map_err(LinuxVfioError::PciControl)?;
+        let backend = Self::initialize_pci_coherent(device, iommu, setup)?;
+        let config = pci
+            .verify_dma_disabled()
+            .map_err(LinuxVfioError::PciControl)?;
+        Ok(OpenedPciCoherent {
+            backend,
+            pci,
+            config,
         })
     }
 
@@ -744,6 +782,10 @@ impl Drop for LinuxVfio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::Cell,
+        io::{Seek, SeekFrom, Write},
+    };
     use userspace_vfio::test_support::{
         Failure, FakeIrq, Record, signal_eventfd, with_fake_automasked_io, with_fake_io,
         with_fake_io_failure, with_fake_pci_io,
@@ -764,6 +806,31 @@ mod tests {
             .unwrap();
         file.set_len(64 * 1024).unwrap();
         (Arc::new(file), path)
+    }
+
+    fn fake_pci_control(command: u16, power_state: u8) -> (PciControl, File, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "drv-pci-config-fake-{}-{:?}-{command:04x}-{power_state}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut bytes = [0; 256];
+        bytes[4..6].copy_from_slice(&command.to_le_bytes());
+        bytes[6..8].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        bytes[0x34] = 0x40;
+        bytes[0x40] = 1;
+        bytes[0x44..0x46].copy_from_slice(&u16::from(power_state).to_le_bytes());
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        let observer = file.try_clone().unwrap();
+        (PciControl::from_file(file), observer, path)
     }
 
     fn fake_pci_backend(device: Arc<File>) -> LinuxVfio {
@@ -1040,6 +1107,68 @@ mod tests {
         assert!(!records.contains(&Record::QueryRegion(6)));
         assert!(records.contains(&Record::InstallIrqAt { index: 2, start: 3 }));
         assert!(records.contains(&Record::DisableIrqAt { index: 2, start: 3 }));
+    }
+
+    #[test]
+    fn pci_construction_gates_both_sides_of_attach() {
+        const MSE: u16 = 1 << 1;
+        const BME: u16 = 1 << 2;
+        let (device, device_path) = fake_device();
+        let iommu = Arc::new(File::open("/dev/null").unwrap());
+        let (unsafe_pci, _, unsafe_path) = fake_pci_control(MSE | BME, 0);
+        let attached = Cell::new(false);
+        assert!(matches!(
+            LinuxVfio::initialize_pci_controlled(
+                unsafe_pci,
+                Arc::clone(&device),
+                Arc::clone(&iommu),
+                |_, _| {
+                    attached.set(true);
+                    unreachable!()
+                }
+            ),
+            Err(LinuxVfioError::PciControl(
+                PciControlError::UnsafeDmaState { .. }
+            ))
+        ));
+        assert!(!attached.get());
+
+        let (safe_pci, mut config, safe_path) = fake_pci_control(MSE, 0);
+        with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 0,
+                eventfd: true,
+            },
+            || {
+                assert!(matches!(
+                    LinuxVfio::initialize_pci_controlled(
+                        safe_pci,
+                        device,
+                        iommu,
+                        |device, iommu| {
+                            userspace_vfio::bind_iommufd(device, iommu)?;
+                            let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                            userspace_vfio::attach_ioas(device, ioas.id())?;
+                            config.seek(SeekFrom::Start(4)).map_err(|e| e.to_string())?;
+                            config
+                                .write_all(&(MSE | BME).to_le_bytes())
+                                .map_err(|e| e.to_string())?;
+                            Ok(ioas)
+                        }
+                    ),
+                    Err(LinuxVfioError::PciControl(
+                        PciControlError::UnsafeDmaState { .. }
+                    ))
+                ));
+            },
+        );
+        std::fs::remove_file(device_path).unwrap();
+        std::fs::remove_file(unsafe_path).unwrap();
+        std::fs::remove_file(safe_path).unwrap();
     }
 
     #[test]

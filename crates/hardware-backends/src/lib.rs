@@ -6,7 +6,11 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 #[cfg(target_os = "linux")]
 mod linux_vfio;
 #[cfg(target_os = "linux")]
-pub use linux_vfio::{LinuxVfio, LinuxVfioError};
+pub use linux_vfio::{LinuxVfio, LinuxVfioError, OpenedPciCoherent};
+#[cfg(target_os = "linux")]
+mod pci_control;
+#[cfg(target_os = "linux")]
+pub use pci_control::{PciConfigSnapshot, PciControl, PciControlError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
