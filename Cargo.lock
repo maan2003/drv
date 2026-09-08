@@ -98,6 +98,9 @@ version = "0.1.0"
 [[package]]
 name = "ath11k-wmi"
 version = "0.1.0"
+dependencies = [
+ "ath11k-ce",
+]
 
 [[package]]
 name = "autocfg"

@@ -7,11 +7,13 @@ mod control;
 mod device;
 mod peer_assoc;
 mod scan;
+mod transport;
 mod wow;
 pub use control::*;
 pub use device::*;
 pub use peer_assoc::*;
 pub use scan::*;
+pub use transport::*;
 pub use wow::*;
 
 pub trait CommandEncoder {
