@@ -53,6 +53,51 @@ pub struct OpenedPciCoherent {
     config: PciConfigSnapshot,
 }
 
+/// Inert, pre-opened authority needed to activate one coherent VFIO PCI device.
+///
+/// [`LinuxVfioPciCapabilities::open`] is the pre-lockdown setup phase. On
+/// success it has issued only `openat` calls, and owns the endpoint's writable
+/// PCI configuration file, VFIO cdev, and `/dev/iommu`. It performs no ioctl,
+/// mmap, device access, or PCI configuration read/write/seek.
+///
+/// Pass this value to [`LinuxVfio::activate_pci_coherent`] after lockdown. That
+/// consuming activation phase performs PCI configuration read/seek and
+/// VFIO/iommufd ioctl setup. The resulting active owner may subsequently use
+/// PCI configuration write/seek, ioctl, mmap/munmap, eventfd/read/ppoll,
+/// clocks/futex, and telemetry write/close while it operates the device.
+pub struct LinuxVfioPciCapabilities {
+    pci: PciControl,
+    device: Arc<File>,
+    iommu: Arc<File>,
+}
+
+impl LinuxVfioPciCapabilities {
+    /// Open and adopt the three PCI/VFIO descriptors without activating them.
+    pub fn open(
+        path: impl AsRef<Path>,
+        pci_config_path: impl AsRef<Path>,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        Self::open_with_iommu_path(path, pci_config_path, "/dev/iommu")
+    }
+
+    fn open_with_iommu_path(
+        path: impl AsRef<Path>,
+        pci_config_path: impl AsRef<Path>,
+        iommu_path: impl AsRef<Path>,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let pci = PciControl::open(pci_config_path).map_err(LinuxVfioError::PciControl)?;
+        let device = Arc::new(open_device(path)?);
+        let iommu = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(iommu_path)
+                .map_err(LinuxVfioError::OpenIommufd)?,
+        );
+        Ok(Self { pci, device, iommu })
+    }
+}
+
 impl OpenedPciCoherent {
     pub fn into_parts(self) -> (LinuxVfio, PciControl, PciConfigSnapshot) {
         (self.backend, self.pci, self.config)
@@ -185,19 +230,30 @@ impl LinuxVfio {
         Ok(())
     }
 
+    /// Compatibility entrypoint that performs both pre-lockdown descriptor
+    /// adoption and activation. New sandboxed production callers should call
+    /// [`LinuxVfioPciCapabilities::open`], install lockdown, and then pass the
+    /// result to [`LinuxVfio::activate_pci_coherent`].
     pub fn open_pci_coherent(
         path: impl AsRef<Path>,
         pci_config_path: impl AsRef<Path>,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
-        let pci = PciControl::open(pci_config_path).map_err(LinuxVfioError::PciControl)?;
-        let device = Arc::new(open_device(path)?);
-        let iommu = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/iommu")
-                .map_err(LinuxVfioError::OpenIommufd)?,
-        );
+        let capabilities = LinuxVfioPciCapabilities::open(path, pci_config_path)?;
+        Self::activate_pci_coherent(capabilities)
+    }
+
+    /// Consume inert, pre-opened PCI/VFIO capabilities and activate the device.
+    ///
+    /// This is the post-lockdown phase. It validates PCI DMA state, binds the
+    /// VFIO cdev to iommufd, allocates and attaches an IOAS, discovers reset and
+    /// MSI-X/MSI support, then revalidates PCI DMA state before exposing the
+    /// backend. These operations issue VFIO/iommufd ioctls and PCI config
+    /// read/lseek; later device operation may issue PCI config writes/lseek,
+    /// mmap/munmap, eventfd/read/ppoll, clocks/futex, and telemetry write/close.
+    pub fn activate_pci_coherent(
+        capabilities: LinuxVfioPciCapabilities,
+    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
+        let LinuxVfioPciCapabilities { pci, device, iommu } = capabilities;
         Self::initialize_pci_controlled(pci, device, iommu, |device, iommu| {
             userspace_vfio::bind_iommufd(device, iommu)?;
             let ioas = userspace_vfio::allocate_ioas(iommu)?;
@@ -1264,6 +1320,72 @@ mod tests {
         std::fs::remove_file(device_path).unwrap();
         std::fs::remove_file(unsafe_path).unwrap();
         std::fs::remove_file(safe_path).unwrap();
+    }
+
+    #[test]
+    fn pci_capability_adoption_is_inert_and_activation_consumes_it() {
+        const MSE: u16 = 1 << 1;
+        let (device, device_path) = fake_device();
+        drop(device);
+        let (pci, config_observer, config_path) = fake_pci_control(MSE, 0);
+        drop(pci);
+        drop(config_observer);
+        let iommu_path = config_path.with_extension("iommu");
+        File::create(&iommu_path).unwrap();
+
+        let (capabilities, setup_records) = with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 0,
+                eventfd: true,
+            },
+            || {
+                LinuxVfioPciCapabilities::open_with_iommu_path(
+                    &device_path,
+                    &config_path,
+                    &iommu_path,
+                )
+                .unwrap()
+            },
+        );
+        assert!(setup_records.is_empty());
+
+        // The capability owns the descriptors rather than retaining paths.
+        std::fs::remove_file(device_path).unwrap();
+        std::fs::remove_file(config_path).unwrap();
+        std::fs::remove_file(iommu_path).unwrap();
+
+        let (config, activation_records) = with_fake_pci_io(
+            FakeIrq {
+                count: 1,
+                eventfd: true,
+            },
+            FakeIrq {
+                count: 0,
+                eventfd: true,
+            },
+            || {
+                let opened = LinuxVfio::activate_pci_coherent(capabilities).unwrap();
+                let (_, _, config) = opened.into_parts();
+                config
+            },
+        );
+        assert_eq!(config.command(), MSE);
+        assert_eq!(
+            activation_records,
+            vec![
+                Record::Bind,
+                Record::AllocateIoas,
+                Record::AttachIoas(7),
+                Record::QueryDevice,
+                Record::QueryIrq(2),
+                Record::QueryIrq(1),
+                Record::DestroyIoas(7),
+            ]
+        );
     }
 
     #[test]

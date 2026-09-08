@@ -11,7 +11,7 @@ use std::{
 #[cfg(target_os = "linux")]
 mod linux_vfio;
 #[cfg(target_os = "linux")]
-pub use linux_vfio::{LinuxVfio, LinuxVfioError, OpenedPciCoherent};
+pub use linux_vfio::{LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, OpenedPciCoherent};
 #[cfg(target_os = "linux")]
 mod pci_control;
 #[cfg(target_os = "linux")]
