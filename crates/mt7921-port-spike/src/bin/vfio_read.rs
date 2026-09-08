@@ -29,31 +29,30 @@ use mt7921_port_spike::{
     CONNAC2_MCU_TXD_BYTES, CandidateChannel, ClientChannelContext, ClientDataGeneration,
     ClientEdcaAc, ClientEdcaParameters, ClientFirmwareEffectsState, ClientPhysicalChannel,
     ClientPhysicalChannelEnsure, ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease,
-    ClientWcid, LegacyWmeAssociation, NicCapability, NicPhyCapability, PassiveMacMmioOperation,
-    PassiveMcuCommand, PassiveRxError, PhysicalBand, RateTxPowerAuthorizer, RateTxPowerTransport,
-    RegulatoryRatePowerSnapshot, candidate_channels, classify_preassociation_sae_auth,
-    MT7921_DATA_RX_RING_COUNT, MT7921_MCU_RX_BUFFER_BYTES, client_data_mpdu_to_ethernet,
-    connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi, prepare_data_rx_ring,
+    ClientWcid, LegacyWmeAssociation, MT7921_DATA_RX_RING_COUNT, MT7921_MCU_RX_BUFFER_BYTES,
+    NicCapability, NicPhyCapability, PassiveMacMmioOperation, PassiveMcuCommand, PassiveRxError,
+    PhysicalBand, RateTxPowerAuthorizer, RateTxPowerTransport, RegulatoryRatePowerSnapshot,
+    candidate_channels, classify_preassociation_sae_auth, client_data_mpdu_to_ethernet,
+    connac2_group1_pn, encode_client_bss_command, encode_client_data_txwi,
     encode_client_early_edca_command, encode_client_edca_command,
     encode_client_interface_bss_command, encode_client_interface_commands,
     encode_client_interface_dev_command, encode_client_join_roc_abort,
     encode_client_join_roc_acquire, encode_client_management_tx,
     encode_client_post_assoc_beacon_timing_command,
-    encode_client_post_assoc_power_state_command,
-    encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_rlm_command,
-    encode_client_post_assoc_rx_filter_clear_command, encode_client_post_assoc_rx_filter_command,
-    encode_conservative_rate_tx_power_commands, encode_disable_keys_command, encode_gtk_command,
-    encode_igtk_command, encode_key_v2_command, encode_legacy_wme_add_wcid_command,
-    encode_passive_mcu_command, encode_ptk_command, encode_regulatory_rate_tx_power_commands,
-    encode_remove_wcid_command, linux_legacy_rate_context_reference,
-    linux_preauth_rate_context_reference, linux_qos_eapol_control_port_reference,
-    linux_qos_null_probe_reference, linux_qos_null_probe_reference_for_tid,
-    load_mt7921_firmware_with_passive_boundary, narrow_regulatory_rate_power_snapshot,
-    parse_client_join_roc_grant, parse_connac2_rx_frame, parse_passive_advertisement,
-    parse_passive_scan_done, passive_mac_bar_offset, passive_mac_mmio_plan,
-    passive_mac_source_rmw_value, regulatory_rate_power_channel_skeleton,
-    regulatory_rate_power_snapshot_from_regdb_v20, set_client_txwi_wcid,
-    validate_passive_mac_bar_read,
+    encode_client_post_assoc_interface_wcid_command, encode_client_post_assoc_power_state_command,
+    encode_client_post_assoc_rlm_command, encode_client_post_assoc_rx_filter_clear_command,
+    encode_client_post_assoc_rx_filter_command, encode_conservative_rate_tx_power_commands,
+    encode_disable_keys_command, encode_gtk_command, encode_igtk_command, encode_key_v2_command,
+    encode_legacy_wme_add_wcid_command, encode_passive_mcu_command, encode_ptk_command,
+    encode_regulatory_rate_tx_power_commands, encode_remove_wcid_command,
+    linux_legacy_rate_context_reference, linux_preauth_rate_context_reference,
+    linux_qos_eapol_control_port_reference, linux_qos_null_probe_reference,
+    linux_qos_null_probe_reference_for_tid, load_mt7921_firmware_with_passive_boundary,
+    narrow_regulatory_rate_power_snapshot, parse_client_join_roc_grant, parse_connac2_rx_frame,
+    parse_passive_advertisement, parse_passive_scan_done, passive_mac_bar_offset,
+    passive_mac_mmio_plan, passive_mac_source_rmw_value, prepare_data_rx_ring,
+    regulatory_rate_power_channel_skeleton, regulatory_rate_power_snapshot_from_regdb_v20,
+    set_client_txwi_wcid, validate_passive_mac_bar_read,
 };
 use mt7921_port_spike::{
     ChannelDomainCommand, ClcSetCommand, ClcSetResponse, DisabledFirmwareStageError,
@@ -3281,7 +3280,7 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         firmware: ClientFirmwareEffectsState::default(),
         peer_wcid: None,
         join_roc_generation: None,
-            established_channel: None,
+        established_channel: None,
         join_roc_deadline: None,
         post_association_data_wait: None,
         eapol_start_deadline: None,
@@ -6654,7 +6653,7 @@ fn run() -> Result<(), String> {
                                 )?;
                             validate_production_prefix_sequence(e2e94_probe, loader.sequence)?;
                             let mut mechanics = VfioPassiveMechanics {
-            idle_rx_polls: 0,
+                                idle_rx_polls: 0,
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -6767,7 +6766,7 @@ fn run() -> Result<(), String> {
                                 )))
                             });
                             let mut mechanics = VfioPassiveMechanics {
-            idle_rx_polls: 0,
+                                idle_rx_polls: 0,
                                 loader,
                                 ledger: capsule
                                     .containment
@@ -7160,7 +7159,7 @@ fn run() -> Result<(), String> {
                                         firmware: ClientFirmwareEffectsState::default(),
                                         peer_wcid: None,
                                         join_roc_generation: None,
-            established_channel: None,
+                                        established_channel: None,
                                         join_roc_deadline: None,
                                         post_association_data_wait: None,
                                         eapol_start_deadline: None,
@@ -9237,7 +9236,11 @@ impl DescriptorProvenance {
             rings: vec![
                 ring(DescriptorOccurrenceRoute::McuNormalRx, 0, 8),
                 ring(DescriptorOccurrenceRoute::McuNormalRx, 4, 8),
-                ring(DescriptorOccurrenceRoute::DataRx, 2, MT7921_DATA_RX_RING_COUNT),
+                ring(
+                    DescriptorOccurrenceRoute::DataRx,
+                    2,
+                    MT7921_DATA_RX_RING_COUNT,
+                ),
             ],
             sealed: Vec::new(),
             revoked: exhausted,
@@ -14286,7 +14289,9 @@ impl LiveClientEffects {
                     record_sae_stage("client_channel_switch result=unsupported");
                 }
                 Err(status) => {
-                    record_sae_stage(&format!("client_channel_switch result=error status={status}"));
+                    record_sae_stage(&format!(
+                        "client_channel_switch result=error status={status}"
+                    ));
                     return Err(status);
                 }
             }
@@ -14818,39 +14823,41 @@ impl Mt7921ClientEffects for LiveClientEffects {
             0
         };
         let qos_frame;
-        let (bytes, control, qos, tid): (&[u8], u16, bool, u8) =
-            if eapol && !qos && association.negotiated_qos {
-                // The Fuchsia MLME deliberately emits EAPOL as a non-QoS data
-                // frame (bound.rs send_eapol_frame). Linux's mac80211 always
-                // builds control-port EAPOL as a QoS data frame with TID 7 on
-                // a WME association (ieee80211_build_hdr with skb priority 7),
-                // so promote the MPDU here to keep the on-air bytes equal to
-                // the oracle instead of rejecting the frame.
-                if to_ds && from_ds {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                let qos_control = control | 0x0080;
-                let mut frame = Vec::with_capacity(bytes.len() + 2);
-                frame.extend_from_slice(&qos_control.to_le_bytes());
-                frame.extend_from_slice(bytes.get(2..24).ok_or(zx::Status::INVALID_ARGS)?);
-                frame.extend_from_slice(&[7, 0]);
-                frame.extend_from_slice(bytes.get(24..).ok_or(zx::Status::INVALID_ARGS)?);
-                record_sae_stage(&format!(
-                    "client_eapol_qos_promotion source=mlme_non_qos_data result=qos_data_tid7 linux_reference=mac80211_control_port frame_len_before={} frame_len_after={}",
-                    bytes.len(),
-                    frame.len()
-                ));
-                qos_frame = frame;
-                (qos_frame.as_slice(), qos_control, true, 7)
-            } else if eapol && qos != association.negotiated_qos {
-                record_sae_stage(&format!(
-                    "client_data_tx_blocked reason=eapol_qos_mismatch qos={qos} negotiated_qos={}",
-                    association.negotiated_qos
-                ));
-                return Err(zx::Status::BAD_STATE);
-            } else {
-                (bytes, control, qos, tid)
-            };
+        let (bytes, control, qos, tid): (&[u8], u16, bool, u8) = if eapol
+            && !qos
+            && association.negotiated_qos
+        {
+            // The Fuchsia MLME deliberately emits EAPOL as a non-QoS data
+            // frame (bound.rs send_eapol_frame). Linux's mac80211 always
+            // builds control-port EAPOL as a QoS data frame with TID 7 on
+            // a WME association (ieee80211_build_hdr with skb priority 7),
+            // so promote the MPDU here to keep the on-air bytes equal to
+            // the oracle instead of rejecting the frame.
+            if to_ds && from_ds {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let qos_control = control | 0x0080;
+            let mut frame = Vec::with_capacity(bytes.len() + 2);
+            frame.extend_from_slice(&qos_control.to_le_bytes());
+            frame.extend_from_slice(bytes.get(2..24).ok_or(zx::Status::INVALID_ARGS)?);
+            frame.extend_from_slice(&[7, 0]);
+            frame.extend_from_slice(bytes.get(24..).ok_or(zx::Status::INVALID_ARGS)?);
+            record_sae_stage(&format!(
+                "client_eapol_qos_promotion source=mlme_non_qos_data result=qos_data_tid7 linux_reference=mac80211_control_port frame_len_before={} frame_len_after={}",
+                bytes.len(),
+                frame.len()
+            ));
+            qos_frame = frame;
+            (qos_frame.as_slice(), qos_control, true, 7)
+        } else if eapol && qos != association.negotiated_qos {
+            record_sae_stage(&format!(
+                "client_data_tx_blocked reason=eapol_qos_mismatch qos={qos} negotiated_qos={}",
+                association.negotiated_qos
+            ));
+            return Err(zx::Status::BAD_STATE);
+        } else {
+            (bytes, control, qos, tid)
+        };
         if qos && !self.firmware.qos_tx_ready() {
             record_sae_stage("client_data_tx_blocked reason=edca_not_programmed");
             return Err(zx::Status::BAD_STATE);
@@ -17308,8 +17315,7 @@ impl VfioPassiveMechanics<'_, '_, '_> {
                     });
                 record_sae_stage(&format!(
                     "client_data_tx_descriptor txd={dwords:08x?} txp_len={} txp_token={} descriptor_hash=fnv1a64:{descriptor_hash:016x}",
-                    dma_len,
-                    token
+                    dma_len, token
                 ));
                 let descriptor = mt7921_dma_tx(
                     DmaSegment {
@@ -18058,7 +18064,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 "passive_m1_tx_boundary result=authorized phase=preassociation class={class} ownership=pinned_sme_mlme permit_consumed=true physical_submit_pending=true"
             ));
         }
-        let validation_trigger = !self.e2e94_probe && eapol && !self.e2e81_probe_done && !self.active_client;
+        let validation_trigger =
+            !self.e2e94_probe && eapol && !self.e2e81_probe_done && !self.active_client;
         if validation_trigger {
             // Same-session source-exact AC discriminator. Validation invokes
             // this only after the complete post-association firmware tail;
@@ -26948,7 +26955,7 @@ mod tests {
                 firmware: ClientFirmwareEffectsState::default(),
                 peer_wcid: None,
                 join_roc_generation: None,
-            established_channel: None,
+                established_channel: None,
                 join_roc_deadline: None,
                 post_association_data_wait: None,
                 eapol_start_deadline: None,

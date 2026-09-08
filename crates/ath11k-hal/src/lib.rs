@@ -3,6 +3,8 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma};
+pub mod srng;
+pub use srng::{RingDirection, RingFlags, RingType, Srng, SrngParams, Wcn6750Registers};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RingId(pub u16);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
