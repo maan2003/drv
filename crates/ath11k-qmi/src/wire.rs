@@ -127,17 +127,19 @@ impl QmiResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StandardResponse {
     pub response: QmiResponse,
+    transaction_id: crate::TransactionId,
     raw: Vec<u8>,
 }
 impl StandardResponse {
     pub fn decode(response: &Response) -> Result<Self, QmiError> {
         Ok(Self {
             response: decode_response(response.bytes())?,
+            transaction_id: response.transaction_id(),
             raw: response.bytes().to_vec(),
         })
     }
     pub fn encode(&self, message_id: MessageId) -> Response {
-        Response::checked(message_id, self.raw.clone())
+        Response::checked(self.transaction_id, message_id, self.raw.clone())
             .expect("a decoded response remains a valid TLV body")
     }
 }
@@ -170,6 +172,7 @@ impl DeviceInfoRequest {
 pub struct IndicationRegisterResponse {
     pub response: QmiResponse,
     pub firmware_status: Option<u64>,
+    transaction_id: crate::TransactionId,
     raw: Vec<u8>,
 }
 impl IndicationRegisterResponse {
@@ -177,12 +180,17 @@ impl IndicationRegisterResponse {
         Ok(Self {
             response: decode_response(response.bytes())?,
             firmware_status: optional_u64(response.bytes(), 0x10)?,
+            transaction_id: response.transaction_id(),
             raw: response.bytes().to_vec(),
         })
     }
     pub fn encode(&self) -> Response {
-        Response::checked(MessageId::IndicationRegister, self.raw.clone())
-            .expect("a decoded response remains a valid TLV body")
+        Response::checked(
+            self.transaction_id,
+            MessageId::IndicationRegister,
+            self.raw.clone(),
+        )
+        .expect("a decoded response remains a valid TLV body")
     }
 }
 
@@ -244,7 +252,7 @@ pub struct IndicationRegisterRequest {
     pub request_memory: Option<u8>,
     pub fw_memory_ready: Option<u8>,
     pub fw_init_done: Option<u8>,
-    pub rejuvenate: Option<u32>,
+    pub rejuvenate: Option<u8>,
     pub xo_cal: Option<u8>,
     pub cal_done: Option<u8>,
 }
@@ -270,7 +278,7 @@ impl IndicationRegisterRequest {
         opt_u8(&mut b, 0x16, self.request_memory);
         opt_u8(&mut b, 0x17, self.fw_memory_ready);
         opt_u8(&mut b, 0x18, self.fw_init_done);
-        opt_u32(&mut b, 0x19, self.rejuvenate);
+        opt_u8(&mut b, 0x19, self.rejuvenate);
         opt_u8(&mut b, 0x1a, self.xo_cal);
         opt_u8(&mut b, 0x1b, self.cal_done);
         Request::from_tlv_bytes(MessageId::IndicationRegister, b)
@@ -404,11 +412,13 @@ pub struct CapabilityResponse {
     pub otp_version: Option<u32>,
     pub eeprom_read_timeout: Option<u32>,
     raw: Vec<u8>,
+    transaction_id: crate::TransactionId,
 }
 
 impl CapabilityResponse {
     pub fn decode(response: &Response) -> Result<Self, QmiError> {
         let bytes = response.bytes();
+        let transaction_id = response.transaction_id();
         validate_tlvs(bytes)?;
         let response = decode_response(bytes)?;
         let chip = optional(bytes, 0x10, |v| {
@@ -447,10 +457,11 @@ impl CapabilityResponse {
             otp_version: optional_u32(bytes, 0x18)?,
             eeprom_read_timeout: optional_u32(bytes, 0x19)?,
             raw: bytes.to_vec(),
+            transaction_id,
         })
     }
     pub fn encode(&self) -> Response {
-        Response::checked(MessageId::Capability, self.raw.clone())
+        Response::checked(self.transaction_id, MessageId::Capability, self.raw.clone())
             .expect("a decoded response remains a valid TLV body")
     }
 }
@@ -461,6 +472,7 @@ pub struct DeviceInfoResponse {
     pub bar_address: Option<u64>,
     pub bar_size: Option<u32>,
     raw: Vec<u8>,
+    transaction_id: crate::TransactionId,
 }
 impl DeviceInfoResponse {
     pub fn decode(r: &Response) -> Result<Self, QmiError> {
@@ -469,10 +481,11 @@ impl DeviceInfoResponse {
             bar_address: optional_u64(r.bytes(), 0x10)?,
             bar_size: optional_u32(r.bytes(), 0x11)?,
             raw: r.bytes().to_vec(),
+            transaction_id: r.transaction_id(),
         })
     }
     pub fn encode(&self) -> Response {
-        Response::checked(MessageId::DeviceInfo, self.raw.clone())
+        Response::checked(self.transaction_id, MessageId::DeviceInfo, self.raw.clone())
             .expect("a decoded response remains a valid TLV body")
     }
 }
@@ -572,7 +585,12 @@ impl WlanConfigRequest {
             if s.as_bytes().len() > 16 {
                 return Err(QmiError::MessageTooLong);
             }
-            tlv(&mut b, 0x10, s.as_bytes())?
+            let end = s
+                .as_bytes()
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(s.as_bytes().len());
+            tlv(&mut b, 0x10, &s.as_bytes()[..end])?
         }
         if let Some(v) = &self.target_pipes {
             if v.len() > MAX_TARGET_PIPES {
@@ -908,7 +926,12 @@ mod tests {
             2, 4, 0, 0, 0, 0, 0, 0x10, 8, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0x11, 4, 0, 0xff, 0, 0, 0,
             0x13, 9, 0, 0x78, 0x56, 0x34, 0x12, 4, b'1', b'2', b'3', b'4',
         ];
-        let r = Response::checked(MessageId::Capability, raw.clone()).unwrap();
+        let r = Response::checked(
+            crate::TransactionId::new(7),
+            MessageId::Capability,
+            raw.clone(),
+        )
+        .unwrap();
         let c = CapabilityResponse::decode(&r).unwrap();
         assert_eq!(c.firmware.unwrap().version, 0x12345678);
         assert_eq!(c.encode().bytes(), raw);
@@ -933,6 +956,36 @@ mod tests {
             request.bytes(),
             [0x10, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b, 0x18, 1, 0, 1, 0x1b, 1, 0, 1,]
         );
+    }
+
+    #[test]
+    fn rejuvenate_is_one_byte_per_elem_info() {
+        let request = IndicationRegisterRequest {
+            rejuvenate: Some(7),
+            ..Default::default()
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(request.bytes(), [0x19, 1, 0, 7]);
+    }
+
+    #[test]
+    fn outbound_qmi_string_uses_c_strlen_prefix() {
+        let request = WlanConfigRequest {
+            host_version: Some(QmiString::new(b"WIN\0ignored".to_vec(), 16).unwrap()),
+            ..Default::default()
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(request.bytes(), [0x10, 3, 0, b'W', b'I', b'N']);
+    }
+
+    #[test]
+    fn empty_indication_skips_unknown_optional_tlv() {
+        let bytes = [0x10, 1, 0, 7];
+        let indication = Indication::decode(MessageId::FirmwareReady, &bytes).unwrap();
+        assert_eq!(indication, Indication::FirmwareReady);
+        assert!(Indication::decode(MessageId::FirmwareReady, &[1, 0, 0]).is_err());
     }
 
     #[test]
@@ -989,7 +1042,11 @@ mod tests {
             }
             let _ = validate_tlvs(&bytes[..len]);
             let _ = RequestMemoryIndication::decode(&bytes[..len]);
-            if let Ok(response) = Response::checked(MessageId::Capability, bytes[..len].to_vec()) {
+            if let Ok(response) = Response::checked(
+                crate::TransactionId::new(1),
+                MessageId::Capability,
+                bytes[..len].to_vec(),
+            ) {
                 let _ = CapabilityResponse::decode(&response);
             }
         }

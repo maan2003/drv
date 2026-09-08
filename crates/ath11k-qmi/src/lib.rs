@@ -41,17 +41,26 @@ impl Request {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
+    transaction_id: TransactionId,
     message_id: MessageId,
     bytes: Vec<u8>,
 }
 
 impl Response {
-    pub fn checked(message_id: MessageId, bytes: Vec<u8>) -> Result<Self, QmiError> {
+    pub fn checked(
+        transaction_id: TransactionId,
+        message_id: MessageId,
+        bytes: Vec<u8>,
+    ) -> Result<Self, QmiError> {
         wire::validate_tlvs(&bytes)?;
         if bytes.len() > wire::RESPONSE_MAX_LEN {
             return Err(QmiError::MessageTooLong);
         }
-        Ok(Self { message_id, bytes })
+        Ok(Self {
+            transaction_id,
+            message_id,
+            bytes,
+        })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -60,6 +69,20 @@ impl Response {
 
     pub const fn message_id(&self) -> MessageId {
         self.message_id
+    }
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionId(u16);
+impl TransactionId {
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+    pub const fn value(self) -> u16 {
+        self.0
     }
 }
 
@@ -74,6 +97,7 @@ pub enum QmiError {
     Malformed,
     MessageTooLong,
     Protocol(wire::QmiResponse),
+    Disconnected,
     Timeout,
     Transport,
 }
@@ -109,8 +133,10 @@ pub enum Incoming {
 pub trait Transport {
     fn start_service(&mut self, version: u32, instance: u32) -> Result<(), QmiError>;
     fn stop_service(&mut self);
-    fn send(&mut self, request: Request) -> Result<(), QmiError>;
-    fn receive(&mut self, deadline_ns: u64) -> Result<Incoming, QmiError>;
+    fn send(&mut self, request: Request) -> Result<TransactionId, QmiError>;
+    fn now_ns(&self) -> u64;
+    /// Wait at most `timeout_ns`; this is a duration, not an absolute timestamp.
+    fn receive(&mut self, timeout_ns: u64) -> Result<Incoming, QmiError>;
 }
 
 pub trait Handshake {

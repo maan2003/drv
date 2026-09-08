@@ -18,10 +18,10 @@ integration path not owned by this protocol crate. Source-derived fixtures cover
 
 | Rust item | Status | C responsibility |
 |---|---|---|
-| `Request` / `Response` / `RawIndication` | **ported** | Message-ID-bearing, bounded checked QMI TLV bodies. |
+| `Request` / `Response` / `RawIndication` | **ported** | Message-ID-bearing, bounded checked QMI TLV bodies; responses retain the QMI transaction ID. |
 | `FirmwareReady` / `DriverEvent` | **ported** | Typed lifecycle outcomes after firmware-ready/init-done. |
 | `QmiError` | **ported** | Transport, malformed input, timeout, and QMI result/error. |
-| `Transport` | **ported/replaced** | Event-driven service discovery, send, response, and unsolicited indication boundary; AF_QIPCRTR stays outside. |
+| `Transport` | **ported/replaced** | Event-driven service discovery, transaction-correlated send/response, monotonic timeout accounting, and unsolicited indication boundary; AF_QIPCRTR stays outside. |
 | `Wcn6750Handshake` | **ported** | Registration, host/target capabilities, memory/BDF/caldata/M3 exchange, start/stop, and readiness sequencing. |
 | `MemoryProvider` / `FirmwareAssets` | **replaced** | Caller-owned DMA/MMIO and firmware lookup without upward dependencies. |
 

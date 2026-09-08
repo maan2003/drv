@@ -14,6 +14,7 @@ const BDF_NAME_SIZE: u32 = 64;
 /// Firmware data selected by the composition root (board-2.bin parsing remains above QMI).
 pub trait FirmwareAssets {
     fn board_data(&mut self, board_id: u32) -> Result<Vec<u8>, QmiError>;
+    /// `None` means the caller explicitly authorizes factory-test boot without caldata.
     fn calibration_data(&mut self) -> Result<Option<Vec<u8>>, QmiError>;
     fn regulatory_data(&mut self) -> Result<Option<Vec<u8>>, QmiError>;
     fn m3_firmware(&mut self) -> Result<Option<Vec<u8>>, QmiError>;
@@ -54,7 +55,8 @@ pub struct HandshakeConfig {
     pub hybrid_bus: bool,
     pub supports_regdb: bool,
     pub m3_support: bool,
-    pub deadline_ns: u64,
+    pub cold_boot_calibration: bool,
+    pub timeout_ns: u64,
 }
 
 impl Default for HandshakeConfig {
@@ -67,7 +69,8 @@ impl Default for HandshakeConfig {
             hybrid_bus: true,
             supports_regdb: true,
             m3_support: false,
-            deadline_ns: 10_000_000_000,
+            cold_boot_calibration: true,
+            timeout_ns: 10_000_000_000,
         }
     }
 }
@@ -141,15 +144,38 @@ impl<'a> Wcn6750Handshake<'a> {
 
     /// The QMI-owned portion of `ath11k_qmi_firmware_stop`.
     pub fn firmware_stop(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
-        self.exchange(
-            transport,
-            WlanModeRequest {
-                mode: 4,
-                hardware_debug: Some(0),
+        let request = WlanModeRequest {
+            mode: 4,
+            hardware_debug: Some(0),
+        }
+        .encode()?;
+        let expected = request.message_id();
+        let transaction = transport.send(request)?;
+        let deadline = transport.now_ns().saturating_add(self.config.timeout_ns);
+        loop {
+            let remaining = deadline.saturating_sub(transport.now_ns());
+            if remaining == 0 {
+                return Err(QmiError::Timeout);
             }
-            .encode()?,
-        )?;
-        Ok(())
+            match transport.receive(remaining) {
+                Ok(Incoming::Response(response)) if response.transaction_id() == transaction => {
+                    if response.message_id() != expected {
+                        return Err(QmiError::Malformed);
+                    }
+                    let status = wire::decode_response(response.bytes())?;
+                    return if status.is_success() {
+                        Ok(())
+                    } else {
+                        Err(QmiError::Protocol(status))
+                    };
+                }
+                Ok(Incoming::Response(_)) => continue,
+                Ok(Incoming::Indication(indication)) => self.pending.push(indication),
+                Ok(Incoming::ServerExited) | Err(QmiError::Disconnected) => return Ok(()),
+                Ok(Incoming::ServerArrived) => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn server_arrived(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
@@ -176,7 +202,7 @@ impl<'a> Wcn6750Handshake<'a> {
             .encode()?,
         )?;
         if self.config.fixed_firmware_memory {
-            self.load_bdf(transport)?;
+            self.load_bdf(transport, false)?;
         }
         Ok(())
     }
@@ -190,7 +216,7 @@ impl<'a> Wcn6750Handshake<'a> {
         if !self.pending.is_empty() {
             return self.process_indication(transport);
         }
-        match transport.receive(self.config.deadline_ns)? {
+        match transport.receive(self.config.timeout_ns)? {
             Incoming::ServerArrived => {
                 self.server_arrived(transport)?;
                 Ok(DriverEvent::ServerArrived)
@@ -222,10 +248,13 @@ impl<'a> Wcn6750Handshake<'a> {
                 Ok(DriverEvent::RequestMemory)
             }
             Indication::FirmwareMemoryReady => {
-                self.load_bdf(transport)?;
+                self.load_bdf(transport, true)?;
                 Ok(DriverEvent::FirmwareMemoryReady)
             }
-            Indication::FirmwareReady => Ok(DriverEvent::FirmwareReady(self.ready())),
+            Indication::FirmwareReady => {
+                self.config.cal_done = true;
+                Ok(DriverEvent::FirmwareReady(self.ready()))
+            }
             Indication::FirmwareInitDone => Ok(DriverEvent::FirmwareInitDone(self.ready())),
             Indication::ColdBootCalibrationDone => {
                 self.config.cal_done = true;
@@ -240,21 +269,28 @@ impl<'a> Wcn6750Handshake<'a> {
         request: Request,
     ) -> Result<Response, QmiError> {
         let expected = request.message_id();
-        transport.send(request)?;
+        let transaction = transport.send(request)?;
+        let deadline = transport.now_ns().saturating_add(self.config.timeout_ns);
         loop {
-            match transport.receive(self.config.deadline_ns)? {
-                Incoming::Response(response) if response.message_id() == expected => {
+            let remaining = deadline.saturating_sub(transport.now_ns());
+            if remaining == 0 {
+                return Err(QmiError::Timeout);
+            }
+            match transport.receive(remaining)? {
+                Incoming::Response(response) if response.transaction_id() == transaction => {
+                    if response.message_id() != expected {
+                        return Err(QmiError::Malformed);
+                    }
                     let status = wire::decode_response(response.bytes())?;
                     if !status.is_success() {
                         return Err(QmiError::Protocol(status));
                     }
                     return Ok(response);
                 }
-                Incoming::Response(_) => return Err(QmiError::Malformed),
+                Incoming::Response(_) => continue,
                 Incoming::Indication(indication) => self.pending.push(indication),
-                Incoming::ServerArrived | Incoming::ServerExited => {
-                    return Err(QmiError::Transport)
-                }
+                Incoming::ServerArrived => continue,
+                Incoming::ServerExited => return Err(QmiError::Disconnected),
             }
         }
     }
@@ -266,7 +302,7 @@ impl<'a> Wcn6750Handshake<'a> {
             self.firmware_version = fw.version;
         }
         self.board_id = cap.board_id.unwrap_or(0xff);
-        self.eeprom_caldata = cap.eeprom_read_timeout.is_some();
+        self.eeprom_caldata = uses_eeprom_caldata(cap.eeprom_read_timeout);
 
         if self.config.hybrid_bus {
             let request = Request::from_tlv_bytes(MessageId::DeviceInfo, Vec::new())?;
@@ -314,7 +350,7 @@ impl<'a> Wcn6750Handshake<'a> {
         Ok(())
     }
 
-    fn load_bdf(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
+    fn load_bdf(&mut self, transport: &mut dyn Transport, send_m3: bool) -> Result<(), QmiError> {
         self.capabilities(transport)?;
 
         if self.config.supports_regdb {
@@ -350,11 +386,18 @@ impl<'a> Wcn6750Handshake<'a> {
             }
         }
 
-        if self.config.m3_support {
-            let Some(m3) = self.assets.m3_firmware()? else {
-                return Err(QmiError::Transport);
+        if send_m3 {
+            let region = if self.config.m3_support {
+                let Some(m3) = self.assets.m3_firmware()? else {
+                    return Err(QmiError::Transport);
+                };
+                self.memory.load_m3(&m3)?
+            } else {
+                MemoryRegion {
+                    device_address: 0,
+                    size: 0,
+                }
             };
-            let region = self.memory.load_m3(&m3)?;
             self.exchange(
                 transport,
                 M3InfoRequest {
@@ -369,12 +412,17 @@ impl<'a> Wcn6750Handshake<'a> {
 
     fn next_indication(&mut self, transport: &mut dyn Transport) -> Result<Indication, QmiError> {
         let raw = if self.pending.is_empty() {
+            let deadline = transport.now_ns().saturating_add(self.config.timeout_ns);
             loop {
-                match transport.receive(self.config.deadline_ns)? {
+                let remaining = deadline.saturating_sub(transport.now_ns());
+                if remaining == 0 {
+                    return Err(QmiError::Timeout);
+                }
+                match transport.receive(remaining)? {
                     Incoming::Indication(indication) => break indication,
                     Incoming::Response(_) => return Err(QmiError::Malformed),
                     Incoming::ServerArrived => continue,
-                    Incoming::ServerExited => return Err(QmiError::Transport),
+                    Incoming::ServerExited => return Err(QmiError::Disconnected),
                 }
             }
         } else {
@@ -382,6 +430,10 @@ impl<'a> Wcn6750Handshake<'a> {
         };
         Indication::decode(raw.message_id(), raw.bytes())
     }
+}
+
+fn uses_eeprom_caldata(timeout: Option<u32>) -> bool {
+    timeout.unwrap_or(0) != 0
 }
 
 impl Handshake for Wcn6750Handshake<'_> {
@@ -396,7 +448,10 @@ impl Handshake for Wcn6750Handshake<'_> {
         }
         loop {
             match self.process_next_event(transport)? {
-                DriverEvent::FirmwareReady(ready) | DriverEvent::FirmwareInitDone(ready) => {
+                DriverEvent::FirmwareReady(ready) => return Ok(ready),
+                DriverEvent::FirmwareInitDone(ready)
+                    if self.config.cal_done || !self.config.cold_boot_calibration =>
+                {
                     return Ok(ready)
                 }
                 DriverEvent::ServerExited => return Err(QmiError::Transport),
@@ -452,6 +507,7 @@ mod tests {
         incoming: VecDeque<Incoming>,
         sent: Vec<MessageId>,
         service: Option<(u32, u32)>,
+        next_transaction: u16,
     }
     impl Transport for MockTransport {
         fn start_service(&mut self, version: u32, instance: u32) -> Result<(), QmiError> {
@@ -461,17 +517,28 @@ mod tests {
         fn stop_service(&mut self) {
             self.service = None;
         }
-        fn send(&mut self, request: Request) -> Result<(), QmiError> {
+        fn send(&mut self, request: Request) -> Result<crate::TransactionId, QmiError> {
             self.sent.push(request.message_id());
-            Ok(())
+            self.next_transaction += 1;
+            Ok(crate::TransactionId::new(self.next_transaction))
+        }
+        fn now_ns(&self) -> u64 {
+            1
         }
         fn receive(&mut self, _: u64) -> Result<Incoming, QmiError> {
             self.incoming.pop_front().ok_or(QmiError::Timeout)
         }
     }
 
-    fn success(id: MessageId) -> Incoming {
-        Incoming::Response(Response::checked(id, vec![2, 4, 0, 0, 0, 0, 0]).unwrap())
+    fn success(transaction: u16, id: MessageId) -> Incoming {
+        Incoming::Response(
+            Response::checked(
+                crate::TransactionId::new(transaction),
+                id,
+                vec![2, 4, 0, 0, 0, 0, 0],
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -486,17 +553,27 @@ mod tests {
         let mut transport = MockTransport {
             incoming: VecDeque::from(vec![
                 Incoming::ServerArrived,
-                success(MessageId::IndicationRegister),
-                success(MessageId::HostCapability),
-                Incoming::Response(Response::checked(MessageId::Capability, cap).unwrap()),
-                Incoming::Response(Response::checked(MessageId::DeviceInfo, device).unwrap()),
-                success(MessageId::BdfDownload),
+                success(1, MessageId::IndicationRegister),
+                success(2, MessageId::HostCapability),
+                Incoming::Response(
+                    Response::checked(crate::TransactionId::new(3), MessageId::Capability, cap)
+                        .unwrap(),
+                ),
+                Incoming::Response(
+                    Response::checked(crate::TransactionId::new(4), MessageId::DeviceInfo, device)
+                        .unwrap(),
+                ),
+                success(5, MessageId::BdfDownload),
+                Incoming::Indication(
+                    RawIndication::checked(MessageId::FirmwareInitDone, Vec::new()).unwrap(),
+                ),
                 Incoming::Indication(
                     RawIndication::checked(MessageId::FirmwareReady, Vec::new()).unwrap(),
                 ),
             ]),
             sent: Vec::new(),
             service: None,
+            next_transaction: 0,
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
@@ -504,6 +581,7 @@ mod tests {
             Wcn6750Handshake::new(HandshakeConfig::default(), &mut assets, &mut memory);
         let ready = handshake.start(&mut transport).unwrap();
         assert_eq!(ready.firmware_version, 0x11223344);
+        assert!(handshake.config.cal_done);
         assert_eq!(transport.service, Some((1, 3)));
         assert_eq!(
             transport.sent,
@@ -524,13 +602,14 @@ mod tests {
     fn firmware_start_and_stop_order() {
         let mut transport = MockTransport {
             incoming: VecDeque::from(vec![
-                success(MessageId::WlanIni),
-                success(MessageId::WlanConfig),
-                success(MessageId::WlanMode),
-                success(MessageId::WlanMode),
+                success(1, MessageId::WlanIni),
+                success(2, MessageId::WlanConfig),
+                success(3, MessageId::WlanMode),
+                success(4, MessageId::WlanMode),
             ]),
             sent: Vec::new(),
             service: None,
+            next_transaction: 0,
         };
         let mut assets = Assets;
         let mut memory = Memory::default();
@@ -549,5 +628,48 @@ mod tests {
                 MessageId::WlanMode
             ]
         );
+    }
+
+    #[test]
+    fn eeprom_caldata_uses_value_not_presence() {
+        assert!(!uses_eeprom_caldata(None));
+        assert!(!uses_eeprom_caldata(Some(0)));
+        assert!(uses_eeprom_caldata(Some(1)));
+    }
+
+    #[test]
+    fn stale_transaction_response_does_not_complete_exchange() {
+        let mut transport = MockTransport {
+            incoming: VecDeque::from(vec![
+                success(99, MessageId::WlanConfig),
+                success(1, MessageId::WlanConfig),
+                success(2, MessageId::WlanMode),
+            ]),
+            sent: Vec::new(),
+            service: None,
+            next_transaction: 0,
+        };
+        let mut assets = Assets;
+        let mut memory = Memory::default();
+        let mut handshake =
+            Wcn6750Handshake::new(HandshakeConfig::default(), &mut assets, &mut memory);
+        handshake
+            .firmware_start(&mut transport, &WlanConfigRequest::default(), 0, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn firmware_stop_accepts_service_disconnect() {
+        let mut transport = MockTransport {
+            incoming: VecDeque::from(vec![Incoming::ServerExited]),
+            sent: Vec::new(),
+            service: None,
+            next_transaction: 0,
+        };
+        let mut assets = Assets;
+        let mut memory = Memory::default();
+        let mut handshake =
+            Wcn6750Handshake::new(HandshakeConfig::default(), &mut assets, &mut memory);
+        assert_eq!(handshake.firmware_stop(&mut transport), Ok(()));
     }
 }
