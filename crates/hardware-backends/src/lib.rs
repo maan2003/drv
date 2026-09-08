@@ -37,6 +37,32 @@ pub enum Operation {
 }
 pub type OperationLog = Rc<RefCell<Vec<Operation>>>;
 
+#[derive(Default)]
+struct DoorbellDependency {
+    descriptor: Range<u64>,
+    doorbell_offset: usize,
+    satisfied: bool,
+}
+
+/// Assertions attached to a recording backend for descriptor/doorbell tests.
+#[derive(Clone)]
+pub struct OrderingAssertions(Rc<RefCell<Vec<DoorbellDependency>>>);
+impl OrderingAssertions {
+    /// Require a fresh DMA write covering `descriptor` before each write to
+    /// `doorbell_offset`. A violation makes the doorbell write fail closed.
+    pub fn expect_descriptor_before_doorbell(
+        &self,
+        descriptor: Range<u64>,
+        doorbell_offset: usize,
+    ) {
+        self.0.borrow_mut().push(DoorbellDependency {
+            descriptor,
+            doorbell_offset,
+            satisfied: false,
+        });
+    }
+}
+
 const FIRST_IOVA: u64 = 0x1000_0000;
 struct Dma {
     bytes: Vec<u8>,
@@ -58,6 +84,7 @@ pub struct DeterministicBackend {
     count: usize,
     edu_buffer: Vec<u8>,
     operations: Option<OperationLog>,
+    ordering: Option<OrderingAssertions>,
 }
 impl Default for DeterministicBackend {
     fn default() -> Self {
@@ -75,6 +102,7 @@ impl Default for DeterministicBackend {
             count: 0,
             edu_buffer: vec![0; 4096],
             operations: None,
+            ordering: None,
         }
     }
 }
@@ -90,11 +118,36 @@ impl DeterministicBackend {
         };
         (Device::from_backend(backend), operations)
     }
+    pub fn recording_device_with_ordering_checks()
+    -> (Device<Self>, OperationLog, OrderingAssertions) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let ordering = OrderingAssertions(Rc::new(RefCell::new(Vec::new())));
+        let backend = Self {
+            operations: Some(operations.clone()),
+            ordering: Some(ordering.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations, ordering)
+    }
     fn dma(&self, id: &u64) -> Result<&Dma> {
         self.dmas.get(id).ok_or(Error::StaleHandle)
     }
     fn dma_mut(&mut self, id: &u64) -> Result<&mut Dma> {
         self.dmas.get_mut(id).ok_or(Error::StaleHandle)
+    }
+    fn record_dma_write(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
+        let iova = self.dma(dma)?.iova;
+        if let Some(ordering) = &self.ordering {
+            let written = iova + range.start as u64..iova + range.end as u64;
+            for dependency in ordering.0.borrow_mut().iter_mut() {
+                if written.start <= dependency.descriptor.start
+                    && written.end >= dependency.descriptor.end
+                {
+                    dependency.satisfied = true;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -130,6 +183,16 @@ impl Backend for DeterministicBackend {
         Ok(value)
     }
     fn write_u32(&mut self, region: &u8, offset: usize, value: u32) -> Result<()> {
+        if let Some(ordering) = &self.ordering {
+            for dependency in ordering.0.borrow_mut().iter_mut() {
+                if dependency.doorbell_offset == offset {
+                    if !dependency.satisfied {
+                        return Err(Error::DeviceFault);
+                    }
+                    dependency.satisfied = false;
+                }
+            }
+        }
         if let Some(log) = &self.operations {
             log.borrow_mut().push(Operation::WriteU32 {
                 region: *region,
@@ -298,6 +361,7 @@ impl Backend for DeterministicBackend {
         Ok(())
     }
     fn dma_write(&mut self, dma: &u64, r: Range<usize>, bytes: &[u8]) -> Result<()> {
+        self.record_dma_write(dma, r.clone())?;
         let d = self.dma_mut(dma)?;
         // hardware-api uses this backend primitive to initialize every fresh
         // allocation, including device-to-CPU buffers. Directional access is
@@ -312,6 +376,7 @@ impl Backend for DeterministicBackend {
         Ok(u32::from_ne_bytes(bytes))
     }
     fn dma_write_once_u32(&mut self, dma: &u64, offset: usize, value: u32) -> Result<()> {
+        self.record_dma_write(dma, offset..offset + 4)?;
         self.dma_mut(dma)?.bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         Ok(())
     }
@@ -620,6 +685,22 @@ mod tests {
         streaming.sync_for_device(0, 4).unwrap();
         streaming.write_once(4, 0x8765_4321_u32).unwrap();
         assert_eq!(streaming.read_once::<u32>(4).unwrap(), 0x8765_4321);
+    }
+
+    #[test]
+    fn recording_backend_rejects_doorbell_before_declared_descriptor_write() {
+        let (device, _, ordering) = DeterministicBackend::recording_device_with_ordering_checks();
+        let bar = device.open_region(0).unwrap();
+        let mut descriptors = device
+            .alloc_coherent::<drv_hardware::ToDevice>(16, 4)
+            .unwrap();
+        let descriptor = descriptors.device_address(4).unwrap().bits();
+        ordering.expect_descriptor_before_doorbell(descriptor..descriptor + 4, 0x100);
+
+        assert_eq!(bar.write_u32(0x100, 1), Err(Error::DeviceFault));
+        descriptors.write(4, &[1, 2, 3, 4]).unwrap();
+        bar.write_u32(0x100, 1).unwrap();
+        assert_eq!(bar.write_u32(0x100, 2), Err(Error::DeviceFault));
     }
 
     #[test]

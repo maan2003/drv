@@ -109,7 +109,9 @@ pub trait Backend {
     /// DMA observe device writes completed before the register became visible.
     fn read_u32(&mut self, region: &Self::Region, offset: usize) -> Result<u32>;
     /// MMIO store with release ordering relative to preceding CPU writes to
-    /// coherent DMA and preceding `sync_for_device` operations.
+    /// coherent DMA and preceding `sync_for_device` operations on the same
+    /// thread. In particular, a descriptor write must become visible before a
+    /// later doorbell store performed through this method.
     fn write_u32(&mut self, region: &Self::Region, offset: usize, value: u32) -> Result<()>;
     /// DMA-address store with the same release ordering as `write_u32`.
     fn write_dma_address(
@@ -580,6 +582,8 @@ impl<B: Backend, D: Direction> CoherentDma<B, D> {
     }
 }
 impl<B: Backend, D: CpuWrite> CoherentDma<B, D> {
+    /// Write DMA memory. A later [`MmioRegion::write_u32`] on the same thread
+    /// is release-ordered after this write by the backend contract.
     pub fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
         let r = self.0.range(offset, bytes.len())?;
         self.0.bytes[r.clone()].copy_from_slice(bytes);
