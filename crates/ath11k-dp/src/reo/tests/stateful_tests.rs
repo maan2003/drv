@@ -1,4 +1,5 @@
 use super::*;
+extern crate std;
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -6,9 +7,11 @@ enum Command {
     Setup {
         tid: u8,
         window: u8,
+        wmi_outcome: u8,
     },
     Delete {
         tid: u8,
+        fail_invalidation: bool,
     },
     Status {
         tag: u16,
@@ -22,14 +25,40 @@ enum Command {
 }
 
 fn command() -> impl Strategy<Value = Command> {
+    let tid = prop_oneof![5 => Just(0_u8), 1 => 1_u8..=3];
     prop_oneof![
-        3 => (0_u8..=3, 1_u8..=128).prop_map(|(tid, window)| Command::Setup { tid, window }),
-        3 => (0_u8..=3).prop_map(|tid| Command::Delete { tid }),
+        5 => (tid.clone(), 1_u8..=128, 0_u8..=2).prop_map(
+            |(tid, window, wmi_outcome)| Command::Setup { tid, window, wmi_outcome }
+        ),
+        4 => (tid, any::<bool>()).prop_map(
+            |(tid, fail_invalidation)| Command::Delete { tid, fail_invalidation }
+        ),
         5 => (0_u16..=511, any::<u8>(), 0_u8..=3, any::<bool>()).prop_map(
             |(tag, pending, execution, short)| Command::Status { tag, pending, execution, short }
         ),
         2 => any::<u16>().prop_map(|now_ms| Command::Poll { now_ms }),
     ]
+}
+
+fn stateful_cases() -> u32 {
+    std::env::var("ATH11K_STATEFUL_CASES")
+        .or_else(|_| std::env::var("PROPTEST_CASES"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128)
+}
+
+fn stateful_max_steps() -> usize {
+    std::env::var("ATH11K_STATEFUL_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(96)
+        .clamp(1, 4_096)
+}
+
+fn sequence_lengths() -> core::ops::RangeInclusive<usize> {
+    let max = stateful_max_steps();
+    if max > 96 { max / 2..=max } else { 1..=max }
 }
 
 fn check_accounting(peers: &PeerRxTids<DeterministicBackend>) {
@@ -40,14 +69,16 @@ fn check_accounting(peers: &PeerRxTids<DeterministicBackend>) {
         + peers.uncertain_setup.len()
         + peers.failed_delete.len();
     assert_eq!((peers.pool.free_segments() + owned) % 8, 0);
-    for tid in 0..=3 {
+    let mut device_visible_keys = alloc::collections::BTreeSet::new();
+    for entry in peers
+        .tids
+        .iter()
+        .chain(&peers.uncertain_setup)
+        .chain(&peers.failed_delete)
+    {
         assert!(
-            peers
-                .tids
-                .iter()
-                .filter(|entry| entry.tid.tid == tid)
-                .count()
-                <= 1
+            device_visible_keys.insert((entry.vdev_id, entry.peer_addr, entry.tid.tid)),
+            "same peer/TID key has more than one possibly device-visible owner"
         );
     }
 }
@@ -67,29 +98,61 @@ fn descriptor(tag: u16, command_number: u16, execution: u8, short: bool) -> Desc
 fn run_commands(commands: &[Command]) {
     let (device, operations) = DeterministicBackend::recording_noncoherent_device();
     let mut peers = PeerRxTids::new(device).unwrap();
+    peers
+        .register_peer_after_firmware_create(1, [1; 6])
+        .unwrap();
     let mut reo = controller();
     let mut rings = ModelRings::default();
     let mut wmi = ModelWmi::default();
 
     for command in commands {
         match *command {
-            Command::Setup { tid, window } => {
-                let _ = peers.ath11k_peer_rx_tid_setup(
-                    &mut reo,
-                    &mut rings,
-                    &mut wmi,
-                    1,
-                    [1; 6],
-                    tid,
-                    u32::from(window),
-                    0,
-                    PacketNumberType::None,
-                );
+            Command::Setup {
+                tid,
+                window,
+                wmi_outcome,
+            } => {
+                if wmi_outcome == 2 {
+                    let _ = peers.ath11k_peer_rx_tid_setup(
+                        &mut reo,
+                        &mut rings,
+                        &mut UncertainWmi,
+                        1,
+                        [1; 6],
+                        tid,
+                        u32::from(window),
+                        0,
+                        PacketNumberType::None,
+                    );
+                } else {
+                    wmi.fail = wmi_outcome == 1;
+                    let _ = peers.ath11k_peer_rx_tid_setup(
+                        &mut reo,
+                        &mut rings,
+                        &mut wmi,
+                        1,
+                        [1; 6],
+                        tid,
+                        u32::from(window),
+                        0,
+                        PacketNumberType::None,
+                    );
+                    wmi.fail = false;
+                }
             }
-            Command::Delete { tid } => {
-                peers
-                    .ath11k_peer_rx_tid_delete(&mut reo, &mut rings, 1, [1; 6], tid)
-                    .unwrap();
+            Command::Delete {
+                tid,
+                fail_invalidation,
+            } => {
+                rings.fail_publish = fail_invalidation;
+                let result = peers.ath11k_peer_rx_tid_delete(&mut reo, &mut rings, 1, [1; 6], tid);
+                rings.fail_publish = false;
+                if fail_invalidation && result.is_ok() {
+                    assert!(
+                        !peers.tids.iter().any(|entry| entry.tid.tid == tid),
+                        "a successful no-op delete must not leave an unexpected active owner"
+                    );
+                }
             }
             Command::Status {
                 tag,
@@ -126,11 +189,11 @@ fn run_commands(commands: &[Command]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(stateful_cases()))]
 
     #[test]
     fn reo_command_sequences_keep_owner_accounting_consistent(
-        commands in proptest::collection::vec(command(), 1..=64)
+        commands in proptest::collection::vec(command(), sequence_lengths())
     ) {
         run_commands(&commands);
     }

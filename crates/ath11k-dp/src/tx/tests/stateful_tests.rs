@@ -1,5 +1,7 @@
 use super::*;
+extern crate std;
 use alloc::collections::BTreeSet;
+use alloc::collections::VecDeque;
 use ath11k_platform_backend::MmioRegion;
 use proptest::prelude::*;
 
@@ -25,19 +27,49 @@ enum Command {
         work: u8,
         receive: u8,
     },
+    DmaPrepareFailure,
 }
 
 fn command() -> impl Strategy<Value = Command> {
     prop_oneof![
         3 => (any::<bool>(), any::<bool>()).prop_map(|(qos, protected)| Command::Submit { qos, protected }),
-        4 => (any::<u8>(), 0_u8..=7, any::<u8>(), any::<bool>()).prop_map(
+        6 => (0_u8..=3, 0_u8..=7, any::<u8>(), any::<bool>()).prop_map(
             |(owner, source, status, short)| Command::TxCompletion { owner, source, status, short }
         ),
-        5 => (any::<u8>(), 0_u8..=6, 0_u8..=3, any::<u16>()).prop_map(
+        7 => (0_u8..=3, 0_u8..=6, 0_u8..=3, any::<u16>()).prop_map(
             |(owner, shape, push_reason, length)| Command::RxCompletion { owner, shape, push_reason, length }
         ),
-        4 => (0_u8..=8, 0_u8..=4).prop_map(|(work, receive)| Command::Service { work, receive }),
+        7 => (0_u8..=8, 0_u8..=4).prop_map(|(work, receive)| Command::Service { work, receive }),
+        1 => Just(Command::DmaPrepareFailure),
     ]
+}
+
+fn stateful_cases() -> u32 {
+    std::env::var("ATH11K_STATEFUL_CASES")
+        .or_else(|_| std::env::var("PROPTEST_CASES"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128)
+}
+
+fn stateful_max_steps() -> usize {
+    std::env::var("ATH11K_STATEFUL_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(96)
+        .clamp(1, 4_096)
+}
+
+fn sequence_lengths() -> core::ops::RangeInclusive<usize> {
+    let max = stateful_max_steps();
+    if max > 96 { max / 2..=max } else { 1..=max }
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedTxCompletion {
+    Malformed,
+    Retain,
+    Remove { msdu_id: u32, callback: bool },
 }
 
 #[derive(Default)]
@@ -103,7 +135,11 @@ fn copy_to_rx(
     bar.write_u32(0x98, 1 | 2).unwrap();
 }
 
-fn check_state(dp: &ClientDataPath<DeterministicBackend, ModelRings>, host: &RecordingHost) {
+fn check_state(
+    dp: &ClientDataPath<DeterministicBackend, ModelRings>,
+    host: &RecordingHost,
+    expected_live_tx: &BTreeSet<u32>,
+) {
     let tx_ids = dp
         .pending
         .iter()
@@ -113,6 +149,10 @@ fn check_state(dp: &ClientDataPath<DeterministicBackend, ModelRings>, host: &Rec
         tx_ids.len(),
         dp.pending.len(),
         "live TX IDs must be distinct"
+    );
+    assert_eq!(
+        &tx_ids, expected_live_tx,
+        "TX owner accounting differs from the independent command model"
     );
     assert!(
         host.tx_ids.is_disjoint(&tx_ids),
@@ -161,8 +201,14 @@ fn run_commands(commands: &[Command]) {
         8,
     )
     .unwrap();
+    // Put the cursor at its boundary while IDs 1 through 8 remain live. Two
+    // replacements therefore cross the 18-bit wrap in a short generated run.
+    dp.next_rx_cookie = RX_BUFFER_ID_MASK;
     let mut host = RecordingHost::default();
     let mut device_written = BTreeSet::new();
+    let mut expected_live_tx = BTreeSet::new();
+    let mut next_msdu_id = 0_u32;
+    let mut expected_tx_completions = VecDeque::new();
 
     for command in commands {
         match *command {
@@ -186,6 +232,20 @@ fn run_commands(commands: &[Command]) {
                     },
                 )
                 .unwrap();
+                let mut expected = next_msdu_id;
+                while expected_live_tx.contains(&expected) {
+                    expected = if expected == MAX_MSDU_ID {
+                        0
+                    } else {
+                        expected + 1
+                    };
+                }
+                assert!(expected_live_tx.insert(expected));
+                next_msdu_id = if expected == MAX_MSDU_ID {
+                    0
+                } else {
+                    expected + 1
+                };
             }
             Command::TxCompletion {
                 owner,
@@ -199,6 +259,7 @@ fn run_commands(commands: &[Command]) {
                     dp.pending[usize::from(owner) % dp.pending.len()].msdu_id
                 };
                 let descriptor = if short {
+                    expected_tx_completions.push_back(ExpectedTxCompletion::Malformed);
                     Descriptor::new(vec![0; usize::from(owner % 32)], usize::from(owner % 32))
                         .unwrap()
                 } else {
@@ -213,6 +274,19 @@ fn run_commands(commands: &[Command]) {
                     let info0 = u32::from_le_bytes(raw[8..12].try_into().unwrap())
                         | (u32::from(status & 0x1f) << 9);
                     raw[8..12].copy_from_slice(&info0.to_le_bytes());
+                    let expected = match source {
+                        0 => ExpectedTxCompletion::Remove {
+                            msdu_id,
+                            callback: true,
+                        },
+                        3 if status & 0x0f == 5 => ExpectedTxCompletion::Retain,
+                        3 => ExpectedTxCompletion::Remove {
+                            msdu_id,
+                            callback: !matches!(status & 0x0f, 3 | 4),
+                        },
+                        _ => ExpectedTxCompletion::Retain,
+                    };
+                    expected_tx_completions.push_back(expected);
                     Descriptor::new(raw.to_vec(), raw.len()).unwrap()
                 };
                 dp.rings_mut()
@@ -262,11 +336,29 @@ fn run_commands(commands: &[Command]) {
                 operations.borrow_mut().clear();
                 let before_rx = host.rx_count;
                 let before_tx = host.tx_ids.len();
+                let queued_before = dp.rings().ring_completions.get(&3).map_or(0, VecDeque::len);
                 let result = dp
                     .service_host(usize::from(work), usize::from(receive), &mut host)
                     .unwrap();
+                let queued_after = dp.rings().ring_completions.get(&3).map_or(0, VecDeque::len);
+                let mut expected_callbacks = 0;
+                for _ in 0..queued_before - queued_after {
+                    match expected_tx_completions.pop_front().unwrap() {
+                        ExpectedTxCompletion::Malformed | ExpectedTxCompletion::Retain => {}
+                        ExpectedTxCompletion::Remove { msdu_id, callback } => {
+                            if expected_live_tx.remove(&msdu_id) && callback {
+                                expected_callbacks += 1;
+                            }
+                        }
+                    }
+                }
                 assert_eq!(host.rx_count - before_rx, result.rx_delivered);
                 assert_eq!(host.tx_ids.len() - before_tx, result.tx_delivered);
+                assert_eq!(
+                    host.tx_ids.len() - before_tx,
+                    expected_callbacks,
+                    "TX callbacks differ from supported completion-source accounting"
+                );
                 let operations = operations.borrow();
                 for pair in operations.chunks(2) {
                     match pair {
@@ -287,17 +379,33 @@ fn run_commands(commands: &[Command]) {
                     }
                 }
             }
+            Command::DmaPrepareFailure => {
+                let (device, failures) = DeterministicBackend::noncoherent_device_with_failures();
+                let pool = make_rx_pool(device).unwrap();
+                let mut completed = RxBuffer::replenish(&pool).unwrap();
+                let discarded = completed.device_address().unwrap().bits();
+                completed.sync_and_read(completed.len()).unwrap();
+                failures.fail_next_sync_for_device();
+                assert_eq!(completed.prepare_for_device(), Err(DpError::DeviceFault));
+                drop(completed);
+                let replacement = RxBuffer::replenish(&pool).unwrap();
+                assert_ne!(
+                    replacement.device_address().unwrap().bits(),
+                    discarded,
+                    "a segment whose prepare failed returned to the DMA pool"
+                );
+            }
         }
-        check_state(&dp, &host);
+        check_state(&dp, &host, &expected_live_tx);
     }
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(stateful_cases()))]
 
     #[test]
     fn command_sequences_keep_buffer_lifecycle_consistent(
-        commands in proptest::collection::vec(command(), 1..=64)
+        commands in proptest::collection::vec(command(), sequence_lengths())
     ) {
         run_commands(&commands);
     }

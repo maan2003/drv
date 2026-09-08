@@ -25,18 +25,77 @@ enum Command {
     },
 }
 
-fn command() -> impl Strategy<Value = Command> {
+const DEFAULT_STATEFUL_CASES: u32 = 128;
+const DEFAULT_STATEFUL_STEPS: usize = 64;
+const STATEFUL_COMMAND_LIMIT: usize = 4096;
+
+fn stateful_cases() -> u32 {
+    std::env::var("ATH11K_STATEFUL_CASES")
+        .or_else(|_| std::env::var("PROPTEST_CASES"))
+        .ok()
+        .map(|value| {
+            value.parse().unwrap_or_else(|error| {
+                panic!("ATH11K_STATEFUL_CASES must be a positive integer: {error}")
+            })
+        })
+        .unwrap_or(DEFAULT_STATEFUL_CASES)
+        .max(1)
+}
+
+fn stateful_max_steps() -> usize {
+    std::env::var("ATH11K_STATEFUL_STEPS")
+        .ok()
+        .map(|value| {
+            value.parse().unwrap_or_else(|error| {
+                panic!("ATH11K_STATEFUL_STEPS must be a positive integer: {error}")
+            })
+        })
+        .unwrap_or(DEFAULT_STATEFUL_STEPS)
+        .clamp(1, STATEFUL_COMMAND_LIMIT)
+}
+
+fn command(endpoint: u8) -> impl Strategy<Value = Command> {
     prop_oneof![
         5 => (0_u16..=700, any::<bool>()).prop_map(|(length, fail)| Command::Send { length, fail }),
-        4 => (0_u8..=12, any::<u8>(), any::<bool>()).prop_map(
+        4 => (prop_oneof![4 => Just(endpoint), 1 => 0_u8..=12], any::<u8>(), any::<bool>()).prop_map(
             |(endpoint, amount, short)| Command::ReceiveCredit { endpoint, amount, short }
         ),
-        4 => (0_u8..=12, 0_u16..=512, any::<bool>()).prop_map(
+        4 => (prop_oneof![4 => Just(endpoint), 1 => 0_u8..=12], 0_u16..=512, any::<bool>()).prop_map(
             |(endpoint, length, short)| Command::ReceivePayload { endpoint, length, short }
         ),
         2 => any::<u8>().prop_map(|length| Command::TxBuffer { length }),
         2 => any::<u8>().prop_map(|length| Command::RxBuffer { length }),
     ]
+}
+
+fn command_sequence(max_commands: usize) -> impl Strategy<Value = Vec<Command>> {
+    let long_sequence_start = (max_commands / 2).max(1);
+    (
+        0_u8..=12,
+        prop_oneof![
+            1 => 1_usize..=max_commands,
+            4 => long_sequence_start..=max_commands,
+        ],
+    )
+        .prop_flat_map(|(endpoint, length)| {
+            let max_runs = length.div_ceil(8).max(1);
+            proptest::collection::vec((command(endpoint), 1_usize..=32), 1..=max_runs).prop_map(
+                move |runs| {
+                    let mut commands = Vec::with_capacity(length);
+                    for (command, run_length) in runs {
+                        commands.extend(core::iter::repeat_n(command, run_length));
+                        if commands.len() >= length {
+                            commands.truncate(length);
+                            return commands;
+                        }
+                    }
+
+                    let last = commands.last().cloned().expect("at least one command run");
+                    commands.resize(length, last);
+                    commands
+                },
+            )
+        })
 }
 
 fn credit_frame(endpoint: u8, amount: u8, short: bool) -> Vec<u8> {
@@ -192,11 +251,11 @@ fn run_commands(commands: &[Command]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(stateful_cases()))]
 
     #[test]
     fn htc_and_dma_command_sequences_keep_accounting_consistent(
-        commands in proptest::collection::vec(command(), 1..=64)
+        commands in command_sequence(stateful_max_steps())
     ) {
         run_commands(&commands);
     }
