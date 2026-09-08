@@ -3,8 +3,8 @@
 //! Ath11k client binding for the chip-neutral synchronous SoftMAC contract.
 
 use ath11k_core::{
-    ClientRadioControl as _, Device, DeviceState, EventSource as _, Lifecycle as _,
-    ModelSubsystems, RadioControl as _, ScanConfig, ScanId, Subsystems, VdevId, WCN6750, WlanEvent,
+    ClientRadioControl as _, Device, DeviceState, Lifecycle as _, ModelSubsystems,
+    RadioControl as _, ScanConfig, ScanId, Subsystems, VdevId, WCN6750, WlanEvent,
 };
 use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType};
 use wlan_softmac_host::{
@@ -116,13 +116,22 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
         if self.upcalls.is_some() || self.device.state() != DeviceState::Allocated {
             return Err(zx::Status::BAD_STATE);
         }
-        self.device.probe().map_err(status)?;
-        self.device.attach_firmware().map_err(status)?;
-        self.device.start_radio().map_err(status)?;
+        if let Err(error) = self.device.probe() {
+            self.device.abort_startup();
+            return Err(status(error));
+        }
+        if let Err(error) = self.device.attach_firmware() {
+            self.device.abort_startup();
+            return Err(status(error));
+        }
+        if let Err(error) = self.device.start_radio() {
+            self.device.abort_startup();
+            return Err(status(error));
+        }
         match self.device.create_client_vdev(self.mac) {
             Ok(vdev) => self.vdev = Some(vdev),
             Err(error) => {
-                let _ = self.device.stop();
+                self.device.abort_startup();
                 return Err(status(error));
             }
         }
@@ -220,8 +229,12 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 });
         }
 
-        if let Some(event) = self.device.next_wlan_event().map_err(status)? {
-            progressed = true;
+        let (event, control_progressed) = self
+            .device
+            .poll_wlan_event(DP_WORK_BUDGET)
+            .map_err(status)?;
+        progressed |= control_progressed;
+        if let Some(event) = event {
             match event {
                 WlanEvent::ManagementReceived {
                     channel_mhz,
@@ -318,12 +331,8 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
 
     fn join_bss(&mut self, request: JoinBssRequest) -> Result<(), zx::Status> {
-        let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
-        self.device
-            .create_peer(self.ready_vdev()?, peer)
-            .map_err(status)?;
-        self.peer = Some(peer);
-        Ok(())
+        let _ = request;
+        Err(zx::Status::NOT_SUPPORTED)
     }
     fn install_key(&mut self, _configuration: WlanKeyConfiguration) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
@@ -407,9 +416,25 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ath11k_core::Operation;
     use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
 
     const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
+
+    struct NoopUpcalls;
+    impl WlanSoftmacUpcalls for NoopUpcalls {
+        fn recv(&mut self, _: Vec<u8>, _: WlanRxInfo) {}
+        fn report_tx_result(&mut self, _: WlanTxResult) {}
+        fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
+    }
+
+    fn failed_start(operation: Operation) -> Device<ModelSubsystems> {
+        let mut backend = ModelSubsystems::default();
+        backend.fail_once(operation);
+        let mut adapter = Ath11kClientDevice::new(WCN6750.device(backend), CLIENT);
+        assert!(adapter.start(Box::new(NoopUpcalls)).is_err());
+        adapter.into_device()
+    }
 
     #[test]
     fn deterministic_ath11k_passes_the_generic_client_contract() {
@@ -421,5 +446,47 @@ mod tests {
             run_client_conformance(Ath11kClientDevice::deterministic(CLIENT), channel).unwrap(),
             expected_client_conformance(CLIENT, 1)
         );
+    }
+
+    #[test]
+    fn failed_firmware_attach_unwinds_probed_device() {
+        let device = failed_start(Operation::QmiWaitFirmwareReady);
+        assert_eq!(device.state(), DeviceState::Stopped);
+        assert!(device.backend().operations().ends_with(&[
+            Operation::HifPowerDown,
+            Operation::RegFree,
+            Operation::QmiDeinitService,
+        ]));
+    }
+
+    #[test]
+    fn failed_hif_power_up_unwinds_allocated_device() {
+        let device = failed_start(Operation::HifPowerUp);
+        assert_eq!(device.state(), DeviceState::Stopped);
+        assert!(device.backend().operations().contains(&Operation::WmiDetach));
+    }
+
+    #[test]
+    fn failed_dp_allocation_releases_partial_transport() {
+        let device = failed_start(Operation::DpAllocate);
+        assert_eq!(device.state(), DeviceState::Stopped);
+        assert!(device.backend().operations().contains(&Operation::WmiDetach));
+    }
+
+    #[test]
+    fn failed_radio_start_unwinds_ready_device() {
+        let device = failed_start(Operation::RadioStart);
+        assert_eq!(device.state(), DeviceState::Stopped);
+        assert!(
+            device
+                .backend()
+                .operations()
+                .contains(&Operation::QmiFirmwareStop)
+        );
+        assert!(device.backend().operations().ends_with(&[
+            Operation::DpFree,
+            Operation::RegFree,
+            Operation::QmiDeinitService,
+        ]));
     }
 }

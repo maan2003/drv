@@ -168,6 +168,37 @@ impl<B: Subsystems> Device<B> {
             .service_dp_host(work_budget, receive_budget, host)
     }
 
+    /// Consume a bounded control-event slot, including ignored firmware work.
+    pub fn poll_wlan_event(
+        &mut self,
+        work_budget: usize,
+    ) -> Result<(Option<WlanEvent>, bool), CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        self.backend.next_wlan_event_bounded(work_budget)
+    }
+
+    /// Unwind a partially or fully initialized device after lifecycle start
+    /// fails. This is terminal; callers construct a fresh owner to retry.
+    pub fn abort_startup(&mut self) {
+        match self.state {
+            DeviceState::Allocated | DeviceState::Probed => {
+                let _ = self.op(Operation::DpFree);
+                let _ = self.op(Operation::WmiDetach);
+                let _ = self.op(Operation::QmiFirmwareStop);
+                let _ = self.op(Operation::HifPowerDown);
+                let _ = self.op(Operation::RegFree);
+                let _ = self.op(Operation::QmiDeinitService);
+                self.state = DeviceState::Stopped;
+            }
+            DeviceState::Ready | DeviceState::Recovering => {
+                let _ = self.stop();
+            }
+            DeviceState::Stopped | DeviceState::Wedged => {}
+        }
+    }
+
     fn op(&mut self, operation: Operation) -> Result<(), CoreError> {
         self.backend.execute(operation)
     }

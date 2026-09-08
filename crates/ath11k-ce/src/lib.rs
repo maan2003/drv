@@ -1213,12 +1213,24 @@ impl<I: HtcPacketIo> HtcRouter<I> {
     /// Drain currently completed CE frames and route each HTC payload to the
     /// queue belonging to its connected endpoint.
     pub fn service_receive(&self, deadline_ns: u64) -> Result<usize, CeError> {
+        self.service_receive_bounded(deadline_ns, usize::MAX)
+    }
+
+    /// Route at most `budget` completed CE frames to connected endpoints.
+    pub fn service_receive_bounded(
+        &self,
+        deadline_ns: u64,
+        budget: usize,
+    ) -> Result<usize, CeError> {
         let mut core = self
             .core
             .try_borrow_mut()
             .map_err(|_| CeError::DeviceFault)?;
         let mut routed = 0;
-        while let Some(frame) = core.transport.receive(deadline_ns)? {
+        while routed < budget {
+            let Some(frame) = core.transport.receive(deadline_ns)? else {
+                break;
+            };
             let endpoint = core
                 .transport
                 .htc()
@@ -1994,7 +2006,8 @@ mod tests {
         let mut htt = router.endpoint(ServiceId::HTT_DATA_MSG).unwrap();
         wmi.send_payload(&[1, 2, 3]).unwrap();
         htt.send_payload(&[4, 5]).unwrap();
-        assert_eq!(router.service_receive(10), Ok(2));
+        assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
+        assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
         // Each independent consumer sees only its endpoint's routed queue.
         assert_eq!(htt.receive_payload(10), Ok(Some(vec![7, 6])));
         assert_eq!(wmi.receive_payload(10), Ok(Some(vec![9, 8])));
