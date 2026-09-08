@@ -118,12 +118,16 @@ the zero mask, and performs the mandatory VFIO reset. It does not arm a VFIO
 IRQ or enable any device interrupt.
 
 `--stage-disabled-firmware-descriptor` decompresses and bounds-checks the exact
-installed MT7961 ROM patch, maps separate one-page descriptor and payload
-arenas at fixed low-32-bit IOVAs, and stages only its first 4096-byte raw
-`FW_SCATTER` chunk. It first requires TX/RX DMA and every host interrupt to be
-disabled. The payload is copied before a release fence publishes one ring-16
-descriptor, which is read back and then reset to CPU ownership; the payload is
-zeroed, both mappings are explicitly removed, and VFIO reset is mandatory.
+installed MT7961 ROM patch, then uses typed coherent DMA for separate one-page
+descriptor and payload arenas. The descriptor ring is bidirectional because
+hardware owns completion state; the payload is device-readable only. Both
+allocations require one segment, page alignment, and a maximum device address
+of `u32::MAX`; only returned device addresses are programmed. The operation
+stages the first 4096-byte raw `FW_SCATTER` chunk. It first requires TX/RX DMA
+and every host interrupt to be disabled. The payload is copied before a release
+fence publishes one ring-16 descriptor, which is read back and then reset to
+CPU ownership; the payload is zeroed, both mappings are released, and typed
+VFIO reset is mandatory.
 No ring register, producer index, DMA-enable bit, interrupt mask, or MCU command
 is written, so the device cannot observe the staged descriptor.
 
