@@ -19,7 +19,8 @@ struct oracle_qcn_rx { u8 first_msdu, last_msdu, l3_padding, msdu_done;
     u8 multicast_broadcast, decrypted; u16 msdu_length; u8 decap_type, mesh_control_present, ldpc, sgi, mcs;
     u8 bandwidth, packet_type, spatial_stream_bitmap, nss; u32 frequency;
     u8 tid; u16 peer; u8 sequence_valid, frame_valid; u16 sequence_number;
-    u8 encryption_valid, encryption_type; u16 phy_ppdu_id; };
+    u8 encryption_valid, encryption_type; u16 phy_ppdu_id;
+    u8 mpdu_start_valid, address2_valid, address2[6]; };
 
 static void words(u8 *out, const u32 *in, size_t count) { memcpy(out, in, count * 4); }
 void oracle_htt_version(u8 *out) { memset(out, 0, 4); }
@@ -97,7 +98,11 @@ int oracle_qcn9074_rx_decode(const u8 *b, size_t len, struct oracle_qcn_rx *o) {
     o->frame_valid = mpdu11 & 1; o->sequence_number = (mpdu11 >> 20) & 0xfff;
     o->encryption_valid = (mpdu11 >> 9) & 1;
     o->encryption_type = o->encryption_valid ? (mpdu9 >> 2) & 0xf : 7;
-    o->phy_ppdu_id = get16(b + 178); return 0;
+    o->phy_ppdu_id = get16(b + 178);
+    o->mpdu_start_valid = ((get32(b + 136) >> 1) & 0x1ff) == 207;
+    o->address2_valid = (mpdu11 >> 3) & 1;
+    memcpy(o->address2, b + 206, sizeof(o->address2));
+    return 0;
 }
 
 int oracle_reo_msdu_continuation(const u8 *b, size_t len) {
