@@ -92,6 +92,7 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
     Some(match id {
         0x000001 => ("init", INIT_MASKS),
         0x003001 => ("scan-start", NO_MASKS),
+        0x003002 => ("scan-stop", NO_MASKS),
         0x003003 => ("scan-channel-list", NO_MASKS),
         0x003006 => ("scan-probe-request-oui", NO_MASKS),
         0x004003 => ("pdev-set-param", NO_MASKS),
@@ -246,6 +247,9 @@ enum SemanticRequest {
     PeerAssoc(super::PeerAssoc),
     PeerCreate(super::PeerCreate),
     PeerDelete(super::PeerDelete),
+    ScanChannelList(super::ScanChannelList),
+    ScanStart(super::ScanStart),
+    ScanStop(super::ScanStop),
     VdevCreate(super::VdevCreate),
     VdevDelete(super::VdevDelete),
     VdevStart(super::VdevStart),
@@ -260,6 +264,9 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::PeerAssoc(request) => request.encode_command(),
             SemanticRequest::PeerCreate(request) => request.encode_command(),
             SemanticRequest::PeerDelete(request) => request.encode_command(),
+            SemanticRequest::ScanChannelList(request) => request.encode_command(),
+            SemanticRequest::ScanStart(request) => request.encode_command(),
+            SemanticRequest::ScanStop(request) => request.encode_command(),
             SemanticRequest::VdevCreate(request) => request.encode_command(),
             SemanticRequest::VdevDelete(request) => request.encode_command(),
             SemanticRequest::VdevStart(request) => request.encode_command(),
@@ -554,6 +561,175 @@ pub fn reverse_map_semantic_command(
                     is_assoc: false,
                 },
                 hw_crypto_disabled: false,
+            })
+        }
+        0x003002 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_STOP_SCAN_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<5>(&tlvs[0].value)?;
+            let cancel_type = match fixed[2] {
+                0 => super::ScanCancelType::Single,
+                0x0100_0000 => super::ScanCancelType::VdevAll,
+                0x0400_0000 => super::ScanCancelType::PdevAll,
+                _ => return Err(WmiError::Malformed),
+            };
+            SemanticRequest::ScanStop(super::ScanStop {
+                requester: fixed[0],
+                scan_id: fixed[1],
+                cancel_type,
+                vdev_id: fixed[3],
+                pdev_id: fixed[4],
+            })
+        }
+        0x003003 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 2
+                || tlvs[0].tag != crate::tags::WMI_TAG_SCAN_CHAN_LIST_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_STRUCT.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<3>(&tlvs[0].value)?;
+            let count = usize::try_from(fixed[0]).map_err(|_| WmiError::Malformed)?;
+            if count == 0 || tlvs[1].value.len() != count * 28 {
+                return Err(WmiError::Malformed);
+            }
+            let mut channels = Vec::with_capacity(count);
+            for channel in tlvs[1].value.chunks_exact(28) {
+                let header =
+                    u32::from_le_bytes(channel[..4].try_into().map_err(|_| WmiError::Malformed)?);
+                if header != (u32::from(crate::tags::WMI_TAG_CHANNEL.0) << 16) | 24 {
+                    return Err(WmiError::Malformed);
+                }
+                let value = words::<6>(&channel[4..])?;
+                let info = value[3];
+                channels.push(super::ScanChannel {
+                    mhz: value[0],
+                    center_freq1: value[1],
+                    center_freq2: value[2],
+                    passive: info & (1 << 7) != 0,
+                    allow_ht: info & (1 << 11) != 0,
+                    allow_vht: info & (1 << 12) != 0,
+                    allow_he: info & (1 << 17) != 0,
+                    half_rate: info & (1 << 14) != 0,
+                    quarter_rate: info & (1 << 15) != 0,
+                    psc: info & (1 << 18) != 0,
+                    dfs: info & (1 << 10) != 0,
+                    phy_mode: info & 0x3f,
+                    min_power: value[4] as u8,
+                    max_power: (value[4] >> 8) as u8,
+                    max_reg_power: (value[4] >> 16) as u8,
+                    antenna_max: value[5] as u8,
+                    reg_class_id: (value[4] >> 24) as u8,
+                });
+            }
+            SemanticRequest::ScanChannelList(super::ScanChannelList {
+                pdev_id: fixed[2],
+                append: fixed[1] != 0,
+                channels,
+            })
+        }
+        0x003001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 5
+                || tlvs[0].tag != crate::tags::WMI_TAG_START_SCAN_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_UINT32.0
+                || tlvs[2].tag != crate::tags::WMI_TAG_ARRAY_FIXED_STRUCT.0
+                || tlvs[3].tag != crate::tags::WMI_TAG_ARRAY_FIXED_STRUCT.0
+                || tlvs[4].tag != crate::tags::WMI_TAG_ARRAY_BYTE.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<39>(&tlvs[0].value)?;
+            if fixed[25..34] != [0; 9] || fixed[38] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            let channels = tlvs[1]
+                .value
+                .chunks_exact(4)
+                .map(|value| u32::from_le_bytes(value.try_into().expect("four-byte chunk")))
+                .collect::<Vec<_>>();
+            if channels.len() != fixed[16] as usize
+                || tlvs[2].value.len() != fixed[18] as usize * 36
+                || tlvs[3].value.len() != fixed[17] as usize * 8
+            {
+                return Err(WmiError::Malformed);
+            }
+            let mut ssids = Vec::new();
+            for value in tlvs[2].value.chunks_exact(36) {
+                let len =
+                    u32::from_le_bytes(value[..4].try_into().map_err(|_| WmiError::Malformed)?)
+                        as usize;
+                if len > 32 {
+                    return Err(WmiError::Malformed);
+                }
+                ssids.push(value[4..4 + len].to_vec());
+            }
+            let bssids = tlvs[3]
+                .value
+                .chunks_exact(8)
+                .map(|value| mac(&value[..6]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ie_len = fixed[19] as usize;
+            if ie_len > tlvs[4].value.len() {
+                return Err(WmiError::Malformed);
+            }
+            let flags = fixed[14];
+            let bit = |mask| flags & mask != 0;
+            SemanticRequest::ScanStart(super::ScanStart {
+                scan_id: fixed[0],
+                scan_requester_id: fixed[1],
+                vdev_id: fixed[2],
+                scan_priority: fixed[3],
+                notify_scan_events: fixed[4],
+                event_flags: super::ScanEventFlags::default(),
+                control_flags: super::ScanControlFlags {
+                    passive: bit(0x1),
+                    broadcast_probe: bit(0x2),
+                    cck_rates: bit(0x4),
+                    ofdm_rates: bit(0x8),
+                    channel_stat_event: bit(0x10),
+                    filter_probe_request: bit(0x20),
+                    promiscuous: bit(0x100),
+                    force_active_dfs: bit(0x200),
+                    add_tpc_ie: bit(0x400),
+                    add_ds_ie: bit(0x800),
+                    spoofed_mac: bit(0x1000),
+                    offchannel_mgmt_tx: bit(0x2000),
+                    offchannel_data_tx: bit(0x4000),
+                    capture_phy_error: bit(0x8000),
+                    strict_passive: bit(0x10000),
+                    half_rate: bit(0x20000),
+                    quarter_rate: bit(0x40000),
+                    random_sequence: bit(0x80000),
+                    ie_whitelist: bit(0x100000),
+                    adaptive_dwell_mode: (flags >> 21) & 7,
+                },
+                control_flags_ext: fixed[34],
+                dwell_time_active: fixed[5],
+                dwell_time_active_2ghz: fixed[35],
+                dwell_time_passive: fixed[6],
+                dwell_time_active_6ghz: fixed[36],
+                dwell_time_passive_6ghz: fixed[37],
+                min_rest_time: fixed[7],
+                max_rest_time: fixed[8],
+                repeat_probe_time: fixed[9],
+                probe_spacing_time: fixed[10],
+                idle_time: fixed[11],
+                max_scan_time: fixed[12],
+                probe_delay: fixed[13],
+                burst_duration: fixed[15],
+                n_probes: fixed[20],
+                mac_addr: mac(&tlvs[0].value[84..90])?,
+                mac_mask: mac(&tlvs[0].value[92..98])?,
+                channels,
+                ssids,
+                bssids,
+                extra_ie: tlvs[4].value[..ie_len].to_vec(),
+                short_ssid_hints: Vec::new(),
+                bssid_hints: Vec::new(),
             })
         }
         _ => return Ok(None),
