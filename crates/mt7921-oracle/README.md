@@ -52,6 +52,16 @@ same WCID, queue, basic rate, and single-buffer TXP selected by the Rust API.
 Any confirmed valid-domain difference is documented rather than copied into
 Rust.
 
+Channel-programming coverage executes the pinned
+`mt7921_mcu_set_chan_info`, `mt76_connac_mcu_set_channel_domain`, and
+`__mt7921_mcu_set_clc` bodies behind minimal MCU/skb shims. It compares the
+complete legacy command envelopes emitted by the public Rust encoders for
+RX-path setup, normal and off-channel switches (including 20/40/80/160 and
+80+80 identities), the conservative world/indoor channel domain, and opaque
+world CLC rules. The channel-domain and CLC wrappers use only ordered enabled
+2/5 GHz records and valid public command fields; the shared capture shim is
+serialized because the extracted kernel send boundary is process-global.
+
 `mt7921-core` does not currently expose an RX ring entry ownership or cleanup
 API: its public RX surface prepares descriptor arrays, while `WfdmaRing` is a
 TX ring model. Consequently the RX cleanup checkpoint executes and asserts the
