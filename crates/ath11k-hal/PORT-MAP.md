@@ -1,63 +1,65 @@
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 # ath11k-hal port map
 
-Maintain one row per pinned Linux symbol. Status is stub, ported,
-oracle-checked, or hardware-checked.
+This map tracks Rust counterparts of symbols in the pinned Linux ath11k oracle.
+Paths are relative to `ath11k-reference/`, and line ranges are inclusive.
 
-| C file:symbol | Rust item | status | oracle artifact |
-|---|---|---|---|
-| `hal_desc.h:ath11k_buffer_addr` / `hal_wbm_buffer_ring` | `descriptors::RxdmaBufferRing` | oracle-checked | `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked` |
-| `hal_desc.h:rx_mpdu_desc` | `descriptors::RxMpduDescriptor` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
-| `hal_desc.h:rx_msdu_desc` | `descriptors::RxMsduDescriptor` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
-| `hal_desc.h:hal_tcl_data_cmd` | `descriptors::TclDataCommand` | oracle-checked | `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked` |
-| `hal_desc.h:hal_reo_entrance_ring` | `descriptors::ReoEntranceRing` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
-| `hal_desc.h:hal_reo_dest_ring` | `descriptors::ReoDestinationRing` | oracle-checked | `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words` |
-| `hal_desc.h:hal_wbm_release_ring` | `descriptors::WbmReleaseRing` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
-| `hal_desc.h:hal_ce_srng_src_desc` | `descriptors::CeSourceDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
-| `hal_desc.h:hal_ce_srng_dest_desc` | `descriptors::CeDestinationDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
-| `hal_desc.h:hal_ce_srng_dst_status_desc` | `descriptors::CeDestinationStatusDescriptor` | oracle-checked | `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian` |
-| `hal_desc.h:hal_tlv_hdr` | `descriptors::RxMonitorTlvHeader` | oracle-checked | `tests/descriptors.rs::monitor_tlv_header_uses_linux_bit_positions` |
-| `hal_rx.h:hal_rx_ppdu_start` | `descriptors::RxPpduStart` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
-| `hal_rx.h:hal_rx_mpdu_info_ipq8074` | `descriptors::RxMpduInfoWcn6750` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle`; selected by `hw.c:wcn6750_ops.mpdu_info_get_peerid` |
-| `hal_rx.h:hal_rx_ppdu_end_duration` | `descriptors::RxPpduEndDuration` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
-| `hal_rx.h:hal_rx_ppdu_end_user_stats` | `descriptors::RxPpduEndUserStats` | oracle-checked | `tests/descriptors.rs::rx_end_family_offsets_match_oracle` |
-| `hal_rx.h:hal_rx_ppdu_end_user_stats_ext` | `descriptors::RxPpduEndUserStatsExt` | oracle-checked | exact-length parser; the oracle declares no field masks |
-| hal.c:`hw_srng_config_template` | `srng::config`, `RingType`, `Wcn6750Registers` | oracle-checked | source-derived table/unit tests |
-| hw.c:`wcn6750_regs` | `Wcn6750Registers`, `srng::config` register bases/strides | oracle-checked | `wcn6750_table_matches_source` |
-| hal.c:`ath11k_hal_srng_get_ring_id` | `Wcn6750Registers::ring_id` | oracle-checked | `wcn6750_table_matches_source` |
-| hal.c:`ath11k_hal_srng_get_entrysize` | `Wcn6750Registers::entry_size` | oracle-checked | `wcn6750_table_matches_source` |
-| hal.c:`ath11k_hal_srng_get_max_entries` | `Wcn6750Registers::max_entries` | oracle-checked | `wcn6750_table_matches_source` |
-| hal.c:`ath11k_hal_srng_setup` | `Srng::setup` | oracle-checked | crate-local recording Backend sequence tests |
-| hal.c:`ath11k_hal_srng_src_hw_init` | `Srng::program` source branch | oracle-checked | `source_setup_write_order_matches_hal_c` |
-| hal.c:`ath11k_hal_srng_dst_hw_init` | `Srng::program` destination branch | oracle-checked | `destination_setup_write_order_matches_hal_c` |
-| hal.c:`ath11k_hal_srng_src_get_next_entry` | `Srng::source_next` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
-| hal.c:`ath11k_hal_srng_dst_get_next_entry` | `Srng::destination_next` | ported | source-derived unit arithmetic |
-| hal.c:`ath11k_hal_srng_{src,dst}_num_free` | `Srng::number_free` | ported | source-derived unit arithmetic |
-| hal.c:`ath11k_hal_srng_{src,dst}_peek` | `Srng::peek` | ported | source-derived unit arithmetic |
-| hal.c:`ath11k_hal_srng_access_begin` | `Srng::access_begin_remote` | ported | coherent RDP read + acquire fence maps READ_ONCE + dma_rmb |
-| hal.c:`ath11k_hal_srng_access_end` | `Srng::access_end` | ported | ordered `write_u32` release maps dma_wmb/mb + pointer write |
-| hal.c:`ath11k_hal_srng_update_hp_tp_addr` | `Srng::set_shadow_publication_register` | ported | source-derived shadow publication path |
-| hal.c:LMAC branch of `ath11k_hal_srng_access_end` | `Srng::access_end_lmac` | ported | release/seq-cst fence then coherent WRP write |
-| hal.c:`ath11k_hal_ce_src_set_desc` | `descriptors::CeSourceDescriptor::for_transfer` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
-| hal.c:`ath11k_hal_ce_dst_set_desc` | `descriptors::CeDestinationDescriptor::from_address` | oracle-checked | checked 8-byte layout fixture |
-| hal.c:`ath11k_hal_ce_dst_status_get_length` | `descriptors::CeDestinationStatusDescriptor::take_length` | oracle-checked | checked 16-byte layout fixture |
-| hal_tx.c:`ath11k_hal_tx_cmd_desc_setup` | `descriptors::TclDataCommand::for_transmit`, `TxCommandInfo` | oracle-checked | `tcl_data_command_is_byte_exact_and_checked`; WCN6750 QCN9074 mesh bit |
-| hal_tx.c:`ath11k_hal_tx_set_dscp_tid_map` | `descriptors::program_dscp_tid_map` | ported | source-derived bitstream/register sequence |
-| hal_desc.h:`struct hal_wbm_release_ring` | `descriptors::WbmReleaseRing` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
-| hal.c:`ath11k_hal_srng_src_reap_next` | `Srng::source_reap_next` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
-| hal.c:`ath11k_hal_srng_src_get_next_reaped` | `Srng::source_next_reaped` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
-| hal.c:`ath11k_hal_srng_src_next_peek` | `Srng::source_next_peek` | ported | source-derived arithmetic |
-| hal_rx.c:`ath11k_hal_rx_buf_addr_info_set/get` | `RxdmaBufferRing::for_buffer/info`, `BufferAddressInfo` | oracle-checked | `reo_and_rxdma_masks_land_in_oracle_words` |
-| hal_rx.c:`ath11k_hal_rx_reo_ent_buf_paddr_get` | `ReoEntranceRing::received_buffer` | oracle-checked | REO/RXDMA oracle fixture |
-| hal_rx.c:`ath11k_hal_rx_msdu_link_info_get` | `RxMsduLink::info`, `RxMsduLinkInfo` | oracle-checked | `msdu_link_info_stops_at_first_zero_low_address` |
-| hal_desc.h:`struct hal_rx_msdu_details` | `RxMsduDetails` | oracle-checked | MSDU-link fixture |
-| hal_desc.h:`struct hal_rx_msdu_link` | `RxMsduLink` | oracle-checked | 128-byte MSDU-link fixture |
-| hal.c:`ath11k_hal_srng_update_shadow_config` | `Srng::set_shadow_publication_register` | ported | WCN6750 shadow register path |
-| hal.c:LMAC branches of `ath11k_hal_srng_setup/access_begin/access_end` | `Srng::setup`, `access_begin_remote`, `access_end_lmac` | ported | coherent RDP/WRP pointers; acquire/release fences |
-| hal.c:`ath11k_hal_ce_dst_setup` | `Srng::setup` CE-destination branch | ported | source-derived max-buffer-length RMW |
-| hal_rx.c:`ath11k_hal_reo_init_cmd_ring` | `reo::initialize_command_ring` | ported | command-number unit test |
-| hal_rx.c:`ath11k_hal_reo_cmd_send` | `reo::ReoCommand::encode` | ported | source-exact supported variants; unsupported variants preserve `-EOPNOTSUPP` |
-| hal_rx.c:`ath11k_hal_reo_process_status` | `reo::ReoStatus::decode` | ported | status tag/header unit test |
-| hal_rx.c:`ath11k_hal_reo_qdesc_setup` | `reo::ReoQueueDescriptor::new` | ported | descriptor layout unit test |
-| hal_rx.c:`ath11k_hal_rx_msdu_link_desc_set` | `WbmReleaseRing::for_msdu_link` | ported | source-derived buffer-info copy and WBM fields |
-| hal.c:`ath11k_hal_set_link_desc_addr` | `WbmLinkDescriptor::new_at` | ported | checked device address path |
-| hw.c:`ath11k_hw_wcn6855_reo_setup` (`wcn6750_ops`) | `reo::setup_wcn6750` | ported | source-derived WCN6750 register offsets and values |
+| C symbol | C file:lines | Rust item | status | note |
+|---|---|---|---|---|
+| `struct ath11k_buffer_addr` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:17-20` | `descriptors::RxdmaBufferRing` | ported | Oracle layout covered by `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked`. |
+| `struct hal_wbm_buffer_ring` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1858-1860` | `descriptors::RxdmaBufferRing` | ported | Same buffer-address wire layout; oracle fixture coverage is in `tests/descriptors.rs`. |
+| `struct rx_mpdu_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:503-506` | `descriptors::RxMpduDescriptor` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `struct rx_msdu_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:589-592` | `descriptors::RxMsduDescriptor` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `struct hal_tcl_data_cmd` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1026-1033` | `descriptors::TclDataCommand` | ported | Byte-exact oracle fixture: `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked`. |
+| `struct hal_reo_entrance_ring` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:795-803` | `descriptors::ReoEntranceRing` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `struct hal_reo_dest_ring` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:692-706` | `descriptors::ReoDestinationRing` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `struct hal_wbm_release_ring` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1668-1675` | `descriptors::WbmReleaseRing` | ported | Little-endian oracle fixture: `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian`. |
+| `struct hal_ce_srng_src_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1312-1317` | `descriptors::CeSourceDescriptor` | ported | Little-endian oracle fixture: `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian`. |
+| `struct hal_ce_srng_dest_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1401-1404` | `descriptors::CeDestinationDescriptor` | ported | Little-endian oracle fixture: `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian`. |
+| `struct hal_ce_srng_dst_status_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1456-1461` | `descriptors::CeDestinationStatusDescriptor` | ported | Little-endian oracle fixture: `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian`. |
+| `struct hal_tlv_hdr` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:482-485` | `descriptors::RxMonitorTlvHeader` | ported | Oracle bit positions covered by `tests/descriptors.rs::monitor_tlv_header_uses_linux_bit_positions`. |
+| `struct hal_rx_ppdu_start` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.h:198-202` | `descriptors::RxPpduStart` | ported | Oracle offsets covered by `tests/descriptors.rs::rx_end_family_offsets_match_oracle`. |
+| `struct hal_rx_mpdu_info_ipq8074` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.h:415-421` | `descriptors::RxMpduInfoWcn6750` | wcn6750-specific | Selected for WCN6750 through `wcn6750_ops.mpdu_info_get_peerid`; oracle offsets are covered by `tests/descriptors.rs::rx_end_family_offsets_match_oracle`. |
+| `struct hal_rx_ppdu_end_duration` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.h:446-450` | `descriptors::RxPpduEndDuration` | ported | Oracle offsets covered by `tests/descriptors.rs::rx_end_family_offsets_match_oracle`. |
+| `struct hal_rx_ppdu_end_user_stats` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.h:229-247` | `descriptors::RxPpduEndUserStats` | ported | Oracle offsets covered by `tests/descriptors.rs::rx_end_family_offsets_match_oracle`. |
+| `struct hal_rx_ppdu_end_user_stats_ext` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.h:249-257` | `descriptors::RxPpduEndUserStatsExt` | ported | Exact-length parser; the oracle declares no field masks. |
+| `hw_srng_config_template` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:13-192` | `srng::config`, `srng::RingType`, `srng::Wcn6750Registers` | ported | Source-derived table with crate-local unit coverage. |
+| `wcn6750_regs` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hw.c:2623-2708` | `srng::Wcn6750Registers`, `srng::config` | wcn6750-specific | Register bases and strides covered by `wcn6750_table_matches_source`. |
+| `ath11k_hal_srng_get_ring_id` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:465-485` | `srng::Wcn6750Registers::ring_id` | ported | Covered by `wcn6750_table_matches_source`. |
+| `ath11k_hal_srng_get_entrysize` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:487-497` | `srng::Wcn6750Registers::entry_size` | ported | Covered by `wcn6750_table_matches_source`. |
+| `ath11k_hal_srng_get_max_entries` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:499-509` | `srng::Wcn6750Registers::max_entries` | ported | Covered by `wcn6750_table_matches_source`. |
+| `ath11k_hal_srng_setup` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:998-1120` | `srng::Srng::setup` | ported | Includes the LMAC setup path; crate-local recording-backend tests check the programming sequence. |
+| `ath11k_hal_srng_src_hw_init` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:347-454` | `srng::Srng::program` | ported | Source branch covered by `source_setup_write_order_matches_hal_c`. |
+| `ath11k_hal_srng_dst_hw_init` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:268-345` | `srng::Srng::program` | ported | Destination branch covered by `destination_setup_write_order_matches_hal_c`. |
+| `ath11k_hal_srng_src_get_next_entry` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:730-761` | `srng::Srng::source_next` | ported | Arithmetic covered by `ring_arithmetic_reserves_one_source_entry`. |
+| `ath11k_hal_srng_dst_get_next_entry` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:660-683` | `srng::Srng::destination_next` | ported | Source-derived unit arithmetic. |
+| `ath11k_hal_srng_src_num_free` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:708-728` | `srng::Srng::number_free` | ported | Source-ring arithmetic reserves one entry. |
+| `ath11k_hal_srng_dst_num_free` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:685-705` | `srng::Srng::number_free` | ported | Destination-ring free-count arithmetic. |
+| `ath11k_hal_srng_src_peek` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:814-823` | `srng::Srng::peek` | ported | Source-ring branch is source-derived. |
+| `ath11k_hal_srng_dst_peek` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:620-628` | `srng::Srng::peek` | ported | Destination-ring branch is source-derived. |
+| `ath11k_hal_srng_access_begin` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:825-849` | `srng::Srng::access_begin_remote` | ported | Coherent RDP read plus acquire fence maps `READ_ONCE` plus `dma_rmb`. |
+| `ath11k_hal_srng_access_end` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:854-904` | `srng::Srng::access_end`, `srng::Srng::access_end_lmac` | ported | Ordered MMIO publication maps the host path; release/SeqCst fences and coherent WRP writes map the LMAC branches. |
+| `ath11k_hal_srng_update_hp_tp_addr` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:1122-1144` | `srng::Srng::set_shadow_publication_register` | ported | Source-derived shadow-publication path. |
+| `ath11k_hal_ce_src_set_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:572-586` | `descriptors::CeSourceDescriptor::for_transfer` | ported | Covered by `tests/descriptors.rs::ce_and_wbm_layouts_are_little_endian`. |
+| `ath11k_hal_ce_dst_set_desc` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:588-596` | `descriptors::CeDestinationDescriptor::from_address` | ported | Checked against the 8-byte oracle layout fixture. |
+| `ath11k_hal_ce_dst_status_get_length` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:598-607` | `descriptors::CeDestinationStatusDescriptor::take_length` | ported | Checked against the 16-byte oracle layout fixture. |
+| `ath11k_hal_tx_cmd_desc_setup` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_tx.c:37-81` | `descriptors::TclDataCommand::for_transmit`, `descriptors::TxCommandInfo` | ported | Byte-exact fixture: `tests/descriptors.rs::tcl_data_command_is_byte_exact_and_checked`; includes the WCN6750/QCN9074 mesh bit. |
+| `ath11k_hal_tx_set_dscp_tid_map` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_tx.c:83-138` | `descriptors::program_dscp_tid_map` | ported | Source-derived bitstream and register sequence. |
+| `ath11k_hal_srng_src_reap_next` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:763-781` | `srng::Srng::source_reap_next` | ported | Arithmetic covered by `ring_arithmetic_reserves_one_source_entry`. |
+| `ath11k_hal_srng_src_get_next_reaped` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:783-798` | `srng::Srng::source_next_reaped` | ported | Arithmetic covered by `ring_arithmetic_reserves_one_source_entry`. |
+| `ath11k_hal_srng_src_next_peek` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:800-812` | `srng::Srng::source_next_peek` | ported | Source-derived arithmetic. |
+| `ath11k_hal_rx_buf_addr_info_set` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:266-278` | `descriptors::RxdmaBufferRing::for_buffer` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `ath11k_hal_rx_buf_addr_info_get` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:280-290` | `descriptors::RxdmaBufferRing::info`, `descriptors::BufferAddressInfo` | ported | Oracle masks covered by `tests/descriptors.rs::reo_and_rxdma_masks_land_in_oracle_words`. |
+| `ath11k_hal_rx_reo_ent_buf_paddr_get` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:1536-1563` | `descriptors::ReoEntranceRing::received_buffer` | ported | Checked by the REO/RXDMA oracle fixture. |
+| `ath11k_hal_rx_msdu_link_info_get` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:292-318` | `descriptors::RxMsduLink::info`, `descriptors::RxMsduLinkInfo` | ported | Covered by `msdu_link_info_stops_at_first_zero_low_address`. |
+| `struct hal_rx_msdu_details` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1903-1906` | `descriptors::RxMsduDetails` | ported | Checked by the MSDU-link fixture. |
+| `struct hal_rx_msdu_link` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_desc.h:1911-1917` | `descriptors::RxMsduLink` | ported | Checked by the 128-byte MSDU-link fixture. |
+| `ath11k_hal_srng_update_shadow_config` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:1146-1182` | `srng::Srng::set_shadow_publication_register` | ported | WCN6750 shadow-register path. |
+| `ath11k_hal_ce_dst_setup` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:250-266` | `srng::Srng::setup` | ported | Source-derived CE-destination max-buffer-length read-modify-write. |
+| `ath11k_hal_reo_init_cmd_ring` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:784-807` | `reo::initialize_command_ring` | ported | Command-number behavior has unit coverage. |
+| `ath11k_hal_reo_cmd_send` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:219-264` | `reo::ReoCommand::encode` | ported | Supported variants are source-exact; unsupported variants preserve `-EOPNOTSUPP`. |
+| `ath11k_hal_reo_process_status` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:499-508` | `reo::ReoStatus::decode` | ported | Status tag and header have unit coverage. |
+| `ath11k_hal_reo_qdesc_setup` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:701-782` | `reo::ReoQueueDescriptor::new` | ported | Descriptor layout has unit coverage. |
+| `ath11k_hal_rx_msdu_link_desc_set` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal_rx.c:418-431` | `descriptors::WbmReleaseRing::for_msdu_link` | ported | Source-derived buffer-info copy and WBM fields. |
+| `ath11k_hal_set_link_desc_addr` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hal.c:609-618` | `descriptors::WbmLinkDescriptor::new_at` | ported | Checked device-address path. |
+| `ath11k_hw_wcn6855_reo_setup` | `reference/linux-509ce3d952d550f93b544c8d94c99e798f09a9b4/drivers/net/wireless/ath/ath11k/hw.c:759-796` | `reo::setup_wcn6750` | wcn6750-specific | Used by `wcn6750_ops`; register offsets and values are source-derived. |
