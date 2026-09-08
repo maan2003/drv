@@ -75,6 +75,8 @@ version = "0.1.0"
 dependencies = [
  "ath11k-ce",
  "ath11k-hal",
+ "ath11k-platform-backend",
+ "drv-hardware-backends",
 ]
 
 [[package]]
