@@ -17,6 +17,10 @@ wlan-softmac-host = { path = "../wlan-softmac-host" }
 zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 
 [dev-dependencies]
+ath11k-qmi = { path = "../ath11k-qmi" }
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
+proptest = "1"
 wlan-softmac-host = { path = "../wlan-softmac-host", features = ["conformance"] }
 
 [patch.crates-io]
