@@ -95,6 +95,22 @@ struct ActiveTid<B: Backend> {
     tid: ReoTid<B>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerKey {
+    vdev_id: u32,
+    peer_addr: [u8; 6],
+}
+
+struct FragmentState {
+    key: PeerKey,
+    tid: u8,
+    current_sequence: u16,
+    last_fragment: u8,
+    bitmap: u16,
+    frames: Vec<Vec<u8>>,
+    timer_armed: bool,
+}
+
 /// Global peer receive-reorder queue coordinator. Every peer's pending
 /// command is kept here because they share one REO status ring.
 pub struct PeerRxTids<B: Backend> {
@@ -105,6 +121,8 @@ pub struct PeerRxTids<B: Backend> {
     pending_flush: Vec<PendingTid<B>>,
     uncertain_setup: Vec<ActiveTid<B>>,
     failed_delete: Vec<ActiveTid<B>>,
+    tearing_down: Vec<PeerKey>,
+    fragments: Vec<FragmentState>,
 }
 
 impl<B: Backend> PeerRxTids<B> {
@@ -124,6 +142,8 @@ impl<B: Backend> PeerRxTids<B> {
             pending_flush: Vec::new(),
             uncertain_setup: Vec::new(),
             failed_delete: Vec::new(),
+            tearing_down: Vec::new(),
+            fragments: Vec::new(),
         })
     }
 
@@ -143,6 +163,10 @@ impl<B: Backend> PeerRxTids<B> {
         pn: PacketNumberType,
     ) -> Result<(), DpError> {
         if tid > 16 {
+            return Err(DpError::WrongState);
+        }
+        let key = PeerKey { vdev_id, peer_addr };
+        if self.tearing_down.contains(&key) {
             return Err(DpError::WrongState);
         }
         if self
@@ -230,9 +254,101 @@ impl<B: Backend> PeerRxTids<B> {
                 });
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.failed_delete.push(ActiveTid {
+                    vdev_id,
+                    peer_addr,
+                    tid: owned,
+                });
+                Err(error)
+            }
         }
     }
+
+    /// Peer disassociation transaction: prevent new queue publication,
+    /// invalidate all TIDs, then purge fragment state. The pinned Linux
+    /// cleanup does not send the otherwise-defined WMI reorder-remove command.
+    /// Errors leave the peer blocked and every possibly-visible owner
+    /// quarantined for reset-time release.
+    pub fn ath11k_peer_rx_tid_cleanup<R: Rings<B>>(
+        &mut self,
+        controller: &mut ReoController,
+        rings: &mut R,
+        vdev_id: u32,
+        peer_addr: [u8; 6],
+    ) -> Result<(), DpError> {
+        let key = PeerKey { vdev_id, peer_addr };
+        if !self.tearing_down.contains(&key) {
+            self.tearing_down.push(key);
+        }
+
+        let mut first_error = None;
+        for tid in 0..=16 {
+            if let Err(error) =
+                self.ath11k_peer_rx_tid_delete(controller, rings, vdev_id, peer_addr, tid)
+            {
+                first_error.get_or_insert(error);
+            }
+            self.fragments
+                .retain(|state| state.key != key || state.tid != tid);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// `ath11k_peer_frags_flush` / `ath11k_dp_rx_frags_cleanup` bookkeeping
+    /// boundary. Full fragment reassembly remains outside this port.
+    pub fn ath11k_peer_frags_flush(&mut self, vdev_id: u32, peer_addr: [u8; 6]) {
+        let key = PeerKey { vdev_id, peer_addr };
+        self.fragments.retain(|state| state.key != key);
+    }
+
+    /// Minimal ownership seam for the fragment bookkeeping that cleanup must
+    /// purge; this deliberately does not perform fragment reassembly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_fragment_state(
+        &mut self,
+        vdev_id: u32,
+        peer_addr: [u8; 6],
+        tid: u8,
+        current_sequence: u16,
+        last_fragment: u8,
+        bitmap: u16,
+        frame: Vec<u8>,
+    ) -> Result<(), DpError> {
+        if tid > 16 {
+            return Err(DpError::WrongState);
+        }
+        let key = PeerKey { vdev_id, peer_addr };
+        if self.tearing_down.contains(&key) {
+            return Err(DpError::WrongState);
+        }
+        if let Some(state) = self
+            .fragments
+            .iter_mut()
+            .find(|state| state.key == key && state.tid == tid)
+        {
+            state.current_sequence = current_sequence;
+            state.last_fragment = last_fragment;
+            state.bitmap = bitmap;
+            state.frames.push(frame);
+            state.timer_armed = true;
+        } else {
+            self.fragments.push(FragmentState {
+                key,
+                tid,
+                current_sequence,
+                last_fragment,
+                bitmap,
+                frames: alloc::vec![frame],
+                timer_armed: true,
+            });
+        }
+        Ok(())
+    }
+
+    /// Release all possibly device-visible peer state only after reset has
+    /// proven that firmware and REO can no longer dereference its DMA IOVAs.
+    pub fn release_after_device_reset(self) {}
 
     /// Ports `ath11k_dp_rx_tid_del_func` and its aged REO cache invalidation.
     pub fn ath11k_dp_rx_tid_del_func<R: Rings<B>>(
@@ -890,5 +1006,147 @@ mod tests {
             ),
             Err(DpError::WrongState)
         );
+    }
+
+    #[test]
+    fn peer_cleanup_invalidates_all_active_tids_and_is_idempotent() {
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        let mut wmi = ModelWmi::default();
+        for tid in [0, 8, 16] {
+            peers
+                .ath11k_peer_rx_tid_setup(
+                    &mut reo,
+                    &mut rings,
+                    &mut wmi,
+                    2,
+                    [0xaa; 6],
+                    tid,
+                    1,
+                    0,
+                    PacketNumberType::None,
+                )
+                .unwrap();
+        }
+        peers
+            .ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                2,
+                [0xbb; 6],
+                8,
+                1,
+                0,
+                PacketNumberType::None,
+            )
+            .unwrap();
+        peers
+            .track_fragment_state(2, [0xaa; 6], 8, 4, 1, 3, vec![1, 2])
+            .unwrap();
+        peers
+            .track_fragment_state(2, [0xbb; 6], 8, 5, 1, 3, vec![3, 4])
+            .unwrap();
+
+        peers
+            .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 2, [0xaa; 6])
+            .unwrap();
+        assert_eq!(rings.published.len(), 3);
+        assert_eq!(peers.pending_delete.len(), 3);
+        assert!(
+            peers
+                .fragments
+                .iter()
+                .all(|state| state.key.peer_addr == [0xbb; 6])
+        );
+        assert!(peers.is_active(2, [0xbb; 6], 8));
+        assert_eq!(
+            peers.ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                2,
+                [0xaa; 6],
+                3,
+                1,
+                0,
+                PacketNumberType::None,
+            ),
+            Err(DpError::WrongState)
+        );
+        assert_eq!(
+            peers.track_fragment_state(2, [0xaa; 6], 8, 6, 2, 7, vec![9]),
+            Err(DpError::WrongState)
+        );
+        peers
+            .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 2, [0xaa; 6])
+            .unwrap();
+        assert_eq!(rings.published.len(), 3);
+    }
+
+    #[test]
+    fn partial_cleanup_quarantines_failed_owner_until_reset() {
+        let device = DeterministicBackend::device();
+        let mut peers = PeerRxTids::new(device.clone()).unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        let mut wmi = ModelWmi::default();
+        for tid in [0, 1, 2] {
+            peers
+                .ath11k_peer_rx_tid_setup(
+                    &mut reo,
+                    &mut rings,
+                    &mut wmi,
+                    3,
+                    [0xcc; 6],
+                    tid,
+                    1,
+                    0,
+                    PacketNumberType::None,
+                )
+                .unwrap();
+        }
+        rings.fail_publish_attempt = Some(2);
+        assert_eq!(
+            peers.ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 3, [0xcc; 6]),
+            Err(DpError::NoResources)
+        );
+        assert_eq!(rings.published.len(), 2);
+        assert_eq!(peers.pending_delete.len(), 2);
+        assert_eq!(peers.failed_delete.len(), 1);
+        assert_eq!(
+            peers.ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                3,
+                [0xcc; 6],
+                1,
+                1,
+                0,
+                PacketNumberType::None,
+            ),
+            Err(DpError::WrongState)
+        );
+
+        device.reset().unwrap();
+        peers.release_after_device_reset();
+        let mut peers = PeerRxTids::new(device).unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        peers
+            .ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                3,
+                [0xcc; 6],
+                1,
+                1,
+                0,
+                PacketNumberType::None,
+            )
+            .unwrap();
     }
 }
