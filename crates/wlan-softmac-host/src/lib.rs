@@ -37,6 +37,14 @@ pub trait WlanSoftmacLifecycle {
     fn stop(&mut self) -> Result<(), zx::Status>;
 }
 
+/// Synchronous, policy-free hardware work driven at the host runtime's
+/// deterministic device slot.
+pub trait ClientRuntimeDriver {
+    fn drive(&mut self) -> Result<bool, zx::Status>;
+    fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
+    fn reset(&mut self) -> Result<(), zx::Status>;
+}
+
 /// Synchronous client-only calls from the host MLME into a SoftMAC device.
 ///
 /// Implementations complete each operation before returning. Policy,

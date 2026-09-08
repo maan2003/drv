@@ -31,6 +31,16 @@ const AP: [u8; 6] = [6; 6];
 const SSID: &[u8] = b"test";
 const PASSPHRASE: &[u8] = b"password";
 
+struct ScanCompleteUpcalls(Arc<Mutex<Vec<(zx::Status, u64)>>>);
+
+impl wlan_softmac_host::WlanSoftmacUpcalls for ScanCompleteUpcalls {
+    fn recv(&mut self, _: Vec<u8>, _: fidl_softmac::WlanRxInfo) {}
+    fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+    fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
+        self.0.lock().unwrap().push((status, scan_id));
+    }
+}
+
 fn channel(number: u8) -> fidl_ieee80211::ChannelNumber {
     fidl_ieee80211::ChannelNumber {
         band: fidl_ieee80211::WlanBand::TwoGhz,
@@ -492,6 +502,12 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         let backend = ProductionBackend(state.clone());
         let (mut device, runner) =
             Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
+        let scan_completions = Arc::new(Mutex::new(Vec::new()));
+        wlan_softmac_host::WlanSoftmacLifecycle::start(
+            &mut device,
+            Box::new(ScanCompleteUpcalls(scan_completions.clone())),
+        )
+        .unwrap();
         let mut events = device.take_mlme_event_stream().unwrap();
         let (timer, _timer_stream) = wlan_mlme::common::timer::create_timer();
         let mut mlme = ClientMlme::new(Default::default(), device, timer)
@@ -538,6 +554,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             other => panic!("expected matching physical completion, got {other:?}"),
         };
         assert!(success);
+        assert_eq!(&*scan_completions.lock().unwrap(), &[(zx::Status::OK, scan_id)]);
         mlme.handle_scan_complete(zx::Status::OK, scan_id).await;
         Station::on_mlme_event(
             &mut sme,
@@ -639,6 +656,39 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         assert!(state.authorized_rate_mbps.is_none());
         assert!(state.programmed_rate_mbps.is_none());
     });
+}
+
+#[test]
+fn runtime_driver_routes_scan_completion_after_runner_handoff() {
+    let state = Arc::new(Mutex::new(BackendState::default()));
+    let backend = ProductionBackend(state);
+    let (mut device, runner) =
+        Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
+    let scan_completions = Arc::new(Mutex::new(Vec::new()));
+    wlan_softmac_host::WlanSoftmacLifecycle::start(
+        &mut device,
+        Box::new(ScanCompleteUpcalls(scan_completions.clone())),
+    )
+    .unwrap();
+    let response = wlan_softmac_host::WlanSoftmac::start_passive_scan(
+        &mut device,
+        fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest {
+            channels: Some(vec![channel(6)]),
+            min_channel_time: Some(10),
+            max_channel_time: Some(20),
+            min_home_time: Some(0),
+        },
+    )
+    .unwrap();
+    let scan_id = response.scan_id.unwrap();
+    drop(runner);
+
+    assert!(wlan_softmac_host::ClientRuntimeDriver::drive(&mut device).unwrap());
+    assert!(wlan_softmac_host::ClientRuntimeDriver::drive(&mut device).unwrap());
+    assert_eq!(
+        &*scan_completions.lock().unwrap(),
+        &[(zx::Status::OK, scan_id)]
+    );
 }
 
 #[test]

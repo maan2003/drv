@@ -120,8 +120,6 @@ use std::{
     time::Instant,
 };
 use userspace_vfio::{Ioas, RegionInfo, VfioIrq};
-#[cfg(feature = "fuchsia-passive")]
-use wlan_mlme::device::DeviceOps;
 
 const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
@@ -3368,9 +3366,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         comeback_adapter,
         comeback_support.clone(),
     );
+    drop(comeback_runner);
     let mut comeback_runtime = PinnedClientRuntime::new(
         comeback_device,
-        comeback_runner,
         wlan_sme::client::ClientConfig::default(),
         comeback_device_info,
         comeback_support.security,
@@ -3588,9 +3586,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
         burst_adapter,
         burst_support.clone(),
     );
+    drop(burst_runner);
     let mut burst_runtime = PinnedClientRuntime::new(
         burst_device,
-        burst_runner,
         wlan_sme::client::ClientConfig::default(),
         burst_info,
         burst_support.security,
@@ -3714,16 +3712,16 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let security = support.security.clone();
     let spectrum = support.spectrum_management.clone();
     let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
-    DeviceOps::set_channel(
-        &mut device,
-        channel,
-        ChannelBandwidth::Cbw80,
-        ChannelNumber {
-            number: 0,
-            ..channel
-        },
+    device.set_runtime_channel(
+        set_channel_request(
+            channel,
+            ChannelBandwidth::Cbw80,
+            Some(ChannelNumber {
+                number: 0,
+                ..channel
+            }),
+        ),
     )
-    .await
     .map_err(|e| format!("self-test set channel: {e}"))?;
     {
         let mut state = shared.lock().unwrap();
@@ -3740,9 +3738,9 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     }
     let mut config = wlan_sme::client::ClientConfig::default();
     config.wpa3_supported = true;
+    drop(runner);
     let mut runtime = PinnedClientRuntime::new(
         device,
-        runner,
         config,
         device_info,
         security,
@@ -6894,17 +6892,8 @@ fn run() -> Result<(), String> {
                                     .map_err(|_| "convert SoftMAC device info failed")?;
                                     let security_support = support.security.clone();
                                     let spectrum_support = support.spectrum_management.clone();
-                                    let (mut device, runner, ethernet_device) =
-                                        Mt7921ClientDevice::new_with_ethernet(
-                                            effects, adapter, support, 32,
-                                        )
-                                        .map_err(
-                                            |error| {
-                                                format!(
-                                                    "construct pinned Ethernet boundary: {error}"
-                                                )
-                                            },
-                                        )?;
+                                    let (mut device, runner) =
+                                        Mt7921ClientDevice::new(effects, adapter, support);
                                     let bss =
                                         target_bss.as_ref().ok_or("target BSS was not retained")?;
                                     // Linux establishes the complete chandef before
@@ -6912,12 +6901,12 @@ fn run() -> Result<(), String> {
                                     // source-exact width transition while the passive
                                     // phase still permits CHANNEL_SWITCH; ClientMlme's
                                     // later replay must resolve to this same context.
-                                    futures::executor::block_on(DeviceOps::set_channel(
-                                        &mut device,
-                                        bss.primary,
-                                        bss.bandwidth,
-                                        bss.vht_secondary_80_channel,
-                                    ))
+                                    device.set_runtime_channel(set_channel_request(
+                                            bss.primary,
+                                            bss.bandwidth,
+                                            Some(bss.vht_secondary_80_channel),
+                                        ),
+                                    )
                                     .map_err(|status| {
                                         format!("DeviceOps target channel context failed: {status}")
                                     })?;
@@ -6992,17 +6981,21 @@ fn run() -> Result<(), String> {
                                     };
                                     let mut sme_config = wlan_sme::client::ClientConfig::default();
                                     sme_config.wpa3_supported = true;
+                                    drop(runner);
                                     let mut runtime =
-                                        futures::executor::block_on(PinnedClientRuntime::new(
+                                        futures::executor::block_on(PinnedClientRuntime::new_with_ethernet_capacity(
                                             device,
-                                            runner,
                                             sme_config,
                                             device_info,
                                             security_support,
                                             spectrum_support,
                                             fuchsia_inspect::Inspector::default(),
+                                            32,
                                         ))
                                         .map_err(|_| "construct pinned SME/MLME runtime failed")?;
+                                    let ethernet_device = runtime
+                                        .take_ethernet_device()
+                                        .ok_or("host Ethernet boundary was already taken")?;
                                     let deadline =
                                         Instant::now() + std::time::Duration::from_secs(25);
                                     futures::executor::block_on(runtime.connect(request, deadline))
@@ -22101,15 +22094,21 @@ mod tests {
     #[test]
     fn live_wpa3_path_keeps_driver_owner_while_netstack_runs_out_of_process() {
         let source = include_str!("vfio_read.rs");
-        let start = source
-            .find("let (mut device, runner, ethernet_device) =")
+        let runtime_constructor = source
+            .find("PinnedClientRuntime::new_with_ethernet_capacity")
             .unwrap();
-        let end = source[start..]
+        let start = source[..runtime_constructor]
+            .rfind("let (mut device, runner) =")
+            .unwrap();
+        let end = source[runtime_constructor..]
             .find("let transport = adapter.into_transport();")
-            .unwrap();
-        let exchange = &source[start..start + end];
+            .unwrap()
+            + runtime_constructor;
+        let exchange = &source[start..end];
         for required in [
-            "Mt7921ClientDevice::new_with_ethernet",
+            "Mt7921ClientDevice::new",
+            "PinnedClientRuntime::new_with_ethernet_capacity",
+            ".take_ethernet_device()",
             "fidl_internal::Protocol::Wpa3Personal",
             ".into_passphrase()",
             "PinnedClientRuntime::new",
@@ -24732,16 +24731,15 @@ mod tests {
             let security = support.security.clone();
             let spectrum = support.spectrum_management.clone();
             let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
-            DeviceOps::set_channel(
-                &mut device,
-                channel,
-                ChannelBandwidth::Cbw80,
-                ChannelNumber {
-                    number: 0,
-                    ..channel
-                },
+            device.set_runtime_channel(set_channel_request(
+                    channel,
+                    ChannelBandwidth::Cbw80,
+                    Some(ChannelNumber {
+                        number: 0,
+                        ..channel
+                    }),
+                ),
             )
-            .await
             .unwrap();
             {
                 let state = &mut shared.lock().unwrap();
@@ -24768,9 +24766,9 @@ mod tests {
                     )
                     .unwrap();
             }
+            drop(runner);
             let mut runtime = PinnedClientRuntime::new(
                 device,
-                runner,
                 {
                     let mut config = wlan_sme::client::ClientConfig::default();
                     config.wpa3_supported = true;
