@@ -94,6 +94,15 @@ pub struct DeterministicBackend {
     operations: Option<OperationLog>,
     ordering: Option<OrderingAssertions>,
     cache_coherent: bool,
+    failures: Option<FailureInjection>,
+}
+
+#[derive(Clone, Default)]
+pub struct FailureInjection(Rc<RefCell<bool>>);
+impl FailureInjection {
+    pub fn fail_next_sync_for_device(&self) {
+        *self.0.borrow_mut() = true;
+    }
 }
 impl Default for DeterministicBackend {
     fn default() -> Self {
@@ -113,6 +122,7 @@ impl Default for DeterministicBackend {
             operations: None,
             ordering: None,
             cache_coherent: true,
+            failures: None,
         }
     }
 }
@@ -125,6 +135,15 @@ impl DeterministicBackend {
             cache_coherent: false,
             ..Self::default()
         })
+    }
+    pub fn noncoherent_device_with_failures() -> (Device<Self>, FailureInjection) {
+        let failures = FailureInjection::default();
+        let backend = Self {
+            cache_coherent: false,
+            failures: Some(failures.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), failures)
     }
     pub fn recording_device() -> (Device<Self>, OperationLog) {
         let operations = Rc::new(RefCell::new(Vec::new()));
@@ -491,6 +510,13 @@ impl Backend for DeterministicBackend {
         }
     }
     fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
+        if let Some(failures) = &self.failures {
+            let mut fail = failures.0.borrow_mut();
+            if *fail {
+                *fail = false;
+                return Err(Error::DeviceFault);
+            }
+        }
         let d = self.dma_mut(dma)?;
         if d.coherent {
             Err(Error::Invalid)
