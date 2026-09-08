@@ -4,7 +4,7 @@ use ath11k_ce::{RxFrame, ServiceId, Transport, TxFrame};
 
 use crate::{DpError, HttControl, HttHostMessage, HttTargetMessage};
 
-pub const HTT_DATA_MESSAGE_SERVICE: ServiceId = ServiceId(0x0300);
+pub const HTT_DATA_MESSAGE_SERVICE: ServiceId = ServiceId::HTT_DATA_MSG;
 
 pub struct HttTransport<T> {
     transport: T,

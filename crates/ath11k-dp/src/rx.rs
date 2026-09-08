@@ -37,6 +37,7 @@ pub struct RxDescriptorStatus {
     pub fcs_error: bool,
     pub decrypt_error: bool,
     pub tkip_mic_error: bool,
+    pub multicast_broadcast: bool,
     pub decrypted: bool,
     pub msdu_length: u16,
     pub decap_type: u8,
@@ -46,6 +47,7 @@ pub struct RxDescriptorStatus {
     pub bandwidth: u8,
     pub packet_type: u8,
     pub spatial_stream_bitmap: u8,
+    pub nss: u8,
     pub frequency: u32,
     pub tid: u8,
     pub peer: PeerId,
@@ -104,6 +106,7 @@ impl<'a> Wcn6750RxDescriptor<'a> {
             fcs_error: attention1 & (1 << 31) != 0,
             decrypt_error: attention1 & (1 << 29) != 0,
             tkip_mic_error: attention1 & (1 << 28) != 0,
+            multicast_broadcast: attention1 & (1 << 2) != 0,
             decrypted: ((attention2 >> 10) & 7) == 0,
             msdu_length: (msdu1 & 0x3fff) as u16,
             decap_type: ((msdu2 >> 8) & 3) as u8,
@@ -113,6 +116,7 @@ impl<'a> Wcn6750RxDescriptor<'a> {
             bandwidth: ((msdu3 >> 19) & 3) as u8,
             packet_type: ((msdu3 >> 8) & 0xf) as u8,
             spatial_stream_bitmap: (msdu3 >> 24) as u8,
+            nss: ((msdu3 >> 24) as u8).count_ones() as u8,
             frequency: self.u32(MSDU_START_PHY_METADATA),
             tid: ((mpdu9 >> 15) & 0xf) as u8,
             peer: PeerId(self.u16(MPDU_START_SW_PEER_ID)),
@@ -197,6 +201,7 @@ mod tests {
             (status.mcs, status.bandwidth, status.spatial_stream_bitmap),
             (9, 1, 3)
         );
+        assert_eq!(status.nss, 2);
     }
 
     #[test]
