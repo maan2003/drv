@@ -333,6 +333,10 @@ impl Backend for LinuxVfio {
         self.generation
     }
 
+    fn is_cache_coherent(&self) -> bool {
+        self.flavor != Flavor::Broker
+    }
+
     fn open_region(&mut self, index: u8) -> Result<u64> {
         if self.flavor == Flavor::PciCoherent && index > 5 {
             return Err(Error::Invalid);

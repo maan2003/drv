@@ -69,6 +69,14 @@ struct Dma {
     iova: u64,
     direction: DmaDirection,
     coherent: bool,
+    ownership: DmaOwnership,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmaOwnership {
+    Cpu,
+    CpuDirty,
+    Device,
+    DeviceDirty,
 }
 pub struct DeterministicBackend {
     generation: u64,
@@ -85,6 +93,7 @@ pub struct DeterministicBackend {
     edu_buffer: Vec<u8>,
     operations: Option<OperationLog>,
     ordering: Option<OrderingAssertions>,
+    cache_coherent: bool,
 }
 impl Default for DeterministicBackend {
     fn default() -> Self {
@@ -103,6 +112,7 @@ impl Default for DeterministicBackend {
             edu_buffer: vec![0; 4096],
             operations: None,
             ordering: None,
+            cache_coherent: true,
         }
     }
 }
@@ -110,10 +120,25 @@ impl DeterministicBackend {
     pub fn device() -> Device<Self> {
         Device::from_backend(Self::default())
     }
+    pub fn noncoherent_device() -> Device<Self> {
+        Device::from_backend(Self {
+            cache_coherent: false,
+            ..Self::default()
+        })
+    }
     pub fn recording_device() -> (Device<Self>, OperationLog) {
         let operations = Rc::new(RefCell::new(Vec::new()));
         let backend = Self {
             operations: Some(operations.clone()),
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations)
+    }
+    pub fn recording_noncoherent_device() -> (Device<Self>, OperationLog) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let backend = Self {
+            operations: Some(operations.clone()),
+            cache_coherent: false,
             ..Self::default()
         };
         (Device::from_backend(backend), operations)
@@ -149,6 +174,14 @@ impl DeterministicBackend {
         }
         Ok(())
     }
+    fn device_accessible(&self, dma: u64) -> Result<()> {
+        let dma = self.dmas.get(&dma).ok_or(Error::StaleHandle)?;
+        if self.cache_coherent || dma.coherent || dma.ownership == DmaOwnership::Device {
+            Ok(())
+        } else {
+            Err(Error::DeviceFault)
+        }
+    }
 }
 
 impl Backend for DeterministicBackend {
@@ -157,6 +190,9 @@ impl Backend for DeterministicBackend {
     type Interrupt = u32;
     fn generation(&self) -> u64 {
         self.generation
+    }
+    fn is_cache_coherent(&self) -> bool {
+        self.cache_coherent
     }
     fn open_region(&mut self, index: u8) -> Result<u8> {
         if index != 0 {
@@ -220,6 +256,7 @@ impl Backend for DeterministicBackend {
             (0x98, value) if value & 1 != 0 => {
                 if value & 2 != 0 {
                     let destination = self.destination.ok_or(Error::Invalid)?;
+                    self.device_accessible(destination.0)?;
                     let end = destination
                         .1
                         .checked_add(self.count)
@@ -240,8 +277,18 @@ impl Backend for DeterministicBackend {
                         .ok_or(Error::StaleHandle)?
                         .bytes[destination.1..end]
                         .copy_from_slice(&self.edu_buffer[..self.count]);
+                    if !self.cache_coherent {
+                        let dma = self
+                            .dmas
+                            .get_mut(&destination.0)
+                            .ok_or(Error::StaleHandle)?;
+                        if !dma.coherent {
+                            dma.ownership = DmaOwnership::DeviceDirty;
+                        }
+                    }
                 } else {
                     let source = self.source.ok_or(Error::Invalid)?;
+                    self.device_accessible(source.0)?;
                     let end = source.1.checked_add(self.count).ok_or(Error::OutOfBounds)?;
                     if end
                         > self
@@ -325,6 +372,7 @@ impl Backend for DeterministicBackend {
                 iova: self.next,
                 direction,
                 coherent,
+                ownership: DmaOwnership::Cpu,
             },
         );
         self.next += size as u64;
@@ -357,6 +405,12 @@ impl Backend for DeterministicBackend {
         if matches!(d.direction, DmaDirection::ToDevice) {
             return Err(Error::Invalid);
         }
+        if !self.cache_coherent
+            && !d.coherent
+            && !matches!(d.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty)
+        {
+            return Err(Error::DeviceFault);
+        }
         out.copy_from_slice(&d.bytes[r]);
         Ok(())
     }
@@ -367,6 +421,25 @@ impl Backend for DeterministicBackend {
         // allocation, including device-to-CPU buffers. Directional access is
         // enforced by the public typed DMA handles.
         d.bytes[r].copy_from_slice(bytes);
+        Ok(())
+    }
+    fn streaming_cpu_dirty(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+        if !self.cache_coherent {
+            let dma = self.dma_mut(dma)?;
+            if !dma.coherent {
+                dma.ownership = DmaOwnership::CpuDirty;
+            }
+        }
+        Ok(())
+    }
+    fn streaming_cpu_read(&mut self, dma: &u64, _: Range<usize>) -> Result<()> {
+        let dma = self.dma(dma)?;
+        if !self.cache_coherent
+            && !dma.coherent
+            && !matches!(dma.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty)
+        {
+            return Err(Error::DeviceFault);
+        }
         Ok(())
     }
     fn dma_read_once_u32(&mut self, dma: &u64, offset: usize) -> Result<u32> {
@@ -381,10 +454,17 @@ impl Backend for DeterministicBackend {
         Ok(())
     }
     fn sync_for_cpu(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
-        let d = self.dma(dma)?;
+        let d = self.dma_mut(dma)?;
         if d.coherent || matches!(d.direction, DmaDirection::ToDevice) {
             Err(Error::Invalid)
         } else {
+            if !matches!(
+                d.ownership,
+                DmaOwnership::Device | DmaOwnership::DeviceDirty
+            ) {
+                return Err(Error::DeviceFault);
+            }
+            d.ownership = DmaOwnership::Cpu;
             if let Some(log) = &self.operations {
                 log.borrow_mut()
                     .push(Operation::SyncForCpu { dma: *dma, range });
@@ -393,10 +473,14 @@ impl Backend for DeterministicBackend {
         }
     }
     fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
-        let d = self.dma(dma)?;
+        let d = self.dma_mut(dma)?;
         if d.coherent {
             Err(Error::Invalid)
         } else {
+            if !matches!(d.ownership, DmaOwnership::Cpu | DmaOwnership::CpuDirty) {
+                return Err(Error::DeviceFault);
+            }
+            d.ownership = DmaOwnership::Device;
             if let Some(log) = &self.operations {
                 log.borrow_mut()
                     .push(Operation::SyncForDevice { dma: *dma, range });
@@ -701,6 +785,70 @@ mod tests {
         descriptors.write(4, &[1, 2, 3, 4]).unwrap();
         bar.write_u32(0x100, 1).unwrap();
         assert_eq!(bar.write_u32(0x100, 2), Err(Error::DeviceFault));
+    }
+
+    #[test]
+    fn coherent_streaming_syncs_are_noops_but_noncoherent_syncs_transition_ownership() {
+        let (coherent, operations) = DeterministicBackend::recording_device();
+        assert!(coherent.is_cache_coherent());
+        let mut dma = coherent
+            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        dma.write(0, &[1]).unwrap();
+        dma.sync_for_device(0, 1).unwrap();
+        dma.sync_for_cpu(0, 1).unwrap();
+        assert!(operations.borrow().is_empty());
+
+        let (noncoherent, operations) = DeterministicBackend::recording_noncoherent_device();
+        assert!(!noncoherent.is_cache_coherent());
+        let mut dma = noncoherent
+            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        operations.borrow_mut().clear();
+        dma.write(0, &[1]).unwrap();
+        dma.sync_for_device(0, 1).unwrap();
+        dma.sync_for_cpu(0, 1).unwrap();
+        assert_eq!(
+            operations.borrow().as_slice(),
+            &[
+                Operation::SyncForDevice {
+                    dma: 1,
+                    range: 0..1
+                },
+                Operation::SyncForCpu {
+                    dma: 1,
+                    range: 0..1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn noncoherent_backend_rejects_unsynchronized_device_and_cpu_access() {
+        let device = DeterministicBackend::noncoherent_device();
+        let bar = device.open_region(0).unwrap();
+        let mut source = device
+            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        bar.write_device_address(0x80, Some(0x84), source.device_address(0).unwrap())
+            .unwrap();
+        bar.write_u32(0x90, 1).unwrap();
+        source.write(0, &[7]).unwrap();
+        assert_eq!(bar.write_u32(0x98, 1), Err(Error::DeviceFault));
+        source.sync_for_device(0, 1).unwrap();
+        bar.write_u32(0x98, 1).unwrap();
+
+        let mut destination = device
+            .alloc_streaming::<drv_hardware::Bidirectional>(16, 4)
+            .unwrap();
+        bar.write_u32(0x80, 0x40000).unwrap();
+        bar.write_device_address(0x88, Some(0x8c), destination.device_address(0).unwrap())
+            .unwrap();
+        bar.write_u32(0x98, 1 | 2).unwrap();
+        let mut byte = [0];
+        assert_eq!(destination.read(0, &mut byte), Err(Error::DeviceFault));
+        destination.sync_for_cpu(0, 1).unwrap();
+        destination.read(0, &mut byte).unwrap();
     }
 
     #[test]

@@ -103,6 +103,10 @@ pub trait Backend {
     type Dma;
     type Interrupt;
     fn generation(&self) -> u64;
+    /// Whether streaming DMA mappings are cache coherent for this device.
+    fn is_cache_coherent(&self) -> bool {
+        true
+    }
     fn open_region(&mut self, index: u8) -> Result<Self::Region>;
     fn region_len(&self, region: &Self::Region) -> usize;
     /// MMIO load with acquire ordering: subsequent CPU reads from coherent
@@ -149,6 +153,17 @@ pub trait Backend {
     }
     fn dma_read(&mut self, dma: &Self::Dma, range: Range<usize>, out: &mut [u8]) -> Result<()>;
     fn dma_write(&mut self, dma: &Self::Dma, range: Range<usize>, bytes: &[u8]) -> Result<()>;
+    /// Notify a backend that a streaming CPU shadow has been modified but not
+    /// yet synchronized for the device. Production backends may ignore this;
+    /// deterministic backends use it to reject missing ownership transitions.
+    fn streaming_cpu_dirty(&mut self, _dma: &Self::Dma, _range: Range<usize>) -> Result<()> {
+        Ok(())
+    }
+    /// Validate a CPU read from a streaming shadow. Deterministic
+    /// non-coherent backends use this to catch a missing `sync_for_cpu`.
+    fn streaming_cpu_read(&mut self, _dma: &Self::Dma, _range: Range<usize>) -> Result<()> {
+        Ok(())
+    }
     /// Perform one naturally aligned, non-tearing 32-bit DMA-memory load.
     fn dma_read_once_u32(&mut self, _dma: &Self::Dma, _offset: usize) -> Result<u32> {
         Err(Error::Invalid)
@@ -204,6 +219,9 @@ impl<B: Backend> Device<B> {
     }
     pub fn generation(&self) -> u64 {
         self.shared.0.borrow().generation()
+    }
+    pub fn is_cache_coherent(&self) -> bool {
+        self.shared.0.borrow().is_cache_coherent()
     }
     pub fn open_region(&self, index: u8) -> Result<MmioRegion<B>> {
         let mut b = self.shared.0.borrow_mut();
@@ -438,7 +456,10 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
             b.release_dma(token);
             return Err(error);
         }
-        if !coherent && let Err(error) = b.sync_for_device(&token, 0..size) {
+        if !coherent
+            && !b.is_cache_coherent()
+            && let Err(error) = b.sync_for_device(&token, 0..size)
+        {
             b.release_dma(token);
             return Err(error);
         }
@@ -656,8 +677,14 @@ impl<B: Backend, D: Direction> StreamingDma<B, D> {
 impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
     pub fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
         let r = self.0.range(offset, bytes.len())?;
-        self.0.bytes[r].copy_from_slice(bytes);
-        Ok(())
+        self.0.bytes[r.clone()].copy_from_slice(bytes);
+        let backend_range = self.0.backend_range(r);
+        self.0
+            .allocation
+            .shared
+            .0
+            .borrow_mut()
+            .streaming_cpu_dirty(self.0.allocation.token.as_ref().unwrap(), backend_range)
     }
     pub fn write_pod<T: FromBytes + IntoBytes>(
         &mut self,
@@ -665,8 +692,14 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
         mut value: T,
     ) -> Result<()> {
         let range = self.0.pod_range::<T>(offset)?;
-        self.0.bytes[range].copy_from_slice(value.as_mut_bytes());
-        Ok(())
+        self.0.bytes[range.clone()].copy_from_slice(value.as_mut_bytes());
+        let backend_range = self.0.backend_range(range);
+        self.0
+            .allocation
+            .shared
+            .0
+            .borrow_mut()
+            .streaming_cpu_dirty(self.0.allocation.token.as_ref().unwrap(), backend_range)
     }
     pub fn write_once<T: PodOnce>(&mut self, offset: usize, value: T) -> Result<()> {
         let range = self.0.pod_range::<T>(offset)?;
@@ -678,7 +711,9 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
             backend_range.start,
             value,
         )?;
-        backend.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
+        if !backend.is_cache_coherent() {
+            backend.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
+        }
         self.0.bytes[range].copy_from_slice(&value.to_ne_bytes());
         Ok(())
     }
@@ -692,7 +727,11 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
             backend_range.clone(),
             bytes,
         )?;
-        b.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)
+        if b.is_cache_coherent() {
+            Ok(())
+        } else {
+            b.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)
+        }
     }
 }
 impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
@@ -700,10 +739,12 @@ impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
         let r = self.0.range(offset, length)?;
         let backend_range = self.0.backend_range(r.clone());
         let mut b = self.0.allocation.shared.0.borrow_mut();
-        b.sync_for_cpu(
-            self.0.allocation.token.as_ref().unwrap(),
-            backend_range.clone(),
-        )?;
+        if !b.is_cache_coherent() {
+            b.sync_for_cpu(
+                self.0.allocation.token.as_ref().unwrap(),
+                backend_range.clone(),
+            )?;
+        }
         b.dma_read(
             self.0.allocation.token.as_ref().unwrap(),
             backend_range,
@@ -712,21 +753,37 @@ impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
     }
     pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<()> {
         let r = self.0.range(offset, out.len())?;
+        let backend_range = self.0.backend_range(r.clone());
+        self.0
+            .allocation
+            .shared
+            .0
+            .borrow_mut()
+            .streaming_cpu_read(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
         out.copy_from_slice(&self.0.bytes[r]);
         Ok(())
     }
     pub fn read_pod<T: FromBytes + IntoBytes>(&self, offset: usize) -> Result<T> {
         let range = self.0.pod_range::<T>(offset)?;
+        let backend_range = self.0.backend_range(range.clone());
+        self.0
+            .allocation
+            .shared
+            .0
+            .borrow_mut()
+            .streaming_cpu_read(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
         T::read_from_bytes(&self.0.bytes[range]).map_err(|_| Error::Invalid)
     }
     pub fn read_once<T: PodOnce>(&mut self, offset: usize) -> Result<T> {
         let range = self.0.pod_range::<T>(offset)?;
         let backend_range = self.0.backend_range(range.clone());
         let mut backend = self.0.allocation.shared.0.borrow_mut();
-        backend.sync_for_cpu(
-            self.0.allocation.token.as_ref().unwrap(),
-            backend_range.clone(),
-        )?;
+        if !backend.is_cache_coherent() {
+            backend.sync_for_cpu(
+                self.0.allocation.token.as_ref().unwrap(),
+                backend_range.clone(),
+            )?;
+        }
         let value = backend.dma_read_once_u32(
             self.0.allocation.token.as_ref().unwrap(),
             backend_range.start,
