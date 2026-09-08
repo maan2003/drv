@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn coherent_flavor_binds_attaches_maps_and_unmaps_fake_fds() {
+    fn platform_cdev_binds_attaches_maps_and_sets_level_irq_in_order() {
         let (device, path) = fake_device();
         let iommu = Arc::new(File::open("/dev/null").unwrap());
         let (_, records) = with_fake_io(false, || {
@@ -800,6 +800,18 @@ mod tests {
             let dma = backend
                 .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, false)
                 .unwrap();
+            let irq = backend.open_interrupt(3).unwrap();
+            signal_eventfd(backend.interrupts.get(&irq).unwrap().1.event_fd(), 1).unwrap();
+            let deadline = userspace_vfio::monotonic_time_ns().unwrap() + 1_000_000_000;
+            assert_eq!(
+                backend
+                    .wait_interrupt(&irq, deadline)
+                    .unwrap()
+                    .unwrap()
+                    .count,
+                1
+            );
+            backend.release_interrupt(irq);
             backend.release_dma(dma);
             drop(backend);
         });
@@ -814,6 +826,10 @@ mod tests {
                     iova: FIRST_IOVA,
                     length: PAGE as u64
                 },
+                Record::QueryIrq(3),
+                Record::InstallIrq(3),
+                Record::UnmaskIrq(3),
+                Record::DisableIrq(3),
                 Record::Unmap {
                     iova: FIRST_IOVA,
                     length: PAGE as u64
