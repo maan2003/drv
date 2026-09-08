@@ -1863,10 +1863,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ep.tx_credits, 4);
+        assert!(ep.credit_flow_enabled);
+        assert_eq!(htc.connect_request(ServiceId::HTT_DATA_MSG).flags, 8);
+        let htt = htc
+            .connect_service(
+                ServiceId::HTT_DATA_MSG,
+                &[3, 0, 0, 3, 0, 2, 0, 8, 0, 0, 0, 0],
+            )
+            .unwrap();
+        assert_eq!(htt.tx_credits, 0);
+        assert!(!htt.credit_flow_enabled);
         for _ in 0..4 {
             htc.send(1, &[0; 1]).unwrap();
         }
         assert_eq!(htc.send(1, &[0]), Err(CeError::NoCredits));
+        for _ in 0..8 {
+            htc.send(2, &[0; 64]).unwrap();
+        }
+        assert_eq!(htc.endpoint(2).unwrap().tx_credits, 0);
         let credit_only = [1, 2, 8, 0, 8, 0, 0, 0, 1, 4, 0, 0, 1, 2, 0, 0];
         assert_eq!(htc.receive(&credit_only), Ok(None));
         assert_eq!(htc.endpoint(1).unwrap().tx_credits, 2);
