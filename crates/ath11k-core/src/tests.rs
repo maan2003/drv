@@ -50,16 +50,63 @@ fn wcn6750_parameters_and_static_windows_match_source() {
         RegisterWindow::CopyEngine.mapped_offset(0x01b8_1234),
         0x0010_1234
     );
-    assert_eq!(WCN6750_INTERRUPT_ROUTES.len(), 28);
+    assert_eq!(WCN6750_INTERRUPT_ROUTES.len(), 16);
     assert!(
-        WCN6750_INTERRUPT_ROUTES[..10]
+        WCN6750_INTERRUPT_ROUTES[..7]
             .iter()
             .all(|route| route.user == MsiUser::CopyEngine)
     );
     assert!(
-        WCN6750_INTERRUPT_ROUTES[10..]
+        WCN6750_INTERRUPT_ROUTES[7..]
             .iter()
             .all(|route| route.user == MsiUser::DataPath)
+    );
+    assert_eq!(
+        WCN6750_INTERRUPT_ROUTES
+            .iter()
+            .map(|route| (route.vector, route.irq))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, Wcn6750Irq::CopyEngine(0)),
+            (1, Wcn6750Irq::CopyEngine(1)),
+            (2, Wcn6750Irq::CopyEngine(2)),
+            (3, Wcn6750Irq::CopyEngine(3)),
+            (4, Wcn6750Irq::CopyEngine(5)),
+            (5, Wcn6750Irq::CopyEngine(7)),
+            (6, Wcn6750Irq::CopyEngine(8)),
+            (10, Wcn6750Irq::DataPathExternalGroup(0)),
+            (11, Wcn6750Irq::DataPathExternalGroup(1)),
+            (12, Wcn6750Irq::DataPathExternalGroup(2)),
+            (14, Wcn6750Irq::DataPathExternalGroup(4)),
+            (16, Wcn6750Irq::DataPathExternalGroup(6)),
+            (17, Wcn6750Irq::DataPathExternalGroup(7)),
+            (18, Wcn6750Irq::DataPathExternalGroup(8)),
+            (19, Wcn6750Irq::DataPathExternalGroup(9)),
+            (20, Wcn6750Irq::DataPathExternalGroup(10)),
+        ]
+    );
+    let mask = WCN6750.ring_mask();
+    let active_groups = (0..11)
+        .filter(|&group| {
+            mask.tx[group] != 0
+                || mask.rx_mon_status[group] != 0
+                || mask.rx[group] != 0
+                || mask.rx_err[group] != 0
+                || mask.rx_wbm_release[group] != 0
+                || mask.reo_status[group] != 0
+                || mask.rxdma_to_host[group] != 0
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(active_groups, vec![0, 1, 2, 4, 6, 7, 8, 9, 10]);
+    assert_eq!(
+        WCN6750_DP_INTERRUPT_ROUTES
+            .iter()
+            .map(|route| match route.irq {
+                Wcn6750Irq::DataPathExternalGroup(group) => usize::from(group),
+                Wcn6750Irq::CopyEngine(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        active_groups
     );
 }
 
