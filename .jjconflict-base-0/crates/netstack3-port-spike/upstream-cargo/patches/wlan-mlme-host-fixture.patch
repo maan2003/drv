@@ -1,0 +1,11 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/lib.rs
+@@ -14,6 +14,8 @@
+ #[cfg(target_os = "fuchsia")]
+ pub mod ap;
+ pub mod auth;
++#[cfg(not(target_os = "fuchsia"))]
++pub mod host_fixture;
+ mod block_ack;
+ pub mod client;
+ mod ddk_converter;

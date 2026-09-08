@@ -1,0 +1,5 @@
+[package]
+name = "teststd"
+edition.workspace = true
+license.workspace = true
+version.workspace = true

@@ -1,0 +1,220 @@
+# Netstack3 host-portability spike
+
+This spike tests whether Fuchsia's Netstack3 can supply the portable network
+service described by [ARCH-network-service](../../specs/ARCH-network-service.md).
+It is not an adoption decision and it contains no MT7921 or other hardware code.
+
+## Reproducible source and license audit
+
+The repository's `scripts/fetch-fuchsia-reference` fetches Gitiles archives at
+Fuchsia commit `1e1219e3fac944c9a906aea9646939746b6062b3`, records each archive's
+SHA-256, and expands the ignored tree under `reference/`. The audit below used
+that mechanism. At this pin:
+
+- the Netstack3 archive is 1.57 MiB compressed and 12 MiB expanded;
+- all fetched references are 59 MiB expanded;
+- Netstack3 core contains 163,854 lines of Rust after excluding the separate
+  integration-test, fuzz, and `teststd` trees;
+- the aggregate core crate's own GN-listed production sources are 10,121 lines;
+- Fuchsia's GN-listed production bindings sources are 44,474 lines; and
+- none of the relevant first-party archives contains a `Cargo.toml`.
+
+Fuchsia source is under the BSD 2-Clause license in the repository-root
+`LICENSE`; individual source headers refer to that file. The Cargo overlay
+therefore carries the exact pinned root license as `upstream-cargo/LICENSE.fuchsia`
+and records its origin in `upstream-cargo/PROVENANCE.md`. No Fuchsia source is
+copied into this crate; `prepare-upstream` applies packaging metadata to the
+ignored, pinned reference tree.
+
+## Smallest portable closure found
+
+Netstack3 deliberately separates a functional protocol core from platform
+bindings. `docs/CORE_BINDINGS.md` says the core is platform-agnostic and that a
+binary supplies the outside world as trait implementations. Production core
+code has no unconditional Zircon, FIDL IPC, filesystem, or device access.
+Fuchsia tracing has a non-Fuchsia implementation; the `fuchsia_async` and
+Inspect uses found in core are target-gated test code.
+
+The useful adoption unit is nevertheless the **aggregate core**, not just its
+Ethernet and ICMP directories. Its production GN target unconditionally depends
+on these protocol crates:
+
+`base`, `datagram`, `device`, `filter`, `hashmap`, `icmp_echo`, `ip`,
+`lock-order`, `macros`, `sync`, `tcp`, `trace`, and `udp`.
+
+Together with the aggregate crate that is 14 first-party crates. Their portable
+Fuchsia-library closure includes `net-types` (and proc macro),
+`packet-formats`, `internet-checksum`, `packet`, `diagnostics-traits`,
+`explicit`, and `replace-with`, plus ordinary crates.io dependencies. The
+checked-in Cargo overlay packages exactly this closure. Its FIDL-free
+`net-declare` facade exposes the literal macros and portable network types used
+by core without importing generated Fuchsia network FIDL types. Versions are
+locked and `core/build.rs` reproduces the aggregate GN target's
+`cfg(no_lock_order)` setting.
+
+The required host binding is a concrete context implementing the aggregate
+marker traits over smaller responsibilities: monotonic time and timers,
+randomness, owned packet buffers and device TX, device events, socket buffers
+and readiness, reference-lifetime notifications, filtering metadata, and
+diagnostics. Fuchsia's 44,474-line binding additionally owns FIDL socket,
+route, interface and netdevice services plus Zircon async behavior. That shell
+is not part of the portable closure.
+
+## Protocol ownership at the pin
+
+| Capability | Location |
+| --- | --- |
+| Ethernet and loopback/pure-IP devices | core (`device` and aggregate device API) |
+| IPv4 and IPv6, fragmentation and forwarding | core (`ip`) |
+| ARP | core (`device`) |
+| IPv6 NDP/NUD, DAD, SLAAC and router discovery | core (`ip` device logic) |
+| route tables, rules and multicast routing | core (`ip` and aggregate API) |
+| ICMPv4/ICMPv6 and ICMP echo sockets | core (`ip`, `datagram`, `icmp_echo`) |
+| UDP | core (`udp` plus shared `datagram`) |
+| TCP state machine and socket state | core (`tcp`); POSIX/FIDL descriptors are bindings |
+| DHCPv4 client and address policy | separate Fuchsia service; `main.rs` calls it out as out-of-stack |
+| DNS configuration and name resolution | separate services (`netcfg`/name lookup), not core; Netstack3's DNS watcher deliberately does not serve results |
+
+DHCP and DNS therefore remain explicit service dependencies even after a core port. The Cargo overlay now links Fuchsia.s pinned platform-agnostic DHCP client core and protocol directly. Its only native code implements the abstract clock, entropy, AF_PACKET, UDP, and configuration-effect boundaries. Name resolution links Fuchsia.s pinned Trust-DNS 0.22 forks directly; a bounded Send command channel implements their Time, UDP, TCP, and spawning traits against the single-owner Netstack3 runtime. No parallel DHCP codec/lease state machine or DNS cache/retry/fallback implementation remains.
+
+## Integration boundary
+
+The safe native-Rust data-plane contract is the `EthernetDevice` trait in this
+crate:
+
+```text
+Wi-Fi Ethernet boundary -> owned EthernetFrame -> Netstack3 host binding
+Wi-Fi Ethernet boundary <- owned EthernetFrame <- Netstack3 host binding
+```
+
+`EthernetFrame` owns exactly 14 through 1514 bytes (Ethernet II without FCS,
+initially no VLAN, 1500-byte MTU). Both fake-device queues have an explicit item
+bound and return frame ownership on backpressure. The trait exposes no file,
+path, descriptor, ioctl, hardware handle, clock, executor, or random
+source. Configuration, monotonic timers, entropy and socket readiness are
+separate injected capabilities. `EthernetEventSource` adds link, receive-ready,
+and returned-transmit-credit events without exposing an OS handle, while
+`EthernetRunner` retains at most one frame in each direction during
+backpressure. This makes the
+frame edge usable in-process without granting the protocol engine ambient
+hardware or filesystem authority and keeps it compatible with
+[REQ-host-portability](../../specs/REQ-host-portability.md).
+
+## Reproduce the executable proof
+
+`FakeEthernetDevice` deterministically demonstrates:
+
+- ingress and transmit transfer owned, lossless Ethernet frames in FIFO order;
+- an ARP-EtherType fixture and an IPv4-EtherType fixture remain opaque to the
+  device boundary;
+- short and oversized frames are rejected before crossing it; and
+- bounded queues return ownership rather than allocate without limit or block.
+
+The package tests drive the pinned Fuchsia DHCP client and Trust-DNS resolver through production Netstack3 without ambient I/O. Run these boundary tests with:
+
+```sh
+cargo test -p netstack3-port-spike
+```
+
+The pinned upstream aggregate core, its `testutils` variant, and the actual
+upstream protocol tests are reproduced with:
+
+```sh
+./crates/netstack3-port-spike/prepare-upstream
+```
+
+That command fetches the exact source pin if needed, overlays the checked-in
+Cargo metadata, performs locked production and `testutils` checks, then runs
+five tests through upstream core APIs behind this crate's owned-frame boundary:
+
+- Ethernet ARP resolution, IPv4 route selection, and queued UDP transmission;
+- Ethernet IPv4 ICMP echo request and reply;
+- IPv6 NDP neighbor solicitation/advertisement and UDP transmission;
+- a real upstream TCP loopback handshake followed by payload receive; and
+- DHCPv4 acquisition over bounded Ethernet, application of the accepted
+  address and on-link route to Netstack3, DNS request/response over Netstack3
+  UDP, and a TCP handshake plus payload between two Ethernet-attached stacks.
+
+The overlay also builds `NativeBindingsCtx` against production core with its
+`testutils` feature disabled. This standalone context supplies injected time and
+entropy, budgeted timers, non-panicking reference notifiers, bounded frame,
+event and UDP queues, TCP buffers/readiness, and device dispatch. Its focused
+tests run in addition to the five protocol tests above (the older protocol
+fixtures still use upstream's fake context as an oracle).
+
+`Runtime` is the narrow production-facing owner. It creates and enables an
+explicit Ethernet interface, applies/revokes IPv4 and IPv6 addresses, atomically
+replaces each version's on-link/default route set with `RoutesApi::set_routes`,
+and exposes bounded opaque IPv4 and IPv6 UDP and TCP handles. Pre-lease DHCP uses
+a private Netstack3 device socket, so
+0.0.0.0/broadcast traffic crosses core's FIFO and normal TX backpressure;
+accepted leases install the address, routes and DNS server set. A deterministic
+two-runtime test then resolves DNS over native UDP. Separate native tests prove
+ARP/NDP, bidirectional IPv4/IPv6 UDP, IPv4/IPv6 TCP
+connect/listen/accept/read/write/shutdown, socket quotas, stale handles, and FIN
+exchange over owned Ethernet frames. The IPv6 tests use two production
+`Runtime` instances rather than Netstack3's fake context.
+
+The exact facade limits are:
+
+- configuration owns at most one explicit address and two explicit routes
+  (on-link plus optional default) per IP version; IPv6 router solicitation and
+  discovered default routes are disabled in favor of that supplied route set;
+- `queue_capacity` bounds each external frame/event/readiness queue, aggregate
+  pending UDP receive datagrams, the shared total of IPv4 and IPv6 UDP/TCP
+  sockets, and each TCP listen backlog;
+- Ethernet MTU is at most 1500 bytes, with owned frames limited to 14–1514
+  bytes;
+- IPv4 and IPv6 UDP payloads are limited to 1472 and 1452 bytes respectively;
+- DHCP/DNS control datagrams are limited to 1232 bytes; and
+- each TCP direction uses a 64 KiB default buffer under Netstack3's configured
+  4 KiB minimum and 4 MiB maximum.
+
+This establishes a usable synchronous native userspace stack. The embedding drives bounded time/frame polls; DHCP renewal/rebind/expiry and DNS retry/cache/TCP fallback execute in their pinned upstream state machines. The remaining deployment-specific step is implementing the existing frame/readiness contract at the Wi-Fi Ethernet boundary.
+
+## Production host socket boundary
+
+RemoteSocketProvider is the authority-free application boundary intended for
+a Linux kernel proxy. It exposes only Netstack3-backed remote IPv4/IPv6 UDP and
+TCP operations. Private Linux loopback traffic remains outside this provider.
+Each proxy client receives a non-reused capability ID and explicit socket
+quota; closing the client revokes every handle. Closed IDs remain stale rather
+than aliasing a later socket.
+
+NativeSocketProvider maps those operations directly to production Netstack3
+UDP/TCP APIs. It adds no transport state machine. UDP readiness stages at most
+one already-bounded Netstack3 datagram, while TCP readiness reads the upstream
+bindings buffer limits. Interface/route/DNS administration is a separate
+NetworkConfigurationAdmin capability. Packet-filter administration is a separate PacketFilterAdmin capability and is intentionally not granted by the application provider. NativeFilterRules carries the pinned netstack3_filter Routines types directly into FilterApi set_filter_state, without a second rule language or translator.
+
+The Cargo overlay builds `netstack3-provider-daemon`, which binds the v2 kernel
+device to ProviderDispatcherV2 and NativeSocketProvider. It validates each full
+frame before accepting its multiplexed namespace/client identity, bounds queued
+requests to the kernel queue limit, advances injected monotonic time, and emits
+sequenced events only when readiness changes. It first requires a versioned attach and link-up over an inherited connected
+`SOCK_SEQPACKET` Ethernet capability. The attach supplies the validated MAC and
+MTU, after which the daemon opens the nonblocking kernel device regardless of
+address state. The pinned DHCP service atomically applies and removes address,
+routes, and DNS without revoking clients; a NixOS static IPv4 option disables
+dependence on DHCP configuration. Offline socket creation, wildcard bind/listen,
+and UDP setup remain available, while remote operations report Netstack3
+reachability errors and never fall back to Linux networking. Link-down removes
+dynamic reachability without closing the socket API. Peer loss, malformed
+transport, provider-device failure, and shutdown terminate the daemon, close the
+sole device descriptor, and revoke every provider client; supervisor restart
+opens a fresh generation after a new attach.
+
+`netstack3-link-supervisor` creates exactly one bounded `SOCK_SEQPACKET` pair,
+passes fd 3 to the daemon and a required shell-free link-peer command, reaps both
+children, and kills the sibling when either exits. NixOS deployments import
+`nixosModules.netstack3-kernel-provider`, enable `services.netstack3Provider`,
+and set `linkPeer.command`; no AF_PACKET, TAP, or dummy production peer is
+provided. The package is exposed as `packages.<system>.netstack3-provider-daemon`.
+
+The experimental, incompatible version-1 proxy transport has a versioned 40-byte little-endian header and a
+64 KiB payload ceiling. ProviderFramedEndpoint fixes client and namespace
+identity at construction and rejects mismatched identities on decode.
+ProviderAbiHarness supplies bounded request/response FIFOs plus golden-byte,
+malformed-identity, and queue-capacity compatibility tests.
+The version-1 routing rule is explicit: IPv4 127/8 and IPv6 ::1 remain private
+Linux loopback; every other destination is a Netstack3 remote socket.

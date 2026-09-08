@@ -1,0 +1,9 @@
+[package]
+name = "fuchsia-async"
+workspace = "../../connectivity/network/netstack3"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+version.workspace = true
+
+[dependencies]
+zx = { path = "../../../sdk/rust/zx" }

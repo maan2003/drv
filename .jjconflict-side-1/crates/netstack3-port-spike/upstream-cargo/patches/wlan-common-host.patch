@@ -1,0 +1,118 @@
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/error.rs b/src/connectivity/wlan/lib/common/rust/src/error.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/error.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/error.rs
+@@ -22,6 +22,7 @@
+     }
+ }
+
++#[cfg(target_os = "fuchsia")]
+ impl From<zx::Status> for FrameWriteError {
+     fn from(status: zx::Status) -> Self {
+         FrameWriteError::BadWrite(status.to_string())
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/lib.rs b/src/connectivity/wlan/lib/common/rust/src/lib.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/lib.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/lib.rs
+@@ -25,7 +25,7 @@
+ pub mod sequestered;
+ pub mod sink;
+ pub mod stats;
+-#[cfg(target_os = "fuchsia")]
++#[cfg(any(target_os = "fuchsia", feature = "host_test_utils"))]
+ pub mod test_utils;
+ pub mod tim;
+ pub mod time;
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/scan.rs b/src/connectivity/wlan/lib/common/rust/src/scan.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/scan.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/scan.rs
+@@ -322,7 +322,6 @@
+     pub compatibility: Compatibility,
+     // Time of the scan result relative to when the system was powered on.
+     // See https://fuchsia.dev/fuchsia-src/concepts/time/language_support?hl=en#monotonic_time
+-    #[cfg(target_os = "fuchsia")]
+     pub timestamp: zx::MonotonicInstant,
+     pub bss_description: BssDescription,
+ }
+@@ -337,16 +336,12 @@
+     fn from(scan_result: ScanResult) -> fidl_sme::ScanResult {
+         let ScanResult {
+             compatibility,
+-            #[cfg(target_os = "fuchsia")]
+             timestamp,
+             bss_description,
+         } = scan_result;
+         fidl_sme::ScanResult {
+             compatibility: compatibility.into_fidl(),
+-            #[cfg(target_os = "fuchsia")]
+             timestamp_nanos: timestamp.into_nanos(),
+-            #[cfg(not(target_os = "fuchsia"))]
+-            timestamp_nanos: 0,
+             bss_description: bss_description.into(),
+         }
+     }
+@@ -360,13 +355,18 @@
+         Ok(ScanResult {
+             compatibility: Compatibility::try_from_fidl(compatibility)
+                 .map_err(|_| format_err!("failed to convert FIDL `Compatibility`"))?,
+-            #[cfg(target_os = "fuchsia")]
+             timestamp: zx::MonotonicInstant::from_nanos(timestamp_nanos),
+             bss_description: bss_description.try_into()?,
+         })
+     }
+ }
+
++/// VMO persistence is a Fuchsia transport operation and is unavailable on the host.
++#[cfg(not(target_os = "fuchsia"))]
++pub fn write_vmo(_results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
++    Err(format_err!("scan-result VMO persistence is unavailable on the host"))
++}
++
+ /// Creates a VMO containing FIDL-encoded scan results.
+ #[cfg(target_os = "fuchsia")]
+ pub fn write_vmo(results: Vec<fidl_sme::ScanResult>) -> Result<fidl::Vmo, anyhow::Error> {
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs b/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/test_utils/mod.rs
+@@ -3,16 +3,23 @@
+ // found in the LICENSE file.
+
+ use crate::append::{Append, BufferTooSmall, TrackedAppend, VecCursor};
++#[cfg(target_os = "fuchsia")]
+ use fuchsia_async::{DurationExt, OnTimeout, TimeoutExt};
+
++#[cfg(target_os = "fuchsia")]
+ use futures::Future;
+
++#[cfg(target_os = "fuchsia")]
+ pub mod fake_capabilities;
++#[cfg(target_os = "fuchsia")]
+ pub mod fake_features;
++#[cfg(target_os = "fuchsia")]
+ pub mod fake_frames;
++#[cfg(target_os = "fuchsia")]
+ pub mod fake_stas;
+
+ /// A trait which allows to expect a future to terminate within a given time or panic otherwise.
++#[cfg(target_os = "fuchsia")]
+ pub trait ExpectWithin: Future + Sized {
+     fn expect_within<S: ToString + Clone>(
+         self,
+@@ -24,6 +31,7 @@
+     }
+ }
+
++#[cfg(target_os = "fuchsia")]
+ impl<F: Future + Sized> ExpectWithin for F {}
+
+ pub struct FixedSizedTestBuffer(VecCursor);
+diff -ruN a/src/connectivity/wlan/lib/common/rust/src/time.rs b/src/connectivity/wlan/lib/common/rust/src/time.rs
+--- a/src/connectivity/wlan/lib/common/rust/src/time.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/time.rs
+@@ -27,8 +27,6 @@
+ )]
+ pub struct TimeUnit(pub u16);
+
+-#[cfg(target_os = "fuchsia")]
+-#[cfg(target_os = "fuchsia")]
+ impl From<TimeUnit> for zx::MonotonicDuration {
+     fn from(tu: TimeUnit) -> zx::MonotonicDuration {
+         zx::MonotonicDuration::from_micros(tu.into_micros())
