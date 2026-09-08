@@ -95,7 +95,7 @@
 | `ath11k_qmi_free_target_mem_chunk` | `qmi.c:1956-1977` | `src/handshake.rs::MemoryProvider` | kernel-substrate | DMA/MMIO release is platform-owned. |
 | `ath11k_qmi_alloc_target_mem_chunk` | `qmi.c:1979-2037` | `src/handshake.rs::MemoryProvider::provision` | local-seam | Platform allocation policy is injected. |
 | `ath11k_qmi_assign_target_mem_chunk` | `qmi.c:2039-2118` | `src/handshake.rs::MemoryProvider::provision` | wcn6750-specific | WCN6750 fixed reserved-memory assignment is supplied by the platform seam. |
-| `ath11k_qmi_request_device_info` | `qmi.c:2120-2195` | `src/wire.rs::DeviceInfoRequest; src/wire.rs::DeviceInfoResponse` | deferred | Hybrid-bus BAR validation/mapping is not used by the WCN6750 handshake. |
+| `ath11k_qmi_request_device_info` | `qmi.c:2120-2195` | `src/wire.rs::DeviceInfoRequest; src/wire.rs::DeviceInfoResponse; src/handshake.rs::Wcn6750Handshake::capabilities` | ported | The hybrid-bus path requires both BAR TLVs, a nonzero address, and an exact 2 MiB size before mapping. |
 | `ath11k_qmi_request_target_cap` | `qmi.c:2197-2295` | `src/handshake.rs::Wcn6750Handshake::capabilities` | ported | The pinned source has no PHY-capability message; the 0x0024 target-capability transaction is the capability step. |
 | `ath11k_qmi_load_file_target_mem` | `qmi.c:2297-2411` | `src/handshake.rs::Wcn6750Handshake::download` | ported | Segmented BDF/caldata/EEPROM download; fixed-address copying remains platform-owned. |
 | `ath11k_qmi_load_bdf_qmi` | `qmi.c:2413-2509` | `src/handshake.rs::Wcn6750Handshake::load_bdf` | ported | FirmwareAssets supplies file and board discovery. |
