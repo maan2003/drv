@@ -429,7 +429,8 @@
             MT7921_FUCHSIA_BASE_REVISION = mt7921FuchsiaSource.fuchsiaBaseRevision;
             MT7921_FUCHSIA_ORDERED_PATCH_SET_SHA256 = mt7921FuchsiaSource.fuchsiaOrderedPatchSetSha256;
             MT7921_FUCHSIA_ORDERED_PATCH_LIST = mt7921FuchsiaSource.fuchsiaOrderedPatchList;
-            session_client_mac = "8a:fd:2a:8b:70:5a";
+            session_client_mac = "da:61:40:51:27:e8";
+            MT7921_SESSION_CLIENT_MAC = "da:61:40:51:27:e8";
             preBuild = ''
               ref=reference/fuchsia-${mt7921FuchsiaSource.fuchsiaBaseRevision}
               export MT7921_MATERIALIZED_SOURCE_TREE_SHA256=$(cat "$ref/.drv-materialized-source-tree-sha256")
@@ -522,7 +523,7 @@
               printf '%s\n' "$rate_output" | grep -F '"rate_power_self_test":"passed"'
               launcher=$out/bin/mt7921-full-firmware-validation
               grep -F 'DRV_ACTIVE_CLIENT=1' "$launcher"
-              grep -F 'DRV_SAE_CLIENT_MAC=8a:fd:2a:8b:70:5a' "$launcher"
+              grep -F 'DRV_SAE_CLIENT_MAC=da:61:40:51:27:e8' "$launcher"
               grep -F -- '--run-one-shot-sae-auth' "$launcher"
               if "$launcher" --run-one-shot-patch-table-gate 2>/dev/null; then
                 echo 'fixed launcher unexpectedly accepted patch-table gate dispatch' >&2
@@ -537,6 +538,7 @@
             mt7921-full-firmware-validation.overrideAttrs (old: {
               pname = "mt7921-fresh-laa-diagnostic";
               session_client_mac = "02:7d:91:4c:b8:3e";
+              MT7921_SESSION_CLIENT_MAC = "02:7d:91:4c:b8:3e";
               cargoBuildFlags = [
                 "--no-default-features"
                 "--features"
@@ -571,7 +573,7 @@
                 --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run --subst-var-by var_root /var \
                 --subst-var-by id_command ${pkgs.coreutils}/bin/id \
-                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by native_client_mac da:61:40:51:27:e8 \
                 --subst-var-by session_client_mac 02:7d:91:4c:b8:3e \
                 --subst-var-by identity_mode fixed-fresh-laa-diagnostic
               chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
@@ -663,8 +665,8 @@
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
                 --subst-var-by id_command ${pkgs.coreutils}/bin/id \
-                --subst-var-by native_client_mac 8a:fd:2a:8b:70:5a \
-                --subst-var-by session_client_mac 8a:fd:2a:8b:70:5a \
+                --subst-var-by native_client_mac da:61:40:51:27:e8 \
+                --subst-var-by session_client_mac da:61:40:51:27:e8 \
                 --subst-var-by identity_mode native-handoff
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
@@ -1197,7 +1199,7 @@
                 ${mt7921-full-firmware-validation-manifest} > "$out"
               cat >> "$out" <<'EOF'
               IDENTITY_MODE=fixed-fresh-laa-diagnostic
-              NATIVE_CLIENT_MAC=8a:fd:2a:8b:70:5a
+              NATIVE_CLIENT_MAC=da:61:40:51:27:e8
               SESSION_IDENTITY_CONTRACT=single-typed-source-fixed-fresh-laa-dev-muar-bss-omac-sme-mgmt-rx-v1
               RECOVERY_IDENTITY_CONTRACT=native-address-required-before-watchdog-disarm
               EOF
