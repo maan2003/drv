@@ -17,6 +17,7 @@ use crate::tags::{
     WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT, WMI_TAG_VDEV_START_RESPONSE_EVENT,
     WMI_TAG_VDEV_STOPPED_EVENT,
 };
+use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, EventId, WmiError};
 
 mod lifecycle;
@@ -45,6 +46,10 @@ impl<'a> TlvIter<'a> {
             remaining: bytes,
             failed: false,
         }
+    }
+
+    pub fn validate_with_trace(bytes: &[u8], sink: &mut dyn TraceSink) -> Result<(), WmiError> {
+        trace_tlv_stream(bytes, sink)
     }
 }
 
@@ -127,10 +132,25 @@ pub fn find_tlv(bytes: &[u8], tag: u16) -> Result<Option<&[u8]>, WmiError> {
     Ok(found)
 }
 
+pub fn find_tlv_with_trace<'a>(
+    bytes: &'a [u8],
+    tag: u16,
+    sink: &mut dyn TraceSink,
+) -> Result<Option<&'a [u8]>, WmiError> {
+    trace_tlv_stream(bytes, sink)?;
+    let found = find_tlv(bytes, tag)?;
+    sink.record(TraceEvent::Branch {
+        name: "wmi.find_tlv.tag_present",
+        taken: found.is_some(),
+    });
+    Ok(found)
+}
+
 pub trait WireEvent: Sized {
     const TAG: u16;
     const MIN_LEN: usize;
     fn parse(value: &[u8], all_tlvs: &[u8]) -> Result<Self, WmiError>;
+    fn trace_fields(&self, _sink: &mut dyn TraceSink) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +166,77 @@ impl<T> Decoder<T> {
             marker: PhantomData,
         }
     }
+}
+
+impl<T: WireEvent> Decoder<T> {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<T, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: core::any::type_name::<T>(),
+                        taken: true,
+                    });
+                    value.trace_fields(trace);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: core::any::type_name::<T>(),
+                        taken: false,
+                    });
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn trace_tlv_stream(bytes: &[u8], sink: &mut dyn TraceSink) -> Result<(), WmiError> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 4 {
+            sink.record(TraceEvent::Reject {
+                reason: RejectReason::Truncated,
+                offset,
+            });
+            return Err(WmiError::Malformed);
+        }
+        let header = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let len = (header & 0xffff) as usize;
+        let tag = (header >> 16) as u16;
+        sink.record(TraceEvent::Tlv { tag, len, offset });
+        if len > bytes.len() - offset - 4 {
+            sink.record(TraceEvent::Reject {
+                reason: RejectReason::Truncated,
+                offset,
+            });
+            return Err(WmiError::Malformed);
+        }
+        if policy_min_len(tag).is_some_and(|minimum| len < minimum) {
+            sink.record(TraceEvent::Reject {
+                reason: RejectReason::InvalidArgument,
+                offset,
+            });
+            return Err(WmiError::Malformed);
+        }
+        offset += 4 + len;
+    }
+    Ok(())
 }
 
 impl<T: WireEvent> EventDecoder for Decoder<T> {
@@ -187,6 +278,12 @@ macro_rules! words_event {
             const MIN_LEN: usize = $len;
             fn parse(value: &[u8], _: &[u8]) -> Result<Self, WmiError> {
                 Ok(Self { $($field: word(value, $off)?),+ })
+            }
+            fn trace_fields(&self, sink: &mut dyn TraceSink) {
+                $(sink.record(TraceEvent::Field {
+                    name: concat!("wmi.", stringify!($name), ".", stringify!($field)),
+                    value: u64::from(self.$field),
+                });)+
             }
         }
     };
@@ -494,6 +591,42 @@ pub struct PeerCfrCapture {
 pub struct PeerCfrCaptureDecoder {
     pub id: EventId,
 }
+impl PeerCfrCaptureDecoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<PeerCfrCapture, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.PeerCfrCapture.fixed.present",
+                        taken: value.fixed.is_some(),
+                    });
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.PeerCfrCapture.phase.present",
+                        taken: value.phase.is_some(),
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
 impl EventDecoder for PeerCfrCaptureDecoder {
     type Output = PeerCfrCapture;
     fn decode(&self, event: Event) -> Result<Self::Output, WmiError> {
@@ -532,6 +665,35 @@ pub struct OpaqueEvent {
 #[derive(Clone, Copy, Debug)]
 pub struct OpaqueEventDecoder {
     pub id: EventId,
+}
+impl OpaqueEventDecoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        sink: Option<&mut dyn TraceSink>,
+    ) -> Result<OpaqueEvent, WmiError> {
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Field {
+                        name: "wmi.OpaqueEvent.bytes.len",
+                        value: value.bytes.len() as u64,
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::InvalidArgument,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 /// Validate one receive message through the same typed decoder selected by
@@ -624,6 +786,107 @@ pub fn validate_known_event(event: Event) -> Result<&'static str, WmiError> {
         _ => {
             for tlv in TlvIter::new(event.tlvs()) {
                 tlv?;
+            }
+            Ok("opaque/unknown")
+        }
+    }
+}
+
+/// Traced form of [`validate_known_event`].
+pub fn validate_known_event_with_trace(
+    event: Event,
+    sink: Option<&mut dyn TraceSink>,
+) -> Result<&'static str, WmiError> {
+    macro_rules! fixed {
+        ($ty:ty, $name:literal) => {{
+            let id = event.id;
+            Decoder::<$ty>::new(id).decode_with_trace(event, sink)?;
+            Ok($name)
+        }};
+    }
+    match event.id {
+        tags::WMI_SERVICE_READY_EVENTID => {
+            ServiceReadyDecoder.decode_with_trace(event, sink)?;
+            Ok("ServiceReady")
+        }
+        tags::WMI_SERVICE_READY_EXT_EVENTID => {
+            ServiceReadyExtDecoder.decode_with_trace(event, sink)?;
+            Ok("ServiceReadyExt")
+        }
+        tags::WMI_SERVICE_READY_EXT2_EVENTID => {
+            ServiceReadyExt2Decoder.decode_with_trace(event, sink)?;
+            Ok("ServiceReadyExt2")
+        }
+        tags::WMI_REG_CHAN_LIST_CC_EVENTID => {
+            fixed!(RegulatoryChannelListLegacy, "RegulatoryChannelListLegacy")
+        }
+        tags::WMI_REG_CHAN_LIST_CC_EXT_EVENTID => fixed!(
+            RegulatoryChannelListExtended,
+            "RegulatoryChannelListExtended"
+        ),
+        tags::WMI_READY_EVENTID => {
+            ReadyDecoder.decode_with_trace(event, sink)?;
+            Ok("Ready")
+        }
+        tags::WMI_PEER_DELETE_RESP_EVENTID => fixed!(PeerDeleteResponse, "PeerDeleteResponse"),
+        tags::WMI_VDEV_START_RESP_EVENTID => fixed!(VdevStartResponse, "VdevStartResponse"),
+        tags::WMI_OFFLOAD_BCN_TX_STATUS_EVENTID => fixed!(BeaconTxStatus, "BeaconTxStatus"),
+        tags::WMI_VDEV_STOPPED_EVENTID => fixed!(VdevStopped, "VdevStopped"),
+        tags::WMI_MGMT_RX_EVENTID => fixed!(MgmtRx, "MgmtRx"),
+        tags::WMI_MGMT_TX_COMPLETION_EVENTID => fixed!(MgmtTxCompletion, "MgmtTxCompletion"),
+        tags::WMI_SCAN_EVENTID => fixed!(Scan, "Scan"),
+        tags::WMI_PEER_STA_KICKOUT_EVENTID => fixed!(PeerStaKickout, "PeerStaKickout"),
+        tags::WMI_ROAM_EVENTID => fixed!(Roam, "Roam"),
+        tags::WMI_CHAN_INFO_EVENTID => fixed!(ChannelInfo, "ChannelInfo"),
+        tags::WMI_PDEV_BSS_CHAN_INFO_EVENTID => fixed!(PdevBssChannelInfo, "PdevBssChannelInfo"),
+        tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID => {
+            fixed!(InstallKeyCompletion, "InstallKeyCompletion")
+        }
+        tags::WMI_SERVICE_AVAILABLE_EVENTID => fixed!(ServiceAvailable, "ServiceAvailable"),
+        tags::WMI_PEER_ASSOC_CONF_EVENTID => fixed!(PeerAssocConfirmation, "PeerAssocConfirmation"),
+        tags::WMI_UPDATE_STATS_EVENTID => fixed!(UpdateStats, "UpdateStats"),
+        tags::WMI_PDEV_CTL_FAILSAFE_CHECK_EVENTID => {
+            fixed!(PdevCtlFailsafeCheck, "PdevCtlFailsafeCheck")
+        }
+        tags::WMI_PDEV_CSA_SWITCH_COUNT_STATUS_EVENTID => {
+            fixed!(PdevCsaSwitchCount, "PdevCsaSwitchCount")
+        }
+        tags::WMI_PDEV_TEMPERATURE_EVENTID => fixed!(PdevTemperature, "PdevTemperature"),
+        tags::WMI_PDEV_DMA_RING_BUF_RELEASE_EVENTID => {
+            fixed!(DmaRingBufferRelease, "DmaRingBufferRelease")
+        }
+        tags::WMI_HOST_FILS_DISCOVERY_EVENTID => fixed!(FilsDiscovery, "FilsDiscovery"),
+        tags::WMI_OFFLOAD_PROB_RESP_TX_STATUS_EVENTID => {
+            fixed!(ProbeResponseTxStatus, "ProbeResponseTxStatus")
+        }
+        tags::WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID => {
+            fixed!(ObssColorCollision, "ObssColorCollision")
+        }
+        tags::WMI_TWT_ADD_DIALOG_EVENTID => fixed!(TwtAddDialog, "TwtAddDialog"),
+        tags::WMI_PDEV_DFS_RADAR_DETECTION_EVENTID => fixed!(PdevDfsRadar, "PdevDfsRadar"),
+        tags::WMI_VDEV_DELETE_RESP_EVENTID => fixed!(VdevDeleteResponse, "VdevDeleteResponse"),
+        tags::WMI_WOW_WAKEUP_HOST_EVENTID => fixed!(WowWakeupHost, "WowWakeupHost"),
+        tags::WMI_11D_NEW_COUNTRY_EVENTID => fixed!(NewCountry, "NewCountry"),
+        tags::WMI_PEER_STA_PS_STATECHG_EVENTID => {
+            fixed!(PeerStaPowerSaveStateChange, "PeerStaPowerSaveStateChange")
+        }
+        tags::WMI_GTK_OFFLOAD_STATUS_EVENTID => fixed!(GtkOffloadStatus, "GtkOffloadStatus"),
+        tags::WMI_P2P_NOA_EVENTID => fixed!(P2pNoa, "P2pNoa"),
+        tags::WMI_PEER_CFR_CAPTURE_EVENTID => {
+            PeerCfrCaptureDecoder { id: event.id }.decode_with_trace(event, sink)?;
+            Ok("PeerCfrCapture")
+        }
+        tags::WMI_PDEV_UTF_EVENTID | tags::WMI_DIAG_EVENTID => {
+            OpaqueEventDecoder { id: event.id }.decode_with_trace(event, sink)?;
+            Ok("OpaqueEvent")
+        }
+        _ => {
+            if let Some(trace) = sink {
+                trace_tlv_stream(event.tlvs(), trace)?;
+            } else {
+                for tlv in TlvIter::new(event.tlvs()) {
+                    tlv?;
+                }
             }
             Ok("opaque/unknown")
         }
@@ -881,6 +1144,48 @@ pub struct Ready {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadyDecoder;
+impl ReadyDecoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<Ready, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.Ready.fixed.present",
+                        taken: value.mac_addr.is_some(),
+                    });
+                    trace.record(TraceEvent::Field {
+                        name: "wmi.Ready.extra_mac_addresses.len",
+                        value: value.extra_mac_addresses.len() as u64,
+                    });
+                    if let Some(status) = value.status {
+                        trace.record(TraceEvent::Field {
+                            name: "wmi.Ready.status",
+                            value: u64::from(status),
+                        });
+                    }
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
 impl EventDecoder for ReadyDecoder {
     type Output = Ready;
     fn decode(&self, event: Event) -> Result<Self::Output, WmiError> {
@@ -922,6 +1227,14 @@ impl EventDecoder for ReadyDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Trace(Vec<TraceEvent>);
+    impl TraceSink for Trace {
+        fn record(&mut self, event: TraceEvent) {
+            self.0.push(event);
+        }
+    }
 
     fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1023,5 +1336,54 @@ mod tests {
     fn unknown_event_still_requires_structural_tlvs() {
         let event = Event::from_tlvs(EventId(u32::MAX), alloc::vec![8, 0, 1, 0]).unwrap();
         assert_eq!(validate_known_event(event), Err(WmiError::Malformed));
+    }
+
+    #[test]
+    fn traced_scan_records_tlv_branch_and_full_path_fields() {
+        let value: Vec<_> = [1u32, 2, 2412, 4, 5, 6, 7]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let event = Event::from_tlvs(tags::WMI_SCAN_EVENTID, tlv(Scan::TAG, &value)).unwrap();
+        let mut trace = Trace::default();
+        assert_eq!(
+            validate_known_event_with_trace(event, Some(&mut trace)),
+            Ok("Scan")
+        );
+        assert!(
+            matches!(trace.0[0], TraceEvent::Tlv { tag, len: 28, offset: 0 } if tag == Scan::TAG)
+        );
+        assert!(trace.0.iter().any(|event| matches!(
+            event,
+            TraceEvent::Field {
+                name: "wmi.Scan.channel_freq",
+                value: 2412
+            }
+        )));
+        assert!(trace.0.iter().any(|event| matches!(event,
+            TraceEvent::Branch { name, taken: true } if name.ends_with("::Scan"))));
+    }
+
+    #[test]
+    fn traced_iterator_reports_precise_truncation_offset() {
+        let mut trace = Trace::default();
+        assert_eq!(
+            TlvIter::validate_with_trace(&[8, 0, 1, 0], &mut trace),
+            Err(WmiError::Malformed)
+        );
+        assert_eq!(
+            trace.0,
+            alloc::vec![
+                TraceEvent::Tlv {
+                    tag: 1,
+                    len: 8,
+                    offset: 0
+                },
+                TraceEvent::Reject {
+                    reason: RejectReason::Truncated,
+                    offset: 0
+                },
+            ]
+        );
     }
 }
