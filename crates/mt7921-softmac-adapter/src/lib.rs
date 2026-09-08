@@ -8,6 +8,7 @@
 pub mod client_device;
 pub mod ethernet;
 mod production_client;
+pub mod production_effects;
 
 pub use production_client::Mt7921ProductionClient;
 

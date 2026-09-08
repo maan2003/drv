@@ -36,6 +36,14 @@ host-retained `DeviceOps` method returns `ZX_ERR_NOT_SUPPORTED` rather than fake
 success. Frames and key-bearing values are never included in adapter Debug or
 error output; tests use only a documented synthetic key pattern.
 
+`production_effects::LiveClientEffects` owns the production client effect
+state behind an opaque API. Its separate, non-cloneable authorization handle is
+fixed to the constructor's target and can only publish matching rate-power
+readiness and SAE authorization. The synchronous diagnostic observer is
+infallible and panic-contained, runs only after internal locks are released,
+and receives bounded redacted events rather than frame or key bytes. TIM
+telemetry publishes `partial_virtual_bitmap_sha256`, not the bitmap contents.
+
 `Mt7921AssociationState` is the hardware-side ordering guard for those
 effects. Association publishes one bounded WCID, traffic-key effects retain
 only non-secret readiness bits, the controlled port cannot open before
@@ -63,9 +71,11 @@ other transport.
 The offline mechanics gate is complete: tests pass exact query, channel, join,
 frame/flag, synthetic-key, association, link, MLME-event, and RX-status values
 through the pinned `DeviceOps` contract; injected failures are returned once
-without later effects. The internal effects seam has no public consumer API,
-and the pristine production SME/MLME/RSN gate remains green. This is not
-evidence for management-frame transmission or a production backend.
+without later effects. The live effects API exposes only production
+construction/authorization and the pure frame helpers required by the physical
+consumer; mutable state and diagnostic controls remain private. The pristine
+production SME/MLME/RSN gate remains green. This is not evidence for
+management-frame transmission or a production backend.
 
 ## Netstack3 Ethernet boundary
 

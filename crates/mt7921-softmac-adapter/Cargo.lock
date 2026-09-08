@@ -1093,6 +1093,7 @@ dependencies = [
  "netstack3-port-integration",
  "netstack3-port-spike",
  "netstack3_base",
+ "num-bigint",
  "packet",
  "packet_formats",
  "rand 0.9.4",
@@ -2223,10 +2224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "userspace-vfio"
-version = "0.1.0"
-
-[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2505,9 +2502,7 @@ dependencies = [
  "fuchsia-inspect",
  "fuchsia-trace",
  "futures",
- "netstack3-port-integration",
  "netstack3-port-spike",
- "rand 0.9.4",
  "tokio",
  "wlan-mlme",
  "wlan-sme",
