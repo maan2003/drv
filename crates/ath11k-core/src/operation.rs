@@ -317,6 +317,25 @@ impl Operation {
 pub trait Subsystems {
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError>;
 
+    /// Execute one vdev start and classify whether failure leaves a firmware
+    /// response outstanding. Generic transports conservatively report
+    /// ambiguity; transports with stronger send/completion contracts override.
+    fn execute_vdev_start(
+        &mut self,
+        vdev: VdevId,
+        restart: bool,
+        channel: Channel,
+    ) -> Result<(), VdevStartFailure> {
+        self.execute(Operation::WmiVdevStart {
+            vdev,
+            restart,
+            channel,
+        })
+        .map_err(VdevStartFailure::Ambiguous)?;
+        self.execute(Operation::WaitVdevSetup { vdev })
+            .map_err(VdevStartFailure::Ambiguous)
+    }
+
     /// Drive the event-oriented QMI handshake until firmware reports ready.
     /// The returned value is consumed by core rather than supplied by its caller.
     fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError>;
@@ -356,6 +375,16 @@ pub trait Subsystems {
             rx_dropped: Default::default(),
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VdevStartFailure {
+    /// The command was definitively not visible to firmware.
+    NotSent(CoreError),
+    /// Firmware returned a matched, completed rejection.
+    Rejected(CoreError),
+    /// A response may still arrive and cannot be correlated with a retry.
+    Ambiguous(CoreError),
 }
 
 /// Deterministic subsystem model used before transports are attached and by

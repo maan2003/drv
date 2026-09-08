@@ -64,6 +64,10 @@ impl<T: Transport> Wmi<T> {
         self.events.wait_for_vdev_start(deadline_ns, vdev_id)
     }
 
+    pub fn discard_vdev_start(&mut self, vdev_id: u32) {
+        self.events.discard_vdev_start(vdev_id);
+    }
+
     pub fn send<R: EncodeCommand>(&mut self, request: &R) -> Result<(), WmiError> {
         self.events.transport_mut().send(request.encode_command()?)
     }
@@ -146,5 +150,20 @@ mod tests {
         assert_eq!((response.vdev_id, response.status), (1, 7));
         assert_eq!(wmi.next_event(10), Ok(Some(unrelated)));
         assert_eq!(wmi.next_event(10), Ok(Some(mismatched)));
+    }
+
+    #[test]
+    fn new_vdev_start_discards_a_pending_same_vdev_completion() {
+        let stale = vdev_start_response(1, 0);
+        let matched = vdev_start_response(1, 7);
+        let mut wmi = Wmi::attach(MockTransport {
+            commands: Vec::new(),
+            incoming: VecDeque::from([stale]),
+        });
+        assert_eq!(wmi.wait_for_vdev_start(10, 2), Err(WmiError::Timeout));
+        wmi.events.transport_mut().incoming.push_back(matched);
+        wmi.discard_vdev_start(1);
+        let response = wmi.wait_for_vdev_start(10, 1).unwrap();
+        assert_eq!(response.status, 7);
     }
 }

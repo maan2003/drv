@@ -25,6 +25,7 @@ pub use hw::{FirmwareLayout, HardwareParams, RingMask, WCN6750, Wcn6750};
 pub use operation::{
     Channel, Cipher, KeyConfig, KeyKind, ManagementFrame, ModelSubsystems, Operation,
     OperationTarget, RegulatoryChannel, RegulatoryDomain, ScanConfig, ScanId, Subsystems,
+    VdevStartFailure,
 };
 pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
 pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink, wcn6750_scan_start};
@@ -117,6 +118,7 @@ pub struct Device<B: Subsystems> {
     state: DeviceState,
     firmware: Option<FirmwareReady>,
     vdevs: Vec<Vdev>,
+    uncertain_vdev_starts: Vec<VdevId>,
     peers: Vec<(VdevId, [u8; 6])>,
     crash_count: u32,
 }
@@ -128,6 +130,7 @@ impl Wcn6750 {
             state: DeviceState::Allocated,
             firmware: None,
             vdevs: Vec::new(),
+            uncertain_vdev_starts: Vec::new(),
             peers: Vec::new(),
             crash_count: 0,
         }
@@ -270,6 +273,7 @@ impl<B: Subsystems> Device<B> {
         }
         self.state = DeviceState::Probed;
         self.vdevs.clear();
+        self.uncertain_vdev_starts.clear();
         self.peers.clear();
         self.attach_firmware()
     }
@@ -412,14 +416,22 @@ impl<B: Subsystems> RadioControl for Device<B> {
             .vdevs
             .iter()
             .find(|item| item.id == vdev)
-            .is_some_and(|item| item.started);
+            .ok_or(CoreError::WrongState)?
+            .started;
+        if self.uncertain_vdev_starts.contains(&vdev) {
+            return Err(CoreError::WrongState);
+        }
         let channel = Channel::client_20mhz(regulatory);
-        self.op(Operation::WmiVdevStart {
-            vdev,
-            restart,
-            channel,
-        })?;
-        self.op(Operation::WaitVdevSetup { vdev })?;
+        match self.backend.execute_vdev_start(vdev, restart, channel) {
+            Ok(()) => {}
+            Err(VdevStartFailure::NotSent(error) | VdevStartFailure::Rejected(error)) => {
+                return Err(error);
+            }
+            Err(VdevStartFailure::Ambiguous(error)) => {
+                self.uncertain_vdev_starts.push(vdev);
+                return Err(error);
+            }
+        }
         if let Some(item) = self.vdevs.iter_mut().find(|item| item.id == vdev) {
             item.started = true;
         }

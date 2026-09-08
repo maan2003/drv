@@ -5,9 +5,28 @@ use alloc::{vec, vec::Vec};
 struct Model {
     log: Vec<Operation>,
     fail: Option<Operation>,
+    vdev_start_failure: Option<VdevStartFailure>,
 }
 
 impl Subsystems for Model {
+    fn execute_vdev_start(
+        &mut self,
+        vdev: VdevId,
+        restart: bool,
+        channel: Channel,
+    ) -> Result<(), VdevStartFailure> {
+        self.log.push(Operation::WmiVdevStart {
+            vdev,
+            restart,
+            channel,
+        });
+        if let Some(error) = self.vdev_start_failure.take() {
+            return Err(error);
+        }
+        self.execute(Operation::WaitVdevSetup { vdev })
+            .map_err(VdevStartFailure::Ambiguous)
+    }
+
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError> {
         self.log.push(operation.clone());
         if self.fail.as_ref() == Some(&operation) {
@@ -338,7 +357,7 @@ fn repeated_channel_set_uses_vdev_restart_only_after_completed_start() {
 }
 
 #[test]
-fn failed_vdev_start_completion_does_not_promote_restart_state() {
+fn failed_vdev_start_completion_makes_the_vdev_uncertain() {
     let mut device = ready_device();
     let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
     let channel = RegulatoryChannel {
@@ -358,11 +377,70 @@ fn failed_vdev_start_completion_does_not_promote_restart_state() {
         Err(CoreError::DeviceFault)
     );
     device.backend_mut().log.clear();
-    device.start_vdev(vdev, channel).unwrap();
-    assert!(matches!(
-        device.backend().log.first(),
-        Some(Operation::WmiVdevStart { restart: false, .. })
-    ));
+    device.backend_mut().fail = None;
+    assert_eq!(device.start_vdev(vdev, channel), Err(CoreError::WrongState));
+    assert!(device.backend().log.is_empty());
+}
+
+#[test]
+fn uncertain_start_id_remains_quarantined_after_delete_and_recreate() {
+    let mut device = ready_device();
+    let mac = [2, 0, 0, 0, 0, 1];
+    let vdev = device.create_client_vdev(mac).unwrap();
+    let channel = RegulatoryChannel {
+        frequency_mhz: 2437,
+        max_power_dbm: 20,
+        max_reg_power_dbm: 20,
+        max_antenna_gain_dbi: 0,
+        passive: false,
+        radar: false,
+        allow_ht: true,
+        allow_vht: true,
+        allow_he: true,
+    };
+    device.backend_mut().vdev_start_failure =
+        Some(VdevStartFailure::Ambiguous(CoreError::Protocol));
+    assert_eq!(device.start_vdev(vdev, channel), Err(CoreError::Protocol));
+    device.delete_vdev(vdev).unwrap();
+    let replacement = device.create_client_vdev(mac).unwrap();
+    assert_eq!(replacement, vdev);
+    device.backend_mut().log.clear();
+    assert_eq!(
+        device.start_vdev(replacement, channel),
+        Err(CoreError::WrongState)
+    );
+    assert!(device.backend().log.is_empty());
+}
+
+#[test]
+fn definitive_start_failures_remain_retryable() {
+    for (failure, expected) in [
+        (
+            VdevStartFailure::NotSent(CoreError::DeviceFault),
+            CoreError::DeviceFault,
+        ),
+        (
+            VdevStartFailure::Rejected(CoreError::Protocol),
+            CoreError::Protocol,
+        ),
+    ] {
+        let mut device = ready_device();
+        let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
+        let channel = RegulatoryChannel {
+            frequency_mhz: 2437,
+            max_power_dbm: 20,
+            max_reg_power_dbm: 20,
+            max_antenna_gain_dbi: 0,
+            passive: false,
+            radar: false,
+            allow_ht: true,
+            allow_vht: true,
+            allow_he: true,
+        };
+        device.backend_mut().vdev_start_failure = Some(failure);
+        assert_eq!(device.start_vdev(vdev, channel), Err(expected));
+        device.start_vdev(vdev, channel).unwrap();
+    }
 }
 
 #[test]

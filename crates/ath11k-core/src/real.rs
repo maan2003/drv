@@ -414,6 +414,33 @@ where
     D: FnMut() -> u64,
     S: WmiTraceSink,
 {
+    fn execute_vdev_start(
+        &mut self,
+        vdev: crate::VdevId,
+        restart: bool,
+        channel: crate::Channel,
+    ) -> Result<(), crate::VdevStartFailure> {
+        let nss = u32::from(
+            self.client_nss()
+                .map_err(crate::VdevStartFailure::NotSent)?,
+        );
+        Self::protocol(self.wmi.as_mut())
+            .map_err(crate::VdevStartFailure::NotSent)?
+            .discard_vdev_start(u32::from(vdev.0));
+        self.wmi_send(&wcn6750_client_vdev_start(vdev, restart, channel, nss))
+            .map_err(crate::VdevStartFailure::NotSent)?;
+        self.pump().map_err(crate::VdevStartFailure::Ambiguous)?;
+        let response = Self::protocol(self.wmi.as_mut())
+            .map_err(crate::VdevStartFailure::Ambiguous)?
+            .wait_for_vdev_start((self.deadline)(), u32::from(vdev.0))
+            .map_err(|_| crate::VdevStartFailure::Ambiguous(CoreError::Protocol))?;
+        if response.status == 0 {
+            Ok(())
+        } else {
+            Err(crate::VdevStartFailure::Rejected(CoreError::Protocol))
+        }
+    }
+
     fn service_dp_host<H: ath11k_dp::tx::DpHost>(
         &mut self,
         work_budget: usize,
@@ -676,6 +703,7 @@ where
                 channel,
             } => {
                 let nss = u32::from(self.client_nss()?);
+                Self::protocol(self.wmi.as_mut())?.discard_vdev_start(u32::from(vdev.0));
                 self.wmi_send(&wcn6750_client_vdev_start(vdev, restart, channel, nss))
             }
             Operation::WaitVdevSetup { vdev } => {
