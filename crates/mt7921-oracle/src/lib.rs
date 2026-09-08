@@ -720,15 +720,10 @@ mod tests {
                 sequence, bss_index, bssid, channel, beacon_interval,
                 dtim_period, qos, enable,
             ).unwrap();
-            let mut c = c_bss(
+            let c = c_bss(
                 bss_index, bssid, channel, beacon_interval, dtim_period,
                 qos, enable, sequence,
             );
-            if !enable {
-                prop_assert_eq!(rust[56], 0);
-                prop_assert_eq!(c[56], 1);
-                c[56] = rust[56];
-            }
             prop_assert_eq!(rust, c);
         }
 
@@ -767,15 +762,10 @@ mod tests {
                 sequence, bss_index, wcid, muar_index, key_id, &key,
                 Some((retained_id, &retained_key)),
             ).unwrap();
-            let mut c = c_key(
+            let c = c_key(
                 bss_index, wcid, muar_index, key_id, key,
                 Some((retained_id, retained_key)), false, sequence,
             );
-            if key_id != 0 {
-                prop_assert_eq!(rust.as_bytes()[102], 0);
-                prop_assert_eq!(c[102], key_id);
-                c[102] = 0;
-            }
             prop_assert_eq!(rust.as_bytes(), c);
 
             let rust = mt7921_core::encode_disable_keys_command(
