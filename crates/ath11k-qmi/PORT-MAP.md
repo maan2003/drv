@@ -167,7 +167,7 @@ The other static protocol dispatch objects are
 | `ath11k_qmi_firmware_stop` | lifecycle stop using WLAN mode-off | **ported**; no Rust stop contract exists |
 | `ath11k_qmi_firmware_start` | lifecycle start tail (optional INI, WLAN config, mode) | **ported**; intended beneath `Handshake::start`/core lifecycle |
 | `ath11k_qmi_fwreset_from_cold_boot` | core/platform reset orchestration | **deferred**; QMI only reports calibration completion |
-| `ath11k_qmi_process_coldboot_calibration` | handshake cold-boot mode and completion wait | **stub**; reset remains platform/core-owned |
+| `ath11k_qmi_process_coldboot_calibration` | `start_cold_boot_calibration` plus indication processing | **ported**; any post-calibration reset remains platform/core-owned |
 | `ath11k_qmi_driver_event_post` | private handshake event enqueue | **ported**; Linux list/spinlock/workqueue mechanics **replaced** |
 | `ath11k_qmi_event_mem_request` | handshake memory-request transition | **ported** |
 | `ath11k_qmi_event_load_bdf` | handshake capability/device-info/BDF transition | **ported** |

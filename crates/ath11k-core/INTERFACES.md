@@ -54,7 +54,8 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
   service discovery and sends/receives transaction-correlated responses plus
   unsolicited indications against a monotonic timeout budget.
   `Wcn6750Handshake` exposes `init_service`/`deinit_service`,
-  `process_next_event`, and `firmware_start`/`firmware_stop`; it returns typed
+  `process_next_event`, `start_cold_boot_calibration`, and
+  `firmware_start`/`firmware_stop`; it returns typed
   `DriverEvent`/`FirmwareReady` outcomes. Caller-supplied `MemoryProvider` and
   `FirmwareAssets` traits perform DMA/MMIO and firmware acquisition without a
   dependency from QMI onto HAL, platform, or core.

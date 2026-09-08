@@ -178,6 +178,22 @@ impl<'a> Wcn6750Handshake<'a> {
         }
     }
 
+    /// Start the source `ATH11K_FIRMWARE_MODE_COLD_BOOT` calibration pass.
+    pub fn start_cold_boot_calibration(
+        &mut self,
+        transport: &mut dyn Transport,
+    ) -> Result<(), QmiError> {
+        self.exchange(
+            transport,
+            WlanModeRequest {
+                mode: 7,
+                hardware_debug: Some(0),
+            }
+            .encode()?,
+        )?;
+        Ok(())
+    }
+
     fn server_arrived(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
         self.exchange(
             transport,
@@ -449,10 +465,11 @@ impl Handshake for Wcn6750Handshake<'_> {
         loop {
             match self.process_next_event(transport)? {
                 DriverEvent::FirmwareReady(ready) => return Ok(ready),
-                DriverEvent::FirmwareInitDone(ready)
-                    if self.config.cal_done || !self.config.cold_boot_calibration =>
-                {
-                    return Ok(ready)
+                DriverEvent::FirmwareInitDone(ready) => {
+                    if self.config.cal_done || !self.config.cold_boot_calibration {
+                        return Ok(ready);
+                    }
+                    self.start_cold_boot_calibration(transport)?;
                 }
                 DriverEvent::ServerExited => return Err(QmiError::Transport),
                 _ => {}
@@ -567,6 +584,7 @@ mod tests {
                 Incoming::Indication(
                     RawIndication::checked(MessageId::FirmwareInitDone, Vec::new()).unwrap(),
                 ),
+                success(6, MessageId::WlanMode),
                 Incoming::Indication(
                     RawIndication::checked(MessageId::FirmwareReady, Vec::new()).unwrap(),
                 ),
@@ -591,6 +609,7 @@ mod tests {
                 MessageId::Capability,
                 MessageId::DeviceInfo,
                 MessageId::BdfDownload,
+                MessageId::WlanMode,
             ]
         );
         drop(handshake);
