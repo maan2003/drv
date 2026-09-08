@@ -31,6 +31,26 @@ mod tests {
         extended_event_id: u8,
     }
 
+    #[repr(C, align(4))]
+    #[derive(Clone, Copy)]
+    struct CTxwi([u8; 64]);
+
+    impl Default for CTxwi {
+        fn default() -> Self {
+            Self([0; 64])
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CConnac2Rx {
+        payload_offset: u32,
+        channel: u8,
+        signal: i8,
+        has_pn: bool,
+        pn: [u8; 6],
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -56,6 +76,30 @@ mod tests {
             command: i32,
             sequence: i32,
             output: *mut CMcuResponse,
+        ) -> i32;
+        fn oracle_client_data_txwi(
+            payload_len: u16,
+            payload_iova: u32,
+            token: u16,
+            pid: u8,
+            eapol: bool,
+            protected_frame: bool,
+            qos: bool,
+            tid: u8,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_client_management_txwi(
+            frame_len: u16,
+            frame_iova: u32,
+            token: u16,
+            pid: u8,
+            subtype: u8,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_connac2_rx_frame(
+            input: *const u8,
+            input_len: usize,
+            output: *mut CConnac2Rx,
         ) -> i32;
     }
 
@@ -141,6 +185,125 @@ mod tests {
         };
         assert_eq!(result, 0);
         output
+    }
+
+    struct DataTxwiInput {
+        payload_len: u16,
+        payload_iova: u32,
+        token: u16,
+        pid: u8,
+        eapol: bool,
+        protected: bool,
+        qos: bool,
+        tid: u8,
+    }
+
+    fn c_data_txwi(input: DataTxwiInput) -> [u8; 64] {
+        let mut output = CTxwi::default();
+        // SAFETY: `output` is live, 4-byte aligned, and exactly 64 bytes. The
+        // source-exact C wrapper writes only those bytes from scalar inputs.
+        let result = unsafe {
+            oracle_client_data_txwi(
+                input.payload_len,
+                input.payload_iova,
+                input.token,
+                input.pid,
+                input.eapol,
+                input.protected,
+                input.qos,
+                input.tid,
+                output.0.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        output.0
+    }
+
+    fn c_management_txwi(
+        frame_len: u16,
+        frame_iova: u32,
+        token: u16,
+        pid: u8,
+        subtype: u8,
+    ) -> [u8; 64] {
+        let mut output = CTxwi::default();
+        // SAFETY: `output` is live, 4-byte aligned, and exactly 64 bytes. The
+        // source-exact C wrapper writes only those bytes from scalar inputs.
+        let result = unsafe {
+            oracle_client_management_txwi(
+                frame_len,
+                frame_iova,
+                token,
+                pid,
+                subtype,
+                output.0.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        output.0
+    }
+
+    fn c_connac2_rx(bytes: &[u8]) -> CConnac2Rx {
+        let mut output = CConnac2Rx::default();
+        // SAFETY: both objects remain live for the call, and the wrapper
+        // bounds-checks every variable group before reading it.
+        let result = unsafe { oracle_connac2_rx_frame(bytes.as_ptr(), bytes.len(), &mut output) };
+        assert_eq!(result, 0);
+        output
+    }
+
+    struct RxEnvelope<'a> {
+        packet_type: u32,
+        channel: u8,
+        group4: bool,
+        group1: Option<[u8; 16]>,
+        group2: bool,
+        group5: bool,
+        remove_pad: u8,
+        rcpi: [u8; 2],
+        frame: &'a [u8],
+    }
+
+    fn connac2_rx_envelope(input: RxEnvelope<'_>) -> Vec<u8> {
+        let metadata_len = 24
+            + usize::from(input.group4) * 16
+            + usize::from(input.group1.is_some()) * 16
+            + usize::from(input.group2) * 8
+            + 8
+            + usize::from(input.group5) * 72
+            + usize::from(input.remove_pad) * 2;
+        let mut bytes = vec![0; metadata_len + input.frame.len()];
+        let packet_flag = u32::from(input.packet_type == 7);
+        let rxd0 = (bytes.len() as u32) | (packet_flag << 16) | (input.packet_type << 27);
+        bytes[0..4].copy_from_slice(&rxd0.to_le_bytes());
+        let groups = (u32::from(input.group1.is_some()) << 11)
+            | (u32::from(input.group2) << 12)
+            | (1 << 13)
+            | (u32::from(input.group4) << 14)
+            | (u32::from(input.group5) << 15);
+        bytes[4..8].copy_from_slice(&groups.to_le_bytes());
+        bytes[8..12].copy_from_slice(&(u32::from(input.remove_pad) << 14).to_le_bytes());
+        bytes[12..16].copy_from_slice(&(u32::from(input.channel) << 8).to_le_bytes());
+        let mut offset = 24;
+        if input.group4 {
+            offset += 16;
+        }
+        if let Some(group1) = input.group1 {
+            bytes[offset..offset + 16].copy_from_slice(&group1);
+            offset += 16;
+        }
+        if input.group2 {
+            offset += 8;
+        }
+        bytes[offset + 4..offset + 6].copy_from_slice(&input.rcpi);
+        offset += 8;
+        if input.group5 {
+            bytes[offset + 24..offset + 26].copy_from_slice(&input.rcpi);
+            offset += 72;
+        }
+        offset += usize::from(input.remove_pad) * 2;
+        bytes[offset..].copy_from_slice(input.frame);
+        bytes
     }
 
     fn response_bytes(
@@ -230,6 +393,149 @@ mod tests {
                 (first.iova, first.len), second.map(|s| (s.iova, s.len)), info));
             let rust = Mt7921Descriptor::rx(first).unwrap();
             prop_assert_eq!(words(rust.to_le_bytes()), c_dma_rx((u64::from(address0), length0)));
+        }
+
+        #[test]
+        fn client_data_txwi_and_txp_match_source_assignments(
+            payload_len in 1u16..=0x0fff,
+            payload_iova in 0u32..=u32::MAX - 0x0fff,
+            token in 0u16..8192,
+            pid in 3u8..127,
+            eapol: bool,
+            protected_input: bool,
+            qos: bool,
+            tid in 0u8..=7,
+        ) {
+            let protected = protected_input || !eapol;
+            let rust = mt7921_core::encode_client_data_txwi(
+                usize::from(payload_len),
+                u64::from(payload_iova),
+                token,
+                pid,
+                eapol,
+                protected,
+                qos,
+                tid,
+            ).unwrap();
+            prop_assert_eq!(rust, c_data_txwi(DataTxwiInput {
+                payload_len, payload_iova, token, pid, eapol, protected, qos, tid
+            }));
+        }
+
+        #[test]
+        fn client_management_txwi_txp_and_dma_match_source_assignments(
+            frame_len in 24u16..=0x0fff,
+            txwi_iova in 0u32..=u32::MAX - 64,
+            frame_iova in 0u32..=u32::MAX - 0x0fff,
+            token in 0u16..8192,
+            pid in 3u8..127,
+            subtype in 0u8..=15,
+        ) {
+            let mut frame = vec![0; usize::from(frame_len)];
+            frame[0..2].copy_from_slice(&(u16::from(subtype) << 4).to_le_bytes());
+            let rust = mt7921_core::encode_client_management_tx(
+                &frame, u64::from(txwi_iova), u64::from(frame_iova), token, pid).unwrap();
+            let mut normalized_c = c_management_txwi(
+                frame_len, frame_iova, token, pid, subtype);
+            if subtype != 11 {
+                // Confirmed valid-domain difference: the public encoder
+                // rewrites TXD2 but leaves the auth-shaped TXD7 subtype.
+                prop_assert_eq!(&rust.txwi[28..32], &(11u32 << 16).to_le_bytes());
+                prop_assert_eq!(&normalized_c[28..32], &(u32::from(subtype) << 16).to_le_bytes());
+                normalized_c[28..32].copy_from_slice(&rust.txwi[28..32]);
+            }
+            prop_assert_eq!(rust.txwi, normalized_c);
+            prop_assert_eq!(words(rust.descriptor.to_le_bytes()),
+                c_dma((u64::from(txwi_iova), 64), None, 0));
+        }
+
+        #[test]
+        fn connac2_normal_rx_frames_match_source_group_walk(
+            packet_type in prop_oneof![Just(2u32), Just(7u32)],
+            channel in prop::sample::select(vec![1u8, 6, 11, 14, 36, 52, 100, 144, 165]),
+            group4: bool,
+            has_group1: bool,
+            group1: [u8; 16],
+            group2: bool,
+            group5: bool,
+            remove_pad in 0u8..=3,
+            rcpi0 in 0u8..=219,
+            rcpi1 in 0u8..=219,
+            frame in proptest::collection::vec(any::<u8>(), 2..=256),
+        ) {
+            let group1 = has_group1.then_some(group1);
+            let bytes = connac2_rx_envelope(RxEnvelope {
+                packet_type, channel, group4, group1, group2, group5,
+                remove_pad, rcpi: [rcpi0, rcpi1], frame: &frame,
+            });
+            let c = c_connac2_rx(&bytes);
+            let rust = mt7921_core::parse_connac2_rx_frame(&bytes).unwrap();
+            prop_assert_eq!(c.payload_offset as usize + frame.len(), bytes.len());
+            prop_assert_eq!(rust.bytes, frame);
+            prop_assert_eq!(rust.channel, c.channel);
+            let normalized_signal = [rcpi0, rcpi1].into_iter()
+                .map(|rcpi| ((i16::from(rcpi) - 220) / 2) as i8)
+                .max().unwrap();
+            prop_assert_eq!(rust.rssi_dbm, normalized_signal);
+            let linux_signal = [rcpi0, rcpi1].into_iter()
+                .map(|rcpi| ((i16::from(rcpi) - 220).div_euclid(2)) as i8)
+                .max().unwrap();
+            prop_assert_eq!(c.signal, linux_signal);
+            prop_assert_eq!(rust.pn, group1.map(|pn| [pn[5], pn[4], pn[3], pn[2], pn[1], pn[0]]));
+        }
+
+        #[test]
+        fn connac2_auth_rx_matches_source_group_walk_and_frame_fields(
+            packet_type in prop_oneof![Just(2u32), Just(7u32)],
+            channel in prop::sample::select(vec![1u8, 11, 36, 100, 165]),
+            group4: bool,
+            has_group1: bool,
+            group1: [u8; 16],
+            group2: bool,
+            group5: bool,
+            remove_pad in 0u8..=3,
+            rcpi0 in 0u8..=219,
+            rcpi1 in 0u8..=219,
+            receiver: [u8; 6],
+            transmitter: [u8; 6],
+            bssid: [u8; 6],
+            algorithm: u16,
+            sequence: u16,
+            status: u16,
+            fields in proptest::collection::vec(any::<u8>(), 0..=128),
+        ) {
+            let mut frame = vec![0; 30 + fields.len()];
+            frame[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
+            frame[4..10].copy_from_slice(&receiver);
+            frame[10..16].copy_from_slice(&transmitter);
+            frame[16..22].copy_from_slice(&bssid);
+            frame[24..26].copy_from_slice(&algorithm.to_le_bytes());
+            frame[26..28].copy_from_slice(&sequence.to_le_bytes());
+            frame[28..30].copy_from_slice(&status.to_le_bytes());
+            frame[30..].copy_from_slice(&fields);
+            let bytes = connac2_rx_envelope(RxEnvelope {
+                packet_type,
+                channel,
+                group4,
+                group1: has_group1.then_some(group1),
+                group2,
+                group5,
+                remove_pad,
+                rcpi: [rcpi0, rcpi1],
+                frame: &frame,
+            });
+            let c = c_connac2_rx(&bytes);
+            let stripped = mt7921_core::parse_connac2_rx_frame(&bytes).unwrap();
+            let auth = mt7921_core::parse_mt7921_auth_rx(&bytes).unwrap();
+            prop_assert_eq!(c.payload_offset as usize + frame.len(), bytes.len());
+            prop_assert_eq!(stripped.bytes, frame);
+            prop_assert_eq!(auth.receiver, receiver);
+            prop_assert_eq!(auth.transmitter, transmitter);
+            prop_assert_eq!(auth.bssid, bssid);
+            prop_assert_eq!(auth.algorithm, algorithm);
+            prop_assert_eq!(auth.sequence, sequence);
+            prop_assert_eq!(auth.status, status);
+            prop_assert_eq!(auth.fields, fields);
         }
 
         #[test]
