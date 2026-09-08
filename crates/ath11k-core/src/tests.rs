@@ -17,17 +17,19 @@ impl Subsystems for Model {
             Ok(())
         }
     }
+    fn wait_for_firmware_ready(&mut self) -> Result<FirmwareReady, CoreError> {
+        self.execute(Operation::QmiWaitFirmwareReady)?;
+        Ok(FirmwareReady {
+            firmware_version: 1,
+            target_mem_mode: 0,
+        })
+    }
 }
 
 fn ready_device() -> Device<Model> {
     let mut device = WCN6750.device(Model::default());
     device.probe().unwrap();
-    device
-        .attach_firmware(FirmwareReady {
-            firmware_version: 1,
-            target_mem_mode: 0,
-        })
-        .unwrap();
+    device.attach_firmware().unwrap();
     device
 }
 
@@ -70,6 +72,7 @@ fn firmware_ready_runs_core_c_order() {
         vec![
             Operation::QmiInitService,
             Operation::HifPowerUp,
+            Operation::QmiWaitFirmwareReady,
             Operation::QmiFirmwareStart,
             Operation::CeInitPipes,
             Operation::DpAllocate,
@@ -210,13 +213,7 @@ fn core_start_error_unwinds_without_panicking() {
     };
     let mut device = WCN6750.device(model);
     device.probe().unwrap();
-    assert_eq!(
-        device.attach_firmware(FirmwareReady {
-            firmware_version: 1,
-            target_mem_mode: 0
-        }),
-        Err(CoreError::DeviceFault)
-    );
+    assert_eq!(device.attach_firmware(), Err(CoreError::DeviceFault));
     assert_eq!(device.state(), DeviceState::Probed);
     assert!(device.backend().log.ends_with(&[
         Operation::DpReoCleanup,
@@ -244,12 +241,7 @@ fn crash_and_teardown_follow_distinct_paths() {
             Operation::RecoveryRestart,
         ]
     );
-    device
-        .complete_recovery(FirmwareReady {
-            firmware_version: 2,
-            target_mem_mode: 0,
-        })
-        .unwrap();
+    device.complete_recovery().unwrap();
     device.stop().unwrap();
     assert_eq!(device.state(), DeviceState::Stopped);
 }

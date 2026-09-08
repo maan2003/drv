@@ -86,6 +86,7 @@ pub enum Operation {
     QmiInitService,
     QmiDeinitService,
     QmiFirmwareStart,
+    QmiWaitFirmwareReady,
     QmiFirmwareStop,
     HifPowerUp,
     HifPowerDown,
@@ -252,9 +253,8 @@ impl Operation {
     pub const fn target(&self) -> OperationTarget {
         use Operation::*;
         match self {
-            QmiInitService | QmiDeinitService | QmiFirmwareStart | QmiFirmwareStop => {
-                OperationTarget::Qmi
-            }
+            QmiInitService | QmiDeinitService | QmiFirmwareStart | QmiWaitFirmwareReady
+            | QmiFirmwareStop => OperationTarget::Qmi,
             HifPowerUp | HifPowerDown | HifStart | HifStop | HifIrqEnable | HifIrqDisable => {
                 OperationTarget::Hif
             }
@@ -283,6 +283,10 @@ impl Operation {
 /// lifecycle APIs. Implementations dispatch operations to QMI/CE/HTC/WMI/DP.
 pub trait Subsystems {
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError>;
+
+    /// Drive the event-oriented QMI handshake until firmware reports ready.
+    /// The returned value is consumed by core rather than supplied by its caller.
+    fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError>;
 }
 
 /// Deterministic subsystem model used before transports are attached and by
@@ -312,5 +316,13 @@ impl Subsystems for ModelSubsystems {
         } else {
             Ok(())
         }
+    }
+
+    fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, CoreError> {
+        self.execute(Operation::QmiWaitFirmwareReady)?;
+        Ok(ath11k_qmi::FirmwareReady {
+            firmware_version: 1,
+            target_mem_mode: 0,
+        })
     }
 }

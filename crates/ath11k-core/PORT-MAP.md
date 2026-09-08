@@ -19,7 +19,7 @@ lines: `core.[ch]` 4,174; `ahb.[ch]` 1,362; `hw.[ch]` 3,318;
 bring-up; unrelated chip tables are outside the WCN6750 port rather than
 misreported as replaced code.
 
-<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, ported-corrected, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 | C symbol | C file:lines | Rust item | status | note |
 |---|---|---|---|---|
 | `ath11k_hw_params[WCN6750]` | `core.c:578-662` | `hw::WCN6750_PARAMS` | wcn6750-specific | Complete scalar/feature table; CE/service maps remain CE-owned. |
@@ -52,7 +52,7 @@ misreported as replaced code.
 | `ath11k_core_deinit` | `core.c:2720-2733` | `Lifecycle::stop` | ported | Deterministic teardown asserted. |
 | QMI firmware assets | `core.c:735-1007` | `qmi::Wcn6750FirmwareAssets` | local-seam | Assets are supplied before filesystem capability is dropped. |
 | QMI target memory | `qmi.c:1955-2037` | `qmi::HardwareMemoryProvider` | local-seam | Real generation-tied DMA and allocation-derived IOVAs. |
-| QMI event loop | `qmi.c:3025-3137` | `qmi::Wcn6750QmiSession` | ported | Actual QMI crate tested through fake QRTR peer. |
+| QMI event loop | `qmi.c:3025-3137` | `qmi::Wcn6750QmiSession` | ported | Actual QMI crate tested through fake QRTR peer; firmware-ready is returned by the event loop to core attach. |
 | `ath11k_peer_create` | `peer.c:370-472` | `RadioControl::create_peer` | ported | WMI command plus correlated creation wait. |
 | `ath11k_peer_delete` | `peer.c:350-363` | `RadioControl::delete_peer` | ported | WMI command plus correlated deletion wait. |
 | `ath11k_mac_op_add_interface` STA effects | `mac.c:7073-7331` | `RadioControl::create_client_vdev` | ported | Vdev create, NSS, PS, RTS, DP attach and unwind order asserted. |

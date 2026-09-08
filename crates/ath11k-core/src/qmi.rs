@@ -127,6 +127,7 @@ impl<B: Backend> MemoryProvider for HardwareMemoryProvider<B> {
 pub struct Wcn6750QmiSession<'a, T: ath11k_qmi::Transport> {
     handshake: ath11k_qmi::Wcn6750Handshake<'a>,
     transport: T,
+    service_started: bool,
 }
 
 impl<'a, T: ath11k_qmi::Transport> Wcn6750QmiSession<'a, T> {
@@ -142,11 +143,21 @@ impl<'a, T: ath11k_qmi::Transport> Wcn6750QmiSession<'a, T> {
                 memory,
             ),
             transport,
+            service_started: false,
         }
     }
 
+    pub fn init_service(&mut self) -> Result<(), QmiError> {
+        self.handshake.init_service(&mut self.transport)?;
+        self.service_started = true;
+        Ok(())
+    }
+
     pub fn wait_for_firmware_ready(&mut self) -> Result<ath11k_qmi::FirmwareReady, QmiError> {
-        ath11k_qmi::Handshake::start(&mut self.handshake, &mut self.transport)
+        if !self.service_started {
+            self.init_service()?;
+        }
+        self.handshake.wait_for_firmware_ready(&mut self.transport)
     }
 
     pub fn start_cold_boot_calibration(&mut self) -> Result<(), QmiError> {
@@ -169,7 +180,9 @@ impl<'a, T: ath11k_qmi::Transport> Wcn6750QmiSession<'a, T> {
     }
 
     pub fn deinit(mut self) -> T {
-        self.handshake.deinit_service(&mut self.transport);
+        if self.service_started {
+            self.handshake.deinit_service(&mut self.transport);
+        }
         self.transport
     }
 }

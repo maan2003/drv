@@ -55,7 +55,7 @@ pub enum DeviceState {
 
 pub trait Lifecycle {
     fn probe(&mut self) -> Result<(), CoreError>;
-    fn attach_firmware(&mut self, ready: FirmwareReady) -> Result<(), CoreError>;
+    fn attach_firmware(&mut self) -> Result<FirmwareReady, CoreError>;
     fn start_radio(&mut self) -> Result<(), CoreError>;
     fn stop(&mut self) -> Result<(), CoreError>;
 }
@@ -201,14 +201,14 @@ impl<B: Subsystems> Device<B> {
         Ok(())
     }
 
-    pub fn complete_recovery(&mut self, ready: FirmwareReady) -> Result<(), CoreError> {
+    pub fn complete_recovery(&mut self) -> Result<FirmwareReady, CoreError> {
         if self.state != DeviceState::Recovering {
             return Err(CoreError::WrongState);
         }
         self.state = DeviceState::Probed;
         self.vdevs.clear();
         self.peers.clear();
-        self.attach_firmware(ready)
+        self.attach_firmware()
     }
 }
 
@@ -226,10 +226,11 @@ impl<B: Subsystems> Lifecycle for Device<B> {
         Ok(())
     }
 
-    fn attach_firmware(&mut self, ready: FirmwareReady) -> Result<(), CoreError> {
+    fn attach_firmware(&mut self) -> Result<FirmwareReady, CoreError> {
         if self.state != DeviceState::Probed {
             return Err(CoreError::WrongState);
         }
+        let ready = self.backend.wait_for_firmware_ready()?;
         self.op(Operation::QmiFirmwareStart)?;
         if let Err(error) = self.op(Operation::CeInitPipes) {
             let _ = self.op(Operation::QmiFirmwareStop);
@@ -262,7 +263,7 @@ impl<B: Subsystems> Lifecycle for Device<B> {
         let _ = self.op(Operation::HifIrqEnable);
         self.firmware = Some(ready);
         self.state = DeviceState::Ready;
-        Ok(())
+        Ok(ready)
     }
 
     fn start_radio(&mut self) -> Result<(), CoreError> {

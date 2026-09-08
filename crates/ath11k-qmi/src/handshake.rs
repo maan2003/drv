@@ -109,6 +109,48 @@ impl<'a> Wcn6750Handshake<'a> {
         transport.start_service(wire::SERVICE_VERSION, wire::WCN6750_SERVICE_INSTANCE)
     }
 
+    /// Drive events after `init_service` until firmware is ready for core attach.
+    pub fn wait_for_firmware_ready(
+        &mut self,
+        transport: &mut dyn Transport,
+    ) -> Result<FirmwareReady, QmiError> {
+        loop {
+            match self.process_next_event(transport)? {
+                DriverEvent::ServerArrived => break,
+                DriverEvent::ServerExited => return Err(QmiError::Transport),
+                _ => {}
+            }
+        }
+        let mut cold_boot_deadline: Option<u64> = None;
+        loop {
+            let timeout = if let Some(deadline) = cold_boot_deadline {
+                let remaining = deadline.saturating_sub(transport.now_ns());
+                if remaining == 0 {
+                    return Err(QmiError::Timeout);
+                }
+                remaining
+            } else {
+                self.config.timeout_ns
+            };
+            match self.process_next_event_with_timeout(transport, timeout)? {
+                DriverEvent::FirmwareReady(ready) => return Ok(ready),
+                DriverEvent::FirmwareInitDone(ready) => {
+                    if self.config.cal_done || !self.config.cold_boot_calibration {
+                        return Ok(ready);
+                    }
+                    self.start_cold_boot_calibration(transport)?;
+                    cold_boot_deadline = Some(
+                        transport
+                            .now_ns()
+                            .saturating_add(self.config.cold_boot_timeout_ns),
+                    );
+                }
+                DriverEvent::ServerExited => return Err(QmiError::Transport),
+                _ => {}
+            }
+        }
+    }
+
     /// Portable replacement for `ath11k_qmi_deinit_service`.
     pub fn deinit_service(&mut self, transport: &mut dyn Transport) {
         transport.stop_service();
@@ -470,48 +512,14 @@ fn uses_eeprom_caldata(timeout: Option<u32>) -> bool {
 impl Handshake for Wcn6750Handshake<'_> {
     fn start(&mut self, transport: &mut dyn Transport) -> Result<FirmwareReady, QmiError> {
         self.init_service(transport)?;
-        loop {
-            match self.process_next_event(transport)? {
-                DriverEvent::ServerArrived => break,
-                DriverEvent::ServerExited => return Err(QmiError::Transport),
-                _ => {}
-            }
-        }
-        let mut cold_boot_deadline: Option<u64> = None;
-        loop {
-            let timeout = if let Some(deadline) = cold_boot_deadline {
-                let remaining = deadline.saturating_sub(transport.now_ns());
-                if remaining == 0 {
-                    return Err(QmiError::Timeout);
-                }
-                remaining
-            } else {
-                self.config.timeout_ns
-            };
-            match self.process_next_event_with_timeout(transport, timeout)? {
-                DriverEvent::FirmwareReady(ready) => return Ok(ready),
-                DriverEvent::FirmwareInitDone(ready) => {
-                    if self.config.cal_done || !self.config.cold_boot_calibration {
-                        return Ok(ready);
-                    }
-                    self.start_cold_boot_calibration(transport)?;
-                    cold_boot_deadline = Some(
-                        transport
-                            .now_ns()
-                            .saturating_add(self.config.cold_boot_timeout_ns),
-                    );
-                }
-                DriverEvent::ServerExited => return Err(QmiError::Transport),
-                _ => {}
-            }
-        }
+        self.wait_for_firmware_ready(transport)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{wire::QmiString, RawIndication};
+    use crate::{RawIndication, wire::QmiString};
     use alloc::{collections::VecDeque, vec};
 
     struct Assets;
