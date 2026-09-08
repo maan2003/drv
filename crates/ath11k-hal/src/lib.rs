@@ -47,6 +47,9 @@ pub enum HalError {
 }
 pub trait Rings<B: Backend> {
     fn create(&mut self, kind: RingKind, memory: RingMemory<B>) -> Result<RingId, HalError>;
+    /// Writes the descriptor into coherent ring memory. The caller must first
+    /// sync any referenced streaming DMA packet for the device; publishing the
+    /// new index is then a release-ordered `write_u32` through `Srng::access_end`.
     fn publish(&mut self, ring: RingId, descriptor: Descriptor) -> Result<(), HalError>;
     fn consume(&mut self, ring: RingId) -> Result<Option<Descriptor>, HalError>;
 }

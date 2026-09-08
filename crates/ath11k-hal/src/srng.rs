@@ -5,6 +5,7 @@
 
 use crate::{HalError, RingId, RingMemory};
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma, MmioRegion};
+use core::sync::atomic::{Ordering, fence};
 
 const UMAC_REO: usize = 0x00a3_8000;
 const UMAC_TCL: usize = 0x00a4_4000;
@@ -113,9 +114,9 @@ impl Wcn6750Registers {
         if ring_number >= c.max_rings {
             return None;
         }
-        let lmac = if c.lmac { mac_id as u16 * 16 } else { 0 };
+        let lmac = if c.lmac { mac_id as u16 * 15 } else { 0 };
         let id = c.start_id + ring_number as u16 + lmac;
-        if id >= 176 { None } else { Some(RingId(id)) }
+        if id >= 172 { None } else { Some(RingId(id)) }
     }
 }
 
@@ -367,6 +368,8 @@ pub struct Srng<B: Backend> {
     r0: usize,
     r2: usize,
     pointer_offset: usize,
+    firmware_pointer_offset: usize,
+    publication_offset: usize,
     head: u32,
     tail: u32,
     cached_hardware_pointer: u32,
@@ -399,6 +402,16 @@ impl<B: Backend> Srng<B> {
         let r0 = c.r0 + usize::from(ring_number) * c.r0_stride;
         let r2 = c.r2 + usize::from(ring_number) * c.r2_stride;
         let pointer_offset = usize::from(id.0) * 4;
+        let firmware_pointer_offset = if c.lmac {
+            usize::from(id.0 - 128) * 4
+        } else {
+            0
+        };
+        let publication_offset = if c.direction == RingDirection::Source {
+            r2
+        } else {
+            r2 + 4
+        };
         let flags = if c.lmac {
             params.flags.union(RingFlags::LMAC_RING)
         } else {
@@ -414,6 +427,8 @@ impl<B: Backend> Srng<B> {
             r0,
             r2,
             pointer_offset,
+            firmware_pointer_offset,
+            publication_offset,
             head: 0,
             tail: 0,
             cached_hardware_pointer: 0,
@@ -423,6 +438,16 @@ impl<B: Backend> Srng<B> {
         };
         if !c.lmac {
             ring.program(mmio, remote_read_pointers, params)?;
+            if ring_type == RingType::CeDestination {
+                let control = mmio
+                    .read_u32(r0 + 0xb0)
+                    .map_err(|_| HalError::DeviceFault)?;
+                w(
+                    mmio,
+                    r0 + 0xb0,
+                    (control & !0xffff) | (params.max_buffer_len & 0xffff),
+                )?;
+            }
         }
         Ok(ring)
     }
@@ -484,6 +509,22 @@ impl<B: Backend> Srng<B> {
                 (u32::from(self.id.0) << 8) | self.entry_words
             },
         )?;
+        if src && self.id.0 == 104 {
+            mmio.write_device_address(
+                self.r0,
+                Some(self.r0 + base_msb),
+                self.memory
+                    .dma
+                    .device_address(0)
+                    .map_err(|_| HalError::DeviceFault)?,
+            )
+            .map_err(|_| HalError::DeviceFault)?;
+            let msb = mmio
+                .read_u32(self.r0 + base_msb)
+                .map_err(|_| HalError::DeviceFault)?
+                | size;
+            w(mmio, self.r0 + base_msb, msb)?;
+        }
         let timer = if src {
             p.interrupt_timer_us
         } else {
@@ -625,15 +666,56 @@ impl<B: Backend> Srng<B> {
             .map_err(|_| HalError::DeviceFault)?;
         Ok(())
     }
+    /// Source-faithful pointer refresh from HAL's coherent remote-pointer
+    /// array. The acquire fence maps the destination-ring `dma_rmb()`.
+    pub fn access_begin_remote(
+        &mut self,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+    ) -> Result<(), HalError> {
+        let mut bytes = [0; 4];
+        remote_read_pointers
+            .read(self.pointer_offset, &mut bytes)
+            .map_err(|_| HalError::DeviceFault)?;
+        self.cached_hardware_pointer = u32::from_le_bytes(bytes);
+        if self.direction == RingDirection::Destination {
+            fence(Ordering::Acquire);
+        }
+        Ok(())
+    }
     /// Publishes the software-owned pointer. The ordered MMIO write is release,
     /// matching Linux's dma_wmb/mb before its head/tail write.
     pub fn access_end(&self, mmio: &MmioRegion<B>) -> Result<(), HalError> {
-        let (offset, value) = if self.direction == RingDirection::Source {
-            (self.r2, self.head)
+        let value = if self.direction == RingDirection::Source {
+            self.head
         } else {
-            (self.r2 + 4, self.tail)
+            self.tail
         };
-        w(mmio, offset, value)
+        w(mmio, self.publication_offset, value)
+    }
+    /// Select a firmware-programmed shadow register for subsequent pointer
+    /// publications (`ath11k_hal_srng_update_hp_tp_addr`).
+    pub fn set_shadow_publication_register(&mut self, offset: usize) {
+        self.publication_offset = offset;
+    }
+    /// LMAC rings publish through the coherent WRP array instead of MMIO.
+    /// The fence preserves Linux's dma_wmb/dma_mb before the shared write.
+    pub fn access_end_lmac(
+        &self,
+        remote_write_pointers: &mut CoherentDma<B, Bidirectional>,
+    ) -> Result<(), HalError> {
+        if self.direction == RingDirection::Source {
+            fence(Ordering::Release);
+        } else {
+            fence(Ordering::SeqCst);
+        }
+        let value = if self.direction == RingDirection::Source {
+            self.head
+        } else {
+            self.tail
+        };
+        remote_write_pointers
+            .write(self.firmware_pointer_offset, &value.to_le_bytes())
+            .map_err(|_| HalError::DeviceFault)
     }
 }
 
@@ -742,6 +824,10 @@ mod tests {
             None
         );
         assert_eq!(
+            Wcn6750Registers::ring_id(RingType::RxdmaBuffer, 0, 1),
+            Some(RingId(143))
+        );
+        assert_eq!(
             Wcn6750Registers::max_entries(RingType::CeSource),
             0xffff / 4
         );
@@ -785,6 +871,44 @@ mod tests {
             o[o.len() - 1],
             Op::Write(UMAC_TCL + 0x6a4, RING_ENABLE | SRC_LOOP_COUNT_DISABLE)
         );
+    }
+    #[test]
+    fn destination_setup_write_order_matches_hal_c() {
+        let ops = Rc::new(RefCell::new(Vec::new()));
+        let d = Device::from_backend(Fake {
+            ops: ops.clone(),
+            ..Fake::default()
+        });
+        let mmio = d.open_region(0).unwrap();
+        let mem = RingMemory {
+            dma: d.alloc_coherent(64 * 4, 8).unwrap(),
+            entries: 4,
+            entry_bytes: 64,
+        };
+        let rdp = d.alloc_coherent(176 * 4, 4).unwrap();
+        let _ = Srng::setup(
+            &mmio,
+            RingType::ReoDestination,
+            0,
+            0,
+            mem,
+            &rdp,
+            SrngParams {
+                interrupt_batch_entries: 2,
+                interrupt_timer_us: 16,
+                ..SrngParams::default()
+            },
+        )
+        .unwrap();
+        let o = ops.borrow();
+        assert_eq!(
+            o[0],
+            Op::Address(UMAC_REO + 0x1ec, Some(UMAC_REO + 0x1f0), 0x1000_0000)
+        );
+        assert_eq!(o[1], Op::Write(UMAC_REO + 0x1f0, 64 << 8));
+        assert_eq!(o[2], Op::Write(UMAC_REO + 0x1f4, 16));
+        assert_eq!(o[3], Op::Write(UMAC_REO + 0x210, (2 << 16) | 32));
+        assert_eq!(o[o.len() - 1], Op::Write(UMAC_REO + 0x1fc, RING_ENABLE));
     }
     #[test]
     fn ring_arithmetic_reserves_one_source_entry() {

@@ -28,13 +28,15 @@ oracle-checked, or hardware-checked.
 | hal.c:`ath11k_hal_srng_get_max_entries` | `Wcn6750Registers::max_entries` | oracle-checked | `wcn6750_table_matches_source` |
 | hal.c:`ath11k_hal_srng_setup` | `Srng::setup` | oracle-checked | crate-local recording Backend sequence tests |
 | hal.c:`ath11k_hal_srng_src_hw_init` | `Srng::program` source branch | oracle-checked | `source_setup_write_order_matches_hal_c` |
-| hal.c:`ath11k_hal_srng_dst_hw_init` | `Srng::program` destination branch | ported | source-derived; destination sequence fixture pending |
+| hal.c:`ath11k_hal_srng_dst_hw_init` | `Srng::program` destination branch | oracle-checked | `destination_setup_write_order_matches_hal_c` |
 | hal.c:`ath11k_hal_srng_src_get_next_entry` | `Srng::source_next` | oracle-checked | `ring_arithmetic_reserves_one_source_entry` |
 | hal.c:`ath11k_hal_srng_dst_get_next_entry` | `Srng::destination_next` | ported | source-derived unit arithmetic |
 | hal.c:`ath11k_hal_srng_{src,dst}_num_free` | `Srng::number_free` | ported | source-derived unit arithmetic |
 | hal.c:`ath11k_hal_srng_{src,dst}_peek` | `Srng::peek` | ported | source-derived unit arithmetic |
-| hal.c:`ath11k_hal_srng_access_begin` | `Srng::access_begin` | ported | `read_u32` acquire maps READ_ONCE + dma_rmb |
+| hal.c:`ath11k_hal_srng_access_begin` | `Srng::access_begin_remote` | ported | coherent RDP read + acquire fence maps READ_ONCE + dma_rmb |
 | hal.c:`ath11k_hal_srng_access_end` | `Srng::access_end` | ported | ordered `write_u32` release maps dma_wmb/mb + pointer write |
+| hal.c:`ath11k_hal_srng_update_hp_tp_addr` | `Srng::set_shadow_publication_register` | ported | source-derived shadow publication path |
+| hal.c:LMAC branch of `ath11k_hal_srng_access_end` | `Srng::access_end_lmac` | ported | release/seq-cst fence then coherent WRP write |
 | hal.c:`ath11k_hal_ce_src_set_desc` | `descriptors::CeSourceDescriptor::for_transfer` | oracle-checked | `ce_and_wbm_layouts_are_little_endian` |
 | hal.c:`ath11k_hal_ce_dst_set_desc` | `descriptors::CeDestinationDescriptor::from_address` | oracle-checked | checked 8-byte layout fixture |
 | hal.c:`ath11k_hal_ce_dst_status_get_length` | `descriptors::CeDestinationStatusDescriptor::take_length` | oracle-checked | checked 16-byte layout fixture |
@@ -49,3 +51,6 @@ oracle-checked, or hardware-checked.
 | hal_rx.c:`ath11k_hal_rx_msdu_link_info_get` | `RxMsduLink::info`, `RxMsduLinkInfo` | oracle-checked | `msdu_link_info_stops_at_first_zero_low_address` |
 | hal_desc.h:`struct hal_rx_msdu_details` | `RxMsduDetails` | oracle-checked | MSDU-link fixture |
 | hal_desc.h:`struct hal_rx_msdu_link` | `RxMsduLink` | oracle-checked | 128-byte MSDU-link fixture |
+| hal.c:`ath11k_hal_srng_update_shadow_config` | `Srng::set_shadow_publication_register` | ported | WCN6750 shadow register path |
+| hal.c:LMAC branches of `ath11k_hal_srng_setup/access_begin/access_end` | `Srng::setup`, `access_begin_remote`, `access_end_lmac` | ported | coherent RDP/WRP pointers; acquire/release fences |
+| hal.c:`ath11k_hal_ce_dst_setup` | `Srng::setup` CE-destination branch | ported | source-derived max-buffer-length RMW |

@@ -47,7 +47,11 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
 
 - **platform:** shared `drv-hardware` `Device<B>`, bounded `MmioRegion`, generation-tied `CoherentDma`/`StreamingDma` with sealed directions and explicit streaming sync, `Interrupt`, reset and teardown. Never fds.
 - **HAL:** `RingKind`, `RingMemory`, `RingId`, checked `Descriptor`, and
-  `Rings`. Descriptor construction rejects a wrong layout length.
+  `Rings`, plus additive typed CE/TCL/WBM/REO/RXDMA descriptor codecs and
+  `Srng` accessors. Descriptor construction rejects a wrong layout length;
+  DMA addresses remain allocation-derived `DeviceAddress` values. Ring
+  publication is streaming-buffer sync followed by a release-ordered index
+  write, while consumption acquire-reads the hardware pointer before bytes.
 - **CE:** `ServiceId`, `TxFrame`/`RxFrame`, and `Transport`.
 - **QMI:** bounded `Request`, `Response`, `Transport`, `Handshake`, and
   `FirmwareReady`.
