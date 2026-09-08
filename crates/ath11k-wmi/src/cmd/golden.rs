@@ -102,6 +102,7 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
         0x005003 => ("vdev-start", NO_MASKS),
         0x005005 => ("vdev-up", NO_MASKS),
         0x005006 => ("vdev-stop", NO_MASKS),
+        0x005007 => ("vdev-down", NO_MASKS),
         0x005008 => ("vdev-set-param", NO_MASKS),
         0x005009 => ("vdev-install-key", NO_MASKS),
         0x00500d => ("vdev-wmm-update", NO_MASKS),
@@ -255,6 +256,7 @@ enum SemanticRequest {
     ObssSpatialReuse(super::ObssSpatialReuse),
     PdevLroConfig(super::PdevLroConfig),
     PeerAssoc(super::PeerAssoc),
+    PeerAuthorize(super::PeerAuthorize),
     PeerCreate(super::PeerCreate),
     PeerDelete(super::PeerDelete),
     PeerReorderQueueSetup(super::PeerReorderQueueSetup),
@@ -275,6 +277,7 @@ enum SemanticRequest {
     WmmUpdate(super::WmmUpdate),
     VdevCreate(super::VdevCreate),
     VdevDelete(super::VdevDelete),
+    VdevDown(super::VdevDown),
     VdevStart(super::VdevStart),
     VdevStop(super::VdevStop),
     VdevUp(super::VdevUp),
@@ -291,6 +294,7 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::ObssSpatialReuse(request) => request.encode_command(),
             SemanticRequest::PdevLroConfig(request) => request.encode_command(),
             SemanticRequest::PeerAssoc(request) => request.encode_command(),
+            SemanticRequest::PeerAuthorize(request) => request.encode_command(),
             SemanticRequest::PeerCreate(request) => request.encode_command(),
             SemanticRequest::PeerDelete(request) => request.encode_command(),
             SemanticRequest::PeerReorderQueueSetup(request) => request.encode_command(),
@@ -311,6 +315,7 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::WmmUpdate(request) => request.encode_command(),
             SemanticRequest::VdevCreate(request) => request.encode_command(),
             SemanticRequest::VdevDelete(request) => request.encode_command(),
+            SemanticRequest::VdevDown(request) => request.encode_command(),
             SemanticRequest::VdevStart(request) => request.encode_command(),
             SemanticRequest::VdevStop(request) => request.encode_command(),
             SemanticRequest::VdevUp(request) => request.encode_command(),
@@ -403,16 +408,23 @@ pub fn reverse_map_semantic_command(
                 },
             })
         }
-        0x005002 | 0x005006 => {
+        0x005002 | 0x005006 | 0x005007 => {
             let tlvs = semantic_tlvs(id, bytes)?;
             if tlvs.len() != 1 {
                 return Err(WmiError::Malformed);
             }
             let fixed = words::<1>(&tlvs[0].value)?;
-            if id.0 == 0x005002 {
-                SemanticRequest::VdevDelete(super::VdevDelete { vdev_id: fixed[0] })
-            } else {
-                SemanticRequest::VdevStop(super::VdevStop { vdev_id: fixed[0] })
+            match id.0 {
+                0x005002 if tlvs[0].tag == crate::tags::WMI_TAG_VDEV_DELETE_CMD.0 => {
+                    SemanticRequest::VdevDelete(super::VdevDelete { vdev_id: fixed[0] })
+                }
+                0x005006 if tlvs[0].tag == crate::tags::WMI_TAG_VDEV_STOP_CMD.0 => {
+                    SemanticRequest::VdevStop(super::VdevStop { vdev_id: fixed[0] })
+                }
+                0x005007 if tlvs[0].tag == crate::tags::WMI_TAG_VDEV_DOWN_CMD.0 => {
+                    SemanticRequest::VdevDown(super::VdevDown { vdev_id: fixed[0] })
+                }
+                _ => return Err(WmiError::Malformed),
             }
         }
         0x005003 => {
@@ -875,12 +887,21 @@ pub fn reverse_map_semantic_command(
                 return Err(WmiError::Malformed);
             }
             let fixed = words::<5>(&tlvs[0].value)?;
-            SemanticRequest::PeerSetParam(super::PeerSetParam {
-                vdev_id: fixed[0],
-                peer_addr: mac(&tlvs[0].value[4..10])?,
-                param_id: fixed[3],
-                param_value: fixed[4],
-            })
+            let peer_addr = mac(&tlvs[0].value[4..10])?;
+            if fixed[3] == super::WMI_PEER_AUTHORIZE_PARAM && fixed[4] <= 1 {
+                SemanticRequest::PeerAuthorize(super::PeerAuthorize {
+                    vdev_id: fixed[0],
+                    peer_addr,
+                    authorized: fixed[4] != 0,
+                })
+            } else {
+                SemanticRequest::PeerSetParam(super::PeerSetParam {
+                    vdev_id: fixed[0],
+                    peer_addr,
+                    param_id: fixed[3],
+                    param_value: fixed[4],
+                })
+            }
         }
         0x006013 => {
             let tlvs = semantic_tlvs(id, bytes)?;
