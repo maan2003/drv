@@ -184,9 +184,12 @@ impl<B: Backend> Device<B> {
         let len = b.region_len(&token);
         drop(b);
         Ok(MmioRegion {
-            shared: self.shared.clone(),
-            token: Some(token),
+            allocation: Rc::new(RegionAllocation {
+                shared: self.shared.clone(),
+                token: Some(token),
+            }),
             generation,
+            offset: 0,
             len,
         })
     }
@@ -280,10 +283,22 @@ fn current<B: Backend>(shared: &Shared<B>, generation: u64) -> Result<()> {
     }
 }
 
-pub struct MmioRegion<B: Backend> {
+struct RegionAllocation<B: Backend> {
     shared: Shared<B>,
     token: Option<B::Region>,
+}
+impl<B: Backend> Drop for RegionAllocation<B> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.shared.0.borrow_mut().release_region(token);
+        }
+    }
+}
+
+pub struct MmioRegion<B: Backend> {
+    allocation: Rc<RegionAllocation<B>>,
     generation: u64,
+    offset: usize,
     len: usize,
 }
 impl<B: Backend> MmioRegion<B> {
@@ -293,19 +308,35 @@ impl<B: Backend> MmioRegion<B> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    /// Return an independently owned view bounded to a sub-window of this
+    /// mapping. The backend mapping is released after the last view is dropped.
+    pub fn slice(&self, offset: usize, len: usize) -> Result<Self> {
+        let range = checked_range(offset, len, self.len)?;
+        current(&self.allocation.shared, self.generation)?;
+        Ok(Self {
+            allocation: self.allocation.clone(),
+            generation: self.generation,
+            offset: self
+                .offset
+                .checked_add(range.start)
+                .ok_or(Error::OutOfBounds)?,
+            len: range.len(),
+        })
+    }
     pub fn read_u32(&self, offset: usize) -> Result<u32> {
         self.check(offset, 4)?;
-        self.shared
-            .0
-            .borrow_mut()
-            .read_u32(self.token.as_ref().unwrap(), offset)
+        self.allocation.shared.0.borrow_mut().read_u32(
+            self.allocation.token.as_ref().unwrap(),
+            self.offset + offset,
+        )
     }
     pub fn write_u32(&self, offset: usize, value: u32) -> Result<()> {
         self.check(offset, 4)?;
-        self.shared
-            .0
-            .borrow_mut()
-            .write_u32(self.token.as_ref().unwrap(), offset, value)
+        self.allocation.shared.0.borrow_mut().write_u32(
+            self.allocation.token.as_ref().unwrap(),
+            self.offset + offset,
+            value,
+        )
     }
     pub fn write_device_address<D: Direction>(
         &self,
@@ -317,34 +348,26 @@ impl<B: Backend> MmioRegion<B> {
         if let Some(h) = high {
             self.check(h, 4)?;
         }
-        if !Rc::ptr_eq(&self.shared.0, &address.dma.shared.0) {
+        if !Rc::ptr_eq(&self.allocation.shared.0, &address.dma.shared.0) {
             return Err(Error::Invalid);
         }
-        current(&self.shared, address.dma.generation)?;
-        self.shared.0.borrow_mut().write_dma_address(
-            self.token.as_ref().unwrap(),
-            low,
-            high,
+        current(&self.allocation.shared, address.dma.generation)?;
+        self.allocation.shared.0.borrow_mut().write_dma_address(
+            self.allocation.token.as_ref().unwrap(),
+            self.offset + low,
+            high.map(|offset| self.offset + offset),
             address.dma.token.as_ref().unwrap(),
             address.offset,
         )
     }
     fn check(&self, o: usize, n: usize) -> Result<()> {
-        current(&self.shared, self.generation)?;
+        current(&self.allocation.shared, self.generation)?;
         if !o.is_multiple_of(4) {
             return Err(Error::Invalid);
         }
         checked_range(o, n, self.len).map(|_| ())
     }
 }
-impl<B: Backend> Drop for MmioRegion<B> {
-    fn drop(&mut self) {
-        if let Some(t) = self.token.take() {
-            self.shared.0.borrow_mut().release_region(t)
-        }
-    }
-}
-
 struct DmaBuffer<B: Backend, D: Direction> {
     shared: Shared<B>,
     token: Option<B::Dma>,
