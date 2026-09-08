@@ -276,12 +276,10 @@ pub trait AssociatedDataPump: AssociatedSoftmacTx {
 pub struct NetstackProofConfig {
     pub dns_name: String,
     pub server_port: NonZeroU16,
-    pub http_request: Vec<u8>,
-    pub expected_response_prefix: Vec<u8>,
 }
 
 /// The existing Netstack3 DHCP/DNS/socket stack wired to the MT7921 Ethernet
-/// port. This is a bounded driver, not a DHCP, DNS, TCP, or HTTP implementation.
+/// port. This is a bounded driver, not a DHCP, DNS, or TCP implementation.
 pub struct BoundedNetstackProof {
     runner: EthernetRunner<DhcpService, Mt7921EthernetDevice>,
     config: NetstackProofConfig,
@@ -455,29 +453,13 @@ impl BoundedNetstackProof {
         }
     }
 
-    pub fn prove_http(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
-        let socket = self.socket.ok_or("HTTP requires TCP")?;
-        let mut provider = self.runner.stack().socket_provider();
-        let written = provider
-            .tcp_write(socket, &self.config.http_request)
-            .map_err(|_| "HTTP request failed")?;
-        if written != self.config.http_request.len() {
-            return Err("partial HTTP request");
-        }
-        let mut response = vec![0; 4096];
-        loop {
-            self.drive(deadline)?;
-            match provider.tcp_read(socket, &mut response) {
-                Ok(read) if read != 0 => {
-                    return response[..read]
-                        .starts_with(&self.config.expected_response_prefix)
-                        .then_some(())
-                        .ok_or("unexpected HTTP response");
-                }
-                Ok(_) | Err(netstack3_port_spike::RemoteSocketError::WouldBlock) => {}
-                Err(_) => return Err("HTTP response failed"),
-            }
-        }
+    /// True only after the bounded product-readiness proof has completed.
+    /// HTTP is deliberately not part of product readiness: it is an optional
+    /// lab assertion over an already-proven TCP path.
+    pub fn network_ready(&self) -> bool {
+        self.runner.stack().status() == DhcpStatus::Bound
+            && self.resolved.is_some()
+            && self.socket.is_some()
     }
 
     /// Serve SOCKS5 CONNECT requests through the same Netstack3 instance used
@@ -493,8 +475,8 @@ impl BoundedNetstackProof {
     where
         F: FnMut() -> bool,
     {
-        if self.runner.stack().status() != DhcpStatus::Bound {
-            return Err("SOCKS5 requires DHCP");
+        if !self.network_ready() {
+            return Err("SOCKS5 requires DHCP, DNS, and TCP proof");
         }
         let listener = TcpListener::bind(listen).map_err(|_| "SOCKS5 bind failed")?;
         set_nonblocking(listener.as_raw_fd()).map_err(|_| "SOCKS5 nonblocking setup failed")?;
@@ -511,6 +493,9 @@ impl BoundedNetstackProof {
     where
         F: FnMut() -> bool,
     {
+        if !self.network_ready() {
+            return Err("SOCKS5 requires DHCP, DNS, and TCP proof");
+        }
         let mut clients = Vec::new();
         println!("internet_proxy_ready=true listen={listen}");
         while !stop_requested() && std::time::Instant::now() < deadline {

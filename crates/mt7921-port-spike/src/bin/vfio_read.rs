@@ -432,6 +432,9 @@ unsafe extern "C" {
     fn write_fd(fd: i32, buffer: *const u8, count: usize) -> isize;
     fn pause() -> i32;
     fn signal(number: i32, handler: usize) -> usize;
+    fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+    fn bind(fd: i32, address: *const std::ffi::c_void, length: u32) -> i32;
+    fn listen(fd: i32, backlog: i32) -> i32;
 }
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -480,12 +483,99 @@ impl Drop for ActiveSignalGuard {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+#[derive(Default)]
+struct NetworkReadyHandshake {
+    received: Vec<u8>,
+    serve_written: usize,
+    write_shutdown: bool,
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn poll_network_ready_handshake(
+    bootstrap: &mut UnixStream,
+    listener: &mut Option<TcpListener>,
+    state: &mut NetworkReadyHandshake,
+) -> Result<bool, String> {
+    const SIGNAL: &[u8] = b"NETWORK_READY";
+    if state.received.len() < SIGNAL.len() {
+        let mut bytes = [0u8; 13];
+        loop {
+            match bootstrap.read(&mut bytes[..SIGNAL.len() - state.received.len()]) {
+                Ok(0) => return Err("netstack closed bootstrap before network readiness".into()),
+                Ok(read) => {
+                    state.received.extend_from_slice(&bytes[..read]);
+                    if !SIGNAL.starts_with(&state.received) {
+                        return Err("invalid netstack network-ready signal".into());
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(format!("netstack network readiness: {error}")),
+            }
+        }
+        if state.received.len() < SIGNAL.len() {
+            return Ok(false);
+        }
+    }
+    if let Some(listener) = listener.take() {
+        if unsafe { listen(listener.as_raw_fd(), 128) } != 0 {
+            return Err(format!(
+                "activate SOCKS listener: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        drop(listener);
+    }
+    while state.serve_written < b"SERVE".len() {
+        match bootstrap.write(&b"SERVE"[state.serve_written..]) {
+            Ok(0) => return Err("netstack bootstrap closed during SERVE".into()),
+            Ok(written) => state.serve_written += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(format!("acknowledge SOCKS listener activation: {error}")),
+        }
+    }
+    if !state.write_shutdown {
+        bootstrap
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| format!("netstack SERVE shutdown: {error}"))?;
+        state.write_shutdown = true;
+    }
+    let mut unexpected = [0u8; 1];
+    loop {
+        return match bootstrap.read(&mut unexpected) {
+            Ok(0) => Ok(true),
+            Ok(_) => Err("netstack bootstrap emitted data after network readiness".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(format!("netstack bootstrap close acknowledgment: {error}")),
+        };
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct NetstackChildGuard {
     child: Child,
+    bootstrap: Option<UnixStream>,
+    listener: Option<TcpListener>,
+    handshake: NetworkReadyHandshake,
 }
 
 #[cfg(feature = "fuchsia-passive")]
 impl NetstackChildGuard {
+    fn poll_network_ready(&mut self) -> Result<bool, String> {
+        let Some(bootstrap) = self.bootstrap.as_mut() else {
+            return Ok(true);
+        };
+        if !poll_network_ready_handshake(bootstrap, &mut self.listener, &mut self.handshake)? {
+            return Ok(false);
+        }
+        self.bootstrap = None;
+        audit_netstack_runtime_fds(self.child.id())?;
+        Ok(true)
+    }
+
     fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
         self.child
             .try_wait()
@@ -519,6 +609,86 @@ impl Drop for NetstackChildGuard {
     }
 }
 
+
+#[cfg(feature = "fuchsia-passive")]
+fn prebind_socks_listener(address: SocketAddr) -> Result<TcpListener, String> {
+    const SOCK_STREAM: i32 = 1;
+    const SOCK_CLOEXEC: i32 = 0o2000000;
+    let fd = unsafe {
+        socket(
+            if address.is_ipv4() { 2 } else { 10 },
+            SOCK_STREAM | SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "create SOCKS listener: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let result = match address {
+        SocketAddr::V4(address) => {
+            #[repr(C)]
+            struct SockaddrIn {
+                family: u16,
+                port: u16,
+                address: [u8; 4],
+                zero: [u8; 8],
+            }
+            let raw = SockaddrIn {
+                family: 2,
+                port: address.port().to_be(),
+                address: address.ip().octets(),
+                zero: [0; 8],
+            };
+            unsafe {
+                bind(
+                    fd.as_raw_fd(),
+                    (&raw as *const SockaddrIn).cast(),
+                    std::mem::size_of_val(&raw) as u32,
+                )
+            }
+        }
+        SocketAddr::V6(address) => {
+            #[repr(C)]
+            struct SockaddrIn6 {
+                family: u16,
+                port: u16,
+                flowinfo: u32,
+                address: [u8; 16],
+                scope_id: u32,
+            }
+            let raw = SockaddrIn6 {
+                family: 10,
+                port: address.port().to_be(),
+                flowinfo: address.flowinfo(),
+                address: address.ip().octets(),
+                scope_id: address.scope_id(),
+            };
+            unsafe {
+                bind(
+                    fd.as_raw_fd(),
+                    (&raw as *const SockaddrIn6).cast(),
+                    std::mem::size_of_val(&raw) as u32,
+                )
+            }
+        }
+    };
+    if result != 0 {
+        return Err(format!(
+            "bind SOCKS listener: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let listener = TcpListener::from(fd);
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("make SOCKS listener nonblocking: {error}"))?;
+    Ok(listener)
+}
+
 #[cfg(feature = "fuchsia-passive")]
 fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
     const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -541,7 +711,7 @@ fn spawn_netstack_child(
 ) -> Result<NetstackChildGuard, String> {
     let binary = env::var("DRV_NETSTACK_BINARY").map_err(|_| "DRV_NETSTACK_BINARY is required")?;
     let frame = device.into_frame_fd();
-    let (mut bootstrap_parent, bootstrap_child) =
+    let (bootstrap_parent, bootstrap_child) =
         UnixStream::pair().map_err(|error| format!("create netstack bootstrap pair: {error}"))?;
     let frame_pass = duplicate_capability(frame.as_raw_fd())?;
     let listener_pass = duplicate_capability(listener.as_raw_fd())?;
@@ -575,20 +745,19 @@ fn spawn_netstack_child(
     let child = command
         .spawn()
         .map_err(|error| format!("spawn netstack child: {error}"))?;
-    let child = NetstackChildGuard { child };
-    drop((
-        frame,
-        listener,
-        frame_pass,
-        listener_pass,
-        bootstrap_pass,
-        bootstrap_child,
-    ));
+    let mut child = NetstackChildGuard {
+        child,
+        bootstrap: Some(bootstrap_parent),
+        listener: Some(listener),
+        handshake: NetworkReadyHandshake::default(),
+    };
+    drop((frame, frame_pass, listener_pass, bootstrap_pass, bootstrap_child));
+    let bootstrap = child.bootstrap.as_mut().expect("bootstrap installed");
     let mut ready = [0u8; 5];
-    bootstrap_parent
+    bootstrap
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
-    bootstrap_parent
+    bootstrap
         .read_exact(&mut ready)
         .map_err(|error| format!("netstack READY: {error}"))?;
     if &ready != b"READY" {
@@ -670,48 +839,72 @@ fn spawn_netstack_child(
         child_mnt.display(),
         child_net.display()
     );
-    bootstrap_parent
+    bootstrap
         .write_all(b"GO")
         .map_err(|error| format!("netstack GO: {error}"))?;
-    bootstrap_parent
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|error| format!("netstack GO shutdown: {error}"))?;
-    let mut close_ack = Vec::new();
-    bootstrap_parent
-        .read_to_end(&mut close_ack)
-        .map_err(|error| format!("netstack bootstrap close acknowledgment: {error}"))?;
-    if !close_ack.is_empty() {
-        return Err("netstack bootstrap emitted data after READY".into());
-    }
-    drop(bootstrap_parent);
-    let mut runtime_descriptors = Vec::new();
+    bootstrap
+        .set_read_timeout(None)
+        .map_err(|error| format!("clear netstack bootstrap timeout: {error}"))?;
+    bootstrap
+        .set_nonblocking(true)
+        .map_err(|error| format!("make netstack bootstrap nonblocking: {error}"))?;
+    Ok(child)
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
+    let fd_dir = format!("/proc/{pid}/fd");
+    let mut descriptors = Vec::new();
     for entry in std::fs::read_dir(&fd_dir)
         .map_err(|error| format!("inspect running netstack fds: {error}"))?
     {
         let entry = entry.map_err(|error| error.to_string())?;
-        runtime_descriptors.push((
+        let target = match std::fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        descriptors.push((
             entry.file_name().to_string_lossy().into_owned(),
-            std::fs::read_link(entry.path())
-                .map_err(|error| error.to_string())?
-                .display()
-                .to_string(),
+            target.display().to_string(),
         ));
     }
-    runtime_descriptors.sort();
-    if runtime_descriptors
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        != ["0", "1", "2", "3", "4"]
-    {
-        return Err(format!(
-            "running netstack has unexpected descriptors: {runtime_descriptors:?}"
-        ));
-    }
+    descriptors.sort();
+    validate_netstack_runtime_descriptors(&descriptors)?;
     println!(
-        "netstack_runtime_fds=true pid={pid} descriptors={runtime_descriptors:?} bootstrap_closed=true"
+        "netstack_runtime_fds=true pid={pid} descriptors={descriptors:?} bootstrap_closed=true accepted_client_sockets_allowed=true"
     );
-    Ok(child)
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn validate_netstack_runtime_descriptors(
+    descriptors: &[(String, String)],
+) -> Result<(), String> {
+    let mut base = [false; 5];
+    let mut seen = Vec::new();
+    for (name, target) in descriptors {
+        let fd = name
+            .parse::<usize>()
+            .map_err(|_| format!("running netstack has invalid descriptor: {name:?}"))?;
+        if seen.contains(&fd) {
+            return Err(format!("running netstack has duplicate descriptor: {fd}"));
+        }
+        seen.push(fd);
+        if fd < base.len() {
+            base[fd] = true;
+        } else if !(target.starts_with("socket:[") && target.ends_with(']')) {
+            return Err(format!(
+                "running netstack has unexpected descriptor: fd={fd} target={target:?}"
+            ));
+        }
+    }
+    if base != [true; 5] {
+        return Err(format!(
+            "running netstack is missing a base descriptor: present={base:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6834,11 +7027,7 @@ fn run() -> Result<(), String> {
                                             "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into()
                                         );
                                     }
-                                    let listener = TcpListener::bind(listen)
-                                        .map_err(|error| format!("bind SOCKS listener: {error}"))?;
-                                    listener.set_nonblocking(true).map_err(|error| {
-                                        format!("make SOCKS listener nonblocking: {error}")
-                                    })?;
+                                    let listener = prebind_socks_listener(listen)?;
                                     let mut netstack = spawn_netstack_child(
                                         ethernet_device,
                                         listener,
@@ -6868,6 +7057,7 @@ fn run() -> Result<(), String> {
                                             record_sae_stage("internet_proxy_stopped=true");
                                             break;
                                         }
+                                        netstack.poll_network_ready()?;
                                         let progressed = match futures::executor::block_on(
                                             runtime.pump_associated_once(),
                                         ) {
@@ -21932,6 +22122,17 @@ mod tests {
         let spawn = exchange.find("spawn_netstack_child").unwrap();
         let pump = exchange.find("runtime.pump_associated_once()").unwrap();
         assert!(connect < spawn && spawn < pump);
+        let launcher = include_str!("vfio_read.rs");
+        let process = launcher
+            .find(r#".spawn()
+        .map_err(|error| format!("spawn netstack child"#)
+            .unwrap();
+        let guard = launcher[process..]
+            .find("let mut child = NetstackChildGuard")
+            .unwrap()
+            + process;
+        let ready = launcher[guard..].find(".read_exact(&mut ready)").unwrap() + guard;
+        assert!(process < guard && guard < ready);
         for forbidden in [
             "BoundedNetstackProof::new",
             "runtime.associated_data_pump()",
@@ -21946,9 +22147,127 @@ mod tests {
         let dhcp = child.find("proof.prove_dhcp(initial_deadline)").unwrap();
         let dns = child.find("proof.prove_dns(initial_deadline)").unwrap();
         let tcp = child.find("proof.prove_tcp(initial_deadline)").unwrap();
-        let http = child.find("proof.prove_http(initial_deadline)").unwrap();
+        let ready = child.find("b\"NETWORK_READY\"").unwrap();
         let socks = child.find(".serve_socks5_listener(").unwrap();
-        assert!(dhcp < dns && dns < tcp && tcp < http && http < socks);
+        assert!(dhcp < dns && dns < tcp && tcp < ready && ready < socks);
+        assert!(!child.contains("prove_http("));
+        assert!(!child.contains("HTTP_PROOF"));
+    }
+
+    #[test]
+    fn fragmented_network_ready_alone_activates_prebound_socks_socket() {
+        const SIGNAL_FRAGMENT_POLL_LIMIT: usize = 4;
+        let mut listener =
+            Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = listener.as_ref().unwrap().local_addr().unwrap();
+        let mut child_listener = listener.as_ref().unwrap().try_clone().unwrap();
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        parent.set_nonblocking(true).unwrap();
+        let mut handshake = NetworkReadyHandshake::default();
+
+        child.write_all(b"NETWORK_").unwrap();
+        assert!(!poll_network_ready_handshake(
+            &mut parent,
+            &mut listener,
+            &mut handshake
+        )
+        .unwrap());
+        assert!(std::net::TcpStream::connect_timeout(
+            &address,
+            std::time::Duration::from_millis(100),
+        )
+        .is_err());
+
+        child.write_all(b"READY").unwrap();
+        for _ in 0..SIGNAL_FRAGMENT_POLL_LIMIT {
+            assert!(!poll_network_ready_handshake(
+                &mut parent,
+                &mut listener,
+                &mut handshake
+            )
+            .unwrap());
+            if listener.is_none() {
+                break;
+            }
+        }
+        assert!(listener.is_none());
+        let client = std::net::TcpStream::connect_timeout(
+            &address,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut accepted = None;
+        for _ in 0..100 {
+            match child_listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = Some(stream);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("accept activated client: {error}"),
+            }
+        }
+        let accepted = accepted.expect("activated client was not accepted");
+
+        let mut serve = [0u8; 5];
+        child.read_exact(&mut serve).unwrap();
+        assert_eq!(&serve, b"SERVE");
+        drop(child);
+        assert!(poll_network_ready_handshake(
+            &mut parent,
+            &mut listener,
+            &mut handshake
+        )
+        .unwrap());
+
+        let accepted_target = std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            accepted.as_raw_fd()
+        ))
+        .unwrap()
+        .display()
+        .to_string();
+        let mut descriptors = (0..5)
+            .map(|fd| (fd.to_string(), format!("base-{fd}")))
+            .collect::<Vec<_>>();
+        descriptors.push(("5".into(), accepted_target));
+        validate_netstack_runtime_descriptors(&descriptors).unwrap();
+        descriptors.push(("6".into(), "/dev/vfio/1".into()));
+        assert!(validate_netstack_runtime_descriptors(&descriptors).is_err());
+
+        drop((accepted, client, child_listener));
+    }
+
+    #[test]
+    fn invalid_or_eof_network_ready_never_activates_and_releases_listener() {
+        for invalid in [Some(&b"NO"[..]), None] {
+            let mut listener =
+                Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
+            let address = listener.as_ref().unwrap().local_addr().unwrap();
+            let (mut parent, mut child) = UnixStream::pair().unwrap();
+            parent.set_nonblocking(true).unwrap();
+            if let Some(invalid) = invalid {
+                child.write_all(invalid).unwrap();
+            } else {
+                drop(child);
+            }
+            let error = poll_network_ready_handshake(
+                &mut parent,
+                &mut listener,
+                &mut NetworkReadyHandshake::default(),
+            )
+            .unwrap_err();
+            assert!(error.contains("invalid") || error.contains("before network readiness"));
+            assert!(std::net::TcpStream::connect_timeout(
+                &address,
+                std::time::Duration::from_millis(100),
+            )
+            .is_err());
+            drop(listener);
+            TcpListener::bind(address).unwrap();
+        }
     }
 
     #[test]

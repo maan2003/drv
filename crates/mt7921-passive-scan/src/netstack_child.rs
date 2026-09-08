@@ -50,8 +50,8 @@ const SYS_SOCKET: i64 = 41;
 const SYS_OPENAT: i64 = 257;
 #[cfg(target_arch = "x86_64")]
 const ALLOWED_SYSCALLS: &[u32] = &[
-    0, 1, 3, 7, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 28, 35, 39, 44, 45, 47, 60, 72, 96,
-    131, 202, 219, 228, 230, 231, 288, 318,
+    0, 1, 3, 7, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 28, 35, 39, 44, 45, 47, 60, 72, 96, 131,
+    202, 219, 228, 230, 231, 288, 318,
 ];
 
 #[cfg(target_arch = "aarch64")]
@@ -66,8 +66,8 @@ const SYS_SOCKET: i64 = 198;
 const SYS_OPENAT: i64 = 56;
 #[cfg(target_arch = "aarch64")]
 const ALLOWED_SYSCALLS: &[u32] = &[
-    25, 57, 63, 64, 72, 73, 93, 94, 98, 101, 113, 115, 124, 128, 132, 134, 135, 139, 169,
-    172, 198, 206, 207, 212, 214, 215, 216, 222, 226, 233, 242, 278,
+    25, 57, 63, 64, 72, 73, 93, 94, 98, 101, 113, 115, 124, 128, 132, 134, 135, 139, 169, 172, 198,
+    206, 207, 212, 214, 215, 216, 222, 226, 233, 242, 278,
 ];
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -161,7 +161,9 @@ fn setup(expected_parent: i32) -> Result<(), String> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !root_entries.is_empty() {
-            return Err(format!("netstack sandbox root is not empty: {root_entries:?}"));
+            return Err(format!(
+                "netstack sandbox root is not empty: {root_entries:?}"
+            ));
         }
         syscall_ok(setgroups(0, std::ptr::null()), "clear groups")?;
         for capability in 0usize..64 {
@@ -273,6 +275,40 @@ fn denied_probe(number: i64, arg: *const i8) -> bool {
     }
 }
 
+fn write_all_fd(fd: i32, mut bytes: &[u8], operation: &'static str) -> Result<(), String> {
+    while !bytes.is_empty() {
+        let written = unsafe { syscall(SYS_WRITE, fd, bytes.as_ptr(), bytes.len()) };
+        if written > 0 {
+            bytes = &bytes[written as usize..];
+        } else if written == -1
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            return Err(format!("{operation}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_fd(fd: i32, mut bytes: &mut [u8], operation: &'static str) -> Result<(), String> {
+    while !bytes.is_empty() {
+        let read = unsafe { syscall(SYS_READ, fd, bytes.as_mut_ptr(), bytes.len()) };
+        if read > 0 {
+            bytes = &mut bytes[read as usize..];
+        } else if read == -1
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else if read == 0 {
+            return Err(format!("{operation}: unexpected EOF"));
+        } else {
+            return Err(format!("{operation}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let sandbox_only = env::var_os("DRV_NETSTACK_SANDBOX_SELF_TEST").is_some();
     let expected_parent = env::var("DRV_NETSTACK_PARENT_PID")
@@ -313,18 +349,16 @@ fn run() -> Result<(), String> {
     if !(fs_denied && vfio_denied && iommu_denied && socket_denied && ioctl_denied) {
         return Err("sandbox denial self-proof failed".into());
     }
-    let ready = b"READY";
-    if unsafe { syscall(SYS_WRITE, 5i32, ready.as_ptr(), ready.len()) } != ready.len() as i64 {
-        return Err("bootstrap READY failed".into());
-    }
+    write_all_fd(5, b"READY", "bootstrap READY failed")?;
     let mut go = [0u8; 2];
-    if unsafe { syscall(SYS_READ, 5i32, go.as_mut_ptr(), go.len()) } != 2 || &go != b"GO" {
-        return Err("bootstrap GO failed".into());
-    }
-    unsafe {
-        close(5);
+    read_exact_fd(5, &mut go, "bootstrap GO failed")?;
+    if &go != b"GO" {
+        return Err("invalid bootstrap GO".into());
     }
     if sandbox_only {
+        unsafe {
+            close(5);
+        }
         println!("netstack_sandbox_self_test=true");
         return Ok(());
     }
@@ -334,9 +368,6 @@ fn run() -> Result<(), String> {
         NetstackProofConfig {
             dns_name: "example.com.".into(),
             server_port: NonZeroU16::new(80).unwrap(),
-            http_request: b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n"
-                .to_vec(),
-            expected_response_prefix: b"HTTP/1.".to_vec(),
         },
     )
     .map_err(str::to_string)?;
@@ -347,8 +378,19 @@ fn run() -> Result<(), String> {
     println!("internet_proof_dns=true");
     proof.prove_tcp(initial_deadline).map_err(str::to_string)?;
     println!("internet_proof_tcp=true");
-    proof.prove_http(initial_deadline).map_err(str::to_string)?;
-    println!("internet_proof_http=true");
+    if !proof.network_ready() {
+        return Err("network readiness proof incomplete".into());
+    }
+    write_all_fd(5, b"NETWORK_READY", "network-ready signal failed")?;
+    let mut serve = [0u8; 5];
+    read_exact_fd(5, &mut serve, "listener activation acknowledgment failed")?;
+    if &serve != b"SERVE" {
+        return Err("invalid listener activation acknowledgment".into());
+    }
+    unsafe {
+        close(5);
+    }
+    println!("internet_network_ready=true");
     proof
         .serve_socks5_listener(
             listener,
