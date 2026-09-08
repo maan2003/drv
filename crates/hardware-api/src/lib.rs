@@ -374,6 +374,10 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
             b.release_dma(token);
             return Err(error);
         }
+        if !coherent && let Err(error) = b.sync_for_device(&token, 0..size) {
+            b.release_dma(token);
+            return Err(error);
+        }
         drop(b);
         Ok(Self {
             shared,

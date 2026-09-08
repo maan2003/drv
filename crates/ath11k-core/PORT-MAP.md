@@ -25,14 +25,18 @@ misreported as replaced code.
 | `ath11k_hw_params[WCN6750]` | `core.c:578-662` | `hw::WCN6750_PARAMS` | wcn6750-specific | Complete scalar/feature table; CE/service maps remain CE-owned. |
 | `ath11k_hw_ring_mask_wcn6750` | `hw.c:2036-2071` | `hw::WCN6750_RING_MASK` | wcn6750-specific | Source fixture asserted in core tests. |
 | `wcn6750_regs` | `hw.c:2623-2708` | `ath11k_hal` WCN6750 register APIs | wcn6750-specific | HAL-owned checked registers/descriptors. |
-| `ath11k_ahb_get_msi_irq_wcn6750` | `ahb.c:145-148` | `ahb::WCN6750_INTERRUPT_ROUTES` | wcn6750-specific | 10 CE vectors then 18 DP vectors. |
+| `ath11k_ahb_get_msi_irq_wcn6750` | `ahb.c:145-148` | `ahb::WCN6750_INTERRUPT_ROUTES` | wcn6750-specific | Typed source-active routes within the 10 CE vectors then 18 DP vectors. |
+| `ath11k_ahb_config_irq` hybrid branch | `ahb.c:610-616` | `ahb::Wcn6750Interrupts::configure` | ported | WCN6750 delegates IRQ configuration to the PCIC MSI path. |
+| `ath11k_pcic_get_ce_msi_idx` / CE configuration | `pcic.c:304-319,662-717` | `ahb::WCN6750_CE_INTERRUPT_ROUTES` / `Wcn6750CeInterrupts` | ported | Skips disabled CE pipes and assigns active engines sequentially from CE MSI base 0; owned handles provide the CE completion wait. |
+| `ath11k_pcic_ext_irq_config` | `pcic.c:573-660` | `ahb::WCN6750_DP_INTERRUPT_ROUTES` / `Wcn6750DpInterrupts::enable` | ported | Nonempty WCN6750 ring-mask groups map to DP base vector 10 plus group; opening all routes is transactional. |
+| `ath11k_pcic_ext_irq_enable` / `ath11k_pcic_ext_irq_disable` | `pcic.c:435-521` | `Wcn6750DpInterrupts::{enable,disable}` | ported-corrected | The portable backend has no kernel IRQ masking primitive, so enable opens routes and disable drops them physically; no NAPI policy crosses the seam. |
 | `ath11k_ahb_get_window_start_wcn6750` | `ahb.c:151-164` | `ahb::RegisterWindow::for_offset` | wcn6750-specific | Static DP/CE window selection. |
 | `ath11k_ahb_window_write32_wcn6750` | `ahb.c:167-176` | `ahb::RegisterWindow::mapped_offset` | wcn6750-specific | Bounded MMIO performs the write. |
 | `ath11k_ahb_window_read32_wcn6750` | `ahb.c:178-189` | `ahb::RegisterWindow::mapped_offset` | wcn6750-specific | Bounded MMIO performs the read. |
 | `ath11k_ahb_start` | `ahb.c:365-371` | `Operation::HifStart` / CE `rx_post_buf` | ported | Normative lifecycle transcript plus real CE API. |
 | `ath11k_ahb_stop` | `ahb.c:394-402` | `Operation::HifStop` | ported | Crash-flush distinction retained. |
-| `ath11k_ahb_ce_interrupt_handler` | `ahb.c:476-488` | `ahb::service_ce_interrupt` | ported | Directly dispatches real CE service. |
-| `ath11k_ahb_ext_grp_napi_poll` | `ahb.c:490-508` | `ahb::service_dp_external_group` | ported | Directly dispatches real DP budgeted service. |
+| `ath11k_pcic_ce_interrupt_handler` / `ath11k_pcic_ce_tasklet` | `pcic.c:406-432` | `Wcn6750CeInterrupts::wait_any` / `ahb::service_ce_interrupt` | ported | WCN6750 hybrid-bus delivery is typed by CE engine and directly dispatches real CE service. |
+| `ath11k_pcic_ext_interrupt_handler` / `ath11k_pcic_ext_grp_napi_poll` | `pcic.c:523-565` | `Wcn6750DpInterrupts::wait_any` / `ahb::service_dp_external_group` | ported | Returns every ready typed external group; directly dispatches real budgeted DP service while leaving NAPI policy out of the userspace core. |
 | `ath11k_ahb_power_up` | `ahb.c:404-414` | — | kernel-substrate | remoteproc/SMEM/SMP2P power is complete before VFIO handoff. |
 | `ath11k_ahb_power_down` | `ahb.c:416-421` | — | kernel-substrate | Host kernel retains substrate teardown. |
 | `ath11k_ahb_probe` substrate resource portion | `ahb.c:1108-1165` | `ath11k_platform_backend` | kernel-substrate | Platform device, SMMU and IRQ delivery are host-owned. |

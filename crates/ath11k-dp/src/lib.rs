@@ -14,7 +14,7 @@ pub mod reo;
 pub mod rx;
 pub mod transport;
 pub mod tx;
-pub use hal_rings::{HalDpRings, Wcn6750DpMsi};
+pub use hal_rings::{DpRingMsi, HalDpRings};
 pub use lifecycle::{AllocatedDpRing, DpAllocationError, DpRingOps, DpRingSpec, Wcn6750DpRings};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerId(pub u16);
@@ -51,6 +51,11 @@ pub enum DpError {
     WrongState,
 }
 pub trait HttControl {
+    /// Whether a returned send error guarantees that the message was not
+    /// accepted for firmware visibility. Resumable multi-message operations
+    /// reject transports that do not assert this contract.
+    const SEND_ERROR_IS_NON_VISIBLE: bool = false;
+
     fn send(&mut self, message: HttHostMessage) -> Result<(), DpError>;
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<HttTargetMessage>, DpError>;
 }

@@ -16,8 +16,12 @@ const HAL_RING_COUNT: usize = 172;
 const LMAC_RING_START: u16 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Wcn6750DpMsi {
+pub struct DpRingMsi {
+    pub ring_type: RingType,
+    pub ring_number: u8,
+    pub mac_id: u8,
     pub address: u64,
+    pub data: u32,
 }
 
 struct Ring<B: Backend> {
@@ -32,12 +36,26 @@ pub struct HalDpRings<B: Backend> {
     mmio: MmioRegion<B>,
     remote_read_pointers: CoherentDma<B, Bidirectional>,
     remote_write_pointers: CoherentDma<B, Bidirectional>,
-    msi: Wcn6750DpMsi,
+    msi: Vec<DpRingMsi>,
     rings: Vec<Ring<B>>,
 }
 
 impl<B: Backend> HalDpRings<B> {
-    pub fn new(device: &Device<B>, msi: Wcn6750DpMsi) -> Result<Self, DpError> {
+    /// An empty MSI table selects the polling-first mode required by
+    /// `specs/ARCH-dma-broker.md`; a nonempty table selects MSI mode and must
+    /// cover every interrupt-bearing ring.
+    pub fn new(device: &Device<B>, msi: &[DpRingMsi]) -> Result<Self, DpError> {
+        for (index, entry) in msi.iter().enumerate() {
+            if entry.address == 0 {
+                return Err(DpError::WrongState);
+            }
+            if msi[..index].iter().any(|previous| {
+                (previous.ring_type, previous.ring_number, previous.mac_id)
+                    == (entry.ring_type, entry.ring_number, entry.mac_id)
+            }) {
+                return Err(DpError::WrongState);
+            }
+        }
         let remote_read_pointers = device
             .alloc_coherent(HAL_RING_COUNT * 4, 8)
             .map_err(|_| DpError::NoResources)?;
@@ -49,7 +67,7 @@ impl<B: Backend> HalDpRings<B> {
             mmio: device.open_region(0).map_err(|_| DpError::DeviceFault)?,
             remote_read_pointers,
             remote_write_pointers,
-            msi,
+            msi: msi.to_vec(),
             rings: Vec::new(),
         })
     }
@@ -75,9 +93,12 @@ impl<B: Backend> HalDpRings<B> {
                 params.interrupt_timer_us = 256;
             }
         }
-        if let Some(data) = wcn6750_msi_data(spec) {
-            params.msi_address = self.msi.address;
-            params.msi_data = data;
+        if let Some(msi) = self.msi.iter().find(|msi| {
+            (msi.ring_type, msi.ring_number, msi.mac_id)
+                == (spec.ring_type, spec.ring_number, spec.mac_id)
+        }) {
+            params.msi_address = msi.address;
+            params.msi_data = msi.data;
             params.flags = params.flags.union(RingFlags::MSI_INTERRUPT);
         }
         params
@@ -172,8 +193,17 @@ impl<B: Backend> Rings<B> for HalDpRings<B> {
     }
 
     fn publish(&mut self, id: RingId, descriptor: Descriptor) -> Result<(), HalError> {
-        let Self { mmio, remote_read_pointers, remote_write_pointers, rings, .. } = self;
-        let ring = rings.iter_mut().find(|ring| ring.srng.id == id).ok_or(HalError::NoResources)?;
+        let Self {
+            mmio,
+            remote_read_pointers,
+            remote_write_pointers,
+            rings,
+            ..
+        } = self;
+        let ring = rings
+            .iter_mut()
+            .find(|ring| ring.srng.id == id)
+            .ok_or(HalError::NoResources)?;
         if ring.srng.direction != ath11k_hal::RingDirection::Source {
             return Err(HalError::Unsupported);
         }
@@ -182,7 +212,11 @@ impl<B: Backend> Rings<B> for HalDpRings<B> {
         }
         ring.srng.access_begin_remote(remote_read_pointers)?;
         let offset = ring.srng.peek().ok_or(HalError::NoResources)?;
-        ring.srng.memory.dma.write(offset, descriptor.bytes()).map_err(|_| HalError::DeviceFault)?;
+        ring.srng
+            .memory
+            .dma
+            .write(offset, descriptor.bytes())
+            .map_err(|_| HalError::DeviceFault)?;
         let cursor = ring.srng.checkpoint();
         if ring.srng.source_next() != Some(offset) {
             ring.srng.restore(cursor);
@@ -200,15 +234,30 @@ impl<B: Backend> Rings<B> for HalDpRings<B> {
     }
 
     fn consume(&mut self, id: RingId) -> Result<Option<Descriptor>, HalError> {
-        let Self { mmio, remote_read_pointers, remote_write_pointers, rings, .. } = self;
-        let ring = rings.iter_mut().find(|ring| ring.srng.id == id).ok_or(HalError::NoResources)?;
+        let Self {
+            mmio,
+            remote_read_pointers,
+            remote_write_pointers,
+            rings,
+            ..
+        } = self;
+        let ring = rings
+            .iter_mut()
+            .find(|ring| ring.srng.id == id)
+            .ok_or(HalError::NoResources)?;
         if ring.srng.direction != ath11k_hal::RingDirection::Destination {
             return Err(HalError::Unsupported);
         }
         ring.srng.access_begin_remote(remote_read_pointers)?;
-        let Some(offset) = ring.srng.peek() else { return Ok(None) };
+        let Some(offset) = ring.srng.peek() else {
+            return Ok(None);
+        };
         let mut bytes = alloc::vec![0; ring.srng.entry_size()];
-        ring.srng.memory.dma.read(offset, &mut bytes).map_err(|_| HalError::DeviceFault)?;
+        ring.srng
+            .memory
+            .dma
+            .read(offset, &mut bytes)
+            .map_err(|_| HalError::DeviceFault)?;
         let cursor = ring.srng.checkpoint();
         if ring.srng.destination_next() != Some(offset) {
             ring.srng.restore(cursor);
@@ -225,7 +274,6 @@ impl<B: Backend> Rings<B> for HalDpRings<B> {
         }
         Descriptor::new(bytes, ring.srng.entry_size()).map(Some)
     }
-
 }
 
 impl<B: Backend> DpRingOps<B> for HalDpRings<B> {
@@ -240,6 +288,20 @@ impl<B: Backend> DpRingOps<B> for HalDpRings<B> {
         if self.rings.iter().any(|ring| ring.srng.id == expected) {
             return Err(HalError::NoResources);
         }
+        if !self.msi.is_empty()
+            && requires_msi(spec)
+            && !self.msi.iter().any(|msi| {
+                (msi.ring_type, msi.ring_number, msi.mac_id)
+                    == (spec.ring_type, spec.ring_number, spec.mac_id)
+            })
+        {
+            return Err(HalError::NoResources);
+        }
+        // Linux clears the complete RDP allocation before ring setup in
+        // `hal.c:ath11k_hal_alloc`, and `ath11k_hal_srng_setup` then selects
+        // `hal->rdp.vaddr + ring_id`. We permit owner reuse, so repeat the
+        // per-ID part here before every setup instead of inheriting a stale
+        // hardware pointer from an earlier ring with the same ID.
         self.remote_read_pointers
             .write(usize::from(expected.0) * 4, &0_u32.to_le_bytes())
             .map_err(|_| HalError::DeviceFault)?;
@@ -320,16 +382,14 @@ const fn is_lmac(ring_type: RingType) -> bool {
     )
 }
 
-const fn wcn6750_msi_data(spec: DpRingSpec) -> Option<u32> {
-    match (spec.ring_type, spec.ring_number) {
-        (RingType::WbmToSwRelease, 0) => Some(10),
-        (RingType::WbmToSwRelease, 2) => Some(12),
-        (RingType::WbmToSwRelease, 3) => Some(11),
-        (RingType::WbmToSwRelease, 4) => Some(14),
-        (RingType::ReoException | RingType::ReoStatus, 0) => Some(11),
-        (RingType::ReoDestination, ring @ 0..=3) => Some(17 + ring as u32),
-        (RingType::RxdmaDestination, 0) => Some(10),
-        (RingType::RxdmaMonitorStatus, 0) => Some(16),
-        _ => None,
-    }
+const fn requires_msi(spec: DpRingSpec) -> bool {
+    matches!(
+        spec.ring_type,
+        RingType::WbmToSwRelease
+            | RingType::ReoDestination
+            | RingType::ReoException
+            | RingType::ReoStatus
+            | RingType::RxdmaDestination
+            | RingType::RxdmaMonitorStatus
+    )
 }

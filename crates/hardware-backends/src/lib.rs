@@ -319,7 +319,7 @@ impl Backend for DeterministicBackend {
     }
     fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         let d = self.dma(dma)?;
-        if d.coherent || matches!(d.direction, DmaDirection::FromDevice) {
+        if d.coherent {
             Err(Error::Invalid)
         } else {
             if let Some(log) = &self.operations {
@@ -435,6 +435,19 @@ mod tests {
             .unwrap();
         streaming.sync_for_cpu(0, 32).unwrap();
         streaming.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0; 32]);
+
+        let mut from_device = device
+            .alloc_coherent::<drv_hardware::FromDevice>(32, 8)
+            .unwrap();
+        from_device.read(0, &mut observed).unwrap();
+        assert_eq!(observed, [0; 32]);
+
+        let mut from_device = device
+            .alloc_streaming::<drv_hardware::FromDevice>(32, 8)
+            .unwrap();
+        from_device.sync_for_cpu(0, 32).unwrap();
+        from_device.read(0, &mut observed).unwrap();
         assert_eq!(observed, [0; 32]);
     }
 

@@ -110,6 +110,14 @@ mod tests {
                     dma: 1,
                     range: 0..4,
                 },
+                Operation::SyncForDevice {
+                    dma: 1,
+                    range: 0..4,
+                },
+                Operation::SyncForDevice {
+                    dma: 2,
+                    range: 0..64,
+                },
                 Operation::SyncForCpu {
                     dma: 2,
                     range: 0..4,

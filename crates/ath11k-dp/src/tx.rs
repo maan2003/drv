@@ -188,7 +188,11 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
     }
 
     /// Tear down the SoC-level rings after all pdev phases have been freed.
-    /// Dropping pending entries also performs the C TX DMA cleanup boundary.
+    /// The caller must quiesce firmware and interrupt dispatch before starting
+    /// the DP free sequence. Pinned `core.c:ath11k_core_deinit` does so through
+    /// `ath11k_core_stop` before `ath11k_core_soc_destroy` calls
+    /// `dp.c:ath11k_dp_free`. Dropping pending entries also performs the C TX
+    /// DMA cleanup boundary.
     pub fn ath11k_dp_free(&mut self) -> Result<(), DpError> {
         if !self.ring_resources.pdev_rx().is_empty()
             || !self.ring_resources.reo_destination().is_empty()
@@ -320,6 +324,11 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         Ok(())
     }
 
+    /// Begin the destructive DP teardown sequence. The caller must first
+    /// quiesce firmware and interrupt dispatch, and preserve that precondition
+    /// through `pdev_free -> pdev_reo_cleanup -> dp_free`. Pinned
+    /// `core.c:ath11k_core_deinit` calls `ath11k_core_stop` before the final
+    /// `ath11k_core_soc_destroy`/`dp.c:ath11k_dp_free` path.
     pub fn ath11k_dp_pdev_free(&mut self) -> Result<(), DpError> {
         self.ring_resources.free_pdev_rx(&mut self.rings)?;
         self.rx_buffers.clear();
@@ -334,7 +343,8 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
     /// `ath11k_dp_rx_pdev_alloc`. A failed send leaves the completed prefix so
     /// retry resumes without re-sending firmware-visible DMA addresses.
     pub fn configure_htt<C: crate::HttControl>(&mut self, control: &mut C) -> Result<(), DpError> {
-        if self.reo.is_none()
+        if !C::SEND_ERROR_IS_NON_VISIBLE
+            || self.reo.is_none()
             || self.data_rings.is_none()
             || self.ring_resources.pdev_rx().len() != 4
             || self.rx_buffers.is_empty()
@@ -706,12 +716,20 @@ fn map_hal(error: ath11k_hal::HalError) -> DpError {
 mod tests {
     use super::*;
     use crate::{HttControl, HttHostMessage};
-    use alloc::{collections::{BTreeMap, VecDeque}, rc::Rc};
     use alloc::vec;
+    use alloc::{
+        collections::{BTreeMap, VecDeque},
+        rc::Rc,
+    };
     use ath11k_hal::Descriptor;
     use ath11k_platform_backend::{DmaConstraints, DmaDirection, Error as HardwareError, IrqEvent};
-    use core::{cell::{Cell, RefCell}, ops::Range};
+    use core::{
+        cell::{Cell, RefCell},
+        ops::Range,
+    };
     use drv_hardware_backends::{DeterministicBackend, Operation};
+
+    type DmaWrites = Rc<RefCell<Vec<(u64, Range<usize>)>>>;
 
     #[derive(Default)]
     struct ModelRings {
@@ -780,7 +798,7 @@ mod tests {
     struct AggregateBackend {
         next_dma: u64,
         memory: Rc<RefCell<BTreeMap<u64, Vec<u8>>>>,
-        dma_writes: Rc<RefCell<Vec<(u64, Range<usize>)>>>,
+        dma_writes: DmaWrites,
         mmio_writes: Rc<RefCell<Vec<(usize, u32)>>>,
         fail_dma_write_once: Rc<Cell<bool>>,
         fail_dma_read_token_once: Rc<Cell<Option<u64>>>,
@@ -818,7 +836,12 @@ mod tests {
         fn read_u32(&mut self, _: &Self::Region, _: usize) -> Result<u32, HardwareError> {
             Ok(0)
         }
-        fn write_u32(&mut self, _: &Self::Region, offset: usize, value: u32) -> Result<(), HardwareError> {
+        fn write_u32(
+            &mut self,
+            _: &Self::Region,
+            offset: usize,
+            value: u32,
+        ) -> Result<(), HardwareError> {
             if self.fail_mmio_write_once.replace(false) {
                 return Err(HardwareError::DeviceFault);
             }
@@ -1025,6 +1048,36 @@ mod tests {
         }
     }
 
+    fn msi_config() -> Vec<crate::DpRingMsi> {
+        use ath11k_hal::RingType;
+        [
+            (RingType::WbmToSwRelease, 0),
+            (RingType::WbmToSwRelease, 4),
+            (RingType::WbmToSwRelease, 2),
+            (RingType::WbmToSwRelease, 3),
+            // dp.c:ath11k_dp_srng_msi_setup routes HAL_REO_EXCEPTION through
+            // WCN6750's rx_err interrupt group just like REO status.
+            (RingType::ReoException, 0),
+            (RingType::ReoStatus, 0),
+            (RingType::ReoDestination, 0),
+            (RingType::ReoDestination, 1),
+            (RingType::ReoDestination, 2),
+            (RingType::ReoDestination, 3),
+            (RingType::RxdmaDestination, 0),
+            (RingType::RxdmaMonitorStatus, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (ring_type, ring_number))| crate::DpRingMsi {
+            ring_type,
+            ring_number,
+            mac_id: 0,
+            address: 0xfeed_0000,
+            data: index as u32 + 1,
+        })
+        .collect()
+    }
+
     #[test]
     fn wcn6750_station_config_uses_source_defaults() {
         let config = ClientTxConfig::wcn6750_station(7);
@@ -1043,11 +1096,29 @@ mod tests {
     }
 
     impl HttControl for HttMessages {
+        const SEND_ERROR_IS_NON_VISIBLE: bool = true;
+
         fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
             if self.fail_at == Some(self.messages.len()) {
                 return Err(DpError::DeviceFault);
             }
             self.messages.push(message);
+            Ok(())
+        }
+
+        fn receive(&mut self, _: u64) -> Result<Option<crate::HttTargetMessage>, DpError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct AmbiguousHtt {
+        sends: usize,
+    }
+
+    impl HttControl for AmbiguousHtt {
+        fn send(&mut self, _: HttHostMessage) -> Result<(), DpError> {
+            self.sends += 1;
             Ok(())
         }
 
@@ -1066,11 +1137,8 @@ mod tests {
         let fail_dma_read = backend.fail_dma_read_token_once.clone();
         let fail_mmio_write = backend.fail_mmio_write_once.clone();
         let device = Device::from_backend(backend);
-        let rings = crate::HalDpRings::new(
-            &device,
-            crate::Wcn6750DpMsi { address: 0xfeed_0000 },
-        )
-        .unwrap();
+        // Polling-first mode from specs/ARCH-dma-broker.md has no MSI records.
+        let rings = crate::HalDpRings::new(&device, &[]).unwrap();
         assert!(
             memory
                 .borrow()
@@ -1118,8 +1186,7 @@ mod tests {
             .find(|(_, bytes)| bytes.len() == 2_048 * 64 + 7)
             .map(|(address, _)| address)
             .unwrap();
-        memory.borrow_mut().get_mut(&0).unwrap()[..4]
-            .copy_from_slice(&16_u32.to_le_bytes());
+        memory.borrow_mut().get_mut(&0).unwrap()[..4].copy_from_slice(&16_u32.to_le_bytes());
         memory.borrow_mut().get_mut(&reo_dma).unwrap()[..64].fill(0x33);
         fail_dma_read.set(Some(reo_dma));
         assert_eq!(
@@ -1130,8 +1197,7 @@ mod tests {
         assert!(consumed.bytes().iter().all(|byte| *byte == 0x33));
         assert_eq!(mmio_writes.borrow().last().unwrap().1, 16);
 
-        memory.borrow_mut().get_mut(&0).unwrap()[..4]
-            .copy_from_slice(&32_u32.to_le_bytes());
+        memory.borrow_mut().get_mut(&0).unwrap()[..4].copy_from_slice(&32_u32.to_le_bytes());
         memory.borrow_mut().get_mut(&reo_dma).unwrap()[64..128].fill(0x44);
         fail_mmio_write.set(true);
         assert_eq!(
@@ -1146,6 +1212,9 @@ mod tests {
         assert_eq!(dp.ring_resources().pdev_rx().len(), 4);
         assert_eq!(dp.rx_buffers.len(), 4_095);
         assert_eq!(dp.monitor_status_buffers.len(), 1_023);
+        let mut ambiguous = AmbiguousHtt::default();
+        assert_eq!(dp.configure_htt(&mut ambiguous), Err(DpError::WrongState));
+        assert_eq!(ambiguous.sends, 0);
         let mut htt = HttMessages {
             fail_at: Some(2),
             ..Default::default()
@@ -1174,14 +1243,33 @@ mod tests {
         assert_eq!((setups[1][4], setups[1][6]), (692, 516));
         assert_eq!((setups[2][4], setups[2][6]), (532, 708));
         assert_eq!((setups[3][4], setups[3][6]), (704, 528));
-        assert_eq!((setups[2][8], setups[2][10]), (0xfeed_0000, 10));
-        assert_eq!((setups[3][8], setups[3][10]), (0xfeed_0000, 16));
+        assert!(
+            setups
+                .iter()
+                .all(|setup| (setup[8], setup[9], setup[10]) == (0, 0, 0))
+        );
         assert_eq!(dp.configure_htt(&mut htt), Err(DpError::WrongState));
 
         dp.ath11k_dp_pdev_free().unwrap();
         dp.ath11k_dp_pdev_reo_cleanup().unwrap();
         dp.ath11k_dp_free().unwrap();
-        let _ = dp.into_parts().unwrap();
+
+        let reused_id =
+            ath11k_hal::Wcn6750Registers::ring_id(ath11k_hal::RingType::WbmIdleLink, 0, 0).unwrap();
+        let pointer = usize::from(reused_id.0) * 4;
+        memory.borrow_mut().get_mut(&0).unwrap()[pointer..pointer + 4]
+            .copy_from_slice(&0xfeed_beef_u32.to_le_bytes());
+        let (device, rings) = dp.into_parts().unwrap();
+        let mut reused = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(dp) => dp,
+            Err(_) => panic!("reallocation failed"),
+        };
+        assert_eq!(
+            &memory.borrow().get(&0).unwrap()[pointer..pointer + 4],
+            &[0; 4]
+        );
+        reused.ath11k_dp_free().unwrap();
+        let _ = reused.into_parts().unwrap();
     }
 
     #[test]
@@ -1203,6 +1291,52 @@ mod tests {
             Err(_) => panic!("cleanup retry failed"),
         };
         assert_eq!(rings.destroyed, [RingId(0), RingId(1)]);
+    }
+
+    #[test]
+    fn nonempty_msi_mode_requires_reo_exception_and_programs_htt() {
+        let device = Device::from_backend(AggregateBackend::default());
+        let mut zero_address = msi_config();
+        zero_address[0].address = 0;
+        assert!(matches!(
+            crate::HalDpRings::new(&device, &zero_address),
+            Err(DpError::WrongState)
+        ));
+
+        let mut missing_reo_exception = msi_config();
+        missing_reo_exception.retain(|msi| msi.ring_type != ath11k_hal::RingType::ReoException);
+        let device = Device::from_backend(AggregateBackend::default());
+        let rings = crate::HalDpRings::new(&device, &missing_reo_exception).unwrap();
+        let error = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(_) => panic!("missing REO-exception MSI was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.cause(), DpError::NoResources);
+
+        let device = Device::from_backend(AggregateBackend::default());
+        let rings = crate::HalDpRings::new(&device, &msi_config()).unwrap();
+        let mut dp = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(dp) => dp,
+            Err(_) => panic!("complete MSI configuration was rejected"),
+        };
+        dp.ath11k_dp_pdev_pre_alloc().unwrap();
+        dp.ath11k_dp_pdev_reo_setup().unwrap();
+        dp.ath11k_dp_pdev_alloc().unwrap();
+        let mut htt = HttMessages::default();
+        dp.configure_htt(&mut htt).unwrap();
+        let words = |message: &HttHostMessage| {
+            message
+                .0
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let setups = htt.messages.iter().map(words).collect::<Vec<_>>();
+        assert_eq!((setups[2][8], setups[2][10]), (0xfeed_0000, 11));
+        assert_eq!((setups[3][8], setups[3][10]), (0xfeed_0000, 12));
+        dp.ath11k_dp_pdev_free().unwrap();
+        dp.ath11k_dp_pdev_reo_cleanup().unwrap();
+        dp.ath11k_dp_free().unwrap();
     }
 
     #[test]
@@ -1235,7 +1369,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(operations.borrow().as_slice(), [Operation::SyncForDevice { range, .. }] if range == &(0..28))
+            matches!(operations.borrow().last(), Some(Operation::SyncForDevice { range, .. }) if range == &(0..28))
         );
         let (_, bytes) = &dp.rings().published[0];
         let command = TclDataCommand::from_bytes(bytes.bytes()).unwrap();
@@ -1400,9 +1534,8 @@ mod tests {
         dp.rings_mut().completions.push_back(reo.into_descriptor());
         let received = dp.receive_with_status().unwrap().unwrap();
         assert_eq!(received.packet.bytes, [1, 2, 3, 4]);
-        assert!(matches!(
-            operations.borrow().last(),
-            Some(Operation::SyncForCpu { range, .. }) if range == &(0..2048)
+        assert!(operations.borrow().iter().any(
+            |operation| matches!(operation, Operation::SyncForCpu { range, .. } if range == &(0..2048))
         ));
     }
 }

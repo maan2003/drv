@@ -412,7 +412,7 @@ impl<B: Backend> Srng<B> {
         ring_type: RingType,
         ring_number: u8,
         mac_id: u8,
-        mut memory: RingMemory<B>,
+        memory: RingMemory<B>,
         remote_read_pointers: &CoherentDma<B, Bidirectional>,
         params: SrngParams,
     ) -> Result<Self, HalError> {
@@ -421,10 +421,6 @@ impl<B: Backend> Srng<B> {
             .ok_or(HalError::NoResources)?;
         let entry_words = c.entry_words as u32;
         let ring_words = entry_words * u32::from(memory.entries);
-        memory
-            .dma
-            .write(0, &alloc::vec![0; ring_words as usize * 4])
-            .map_err(|_| HalError::DeviceFault)?;
         let r0 = c.r0 + usize::from(ring_number) * c.r0_stride;
         let r2 = c.r2 + usize::from(ring_number) * c.r2_stride;
         let pointer_offset = usize::from(id.0) * 4;
@@ -433,6 +429,10 @@ impl<B: Backend> Srng<B> {
         } else {
             0
         };
+        // Direct R2 HP/TP is the pre-shadow-config publication path selected
+        // by pinned `hal.c:ath11k_hal_srng_setup`. Only
+        // `hal.c:ath11k_hal_srng_update_hp_tp_addr` replaces it with a shadow
+        // register after the corresponding shadow-v2 entry is configured.
         let publication_offset = if c.direction == RingDirection::Source {
             r2
         } else {
@@ -746,7 +746,9 @@ impl<B: Backend> Srng<B> {
 
     /// Quiesce host-owned SRNG state before its coherent ring memory is
     /// released. The caller must already have stopped firmware/interrupt
-    /// dispatch, matching `ath11k_dp_srng_cleanup`'s lifecycle ordering.
+    /// dispatch. Pinned Linux establishes this order in
+    /// `core.c:ath11k_core_deinit`: `ath11k_core_stop` stops firmware and HIF
+    /// before `ath11k_core_soc_destroy` reaches `dp.c:ath11k_dp_free`.
     pub fn teardown(
         &mut self,
         mmio: &MmioRegion<B>,
