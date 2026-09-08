@@ -23,10 +23,39 @@ use packet_formats::{
 use rand::rngs::StdRng;
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, TcpListener},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::Duration,
 };
+
+#[test]
+fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
+    let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let device = unsafe {
+        ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
+    };
+    let mut service = BoundedNetstackProof::new(
+        device,
+        NetstackProofConfig {
+            dns_name: "unused.invalid.".into(),
+            server_port: NonZeroU16::new(80).unwrap(),
+        },
+    )
+    .unwrap();
+    assert!(!service.network_ready());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listen = listener.local_addr().unwrap();
+
+    service
+        .serve_socks5_listener(
+            listener,
+            listen,
+            Some(std::time::Instant::now() + Duration::from_millis(5)),
+            || false,
+        )
+        .unwrap();
+}
 use wlan_softmac_host::ethernet::{
     AssociatedSoftmacTx, DriverEthernetPort, EthernetIngressError, ethernet_port,
 };

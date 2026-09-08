@@ -309,7 +309,18 @@ fn read_exact_fd(fd: i32, mut bytes: &mut [u8], operation: &'static str) -> Resu
     Ok(())
 }
 
+/// Starts the production service without gating availability on external
+/// reachability and without imposing a lab lifetime.
 pub fn run() -> Result<(), String> {
+    run_inner(false)
+}
+
+/// Preserves the bounded physical-lab startup proof and bootstrap protocol.
+pub fn run_lab() -> Result<(), String> {
+    run_inner(true)
+}
+
+fn run_inner(lab_proof: bool) -> Result<(), String> {
     let sandbox_only = env::var_os("DRV_NETSTACK_SANDBOX_SELF_TEST").is_some();
     let expected_parent = env::var("DRV_NETSTACK_PARENT_PID")
         .map_err(|_| "missing expected parent PID")?
@@ -327,10 +338,14 @@ pub fn run() -> Result<(), String> {
         .map_err(|_| "missing listen address")?
         .parse()
         .map_err(|_| "invalid listen address")?;
-    let seconds = env::var("DRV_DAEMON_MAX_SECONDS")
-        .map_err(|_| "missing daemon deadline")?
-        .parse::<u64>()
-        .map_err(|_| "invalid daemon deadline")?;
+    let seconds = lab_proof
+        .then(|| {
+            env::var("DRV_DAEMON_MAX_SECONDS")
+                .map_err(|_| "missing daemon deadline")?
+                .parse::<u64>()
+                .map_err(|_| "invalid daemon deadline")
+        })
+        .transpose()?;
     let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
     let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
     setup(expected_parent)?;
@@ -371,6 +386,15 @@ pub fn run() -> Result<(), String> {
         },
     )
     .map_err(str::to_string)?;
+    if !lab_proof {
+        unsafe {
+            close(5);
+        }
+        println!("network_service_ready=true reachability=acquiring");
+        return proof
+            .serve_socks5_listener(listener, listen, None, || false)
+            .map_err(str::to_string);
+    }
     let initial_deadline = Instant::now() + Duration::from_secs(45);
     proof.prove_dhcp(initial_deadline).map_err(str::to_string)?;
     println!("internet_proof_dhcp=true");
@@ -395,7 +419,7 @@ pub fn run() -> Result<(), String> {
         .serve_socks5_listener(
             listener,
             listen,
-            Instant::now() + Duration::from_secs(seconds),
+            Some(Instant::now() + Duration::from_secs(seconds.expect("lab deadline was parsed"))),
             || false,
         )
         .map_err(str::to_string)

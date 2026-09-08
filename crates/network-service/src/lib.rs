@@ -23,7 +23,7 @@ use std::time::Duration;
 mod child;
 mod ethernet_device;
 
-pub use child::run;
+pub use child::{run, run_lab};
 use ethernet_device::ServiceEthernetDevice;
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;
@@ -122,9 +122,9 @@ impl BoundedNetstackProof {
         })
     }
 
-    fn drive(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
-        if std::time::Instant::now() >= deadline {
-            return Err("Netstack proof deadline");
+    fn drive(&mut self, deadline: Option<std::time::Instant>) -> Result<(), &'static str> {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err("Netstack service deadline");
         }
         self.now = self
             .anchor
@@ -150,7 +150,7 @@ impl BoundedNetstackProof {
 
     pub fn prove_dhcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         while self.runner.stack().status() != DhcpStatus::Bound {
-            self.drive(deadline)?;
+            self.drive(Some(deadline))?;
         }
         Ok(())
     }
@@ -165,7 +165,7 @@ impl BoundedNetstackProof {
             .lookup_ip(self.config.dns_name.clone())
             .map_err(|_| "DNS start failed")?;
         loop {
-            self.drive(deadline)?;
+            self.drive(Some(deadline))?;
             if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
                 let addresses = result.map_err(|_| "DNS lookup failed")?;
                 self.resolved = addresses.into_iter().find_map(|address| match address {
@@ -199,7 +199,7 @@ impl BoundedNetstackProof {
             )
             .map_err(|_| "TCP connect failed")?;
         loop {
-            self.drive(deadline)?;
+            self.drive(Some(deadline))?;
             let ready = RemoteSocketProvider::readiness(&mut provider, socket)
                 .map_err(|_| "TCP readiness failed")?;
             if ready.writable {
@@ -222,18 +222,17 @@ impl BoundedNetstackProof {
         &mut self,
         listener: TcpListener,
         listen: SocketAddr,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
         mut stop_requested: F,
     ) -> Result<(), &'static str>
     where
         F: FnMut() -> bool,
     {
-        if !self.network_ready() {
-            return Err("SOCKS5 requires DHCP, DNS, and TCP proof");
-        }
         let mut clients = Vec::new();
         println!("internet_proxy_ready=true listen={listen}");
-        while !stop_requested() && std::time::Instant::now() < deadline {
+        while !stop_requested()
+            && deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
+        {
             // Exactly one shared Netstack3 drive precedes a bounded amount of
             // work for every client. No client-specific wait can delay another.
             if let Err(error) = self.drive(deadline) {
