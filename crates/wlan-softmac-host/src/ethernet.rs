@@ -6,6 +6,8 @@
 //! controlled-port policy, and selection of protected data frames.
 
 use netstack3_port_spike::{EthernetDeviceEvent, EthernetFrame, FrameSizeError};
+#[cfg(any(test, feature = "conformance"))]
+use netstack3_port_spike::{EthernetDevice, EthernetEventSource};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::ErrorKind;
@@ -89,7 +91,7 @@ impl SeqpacketFrameEndpoint {
         self.fd.take();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "conformance"))]
     fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
         let mut descriptor = PollFd {
             fd: self.raw_fd(),
@@ -186,7 +188,7 @@ impl EthernetFrameSeam for SeqpacketFrameEndpoint {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 #[repr(C)]
 struct PollFd {
     fd: i32,
@@ -201,22 +203,22 @@ const SOCK_CLOEXEC: i32 = 0x80000;
 const MSG_DONTWAIT: i32 = 0x40;
 const MSG_TRUNC: i32 = 0x20;
 const MSG_NOSIGNAL: i32 = 0x4000;
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 const POLLIN: i16 = 0x001;
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 const POLLOUT: i16 = 0x004;
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 const POLLERR: i16 = 0x008;
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 const POLLHUP: i16 = 0x010;
-#[cfg(test)]
+#[cfg(any(test, feature = "conformance"))]
 const POLLNVAL: i16 = 0x020;
 
 unsafe extern "C" {
     fn socketpair(domain: i32, socket_type: i32, protocol: i32, sockets: *mut i32) -> i32;
     fn send(fd: i32, bytes: *const u8, len: usize, flags: i32) -> isize;
     fn recv(fd: i32, bytes: *mut u8, len: usize, flags: i32) -> isize;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "conformance"))]
     fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
 }
 
@@ -318,8 +320,8 @@ impl HostEthernetDevice {
     }
 }
 
-#[cfg(test)]
-impl HostEthernetDevice {
+#[cfg(any(test, feature = "conformance"))]
+impl EthernetDevice for HostEthernetDevice {
     fn receive(&mut self) -> Option<EthernetFrame> {
         let state = self.lifecycle.lock().unwrap();
         if state.properties.is_none() || !state.link_up {
@@ -335,7 +337,10 @@ impl HostEthernetDevice {
         }
         self.seam.try_send_frame(frame).map_err(|(_, frame)| frame)
     }
+}
 
+#[cfg(any(test, feature = "conformance"))]
+impl EthernetEventSource for HostEthernetDevice {
     fn take_event(&mut self) -> Option<EthernetDeviceEvent> {
         let mut lifecycle = self.lifecycle.lock().unwrap();
         let event = lifecycle.events.pop_front();
