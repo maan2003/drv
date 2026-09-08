@@ -435,6 +435,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dma-pool"
+version = "0.1.0"
+dependencies = [
+ "drv-hardware",
+ "drv-hardware-backends",
+]
+
+[[package]]
 name = "driver-runtime"
 version = "0.1.0"
 
