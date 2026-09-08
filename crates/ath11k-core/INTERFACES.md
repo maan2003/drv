@@ -44,6 +44,15 @@ Protocol crates never depend on core. HAL depends directly on the shared `drv-ha
 ## Public API contract
 
 - **platform:** shared `drv-hardware` `Device<B>`, bounded `MmioRegion`, generation-tied `CoherentDma`/`StreamingDma` with sealed directions and explicit streaming sync, `Interrupt`, reset and teardown. Never fds.
+  The Linux host adapter has explicit, non-fallback constructors:
+  `LinuxVfio::open_broker` for a probed non-coherent vfio-platform device,
+  `LinuxVfio::open_coherent` for a platform-proven coherent device, and
+  `LinuxVfio::open_pci_coherent` for a coherent VFIO PCI cdev. The PCI flavor
+  exposes only mmap-capable BAR regions 0 through 5 via `open_region`, selects
+  MSI-X then MSI (including single-vector MSI, never implicit INTx), and maps
+  logical vector numbers onto the unchanged `Interrupt`/`wait_any` surface.
+  An out-of-range vector returns `Limit`. PCI configuration and reset details
+  remain private backend plumbing; reset revokes all generation-tied resources.
 - **HAL:** `RingKind`, `RingMemory`, `RingId`, checked `Descriptor`, and
   `Rings`, plus additive typed CE/TCL/WBM/REO/RXDMA descriptor codecs and
   `Srng` accessors. Descriptor construction rejects a wrong layout length;
