@@ -87,6 +87,7 @@ impl crate::cmd::EncodeCommand for GoldenCommandEnvelope {
 const NO_MASKS: &[&str] = &[];
 const INIT_MASKS: &[&str] = &["host_memory_chunks[].paddr"];
 const MGMT_TX_MASKS: &[&str] = &["paddr", "frame"];
+const REORDER_MASKS: &[&str] = &["queue_address"];
 
 fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
     Some(match id {
@@ -108,7 +109,7 @@ fn command_family(id: u32) -> Option<(&'static str, &'static [&'static str])> {
         0x006002 => ("peer-delete", NO_MASKS),
         0x006004 => ("peer-set-param", NO_MASKS),
         0x006005 => ("peer-assoc", NO_MASKS),
-        0x006013 => ("peer-reorder-queue-setup", NO_MASKS),
+        0x006013 => ("peer-reorder-queue-setup", REORDER_MASKS),
         0x007008 => ("mgmt-tx-send", MGMT_TX_MASKS),
         0x00700c => ("bss-color-change-enable", NO_MASKS),
         0x009001 => ("sta-powersave-mode", NO_MASKS),
@@ -247,9 +248,17 @@ enum SemanticRequest {
     PeerAssoc(super::PeerAssoc),
     PeerCreate(super::PeerCreate),
     PeerDelete(super::PeerDelete),
+    PeerReorderQueueSetup(super::PeerReorderQueueSetup),
+    PeerSetParam(super::PeerSetParam),
+    PdevSetParam(super::PdevSetParam),
     ScanChannelList(super::ScanChannelList),
     ScanStart(super::ScanStart),
     ScanStop(super::ScanStop),
+    StaPowerSaveMode(super::StaPowerSaveMode),
+    StaPowerSaveParameter(super::StaPowerSaveParameter),
+    VdevInstallKey(super::VdevInstallKey),
+    VdevSetParam(super::VdevSetParam),
+    WmmUpdate(super::WmmUpdate),
     VdevCreate(super::VdevCreate),
     VdevDelete(super::VdevDelete),
     VdevStart(super::VdevStart),
@@ -264,9 +273,17 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
             SemanticRequest::PeerAssoc(request) => request.encode_command(),
             SemanticRequest::PeerCreate(request) => request.encode_command(),
             SemanticRequest::PeerDelete(request) => request.encode_command(),
+            SemanticRequest::PeerReorderQueueSetup(request) => request.encode_command(),
+            SemanticRequest::PeerSetParam(request) => request.encode_command(),
+            SemanticRequest::PdevSetParam(request) => request.encode_command(),
             SemanticRequest::ScanChannelList(request) => request.encode_command(),
             SemanticRequest::ScanStart(request) => request.encode_command(),
             SemanticRequest::ScanStop(request) => request.encode_command(),
+            SemanticRequest::StaPowerSaveMode(request) => request.encode_command(),
+            SemanticRequest::StaPowerSaveParameter(request) => request.encode_command(),
+            SemanticRequest::VdevInstallKey(request) => request.encode_command(),
+            SemanticRequest::VdevSetParam(request) => request.encode_command(),
+            SemanticRequest::WmmUpdate(request) => request.encode_command(),
             SemanticRequest::VdevCreate(request) => request.encode_command(),
             SemanticRequest::VdevDelete(request) => request.encode_command(),
             SemanticRequest::VdevStart(request) => request.encode_command(),
@@ -732,6 +749,155 @@ pub fn reverse_map_semantic_command(
                 bssid_hints: Vec::new(),
             })
         }
+        0x004003 | 0x005008 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<3>(&tlvs[0].value)?;
+            if id.0 == 0x004003 {
+                if tlvs[0].tag != crate::tags::WMI_TAG_PDEV_SET_PARAM_CMD.0 {
+                    return Err(WmiError::Malformed);
+                }
+                SemanticRequest::PdevSetParam(super::PdevSetParam {
+                    pdev_id: fixed[0],
+                    param_id: fixed[1],
+                    param_value: fixed[2],
+                })
+            } else {
+                if tlvs[0].tag != crate::tags::WMI_TAG_VDEV_SET_PARAM_CMD.0 {
+                    return Err(WmiError::Malformed);
+                }
+                SemanticRequest::VdevSetParam(super::VdevSetParam {
+                    vdev_id: fixed[0],
+                    param_id: fixed[1],
+                    param_value: fixed[2],
+                })
+            }
+        }
+        0x005009 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 2
+                || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_INSTALL_KEY_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_BYTE.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<25>(&tlvs[0].value)?;
+            let key_len = fixed[20] as usize;
+            if fixed[8..20] != [0; 12]
+                || fixed[23] != 0
+                || fixed[24] != 0
+                || key_len > tlvs[1].value.len()
+            {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::VdevInstallKey(super::VdevInstallKey {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+                key_idx: fixed[3],
+                key_flags: fixed[4],
+                key_cipher: fixed[5],
+                key_rsc_counter: super::KeySeqCounter {
+                    low: fixed[6],
+                    high: fixed[7],
+                },
+                key_data: tlvs[1].value[..key_len].to_vec(),
+                key_txmic_len: fixed[21],
+                key_rxmic_len: fixed[22],
+            })
+        }
+        0x00500d => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_VDEV_SET_WMM_PARAMS_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let value = &tlvs[0].value;
+            if value.len() != 120 {
+                return Err(WmiError::Malformed);
+            }
+            let vdev_id =
+                u32::from_le_bytes(value[..4].try_into().map_err(|_| WmiError::Malformed)?);
+            let mut categories = [super::WmmAccessCategory::default(); 4];
+            for (category, encoded) in categories.iter_mut().zip(value[4..116].chunks_exact(28)) {
+                let header =
+                    u32::from_le_bytes(encoded[..4].try_into().map_err(|_| WmiError::Malformed)?);
+                if header != (u32::from(crate::tags::WMI_TAG_VDEV_SET_WMM_PARAMS_CMD.0) << 16) | 24
+                {
+                    return Err(WmiError::Malformed);
+                }
+                let fields = words::<6>(&encoded[4..])?;
+                *category = super::WmmAccessCategory {
+                    cw_min: fields[0],
+                    cw_max: fields[1],
+                    aifs: fields[2],
+                    txop_limit: fields[3],
+                    admission_control_mandatory: fields[4],
+                    no_ack: fields[5],
+                };
+            }
+            let parameter_type =
+                u32::from_le_bytes(value[116..].try_into().map_err(|_| WmiError::Malformed)?);
+            SemanticRequest::WmmUpdate(super::WmmUpdate {
+                vdev_id,
+                parameter_type,
+                access_categories: categories,
+            })
+        }
+        0x006004 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_PEER_SET_PARAM_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<5>(&tlvs[0].value)?;
+            SemanticRequest::PeerSetParam(super::PeerSetParam {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+                param_id: fixed[3],
+                param_value: fixed[4],
+            })
+        }
+        0x006013 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_REORDER_QUEUE_SETUP_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<9>(&tlvs[0].value)?;
+            if fixed[3] != fixed[6] {
+                return Err(WmiError::Malformed);
+            }
+            SemanticRequest::PeerReorderQueueSetup(super::PeerReorderQueueSetup {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+                tid: u8::try_from(fixed[3]).map_err(|_| WmiError::Malformed)?,
+                queue_address: 0,
+                ba_window_size_valid: u8::try_from(fixed[7]).map_err(|_| WmiError::Malformed)?,
+                ba_window_size: fixed[8],
+            })
+        }
+        0x009001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_STA_POWERSAVE_MODE_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<2>(&tlvs[0].value)?;
+            SemanticRequest::StaPowerSaveMode(super::StaPowerSaveMode {
+                vdev_id: fixed[0],
+                mode: fixed[1],
+            })
+        }
+        0x009002 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_STA_POWERSAVE_PARAM_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<3>(&tlvs[0].value)?;
+            SemanticRequest::StaPowerSaveParameter(super::StaPowerSaveParameter {
+                vdev_id: fixed[0],
+                param: fixed[1],
+                value: fixed[2],
+            })
+        }
         _ => return Ok(None),
     };
     let (family, masked_fields) = command_family(id.0).ok_or(WmiError::Malformed)?;
@@ -739,7 +905,11 @@ pub fn reverse_map_semantic_command(
         family,
         request,
         masked_fields,
-        masked_ranges: Vec::new(),
+        masked_ranges: if id.0 == 0x006013 {
+            core::iter::once(24..32).collect()
+        } else {
+            Vec::new()
+        },
     }))
 }
 

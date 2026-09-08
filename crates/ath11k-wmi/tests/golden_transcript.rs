@@ -57,9 +57,11 @@ fn covered_concrete_encoders_match_native_commands() {
         let mut actual = (command.id.0 & 0x00ff_ffff).to_le_bytes().to_vec();
         actual.extend_from_slice(command.tlvs());
         assert_eq!(
-            record.bytes, actual,
+            compare_reencoded(&record.bytes, &actual, &request.masked_ranges),
+            None,
             "{} seq {}",
-            request.family, record.seq
+            request.family,
+            record.seq
         );
         *families.entry(request.family).or_default() += 1;
     }
@@ -67,16 +69,24 @@ fn covered_concrete_encoders_match_native_commands() {
         families,
         BTreeMap::from([
             ("init", 1),
+            ("pdev-set-param", 27),
             ("peer-assoc", 3),
             ("peer-create", 6),
             ("peer-delete", 1),
+            ("peer-reorder-queue-setup", 104),
+            ("peer-set-param", 4),
             ("scan-channel-list", 14),
             ("scan-start", 3),
+            ("sta-powersave-mode", 9),
+            ("sta-powersave-param", 69),
             ("vdev-create", 4),
             ("vdev-delete", 3),
+            ("vdev-install-key", 4),
+            ("vdev-set-param", 68),
             ("vdev-start", 6),
             ("vdev-stop", 1),
             ("vdev-up", 3),
+            ("vdev-wmm-update", 34),
         ])
     );
 }
