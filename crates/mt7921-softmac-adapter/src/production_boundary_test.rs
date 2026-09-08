@@ -554,7 +554,10 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             other => panic!("expected matching physical completion, got {other:?}"),
         };
         assert!(success);
-        assert_eq!(&*scan_completions.lock().unwrap(), &[(zx::Status::OK, scan_id)]);
+        assert_eq!(
+            &*scan_completions.lock().unwrap(),
+            &[(zx::Status::OK, scan_id)]
+        );
         mlme.handle_scan_complete(zx::Status::OK, scan_id).await;
         Station::on_mlme_event(
             &mut sme,
@@ -659,35 +662,17 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
 }
 
 #[test]
-fn runtime_driver_routes_scan_completion_after_runner_handoff() {
+fn real_mt7921_device_passes_the_generic_client_contract() {
+    use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
+
     let state = Arc::new(Mutex::new(BackendState::default()));
     let backend = ProductionBackend(state);
-    let (mut device, runner) =
-        Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
-    let scan_completions = Arc::new(Mutex::new(Vec::new()));
-    wlan_softmac_host::WlanSoftmacLifecycle::start(
-        &mut device,
-        Box::new(ScanCompleteUpcalls(scan_completions.clone())),
-    )
-    .unwrap();
-    let response = wlan_softmac_host::WlanSoftmac::start_passive_scan(
-        &mut device,
-        fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest {
-            channels: Some(vec![channel(6)]),
-            min_channel_time: Some(10),
-            max_channel_time: Some(20),
-            min_home_time: Some(0),
-        },
-    )
-    .unwrap();
-    let scan_id = response.scan_id.unwrap();
+    let (device, runner) = Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
     drop(runner);
 
-    assert!(wlan_softmac_host::ClientRuntimeDriver::drive(&mut device).unwrap());
-    assert!(wlan_softmac_host::ClientRuntimeDriver::drive(&mut device).unwrap());
     assert_eq!(
-        &*scan_completions.lock().unwrap(),
-        &[(zx::Status::OK, scan_id)]
+        run_client_conformance(device, channel(6)).unwrap(),
+        expected_client_conformance(CLIENT, 1)
     );
 }
 

@@ -7,6 +7,8 @@
 //! are paired by [`runtime::ClientRuntime`], the sole owner of a started
 //! device and its MLME/SME state.
 
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 pub mod ethernet;
 pub mod netstack_child;
 pub mod runtime;
