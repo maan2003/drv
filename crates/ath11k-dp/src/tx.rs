@@ -22,6 +22,7 @@ const RX_BUFFER_SIZE: usize = 2_048;
 const RX_POOL_PAGE_SIZE: usize = 4_096;
 const RX_BUFFER_ALIGNMENT: usize = 128;
 const RX_POOL_HIGH_WATERMARK: usize = 64;
+const RX_BUFFER_ID_MASK: u32 = 0x3_ffff;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -558,13 +559,12 @@ fn replenish_pool<B: Backend, R: Rings<B>>(
         return Err(DpError::NoResources);
     }
     for _ in 0..count {
-        let buffer_id = *next_cookie & 0x3_ffff;
+        let buffer_id = next_unused_rx_buffer_id(next_cookie, |candidate| {
+            buffers
+                .iter()
+                .any(|entry| entry.cookie & RX_BUFFER_ID_MASK == candidate)
+        })?;
         let cookie = buffer_id | ((u32::from(pdev_id) & 7) << 18);
-        *next_cookie = if buffer_id == 0x3_ffff {
-            1
-        } else {
-            buffer_id + 1
-        };
         let buffer = RxBuffer::replenish(pool)?;
         let descriptor =
             RxdmaBufferRing::for_buffer(&buffer.device_address()?, cookie, return_buffer_manager);
@@ -574,6 +574,26 @@ fn replenish_pool<B: Backend, R: Rings<B>>(
         buffers.push(PendingRx { cookie, buffer });
     }
     Ok(())
+}
+
+/// Source-shaped `idr_alloc(..., 1, max)` replacement: choose an unused live
+/// buffer ID rather than blindly reusing the cursor after its 18-bit wrap.
+fn next_unused_rx_buffer_id(
+    next: &mut u32,
+    mut is_used: impl FnMut(u32) -> bool,
+) -> Result<u32, DpError> {
+    for _ in 0..RX_BUFFER_ID_MASK {
+        let candidate = (*next & RX_BUFFER_ID_MASK).max(1);
+        *next = if candidate == RX_BUFFER_ID_MASK {
+            1
+        } else {
+            candidate + 1
+        };
+        if !is_used(candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(DpError::NoResources)
 }
 
 fn make_rx_pool<B: Backend>(device: Device<B>) -> Result<DmaPool<B, FromDevice>, DpError> {
@@ -1439,6 +1459,27 @@ mod tests {
                 .info();
         assert_eq!(replacement.cookie, (2 << 18) | 4);
         assert_eq!(replacement.address, completed_address);
+    }
+
+    #[test]
+    fn rx_buffer_id_wrap_skips_live_cookie_and_reports_exhaustion() {
+        let mut next = RX_BUFFER_ID_MASK;
+        let mut live = vec![1];
+        let last =
+            next_unused_rx_buffer_id(&mut next, |candidate| live.contains(&candidate)).unwrap();
+        assert_eq!(last, RX_BUFFER_ID_MASK);
+        live.push(last);
+        assert_eq!(
+            next_unused_rx_buffer_id(&mut next, |candidate| live.contains(&candidate)),
+            Ok(2)
+        );
+
+        let mut next = 17;
+        assert_eq!(
+            next_unused_rx_buffer_id(&mut next, |_| true),
+            Err(DpError::NoResources)
+        );
+        assert_eq!(next, 17);
     }
 
     #[test]
