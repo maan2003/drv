@@ -201,12 +201,25 @@ fn alignment_pairs(
     pairs
 }
 
+fn command_discriminator(record: &TranscriptRecord) -> Option<u32> {
+    let offset = match record.id {
+        // pdev/vdev and station power-save parameter commands all encode the
+        // parameter ID as their second fixed word.
+        0x4003 | 0x5008 | 0x9002 => 12,
+        // PeerSetParam follows vdev_id and the padded peer MAC.
+        0x6004 => 20,
+        _ => return None,
+    };
+    let bytes = record.bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 fn command_score(expected: &TranscriptRecord, seen: &TranscriptRecord) -> usize {
     if expected.id != seen.id {
         return 0;
     }
     if expected.bytes == seen.bytes {
-        return 3;
+        return 5;
     }
     let masks = expected
         .envelope_parts()
@@ -218,7 +231,11 @@ fn command_score(expected: &TranscriptRecord, seen: &TranscriptRecord) -> usize 
         })
         .map_or_else(Vec::new, |request| request.masked_ranges);
     if !masks.is_empty() && compare_reencoded(&expected.bytes, &seen.bytes, &masks).is_none() {
-        2
+        4
+    } else if command_discriminator(expected).is_some()
+        && command_discriminator(expected) == command_discriminator(seen)
+    {
+        3
     } else {
         1
     }
@@ -523,6 +540,27 @@ mod tests {
             text,
             "phase boot-through-service-ready\n  commands exact=0 masked=0 mismatched=0 missing=0 extra=0 reordered=0\n  events expected=1 seen=1 aligned=1 missing=0 extra=0 reordered=0\nphase vdev-create-start\n  commands exact=2 masked=0 mismatched=0 missing=0 extra=0 reordered=1\n    Exact id=0x005001 expected_seq=2 seen_seq=11\n    Exact id=0x005003 expected_seq=3 seen_seq=13\n    Reordered id=0x005008 expected_seq=4 seen_seq=12\n  events expected=0 seen=0 aligned=0 missing=0 extra=0 reordered=0\nphase scan\n  commands exact=1 masked=1 mismatched=1 missing=0 extra=1 reordered=0\n    Exact id=0x003001 expected_seq=5 seen_seq=14\n    Masked id=0x007008 expected_seq=6 seen_seq=15 masks=paddr,frame\n    Mismatched id=0x003006 expected_seq=7 seen_seq=16 first_difference=4\n    Extra id=0x003007 expected_seq=- seen_seq=17\n  events expected=1 seen=1 aligned=0 missing=1 extra=1 reordered=0\n    Missing event id=0x003002 expected_seq=8\n    Extra event id=0x003003 seen_seq=18\nphase connect\n  commands exact=0 masked=0 mismatched=0 missing=1 extra=0 reordered=0\n    Missing id=0x006001 expected_seq=9 seen_seq=-\n  events expected=0 seen=0 aligned=0 missing=0 extra=0 reordered=0\n"
         );
+    }
+
+    #[test]
+    fn repeated_parameter_commands_align_by_parameter_id() {
+        let set_param = |seq: u64, parameter: u32, value: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&((0x5fu32 << 16) | 12).to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&parameter.to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+            command_record(seq, 0x5008, &payload)
+        };
+        let native = [set_param(1, 0x30, 1), set_param(2, 0x22, 2)];
+        let runner = [set_param(9, 0x22, 1)];
+        let report = compare_transcripts(&native, &runner);
+        let boot = &report.phases[BringupPhase::BootThroughServiceReady as usize];
+        assert_eq!(boot.commands[0].kind, CommandAlignmentKind::Missing);
+        assert_eq!(boot.commands[0].expected_seq, Some(1));
+        assert_eq!(boot.commands[1].kind, CommandAlignmentKind::Mismatched);
+        assert_eq!(boot.commands[1].expected_seq, Some(2));
+        assert_eq!(boot.commands[1].seen_seq, Some(9));
     }
 
     #[test]
