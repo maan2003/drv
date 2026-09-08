@@ -1436,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn init_memory_chunk_trace_difference_is_explicit() {
+    fn init_memory_chunk_trace_matches_c() {
         use ath11k_wmi::cmd::{HostMemoryChunk, ResourceConfig};
         let command = Init { resource_config: ResourceConfig::default(),
             memory_chunks: vec![HostMemoryChunk { request_id: 0, physical_address: 0, size: 0 }],
@@ -1444,8 +1444,7 @@ mod tests {
         assert_eq!(rust_wmi(&command), c_wmi_init(&command).unwrap());
         let mut sink = WmiSink::default();
         command.encode_command_with_trace(&mut sink).unwrap();
-        assert!(sink.0.contains(&WmiTraceEvent::Reject {
-            reason: ath11k_wmi::trace::RejectReason::Truncated, offset: 332 }));
+        assert!(!sink.0.iter().any(|event| matches!(event, WmiTraceEvent::Reject { .. })));
     }
 
     #[test]
