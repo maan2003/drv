@@ -12,6 +12,7 @@ mod events;
 mod hw;
 mod operation;
 mod qmi;
+mod real;
 
 pub use ahb::{
     InterruptRoute, MsiUser, RegisterWindow, WCN6750_INTERRUPT_ROUTES, service_ce_interrupt,
@@ -24,6 +25,7 @@ pub use operation::{
     OperationTarget, RegulatoryChannel, RegulatoryDomain, ScanConfig, ScanId, Subsystems,
 };
 pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
+pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink};
 
 use alloc::vec::Vec;
 use ath11k_qmi::FirmwareReady;

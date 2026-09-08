@@ -21,6 +21,21 @@ pub trait FirmwareAssets {
     fn m3_firmware(&mut self) -> Result<Option<Vec<u8>>, QmiError>;
 }
 
+impl<T: FirmwareAssets + ?Sized> FirmwareAssets for &mut T {
+    fn board_data(&mut self, board_id: u32) -> Result<Vec<u8>, QmiError> {
+        (**self).board_data(board_id)
+    }
+    fn calibration_data(&mut self) -> Result<Option<Vec<u8>>, QmiError> {
+        (**self).calibration_data()
+    }
+    fn regulatory_data(&mut self) -> Result<Option<Vec<u8>>, QmiError> {
+        (**self).regulatory_data()
+    }
+    fn m3_firmware(&mut self) -> Result<Option<Vec<u8>>, QmiError> {
+        (**self).m3_firmware()
+    }
+}
+
 /// Platform memory effects. Returned addresses are device-visible addresses.
 pub trait MemoryProvider {
     fn provision(
@@ -29,6 +44,21 @@ pub trait MemoryProvider {
     ) -> Result<Vec<MemorySegmentResponse>, QmiError>;
     fn load_m3(&mut self, firmware: &[u8]) -> Result<MemoryRegion, QmiError>;
     fn map_device_bar(&mut self, address: u64, size: u32) -> Result<(), QmiError>;
+}
+
+impl<T: MemoryProvider + ?Sized> MemoryProvider for &mut T {
+    fn provision(
+        &mut self,
+        requested: &[MemorySegment],
+    ) -> Result<Vec<MemorySegmentResponse>, QmiError> {
+        (**self).provision(requested)
+    }
+    fn load_m3(&mut self, firmware: &[u8]) -> Result<MemoryRegion, QmiError> {
+        (**self).load_m3(firmware)
+    }
+    fn map_device_bar(&mut self, address: u64, size: u32) -> Result<(), QmiError> {
+        (**self).map_device_bar(address, size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,22 +109,18 @@ impl Default for HandshakeConfig {
     }
 }
 
-pub struct Wcn6750Handshake<'a> {
+pub struct Wcn6750Handshake<A, M> {
     config: HandshakeConfig,
-    assets: &'a mut dyn FirmwareAssets,
-    memory: &'a mut dyn MemoryProvider,
+    assets: A,
+    memory: M,
     firmware_version: u32,
     board_id: u32,
     eeprom_caldata: bool,
     pending: Vec<crate::RawIndication>,
 }
 
-impl<'a> Wcn6750Handshake<'a> {
-    pub fn new(
-        config: HandshakeConfig,
-        assets: &'a mut dyn FirmwareAssets,
-        memory: &'a mut dyn MemoryProvider,
-    ) -> Self {
+impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
+    pub fn new(config: HandshakeConfig, assets: A, memory: M) -> Self {
         Self {
             config,
             assets,
@@ -511,7 +537,7 @@ fn uses_eeprom_caldata(timeout: Option<u32>) -> bool {
     timeout.unwrap_or(0) != 0
 }
 
-impl Handshake for Wcn6750Handshake<'_> {
+impl<A: FirmwareAssets, M: MemoryProvider> Handshake for Wcn6750Handshake<A, M> {
     fn start(&mut self, transport: &mut dyn Transport) -> Result<FirmwareReady, QmiError> {
         self.init_service(transport)?;
         self.wait_for_firmware_ready(transport)

@@ -50,6 +50,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ath11k-bringup"
+version = "0.1.0"
+dependencies = [
+ "ath11k-ce",
+ "ath11k-core",
+ "ath11k-qmi",
+ "ath11k-qmi-qrtr",
+ "drv-hardware",
+ "drv-hardware-backends",
+ "sha2",
+ "userspace-vfio",
+]
+
+[[package]]
 name = "ath11k-ce"
 version = "0.1.0"
 dependencies = [

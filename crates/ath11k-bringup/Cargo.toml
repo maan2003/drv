@@ -1,0 +1,16 @@
+[package]
+name = "ath11k-bringup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Staged Linux host bring-up runner for Redwood WCN6750"
+
+[dependencies]
+ath11k-ce = { path = "../ath11k-ce" }
+ath11k-core = { path = "../ath11k-core" }
+ath11k-qmi = { path = "../ath11k-qmi" }
+ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
+sha2 = "0.10"
+userspace-vfio = { path = "../userspace-vfio" }

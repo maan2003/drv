@@ -80,6 +80,29 @@ Protocol crates never depend on core. HAL depends directly on the shared `drv-ha
 - **core:** `Lifecycle`, typed pdev/vdev IDs and `RadioControl`. The latter
   is intentionally narrower than mac80211 and implements WlanSoftmac effects.
 
+### Concrete aggregate seam requested by core
+
+`Wcn6750Subsystems` needs one DP owner rather than calls into independent ring
+helpers. `ath11k-dp` should expose a `Wcn6750DataPath<B>` that owns its HAL
+rings, `ClientDataPath`, and `ReoController`, with these entry points:
+`allocate(Device<B>)`, `pdev_pre_allocate()`, `reo_setup(&MmioRegion<B>)`,
+`configure_htt(&mut impl HttControl)`, `pdev_allocate()`,
+`vdev_tx_attach(VdevId)`, `service(budget)`, `pdev_free()`, `reo_cleanup()`, and
+consuming `free()`. Construction must return the ring IDs/configuration needed
+by HTT setup; teardown must return or release every generation-tied resource.
+
+The MAC/IRQ side likewise needs concrete owners for the remaining lifecycle
+markers. Core needs `Wcn6750Mac::{allocate, register, start, suspend,
+unregister, destroy}` (with `start` and `suspend` issuing the required typed
+WMI pdev commands) and `Wcn6750Interrupts::{open, enable, disable,
+wait_and_service}`. The interrupt owner must open the published WCN6750 CE/DP
+routes, use one absolute-deadline `Interrupt::wait_any`, and dispatch ready CE
+vectors to CE service and ready DP vectors to `Wcn6750DataPath::service`; it
+must not expose raw descriptors or file descriptors. These calls map directly
+to the existing `Dp*`, `Mac*`, `RadioStart`, `PdevSuspend`, and `HifIrq*`
+operations so core can replace those no-op arms without changing lifecycle
+order.
+
 Bodies are scaffolding, not a fabricated implementation. Porters may add
 checked source-shaped types and methods but should propose changes before
 weakening these dependency directions or exposing byte arrays as unchecked

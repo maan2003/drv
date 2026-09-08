@@ -124,18 +124,24 @@ impl<B: Backend> MemoryProvider for HardwareMemoryProvider<B> {
 }
 
 /// Owns the event-driven WCN6750 QMI handshake and its AF_QIPCRTR transport.
-pub struct Wcn6750QmiSession<'a, T: ath11k_qmi::Transport> {
-    handshake: ath11k_qmi::Wcn6750Handshake<'a>,
+pub struct Wcn6750QmiSession<T, A, M>
+where
+    T: ath11k_qmi::Transport,
+    A: FirmwareAssets,
+    M: MemoryProvider,
+{
+    handshake: ath11k_qmi::Wcn6750Handshake<A, M>,
     transport: T,
     service_started: bool,
 }
 
-impl<'a, T: ath11k_qmi::Transport> Wcn6750QmiSession<'a, T> {
-    pub fn new(
-        transport: T,
-        assets: &'a mut dyn FirmwareAssets,
-        memory: &'a mut dyn MemoryProvider,
-    ) -> Self {
+impl<T, A, M> Wcn6750QmiSession<T, A, M>
+where
+    T: ath11k_qmi::Transport,
+    A: FirmwareAssets,
+    M: MemoryProvider,
+{
+    pub fn new(transport: T, assets: A, memory: M) -> Self {
         Self {
             handshake: ath11k_qmi::Wcn6750Handshake::new(
                 ath11k_qmi::HandshakeConfig::default(),
@@ -179,10 +185,15 @@ impl<'a, T: ath11k_qmi::Transport> Wcn6750QmiSession<'a, T> {
         self.handshake.firmware_stop(&mut self.transport)
     }
 
-    pub fn deinit(mut self) -> T {
+    pub fn deinit_service(&mut self) {
         if self.service_started {
             self.handshake.deinit_service(&mut self.transport);
+            self.service_started = false;
         }
+    }
+
+    pub fn deinit(mut self) -> T {
+        self.deinit_service();
         self.transport
     }
 }

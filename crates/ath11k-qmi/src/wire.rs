@@ -102,6 +102,7 @@ pub enum PipeDirection {
     In = 1,
     Out = 2,
     InOut = 3,
+    InOutHostToHost = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
