@@ -103,3 +103,37 @@ CID for the ordinary patch path.
 where pinned Linux derives it from device generation and address. A valid RAM
 region at the reserved Connac2 patch address would be initialized with a
 different command from Linux.
+
+## MAC/WPDMA reset recovery is absent from the Rust core
+
+Pinned PCIe `mt7921e_mac_reset` first acquires conn-on driver ownership, masks
+host and PCI MAC interrupts, and performs forced WPDMA recovery. The WPDMA
+path disables TX/RX DMA and pointer chaining, waits for both busy bits to
+clear, bypasses DMASHDL, toggles the DMASHDL/logic reset bits, resets queues,
+then restores the MT7921 prefetch table, all TX indices, global configuration,
+TX/RX DMA, and interrupt state in that order. Only after those operations does
+Linux acquire top driver ownership and reload firmware.
+
+The public Rust core exposes WFSYS reset and disabled-state RX/TX ring
+replacement separately, but no typed MAC reset or WPDMA disable/reset/restore
+transaction. In particular, it cannot reproduce the ordered global-config,
+DMASHDL, logic-reset, prefetch, DMA-enable, and interrupt transitions above.
+
+**Likely Rust port bug:** firmware assertion or MAC recovery has no
+Linux-equivalent core transaction, so a caller cannot safely recover WPDMA and
+reload firmware without rebuilding source-sensitive ordering outside the
+core.
+
+## The reversible ownership helper has the wrong post-reset ownership order
+
+For an initially firmware-owned device, Rust's only combined ownership helper,
+`round_trip_driver_ownership`, emits conn-on `CLR_OWN` and later conn-on
+`SET_OWN`. Pinned `mt7921e_mac_reset` instead emits conn-on driver-own before
+WPDMA reset, restores DMA and interrupts, emits top driver-own, and reloads
+firmware. It does not issue firmware-own during the reset transaction.
+
+**Likely Rust port bug if used for recovery:** restoring firmware ownership
+before firmware reload is not source-equivalent and can surrender the device
+at the point reset recovery still requires driver ownership. The round-trip
+helper remains correct for its documented reversible-probe purpose; a reset
+owner must not substitute it for a dedicated recovery transaction.

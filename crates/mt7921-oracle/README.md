@@ -75,6 +75,17 @@ complete bytes rather than using a Rust-produced payload as C input. Two
 valid-domain differences found by this checkpoint are recorded in
 `MISMATCHES.md`.
 
+Reset coverage pins the ordered register and branch operations in
+`mt7921e_mac_reset` and its forced `mt792x_wpdma_reset` disable/restore path.
+The C normalization varies valid pre-reset register contents and the successful
+busy-poll position, and preserves the disable, DMASHDL/reset, prefetch, index,
+global-enable, interrupt, and ownership order. Linux acquires conn-on driver
+ownership before reset and top
+driver ownership after DMA/interrupt restoration, then reloads firmware; it
+does not restore firmware ownership in this transaction. The public Rust core
+has safe pieces for WFSYS reset, disabled ring replacement, and a reversible
+ownership probe, but no MAC/WPDMA recovery transaction to compare end-to-end.
+
 `mt7921-core` does not currently expose an RX ring entry ownership or cleanup
 API: its public RX surface prepares descriptor arrays, while `WfdmaRing` is a
 TX ring model. Consequently the RX cleanup checkpoint executes and asserts the

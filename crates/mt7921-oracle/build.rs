@@ -38,6 +38,9 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     let mt7921_mac = std::fs::read_to_string(mt76.join("mt7921/mac.c")).expect("read MT7921 MAC C");
     let mt792x_core =
         std::fs::read_to_string(mt76.join("mt792x_core.c")).expect("read MT792x core C");
+    let mt792x_dma = std::fs::read_to_string(mt76.join("mt792x_dma.c")).expect("read MT792x DMA C");
+    let mt7921_pci_mac =
+        std::fs::read_to_string(mt76.join("mt7921/pci_mac.c")).expect("read MT7921 PCI MAC C");
     let util = std::fs::read_to_string(mt76.join("util.c")).expect("read mt76 util C");
     let poll_function = item(
         &util,
@@ -139,6 +142,65 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
         "void mt7921_mac_add_txs(",
         "static void mt7921_mac_tx_free(",
     );
+    // The reset oracle below spells out only register and branch observations.
+    // Pin that normalization to the ordered source operations it represents so
+    // a source-tag change cannot silently leave a plausible handwritten trace.
+    require_ordered(
+        &mt7921_pci_mac,
+        &[
+            "mt792xe_mcu_drv_pmctrl(dev);",
+            "mt76_wr(dev, dev->irq_map->host_irq_enable, 0);",
+            "mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0x0);",
+            "mt792x_wpdma_reset(dev, true);",
+            "mt76_wr(dev, dev->irq_map->host_irq_enable,",
+            "mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);",
+            "err = mt7921e_driver_own(dev);",
+            "err = mt7921_run_firmware(dev);",
+        ],
+    );
+    require_ordered(
+        &mt792x_dma,
+        &[
+            "err = mt792x_dma_disable(dev, force);",
+            "mt76_queue_reset(dev, dev->mphy.q_tx[i], true);",
+            "mt76_queue_reset(dev, dev->mt76.q_mcu[i], true);",
+            "mt76_queue_reset(dev, &dev->mt76.q_rx[i], true);",
+            "return mt792x_dma_enable(dev);",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt792x_dma,
+            "int mt792x_dma_disable(",
+            "EXPORT_SYMBOL_GPL(mt792x_dma_disable);",
+        ),
+        &[
+            "mt76_clear(dev, MT_WFDMA0_GLO_CFG,",
+            "mt76_poll_msec_tick(dev, MT_WFDMA0_GLO_CFG,",
+            "mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,",
+            "mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);",
+            "if (force)",
+            "mt76_clear(dev, MT_WFDMA0_RST,",
+            "mt76_set(dev, MT_WFDMA0_RST,",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt792x_dma,
+            "int mt792x_dma_enable(",
+            "EXPORT_SYMBOL_GPL(mt792x_dma_enable);",
+        ),
+        &[
+            "mt792x_dma_prefetch(dev);",
+            "mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);",
+            "mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);",
+            "mt76_set(dev, MT_WFDMA0_GLO_CFG,",
+            "MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN",
+            "mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);",
+            "mt76_connac_irq_enable(&dev->mt76,",
+            "mt76_set(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);",
+        ],
+    );
     let wrapper = std::fs::read_to_string(manifest.join("c/oracle.c")).expect("read wrapper");
     let generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("mt76_oracle.c");
     std::fs::write(
@@ -150,6 +212,16 @@ fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
     )
     .expect("write generated oracle");
     generated
+}
+
+fn require_ordered(text: &str, needles: &[&str]) {
+    let mut rest = text;
+    for needle in needles {
+        let offset = rest
+            .find(needle)
+            .unwrap_or_else(|| panic!("pinned source lost ordered reset operation {needle}"));
+        rest = &rest[offset + needle.len()..];
+    }
 }
 
 fn item<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
