@@ -17666,7 +17666,7 @@ fn parse_mac(value: &str) -> Result<[u8; 6], String> {
 struct ClientVifIdentity([u8; 6]);
 
 #[cfg(feature = "fuchsia-passive")]
-const NATIVE_VALIDATION_CLIENT: [u8; 6] = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
+const NATIVE_VALIDATION_CLIENT: [u8; 6] = [0xda, 0x61, 0x40, 0x51, 0x27, 0xe8];
 #[cfg(feature = "fuchsia-passive")]
 const FRESH_DIAGNOSTIC_CLIENT: [u8; 6] = [0x02, 0x7d, 0x91, 0x4c, 0xb8, 0x3e];
 
