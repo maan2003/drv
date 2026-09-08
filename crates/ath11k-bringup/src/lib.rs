@@ -1156,7 +1156,6 @@ impl Host for RealHost {
             .ok_or(Error::Unsupported("DP poll requested before core startup"))?;
         let mut host = DiagnosticDpHost::default();
         let result = device
-            .backend_mut()
             .service_dp_host(WORK_BUDGET, RECEIVE_BUDGET, &mut host)
             .map_err(Error::Core)?;
         host.lines.push(dp_poll_summary_line(result));

@@ -154,6 +154,20 @@ impl<B: Subsystems> Device<B> {
         self.crash_count
     }
 
+    /// Service one bounded host-facing data-path slot.
+    pub fn service_dp_host<H: ath11k_dp::tx::DpHost>(
+        &mut self,
+        work_budget: usize,
+        receive_budget: usize,
+        host: &mut H,
+    ) -> Result<ath11k_dp::tx::HostServiceResult, CoreError> {
+        if self.state != DeviceState::Ready {
+            return Err(CoreError::WrongState);
+        }
+        self.backend
+            .service_dp_host(work_budget, receive_budget, host)
+    }
+
     fn op(&mut self, operation: Operation) -> Result<(), CoreError> {
         self.backend.execute(operation)
     }

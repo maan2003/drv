@@ -1,0 +1,24 @@
+[package]
+name = "ath11k-softmac-adapter"
+description = "Ath11k client adapter for the pinned Fuchsia SoftMAC boundary"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+ath11k-core = { path = "../ath11k-core" }
+ath11k-dp = { path = "../ath11k-dp" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
+wlan-softmac-host = { path = "../wlan-softmac-host" }
+zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
+
+[dev-dependencies]
+wlan-softmac-host = { path = "../wlan-softmac-host", features = ["conformance"] }
+
+[patch.crates-io]
+trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
+trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }
