@@ -600,6 +600,53 @@ pub trait Transport {
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError>;
 }
 
+/// Endpoint-bound payload seam consumed by protocol adapters in WMI and DP.
+/// Implementations own HTC framing; callers see only their service payload.
+pub trait HtcServiceTransport {
+    fn send_payload(&mut self, payload: &[u8]) -> Result<(), CeError>;
+    fn receive_payload(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
+}
+
+/// A service-specific view of the frozen multiplexed CE transport floor.
+pub struct BoundService<T> {
+    transport: T,
+    service: ServiceId,
+}
+
+impl<T> BoundService<T> {
+    pub const fn new(transport: T, service: ServiceId) -> Self {
+        Self { transport, service }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.transport
+    }
+}
+
+impl<T: Transport> HtcServiceTransport for BoundService<T> {
+    fn send_payload(&mut self, payload: &[u8]) -> Result<(), CeError> {
+        self.transport.send(TxFrame {
+            service: self.service,
+            bytes: payload.to_vec(),
+        })
+    }
+
+    fn receive_payload(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+        match self.transport.receive(deadline_ns)? {
+            Some(frame) if frame.service == self.service => Ok(Some(frame.bytes)),
+            Some(_) => Err(CeError::InvalidFrame),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Raw CE packet operations beneath HTC framing. `pipe` is the WCN6750 CE
+/// number selected by the service map, and `transfer_id` is the HTC endpoint.
+pub trait HtcPacketIo {
+    fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError>;
+    fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
     pub service: ServiceId,
@@ -655,6 +702,12 @@ impl Htc {
 
     pub fn endpoint(&self, id: u8) -> Option<&Endpoint> {
         self.endpoints.get(id as usize)
+    }
+
+    pub fn endpoint_for_service(&self, service: ServiceId) -> Option<&Endpoint> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.service == service)
     }
 
     pub fn wait_target(&mut self, bytes: &[u8]) -> Result<ReadyMessage, CeError> {
@@ -805,6 +858,13 @@ impl Htc {
         Ok(bytes)
     }
 
+    fn restore_send_credits(&mut self, endpoint: u8, frame_len: usize) {
+        let ep = &mut self.endpoints[endpoint as usize];
+        if self.credit_flow && ep.credit_flow_enabled {
+            ep.tx_credits += frame_len.div_ceil(self.target_credit_size as usize) as i32;
+        }
+    }
+
     pub fn receive(&mut self, frame: &[u8]) -> Result<Option<RxFrame>, CeError> {
         let header = HtcHeader::decode(frame)?;
         if header.endpoint as usize >= HTC_ENDPOINT_COUNT
@@ -890,6 +950,68 @@ impl Htc {
     /// stays with the caller.
     pub fn tx_completion(&self, endpoint: u8) -> Option<ServiceId> {
         self.endpoints.get(endpoint as usize).map(|ep| ep.service)
+    }
+}
+
+/// Multiplexes connected HTC endpoints over raw CE packet I/O.
+pub struct HtcTransport<I> {
+    htc: Htc,
+    io: I,
+}
+
+impl<I> HtcTransport<I> {
+    pub const fn new(htc: Htc, io: I) -> Self {
+        Self { htc, io }
+    }
+
+    pub fn htc(&self) -> &Htc {
+        &self.htc
+    }
+
+    pub fn htc_mut(&mut self) -> &mut Htc {
+        &mut self.htc
+    }
+
+    pub fn into_parts(self) -> (Htc, I) {
+        (self.htc, self.io)
+    }
+}
+
+impl<I: HtcPacketIo> Transport for HtcTransport<I> {
+    fn bind_service(
+        &mut self,
+        service: ServiceId,
+        _tx: RingId,
+        _rx: RingId,
+    ) -> Result<(), CeError> {
+        self.htc
+            .endpoint_for_service(service)
+            .map(|_| ())
+            .ok_or(CeError::InvalidFrame)
+    }
+
+    fn send(&mut self, frame: TxFrame) -> Result<(), CeError> {
+        let endpoint = *self
+            .htc
+            .endpoint_for_service(frame.service)
+            .ok_or(CeError::InvalidFrame)?;
+        let bytes = self.htc.send(endpoint.endpoint, &frame.bytes)?;
+        let frame_len = bytes.len();
+        if let Err(error) = self
+            .io
+            .send_htc(endpoint.uplink_pipe, endpoint.endpoint as u16, bytes)
+        {
+            self.htc.restore_send_credits(endpoint.endpoint, frame_len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError> {
+        match self.io.receive_htc(deadline_ns)? {
+            Some(frame) => self.htc.receive(&frame),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1392,6 +1514,86 @@ mod tests {
         assert_eq!(htc.tx_completion(0), Some(ServiceId::RESERVED_CONTROL));
         htc.stop();
         assert_eq!(htc.tx_completion(0), Some(ServiceId::RESERVED));
+    }
+
+    #[derive(Default)]
+    struct PacketIo {
+        sent: Vec<(u8, u16, Vec<u8>)>,
+        receive: Option<Vec<u8>>,
+        fail_send: bool,
+    }
+
+    impl HtcPacketIo for PacketIo {
+        fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError> {
+            if self.fail_send {
+                return Err(CeError::DeviceFault);
+            }
+            self.sent.push((pipe, transfer_id, frame));
+            Ok(())
+        }
+
+        fn receive_htc(&mut self, _: u64) -> Result<Option<Vec<u8>>, CeError> {
+            Ok(self.receive.take())
+        }
+    }
+
+    fn connected_wmi_htc() -> Htc {
+        let mut htc = Htc::new(1, true, false);
+        htc.wait_target(&[1, 0, 4, 0, 0, 1, 9, 0]).unwrap();
+        htc.connect_service(
+            ServiceId::WMI_CONTROL,
+            &[3, 0, 0, 1, 0, 1, 0, 8, 0, 0, 0, 0],
+        )
+        .unwrap();
+        htc
+    }
+
+    #[test]
+    fn service_transport_frames_and_demultiplexes_wmi() {
+        let mut received = Vec::from(
+            HtcHeader {
+                endpoint: 1,
+                flags: 0,
+                payload_len: 2,
+                control_byte_0: 0,
+                control_byte_1: 0,
+            }
+            .encode(),
+        );
+        received.extend_from_slice(&[9, 8]);
+        let io = PacketIo {
+            receive: Some(received),
+            ..PacketIo::default()
+        };
+        let mut multiplexed = HtcTransport::new(connected_wmi_htc(), io);
+        multiplexed
+            .bind_service(ServiceId::WMI_CONTROL, RingId(35), RingId(58))
+            .unwrap();
+        let mut service = BoundService::new(multiplexed, ServiceId::WMI_CONTROL);
+        service.send_payload(&[1, 2, 3]).unwrap();
+        assert_eq!(service.receive_payload(10), Ok(Some(vec![9, 8])));
+        let multiplexed = service.into_inner();
+        let (_, io) = multiplexed.into_parts();
+        assert_eq!((io.sent[0].0, io.sent[0].1), (3, 1));
+        assert_eq!(&io.sent[0].2[HTC_HEADER_LEN..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn failed_ce_send_restores_htc_credits() {
+        let io = PacketIo {
+            fail_send: true,
+            ..PacketIo::default()
+        };
+        let mut transport = HtcTransport::new(connected_wmi_htc(), io);
+        assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 4);
+        assert_eq!(
+            transport.send(TxFrame {
+                service: ServiceId::WMI_CONTROL,
+                bytes: vec![1]
+            }),
+            Err(CeError::DeviceFault)
+        );
+        assert_eq!(transport.htc().endpoint(1).unwrap().tx_credits, 4);
     }
 
     #[test]

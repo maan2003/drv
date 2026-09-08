@@ -36,8 +36,10 @@ WCN6750 selects the QCA6390 CE tables in `core.c`.
 | `htc.c:ath11k_htc_connect_service` | `Htc::connect_request`, `Htc::connect_service` | oracle-checked | connect/credit test |
 | `htc.c:ath11k_htc_start` | `Htc::start`, `setup_complete_message` | oracle-checked | lifecycle byte fixture |
 | `htc.c:ath11k_htc_send` | `Htc::send` | oracle-checked | credit exhaustion test |
+| `htc.c:ath11k_htc_send` + `hif.h:ath11k_hif_map_service_to_pipe` | `HtcTransport::send` | oracle-checked | WMI service framing fixture |
 | `htc.c:ath11k_htc_process_credit_report` | `Htc::process_trailer` | oracle-checked | credit report test |
 | `htc.c:ath11k_htc_process_trailer` | `Htc::process_trailer` | oracle-checked | malformed trailer tests |
 | `htc.c:ath11k_htc_rx_completion_handler` | `Htc::receive` | oracle-checked | frame/trailer tests |
+| CE/WMI/DP composition seam | `HtcServiceTransport`, `BoundService` | oracle-checked | service multiplex/demultiplex fixture |
 | `htc.c:ath11k_htc_tx_completion_handler` | `Htc::tx_completion` | oracle-checked | lifecycle test |
 | no pinned C symbol | `Htc::stop` | local lifecycle seam | endpoint reset test |
