@@ -17,12 +17,14 @@ fn main() {
     cc::Build::new()
         .file(codec)
         .file(generated)
+        .file(manifest.join("c/wmi_oracle.c"))
         .include(manifest.join("stubs"))
         .warnings(true)
         .flag_if_supported("-std=gnu11")
         .compile("ath11k_c_oracle");
     println!("cargo:rerun-if-env-changed=ATH11K_REFERENCE_DIR");
     println!("cargo:rerun-if-changed=c/oracle.c");
+    println!("cargo:rerun-if-changed=c/wmi_oracle.c");
     println!("cargo:rerun-if-changed=stubs");
     println!("cargo:rerun-if-changed={}", root.join("COMMIT").display());
 }

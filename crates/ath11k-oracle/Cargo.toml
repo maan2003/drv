@@ -14,3 +14,4 @@ cc = "1"
 
 [dev-dependencies]
 proptest = "1"
+ath11k-wmi = { path = "../ath11k-wmi", features = ["proptest"] }

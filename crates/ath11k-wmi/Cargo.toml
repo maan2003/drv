@@ -6,3 +6,10 @@ license.workspace=true
 
 [dependencies]
 ath11k-ce={path="../ath11k-ce"}
+
+[features]
+proptest=["dep:proptest"]
+
+[dependencies.proptest]
+version="1"
+optional=true

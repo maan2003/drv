@@ -10,6 +10,7 @@ use crate::tags::{
     WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
     WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS,
 };
+use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, Transport, WmiError};
 
 use super::{EventDecoder, Ready, ReadyDecoder, TlvIter, word};
@@ -48,6 +49,57 @@ pub struct ServiceReady {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServiceReadyDecoder;
+
+impl ServiceReadyDecoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<ServiceReady, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            super::trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.ServiceReady.fixed.present",
+                        taken: value.fixed.is_some(),
+                    });
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.ServiceReady.service_bitmap.present",
+                        taken: value.service_bitmap.is_some(),
+                    });
+                    if let Some(fixed) = &value.fixed {
+                        trace.record(TraceEvent::Field {
+                            name: "wmi.ServiceReadyFixed.phy_capability",
+                            value: u64::from(fixed.phy_capability),
+                        });
+                        trace.record(TraceEvent::Field {
+                            name: "wmi.ServiceReadyFixed.max_supported_macs",
+                            value: u64::from(fixed.max_supported_macs),
+                        });
+                        trace.record(TraceEvent::Field {
+                            name: "wmi.ServiceReadyFixed.num_dbs_hw_modes",
+                            value: u64::from(fixed.num_dbs_hw_modes),
+                        });
+                    }
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
 
 impl EventDecoder for ServiceReadyDecoder {
     type Output = ServiceReady;
@@ -148,6 +200,47 @@ pub struct HwModeCapability {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServiceReadyExtDecoder;
 
+impl ServiceReadyExtDecoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<ServiceReadyExt, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            super::trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Branch {
+                        name: "wmi.ServiceReadyExt.fixed.present",
+                        taken: value.fixed.is_some(),
+                    });
+                    trace.record(TraceEvent::Field {
+                        name: "wmi.ServiceReadyExt.array_groups.len",
+                        value: value.array_groups.len() as u64,
+                    });
+                    trace.record(TraceEvent::Field {
+                        name: "wmi.ServiceReadyExt.hw_modes.len",
+                        value: value.hw_modes.len() as u64,
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 impl EventDecoder for ServiceReadyExtDecoder {
     type Output = ServiceReadyExt;
 
@@ -230,6 +323,39 @@ pub struct ServiceReadyExt2 {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServiceReadyExt2Decoder;
+
+impl ServiceReadyExt2Decoder {
+    pub fn decode_with_trace(
+        &self,
+        event: Event,
+        mut sink: Option<&mut dyn TraceSink>,
+    ) -> Result<ServiceReadyExt2, WmiError> {
+        if let Some(trace) = sink.as_deref_mut() {
+            super::trace_tlv_stream(event.tlvs(), trace)?;
+        }
+        let result = self.decode(event);
+        match result {
+            Ok(value) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Field {
+                        name: "wmi.ServiceReadyExt2.dma_ring_capabilities.len",
+                        value: value.dma_ring_capabilities.len() as u64,
+                    });
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(trace) = sink {
+                    trace.record(TraceEvent::Reject {
+                        reason: RejectReason::Protocol,
+                        offset: 0,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
 
 impl EventDecoder for ServiceReadyExt2Decoder {
     type Output = ServiceReadyExt2;

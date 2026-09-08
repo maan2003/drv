@@ -139,6 +139,7 @@ name = "ath11k-wmi"
 version = "0.1.0"
 dependencies = [
  "ath11k-ce",
+ "proptest",
 ]
 
 [[package]]

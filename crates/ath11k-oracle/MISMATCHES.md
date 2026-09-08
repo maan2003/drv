@@ -25,3 +25,4 @@ of the differential suite.
   outside the logical input length to make the pinned C out-of-bounds read safe
   in userspace; it does not alter the length passed to the codec.
 - test status: not exercised by the valid-input differential suite
+
