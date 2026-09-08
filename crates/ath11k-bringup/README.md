@@ -49,3 +49,28 @@ when that runtime binds to ath11k. The default WMI
 run record is `ath11k-wmi-run.jsonl`; override it with `--wmi-log`. It contains
 one globally ordered JSONL stream with `seq`, `ts_ns`, `kind`, `id`, `len`, and
 `bytes_hex` fields. A recorder write failure fails the run closed.
+
+## Comparing a hardware capture
+
+Compare a run against the pinned native ath11k transcript from the repository
+root:
+
+```sh
+cargo run -p ath11k-wmi --bin compare-wmi -- \
+  artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl \
+  ath11k-wmi-scan-results.jsonl
+```
+
+The report is split into `boot-through-service-ready`, `vdev-create-start`,
+`scan`, and `connect` phases. Each phase first summarizes commands as `exact`,
+`masked`, `mismatched`, `missing`, `extra`, or `reordered`; the indented rows
+give the WMI ID, both sequence numbers, the zero-based offset of the first
+differing byte when applicable, and any masked host-owned fields. The following event summary
+reports expected/seen/aligned totals and lists missing, extra, or reordered
+event IDs.
+
+For a run intentionally stopped after scanning, missing `connect` records are
+expected. Differences caused by the runner's synthetic MAC address and by its
+passive scan request versus the native capture's active-scan fields are also
+expected; assess other mismatches against the phase and WMI ID that reports
+them.
