@@ -51,6 +51,7 @@ unsafe extern "C" {
         tid: u8,
         checksum_offload: u8,
     );
+    fn oracle_hal_tcl_ring_entry(out: *mut u8, payload: *const u8);
     fn oracle_hal_dscp_tid_map(table: *const u8, out: *mut u8);
     fn oracle_hal_rx_buffer(out: *mut u8, address: u64, cookie: u32, manager: u8);
     fn oracle_hal_rx_buffer_get(
@@ -253,6 +254,15 @@ proptest! {
             manager, pool_id, mac_id, lmac_id, metadata, encap, address_search,
             search_type, ast_index, ast_hash, tid, checksum_offload.into()) };
         prop_assert_eq!(rust.as_bytes(), &c);
+    }
+
+    #[test]
+    fn tcl_ring_entry_matches_pinned_c(payload in any::<[u8; 28]>()) {
+        let rust = TclDataCommand::from_bytes(&payload).unwrap().into_ring_descriptor();
+        let mut c = [0; 32];
+        // SAFETY: exact payload and output sizes.
+        unsafe { oracle_hal_tcl_ring_entry(c.as_mut_ptr(), payload.as_ptr()) };
+        prop_assert_eq!(rust.bytes(), &c);
     }
 
     #[test]

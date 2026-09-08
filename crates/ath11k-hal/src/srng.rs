@@ -187,7 +187,7 @@ const fn config(t: RingType) -> Config {
         RingType::TclData => c(
             16,
             3,
-            7,
+            8,
             RingDirection::Source,
             0xfffff,
             false,
@@ -870,7 +870,7 @@ mod tests {
     }
     #[test]
     fn wcn6750_table_matches_source() {
-        assert_eq!(Wcn6750Registers::entry_size(RingType::TclData), 28);
+        assert_eq!(Wcn6750Registers::entry_size(RingType::TclData), 32);
         assert_eq!(
             Wcn6750Registers::ring_id(RingType::CeDestinationStatus, 11, 0),
             Some(RingId(91))
@@ -897,9 +897,9 @@ mod tests {
         });
         let mmio = d.open_region(0).unwrap();
         let mem = RingMemory {
-            dma: d.alloc_coherent(28 * 8, 8).unwrap(),
+            dma: d.alloc_coherent(32 * 8, 8).unwrap(),
             entries: 8,
-            entry_bytes: 28,
+            entry_bytes: 32,
         };
         let rdp = d.alloc_coherent(176 * 4, 4).unwrap();
         let _ = Srng::setup(
@@ -921,8 +921,8 @@ mod tests {
             o[0],
             Op::Address(UMAC_TCL + 0x694, Some(UMAC_TCL + 0x698), 0x1000_0000)
         );
-        assert_eq!(o[1], Op::Write(UMAC_TCL + 0x698, 56 << 8));
-        assert_eq!(o[2], Op::Write(UMAC_TCL + 0x69c, 7));
+        assert_eq!(o[1], Op::Write(UMAC_TCL + 0x698, 64 << 8));
+        assert_eq!(o[2], Op::Write(UMAC_TCL + 0x69c, 8));
         assert_eq!(
             o[o.len() - 1],
             Op::Write(UMAC_TCL + 0x6a4, RING_ENABLE | SRC_LOOP_COUNT_DISABLE)

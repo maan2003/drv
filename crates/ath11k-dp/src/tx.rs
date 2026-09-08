@@ -828,7 +828,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         let buffer = TxBuffer::map(&self.device, &packet.bytes)?;
         let descriptor = make_tcl_descriptor(&buffer, msdu_id, tx)?;
         self.rings
-            .publish(data_rings.tcl, descriptor.into_descriptor())
+            .publish(data_rings.tcl, descriptor.into_ring_descriptor())
             .map_err(map_hal)?;
         self.pending.push(PendingTx { msdu_id, buffer });
         Ok(())
@@ -1771,7 +1771,7 @@ mod tests {
         assert_eq!(dp.ring_resources().reo_destination().len(), 4);
 
         let tcl = dp.data_rings.unwrap().tcl;
-        let descriptor = Descriptor::new(vec![0x5a; 28], 28).unwrap();
+        let descriptor = Descriptor::new(vec![0x5a; 32], 32).unwrap();
         dma_writes.borrow_mut().clear();
         mmio_writes.borrow_mut().clear();
         fail_dma_write.set(true);
@@ -1782,18 +1782,18 @@ mod tests {
         assert!(dma_writes.borrow().is_empty());
         assert!(mmio_writes.borrow().is_empty());
         dp.rings_mut().publish(tcl, descriptor.clone()).unwrap();
-        assert_eq!(dma_writes.borrow().last().unwrap().1, 0..28);
-        assert_eq!(mmio_writes.borrow().last().unwrap().1, 7);
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 0..32);
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 8);
 
         fail_mmio_write.set(true);
         assert_eq!(
             dp.rings_mut().publish(tcl, descriptor.clone()),
             Err(ath11k_hal::HalError::DeviceFault)
         );
-        assert_eq!(dma_writes.borrow().last().unwrap().1, 28..56);
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 32..64);
         dp.rings_mut().publish(tcl, descriptor).unwrap();
-        assert_eq!(dma_writes.borrow().last().unwrap().1, 28..56);
-        assert_eq!(mmio_writes.borrow().last().unwrap().1, 14);
+        assert_eq!(dma_writes.borrow().last().unwrap().1, 32..64);
+        assert_eq!(mmio_writes.borrow().last().unwrap().1, 16);
 
         let reo = dp.data_rings.unwrap().reo;
         let reo_dma = *memory
@@ -2176,7 +2176,7 @@ mod tests {
             matches!(operations.borrow().last(), Some(Operation::SyncForDevice { range, .. }) if range == &(0..28))
         );
         let (_, bytes) = &dp.rings().published[0];
-        let command = TclDataCommand::from_bytes(bytes.bytes()).unwrap();
+        let command = TclDataCommand::from_bytes(&bytes.bytes()[4..]).unwrap();
         assert_eq!(command.data_length(), 28);
         assert_eq!(command.encapsulation_type(), EncapType::NativeWifi as u8);
         assert_eq!(command.buffer_address().software_cookie(), 1 << 19);
