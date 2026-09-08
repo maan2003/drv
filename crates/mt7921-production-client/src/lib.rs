@@ -10,6 +10,12 @@
 //! never stores references to its own fields. Policy/effects and lab telemetry
 //! deliberately remain outside this crate.
 
+mod setup_inputs;
+pub use setup_inputs::{
+    CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
+    FirmwareVerificationError, RegulatorySnapshotFile, VerifiedFirmware, VerifiedFirmwareImages,
+};
+
 use drv_hardware::{
     Backend, Bidirectional, CoherentDma, Device, DmaConstraints, FromDevice, Interrupt, MmioRegion,
     ToDevice,
