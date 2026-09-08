@@ -68,3 +68,40 @@ impl<T: Transport> Wmi<T> {
         self.events.into_inner()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Command, Event};
+
+    #[derive(Default)]
+    struct MockTransport(Vec<Command>);
+    impl Transport for MockTransport {
+        fn send(&mut self, command: Command) -> Result<(), WmiError> {
+            self.0.push(command);
+            Ok(())
+        }
+        fn receive(&mut self, _deadline_ns: u64) -> Result<Option<Event>, WmiError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn attach_connect_init_detach_preserves_transport() {
+        let mut wmi = Wmi::attach(MockTransport::default());
+        wmi.pdev_attach(0);
+        wmi.connect();
+        wmi.cmd_init(&Init {
+            resource_config: Default::default(),
+            memory_chunks: Vec::new(),
+            hardware_mode: None,
+            bands: Vec::new(),
+        })
+        .unwrap();
+        assert!(wmi.is_connected());
+        assert_eq!(wmi.pdev_ids(), &[0]);
+        let transport = wmi.detach();
+        assert_eq!(transport.0.len(), 1);
+        assert_eq!(transport.0[0].id, crate::tags::WMI_INIT_CMDID);
+    }
+}
