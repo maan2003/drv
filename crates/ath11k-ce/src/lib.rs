@@ -615,6 +615,87 @@ pub trait HtcPacketIo {
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError>;
 }
 
+/// Owned real-CE implementation beneath `HtcTransport`. Core creates this
+/// after CE ring initialization, then retains the whole value through the HTC
+/// router until teardown.
+pub struct CePipesPacketIo<B: Backend> {
+    device: Device<B>,
+    mmio: MmioRegion<B>,
+    remote_read_pointers: CoherentDma<B, Bidirectional>,
+    pipes: CePipes<B>,
+}
+
+impl<B: Backend> CePipesPacketIo<B> {
+    pub const fn new(
+        device: Device<B>,
+        mmio: MmioRegion<B>,
+        remote_read_pointers: CoherentDma<B, Bidirectional>,
+        pipes: CePipes<B>,
+    ) -> Self {
+        Self {
+            device,
+            mmio,
+            remote_read_pointers,
+            pipes,
+        }
+    }
+
+    pub fn rx_post_buf(&mut self) -> Result<(), CeError> {
+        self.pipes
+            .rx_post_buf(&self.device, &self.mmio, &mut self.remote_read_pointers)
+    }
+
+    pub fn pipes(&self) -> &CePipes<B> {
+        &self.pipes
+    }
+    pub fn pipes_mut(&mut self) -> &mut CePipes<B> {
+        &mut self.pipes
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Device<B>,
+        MmioRegion<B>,
+        CoherentDma<B, Bidirectional>,
+        CePipes<B>,
+    ) {
+        (
+            self.device,
+            self.mmio,
+            self.remote_read_pointers,
+            self.pipes,
+        )
+    }
+}
+
+impl<B: Backend> HtcPacketIo for CePipesPacketIo<B> {
+    fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError> {
+        let mut buffer = CeTxBuffer::allocate(&self.device, frame.len())?;
+        buffer.write(&frame)?;
+        self.pipes.send(
+            &self.mmio,
+            &mut self.remote_read_pointers,
+            pipe as usize,
+            buffer,
+            transfer_id,
+        )
+    }
+
+    fn receive_htc(&mut self, _deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+        // WCN6750/QCA6390 destination pipes from the exact host CE table.
+        for pipe in [1, 2, 5] {
+            if let Some(frame) =
+                self.pipes
+                    .completed_recv_next(&self.mmio, &mut self.remote_read_pointers, pipe)?
+            {
+                return Ok(Some(frame));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
     pub service: ServiceId,
@@ -1901,16 +1982,18 @@ mod tests {
             state: state.clone(),
         });
         let mmio = device.open_region(0).unwrap();
-        let mut rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
+        let rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
         let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
-        let mut pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
-        assert_eq!(pipes.get_attr_flags(4), Ok(CE_ATTR_DISABLE_INTR));
+        let pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
+        let mut packet_io = CePipesPacketIo::new(device, mmio, rdp, pipes);
+        assert_eq!(
+            packet_io.pipes().get_attr_flags(4),
+            Ok(CE_ATTR_DISABLE_INTR)
+        );
 
         state.borrow_mut().operations.clear();
-        let mut tx = CeTxBuffer::allocate(&device, 64).unwrap();
-        tx.write(&[0x5a; 16]).unwrap();
-        let tx_id = state.borrow().next_id;
-        pipes.send(&mmio, &mut rdp, 0, tx, 0x1234).unwrap();
+        let tx_id = state.borrow().next_id + 1;
+        packet_io.send_htc(0, 0x1234, vec![0x5a; 16]).unwrap();
         let (descriptor_write, packet_sync, head_write) = {
             let state = state.borrow();
             let operations = &state.operations;
@@ -1923,23 +2006,30 @@ mod tests {
         assert!(descriptor_write < packet_sync && packet_sync < head_write);
         state.borrow_mut().dmas.get_mut(&1).unwrap()[128..132]
             .copy_from_slice(&4_u32.to_le_bytes());
-        assert!(pipes.completed_send_next(&mut rdp, 0).unwrap().is_some());
+        assert!(
+            packet_io
+                .pipes
+                .completed_send_next(&mut packet_io.remote_read_pointers, 0)
+                .unwrap()
+                .is_some()
+        );
 
-        let rx = CeRxBuffer::allocate(&device, 64).unwrap();
+        let rx = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
         let rx_id = state.borrow().next_id;
-        pipes.post_receive(&mmio, &mut rdp, 1, rx).unwrap();
+        packet_io
+            .pipes
+            .post_receive(&packet_io.mmio, &mut packet_io.remote_read_pointers, 1, rx)
+            .unwrap();
         state.borrow_mut().dmas.get_mut(&rx_id).unwrap()[..5].copy_from_slice(b"hello");
         // Allocation order: RDP=1, CE0 source=2, CE1 destination=3/status=4.
         state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
         state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
             .copy_from_slice(&4_u32.to_le_bytes());
-        assert_eq!(
-            pipes.completed_recv_next(&mmio, &mut rdp, 1),
-            Ok(Some(b"hello".to_vec()))
-        );
+        assert_eq!(packet_io.receive_htc(0), Ok(Some(b"hello".to_vec())));
         assert!(state.borrow().operations.iter().any(
             |op| matches!(op, LargeOperation::SyncCpu(id, range) if *id == rx_id && range == &(0..64))
         ));
+        let (_, _, _, pipes) = packet_io.into_parts();
         pipes.free_pipes();
     }
 }
