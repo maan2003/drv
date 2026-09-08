@@ -206,6 +206,19 @@ where
         }
     }
 
+    /// Service the polling-first data path without exposing its rings or DMA
+    /// resources above the WCN6750 subsystem owner.
+    pub fn service_dp_host<H: ath11k_dp::tx::DpHost>(
+        &mut self,
+        work_budget: usize,
+        receive_budget: usize,
+        host: &mut H,
+    ) -> Result<ath11k_dp::tx::HostServiceResult, CoreError> {
+        Self::protocol(self.dp.as_mut())?
+            .service_host(work_budget, receive_budget, host)
+            .map_err(Self::dp_error)
+    }
+
     fn receive_control(&mut self) -> Result<Vec<u8>, CoreError> {
         let deadline = (self.deadline)();
         let raw = Self::protocol(self.packet_io.as_mut())?

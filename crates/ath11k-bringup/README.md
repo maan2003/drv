@@ -42,6 +42,8 @@ cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
 cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
   --stop-after scan-results --ssid example \
   --wmi-log ath11k-wmi-scan-results.jsonl
+cargo run -p ath11k-bringup -- --vfio-device /dev/vfio/devices/vfioN \
+  --stop-after dp-poll --wmi-log ath11k-wmi-dp-poll.jsonl
 ```
 
 Do not run real mode while `ath11k_ahb` owns the device or without the project's
@@ -56,7 +58,10 @@ loading stage.
 
 Real execution composes VFIO, QRTR/QMI, CE/HTC, WMI, and HTT and can proceed
 through creation of a client vdev, a passive 2.4 GHz scan, and ordered pumping
-of management RX and scan events through scan completion. `--ssid <name>`
+of management RX and scan events through scan completion. The final diagnostic
+`dp-poll` stage performs one bounded polling-first DP service pass, submits no
+frames, and prints counts plus any delivered RX frames and TX completions for
+capture by the operator stage log. `--ssid <name>`
 reports the strongest matching BSS; without it, all observed BSSes are reported.
 The diagnostic IE walker extracts SSID, DS/HT channel, and RSN/RSNXE presence;
 the chip-neutral SoftMAC host will replace it with its canonical BSS conversion

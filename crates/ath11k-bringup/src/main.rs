@@ -24,14 +24,22 @@ fn main() {
             }
         }
     }
-    let (result, summary) = if config.dry_run {
+    let (result, summary, dp_poll_log) = if config.dry_run {
         let mut host = DryRunHost::default();
         let result = run(&config, &mut host);
-        (result, host.scan_summary().cloned())
+        (
+            result,
+            host.scan_summary().cloned(),
+            host.dp_poll_log().to_vec(),
+        )
     } else {
         let mut host = RealHost::default();
         let result = run(&config, &mut host);
-        (result, host.scan_summary().cloned())
+        (
+            result,
+            host.scan_summary().cloned(),
+            host.dp_poll_log().to_vec(),
+        )
     };
     match result {
         Ok(stages) => {
@@ -46,6 +54,9 @@ fn main() {
                         println!("bss {bss}");
                     }
                 }
+            }
+            for line in dp_poll_log {
+                println!("{line}");
             }
         }
         Err(error) => {

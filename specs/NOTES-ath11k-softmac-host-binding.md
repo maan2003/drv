@@ -80,13 +80,6 @@ without invented values:
   required metadata through the adapter. Conversely, ath11k's pdev ID, WMI
   flags, and firmware-only scan reasons do not belong in the chip-neutral
   trait unless the host demonstrates a policy use.
-- `Wcn6750Subsystems` privately owns `ClientDataPath`. Expose one bounded
-  service entry that returns DP TX results and raw RX frames; do not expose
-  rings, DMA addresses, or interrupt handles. It is called only from
-  `ClientRuntimeDriver::poll`.
-- The CE receive path posts its initial descriptor set but does not yet refill
-  consumed descriptors. Replenish them before treating the bounded poll entry
-  as a durable runtime rather than a one-scan bring-up path.
 - Repeated `set_channel` requires explicit start-versus-restart state and
   completion correlation. Scan IDs, management buffer IDs, peer completions,
   and key completions likewise need adapter-owned correlation tables.
