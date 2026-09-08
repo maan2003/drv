@@ -5,7 +5,10 @@
 #[cfg(test)]
 mod tests {
     use mt76_core::DmaDescriptor as Mt76Descriptor;
-    use mt7921_core::{DmaDescriptor as Mt7921Descriptor, DmaSegment};
+    use mt7921_core::{
+        DmaDescriptor as Mt7921Descriptor, DmaSegment, Low32RingMemory, RingAllocation,
+        RingPublisher, WfdmaRing,
+    };
     use mt7921_core::{DownloadCommand, encode_download_command};
     use proptest::prelude::*;
 
@@ -51,6 +54,17 @@ mod tests {
         pn: [u8; 6],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CDmaQueueState {
+        tail: u32,
+        queued: u32,
+        returned_index: u32,
+        entry_cleared: u32,
+        released_buffers: u32,
+        rx_head_cleared: u32,
+    }
+
     unsafe extern "C" {
         fn oracle_mcu_fill(
             payload: *const u8,
@@ -70,6 +84,19 @@ mod tests {
             output: *mut CDescriptor,
         ) -> i32;
         fn oracle_dma_rx_descriptor(address: u64, length: u16, output: *mut CDescriptor) -> i32;
+        fn oracle_dma_dequeue_bookkeeping(
+            descriptor_count: u32,
+            tail: u32,
+            queued: u32,
+            dma_done: bool,
+            output: *mut CDmaQueueState,
+        ) -> i32;
+        fn oracle_dma_rx_cleanup_bookkeeping(
+            descriptor_count: u32,
+            tail: u32,
+            queued: u32,
+            output: *mut CDmaQueueState,
+        ) -> i32;
         fn oracle_mcu_parse_response(
             input: *const u8,
             input_len: usize,
@@ -130,6 +157,17 @@ mod tests {
             retained_id: u8,
             retained_key: *const u8,
             remove: bool,
+            output: *mut u8,
+        ) -> i32;
+        fn oracle_post_assoc_interface_sta(bss_index: u8, bssid: *const u8, output: *mut u8)
+        -> i32;
+        fn oracle_rate_tx_power(
+            band: u8,
+            target: i8,
+            channels: *const u8,
+            channel_count: u8,
+            alpha2: *const u8,
+            last_message: bool,
             output: *mut u8,
         ) -> i32;
     }
@@ -251,6 +289,44 @@ mod tests {
         c_fill(&payload, (1 << 17) | 3, sequence)
     }
 
+    fn c_post_assoc_interface(bss_index: u8, bssid: [u8; 6], sequence: u8) -> Vec<u8> {
+        let mut payload = [0; 60];
+        // SAFETY: both arrays remain live and have the exact sizes required by C.
+        assert_eq!(
+            unsafe {
+                oracle_post_assoc_interface_sta(bss_index, bssid.as_ptr(), payload.as_mut_ptr())
+            },
+            0
+        );
+        c_fill(&payload, (1 << 17) | 3, sequence)
+    }
+
+    fn c_rate_tx_power(
+        band: u8,
+        target: i8,
+        channels: &[u8],
+        alpha2: [u8; 2],
+        last_message: bool,
+        sequence: u8,
+    ) -> Vec<u8> {
+        let mut payload = vec![0; 44 + channels.len() * 162];
+        // SAFETY: all slices remain live; the output length follows the pinned
+        // fixed header plus one 162-byte SKU record per channel.
+        let length = unsafe {
+            oracle_rate_tx_power(
+                band,
+                target,
+                channels.as_ptr(),
+                channels.len() as u8,
+                alpha2.as_ptr(),
+                last_message,
+                payload.as_mut_ptr(),
+            )
+        };
+        assert_eq!(length as usize, payload.len());
+        c_fill(&payload, (1 << 18) | 0x5d, sequence)
+    }
+
     fn command_id(command: DownloadCommand) -> i32 {
         const QUERY: i32 = 1 << 16;
         const CE: i32 = 1 << 18;
@@ -316,6 +392,85 @@ mod tests {
         let result = unsafe { oracle_dma_rx_descriptor(buffer.0, buffer.1, &mut output) };
         assert_eq!(result, 0);
         output
+    }
+
+    fn c_dma_dequeue(count: u16, tail: u16, queued: u16, done: bool) -> CDmaQueueState {
+        let mut output = CDmaQueueState::default();
+        // SAFETY: `output` is a live C-compatible object; the scalar state is
+        // constrained to the wrapper's bounded queue arrays.
+        let result = unsafe {
+            oracle_dma_dequeue_bookkeeping(
+                u32::from(count),
+                u32::from(tail),
+                u32::from(queued),
+                done,
+                &mut output,
+            )
+        };
+        assert_eq!(result, 0);
+        output
+    }
+
+    fn c_dma_rx_cleanup(count: u16, tail: u16, queued: u16) -> CDmaQueueState {
+        let mut output = CDmaQueueState::default();
+        // SAFETY: `output` is a live C-compatible object; the scalar state is
+        // constrained to the wrapper's bounded queue arrays.
+        let result = unsafe {
+            oracle_dma_rx_cleanup_bookkeeping(
+                u32::from(count),
+                u32::from(tail),
+                u32::from(queued),
+                &mut output,
+            )
+        };
+        assert_eq!(result, 0);
+        output
+    }
+
+    struct OracleMemory {
+        freed: bool,
+    }
+
+    impl Low32RingMemory for OracleMemory {
+        type Error = ();
+
+        fn allocate_low32(
+            &mut self,
+            size: usize,
+            _align: usize,
+        ) -> Result<RingAllocation, Self::Error> {
+            Ok(RingAllocation {
+                id: 1,
+                iova: 0x1000_0000,
+                len: size,
+            })
+        }
+
+        fn free(&mut self, _allocation: RingAllocation) {
+            self.freed = true;
+        }
+    }
+
+    struct OraclePublisher;
+
+    impl RingPublisher for OraclePublisher {
+        type Error = ();
+
+        fn write_descriptor(
+            &mut self,
+            _index: u16,
+            _descriptor: Mt7921Descriptor,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn release_fence(&mut self) {}
+
+        fn publish_producer(&mut self, _index: u16) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn acquire_fence(&mut self) {}
     }
 
     fn c_response(bytes: &[u8], command: DownloadCommand, sequence: u8) -> CMcuResponse {
@@ -541,6 +696,58 @@ mod tests {
                 (first.iova, first.len), second.map(|s| (s.iova, s.len)), info));
             let rust = Mt7921Descriptor::rx(first).unwrap();
             prop_assert_eq!(words(rust.to_le_bytes()), c_dma_rx((u64::from(address0), length0)));
+        }
+
+        #[test]
+        fn wfdma_reclaim_matches_mt76_dequeue_bookkeeping(
+            count in 2u16..=32,
+            queued_seed in 0u16..=32,
+            done: bool,
+        ) {
+            let queued = queued_seed % (count + 1);
+            let mut memory = OracleMemory { freed: false };
+            let mut publisher = OraclePublisher;
+            let mut ring = WfdmaRing::allocate(&mut memory, count).unwrap();
+            for index in 0..queued {
+                ring.enqueue(
+                    &mut publisher,
+                    DmaSegment {
+                        iova: 0x2000_0000 + u64::from(index) * 0x1000,
+                        len: 64,
+                    },
+                    None,
+                    u32::from(index),
+                ).unwrap();
+            }
+            if done && queued != 0 {
+                prop_assert!(ring.complete(0));
+            }
+
+            let c = c_dma_dequeue(count, 0, queued, done);
+            let reclaimed = ring.reclaim_one(&mut publisher);
+            prop_assert_eq!(c.tail, u32::from(ring.consumer()));
+            prop_assert_eq!(c.queued, u32::from(ring.queued()));
+            prop_assert_eq!(
+                c.returned_index,
+                reclaimed.map(u32::from).unwrap_or(u32::MAX),
+            );
+            prop_assert_eq!(c.entry_cleared != 0, reclaimed.is_some());
+        }
+
+        #[test]
+        fn mt76_rx_cleanup_releases_every_owned_queue_entry(
+            count in 2u16..=32,
+            tail_seed in 0u16..=31,
+            queued_seed in 0u16..=32,
+        ) {
+            let tail = tail_seed % count;
+            let queued = queued_seed % (count + 1);
+            let c = c_dma_rx_cleanup(count, tail, queued);
+            prop_assert_eq!(c.tail, u32::from((tail + queued) % count));
+            prop_assert_eq!(c.queued, 0);
+            prop_assert_eq!(c.entry_cleared, u32::from(queued));
+            prop_assert_eq!(c.released_buffers, u32::from(queued));
+            prop_assert_eq!(c.rx_head_cleared, 1);
         }
 
         #[test]
@@ -776,6 +983,70 @@ mod tests {
         }
 
         #[test]
+        fn post_assoc_interface_sta_rec_matches_c_assignments(
+            sequence in 1u8..=15,
+            bssid: [u8; 6],
+        ) {
+            prop_assume!(bssid != [0; 6]);
+            let rust = mt7921_core::encode_client_post_assoc_interface_wcid_command(
+                sequence, 0, bssid,
+            ).unwrap();
+            prop_assert_eq!(rust, c_post_assoc_interface(0, bssid, sequence));
+        }
+
+        #[test]
+        fn conservative_rate_tx_power_batches_match_c_assignments(
+            first_sequence in 1u8..=8,
+            has_5ghz: bool,
+            max_reg_power_dbm in 0u8..=20,
+            sar_limit_half_dbm: i8,
+            external_safety_cap_half_dbm: i8,
+        ) {
+            let capability = mt7921_core::NicCapability {
+                element_count: 0,
+                mac_address: None,
+                phy: Some(mt7921_core::NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 15,
+                    he: true,
+                }),
+                has_6ghz: Some(false),
+                chip_capability: None,
+                unknown_elements: 0,
+            };
+            let limits = mt7921_core::ConservativePowerLimits {
+                alpha2: *b"00",
+                max_reg_power_dbm,
+                sar_limit_half_dbm: Some(sar_limit_half_dbm),
+                external_safety_cap_half_dbm: Some(external_safety_cap_half_dbm),
+            };
+            let target = (max_reg_power_dbm as i8 * 2)
+                .min(sar_limit_half_dbm)
+                .min(external_safety_cap_half_dbm);
+            let rust = mt7921_core::encode_conservative_rate_tx_power_commands(
+                capability, limits, first_sequence,
+            ).unwrap();
+            for (index, command) in rust.iter().enumerate() {
+                let request = &command[mt7921_core::CONNAC2_MCU_TXD_BYTES..];
+                let count = usize::from(request[4]);
+                let channels = request[44..]
+                    .chunks_exact(162)
+                    .take(count)
+                    .map(|entry| entry[0])
+                    .collect::<Vec<_>>();
+                let c = c_rate_tx_power(
+                    request[5], target, &channels, *b"00", request[6] != 0,
+                    first_sequence + index as u8,
+                );
+                prop_assert_eq!(command, &c);
+            }
+        }
+
+        #[test]
         fn connac2_mcu_reply_envelopes_match_c(
             sequence in 1u8..=15,
             event_id: u8,
@@ -850,5 +1121,78 @@ mod tests {
             prop_assert_eq!(rust.valid, valid);
             prop_assert_eq!(rust.data, data);
         }
+    }
+
+    #[test]
+    fn eapol_and_four_way_key_install_mcu_order_matches_linux() {
+        let peer = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let ptk = [0x11; 16];
+        let gtk = [0x22; 16];
+        let mut state = mt7921_core::ClientFirmwareEffectsState::default();
+        let peer_wcid = state.allocate_peer_wcid().unwrap();
+        state.association = Some(mt7921_core::LegacyWmeAssociation {
+            bss_index: 0,
+            peer_wcid,
+            aid: 1,
+            peer,
+            rcpi: 100,
+            basic_rates: 1,
+            legacy_rates: 0x40,
+            ht_cap: None,
+            vht_cap: None,
+            bandwidth: 0,
+            negotiated_qos: true,
+            mfp_required: false,
+        });
+        state.association_generation = Some(1);
+
+        // Linux permits control-port EAPOL at association generation before
+        // installing either key, but does not open ordinary data at this point.
+        assert!(state.tx_generation(true).is_ok());
+        assert!(state.tx_generation(false).is_err());
+        assert!(state.set_controlled_port(true).is_err());
+
+        let transcript = std::cell::RefCell::new(Vec::new());
+        state
+            .install_ptk(
+                &ptk,
+                0,
+                |cid, command| {
+                    transcript.borrow_mut().push((cid, command.to_vec()));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(state.set_controlled_port(true).is_err());
+        state
+            .install_gtk(
+                1,
+                &gtk,
+                0,
+                |cid, command| {
+                    transcript.borrow_mut().push((cid, command.to_vec()));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state.set_controlled_port(true).unwrap();
+
+        let transcript = transcript.into_inner();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].0, 3);
+        assert_eq!(transcript[1].0, 3);
+        assert_eq!(
+            transcript[0].1,
+            c_key(0, peer_wcid.get(), 0, 0, ptk, None, false, 1)
+        );
+        assert_eq!(transcript[1].1, c_key(0, 19, 0x0e, 1, gtk, None, false, 2));
+        // Normalize the source branches to command, target WCID, TLV, and key ID.
+        let events = transcript
+            .iter()
+            .map(|(cid, command)| (*cid, command[49], command[56], command[66]))
+            .collect::<Vec<_>>();
+        assert_eq!(events, [(3, peer_wcid.get(), 17, 0), (3, 19, 17, 1)]);
     }
 }

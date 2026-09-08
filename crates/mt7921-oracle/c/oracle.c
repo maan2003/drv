@@ -107,6 +107,56 @@ int oracle_key_v2(uint8_t bss_index, uint8_t wcid, uint8_t muar_index,
     return 0;
 }
 
+/* BSS_CHANGED_ASSOC's second mt7921_mcu_sta_update(dev, NULL, ...): the
+ * reserved interface WCID receives only the firmware-offload WTBL TLV. */
+int oracle_post_assoc_interface_sta(uint8_t bss_index,
+                                    const uint8_t bssid[6], uint8_t out[60])
+{
+    memset(out, 0, 60);
+    out[0] = bss_index; out[1] = 19; out[2] = 1;
+    out[8] = 13; out[10] = 52;
+    out[12] = 19; out[13] = 1; out[14] = 3;
+    out[20] = 0; out[22] = 20;
+    memcpy(out + 24, bssid, 6);
+    out[30] = 0x0e;
+    out[40] = 1; out[42] = 12;
+    out[45] = 1; out[46] = 1; out[47] = 1;
+    out[52] = 6; out[54] = 8;
+    out[56] = 1; out[58] = 1;
+    return 0;
+}
+
+/* Exact mt76_connac_mcu_build_sku assignments for the valid-input uniform
+ * power-limit subset, wrapped in its SET_RATE_TX_POWER request header. */
+int oracle_rate_tx_power(uint8_t band, int8_t target,
+                         const uint8_t *channels, uint8_t n_chan,
+                         const uint8_t alpha2[2], bool last_msg,
+                         uint8_t *out)
+{
+    uint8_t i, nss;
+    memset(out, 0, 44 + (size_t)n_chan * 162);
+    out[4] = n_chan;
+    out[5] = band;
+    out[6] = last_msg;
+    memcpy(out + 8, alpha2, 2);
+    for (i = 0; i < n_chan; i++) {
+        uint8_t *entry = out + 44 + (size_t)i * 162;
+        uint8_t *sku = entry + 1;
+        entry[0] = channels[i];
+        memset(sku, 127, 161);
+        if (band == 1)
+            memset(sku, target, 4);
+        memset(sku + 4, target, 8);
+        memset(sku + 12, target, 8);
+        memset(sku + 20, target, 8);
+        sku[28] = target;
+        for (nss = 0; nss < 4; nss++)
+            memset(sku + 29 + (size_t)nss * 12, target, 10);
+        memset(sku + 77, target, 84);
+    }
+    return 44 + n_chan * 162;
+}
+
 struct oracle_mcu_response {
     int32_t result;
     uint32_t payload_offset;
@@ -192,6 +242,83 @@ int oracle_dma_rx_descriptor(uint64_t address, uint16_t length,
     if (result < 0)
         return result;
     *out = desc;
+    return 0;
+}
+
+struct oracle_dma_queue_state {
+    uint32_t tail;
+    uint32_t queued;
+    uint32_t returned_index;
+    uint32_t entry_cleared;
+    uint32_t released_buffers;
+    uint32_t rx_head_cleared;
+};
+
+int oracle_dma_dequeue_bookkeeping(uint32_t ndesc, uint32_t tail,
+                                   uint32_t queued, bool dma_done,
+                                   struct oracle_dma_queue_state *out)
+{
+    struct mt76_desc desc[64] = {0};
+    struct mt76_queue_entry entry[64] = {0};
+    struct mt76_queue q = {0};
+    struct mt76_dev dev = {0};
+    bool more;
+    void *buf;
+    uint32_t i;
+    if (!out || ndesc < 2 || ndesc > 64 || tail >= ndesc || queued > ndesc)
+        return -1;
+    for (i = 0; i < queued; i++) {
+        uint32_t idx = (tail + i) % ndesc;
+        entry[idx].buf = (void *)(uintptr_t)(idx + 1);
+    }
+    if (dma_done)
+        desc[tail].ctrl = cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+    q.tail = tail;
+    q.ndesc = ndesc;
+    q.queued = queued;
+    q.desc = desc;
+    q.entry = entry;
+    buf = mt76_dma_dequeue(&dev, &q, false, NULL, NULL, &more, NULL);
+    out->tail = q.tail;
+    out->queued = q.queued;
+    out->returned_index = buf ? (uint32_t)(uintptr_t)buf - 1 : UINT32_MAX;
+    out->entry_cleared = buf && entry[tail].buf == NULL;
+    out->released_buffers = 0;
+    out->rx_head_cleared = 1;
+    return 0;
+}
+
+int oracle_dma_rx_cleanup_bookkeeping(uint32_t ndesc, uint32_t tail,
+                                      uint32_t queued,
+                                      struct oracle_dma_queue_state *out)
+{
+    struct mt76_desc desc[64] = {0};
+    struct mt76_queue_entry entry[64] = {0};
+    struct mt76_queue q = {0};
+    struct mt76_dev dev = {0};
+    uint32_t i, cleared = 0;
+    if (!out || ndesc < 2 || ndesc > 64 || tail >= ndesc || queued > ndesc)
+        return -1;
+    for (i = 0; i < queued; i++) {
+        uint32_t idx = (tail + i) % ndesc;
+        entry[idx].buf = (void *)(uintptr_t)(idx + 1);
+    }
+    q.tail = tail;
+    q.ndesc = ndesc;
+    q.queued = queued;
+    q.desc = desc;
+    q.entry = entry;
+    q.rx_head = (void *)1;
+    oracle_released_buffers = 0;
+    mt76_dma_rx_cleanup(&dev, &q);
+    for (i = 0; i < queued; i++)
+        cleared += entry[(tail + i) % ndesc].buf == NULL;
+    out->tail = q.tail;
+    out->queued = q.queued;
+    out->returned_index = UINT32_MAX;
+    out->entry_cleared = cleared;
+    out->released_buffers = oracle_released_buffers;
+    out->rx_head_cleared = q.rx_head == NULL;
     return 0;
 }
 

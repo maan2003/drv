@@ -13,10 +13,17 @@ The harness feeds only values accepted by the Rust API. It currently executes
 the pinned `mt76_connac2_mcu_fill_message`, `mt7921_mcu_parse_response`, and
 `mt76_dma_add_buf` C bodies for legacy MCU command envelopes, MCU reply/event
 headers and payload boundaries, patch reply scalars, EEPROM replies, and
-one/two-segment DMA descriptors. It also differentially covers client data and
+one/two-segment DMA descriptors. It also executes the pinned
+`mt76_dma_dequeue` and `mt76_dma_rx_cleanup` bodies on ordinary non-WED queue
+states. Dequeue's done-gated tail/queued transition is compared with the public
+`WfdmaRing::reclaim_one` model; RX cleanup is checked directly for forced
+dequeue, buffer release, wraparound, and partial-frame cleanup. It also
+differentially covers client data and
 management TXWI/TXP encoding, Connac2 normal/authentication RX descriptors,
 passive HW scan start/cancel, station BSS/initial STA_REC, and KEY_V2 install
-and disable requests.
+and disable requests. The remaining connect checkpoint covers pre-key EAPOL
+ordering through PTK/GTK STA_REC commands, the post-association interface
+STA_REC update, and uniform conservative SET_RATE_TX_POWER batches.
 
 The MAC TX/RX consumers are too coupled to mac80211, station/vif, PHY, and skb
 state to extract usefully. Their oracle wrappers therefore use the pinned
@@ -28,3 +35,9 @@ modeled. TX comparison assumes the associated 802.3 path is WME and uses the
 same WCID, queue, basic rate, and single-buffer TXP selected by the Rust API.
 Any confirmed valid-domain difference is documented rather than copied into
 Rust.
+
+`mt7921-core` does not currently expose an RX ring entry ownership or cleanup
+API: its public RX surface prepares descriptor arrays, while `WfdmaRing` is a
+TX ring model. Consequently the RX cleanup checkpoint executes and asserts the
+pinned C ownership path but does not claim a Rust equivalence or add a test-only
+RX ownership adapter.
