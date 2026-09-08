@@ -63,8 +63,26 @@ show whether the candidate kernel began executing. The pinned initrd contains
 a 120-second `boot-watchdog.service` that writes diagnostics to `/dev/pmsg0`,
 tries its embedded rescue kexec, and finally forces a reboot. No diagnostic was
 retained after the failed retry, and USB did not return, so neither candidate
-entry nor rescue execution is proved. Require a 16-byte Wi-Fi `reg` and
-live-FDT SHA-256
+entry nor rescue execution is proved. The DT does have a working 2 MiB ramoops
+reservation at `0xa9000000`; `systemd-pstore` archives records and then empties
+the live `/sys/fs/pstore`, so an empty live directory is not evidence that the
+backend is absent. The post-recovery archive contained historical flashed `#1`
+records but no candidate `7.2.0+ #9` record from either failed hop. A diagnostic
+Image with panic-on-oops and soft-lockup, hung-task, and workqueue watchdogs is
+available to retain detector-triggered failures in ramoops, but it cannot prove
+entry before ramoops or diagnose an undetected hang. A no-`--dtb`, sleep-
+inhibited, detached attempt with that Image returned to a new flashed `#1` boot
+with no new ramoops record; it did not establish instrumented-kernel entry. The
+old kernel did prove that `kexec_file_load` loaded the diagnostic kernel,
+initrd, and an automatically generated DTB. Its journal ends before the
+detached unit's eight-second delay elapsed. This is expected to lack a systemd
+shutdown sequence: kexec-tools 2.0.32 implements `kexec -e` as `sync()`,
+interface shutdown, then the kexec reboot syscall. Therefore neither the USB
+transition nor the final journal line locates the failure within the handoff.
+Do not repeat this path without a phase-discriminating change. The retained
+journal, post-return state, and pstore snapshot are on np at
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-bootdiag-kexec-20260909T031206Z`.
+Require a 16-byte Wi-Fi `reg` and live-FDT SHA-256
 `d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
 After the approved stdin-only unlock and return to `#9` userspace, make the
 second hop with the legacy syscall forced:
