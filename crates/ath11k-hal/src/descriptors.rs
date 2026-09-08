@@ -423,6 +423,36 @@ pub fn dscp_tid_map_words(table: &[u8; 64]) -> [u32; 6] {
 fixed_descriptor!(ReoEntranceRing, 32);
 
 impl ReoEntranceRing {
+    /// Builds the REO entrance descriptor used by
+    /// `ath11k_dp_rx_h_defrag_reo_reinject` from the retained exception-ring
+    /// snapshot. The link address/cookie, MPDU metadata, and queue address are
+    /// copied from hardware-owned state rather than reconstructed by DP.
+    pub fn for_defrag_reinject(
+        source: &ReoDestinationRing,
+        sequence: u16,
+        destination: u8,
+    ) -> Result<Self, LayoutError> {
+        let mut descriptor = Self::new();
+        let mut link = source.buffer_address();
+        link.set_return_buffer_manager(1)?;
+        descriptor.set_buffer_address(&link);
+
+        let source_mpdu = source.mpdu();
+        let mut mpdu = RxMpduDescriptor::new();
+        mpdu.0[4..8].copy_from_slice(&source_mpdu.0[4..8]);
+        mpdu.set_msdu_count(1)?;
+        mpdu.set_sequence_number(sequence)?;
+        mpdu.set_fragment(false);
+        mpdu.set_pn_valid(true);
+        mpdu.set_source_address_valid(true);
+        mpdu.set_destination_address_valid(true);
+        mpdu.set_raw_mpdu(true);
+        descriptor.set_mpdu(&mpdu);
+        descriptor.set_queue_address_bits(source.queue_address())?;
+        descriptor.set_reo_destination(destination)?;
+        Ok(descriptor)
+    }
+
     pub fn buffer_address(&self) -> RxdmaBufferRing {
         RxdmaBufferRing::from_bytes(&self.0[..8]).expect("embedded fixed layout")
     }
@@ -527,15 +557,39 @@ impl ReoDestinationRing {
 // `struct hal_wbm_release_ring`.
 fixed_descriptor!(WbmReleaseRing, 32);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum WbmReleaseAction {
+    PutInIdle = 0,
+    ReleaseMsdu = 1,
+}
+
 impl WbmReleaseRing {
+    /// Builds the SW-to-WBM PUT_IN_IDLE descriptor for a retained REO
+    /// exception link. Unlike `for_msdu_link`, the source is the actual REO
+    /// destination snapshot that conveyed ownership to the host.
+    pub fn for_link_return(
+        source: &ReoDestinationRing,
+        action: WbmReleaseAction,
+    ) -> Result<Self, LayoutError> {
+        let mut descriptor = Self::new();
+        let mut link = source.buffer_address();
+        link.set_return_buffer_manager(1)?;
+        descriptor.set_buffer_address(&link);
+        descriptor.set_release_source(4)?;
+        descriptor.set_buffer_manager_action(action as u8)?;
+        descriptor.set_descriptor_type(1)?;
+        Ok(descriptor)
+    }
+
     /// Port of `ath11k_hal_rx_msdu_link_desc_set`.
-    pub fn for_msdu_link(source: &WbmReleaseRing, action: u8) -> Self {
+    pub fn for_msdu_link(source: &WbmReleaseRing, action: WbmReleaseAction) -> Self {
         let mut descriptor = Self::new();
         descriptor.0[..8].copy_from_slice(&source.0[..8]);
         write_word(
             &mut descriptor.0,
             2,
-            4 | (u32::from(action) & 7) << 3 | 1 << 6,
+            4 | (u32::from(action as u8) & 7) << 3 | 1 << 6,
         );
         descriptor
     }
@@ -636,6 +690,12 @@ impl RxMsduDetails {
     pub fn msdu(&self) -> RxMsduDescriptor {
         RxMsduDescriptor::from_bytes(&self.0[8..]).expect("embedded fixed layout")
     }
+    pub fn set_buffer_address(&mut self, value: &RxdmaBufferRing) {
+        self.0[..8].copy_from_slice(value.as_bytes());
+    }
+    pub fn set_descriptor(&mut self, value: &RxMsduDescriptor) {
+        self.0[8..].copy_from_slice(value.as_bytes());
+    }
 }
 
 fixed_descriptor!(RxMsduLink, 128);
@@ -657,6 +717,14 @@ impl RxMsduLink {
         Some(
             RxMsduDetails::from_bytes(&self.0[offset..offset + 16]).expect("embedded fixed layout"),
         )
+    }
+    pub fn set_msdu(&mut self, index: usize, details: &RxMsduDetails) -> Result<(), LayoutError> {
+        if index >= 6 {
+            return Err(LayoutError::FieldValueOutOfRange);
+        }
+        let offset = 32 + index * 16;
+        self.0[offset..offset + 16].copy_from_slice(details.as_bytes());
+        Ok(())
     }
     /// Port of `ath11k_hal_rx_msdu_link_info_get`. Linux takes RBM from the
     /// first slot and stops at the first slot whose low address word is zero.

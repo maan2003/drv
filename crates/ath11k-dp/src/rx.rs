@@ -73,6 +73,22 @@ impl<'a> Wcn6750RxDescriptor<'a> {
         Ok(Self { bytes })
     }
 
+    /// Port of WCN6750's `rx_desc_set_msdu_len` operation used before a
+    /// defragmented frame is returned to REO.
+    pub fn set_msdu_length(bytes: &mut [u8], length: u16) -> Result<(), DpError> {
+        if bytes.len() < WCN6750_RX_DESCRIPTOR_BYTES || length > 0x3fff {
+            return Err(DpError::InvalidFrame);
+        }
+        let old = u32::from_le_bytes(
+            bytes[MSDU_START_INFO1..MSDU_START_INFO1 + 4]
+                .try_into()
+                .map_err(|_| DpError::InvalidFrame)?,
+        );
+        bytes[MSDU_START_INFO1..MSDU_START_INFO1 + 4]
+            .copy_from_slice(&((old & !0x3fff) | u32::from(length)).to_le_bytes());
+        Ok(())
+    }
+
     pub fn mpdu_start_valid(&self) -> bool {
         (self.u32(MPDU_START_TAG) >> 1) & 0x1ff == 207
     }
@@ -236,5 +252,24 @@ mod tests {
                 Err(DpError::MalformedDescriptor)
             );
         }
+    }
+
+    #[test]
+    fn defrag_msdu_length_update_preserves_other_bits() {
+        let mut bytes = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
+        put32(&mut bytes, MSDU_START_INFO1, 0xabcd_c000 | 7);
+        Wcn6750RxDescriptor::set_msdu_length(&mut bytes, 0x2345).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[MSDU_START_INFO1..MSDU_START_INFO1 + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0xabcd_c000 | 0x2345
+        );
+        assert_eq!(
+            Wcn6750RxDescriptor::set_msdu_length(&mut bytes, 0x4000),
+            Err(DpError::InvalidFrame)
+        );
     }
 }

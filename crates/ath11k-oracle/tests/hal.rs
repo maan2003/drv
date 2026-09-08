@@ -1,3 +1,4 @@
+use ath11k_dp::rx::{WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
 use ath11k_dp::tx::{ClientTxConfig, EncapType, client_tx_command_info};
 use ath11k_hal::descriptors::*;
 use ath11k_hal::{
@@ -121,6 +122,24 @@ unsafe extern "C" {
         looping: u8,
     );
     fn oracle_hal_wbm_msdu_link(out: *mut u8, source: *const u8, action: u8);
+    fn oracle_hal_fragment_link_return(out: *mut u8, source: *const u8, action: u8);
+    fn oracle_hal_fragment_reo_entrance(
+        out: *mut u8,
+        source: *const u8,
+        sequence: u16,
+        destination: u8,
+    );
+    fn oracle_hal_fragment_msdu_slot(
+        out: *mut u8,
+        source: *const u8,
+        address: u64,
+        cookie: u32,
+        manager: u8,
+        length: u16,
+        destination: u8,
+        index: u8,
+    );
+    fn oracle_dp_wcn6750_set_msdu_length(out: *mut u8, source: *const u8, length: u16);
     fn oracle_hal_rx_msdu_link_info(
         input: *const u8,
         count: *mut u8,
@@ -670,7 +689,7 @@ proptest! {
     #[test]
     fn wbm_release_fields_and_link_setup_match_pinned_c(
         address in 0u64..(1u64 << 40), cookie in 0u32..=0x1f_ffff, manager in 0u8..=7,
-        source in 0u8..=7, action in 0u8..=7, kind in 0u8..=7, index in 0u8..=15,
+        source in 0u8..=7, action in 0u8..=1, kind in 0u8..=7, index in 0u8..=15,
         tqm_reason in 0u8..=15, rx_reason in 0u8..=3, rx_error in 0u8..=31,
         reo_reason in 0u8..=3, reo_error in 0u8..=31, internal in any::<bool>(),
         status in 0u32..=0xff_ffff, count in 0u8..=0x7f, rssi in any::<u8>(),
@@ -706,7 +725,12 @@ proptest! {
             u64::from(tid), u64::from(ring), u64::from(looping)]);
         let mut linked = [0; 32];
         unsafe { oracle_hal_wbm_msdu_link(linked.as_mut_ptr(), c.as_ptr(), action) };
-        let rust_linked = WbmReleaseRing::for_msdu_link(&rust, action);
+        let typed_action = if action == 0 {
+            WbmReleaseAction::PutInIdle
+        } else {
+            WbmReleaseAction::ReleaseMsdu
+        };
+        let rust_linked = WbmReleaseRing::for_msdu_link(&rust, typed_action);
         prop_assert_eq!(rust_linked.as_bytes(), &linked);
     }
 
@@ -730,6 +754,86 @@ proptest! {
         prop_assert_eq!(rust.count, count);
         prop_assert_eq!(rust.cookies, cookies);
         prop_assert_eq!(rust.return_buffer_manager, manager);
+    }
+
+    #[test]
+    fn fragment_reinject_mutations_match_pinned_c(
+        source in any::<[u8; 64]>(), link in any::<[u8; 128]>(),
+        sequence in 0u16..=0x0fff, destination in 0u8..=0x1f,
+        cookie in 0u32..=0x1f_ffff, manager in 0u8..=7,
+        length in 0u16..=0x3fff, action in 0u8..=1, index in 0usize..6,
+    ) {
+        let source = ReoDestinationRing::from_bytes(&source).unwrap();
+
+        let typed_action = if action == 0 {
+            WbmReleaseAction::PutInIdle
+        } else {
+            WbmReleaseAction::ReleaseMsdu
+        };
+        let rust_return = WbmReleaseRing::for_link_return(&source, typed_action).unwrap();
+        let mut c_return = [0; 32];
+        unsafe {
+            oracle_hal_fragment_link_return(
+                c_return.as_mut_ptr(), source.as_bytes().as_ptr(), action,
+            )
+        };
+        prop_assert_eq!(rust_return.as_bytes(), &c_return);
+
+        let rust_entrance =
+            ReoEntranceRing::for_defrag_reinject(&source, sequence, destination).unwrap();
+        let mut c_entrance = [0; 32];
+        unsafe {
+            oracle_hal_fragment_reo_entrance(
+                c_entrance.as_mut_ptr(), source.as_bytes().as_ptr(), sequence, destination,
+            )
+        };
+        prop_assert_eq!(rust_entrance.as_bytes(), &c_entrance);
+
+        let device = DeterministicBackend::device();
+        let dma = device.alloc_coherent::<ToDevice>(1, 1).unwrap();
+        let address = dma.device_address(0).unwrap();
+        let mut buffer = RxdmaBufferRing::new();
+        buffer.set_address(&address).unwrap();
+        buffer.set_software_cookie(cookie).unwrap();
+        buffer.set_return_buffer_manager(manager).unwrap();
+        let mut descriptor = RxMsduDescriptor::new();
+        descriptor.set_first_in_mpdu(true);
+        descriptor.set_last_in_mpdu(true);
+        descriptor.set_length(length).unwrap();
+        descriptor.set_reo_destination(destination).unwrap();
+        descriptor.set_source_address_valid(true);
+        descriptor.set_destination_address_valid(true);
+        let mut details = RxMsduDetails::new();
+        details.set_buffer_address(&buffer);
+        details.set_descriptor(&descriptor);
+        let mut rust_link = RxMsduLink::from_bytes(&link).unwrap();
+        rust_link.set_msdu(index, &details).unwrap();
+        prop_assert_eq!(
+            rust_link.set_msdu(6, &details),
+            Err(LayoutError::FieldValueOutOfRange)
+        );
+        let mut c_link = [0; 128];
+        unsafe {
+            oracle_hal_fragment_msdu_slot(
+                c_link.as_mut_ptr(), link.as_ptr(), address.bits(), cookie, manager,
+                length, destination, index as u8,
+            )
+        };
+        prop_assert_eq!(rust_link.as_bytes(), &c_link);
+    }
+
+    #[test]
+    fn wcn6750_defrag_msdu_length_mutation_matches_pinned_c(
+        source in prop::collection::vec(any::<u8>(), WCN6750_RX_DESCRIPTOR_BYTES),
+        length in 0u16..=0x3fff,
+    ) {
+        let mut rust = source.clone();
+        Wcn6750RxDescriptor::set_msdu_length(&mut rust, length).unwrap();
+        let mut c = [0; WCN6750_RX_DESCRIPTOR_BYTES];
+        unsafe {
+            oracle_dp_wcn6750_set_msdu_length(c.as_mut_ptr(), source.as_ptr(), length)
+        };
+        prop_assert_eq!(rust, c);
     }
 
     #[test]
