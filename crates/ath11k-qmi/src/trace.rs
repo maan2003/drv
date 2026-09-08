@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 //! Feature-gated semantic events for differential codec oracles.
 
 use crate::wire::{self, MessageId};

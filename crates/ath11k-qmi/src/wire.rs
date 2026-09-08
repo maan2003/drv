@@ -1,3 +1,4 @@
+// PORT-MAP: reusable
 //! QMI WLFW v01 TLV bodies from Linux ath11k `qmi.[ch]`.
 //!
 //! QMI TLVs use a one-byte type, a little-endian 16-bit length, then value.
@@ -7,7 +8,9 @@ use crate::{QmiError, Request, Response};
 use alloc::vec::Vec;
 
 pub const SERVICE_VERSION: u32 = 1;
+// PORT-MAP: wcn6750-specific
 pub const WCN6750_SERVICE_INSTANCE: u32 = 3;
+// PORT-MAP: reusable
 pub const RESPONSE_MAX_LEN: usize = 8192;
 pub const MAX_MEMORY_SEGMENTS: usize = 52;
 pub const MAX_MEMORY_CONFIGS: usize = 2;
@@ -281,6 +284,7 @@ pub struct IndicationRegisterRequest {
 }
 
 impl IndicationRegisterRequest {
+    // PORT-MAP: wcn6750-specific
     pub fn wcn6750() -> Self {
         Self {
             fw_ready: Some(1),
@@ -290,6 +294,7 @@ impl IndicationRegisterRequest {
             ..Self::default()
         }
     }
+    // PORT-MAP: reusable
     pub fn encode(&self) -> Result<Request, QmiError> {
         let mut b = Vec::new();
         opt_u8(&mut b, 0x10, self.fw_ready);

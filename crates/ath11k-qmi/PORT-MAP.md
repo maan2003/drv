@@ -24,10 +24,10 @@
 | `qmi_wlanfw_mem_seg_resp_s_v01` | `qmi.h:271-276` | `src/wire.rs::MemorySegmentResponse` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_respond_mem_req_msg_v01` | `qmi.h:278-281` | `src/wire.rs::RespondMemoryRequest` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_respond_mem_resp_msg_v01` | `qmi.h:283-285` | `src/wire.rs::RespondMemoryResponse` | ported | Typed QMI TLV representation. |
-| `qmi_wlanfw_fw_mem_ready_ind_msg_v01` | `qmi.h:287-289` | `src/wire.rs::Indication::FirmwareMemoryReady` | ported | Empty indication payload. |
+| `qmi_wlanfw_fw_mem_ready_ind_msg_v01` | `qmi.h:287-289` | `src/wire.rs::Indication` | ported | Empty indication payload. |
 | `qmi_wlanfw_fw_ready_ind_msg_v01` | `qmi.h:291-293` | `src/wire.rs::Indication::FirmwareReady` | ported | Empty indication payload. |
-| `qmi_wlanfw_fw_cold_cal_done_ind_msg_v01` | `qmi.h:295-297` | `src/wire.rs::Indication::ColdBootCalibrationDone` | ported | Empty indication payload. |
-| `qmi_wlfw_fw_init_done_ind_msg_v01` | `qmi.h:299-301` | `src/wire.rs::Indication::FirmwareInitDone` | ported | Empty indication payload. |
+| `qmi_wlanfw_fw_cold_cal_done_ind_msg_v01` | `qmi.h:295-297` | `src/wire.rs::Indication` | ported | Empty indication payload. |
+| `qmi_wlfw_fw_init_done_ind_msg_v01` | `qmi.h:299-301` | `src/wire.rs::Indication` | ported | Empty indication payload. |
 | `qmi_wlanfw_pipedir_enum_v01` | `qmi.h:310-315` | `src/wire.rs::PipeDirection` | ported | CE configuration wire direction. |
 | `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01` | `qmi.h:317-323` | `src/wire.rs::TargetPipeConfig` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_ce_svc_pipe_cfg_s_v01` | `qmi.h:325-329` | `src/wire.rs::ServicePipeConfig` | ported | Typed QMI TLV representation. |
@@ -35,8 +35,8 @@
 | `qmi_wlanfw_shadow_reg_v2_cfg_s_v01` | `qmi.h:336-338` | `src/wire.rs::ShadowRegister` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_memory_region_info_s_v01` | `qmi.h:340-344` | `src/wire.rs::MemoryRegionInfo` | deferred | Defined but unused and has no element-info table in the pinned qmi.c. |
 | `qmi_wlanfw_rf_chip_info_s_v01` | `qmi.h:346-349` | `src/wire.rs::ChipInfo` | ported | Typed QMI TLV representation. |
-| `qmi_wlanfw_rf_board_info_s_v01` | `qmi.h:351-353` | `src/wire.rs::CapabilityResponse::board_id` | ported | Typed QMI TLV representation. |
-| `qmi_wlanfw_soc_info_s_v01` | `qmi.h:355-357` | `src/wire.rs::CapabilityResponse::soc_id` | ported | Typed QMI TLV representation. |
+| `qmi_wlanfw_rf_board_info_s_v01` | `qmi.h:351-353` | `src/wire.rs::CapabilityResponse` | ported | Board-info TLV is represented by the response's `board_id` field. |
+| `qmi_wlanfw_soc_info_s_v01` | `qmi.h:355-357` | `src/wire.rs::CapabilityResponse` | ported | SoC-info TLV is represented by the response's `soc_id` field. |
 | `qmi_wlanfw_fw_version_info_s_v01` | `qmi.h:359-362` | `src/wire.rs::FirmwareVersion` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_cal_temp_id_enum_v01` | `qmi.h:364-371` | `src/wire.rs::CalibrationTemperatureId` | ported | Checked raw wire value. |
 | `qmi_wlanfw_cap_resp_msg_v01` | `qmi.h:373-395` | `src/wire.rs::CapabilityResponse` | ported | Typed QMI TLV representation. |
@@ -67,8 +67,8 @@
 | `qmi_wlanfw_device_info_req_msg_v01_ei` | `qmi.c:756-762` | `src/wire.rs::DeviceInfoRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlfw_device_info_resp_msg_v01_ei` | `qmi.c:764-816` | `src/wire.rs::DeviceInfoResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_rf_chip_info_s_v01_ei` | `qmi.c:818-842` | `src/wire.rs::ChipInfo` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_rf_board_info_s_v01_ei` | `qmi.c:844-859` | `src/wire.rs::CapabilityResponse::board_id` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_soc_info_s_v01_ei` | `qmi.c:861-875` | `src/wire.rs::CapabilityResponse::soc_id` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_rf_board_info_s_v01_ei` | `qmi.c:844-859` | `src/wire.rs::CapabilityResponse` | ported | Pinned board-info TLV schema is implemented by the response codec. |
+| `qmi_wlanfw_soc_info_s_v01_ei` | `qmi.c:861-875` | `src/wire.rs::CapabilityResponse` | ported | Pinned SoC-info TLV schema is implemented by the response codec. |
 | `qmi_wlanfw_fw_version_info_s_v01_ei` | `qmi.c:877-901` | `src/wire.rs::FirmwareVersion` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_cap_resp_msg_v01_ei` | `qmi.c:903-1102` | `src/wire.rs::CapabilityResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_bdf_download_req_msg_v01_ei` | `qmi.c:1104-1237` | `src/wire.rs::BdfDownloadRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
@@ -114,10 +114,10 @@
 | `ath11k_qmi_event_load_bdf` | `qmi.c:2961-2989` | `src/handshake.rs::Wcn6750Handshake::load_bdf` | ported | Capability and BDF-loading transition. |
 | `ath11k_qmi_event_server_arrive` | `qmi.c:2991-3019` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Registration and host-capability transition. |
 | `ath11k_qmi_msg_mem_request_cb` | `qmi.c:3021-3065` | `src/handshake.rs::Wcn6750Handshake::process_indication` | ported | Request-memory indication handling; allocation is delegated. |
-| `ath11k_qmi_msg_mem_ready_cb` | `qmi.c:3067-3077` | `src/wire.rs::Indication::FirmwareMemoryReady` | ported | Firmware-memory-ready handling. |
+| `ath11k_qmi_msg_mem_ready_cb` | `qmi.c:3067-3077` | `src/wire.rs::Indication` | ported | Firmware-memory-ready handling. |
 | `ath11k_qmi_msg_fw_ready_cb` | `qmi.c:3079-3095` | `src/wire.rs::Indication::FirmwareReady` | ported | Firmware-ready handling. |
-| `ath11k_qmi_msg_cold_boot_cal_done_cb` | `qmi.c:3097-3109` | `src/wire.rs::Indication::ColdBootCalibrationDone` | ported | Cold-calibration-done handling. |
-| `ath11k_qmi_msg_fw_init_done_cb` | `qmi.c:3111-3122` | `src/wire.rs::Indication::FirmwareInitDone` | ported | Firmware-init-done handling. |
+| `ath11k_qmi_msg_cold_boot_cal_done_cb` | `qmi.c:3097-3109` | `src/wire.rs::Indication` | ported | Cold-calibration-done handling. |
+| `ath11k_qmi_msg_fw_init_done_cb` | `qmi.c:3111-3122` | `src/wire.rs::Indication` | ported | Firmware-init-done handling. |
 | `ath11k_qmi_msg_handlers` | `qmi.c:3124-3165` | `src/wire.rs::MessageId; src/wire.rs::Indication::decode` | ported | Five indication IDs dispatch to typed decoding. |
 | `ath11k_qmi_ops_new_server` | `qmi.c:3167-3190` | `src/lib.rs::Transport::start_service; src/handshake.rs::Wcn6750Handshake::server_arrived` | local-seam | Transport supplies discovery/connect; protocol arrival handling is retained. |
 | `ath11k_qmi_ops_del_server` | `qmi.c:3192-3200` | `src/lib.rs::Transport` | replaced-by-fuchsia-mlme | Transport reports service loss; recovery policy belongs to the driver lifecycle owner. |

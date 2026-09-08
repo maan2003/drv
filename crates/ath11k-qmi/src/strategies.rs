@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 //! Bounded generators for exercising the public WLFW codecs.
 
 use crate::wire::*;
