@@ -8,7 +8,9 @@ chip-neutral traits to either deterministic `ModelSubsystems` or real
 passive-scan path passes the shared host conformance runner. The current
 `ath11k-bringup` stages remain a diagnostic harness, while `ath11k-core`
 implements only part of the hardware effects and completion waits described
-below.
+below. Management frames now use WMI in both directions: TX retains a
+device-readable frame mapping until its matching completion, while MGMT_RX is
+delivered through the host callback.
 
 The binding follows [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) and
 keeps the WCN6750-specific resources described by
@@ -69,7 +71,7 @@ Ath11k currently needs these additions before it can implement the traits
 without invented values:
 
 - The real subsystem must implement the existing vdev up, peer
-  create/associate/authorize, key, management-TX, stop/delete, and correlated
+  create/associate/authorize, key, stop/delete, and correlated
   wait operations. The typed WMI encoders exist for most of them, but the real
   dispatcher currently rejects the operations.
 - `associate_peer(vdev, address)` is too small. The adapter must translate the
@@ -82,8 +84,8 @@ without invented values:
   required metadata through the adapter. Conversely, ath11k's pdev ID, WMI
   flags, and firmware-only scan reasons do not belong in the chip-neutral
   trait unless the host demonstrates a policy use.
-- Scan IDs, management buffer IDs, peer completions, and key completions need
-  adapter-owned correlation tables.
+- Scan IDs, peer completions, and key completions need adapter-owned
+  correlation tables.
 - The controlled-port/link downcall being added with `ClientRuntimeDriver`
   must not report link-up until WMI peer authorization succeeds. Ath11k's
   separate authorize operation therefore maps to that downcall, not to
