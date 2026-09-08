@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+zerocopy = { version = "0.8.56", default-features = false }

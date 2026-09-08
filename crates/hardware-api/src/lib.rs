@@ -9,7 +9,8 @@
 extern crate alloc;
 
 use alloc::{rc::Rc, vec, vec::Vec};
-use core::{cell::RefCell, marker::PhantomData, ops::Range};
+use core::{cell::RefCell, marker::PhantomData, mem, ops::Range};
+use zerocopy::{FromBytes, IntoBytes};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -24,12 +25,29 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 mod sealed {
     pub trait Direction {}
+    pub trait PodOnce: Sized {
+        fn from_u32(value: u32) -> Self;
+        fn into_u32(self) -> u32;
+    }
 }
 pub trait Direction: sealed::Direction + 'static {}
 pub trait CpuWrite: Direction {}
 pub trait CpuRead: Direction {}
 pub trait DeviceRead: Direction {}
 pub trait DeviceWrite: Direction {}
+/// A DMA value supported by one naturally aligned, non-tearing backend access.
+///
+/// This is sealed to the descriptor word width backends currently guarantee.
+pub trait PodOnce: sealed::PodOnce + FromBytes + IntoBytes + Copy {}
+impl sealed::PodOnce for u32 {
+    fn from_u32(value: u32) -> Self {
+        value
+    }
+    fn into_u32(self) -> u32 {
+        self
+    }
+}
+impl PodOnce for u32 {}
 
 pub enum ToDevice {}
 pub enum FromDevice {}
@@ -129,6 +147,14 @@ pub trait Backend {
     }
     fn dma_read(&mut self, dma: &Self::Dma, range: Range<usize>, out: &mut [u8]) -> Result<()>;
     fn dma_write(&mut self, dma: &Self::Dma, range: Range<usize>, bytes: &[u8]) -> Result<()>;
+    /// Perform one naturally aligned, non-tearing 32-bit DMA-memory load.
+    fn dma_read_once_u32(&mut self, _dma: &Self::Dma, _offset: usize) -> Result<u32> {
+        Err(Error::Invalid)
+    }
+    /// Perform one naturally aligned, non-tearing 32-bit DMA-memory store.
+    fn dma_write_once_u32(&mut self, _dma: &Self::Dma, _offset: usize, _value: u32) -> Result<()> {
+        Err(Error::Invalid)
+    }
     fn sync_for_cpu(&mut self, dma: &Self::Dma, range: Range<usize>) -> Result<()>;
     fn sync_for_device(&mut self, dma: &Self::Dma, range: Range<usize>) -> Result<()>;
     fn open_interrupt(&mut self, vector: u32) -> Result<Self::Interrupt>;
@@ -446,6 +472,58 @@ impl<B: Backend, D: Direction> DmaBuffer<B, D> {
         };
         Ok((self, right))
     }
+    fn pod_range<T>(&self, offset: usize) -> Result<Range<usize>> {
+        let size = mem::size_of::<T>();
+        if size == 0 || !(self.offset + offset).is_multiple_of(mem::align_of::<T>()) {
+            return Err(Error::Invalid);
+        }
+        self.range(offset, size)
+    }
+    fn read_pod<T: FromBytes + IntoBytes>(&mut self, offset: usize) -> Result<T> {
+        let range = self.pod_range::<T>(offset)?;
+        let backend_range = self.backend_range(range.clone());
+        self.allocation.shared.0.borrow_mut().dma_read(
+            self.allocation.token.as_ref().unwrap(),
+            backend_range,
+            &mut self.bytes[range.clone()],
+        )?;
+        T::read_from_bytes(&self.bytes[range]).map_err(|_| Error::Invalid)
+    }
+    fn write_pod<T: FromBytes + IntoBytes>(&mut self, offset: usize, mut value: T) -> Result<()> {
+        let range = self.pod_range::<T>(offset)?;
+        let bytes = value.as_mut_bytes();
+        self.bytes[range.clone()].copy_from_slice(bytes);
+        let backend_range = self.backend_range(range);
+        self.allocation.shared.0.borrow_mut().dma_write(
+            self.allocation.token.as_ref().unwrap(),
+            backend_range,
+            bytes,
+        )
+    }
+    fn read_once<T: PodOnce>(&mut self, offset: usize) -> Result<T> {
+        let range = self.pod_range::<T>(offset)?;
+        let backend_offset = self.backend_range(range.clone()).start;
+        let value = self
+            .allocation
+            .shared
+            .0
+            .borrow_mut()
+            .dma_read_once_u32(self.allocation.token.as_ref().unwrap(), backend_offset)?;
+        self.bytes[range].copy_from_slice(&value.to_ne_bytes());
+        Ok(<T as sealed::PodOnce>::from_u32(value))
+    }
+    fn write_once<T: PodOnce>(&mut self, offset: usize, value: T) -> Result<()> {
+        let range = self.pod_range::<T>(offset)?;
+        let backend_offset = self.backend_range(range.clone()).start;
+        let value = <T as sealed::PodOnce>::into_u32(value);
+        self.allocation.shared.0.borrow_mut().dma_write_once_u32(
+            self.allocation.token.as_ref().unwrap(),
+            backend_offset,
+            value,
+        )?;
+        self.bytes[range].copy_from_slice(&value.to_ne_bytes());
+        Ok(())
+    }
 }
 
 pub struct DeviceAddress<'a, B: Backend, D: Direction> {
@@ -508,6 +586,12 @@ impl<B: Backend, D: CpuWrite> CoherentDma<B, D> {
             bytes,
         )
     }
+    pub fn write_pod<T: FromBytes + IntoBytes>(&mut self, offset: usize, value: T) -> Result<()> {
+        self.0.write_pod(offset, value)
+    }
+    pub fn write_once<T: PodOnce>(&mut self, offset: usize, value: T) -> Result<()> {
+        self.0.write_once(offset, value)
+    }
 }
 impl<B: Backend, D: CpuRead> CoherentDma<B, D> {
     pub fn read(&mut self, offset: usize, out: &mut [u8]) -> Result<()> {
@@ -520,6 +604,12 @@ impl<B: Backend, D: CpuRead> CoherentDma<B, D> {
         )?;
         self.0.bytes[r].copy_from_slice(out);
         Ok(())
+    }
+    pub fn read_pod<T: FromBytes + IntoBytes>(&mut self, offset: usize) -> Result<T> {
+        self.0.read_pod(offset)
+    }
+    pub fn read_once<T: PodOnce>(&mut self, offset: usize) -> Result<T> {
+        self.0.read_once(offset)
     }
 }
 
@@ -561,6 +651,29 @@ impl<B: Backend, D: CpuWrite> StreamingDma<B, D> {
         self.0.bytes[r].copy_from_slice(bytes);
         Ok(())
     }
+    pub fn write_pod<T: FromBytes + IntoBytes>(
+        &mut self,
+        offset: usize,
+        mut value: T,
+    ) -> Result<()> {
+        let range = self.0.pod_range::<T>(offset)?;
+        self.0.bytes[range].copy_from_slice(value.as_mut_bytes());
+        Ok(())
+    }
+    pub fn write_once<T: PodOnce>(&mut self, offset: usize, value: T) -> Result<()> {
+        let range = self.0.pod_range::<T>(offset)?;
+        let backend_range = self.0.backend_range(range.clone());
+        let value = <T as sealed::PodOnce>::into_u32(value);
+        let mut backend = self.0.allocation.shared.0.borrow_mut();
+        backend.dma_write_once_u32(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range.start,
+            value,
+        )?;
+        backend.sync_for_device(self.0.allocation.token.as_ref().unwrap(), backend_range)?;
+        self.0.bytes[range].copy_from_slice(&value.to_ne_bytes());
+        Ok(())
+    }
     pub fn sync_for_device(&mut self, offset: usize, length: usize) -> Result<()> {
         let r = self.0.range(offset, length)?;
         let bytes = &self.0.bytes[r.clone()];
@@ -593,6 +706,25 @@ impl<B: Backend, D: CpuRead> StreamingDma<B, D> {
         let r = self.0.range(offset, out.len())?;
         out.copy_from_slice(&self.0.bytes[r]);
         Ok(())
+    }
+    pub fn read_pod<T: FromBytes + IntoBytes>(&self, offset: usize) -> Result<T> {
+        let range = self.0.pod_range::<T>(offset)?;
+        T::read_from_bytes(&self.0.bytes[range]).map_err(|_| Error::Invalid)
+    }
+    pub fn read_once<T: PodOnce>(&mut self, offset: usize) -> Result<T> {
+        let range = self.0.pod_range::<T>(offset)?;
+        let backend_range = self.0.backend_range(range.clone());
+        let mut backend = self.0.allocation.shared.0.borrow_mut();
+        backend.sync_for_cpu(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range.clone(),
+        )?;
+        let value = backend.dma_read_once_u32(
+            self.0.allocation.token.as_ref().unwrap(),
+            backend_range.start,
+        )?;
+        self.0.bytes[range].copy_from_slice(&value.to_ne_bytes());
+        Ok(<T as sealed::PodOnce>::from_u32(value))
     }
 }
 
