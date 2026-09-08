@@ -54,3 +54,10 @@ oracle-checked, or hardware-checked.
 | hal.c:`ath11k_hal_srng_update_shadow_config` | `Srng::set_shadow_publication_register` | ported | WCN6750 shadow register path |
 | hal.c:LMAC branches of `ath11k_hal_srng_setup/access_begin/access_end` | `Srng::setup`, `access_begin_remote`, `access_end_lmac` | ported | coherent RDP/WRP pointers; acquire/release fences |
 | hal.c:`ath11k_hal_ce_dst_setup` | `Srng::setup` CE-destination branch | ported | source-derived max-buffer-length RMW |
+| hal_rx.c:`ath11k_hal_reo_init_cmd_ring` | `reo::initialize_command_ring` | ported | command-number unit test |
+| hal_rx.c:`ath11k_hal_reo_cmd_send` | `reo::ReoCommand::encode` | ported | source-exact supported variants; unsupported variants preserve `-EOPNOTSUPP` |
+| hal_rx.c:`ath11k_hal_reo_process_status` | `reo::ReoStatus::decode` | ported | status tag/header unit test |
+| hal_rx.c:`ath11k_hal_reo_qdesc_setup` | `reo::ReoQueueDescriptor::new` | ported | descriptor layout unit test |
+| hal_rx.c:`ath11k_hal_rx_msdu_link_desc_set` | `WbmReleaseRing::for_msdu_link` | ported | source-derived buffer-info copy and WBM fields |
+| hal.c:`ath11k_hal_set_link_desc_addr` | `WbmLinkDescriptor::new_at` | ported | checked device address path |
+| hw.c:`ath11k_hw_wcn6855_reo_setup` (`wcn6750_ops`) | `reo::setup_wcn6750` | ported | source-derived WCN6750 register offsets and values |
