@@ -36,6 +36,8 @@ From unlocked, running flashed `#1`, hop first in auto mode:
 
 ```sh
 set -e
+test "$(systemctl is-system-running)" = running
+test ! -e /run/redwood-lab-watchdog/armed
 kexec -l /var/lib/ath11k-redwood-lab/stage3/Image \
   --initrd=/var/lib/ath11k-redwood-lab/stage7/initrd-watchdog \
   --dtb=/var/lib/ath11k-redwood-lab/stage10/runB-region1.fdt \
@@ -44,8 +46,12 @@ sync
 kexec -e
 ```
 
-That hop reaches `7.2.0+ #9` but ignores the DTB argument: require a 16-byte
-Wi-Fi `reg` and live-FDT SHA-256
+The one successful observation reached `7.2.0+ #9` but ignored the DTB
+argument. A later attempt from a `degraded`, rather than `running`, flashed
+userspace reset back to flashed `#1`; no retained evidence distinguishes a
+reset before candidate entry from a candidate failure before USB. Do not treat
+the first hop as reproducible or proceed from a degraded system. Require a
+16-byte Wi-Fi `reg` and live-FDT SHA-256
 `d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
 After the approved stdin-only unlock and return to `#9` userspace, make the
 second hop with the legacy syscall forced:
