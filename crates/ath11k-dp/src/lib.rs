@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use ath11k_hal::RingId;
 
 pub mod dma;
+pub mod golden;
 pub mod htt;
 pub mod reo;
 pub mod rx;
