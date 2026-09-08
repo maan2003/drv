@@ -13,4 +13,7 @@ driver-runtime = { path = "../driver-runtime" }
 mt76-core = { path = "../mt76-core" }
 
 [dev-dependencies]
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
+proptest = "1"
 sha2 = "=0.10.9"

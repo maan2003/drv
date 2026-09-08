@@ -9437,6 +9437,8 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    mod stateful_tests;
+
     #[test]
     fn post_assoc_bss_updates_match_captured_linux_commands() {
         let channel = ClientPhysicalChannel {

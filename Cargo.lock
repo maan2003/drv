@@ -822,7 +822,10 @@ name = "mt7921-core"
 version = "0.1.0"
 dependencies = [
  "driver-runtime",
+ "drv-hardware",
+ "drv-hardware-backends",
  "mt76-core",
+ "proptest",
  "sha2",
 ]
 
