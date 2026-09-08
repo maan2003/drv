@@ -56,6 +56,10 @@ impl<B: Backend> HardwareMemoryProvider<B> {
     pub fn device_bar(&self) -> Option<&MmioRegion<B>> {
         self.device_bar.as_ref()
     }
+
+    pub fn take_device_bar(&mut self) -> Option<MmioRegion<B>> {
+        self.device_bar.take()
+    }
 }
 
 fn qmi_transport_error(_: ath11k_platform_backend::Error) -> QmiError {
@@ -197,5 +201,17 @@ where
     pub fn deinit(mut self) -> T {
         self.deinit_service();
         self.transport
+    }
+}
+
+impl<T, A, B> Wcn6750QmiSession<T, A, HardwareMemoryProvider<B>>
+where
+    T: ath11k_qmi::Transport,
+    A: FirmwareAssets,
+    B: Backend,
+{
+    /// Transfer the exact QMI-validated register aperture to the HIF owner.
+    pub fn take_device_bar(&mut self) -> Option<MmioRegion<B>> {
+        self.handshake.memory_mut().take_device_bar()
     }
 }

@@ -546,6 +546,8 @@ fn qmi_memory_provider_uses_selected_exact_bar_window() {
     let mut provider = HardwareMemoryProvider::new(device, 0);
     assert!(provider.map_device_bar(0x1000_0000, 0x20_0000).is_ok());
     assert_eq!(provider.device_bar().unwrap().len(), 0x20_0000);
+    assert_eq!(provider.take_device_bar().unwrap().len(), 0x20_0000);
+    assert!(provider.device_bar().is_none());
 
     let (device, _) = DeterministicBackend::recording_device_with_region_len(0x10_0000);
     let mut wrong_size = HardwareMemoryProvider::new(device, 0);
