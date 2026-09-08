@@ -10,3 +10,5 @@ ath11k-ce={path="../ath11k-ce"}
 ath11k-qmi={path="../ath11k-qmi"}
 ath11k-wmi={path="../ath11k-wmi"}
 ath11k-dp={path="../ath11k-dp"}
+[dev-dependencies]
+drv-hardware-backends={path="../hardware-backends"}

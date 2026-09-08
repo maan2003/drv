@@ -16,7 +16,7 @@ C/header files. They size source ownership, not expected Rust output.
 | `ath11k-wmi` | `wmi.[ch]` | 16,769 | Checked TLV `Command`/`Event`, separately replaceable `CommandEncoder` and `EventDecoder`, and WMI service `Transport`. Split cmd encode and event decode between two engineers inside this crate because the shared IDs/TLV model must remain one API. |
 | `ath11k-hal` | `hal.[ch]`, `hal_desc.h`, `hal_{rx,tx}.[ch]` | 7,295 | WCN6750 register maps, checked descriptors, SRNG creation/publication/consumption. It owns generation-tied `CoherentDma<B, Bidirectional>` ring memory from `drv-hardware`; packet buffers retain typed coherent/streaming directions and explicit sync. |
 | `ath11k-ce` | `ce.[ch]`, then the HTC framing in `htc.[ch]` | 1,290 + 1,143 | Copy-engine rings, credits and typed service frames. It depends only on HAL; WMI and DP adapt this transport without CE depending upward on either protocol. |
-| `ath11k-dp` | `dp.[ch]`, `dp_{rx,tx}.[ch]` | 10,141 | HTT control plus TCL TX, REO RX, WBM completions. Public seams are `HttControl` and `DataPath`; descriptor mechanics remain in HAL and HTC carriage remains in CE. |
+| `ath11k-dp` | `dp.[ch]`, `dp_{rx,tx}.[ch]` | 10,141 | HTT control plus TCL TX, REO RX, WBM completions. Public seams are `HttControl` and `DataPath`; descriptor mechanics remain in HAL and HTC carriage remains in CE. DP directly owns directional streaming-DMA packet buffers because the pinned `dp_rx.c`/`dp_tx.c` own their map, sync, and unmap lifecycle. |
 | `ath11k-core` | `core.[ch]`, `hw.[ch]`, `ahb.[ch]`, `hif.h`, `peer.[ch]`, hardware-facing `mac.c` | 9,686 before `mac.c` | Composes lifecycle and owns pdev/vdev/peer state. `Lifecycle` consumes QMI'"'"'s `FirmwareReady`; `RadioControl` is the hardware-effects side of WlanSoftmac. |
 | `ath11k-platform-backend` | AHB host-resource portion of `ahb.c` | included above | Portable bottom contract: re-exports `drv-hardware` generation-tied bounded MMIO, directional coherent/streaming DMA with explicit sync, interrupt, reset and teardown types. A future host adapter alone may contain unsafe/VFIO details. |
 | replaced rather than ported | policy/callback portions of `mac.[ch]` | 11,062 total file size | Linux `ieee80211_ops`, cfg80211/mac80211 types, scan/association policy and management-frame policy are replaced by the existing Fuchsia MLME through WlanSoftmac. The WMI-emitting pdev/vdev/peer/key/channel operations are ported behind `RadioControl`. |
@@ -34,13 +34,15 @@ implementation live in `dp.[ch]`.
 ath11k-core ──▶ ath11k-qmi
      │       ├▶ ath11k-wmi
      │       ├▶ ath11k-dp ──▶ ath11k-ce ──▶ ath11k-hal
+     │       │      └──────────────▶ ath11k-platform-backend
      │       └▶ ath11k-hal ─────────────────────┘
      └────────────────────────▶ ath11k-platform-backend ──▶ drv-hardware
 ```
 
-Protocol crates never depend on core. HAL depends directly on the shared `drv-hardware` model re-exported by the platform crate, while
-the composition root supplies implementations; higher layers cannot reach raw
-host resources. Every crate forbids unsafe code. When a concrete OS adapter is
+Protocol crates never depend on core. HAL depends directly on the shared `drv-hardware` model re-exported by the platform crate. DP also
+depends on that contract for packet streaming-DMA buffers; it does not expose
+raw host resources at its MLME-facing `DataPath` seam. The composition root
+supplies implementations. Every crate forbids unsafe code. When a concrete OS adapter is
 added, unsafe is permitted only in that adapter, never in these protocol crates.
 
 ## Public API contract
@@ -53,22 +55,18 @@ added, unsafe is permitted only in that adapter, never in these protocol crates.
   publication is streaming-buffer sync followed by a release-ordered index
   write, while consumption acquire-reads the hardware pointer before bytes.
 - **CE:** `ServiceId`, `TxFrame`/`RxFrame`, and `Transport` are the common
-  transport floor. Its source-shaped lifecycle also exposes CE pipe allocation,
-  initialization, attachment/service, RX posting, send and free, plus HTC
-  initialization, target-ready wait, service connection, setup-complete
-  start/stop and TX completion. Core composes those seams; CE retains
-  streaming-DMA packet-buffer and endpoint-credit ownership.
-- **QMI:** bounded `Request`, `Response`, `Transport`, `Handshake`, and
-  `FirmwareReady`.
-- **WMI:** `CommandId`/`EventId`, word-aligned checked TLV envelopes, command
-  encoders, typed event decoders, and `Transport`. Its public
-  `event::EventStream` preserves unrelated events while exposing source-shaped
-  `wait_for_service_ready` and `wait_for_unified_ready` lifecycle waits. The
-  typed results carry firmware capabilities, radio counts, hardware-mode caps,
-  MAC addresses, ready status, and command-correlation identifiers. Public
-  request types cover init/resource configuration and pdev/vdev/peer/key/scan/
-  management commands used by the core lifecycle.
-
+  transport floor. Its source-shaped lifecycle exposes CE pipe allocation,
+  initialization, service, RX posting, send and free, plus HTC initialization,
+  target-ready wait, service connection, setup-complete start/stop and typed
+  endpoint-bound service transports.
+- **QMI:** `MessageId`-bearing bounded `Request`/`Response`, checked
+  `RawIndication`, and an event-driven, transaction-correlated `Transport`.
+  `Wcn6750Handshake` exposes service lifecycle, event processing, cold-boot
+  calibration and firmware start/stop. Caller-supplied `MemoryProvider` and
+  `FirmwareAssets` keep DMA/MMIO and asset acquisition in core.
+- **WMI:** checked TLV envelopes, complete typed command encoders/event decoders,
+  source-shaped lifecycle waits, and `HtcWmiTransport` over a bound HTC service.
+  Results retain firmware capabilities and command correlation identifiers.
 - **DP/HTT:** `HttHostMessage`/`HttTargetMessage`, `HttControl`,
   `DataRings`, typed packets/peer IDs, and `DataPath`.
 - **core:** `Lifecycle`, typed pdev/vdev IDs and `RadioControl`. The latter

@@ -6,7 +6,13 @@ pub mod descriptors;
 
 use alloc::vec::Vec;
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma};
+pub mod reo;
 pub mod srng;
+pub use reo::{
+    PacketNumberType, ReoCommand, ReoCommandKind, ReoCommandParams, ReoQueueDescriptor,
+    ReoResources, ReoStatus, ReoStatusHeader, ReoStatusKind, initialize_command_ring,
+    setup_wcn6750,
+};
 pub use srng::{RingDirection, RingFlags, RingType, Srng, SrngParams, Wcn6750Registers};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RingId(pub u16);
@@ -44,6 +50,7 @@ pub enum HalError {
     WrongDescriptorLength,
     NoResources,
     DeviceFault,
+    Unsupported,
 }
 pub trait Rings<B: Backend> {
     fn create(&mut self, kind: RingKind, memory: RingMemory<B>) -> Result<RingId, HalError>;

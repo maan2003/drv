@@ -1,8 +1,53 @@
 # ath11k-dp port map
 
-Maintain one row per pinned Linux symbol. Status is stub, ported,
-oracle-checked, or hardware-checked.
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 
-| C file:symbol | Rust item | status | oracle artifact |
-|---|---|---|---|
-| — | — | stub | — |
+Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
+
+| C symbol | C file:lines | Rust item | status | note |
+|---|---|---|---|---|
+| `htt_ver_req_cmd` | `dp.h:333-337` | `htt::version_request` | ported | Packed source fixture is byte-exact. |
+| `htt_srng_setup_cmd` and HTT SRNG enums/masks | `dp.h:339-516` | `htt::{SrngSetup,SrngRingType,SrngRingId,SrngFlags}` | ported | 52-byte packed fixture covers every WCN6750 client field. |
+| `htt_rx_ring_selection_cfg_cmd` / `htt_rx_ring_tlv_filter` | `dp.h:668-994` | `htt::{RxRingSelection,RxRingFilter}` | ported | 28-byte packed fixture. |
+| `htt_t2h_version_conf_msg` | `dp.h:1018-1046` | `htt::HttEvent::VersionConfirm` | ported | Truncation checked; target major 3 enforced. |
+| `htt_t2h_peer_map_event` | `dp.h:1048-1061` | `htt::{HttEvent::PeerMap,PeerMap}` | ported | V1 and V2 fixtures cover MAC, AST hash, and hardware peer ID. |
+| `htt_t2h_peer_unmap_event` | `dp.h:1063-1074` | `htt::HttEvent::PeerUnmap` | ported | V1/V2 packed size checked. |
+| `htt_tx_wbm_completion` | `dp.h:304-322` | `htt::TxCompletion` | ported | WBM offset-8 overlay fixture and truncation test. |
+| `ath11k_dp_htt_connect` | `dp.c:942-967` | `transport::{ath11k_dp_htt_connect,HttTransport,HtcHttTransport}` | ported | Supports both raw CE binding and a shared-router `HtcServiceTransport` endpoint; malformed HTT words are rejected. |
+| `ath11k_dp_tx_htt_h2t_ver_req_msg` | `dp_tx.c:995-1034` | `htt::request_target_version` | ported | Sends request, waits to deadline, and rejects incompatible major. |
+| `ath11k_dp_tx_get_ring_id_type` | `dp_tx.c:810-875` | `htt::{SrngRingType,SrngRingId}` | ported | Wire discriminants transcribed from `dp.h`. |
+| `ath11k_dp_tx_htt_srng_setup` | `dp_tx.c:877-993` | `htt::send_srng_setup` | ported | Source-derived byte fixture. |
+| `ath11k_dp_tx_htt_rx_filter_setup` | `dp_tx.c:1071-1150` | `htt::send_rx_ring_selection` | ported | Source-derived byte fixture. |
+| `ath11k_dp_htt_htc_t2h_msg_handler` client branches | `dp_rx.c:1677-1749` | `htt::{HttTargetMessage::decode,HttEvent}` | ported | Version and peer map/unmap handled; malformed length sweeps do not panic. |
+| `ath11k_dp_tx` | `dp_tx.c:83-310` | `tx::ClientDataPath::transmit` | ported | HAL TCL codec; recording backend proves streaming-DMA sync before ring publication. |
+| `ath11k_dp_tx_encap_nwifi` | `dp_tx.c:30-46` | `tx::encap_native_wifi` | ported | QoS control removal and subtype clearing preserved. |
+| `ath11k_dp_tx_completion_handler` | `dp_tx.c:687-754` | `tx::ClientDataPath::service_tx_completions` | ported | TQM and firmware/HTT WBM completions release matching DMA ownership. |
+| `ath11k_dp_rxbufs_replenish` | `dp_rx.c:344-430` | `tx::ClientDataPath::ath11k_dp_rxbufs_replenish` | ported | 128-byte-aligned `StreamingDma<FromDevice>` plus typed RXDMA descriptors. |
+| `ath11k_dp_process_rx` | `dp_rx.c:2650-2785` | `tx::ClientDataPath::receive_with_status` | ported | REO cookie lookup, routing-drop behavior, sync-for-CPU, and budget semantics. |
+| `ath11k_dp_rx_process_msdu` | `dp_rx.c:2534-2610` | `tx::parse_received_chain` | ported | Validates MSDU-done/length exactly before yielding payload and metadata. |
+| `ath11k_dp_rx_msdu_coalesce` | `dp_rx.c:1753-1838` | `tx::parse_received_chain` | ported | Multi-buffer continuation and first-buffer L3-pad boundary model fixture. |
+| `wcn6750_ops` QCN9074 RX descriptor accessors | `hw.c:1103-1137` | `rx::Wcn6750RxDescriptor` | wcn6750-specific | Exact 388-byte QCN9074 layout selected by WCN6750; every truncation rejected. |
+| `ath11k_peer_rx_tid_setup` descriptor/DMA portion | `dp_rx.c:997-1083` | `reo::ReoTid::setup` | ported | Non-coherent REO qdesc is explicitly synced for device after initialization. |
+| `ath11k_dp_tx_send_reo_cmd` | `dp_tx.c:756-808` | `reo::ReoController::ath11k_dp_tx_send_reo_cmd` | ported | HAL preserves source-supported QueueStats, FlushCache, and UpdateRxQueue commands. |
+| `ath11k_dp_process_reo_status` | `dp_rx.c:858-909` | `reo::ReoController::ath11k_dp_process_reo_status` | ported | Typed status tag/header decode; malformed descriptors fail. |
+| `ath11k_dp_pdev_reo_setup` | `dp_rx.c:546-569` | `reo::ReoController::ath11k_dp_pdev_reo_setup` | wcn6750-specific | Calls HAL WCN6750 REO MMIO setup and owns command/status rings. |
+| `ath11k_dp_pdev_reo_cleanup` | `dp_rx.c:537-544` | `reo::ReoController::ath11k_dp_pdev_reo_cleanup` | ported | Typed REO controller teardown. |
+| `ath11k_dp_alloc` | `dp.c:1048-1119` | `tx::ClientDataPath::ath11k_dp_alloc` | ported | DMA packet pools and HAL ring adapter allocation. |
+| `ath11k_dp_free` | `dp.c:1023-1046` | `tx::ClientDataPath::ath11k_dp_free` | ported | Pending streaming mappings are released by ownership drop. |
+| `ath11k_dp_pdev_pre_alloc` | `dp.c:887-909` | `tx::ClientDataPath::ath11k_dp_pdev_pre_alloc` | ported | ID/cookie pools are initialized by allocation. |
+| `ath11k_dp_pdev_alloc` | `dp.c:911-940` | `tx::ClientDataPath::ath11k_dp_pdev_alloc` | ported | Client RXDMA allocation; monitor attach is deferred separately. |
+| `ath11k_dp_pdev_free` | `dp.c:872-885` | `tx::ClientDataPath::ath11k_dp_pdev_free` | ported | Releases client RXDMA ownership; monitor detach is deferred. |
+| `ath11k_dp_service_srng` client rings | `dp.c:770-866` | `tx::ClientDataPath::ath11k_dp_service_srng` | ported | Bounded TCL/WBM and REO/RXDMA interrupt service. |
+| `DataPath::transmit` MLME frame seam | `dp_tx.c:83-310` | `DataPath::transmit` | local-seam | Vec copy is the intentional safe MLME boundary; internal buffers retain DMA ownership. |
+| `DataPath::receive` MLME frame seam | `dp_rx.c:2534-2648` | `DataPath::receive` | local-seam | Vec copy is the intentional safe MLME boundary; internal buffers retain DMA ownership. |
+| Native HTT golden artifact verifier | `trace.h:36-121` | `golden::{parse_jsonl,verify_trace,GoldenRecord}` | local-seam | Parses `artifacts/redwood-native-ath11k/htt/ordered.jsonl`, validates dynamic-array lengths/lower hex, reports exact/unmapped/first differing offset/decode failure, and runs RX descriptors through the real parser. |
+| Link-descriptor error paths | `dp_rx.c:3380-3480` | `ath11k_hal::descriptors::{RxMsduLink,WbmLinkDescriptor}` | deferred | HAL codecs exist; common STA REO destination path receives direct MSDU buffers. |
+| Link-descriptor release paths | `dp_rx.c:3780-3885` | `ath11k_hal::descriptors::{RxMsduLink,WbmLinkDescriptor}` | deferred | HAL codecs exist; common STA REO destination path receives direct MSDU buffers. |
+| `ath11k_dp_tx_htt_h2t_ppdu_stats_req` | `dp_tx.c:1036-1069` | — | deferred | PPDU telemetry is not required for client bring-up. |
+| `ath11k_dp_tx_htt_h2t_ext_stats_req` | `dp_tx.c:1152-1185` | — | deferred | Debugfs extended statistics. |
+| `ath11k_dp_tx_htt_monitor_mode_ring_config` | `dp_tx.c:1187-1267` | — | deferred | Monitor mode. |
+| `ath11k_dp_tx_htt_rx_full_mon_setup` | `dp_tx.c:1269-1305` | — | deferred | Full monitor mode. |
+| `ath11k_htt_pull_ppdu_stats` and helpers | `dp_rx.c:1224-1602` | — | deferred | PPDU telemetry; native golden capture harness is prepared separately. |
+| `ath11k_htt_pktlog` | `dp_rx.c:1604-1624` | — | deferred | Pktlog telemetry; native golden capture harness is prepared separately. |
+| `ath11k_debugfs_htt_ext_stats_handler` | `dp_rx.c:1736-1738` | — | deferred | Debugfs extended statistics. |
+| RX monitor/pktlog ring processing | `dp_rx.c:4350-5804` | — | deferred | Monitor/AP diagnostics come after the STA client milestone. |
