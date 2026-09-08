@@ -20,6 +20,7 @@ pub enum Error {
     Limit,
     DeviceFault,
     Timeout,
+    Unsupported,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 

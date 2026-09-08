@@ -115,14 +115,12 @@ pub struct PlatformDeviceInfo {
     pub flags: u32,
     pub num_regions: u32,
     pub num_irqs: u32,
+    pub reset_supported: bool,
 }
 
 fn validate_platform_info(info: &DeviceInfo) -> Result<(), String> {
     if info.flags & VFIO_DEVICE_FLAGS_PLATFORM == 0 || info.flags & VFIO_DEVICE_FLAGS_PCI != 0 {
         return Err("VFIO cdev is not a platform device".into());
-    }
-    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
-        return Err("VFIO platform device lacks reset support".into());
     }
     if info.num_regions != 1 {
         return Err(format!(
@@ -168,6 +166,7 @@ pub fn validate_wcn6750_platform_cdev(device: &File) -> Result<PlatformDeviceInf
         flags: info.flags,
         num_regions: info.num_regions,
         num_irqs: info.num_irqs,
+        reset_supported: info.flags & VFIO_DEVICE_FLAGS_RESET != 0,
     })
 }
 #[repr(C)]
@@ -360,6 +359,7 @@ pub mod test_support {
         pci_irqs: Option<[FakeIrq; 2]>,
         bound: bool,
         platform_automasked: bool,
+        platform_reset: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +392,7 @@ pub mod test_support {
                 pci_irqs: None,
                 bound: false,
                 platform_automasked: false,
+                platform_reset: true,
             });
         });
         let result = run();
@@ -411,6 +412,27 @@ pub mod test_support {
                 pci_irqs: None,
                 bound: false,
                 platform_automasked: true,
+                platform_reset: true,
+            });
+        });
+        let result = run();
+        FAKE.with(|fake| *fake.borrow_mut() = None);
+        let recorded = records.borrow().clone();
+        (result, recorded)
+    }
+
+    pub fn with_fake_no_reset_io<T>(run: impl FnOnce() -> T) -> (T, Vec<Record>) {
+        let records = Rc::new(RefCell::new(Vec::new()));
+        FAKE.with(|fake| {
+            assert!(fake.borrow().is_none(), "nested fake VFIO transport");
+            *fake.borrow_mut() = Some(Fake {
+                broker_supported: false,
+                records: Rc::clone(&records),
+                fail_once: None,
+                pci_irqs: None,
+                bound: false,
+                platform_automasked: false,
+                platform_reset: false,
             });
         });
         let result = run();
@@ -434,6 +456,7 @@ pub mod test_support {
                 pci_irqs: Some([msi, msix]),
                 bound: false,
                 platform_automasked: false,
+                platform_reset: true,
             });
         });
         let result = run();
@@ -465,7 +488,12 @@ pub mod test_support {
                     if fake.pci_irqs.is_some() {
                         info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI;
                     } else {
-                        info.flags = VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PLATFORM;
+                        info.flags = VFIO_DEVICE_FLAGS_PLATFORM
+                            | if fake.platform_reset {
+                                VFIO_DEVICE_FLAGS_RESET
+                            } else {
+                                0
+                            };
                         info.num_regions = 1;
                         info.num_irqs = 32;
                     }
@@ -1490,7 +1518,7 @@ pub fn disable_irq(device: &File, index: u32) -> Result<(), String> {
         "disable VFIO IRQ",
     )
 }
-pub fn reset_device_supported(device: &File) -> Result<(), String> {
+pub fn device_reset_supported(device: &File) -> Result<bool, String> {
     let mut info = DeviceInfo {
         argsz: size::<DeviceInfo>(),
         ..Default::default()
@@ -1501,7 +1529,10 @@ pub fn reset_device_supported(device: &File) -> Result<(), String> {
         &mut info,
         "query VFIO reset capability",
     )?;
-    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+    Ok(info.flags & VFIO_DEVICE_FLAGS_RESET != 0)
+}
+pub fn reset_device_supported(device: &File) -> Result<(), String> {
+    if !device_reset_supported(device)? {
         return Err("VFIO device does not advertise reset support".into());
     }
     Ok(())
@@ -1590,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_validation_rejects_each_device_info_mismatch() {
+    fn platform_validation_accepts_external_reset_containment_but_rejects_shape_mismatch() {
         let valid = DeviceInfo {
             flags: VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PLATFORM,
             num_regions: 1,
@@ -1598,13 +1629,16 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_platform_info(&valid).is_ok());
+        assert!(
+            validate_platform_info(&DeviceInfo {
+                flags: VFIO_DEVICE_FLAGS_PLATFORM,
+                ..valid
+            })
+            .is_ok()
+        );
         for invalid in [
             DeviceInfo {
                 flags: VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI,
-                ..valid
-            },
-            DeviceInfo {
-                flags: VFIO_DEVICE_FLAGS_PLATFORM,
                 ..valid
             },
             DeviceInfo {
