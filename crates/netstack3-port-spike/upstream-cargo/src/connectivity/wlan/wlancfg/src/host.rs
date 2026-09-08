@@ -237,3 +237,38 @@ pub mod mode_management {
         }
     }
 }
+
+/// Narrow handoff from wlancfg selection policy to the Wi-Fi service.
+///
+/// The command contains only the selected BSS and the authentication material
+/// for this connection attempt.  Saved-network storage, candidate selection,
+/// retry, and roaming policy remain on the wlancfg side; SME/MLME/RSN retain
+/// the association and authentication state machines on the Wi-Fi side.
+pub mod service_boundary {
+    use crate::client::types::ScannedCandidate;
+    use fidl_fuchsia_wlan_common::ScanType;
+    use fidl_fuchsia_wlan_sme::ConnectRequest;
+    use wlan_common::sequestered::Sequestered;
+
+    pub struct WifiConnectCommand(ConnectRequest);
+
+    impl WifiConnectCommand {
+        /// Promote the output of the pinned selector into the sole connection
+        /// command sent to the Wi-Fi service.
+        pub fn from_selected(candidate: ScannedCandidate) -> Self {
+            Self(ConnectRequest {
+                ssid: candidate.network.ssid.to_vec(),
+                bss_description: Sequestered::release(candidate.bss.bss_description),
+                multiple_bss_candidates: candidate.network_has_multiple_bss,
+                authentication: candidate.authenticator.into(),
+                // Preserve pinned Fuchsia wlancfg state-machine behavior. This
+                // legacy field does not describe how the winning BSS was seen.
+                deprecated_scan_type: ScanType::Active,
+            })
+        }
+
+        pub fn into_sme_request(self) -> ConnectRequest {
+            self.0
+        }
+    }
+}

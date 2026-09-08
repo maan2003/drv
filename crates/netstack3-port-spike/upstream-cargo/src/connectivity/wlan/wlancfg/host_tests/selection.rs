@@ -6,7 +6,7 @@ use fidl_fuchsia_wlan_common::{ScanType, SecuritySupport, SpectrumManagementSupp
 use fidl_fuchsia_wlan_ieee80211::{
     BssDescription, BssType, ChannelBandwidth, ChannelNumber, WlanBand,
 };
-use fidl_fuchsia_wlan_internal::{Authentication, Protocol};
+use fidl_fuchsia_wlan_internal::{Authentication, Credentials, Protocol, WpaCredentials};
 use fidl_fuchsia_wlan_mlme::{BandCapability, DeviceInfo};
 use fidl_fuchsia_wlan_sme::ConnectRequest;
 use fidl_fuchsia_wlan_sme::Protection;
@@ -36,6 +36,7 @@ use wlancfg_selection::config_management::{
     Credential, NetworkConfig, NetworkConfigError, PastConnectionData, PastConnectionList,
     SavedNetworksManagerApi,
 };
+use wlancfg_selection::service_boundary::WifiConnectCommand;
 use wlancfg_selection::telemetry::{TelemetryEvent, TelemetrySender};
 use wlancfg_selection::wlan_metrics_registry::PolicyConnectionAttemptMigratedMetricDimensionReason as ConnectReason;
 
@@ -237,6 +238,21 @@ fn bss(
     }
 }
 
+fn wpa3_bss(bssid: [u8; 6], ssid: &[u8]) -> Bss {
+    Bss {
+        bssid: bssid.into(),
+        signal: Signal {
+            rssi_dbm: -30,
+            snr_db: 30,
+        },
+        channel: channel(1),
+        timestamp: zx::MonotonicInstant::from_nanos(1),
+        observation: ScanObservation::Active,
+        compatibility: Compatible::expect_ok([SecurityDescriptor::WPA3_PERSONAL]),
+        bss_description: Sequestered::from(fidl_bss(bssid, ssid, 1, -30)),
+    }
+}
+
 fn scan_result(ssid: &[u8], entries: Vec<Bss>) -> ScanResult {
     ScanResult {
         ssid: types::Ssid::from_bytes_unchecked(ssid.to_vec()),
@@ -253,6 +269,19 @@ fn open_config(ssid: &[u8]) -> NetworkConfig {
             SecurityType::None,
         ),
         Credential::None,
+        true,
+        Some(0.0),
+    )
+    .unwrap()
+}
+
+fn wpa3_config(ssid: &[u8], password: &[u8]) -> NetworkConfig {
+    NetworkConfig::new(
+        NetworkIdentifier::new(
+            types::Ssid::from_bytes_unchecked(ssid.to_vec()),
+            SecurityType::Wpa3,
+        ),
+        Credential::Password(password.to_vec()),
         true,
         Some(0.0),
     )
@@ -304,12 +333,56 @@ fn directed_selection_uses_pinned_filter_and_score_order() {
             .expect("pinned selector should choose a compatible BSS");
 
         assert_eq!(selected.bss.bssid, strongest.into());
+        let request = WifiConnectCommand::from_selected(selected).into_sme_request();
+        assert_eq!(request.ssid, ssid);
+        assert_eq!(request.bss_description.bssid, strongest);
+        assert!(request.multiple_bss_candidates);
+        assert_eq!(request.authentication.protocol, Protocol::Open);
+        assert!(request.authentication.credentials.is_none());
+        assert_eq!(request.deprecated_scan_type, ScanType::Active);
         let calls = scan.calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].reason, ScanReason::BssSelection);
         assert_eq!(calls[0].ssids[0].to_vec(), ssid);
         assert!(calls[0].channels.is_empty());
         assert_eq!(saved.compatible_lookups.lock().await.len(), 1);
+    });
+}
+
+#[test]
+fn wifi_command_contains_only_the_selected_active_credential() {
+    block_on(async {
+        let ssid = b"secured";
+        let password = b"synthetic-password";
+        let address = [2, 0, 0, 0, 0, 4];
+        let scan = Arc::new(SpyScan::new(vec![Ok(vec![ScanResult {
+            ssid: types::Ssid::from_bytes_unchecked(ssid.to_vec()),
+            security_type_detailed: Protection::Wpa3Personal,
+            entries: vec![wpa3_bss(address, ssid)],
+            compatibility: wlancfg_selection::fidl_fuchsia_wlan_policy::Compatibility::Supported,
+        }])]));
+        let saved = Arc::new(SpySavedNetworks::new(vec![wpa3_config(ssid, password)]));
+        let (selector, _telemetry) = selector(scan, saved);
+        let target = NetworkIdentifier::new(
+            types::Ssid::from_bytes_unchecked(ssid.to_vec()),
+            SecurityType::Wpa3,
+        );
+
+        let selected = selector
+            .find_and_select_connection_candidate(Some(target), ConnectReason::FidlConnectRequest)
+            .await
+            .expect("pinned selector should choose the saved WPA3 network");
+        let request = WifiConnectCommand::from_selected(selected).into_sme_request();
+
+        assert_eq!(request.ssid, ssid);
+        assert_eq!(request.bss_description.bssid, address);
+        assert_eq!(request.authentication.protocol, Protocol::Wpa3Personal);
+        assert_eq!(
+            request.authentication.credentials,
+            Some(Box::new(Credentials::Wpa(WpaCredentials::Passphrase(
+                password.to_vec()
+            ))))
+        );
     });
 }
 
