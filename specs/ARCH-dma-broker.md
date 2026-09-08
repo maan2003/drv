@@ -29,122 +29,109 @@ This boundary refines [ARCH-hardware-isolation](ARCH-hardware-isolation.md) and
 is constrained by [REQ-isolation](REQ-isolation.md) and
 [REQ-host-portability](REQ-host-portability.md).
 
-## UAPI
+## VFIO device-feature UAPI
 
-The broker exposes one file descriptor bound to one VFIO-owned device. The
-native backend obtains the corresponding `/dev/drv-dma/<vfio-device-id>`
-node; opening fails unless that device and its complete viable IOMMU group are
-exclusively owned by the same caller's VFIO context. Closing the fd revokes all
-handles after unmapping them.
+Broker mode is a mode of the vfio-platform device, not a second character
+device. The device remains attached to its kernel default IOMMU/SMMU domain
+and is never attached to a userspace iommufd IOAS. The vfio-platform driver is
+therefore the sole DMA-domain owner. The VFIO group still provides exclusive
+device ownership, and the existing VFIO device fd remains the sole authority
+for MMIO, IRQ, reset, and DMA broker operations.
 
-All fields are fixed-width little-endian native UAPI integers. Every request
-must set `argsz` to the structure size and all `flags` and reserved fields
-to zero. Unknown flags, short structures, arithmetic overflow, zero sizes,
-invalid alignment, stale handles, disallowed directions, and out-of-range
-subranges fail without changing state.
+The device fd advertises one out-of-tree `VFIO_DEVICE_FEATURE_DMA_BROKER`
+feature. Its `data[]` starts with `struct vfio_device_dma_broker`, whose
+`operation` selects `ALLOC_COHERENT`, `MAP_STREAMING`, `SYNC_CPU`,
+`SYNC_DEVICE`, `FREE`, or `UNMAP`. `VFIO_DEVICE_FEATURE_PROBE` reports whether
+broker mode is available. Operations use `VFIO_DEVICE_FEATURE_SET`; the kernel
+copies allocation and mapping outputs back through the same argument. There is
+no independent broker fd, arbitrary map ioctl, user-supplied IOVA, or raw
+physical-address interface.
 
 ```c
-#define DRV_DMA_IOC_MAGIC 0xDA
-#define DRV_DMA_TO_DEVICE     1
-#define DRV_DMA_FROM_DEVICE   2
-#define DRV_DMA_BIDIRECTIONAL 3
+#define VFIO_DEVICE_FEATURE_DMA_BROKER  /* out-of-tree feature index */
+#define VFIO_DMA_BROKER_ALLOC_COHERENT  1
+#define VFIO_DMA_BROKER_MAP_STREAMING   2
+#define VFIO_DMA_BROKER_SYNC_CPU        3
+#define VFIO_DMA_BROKER_SYNC_DEVICE     4
+#define VFIO_DMA_BROKER_FREE            5
+#define VFIO_DMA_BROKER_UNMAP           6
+#define VFIO_DMA_TO_DEVICE              1
+#define VFIO_DMA_FROM_DEVICE            2
+#define VFIO_DMA_BIDIRECTIONAL           3
 
-struct drv_dma_alloc_coherent {
+struct vfio_device_dma_broker {
         __u32 argsz;
-        __u32 flags;
-        __u64 size;                 /* in */
-        __u64 alignment;            /* in, nonzero power of two */
-        __u64 max_device_address;   /* in, inclusive */
-        __u32 handle;               /* out */
-        __u32 reserved;
-        __u64 mmap_offset;          /* out, broker-fd offset */
-        __u64 iova;                 /* out */
-};
-
-struct drv_dma_map_streaming {
-        __u32 argsz;
-        __u32 flags;
-        __u64 user_address;         /* in, page-owned backend arena */
-        __u64 size;                 /* in */
-        __u64 alignment;            /* in, nonzero power of two */
-        __u64 max_device_address;   /* in, inclusive */
-        __u32 direction;            /* in, DRV_DMA_* */
-        __u32 handle;               /* out */
-        __u64 iova;                 /* out, contiguous for size bytes */
-};
-
-struct drv_dma_sync {
-        __u32 argsz;
-        __u32 flags;
-        __u32 handle;               /* in */
-        __u32 reserved;
-        __u64 offset;               /* in */
-        __u64 length;               /* in */
-};
-
-struct drv_dma_release {
-        __u32 argsz;
-        __u32 flags;
-        __u32 handle;               /* in */
+        __u32 operation;
+        __u32 flags;                    /* must be zero */
+        __u32 handle;                   /* output for alloc/map; input otherwise */
+        __u64 size;                     /* alloc/map input */
+        __u64 alignment;                /* alloc/map input, power of two */
+        __u64 max_device_address;       /* alloc/map input, inclusive */
+        __u64 user_address;             /* streaming-map input only */
+        __u64 offset;                   /* sync subrange input */
+        __u64 length;                   /* sync subrange input */
+        __u64 mmap_offset;              /* coherent-allocation output */
+        __u64 iova;                     /* alloc/map output */
+        __u32 direction;                /* streaming-map input */
         __u32 reserved;
 };
-
-#define DRV_DMA_ALLOC_COHERENT _IOWR(DRV_DMA_IOC_MAGIC, 0x00, \
-                                     struct drv_dma_alloc_coherent)
-#define DRV_DMA_MAP_STREAMING  _IOWR(DRV_DMA_IOC_MAGIC, 0x01, \
-                                     struct drv_dma_map_streaming)
-#define DRV_DMA_SYNC_CPU       _IOW (DRV_DMA_IOC_MAGIC, 0x02, \
-                                     struct drv_dma_sync)
-#define DRV_DMA_SYNC_DEVICE    _IOW (DRV_DMA_IOC_MAGIC, 0x03, \
-                                     struct drv_dma_sync)
-#define DRV_DMA_FREE           _IOW (DRV_DMA_IOC_MAGIC, 0x04, \
-                                     struct drv_dma_release)
-#define DRV_DMA_UNMAP          _IOW (DRV_DMA_IOC_MAGIC, 0x05, \
-                                     struct drv_dma_release)
 ```
 
-`ALLOC_COHERENT` uses the device's coherent DMA allocator, returns one
-allocation-derived IOVA, and permits exactly one shared, non-executable mmap of
-the returned size and offset. `FREE` applies only to coherent handles and
-fails while a userspace mapping remains.
+The structure is carried in `struct vfio_device_feature.data`; both `argsz`
+values must cover the supplied structures. Unknown flags, short structures,
+nonzero reserved fields, arithmetic overflow, zero sizes, invalid alignment,
+stale handles, disallowed directions, and out-of-range subranges fail without
+changing state. Closing the VFIO device fd revokes every handle after the
+required final ownership transition and unmap.
 
-`MAP_STREAMING` pins only pages in a backend-owned anonymous arena, maps them
-through the broker-owned DMA domain in the declared direction, and succeeds
-only if the entire range has one contiguous device-address interval satisfying
-the requested alignment and maximum address. `UNMAP` applies only to
-streaming handles. It performs the final direction-appropriate CPU ownership
-transition before unpinning.
+`ALLOC_COHERENT` calls the ordinary DMA API for this device, returns its
+DMA address, and permits exactly one shared, non-executable mmap at the
+returned VFIO device-fd offset. `FREE` applies only to coherent handles and
+fails while that userspace mapping remains.
 
-`SYNC_DEVICE` accepts only to-device or bidirectional handles and invokes the
-DMA API's device-ownership transition for exactly the checked subrange.
-`SYNC_CPU` accepts only from-device or bidirectional handles and invokes the
-CPU-ownership transition before returning. Synchronization is serialized with
-unmap, free, and reset. It is never implemented as a compiler fence, CPU fence,
-dirty-tracking operation, or no-op on a non-coherent device.
+`MAP_STREAMING` pins only pages in a backend-owned anonymous arena and maps
+them with the ordinary DMA API in the declared direction. It succeeds only if
+the range has one contiguous device-address interval meeting the alignment
+and maximum-address constraints. `UNMAP` applies only to streaming handles and
+performs the final direction-appropriate CPU ownership transition before
+unpinning.
 
-The broker records the allocation kind, direction, mapped length, DMA mapping
-metadata, and owning file for every unpredictable handle. It validates
-`offset + length <= mapped_length` with checked arithmetic and never accepts
-an IOVA, physical address, kernel pointer, arbitrary fd, or arbitrary page
-range from the caller.
+`SYNC_DEVICE` and `SYNC_CPU` invoke `dma_sync_single_for_device` and
+`dma_sync_single_for_cpu` for exactly the validated subrange. Synchronization
+is serialized with unmap, free, and reset. It is never implemented as a CPU
+fence, dirty-tracking operation, IOAS map/unmap cycle, or no-op on a
+non-coherent device.
+
+The vfio-platform device records allocation kind, direction, mapped length,
+DMA metadata, and owning device file for every unpredictable handle. It
+validates `offset + length <= mapped_length` with checked arithmetic. Reset and
+file close revoke all DMA state. No operation accepts an IOVA, physical
+address, kernel pointer, arbitrary fd, or arbitrary page range from the
+caller.
 
 ## Portable API mapping
 
 | `drv-hardware` operation | Coherent device | Non-coherent device |
 |---|---|---|
-| `alloc_coherent` | backend arena plus `IOMMU_IOAS_MAP` | `ALLOC_COHERENT` and broker mmap |
-| `alloc_streaming` | backend arena plus `IOMMU_IOAS_MAP` | backend arena plus `MAP_STREAMING` |
+| `alloc_coherent` | backend arena plus `IOMMU_IOAS_MAP` | `ALLOC_COHERENT` and VFIO device-fd mmap |
+| `alloc_streaming` | backend arena plus `IOMMU_IOAS_MAP` | backend arena plus `MAP_STREAMING` device feature |
 | `DeviceAddress` | IOAS-derived IOVA plus checked offset | broker-derived IOVA plus checked offset |
 | `sync_for_cpu` | validated no-op after acquire ordering | `SYNC_CPU` |
 | `sync_for_device` | validated no-op before release ordering | `SYNC_DEVICE` |
 | DMA drop | `IOMMU_IOAS_UNMAP`, then arena release | `FREE` or `UNMAP`, then arena release |
-| reset | revoke IOAS mappings before VFIO reset | revoke broker handles before VFIO reset |
+| reset | revoke IOAS mappings before VFIO reset | revoke broker handles as part of VFIO reset |
 
 The backend's MMIO reads remain acquire operations and MMIO writes remain
 release operations as specified by `Backend`. Cache synchronization and
 MMIO ordering are separate obligations.
 
 ## Alternatives
+
+An iommufd-native non-coherent mode remains the preferred upstream future. It
+would require explicit non-coherent IOAS mapping, cache synchronization and
+uncached/coherent allocation UAPIs, together with a controlled relaxation of
+the current coherency rejection. That cross-subsystem design is substantially
+larger than the vfio-platform-local broker and is not assumed by this backend.
 
 Userspace cache instructions are rejected because their availability depends
 on architecture and privileged control state. Treating sync as a fence or
