@@ -1,3 +1,4 @@
+// PORT-MAP: local-seam
 #![no_std]
 #![forbid(unsafe_code)]
 //! Re-export of the project portable hardware contract for ath11k backends.

@@ -4,6 +4,7 @@ device=${REDWOOD_WIFI_DEVICE:-17a10040.wifi}
 driver_dir=${REDWOOD_DRIVER_DIR:-/sys/bus/platform/drivers/ath11k}
 report_dir=${REDWOOD_REPORT_DIR:-/var/lib/ath11k-redwood-lab}
 systemctl_cmd=${REDWOOD_SYSTEMCTL:-systemctl}
+inhibit_cmd=${REDWOOD_SYSTEMD_INHIBIT:-systemd-inhibit}
 ip_cmd=${REDWOOD_IP:-ip}
 deadline=${REDWOOD_DEADLINE_SECONDS:-120}
 restore() {
@@ -43,7 +44,7 @@ SH
    echo SELF_TEST_RESTORE_OK
    exit;;
  --plan)
-   echo "PLAN device=$device deadline_seconds=$deadline local_systemd_restore=true durable_report=$report_dir"
+   echo "PLAN device=$device deadline_seconds=$deadline local_systemd_restore=true sleep_inhibited=true durable_report=$report_dir"
    exit;;
  --run) shift;;
  *) echo "usage: $0 --plan|--self-test|--restore|--run COMMAND..." >&2; exit 2;;
@@ -61,4 +62,5 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT HUP INT TERM
-timeout --signal=TERM --kill-after=10 "${deadline}s" "$@"
+"$inhibit_cmd" --what=sleep --mode=block --why="Redwood Wi-Fi lab transaction" \
+  timeout --signal=TERM --kill-after=10 "${deadline}s" "$@"
