@@ -8,10 +8,12 @@ still requires external DHCP/DNS/TCP proof and its lifetime is bounded: these
 are lab behavior, not the mature service contract. The service implementation
 and executable live in `drv-network-service`, independent of Wi-Fi runtime
 ownership. A Linux socket-provider spike also exists but is not the required
-application path. Offline/loss recovery, service-generation handling, lease-change
-socket preservation, and independent restart of the physical/SOCKS service
-remain destination behavior. Tests of the separate socket-provider spike do
-not establish those properties for this service.
+application path. The standalone service starts offline, and its process
+supervisor replaces and reaps sandboxed children across tested Ethernet
+capability generations. Wiring that supervisor to the Wi-Fi service's rotated
+capabilities, lease-change socket preservation, and automatic restart of the
+physical/SOCKS path remain destination behavior. Tests of the separate
+socket-provider spike do not establish those properties for this service.
 
 One sandboxed portable network service owns Ethernet, ARP/NDP, IP,
 fragmentation, ICMP, UDP, TCP, and routing. It is not split by DNS domain, remote
