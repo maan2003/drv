@@ -28,6 +28,9 @@ impl Subsystems for Model {
     fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
         Ok(None)
     }
+    fn client_nss(&self) -> Result<u8, CoreError> {
+        Ok(2)
+    }
 }
 
 fn ready_device() -> Device<Model> {
@@ -186,7 +189,7 @@ fn client_sequence_preserves_mac_c_wmi_order() {
         device.backend().log,
         vec![
             Operation::WmiVdevCreate { vdev, mac },
-            Operation::WmiVdevSetNss { vdev, nss: 1 },
+            Operation::WmiVdevSetNss { vdev, nss: 2 },
             Operation::WmiStaPsRxWake { vdev },
             Operation::WmiStaPsTxWake { vdev },
             Operation::WmiStaPsPollCount { vdev },
@@ -315,7 +318,7 @@ fn vdev_configuration_failure_deletes_firmware_vdev() {
     device.backend_mut().log.clear();
     device.backend_mut().fail = Some(Operation::WmiVdevSetNss {
         vdev: VdevId(0),
-        nss: 1,
+        nss: 2,
     });
     assert_eq!(
         device.create_client_vdev([2, 0, 0, 0, 0, 1]),

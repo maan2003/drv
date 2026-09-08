@@ -335,7 +335,7 @@ fn collect_scan_results<B: ath11k_core::Subsystems>(
             Some(ath11k_core::WlanEvent::Scan {
                 event_type,
                 reason,
-                scan_id: 1,
+                scan_id: 0xa000,
                 ..
             }) if event_type & SCAN_EVENT_COMPLETED != 0 => {
                 if reason != 0 {
@@ -402,7 +402,7 @@ fn diagnostic_wmi_events() -> Vec<(u32, Vec<u8>)> {
     let mut mgmt_tlvs = tlv(WMI_TAG_MGMT_RX_HDR.0, &header);
     mgmt_tlvs.extend(tlv(WMI_TAG_ARRAY_BYTE.0, &frame_tlv));
 
-    let words = [SCAN_EVENT_COMPLETED, 0, 0, 1, 1, 0, 0];
+    let words = [SCAN_EVENT_COMPLETED, 0, 0, 1, 0xa000, 0, 0];
     let scan_fixed: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
     vec![
         (
@@ -419,7 +419,7 @@ fn diagnostic_wmi_events() -> Vec<(u32, Vec<u8>)> {
 fn dry_scan_config(vdev: ath11k_core::VdevId) -> ath11k_core::ScanConfig {
     ath11k_core::ScanConfig {
         vdev,
-        id: ath11k_core::ScanId(1),
+        id: ath11k_core::ScanId(0xa000),
         active: false,
         channels_mhz: vec![2412, 2437, 2462],
         ssids: Vec::new(),
@@ -508,7 +508,7 @@ impl Host for DryRunHost {
                 event_type: SCAN_EVENT_COMPLETED,
                 reason: 0,
                 request_id: 1,
-                scan_id: 1,
+                scan_id: 0xa000,
                 vdev_id: u32::from(self.vdev.unwrap().0),
                 channel_mhz: 0,
             });
@@ -549,19 +549,19 @@ impl DryRunHost {
         let vdev_id = u32::from(self.vdev.unwrap().0);
         self.record_command(&VdevCreate {
             vdev_id,
-            vdev_type: 0,
+            vdev_type: 2,
             vdev_subtype: 0,
             mac_addr: [0x02, 0, 0, 0, 0, 1],
             pdev_id: 0,
             mbssid_flags: 0,
             mbssid_tx_vdev_id: 0,
-            band_2ghz: TxRxStreams { tx: 1, rx: 1 },
-            band_5ghz: TxRxStreams { tx: 1, rx: 1 },
+            band_2ghz: TxRxStreams { tx: 2, rx: 2 },
+            band_5ghz: TxRxStreams { tx: 2, rx: 2 },
         })?;
         self.record_command(&VdevSetParam {
             vdev_id,
             param_id: 0x22,
-            param_value: 1,
+            param_value: 2,
         })?;
         for (param, value) in [(0, 0), (1, 1), (2, 0)] {
             self.record_command(&StaPowerSaveParameter {
@@ -574,7 +574,7 @@ impl DryRunHost {
         self.record_command(&VdevSetParam {
             vdev_id,
             param_id: 1,
-            param_value: 2347,
+            param_value: u32::MAX,
         })
     }
 
@@ -885,7 +885,8 @@ impl<W: Write> WmiJsonl<W> {
         for byte in bytes {
             write!(self.writer, "{byte:02x}")?;
         }
-        writeln!(self.writer, "\"}}")
+        writeln!(self.writer, "\"}}")?;
+        self.writer.flush()
     }
 
     pub fn into_inner(self) -> W {
@@ -896,6 +897,16 @@ impl<W: Write> WmiJsonl<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushFailure;
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
 
     #[derive(Default)]
     struct Fake {
@@ -982,6 +993,15 @@ mod tests {
         assert_eq!(
             String::from_utf8(log.into_inner()).unwrap(),
             "{\"seq\":0,\"ts_ns\":9,\"kind\":\"wmi_cmd\",\"id\":17,\"len\":2,\"bytes_hex\":\"00af\"}\n{\"seq\":1,\"ts_ns\":10,\"kind\":\"wmi_event\",\"id\":18,\"len\":0,\"bytes_hex\":\"\"}\n"
+        );
+    }
+
+    #[test]
+    fn jsonl_flush_failure_fails_the_record() {
+        assert!(
+            WmiJsonl::new(FlushFailure)
+                .record_at(0, WmiKind::Event, 1, &[])
+                .is_err()
         );
     }
 

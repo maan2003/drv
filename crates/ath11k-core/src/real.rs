@@ -33,10 +33,14 @@ pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart
         scan_id: scan.id.0,
         scan_requester_id: 1,
         vdev_id: u32::from(scan.vdev.0),
-        scan_priority: 0,
+        scan_priority: 2,
         notify_scan_events: 0,
         event_flags: ScanEventFlags {
+            started: true,
             completed: true,
+            bss_channel: true,
+            foreign_channel: true,
+            dequeued: true,
             ..Default::default()
         },
         control_flags: ScanControlFlags {
@@ -45,25 +49,25 @@ pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart
             ..Default::default()
         },
         control_flags_ext: 0,
-        dwell_time_active: 0,
+        dwell_time_active: 50,
         dwell_time_active_2ghz: 0,
-        dwell_time_passive: 110,
-        dwell_time_active_6ghz: 0,
-        dwell_time_passive_6ghz: 110,
+        dwell_time_passive: 150,
+        dwell_time_active_6ghz: 40,
+        dwell_time_passive_6ghz: 30,
         min_rest_time: 50,
         max_rest_time: 500,
         repeat_probe_time: 0,
         probe_spacing_time: 0,
         idle_time: 0,
-        max_scan_time: 30_000,
-        probe_delay: 0,
+        max_scan_time: 20_000,
+        probe_delay: 5,
         burst_duration: 0,
         n_probes: 0,
         mac_addr: [0; 6],
         mac_mask: [0; 6],
         channels: scan.channels_mhz.into_iter().map(u32::from).collect(),
         ssids: scan.ssids,
-        bssids: Vec::new(),
+        bssids: alloc::vec![[0xff; 6]],
         extra_ie: Vec::new(),
         short_ssid_hints: Vec::new(),
         bssid_hints: Vec::new(),
@@ -406,6 +410,20 @@ where
         }
     }
 
+    fn client_nss(&self) -> Result<u8, CoreError> {
+        let chains = self
+            .service_ready
+            .as_ref()
+            .and_then(|state| state.service_ready.as_ref())
+            .and_then(|ready| ready.fixed.as_ref())
+            .map(|fixed| fixed.num_rf_chains)
+            .ok_or(CoreError::Protocol)?;
+        u8::try_from(chains)
+            .ok()
+            .filter(|chains| *chains != 0)
+            .ok_or(CoreError::Protocol)
+    }
+
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError> {
         match operation {
             Operation::QmiInitService => self.qmi.init_service().map_err(|_| CoreError::Protocol),
@@ -535,17 +553,20 @@ where
                     .map(|_| ())
                     .map_err(|_| CoreError::Protocol)
             }
-            Operation::WmiVdevCreate { vdev, mac } => self.wmi_send(&VdevCreate {
-                vdev_id: u32::from(vdev.0),
-                vdev_type: 0,
-                vdev_subtype: 0,
-                mac_addr: mac,
-                pdev_id: 0,
-                mbssid_flags: 0,
-                mbssid_tx_vdev_id: 0,
-                band_2ghz: TxRxStreams { tx: 1, rx: 1 },
-                band_5ghz: TxRxStreams { tx: 1, rx: 1 },
-            }),
+            Operation::WmiVdevCreate { vdev, mac } => {
+                let nss = u32::from(self.client_nss()?);
+                self.wmi_send(&VdevCreate {
+                    vdev_id: u32::from(vdev.0),
+                    vdev_type: 2,
+                    vdev_subtype: 0,
+                    mac_addr: mac,
+                    pdev_id: 0,
+                    mbssid_flags: 0,
+                    mbssid_tx_vdev_id: 0,
+                    band_2ghz: TxRxStreams { tx: nss, rx: nss },
+                    band_5ghz: TxRxStreams { tx: nss, rx: nss },
+                })
+            }
             Operation::WmiVdevSetNss { vdev, nss } => self.wmi_send(&VdevSetParam {
                 vdev_id: u32::from(vdev.0),
                 param_id: 0x22,
