@@ -219,8 +219,8 @@ fn route_for_vector(vector: u32, routes: &[InterruptRoute]) -> Option<Wcn6750Irq
         .map(|route| route.irq)
 }
 
-/// Hardware-facing body of `ath11k_ahb_ce_interrupt_handler` after the host
-/// interrupt source has been masked by the platform backend.
+/// Hardware-facing body of `ath11k_ahb_ce_interrupt_handler` after the
+/// platform backend has delivered the interrupt notification.
 pub fn service_ce_interrupt<B: ath11k_platform_backend::Backend>(
     pipes: &mut ath11k_ce::CePipes<B>,
     mmio: &ath11k_platform_backend::MmioRegion<B>,
