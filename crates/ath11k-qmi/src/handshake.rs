@@ -132,6 +132,11 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
         }
     }
 
+    /// Access platform memory state populated by completed QMI exchanges.
+    pub fn memory_mut(&mut self) -> &mut M {
+        &mut self.memory
+    }
+
     /// Portable replacement for `ath11k_qmi_init_service`.
     pub fn init_service(&mut self, transport: &mut dyn Transport) -> Result<(), QmiError> {
         transport.start_service(wire::SERVICE_VERSION, wire::WCN6750_SERVICE_INSTANCE)
