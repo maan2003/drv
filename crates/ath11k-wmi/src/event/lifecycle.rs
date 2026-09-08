@@ -8,12 +8,12 @@ use crate::tags::{
     WMI_TAG_ARRAY_UINT32, WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT,
     WMI_TAG_HW_MODE_CAPABILITIES, WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT,
     WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
-    WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS,
+    WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS, WMI_VDEV_START_RESP_EVENTID,
 };
 use crate::trace::{RejectReason, TraceEvent, TraceSink};
 use crate::{Event, Transport, WmiError};
 
-use super::{EventDecoder, Ready, ReadyDecoder, TlvIter, word};
+use super::{Decoder, EventDecoder, Ready, ReadyDecoder, TlvIter, VdevStartResponse, word};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceReadyFixed {
@@ -544,6 +544,36 @@ impl<T: Transport> EventStream<T> {
                 .ok_or(WmiError::Timeout)?;
             if event.id == WMI_READY_EVENTID {
                 return ReadyDecoder.decode(event);
+            }
+            self.pending.push(event);
+        }
+    }
+
+    pub fn wait_for_vdev_start(
+        &mut self,
+        deadline_ns: u64,
+        vdev_id: u32,
+    ) -> Result<VdevStartResponse, WmiError> {
+        if let Some(index) = self.pending.iter().position(|event| {
+            event.id == WMI_VDEV_START_RESP_EVENTID
+                && Decoder::<VdevStartResponse>::new(WMI_VDEV_START_RESP_EVENTID)
+                    .decode(event.clone())
+                    .is_ok_and(|response| response.vdev_id == vdev_id)
+        }) {
+            return Decoder::<VdevStartResponse>::new(WMI_VDEV_START_RESP_EVENTID)
+                .decode(self.pending.remove(index));
+        }
+        loop {
+            let event = self
+                .transport
+                .receive(deadline_ns)?
+                .ok_or(WmiError::Timeout)?;
+            if event.id == WMI_VDEV_START_RESP_EVENTID {
+                let response = Decoder::<VdevStartResponse>::new(WMI_VDEV_START_RESP_EVENTID)
+                    .decode(event.clone())?;
+                if response.vdev_id == vdev_id {
+                    return Ok(response);
+                }
             }
             self.pending.push(event);
         }

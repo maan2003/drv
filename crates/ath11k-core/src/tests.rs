@@ -118,6 +118,35 @@ fn wcn6750_parameters_and_static_windows_match_source() {
 }
 
 #[test]
+fn client_20mhz_channel_words_match_wmi_c_bitfields() {
+    let channel = Channel::client_20mhz(RegulatoryChannel {
+        frequency_mhz: 2437,
+        max_power_dbm: 20,
+        max_reg_power_dbm: 18,
+        max_antenna_gain_dbi: 6,
+        passive: true,
+        radar: false,
+        allow_ht: true,
+        allow_vht: true,
+        allow_he: true,
+    });
+    assert_eq!(
+        (
+            channel.primary_mhz,
+            channel.center1_mhz,
+            channel.center2_mhz
+        ),
+        (2437, 2437, 0)
+    );
+    // The pinned station path sets only phymode and NO_IR/passive. DFS and
+    // allow-HT/VHT/HE are left zero even though regulatory metadata retains
+    // those facts for other command paths.
+    assert_eq!(channel.info, 21 | (1 << 7));
+    assert_eq!(channel.reg_info_1, (20 << 8) | (18 << 16));
+    assert_eq!(channel.reg_info_2, 6 | (20 << 8));
+}
+
+#[test]
 fn firmware_ready_runs_core_c_order() {
     let device = ready_device();
     assert_eq!(device.state(), DeviceState::Ready);
@@ -157,8 +186,19 @@ fn client_sequence_preserves_mac_c_wmi_order() {
     device.backend_mut().log.clear();
     let mac = [2, 0, 0, 0, 0, 1];
     let bssid = [2, 0, 0, 0, 0, 2];
+    let channel = RegulatoryChannel {
+        frequency_mhz: 5180,
+        max_power_dbm: 23,
+        max_reg_power_dbm: 23,
+        max_antenna_gain_dbi: 6,
+        passive: false,
+        radar: false,
+        allow_ht: true,
+        allow_vht: true,
+        allow_he: true,
+    };
     let vdev = device.create_client_vdev(mac).unwrap();
-    device.start_vdev(vdev, 5180).unwrap();
+    device.start_vdev(vdev, channel).unwrap();
     device
         .start_scan(ScanConfig {
             vdev,
@@ -201,7 +241,8 @@ fn client_sequence_preserves_mac_c_wmi_order() {
             Operation::DpVdevTxAttach { vdev },
             Operation::WmiVdevStart {
                 vdev,
-                channel: Channel::from_primary_frequency(5180)
+                restart: false,
+                channel: Channel::client_20mhz(channel)
             },
             Operation::WaitVdevSetup { vdev },
             Operation::WmiScanStart(ScanConfig {
@@ -257,6 +298,71 @@ fn client_sequence_preserves_mac_c_wmi_order() {
             },
         ]
     );
+}
+
+#[test]
+fn repeated_channel_set_uses_vdev_restart_only_after_completed_start() {
+    let mut device = ready_device();
+    let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
+    let channel = RegulatoryChannel {
+        frequency_mhz: 2437,
+        max_power_dbm: 20,
+        max_reg_power_dbm: 20,
+        max_antenna_gain_dbi: 0,
+        passive: false,
+        radar: false,
+        allow_ht: true,
+        allow_vht: true,
+        allow_he: true,
+    };
+    device.backend_mut().log.clear();
+    device.start_vdev(vdev, channel).unwrap();
+    device.start_vdev(vdev, channel).unwrap();
+    assert_eq!(
+        device.backend().log,
+        vec![
+            Operation::WmiVdevStart {
+                vdev,
+                restart: false,
+                channel: Channel::client_20mhz(channel),
+            },
+            Operation::WaitVdevSetup { vdev },
+            Operation::WmiVdevStart {
+                vdev,
+                restart: true,
+                channel: Channel::client_20mhz(channel),
+            },
+            Operation::WaitVdevSetup { vdev },
+        ]
+    );
+}
+
+#[test]
+fn failed_vdev_start_completion_does_not_promote_restart_state() {
+    let mut device = ready_device();
+    let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
+    let channel = RegulatoryChannel {
+        frequency_mhz: 2437,
+        max_power_dbm: 20,
+        max_reg_power_dbm: 20,
+        max_antenna_gain_dbi: 0,
+        passive: false,
+        radar: false,
+        allow_ht: true,
+        allow_vht: true,
+        allow_he: true,
+    };
+    device.backend_mut().fail = Some(Operation::WaitVdevSetup { vdev });
+    assert_eq!(
+        device.start_vdev(vdev, channel),
+        Err(CoreError::DeviceFault)
+    );
+    device.backend_mut().log.clear();
+    device.start_vdev(vdev, channel).unwrap();
+    assert!(matches!(
+        device.backend().log.first(),
+        Some(Operation::WmiVdevStart { restart: false, .. })
+    ));
 }
 
 #[test]

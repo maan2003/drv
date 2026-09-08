@@ -74,6 +74,7 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     next_scan_id: u32,
     active_scan: Option<u32>,
     deterministic_scan_completion: bool,
+    regulatory_channels: Vec<ath11k_core::RegulatoryChannel>,
 }
 
 impl<B: Subsystems> Ath11kClientDevice<B> {
@@ -87,7 +88,17 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             next_scan_id: 1,
             active_scan: None,
             deterministic_scan_completion: false,
+            regulatory_channels: Vec::new(),
         }
+    }
+
+    /// Install channel facts projected from the platform regulatory table.
+    pub fn with_regulatory_channels(
+        mut self,
+        channels: Vec<ath11k_core::RegulatoryChannel>,
+    ) -> Self {
+        self.regulatory_channels = channels;
+        self
     }
 
     pub fn into_device(self) -> Device<B> {
@@ -107,6 +118,17 @@ impl Ath11kClientDevice<ModelSubsystems> {
     pub fn deterministic(mac: [u8; 6]) -> Self {
         let mut device = Self::new(WCN6750.device(ModelSubsystems::default()), mac);
         device.deterministic_scan_completion = true;
+        device.regulatory_channels.push(ath11k_core::RegulatoryChannel {
+            frequency_mhz: 2437,
+            max_power_dbm: 0,
+            max_reg_power_dbm: 0,
+            max_antenna_gain_dbi: 0,
+            passive: false,
+            radar: false,
+            allow_ht: true,
+            allow_vht: true,
+            allow_he: true,
+        });
         device
     }
 }
@@ -325,8 +347,15 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             return Err(zx::Status::INVALID_ARGS);
         }
         let vdev = self.ready_vdev()?;
+        let frequency = channel_frequency(primary)?;
+        let channel = self
+            .regulatory_channels
+            .iter()
+            .find(|channel| channel.frequency_mhz == frequency)
+            .copied()
+            .ok_or(zx::Status::NOT_FOUND)?;
         self.device
-            .start_vdev(vdev, channel_frequency(primary)?)
+            .start_vdev(vdev, channel)
             .map_err(status)
     }
 
