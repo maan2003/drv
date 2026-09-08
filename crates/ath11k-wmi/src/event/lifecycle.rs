@@ -578,4 +578,16 @@ impl<T: Transport> EventStream<T> {
             self.pending.push(event);
         }
     }
+
+    /// Drop completions that predate a new command for this vdev. A response
+    /// has no firmware-echoed request token, so it cannot complete the command
+    /// that is about to be sent.
+    pub fn discard_vdev_start(&mut self, vdev_id: u32) {
+        self.pending.retain(|event| {
+            event.id != WMI_VDEV_START_RESP_EVENTID
+                || !Decoder::<VdevStartResponse>::new(WMI_VDEV_START_RESP_EVENTID)
+                    .decode(event.clone())
+                    .is_ok_and(|response| response.vdev_id == vdev_id)
+        });
+    }
 }
