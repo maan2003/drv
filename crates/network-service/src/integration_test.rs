@@ -23,7 +23,7 @@ use packet_formats::{
 use rand::rngs::StdRng;
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, TcpListener},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::Duration,
 };
@@ -46,6 +46,13 @@ fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let listen = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(listen).unwrap();
+    client
+        .write_all(&[
+            5, 1, 0, // greeting: SOCKS5, one method, no authentication
+            5, 1, 0, 1, 192, 0, 2, 1, 0, 80, // CONNECT to TEST-NET-1 while offline
+        ])
+        .unwrap();
 
     service
         .serve_socks5_listener(
@@ -55,6 +62,10 @@ fn service_starts_and_serves_while_dhcp_is_still_acquiring() {
             || false,
         )
         .unwrap();
+    let mut greeting = [0; 2];
+    client.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    assert!(!service.network_ready());
 }
 use wlan_softmac_host::ethernet::{
     AssociatedSoftmacTx, DriverEthernetPort, EthernetIngressError, ethernet_port,
