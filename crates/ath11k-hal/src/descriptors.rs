@@ -265,6 +265,15 @@ pub struct TxCommandInfo {
 }
 
 impl TclDataCommand {
+    /// Builds the complete TCL source-ring entry initialized by
+    /// `ath11k_hal_tx_init_data_ring`: TLV header followed by this payload.
+    pub fn into_ring_descriptor(self) -> Descriptor {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&((324_u32 << 1) | (28_u32 << 10)).to_le_bytes());
+        bytes.extend_from_slice(&self.0);
+        Descriptor::new(bytes, 32).expect("fixed TCL ring-entry layout")
+    }
+
     /// Port of `ath11k_hal_tx_cmd_desc_setup`, including WCN6750's QCN9074
     /// mesh-enable bit in info3[31:30].
     pub fn for_transmit<B: Backend>(

@@ -70,6 +70,12 @@ void oracle_dp_client_tx(u8 out[28], u64 address, u32 msdu_id, u32 length,
                         ast_hash, tid, search_type, lmac_id, 0, 0, manager);
 }
 
+void oracle_hal_tcl_ring_entry(u8 out[32], const u8 payload[28]) {
+    u32 tlv = PREP(0x000003fe, 324) | PREP(0x03fffc00, 28);
+    memcpy(out, &tlv, sizeof(tlv));
+    memcpy(out + 4, payload, 28);
+}
+
 void oracle_hal_dscp_tid_map(const u8 table[64], u8 out[24]) {
     u32 value;
     for (u32 group = 0; group < 8; group++) {
