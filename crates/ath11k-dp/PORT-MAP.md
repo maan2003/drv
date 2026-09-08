@@ -21,16 +21,18 @@ DMA snapshots are not yet available.
 | `dp_rx.c:ath11k_dp_process_rx` DMA sync/unmap boundary | `dma::RxBuffer::sync_and_read` | model-checked | recording backend asserts `SyncForCpu` before read |
 | `hw.c:wcn6750_ops` QCN9074 rx-desc selection | `rx::Wcn6750RxDescriptor` | oracle-checked | `qcn9074_layout_fixture_matches_wcn6750_ops` |
 | `hw.c:ath11k_hw_qcn9074_rx_desc_get_*` | `rx::Wcn6750RxDescriptor::{status,address2,header_status,payload}` | oracle-checked | complete truncation sweep + field fixture |
-| `dp.c:ath11k_dp_alloc` / `ath11k_dp_free` | — | blocked | awaiting additive HAL ring APIs |
-| `dp.c:ath11k_dp_pdev_pre_alloc` | — | blocked | awaiting additive HAL ring APIs |
-| `dp.c:ath11k_dp_pdev_alloc` / `ath11k_dp_pdev_free` | — | blocked | awaiting additive HAL ring APIs |
-| `dp.c:ath11k_dp_service_srng` | — | blocked | awaiting typed HAL consume operations |
-| `dp_tx.c:ath11k_dp_tx` TCL descriptor | — | blocked | requested `ath11k_hal_tx_cmd_desc_setup` from HAL owner |
-| `dp_tx.c:ath11k_dp_tx_completion_handler` | — | blocked | requested WBM release/status parser from HAL owner |
-| `dp_rx.c:ath11k_dp_process_rx` REO processing | — | blocked | requested REO destination/MSDU-link parsers from HAL owner |
-| `dp_rx.c:ath11k_dp_rxbufs_replenish` RXDMA descriptor | — | blocked | requested RX buffer-address constructor from HAL owner |
+| `dp.c:ath11k_dp_alloc` / `ath11k_dp_free` | `tx::ClientDataPath::{ath11k_dp_alloc,ath11k_dp_free}` | model-checked | TX/RX model lifecycle tests |
+| `dp.c:ath11k_dp_pdev_pre_alloc` | `tx::ClientDataPath::ath11k_dp_pdev_pre_alloc` | ported | ID/cookie pools initialized at alloc |
+| `dp.c:ath11k_dp_pdev_alloc` / `ath11k_dp_pdev_free` | `tx::ClientDataPath::{ath11k_dp_pdev_alloc,ath11k_dp_pdev_free}` | model-checked | directional RX mapping ownership |
+| `dp.c:ath11k_dp_service_srng` | `tx::ClientDataPath::ath11k_dp_service_srng` | model-checked | bounded TX/WBM and REO service paths |
+| `dp_tx.c:ath11k_dp_tx` TCL descriptor | `tx::ClientDataPath::transmit`, HAL `TclDataCommand::for_transmit` | model-checked | exact descriptor fields and sync-before-publish test |
+| `dp_tx.c:ath11k_dp_tx_encap_nwifi` | `tx::encap_native_wifi` | oracle-checked | QoS control removal fixture |
+| `dp_tx.c:ath11k_dp_tx_completion_handler` | `tx::ClientDataPath::service_tx_completions` | model-checked | WBM cookie/status fixture |
+| `dp_rx.c:ath11k_dp_process_rx` direct REO processing | `tx::ClientDataPath::receive_with_status` | model-checked | checked REO cookie and RX descriptor path |
+| `dp_rx.c:ath11k_dp_rxbufs_replenish` RXDMA descriptor | `tx::ClientDataPath::ath11k_dp_rxbufs_replenish` | model-checked | HAL `RxdmaBufferRing::for_buffer` + streaming DMA |
+| `dp_rx.c:ath11k_dp_process_rx` MSDU-link processing | — | blocked | HAL parser exists; link-bank DMA lookup seam is not yet exposed |
 | `dp_rx.c:ath11k_peer_rx_tid_setup` and REO command family | — | blocked | requested typed REO command setup from HAL owner |
-| `dp_rx.c:ath11k_dp_rx_msdu_coalesce` | — | pending | client RX chaining follows REO parser integration |
+| `dp_rx.c:ath11k_dp_rx_msdu_coalesce` | — | pending | client multi-buffer chaining |
 | `dp_tx.c:ath11k_dp_tx_htt_h2t_ppdu_stats_req` | — | deferred | PPDU/pktlog telemetry, after client path |
 | `dp_tx.c:ath11k_dp_tx_htt_h2t_ext_stats_req` | — | deferred | debugfs extended statistics |
 | `dp_tx.c:ath11k_dp_tx_htt_monitor_mode_ring_config` | — | deferred | monitor mode |

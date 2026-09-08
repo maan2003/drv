@@ -8,6 +8,7 @@ pub mod dma;
 pub mod htt;
 pub mod rx;
 pub mod transport;
+pub mod tx;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerId(pub u16);
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,9 @@ pub enum DpError {
     MalformedHtt,
     MalformedDescriptor,
     UnsupportedVersion,
+    InvalidFrame,
+    UnsupportedDescriptor,
+    Timeout,
     NoResources,
     DeviceFault,
 }

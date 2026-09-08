@@ -20,6 +20,19 @@ impl<T> HttTransport<T> {
     }
 }
 
+/// `ath11k_dp_htt_connect`: bind the HTC HTT data service and retain its
+/// typed transport adapter.
+pub fn ath11k_dp_htt_connect<T: Transport>(
+    mut transport: T,
+    tx: ath11k_hal::RingId,
+    rx: ath11k_hal::RingId,
+) -> Result<HttTransport<T>, DpError> {
+    transport
+        .bind_service(HTT_DATA_MESSAGE_SERVICE, tx, rx)
+        .map_err(map_ce_error)?;
+    Ok(HttTransport::new(transport))
+}
+
 impl<T: Transport> HttControl for HttTransport<T> {
     fn send(&mut self, message: HttHostMessage) -> Result<(), DpError> {
         self.transport
