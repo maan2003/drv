@@ -125,6 +125,10 @@ type RealWmi<B, W, S> = Wmi<TracingWmi<HtcWmiTransport<Endpoint<B, W>>, S>>;
 type RealHtt<B, W> = HtcHttTransport<Endpoint<B, W>>;
 type RealDp<B> = ClientDataPath<B, HalDpRings<B>>;
 
+const fn control_budget_has_room(consumed: usize, budget: usize) -> bool {
+    consumed < budget
+}
+
 /// Real subsystem owner. Every resource moves forward through an explicit
 /// option; no raw descriptor, DMA address, or backend handle crosses this seam.
 pub struct Wcn6750Subsystems<B, Q, A, M, W, D, S = NoWmiTrace>
@@ -238,12 +242,15 @@ where
         Ok(())
     }
 
-    fn pump(&mut self) -> Result<(), CoreError> {
+    fn pump_bounded(&mut self, work_budget: usize) -> Result<usize, CoreError> {
         let deadline = (self.deadline)();
         Self::protocol(self.router.as_ref())?
-            .service_receive(deadline)
-            .map(|_| ())
+            .service_receive_bounded(deadline, work_budget)
             .map_err(|_| CoreError::DeviceFault)
+    }
+
+    fn pump(&mut self) -> Result<(), CoreError> {
+        self.pump_bounded(usize::MAX).map(|_| ())
     }
 
     fn wmi_send<R: ath11k_wmi::cmd::EncodeCommand>(
@@ -390,21 +397,36 @@ where
     }
 
     fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError> {
+        self.next_wlan_event_bounded(usize::MAX)
+            .map(|(event, _)| event)
+    }
+
+    fn next_wlan_event_bounded(
+        &mut self,
+        work_budget: usize,
+    ) -> Result<(Option<WlanEvent>, bool), CoreError> {
         use ath11k_wmi::event::{Decoder, EventDecoder as _, MgmtRx, Scan};
         use ath11k_wmi::tags::{WMI_MGMT_RX_EVENTID, WMI_SCAN_EVENTID};
 
-        loop {
+        let mut consumed = 0;
+        while consumed < work_budget {
             let deadline = (self.deadline)();
             let mut event = Self::protocol(self.wmi.as_mut())?
                 .next_event(deadline)
                 .map_err(|_| CoreError::Protocol)?;
             if event.is_none() {
-                self.pump()?;
+                consumed = consumed.saturating_add(self.pump_bounded(work_budget - consumed)?);
+                if !control_budget_has_room(consumed, work_budget) {
+                    return Ok((None, true));
+                }
                 event = Self::protocol(self.wmi.as_mut())?
                     .next_event(deadline)
                     .map_err(|_| CoreError::Protocol)?;
             }
-            let Some(event) = event else { return Ok(None) };
+            let Some(event) = event else {
+                return Ok((None, consumed != 0));
+            };
+            consumed = consumed.saturating_add(1);
             let id = event.id;
             let decoded = match id {
                 WMI_MGMT_RX_EVENTID => WlanEvent::from(
@@ -419,8 +441,9 @@ where
                 ),
                 EventId(_) => continue,
             };
-            return Ok(Some(decoded));
+            return Ok((Some(decoded), true));
         }
+        Ok((None, consumed != 0))
     }
 
     fn client_nss(&self) -> Result<u8, CoreError> {
@@ -756,5 +779,13 @@ mod tests {
         fn map_device_bar(&mut self, _: u64, _: u32) -> Result<(), ath11k_qmi::QmiError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn exact_control_budget_defers_the_routed_wmi_event() {
+        // The bounded event loop must return after routing the final allowed
+        // CE frame. Its WMI payload remains queued for the next host drive.
+        assert!(!control_budget_has_room(64, 64));
+        assert!(control_budget_has_room(63, 64));
     }
 }

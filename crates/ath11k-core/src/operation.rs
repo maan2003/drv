@@ -291,6 +291,20 @@ pub trait Subsystems {
     /// Receive the next hardware event consumed by the WlanSoftmac half.
     fn next_wlan_event(&mut self) -> Result<Option<WlanEvent>, CoreError>;
 
+    /// Consume at most one bounded runtime slot and report whether hardware
+    /// work was observed even when it did not produce a host-facing event.
+    fn next_wlan_event_bounded(
+        &mut self,
+        work_budget: usize,
+    ) -> Result<(Option<WlanEvent>, bool), CoreError> {
+        if work_budget == 0 {
+            return Ok((None, false));
+        }
+        let event = self.next_wlan_event()?;
+        let progressed = event.is_some();
+        Ok((event, progressed))
+    }
+
     /// Station spatial streams advertised by firmware for vdev setup.
     fn client_nss(&self) -> Result<u8, CoreError>;
 
