@@ -223,6 +223,7 @@ fn route_for_vector(vector: u32, routes: &[InterruptRoute]) -> Option<Wcn6750Irq
 /// platform backend has delivered the interrupt notification.
 pub fn service_ce_interrupt<B: ath11k_platform_backend::Backend>(
     pipes: &mut ath11k_ce::CePipes<B>,
+    device: &ath11k_platform_backend::Device<B>,
     mmio: &ath11k_platform_backend::MmioRegion<B>,
     remote_read_pointers: &mut ath11k_platform_backend::CoherentDma<
         B,
@@ -230,7 +231,7 @@ pub fn service_ce_interrupt<B: ath11k_platform_backend::Backend>(
     >,
     engine: usize,
 ) -> Result<ath11k_ce::CeServiceBatch<B>, ath11k_ce::CeError> {
-    pipes.per_engine_service(mmio, remote_read_pointers, engine)
+    pipes.per_engine_service(device, mmio, remote_read_pointers, engine)
 }
 
 /// Hardware-facing NAPI poll body of `ath11k_ahb_ext_grp_napi_poll`.
@@ -260,6 +261,7 @@ pub enum Wcn6750InterruptServiceError {
 pub fn dispatch_wcn6750_interrupt<B: Backend, R: ath11k_hal::Rings<B> + ath11k_dp::DpRingOps<B>>(
     irq: Wcn6750Irq,
     pipes: &mut ath11k_ce::CePipes<B>,
+    device: &ath11k_platform_backend::Device<B>,
     mmio: &ath11k_platform_backend::MmioRegion<B>,
     remote_read_pointers: &mut ath11k_platform_backend::CoherentDma<
         B,
@@ -269,11 +271,15 @@ pub fn dispatch_wcn6750_interrupt<B: Backend, R: ath11k_hal::Rings<B> + ath11k_d
     budget: usize,
 ) -> Result<Wcn6750InterruptService<B>, Wcn6750InterruptServiceError> {
     match irq {
-        Wcn6750Irq::CopyEngine(engine) => {
-            service_ce_interrupt(pipes, mmio, remote_read_pointers, usize::from(engine))
-                .map(Wcn6750InterruptService::CopyEngine)
-                .map_err(Wcn6750InterruptServiceError::CopyEngine)
-        }
+        Wcn6750Irq::CopyEngine(engine) => service_ce_interrupt(
+            pipes,
+            device,
+            mmio,
+            remote_read_pointers,
+            usize::from(engine),
+        )
+        .map(Wcn6750InterruptService::CopyEngine)
+        .map_err(Wcn6750InterruptServiceError::CopyEngine),
         Wcn6750Irq::DataPathExternalGroup(_) => service_dp_external_group(data_path, budget)
             .map(Wcn6750InterruptService::DataPath)
             .map_err(Wcn6750InterruptServiceError::DataPath),

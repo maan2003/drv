@@ -13,17 +13,17 @@ Pinned source: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`. WCN6750 selects
 | `ce_pipe_config` | `ce.h:84-91` | `TargetPipeConfig` | ported | Little-endian byte fixture |
 | `ath11k_hal_ce_src_set_desc` | `hal.c:572-586` | `CeTxBuffer::descriptor_before_sync` | ported | HAL checked descriptor; model sync fixture |
 | `ath11k_hal_ce_dst_set_desc` | `hal.c:588-596` | `CeRxBuffer::descriptor` | ported | Allocation-derived DeviceAddress |
-| `ath11k_hal_ce_dst_status_get_length` | `hal.c:598-607` | `CePipes::completed_recv_next` | ported | Clears length; full destination sync |
+| `ath11k_hal_ce_dst_status_get_length` | `hal.c:598-607` | `CePipes::completed_recv_next` | ported | Clears shared LEN before tail publication; a cached payload makes a failed publication retryable while preserving the stale-descriptor sentinel. |
 | `ath11k_ce_send` | `ce.c:709-797` | `CePipes::send` | ported | Descriptor < streaming sync < release HP proved |
 | `ath11k_ce_rx_buf_enqueue_pipe` | `ce.c:272-319` | `CePipes::post_receive` | ported | Full lifecycle model fixture |
-| `ath11k_ce_completed_recv_next` | `ce.c:371-415` | `CePipes::completed_recv_next` | ported | Remote-pointer acquire and payload fixture |
+| `ath11k_ce_completed_recv_next` | `ce.c:371-415` | `CePipes::completed_recv_next` | ported | Remote-pointer acquire and payload fixture; fallible reads, sync, validation, and publication are cursor-transactional. |
 | `ath11k_ce_completed_send_next` | `ce.c:457-496` | `CePipes::completed_send_next` | ported | HAL source-reap fixture |
 | `ath11k_ce_alloc_pipes` | `ce.c:1025-1050` | `CeAllocatedPipes::alloc_pipes` | ported | All nine WCN6750 pipes |
 | `ath11k_ce_init_pipes` | `ce.c:914-970` | `CeAllocatedPipes::init_pipes` | ported | Full lifecycle model fixture |
 | `ath11k_ce_free_pipes` | `ce.c:972-1022` | `CeAllocatedPipes::free_pipes, CePipes::free_pipes` | ported | Generation-tied DMA drop ownership |
 | `ath11k_ce_get_attr_flags` | `ce.c:1072-1078` | `CePipes::get_attr_flags` | ported | CE4 fixture |
-| `ath11k_ce_per_engine_service` | `ce.c:687-697` | `CePipes::per_engine_service` | ported | Send/receive completion paths |
-| `ath11k_ce_rx_post_buf` | `ce.c:883-904` | `CePipes::rx_post_buf` | ported | Streaming destination pool |
+| `ath11k_ce_per_engine_service` | `ce.c:687-697` | `CePipes::per_engine_service` | ported | Drains send/receive completions and replenishes the serviced receive pipe. |
+| `ath11k_ce_rx_post_buf` | `ce.c:883-904` | `CePipes::rx_post_buf` | ported | Streaming destination pool with transactional descriptor publication. |
 | `ath11k_htc_hdr` | `htc.h:58-61` | `HtcHeader` | ported | Byte-exact fixture |
 | `ath11k_htc_ready` | `htc.h:99-102` | `ReadyMessage` | ported | Ready handshake fixture |
 | `ath11k_htc_ready_extended` | `htc.h:104-107` | `ReadyExtendedMessage` | ported | Extended-ready fixture |
