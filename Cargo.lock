@@ -811,6 +811,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt7921-oracle"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "mt76-core",
+ "mt7921-core",
+ "proptest",
+]
+
+[[package]]
 name = "mt7921-port-spike"
 version = "0.1.0"
 dependencies = [
