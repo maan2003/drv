@@ -3,8 +3,8 @@
 <!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, ported-corrected, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 
 Pinned source: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
-Native golden verification is blocked pending a tracing-enabled kexec kernel;
-notes identify the checked-in source-derived evidence used meanwhile.
+Native golden verification uses the checked-in tracing-kexec capture at
+`artifacts/redwood-native-ath11k/20260908T093708Z/wmi/ordered.jsonl`.
 
 | C symbol | C file:lines | Rust item | status | note |
 |---|---|---|---|---|
@@ -94,10 +94,10 @@ notes identify the checked-in source-derived evidence used meanwhile.
 | ath11k_wmi_send_unit_test_cmd | wmi.c:9073-9129 | cmd::UnitTest | ported | wow fixtures |
 | ath11k_wmi_simulate_radar | wmi.c:9131-9164 | cmd::SimulateRadar | ported | wow fixtures |
 | ath11k_wmi_fw_dbglog_cfg | wmi.c:9166-9220 | cmd::DebugLogConfig | ported | wow fixtures |
-| ath11k_wmi_connect | wmi.c:9222-9235 | cmd::Wmi::connect | ported | lifecycle state test pending |
-| ath11k_wmi_pdev_attach | wmi.c:9245-9261 | cmd::Wmi::pdev_attach | ported | lifecycle state test pending |
-| ath11k_wmi_attach | wmi.c:9263-9283 | cmd::Wmi::attach | ported | lifecycle state test pending |
-| ath11k_wmi_detach | wmi.c:9285-9295 | cmd::Wmi::detach | ported | lifecycle state test pending |
+| ath11k_wmi_connect | wmi.c:9222-9235 | cmd::Wmi::connect | ported | cmd::lifecycle::tests::attach_connect_init_detach_preserves_transport |
+| ath11k_wmi_pdev_attach | wmi.c:9245-9261 | cmd::Wmi::pdev_attach | ported | cmd::lifecycle::tests::attach_connect_init_detach_preserves_transport |
+| ath11k_wmi_attach | wmi.c:9263-9283 | cmd::Wmi::attach | ported | cmd::lifecycle::tests::attach_connect_init_detach_preserves_transport |
+| ath11k_wmi_detach | wmi.c:9285-9295 | cmd::Wmi::detach | ported | cmd::lifecycle::tests::attach_connect_init_detach_preserves_transport |
 | ath11k_wmi_hw_data_filter_cmd | wmi.c:9297-9334 | cmd::HwDataFilter | ported | wow fixtures |
 | ath11k_wmi_wow_host_wakeup_ind | wmi.c:9336-9362 | cmd::WowHostWakeup | ported | wow fixtures |
 | ath11k_wmi_wow_enable | wmi.c:9364-9390 | cmd::WowEnable | ported | wow fixtures |
