@@ -38,6 +38,7 @@ const VFIO_REGION_INFO_FLAG_MMAP: u32 = 4;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
+const VFIO_IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
 const EFD_CLOEXEC: i32 = 0x80000;
 const EFD_NONBLOCK: i32 = 0x800;
@@ -65,7 +66,8 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
     fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-    fn poll(fds: *mut PollFd, count: usize, timeout: i32) -> i32;
+    fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+    fn ppoll(fds: *mut PollFd, count: usize, timeout: *const Timespec, sigmask: *const ()) -> i32;
     fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
 }
 
@@ -243,6 +245,10 @@ pub mod test_support {
             offset: u64,
             length: u64,
         },
+        QueryIrq(u32),
+        InstallIrq(u32),
+        UnmaskIrq(u32),
+        DisableIrq(u32),
     }
 
     struct Fake {
@@ -337,11 +343,41 @@ pub mod test_support {
                         }
                     }
                 }
+                VFIO_DEVICE_GET_IRQ_INFO => {
+                    // SAFETY: ioctl_mut supplies IrqInfo for this request.
+                    let info = unsafe { value.cast::<IrqInfo>().as_mut().unwrap() };
+                    info.count = 1;
+                    info.flags = 1 | (1 << 1) | (1 << 2);
+                    Record::QueryIrq(info.index)
+                }
+                VFIO_DEVICE_SET_IRQS => {
+                    // SAFETY: both IRQ payloads begin with IrqSetHeader.
+                    let set = unsafe { value.cast::<IrqSetHeader>().as_ref().unwrap() };
+                    if set.flags & VFIO_IRQ_SET_ACTION_UNMASK != 0 {
+                        Record::UnmaskIrq(set.index)
+                    } else if set.count == 0 {
+                        Record::DisableIrq(set.index)
+                    } else {
+                        Record::InstallIrq(set.index)
+                    }
+                }
                 _ => return Some(Err(25)),
             };
             fake.records.borrow_mut().push(record);
             Some(Ok(()))
         })
+    }
+
+    pub fn signal_eventfd(fd: RawFd, count: u64) -> Result<(), String> {
+        let written = unsafe { write(fd, (&count as *const u64).cast(), 8) };
+        if written == 8 {
+            Ok(())
+        } else {
+            Err(format!(
+                "signal fake eventfd: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
     }
 }
 
@@ -934,6 +970,7 @@ pub struct IrqCapability {
     pub index: u32,
     pub count: u32,
     pub eventfd: bool,
+    pub automasked: bool,
 }
 pub fn irq_capability(device: &File, index: u32) -> Result<IrqCapability, String> {
     let mut info = IrqInfo {
@@ -951,6 +988,7 @@ pub fn irq_capability(device: &File, index: u32) -> Result<IrqCapability, String
         index,
         count: info.count,
         eventfd: info.flags & 1 != 0,
+        automasked: info.flags & (1 << 2) != 0,
     })
 }
 pub struct VfioIrq {
@@ -958,6 +996,8 @@ pub struct VfioIrq {
     event_fd: OwnedFd,
     index: u32,
     installed: bool,
+    automasked: bool,
+    pending_unmask: std::cell::Cell<bool>,
 }
 impl VfioIrq {
     pub fn install(device: &Arc<File>, capability: IrqCapability) -> Result<Self, String> {
@@ -993,6 +1033,8 @@ impl VfioIrq {
             event_fd,
             index: capability.index,
             installed: true,
+            automasked: capability.automasked,
+            pending_unmask: std::cell::Cell::new(false),
         })
     }
     pub fn try_read(&self) -> Result<Option<u64>, String> {
@@ -1005,6 +1047,9 @@ impl VfioIrq {
             )
         };
         if result == 8 {
+            if self.automasked {
+                self.pending_unmask.set(true);
+            }
             Ok(Some(count))
         } else if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
             Ok(None)
@@ -1016,29 +1061,37 @@ impl VfioIrq {
         }
     }
     pub fn wait_until(&self, deadline_ns: u64) -> Result<Option<u64>, String> {
-        let now = monotonic_time_ns()?;
-        let timeout = if deadline_ns <= now {
-            0
-        } else {
-            let remaining = deadline_ns - now;
-            i32::try_from(remaining.div_ceil(1_000_000)).unwrap_or(i32::MAX)
-        };
-        let mut fd = PollFd {
-            fd: self.event_fd.as_raw_fd(),
-            events: POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { poll(&mut fd, 1, timeout) };
-        if result < 0 {
-            Err(format!(
-                "wait for IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ))
-        } else if result == 0 {
+        self.prepare_wait()?;
+        if wait_eventfds_until(&[self.event_fd.as_raw_fd()], deadline_ns)?.is_empty() {
             Ok(None)
         } else {
             self.try_read()
         }
+    }
+    pub fn prepare_wait(&self) -> Result<(), String> {
+        if !self.pending_unmask.replace(false) {
+            return Ok(());
+        }
+        let mut set = IrqSetHeader {
+            argsz: size::<IrqSetHeader>(),
+            flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK,
+            index: self.index,
+            start: 0,
+            count: 1,
+        };
+        if let Err(error) = ioctl_mut(
+            self.device.as_raw_fd(),
+            VFIO_DEVICE_SET_IRQS,
+            &mut set,
+            "unmask VFIO IRQ",
+        ) {
+            self.pending_unmask.set(true);
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub fn event_fd(&self) -> RawFd {
+        self.event_fd.as_raw_fd()
     }
     pub fn disable(&mut self) -> Result<(), String> {
         if !self.installed {
@@ -1047,6 +1100,38 @@ impl VfioIrq {
         disable_irq(&self.device, self.index)?;
         self.installed = false;
         Ok(())
+    }
+}
+
+pub fn wait_eventfds_until(event_fds: &[RawFd], deadline_ns: u64) -> Result<Vec<usize>, String> {
+    let mut fds: Vec<PollFd> = event_fds
+        .iter()
+        .map(|fd| PollFd {
+            fd: *fd,
+            events: POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        let remaining = deadline_ns.saturating_sub(monotonic_time_ns()?);
+        let timeout = Timespec {
+            seconds: (remaining / 1_000_000_000) as i64,
+            nanoseconds: (remaining % 1_000_000_000) as i64,
+        };
+        let result = unsafe { ppoll(fds.as_mut_ptr(), fds.len(), &timeout, std::ptr::null()) };
+        if result >= 0 {
+            return Ok(fds
+                .iter()
+                .enumerate()
+                .filter_map(|(index, fd)| (fd.revents & POLLIN != 0).then_some(index))
+                .collect());
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(4) {
+            return Err(format!(
+                "wait for IRQ eventfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
 }
 
@@ -1105,6 +1190,9 @@ pub fn reset_device_supported(device: &File) -> Result<(), String> {
 }
 pub fn reset_device(device: &File) -> Result<(), String> {
     reset_device_supported(device)?;
+    reset_device_unchecked(device)
+}
+pub fn reset_device_unchecked(device: &File) -> Result<(), String> {
     if unsafe { ioctl(device.as_raw_fd(), VFIO_DEVICE_RESET) } < 0 {
         return Err(format!(
             "VFIO device reset: {}",

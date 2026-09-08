@@ -76,6 +76,7 @@ pub struct LinuxVfio {
     next_iova: u64,
     regions: HashMap<u64, RegionMapping>,
     dmas: HashMap<u64, Dma>,
+    quarantined_dmas: HashMap<u64, Dma>,
     interrupts: HashMap<u64, (u32, VfioIrq)>,
 }
 
@@ -135,6 +136,7 @@ impl LinuxVfio {
             next_iova: FIRST_IOVA,
             regions: HashMap::new(),
             dmas: HashMap::new(),
+            quarantined_dmas: HashMap::new(),
             interrupts: HashMap::new(),
         }
     }
@@ -156,40 +158,77 @@ impl LinuxVfio {
         userspace_vfio::dma_broker_command(&self.device, command).map_err(|_| Error::DeviceFault)
     }
 
-    fn release_dma_resource(&self, mut dma: Dma) {
+    fn release_dma_resource(&self, dma: &mut Dma) -> Result<()> {
         match &mut dma.memory {
             DmaMemory::Ioas(mapping) => {
-                let _ = mapping.teardown();
+                mapping.teardown().map_err(|_| Error::DeviceFault)?;
             }
             DmaMemory::BrokerCoherent(mapping) => {
                 // FREE is required to fail while the shared mapping exists.
-                let _ = mapping.teardown();
+                mapping.teardown().map_err(|_| Error::DeviceFault)?;
                 if let Some(handle) = dma.broker_handle {
-                    let _ = self.broker(DmaBrokerCommand {
+                    self.broker(DmaBrokerCommand {
                         operation: broker::FREE,
                         handle,
                         ..Default::default()
-                    });
+                    })?;
+                    dma.broker_handle = None;
                 }
             }
             DmaMemory::BrokerStreaming(mapping) => {
                 if let Some(handle) = dma.broker_handle {
-                    let _ = self.broker(DmaBrokerCommand {
+                    self.broker(DmaBrokerCommand {
                         operation: broker::UNMAP,
                         handle,
                         ..Default::default()
-                    });
+                    })?;
+                    dma.broker_handle = None;
                 }
-                let _ = mapping.teardown();
+                mapping.teardown().map_err(|_| Error::DeviceFault)?;
             }
         }
+        Ok(())
     }
 
-    fn revoke_all(&mut self) {
-        let interrupts = std::mem::take(&mut self.interrupts);
-        drop(interrupts);
-        for (_, dma) in std::mem::take(&mut self.dmas) {
-            self.release_dma_resource(dma);
+    fn revoke_interrupts(&mut self) -> Result<()> {
+        let mut failed = false;
+        for (id, (vector, mut interrupt)) in std::mem::take(&mut self.interrupts) {
+            if interrupt.disable().is_err() {
+                self.interrupts.insert(id, (vector, interrupt));
+                failed = true;
+            }
+        }
+        (!failed).then_some(()).ok_or(Error::DeviceFault)
+    }
+
+    fn revoke_dmas(&mut self) -> Result<()> {
+        self.quarantined_dmas.extend(std::mem::take(&mut self.dmas));
+        let mut failed = HashMap::new();
+        for (id, mut dma) in std::mem::take(&mut self.quarantined_dmas) {
+            if self.release_dma_resource(&mut dma).is_err() {
+                failed.insert(id, dma);
+            }
+        }
+        self.quarantined_dmas = failed;
+        self.quarantined_dmas
+            .is_empty()
+            .then_some(())
+            .ok_or(Error::DeviceFault)
+    }
+
+    fn discard_reset_broker_dmas(&mut self) {
+        self.quarantined_dmas.extend(std::mem::take(&mut self.dmas));
+        for (_, mut dma) in std::mem::take(&mut self.quarantined_dmas) {
+            dma.broker_handle = None;
+            match &mut dma.memory {
+                DmaMemory::BrokerCoherent(mapping) => {
+                    let _ = mapping.teardown();
+                }
+                DmaMemory::BrokerStreaming(mapping) => {
+                    let _ = mapping.teardown();
+                }
+                DmaMemory::Ioas(_) => unreachable!("broker backend owns no IOAS DMA"),
+            }
         }
     }
 }
@@ -532,9 +571,21 @@ impl Backend for LinuxVfio {
     }
 
     fn reset(&mut self) -> Result<u64> {
-        self.revoke_all();
-        userspace_vfio::reset_device(&self.device).map_err(|_| Error::DeviceFault)?;
-        self.generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
+        userspace_vfio::reset_device_supported(&self.device).map_err(|_| Error::DeviceFault)?;
+        let next_generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
+        // From this point cleanup mutates live resources, so all issued handles
+        // must become stale even if cleanup or the reset ioctl later fails.
+        self.generation = next_generation;
+        self.revoke_interrupts()?;
+        if self.flavor == Flavor::Broker {
+            userspace_vfio::reset_device_unchecked(&self.device).map_err(|_| Error::DeviceFault)?;
+            // Successful broker reset revoked handles in-kernel; only now may
+            // their userspace mappings be discarded without FREE/UNMAP.
+            self.discard_reset_broker_dmas();
+        } else {
+            self.revoke_dmas()?;
+            userspace_vfio::reset_device_unchecked(&self.device).map_err(|_| Error::DeviceFault)?;
+        }
         Ok(self.generation)
     }
 
@@ -542,25 +593,32 @@ impl Backend for LinuxVfio {
         self.regions.remove(&region);
     }
     fn release_dma(&mut self, dma: u64) {
-        if let Some(dma) = self.dmas.remove(&dma) {
-            self.release_dma_resource(dma);
+        if let Some(mut resource) = self.dmas.remove(&dma)
+            && self.release_dma_resource(&mut resource).is_err()
+        {
+            self.quarantined_dmas.insert(dma, resource);
         }
     }
     fn release_interrupt(&mut self, interrupt: u64) {
-        self.interrupts.remove(&interrupt);
+        if let Some((vector, mut resource)) = self.interrupts.remove(&interrupt)
+            && resource.disable().is_err()
+        {
+            self.interrupts.insert(interrupt, (vector, resource));
+        }
     }
 }
 
 impl Drop for LinuxVfio {
     fn drop(&mut self) {
-        self.revoke_all();
+        let _ = self.revoke_interrupts();
+        let _ = self.revoke_dmas();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use userspace_vfio::test_support::{Record, with_fake_io};
+    use userspace_vfio::test_support::{Record, signal_eventfd, with_fake_io};
 
     fn fake_device() -> (Arc<File>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
@@ -708,6 +766,50 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(
             matches!(error, LinuxVfioError::DmaBrokerUnavailable(message) if message == "ENOTTY")
+        );
+    }
+
+    #[test]
+    fn automasked_irq_is_unmasked_before_next_wait_and_balanced_on_release() {
+        let (device, path) = fake_device();
+        let (_, records) = with_fake_io(true, || {
+            let mut backend = LinuxVfio::initialize_broker(device, |_| Ok(())).unwrap();
+            let irq = backend.open_interrupt(3).unwrap();
+            let event_fd = backend.interrupts.get(&irq).unwrap().1.event_fd();
+
+            signal_eventfd(event_fd, 2).unwrap();
+            let deadline = userspace_vfio::monotonic_time_ns().unwrap() + 1_000_000_000;
+            assert_eq!(
+                backend
+                    .wait_interrupt(&irq, deadline)
+                    .unwrap()
+                    .unwrap()
+                    .count,
+                2
+            );
+
+            signal_eventfd(event_fd, 1).unwrap();
+            let deadline = userspace_vfio::monotonic_time_ns().unwrap() + 1_000_000_000;
+            assert_eq!(
+                backend
+                    .wait_interrupt(&irq, deadline)
+                    .unwrap()
+                    .unwrap()
+                    .count,
+                1
+            );
+            backend.release_interrupt(irq);
+            drop(backend);
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Record::QueryIrq(3),
+                Record::InstallIrq(3),
+                Record::UnmaskIrq(3),
+                Record::DisableIrq(3),
+            ]
         );
     }
 
