@@ -722,7 +722,7 @@ impl Indication {
                     MessageId::RequestMemory,
                     message.encode().bytes().to_vec(),
                 )
-                .expect("a decoded indication remains valid")
+                .expect("a decoded indication remains valid");
             }
             Self::FirmwareMemoryReady => (MessageId::FirmwareMemoryReady, Vec::new()),
             Self::FirmwareReady => (MessageId::FirmwareReady, Vec::new()),
@@ -929,10 +929,11 @@ mod tests {
         }
         .encode()
         .unwrap();
-        assert!(r
-            .bytes()
-            .windows(8)
-            .any(|w| w == [0x13, 5, 0, 3, 0, 1, 2, 3]));
+        assert!(
+            r.bytes()
+                .windows(8)
+                .any(|w| w == [0x13, 5, 0, 3, 0, 1, 2, 3])
+        );
     }
     #[test]
     fn memory_indication_round_trip() {
@@ -977,7 +978,9 @@ mod tests {
         let request = IndicationRegisterRequest::wcn6750().encode().unwrap();
         assert_eq!(
             request.bytes(),
-            [0x10, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b, 0x18, 1, 0, 1, 0x1b, 1, 0, 1,]
+            [
+                0x10, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b, 0x18, 1, 0, 1, 0x1b, 1, 0, 1,
+            ]
         );
     }
 

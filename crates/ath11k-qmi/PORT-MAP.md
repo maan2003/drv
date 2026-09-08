@@ -1,4 +1,4 @@
-<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
+<!-- PORT-MAP-SCHEMA: C symbol | C file:lines | Rust item | status ∈ {ported, ported-corrected, wcn6750-specific, local-seam, replaced-by-fuchsia-mlme, kernel-substrate, deferred, blocked} | note -->
 
 | C symbol | C file:lines | Rust item | status | note |
 |---|---|---|---|---|
@@ -54,7 +54,7 @@
 | `qmi_wlanfw_wlan_ini_req_msg_v01` | `qmi.h:507-511` | `src/wire.rs::WlanIniRequest` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_wlan_ini_resp_msg_v01` | `qmi.h:513-515` | `src/wire.rs::WlanIniResponse` | ported | Typed QMI TLV representation. |
 | `qmi_wlanfw_host_cap_req_msg_v01_ei` | `qmi.c:33-282` | `src/wire.rs::HostCapabilityRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_host_cap_resp_msg_v01_ei` | `qmi.c:284-299` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_host_cap_resp_msg_v01_ei` | `qmi.c:284-299` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_ind_register_req_msg_v01_ei` | `qmi.c:301-524` | `src/wire.rs::IndicationRegisterRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_ind_register_resp_msg_v01_ei` | `qmi.c:526-560` | `src/wire.rs::IndicationRegisterResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_mem_cfg_s_v01_ei` | `qmi.c:562-592` | `src/wire.rs::MemoryConfig` | ported | Pinned TLV schema implemented by the named codec. |
@@ -62,7 +62,7 @@
 | `qmi_wlanfw_request_mem_ind_msg_v01_ei` | `qmi.c:636-661` | `src/wire.rs::RequestMemoryIndication::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_mem_seg_resp_s_v01_ei` | `qmi.c:663-701` | `src/wire.rs::MemorySegmentResponse` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_respond_mem_req_msg_v01_ei` | `qmi.c:703-728` | `src/wire.rs::RespondMemoryRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_respond_mem_resp_msg_v01_ei` | `qmi.c:730-746` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_respond_mem_resp_msg_v01_ei` | `qmi.c:730-746` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_cap_req_msg_v01_ei` | `qmi.c:748-754` | `src/wire.rs::CapabilityRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_device_info_req_msg_v01_ei` | `qmi.c:756-762` | `src/wire.rs::DeviceInfoRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlfw_device_info_resp_msg_v01_ei` | `qmi.c:764-816` | `src/wire.rs::DeviceInfoResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
@@ -72,22 +72,22 @@
 | `qmi_wlanfw_fw_version_info_s_v01_ei` | `qmi.c:877-901` | `src/wire.rs::FirmwareVersion` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_cap_resp_msg_v01_ei` | `qmi.c:903-1102` | `src/wire.rs::CapabilityResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_bdf_download_req_msg_v01_ei` | `qmi.c:1104-1237` | `src/wire.rs::BdfDownloadRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_bdf_download_resp_msg_v01_ei` | `qmi.c:1239-1255` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_bdf_download_resp_msg_v01_ei` | `qmi.c:1239-1255` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_m3_info_req_msg_v01_ei` | `qmi.c:1257-1279` | `src/wire.rs::M3InfoRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_m3_info_resp_msg_v01_ei` | `qmi.c:1281-1296` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_m3_info_resp_msg_v01_ei` | `qmi.c:1281-1296` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_ce_tgt_pipe_cfg_s_v01_ei` | `qmi.c:1298-1349` | `src/wire.rs::TargetPipeConfig` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei` | `qmi.c:1351-1384` | `src/wire.rs::ServicePipeConfig` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_shadow_reg_cfg_s_v01_ei` | `qmi.c:1386-1408` | `src/wire.rs::ShadowRegister` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_shadow_reg_v2_cfg_s_v01_ei` | `qmi.c:1410-1425` | `src/wire.rs::ShadowRegister` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_wlan_mode_req_msg_v01_ei` | `qmi.c:1427-1460` | `src/wire.rs::WlanModeRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_wlan_mode_resp_msg_v01_ei` | `qmi.c:1462-1478` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_mode_resp_msg_v01_ei` | `qmi.c:1462-1478` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_wlan_cfg_req_msg_v01_ei` | `qmi.c:1480-1617` | `src/wire.rs::WlanConfigRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_wlan_cfg_resp_msg_v01_ei` | `qmi.c:1619-1634` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_cfg_resp_msg_v01_ei` | `qmi.c:1619-1634` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlanfw_mem_ready_ind_msg_v01_ei` | `qmi.c:1636-1641` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_fw_ready_ind_msg_v01_ei` | `qmi.c:1643-1648` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei` | `qmi.c:1650-1655` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `qmi_wlanfw_wlan_ini_req_msg_v01_ei` | `qmi.c:1657-1681` | `src/wire.rs::WlanIniRequest::encode` | ported | Pinned TLV schema implemented by the named codec. |
-| `qmi_wlanfw_wlan_ini_resp_msg_v01_ei` | `qmi.c:1683-1699` | `src/wire.rs::StandardResponse::decode` | ported | Pinned TLV schema implemented by the named codec. |
+| `qmi_wlanfw_wlan_ini_resp_msg_v01_ei` | `qmi.c:1683-1699` | `src/wire.rs::StandardResponse::decode` | ported-corrected | Pinned TLV schema implemented. [QMI-001](../ath11k-oracle/MISMATCHES.md#qmi-001): C `qmi_decode` reads a 3-byte header before its logical length check; Rust safely rejects a truncated header (oracle input `02`) as `Malformed`. |
 | `qmi_wlfw_fw_init_done_ind_msg_v01_ei` | `qmi.c:1701-1706` | `src/wire.rs::Indication::decode` | ported | Pinned TLV schema implemented by the named codec. |
 | `ath11k_qmi_host_cap_send` | `qmi.c:1710-1791` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Host-capability transaction. |
 | `ath11k_qmi_fw_ind_register_send` | `qmi.c:1793-1870` | `src/handshake.rs::Wcn6750Handshake::server_arrived` | ported | Indication-registration transaction. |

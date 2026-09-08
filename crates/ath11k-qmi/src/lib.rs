@@ -8,6 +8,14 @@ use alloc::vec::Vec;
 pub mod handshake;
 pub mod wire;
 
+#[cfg(feature = "trace")]
+pub mod trace;
+#[cfg(feature = "trace")]
+pub use trace::{RejectReason, TraceEvent, TraceSink};
+
+#[cfg(feature = "proptest")]
+pub mod strategies;
+
 pub use handshake::{
     DriverEvent, FirmwareAssets, HandshakeConfig, MemoryProvider, MemoryRegion, Wcn6750Handshake,
 };
@@ -63,6 +71,19 @@ impl Response {
         })
     }
 
+    #[cfg(feature = "trace")]
+    pub fn checked_with_trace(
+        transaction_id: TransactionId,
+        message_id: MessageId,
+        bytes: Vec<u8>,
+        trace: Option<&mut dyn trace::TraceSink>,
+    ) -> Result<Self, QmiError> {
+        if let Some(sink) = trace {
+            trace::trace_tlvs(&bytes, sink);
+        }
+        Self::checked(transaction_id, message_id, bytes)
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -112,6 +133,17 @@ impl RawIndication {
     pub fn checked(message_id: MessageId, bytes: Vec<u8>) -> Result<Self, QmiError> {
         wire::validate_tlvs(&bytes)?;
         Ok(Self { message_id, bytes })
+    }
+    #[cfg(feature = "trace")]
+    pub fn checked_with_trace(
+        message_id: MessageId,
+        bytes: Vec<u8>,
+        trace: Option<&mut dyn trace::TraceSink>,
+    ) -> Result<Self, QmiError> {
+        if let Some(sink) = trace {
+            trace::trace_tlvs(&bytes, sink);
+        }
+        Self::checked(message_id, bytes)
     }
     pub const fn message_id(&self) -> MessageId {
         self.message_id

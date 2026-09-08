@@ -511,7 +511,7 @@ impl Handshake for Wcn6750Handshake<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{wire::QmiString, RawIndication};
+    use crate::{RawIndication, wire::QmiString};
     use alloc::{collections::VecDeque, vec};
 
     struct Assets;
