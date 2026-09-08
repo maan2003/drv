@@ -393,6 +393,7 @@ pub enum DriverError {
     EventStreamClosed,
     ConnectTransactionClosed,
     ConnectStateMismatch,
+    AlreadyConnected,
     RetryCleanup,
     ControlBudgetExhausted,
     Stopped,
@@ -412,6 +413,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
     mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
     timer_runtime: tokio::runtime::Runtime,
+    connection: Option<wlan_sme::client::ConnectTransactionStream>,
     revoked: bool,
 }
 
@@ -517,6 +519,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             sme_timers,
             mlme_timers,
             timer_runtime,
+            connection: None,
             revoked: false,
         })
     }
@@ -537,6 +540,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     /// and a later call retries only the device stop operation.
     pub fn stop(&mut self) -> Result<(), zx::Status> {
         self.revoked = true;
+        self.connection = None;
         revoke_and_drain(&self.upcalls);
         self.io.lock().unwrap().ethernet.teardown();
         stop_device(&self.device)
@@ -755,6 +759,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
+        if self.connection.is_some() {
+            return Err(ConnectError::Driver(DriverError::AlreadyConnected));
+        }
         let mut progressed = self.pump_once().await?;
         let frame = self
             .io
@@ -825,6 +832,51 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         result
     }
 
+    /// Request a policy-owned disconnect and drive the pinned SME/MLME until
+    /// it reaches Idle. The retained transaction still carries the resulting
+    /// `OnDisconnect` event for the policy service to consume.
+    pub async fn disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: std::time::Instant,
+    ) -> Result<(), ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connection.is_none() && sme_is_retry_quiescent(&self.sme.status()) {
+            return Ok(());
+        }
+        self.sme.on_disconnect_command(reason, Default::default());
+        let result = loop {
+            if std::time::Instant::now() >= deadline {
+                break Err(ConnectError::Timeout);
+            }
+            let progressed = match self.pump_once().await {
+                Ok(progressed) => progressed,
+                Err(error) => break Err(error),
+            };
+            if sme_is_retry_quiescent(&self.sme.status()) {
+                break Ok(());
+            }
+            if !progressed {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        if result.is_err() && !self.revoked {
+            self.revoked = true;
+            self.connection = None;
+            revoke_and_drain(&self.upcalls);
+            self.io.lock().unwrap().ethernet.teardown();
+            self.device
+                .lock()
+                .unwrap()
+                .device
+                .reset()
+                .map_err(|_| ConnectError::Containment)?;
+        }
+        result
+    }
+
     async fn connect_inner(
         &mut self,
         request: fidl_sme::ConnectRequest,
@@ -861,12 +913,13 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                             }
                         }
                         self.pump_once().await?;
-                        return self
-                            .sme
-                            .status()
-                            .is_connected()
-                            .then_some(())
-                            .ok_or(ConnectError::Driver(DriverError::ConnectStateMismatch));
+                        if !self.sme.status().is_connected() {
+                            return Err(ConnectError::Driver(
+                                DriverError::ConnectStateMismatch,
+                            ));
+                        }
+                        self.connection = Some(transaction);
+                        return Ok(());
                     }
                     Ok(_) => {}
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -877,6 +930,35 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
             if !progressed {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Pop one retained post-connect SME event. Driving hardware and protocol
+    /// progress remains explicit through [`Self::pump_associated_once`].
+    pub fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<wlan_sme::client::ConnectTransactionEvent>, ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(None);
+        };
+        match connection.try_recv() {
+            Ok(event) => {
+                if matches!(
+                    event,
+                    wlan_sme::client::ConnectTransactionEvent::OnDisconnect { .. }
+                ) {
+                    self.connection = None;
+                }
+                Ok(Some(event))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Closed) => {
+                self.connection = None;
+                Err(ConnectError::Driver(DriverError::ConnectTransactionClosed))
             }
         }
     }
@@ -1121,6 +1203,7 @@ mod tests {
                         effects.pending_rx.push_back(auth_response(status));
                     }
                     Some(0x00) => effects.pending_rx.push_back(association_response()),
+                    Some(0xc0) => {}
                     _ => return Err(zx::Status::NOT_SUPPORTED),
                 }
             } else {
@@ -1568,6 +1651,47 @@ mod tests {
         let ethernet = runtime.take_ethernet_device().unwrap();
         assert!(ethernet.properties().is_some());
         assert!(runtime.take_ethernet_device().is_none());
+    }
+
+    #[test]
+    fn successful_connection_retains_events_and_disconnects_before_reuse() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().simulate_ap = true;
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            futures::executor::block_on(runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )),
+            Err(ConnectError::Driver(DriverError::AlreadyConnected))
+        );
+        futures::executor::block_on(runtime.disconnect(
+            fidl_sme::UserDisconnectReason::FailedToConnect,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert!(matches!(
+            runtime.next_connection_event().unwrap(),
+            Some(wlan_sme::client::ConnectTransactionEvent::OnDisconnect { .. })
+        ));
+        assert!(sme_is_retry_quiescent(&runtime.sme().status()));
+
+        futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        runtime.stop().unwrap();
+        assert_eq!(
+            runtime.next_connection_event(),
+            Err(ConnectError::Driver(DriverError::Stopped))
+        );
     }
 
     #[test]
