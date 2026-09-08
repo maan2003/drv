@@ -174,7 +174,7 @@ pub fn reverse_map_command_envelope(
         // The byte-array TLV follows the 36-byte fixed TLV.  Its declared
         // value is the downloaded prefix of the host management frame.
         if let Some(frame) = tlvs.get(1) {
-            masked_ranges.push(48..48 + frame.value.len());
+            masked_ranges.push(44..44 + frame.value.len());
         }
     } else if id.0 == 0x000001 {
         // A host-memory chunk is encoded as a 16-byte nested TLV whose first
@@ -185,7 +185,7 @@ pub fn reverse_map_command_envelope(
         for tlv in &tlvs {
             if tlv.tag == 0x12 {
                 let mut nested = 0usize;
-                while nested + 20 <= tlv.value.len() {
+                while nested + 16 <= tlv.value.len() {
                     let h = u32::from_le_bytes(
                         tlv.value[nested..nested + 4]
                             .try_into()
@@ -194,8 +194,8 @@ pub fn reverse_map_command_envelope(
                     if (h >> 16) as u16 != 0x4c || (h & 0xffff) != 16 {
                         return Err(WmiError::Malformed);
                     }
-                    masked_ranges.push(top + 4 + nested + 4..top + 4 + nested + 12);
-                    nested += 20;
+                    masked_ranges.push(top + 4 + nested + 8..top + 4 + nested + 12);
+                    nested += 16;
                 }
             }
             top += 4 + tlv.value.len().next_multiple_of(4);
@@ -243,6 +243,9 @@ pub struct GoldenSemanticRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SemanticRequest {
     Init(super::Init),
+    PeerAssoc(super::PeerAssoc),
+    PeerCreate(super::PeerCreate),
+    PeerDelete(super::PeerDelete),
     VdevCreate(super::VdevCreate),
     VdevDelete(super::VdevDelete),
     VdevStart(super::VdevStart),
@@ -254,6 +257,9 @@ impl crate::cmd::EncodeCommand for GoldenSemanticRequest {
     fn encode_command(&self) -> Result<Command, WmiError> {
         match &self.request {
             SemanticRequest::Init(request) => request.encode_command(),
+            SemanticRequest::PeerAssoc(request) => request.encode_command(),
+            SemanticRequest::PeerCreate(request) => request.encode_command(),
+            SemanticRequest::PeerDelete(request) => request.encode_command(),
             SemanticRequest::VdevCreate(request) => request.encode_command(),
             SemanticRequest::VdevDelete(request) => request.encode_command(),
             SemanticRequest::VdevStart(request) => request.encode_command(),
@@ -420,6 +426,134 @@ pub fn reverse_map_semantic_command(
                 tx_bssid: (tx != [0; 6]).then_some(tx),
                 nontx_profile_idx: fixed[6],
                 nontx_profile_cnt: fixed[7],
+            })
+        }
+        0x006001 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_PEER_CREATE_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<4>(&tlvs[0].value)?;
+            SemanticRequest::PeerCreate(super::PeerCreate {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+                peer_type: fixed[3],
+            })
+        }
+        0x006002 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 1 || tlvs[0].tag != crate::tags::WMI_TAG_PEER_DELETE_CMD.0 {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<3>(&tlvs[0].value)?;
+            SemanticRequest::PeerDelete(super::PeerDelete {
+                vdev_id: fixed[0],
+                peer_addr: mac(&tlvs[0].value[4..10])?,
+            })
+        }
+        0x006005 => {
+            let tlvs = semantic_tlvs(id, bytes)?;
+            if tlvs.len() != 5
+                || tlvs[0].tag != crate::tags::WMI_TAG_PEER_ASSOC_COMPLETE_CMD.0
+                || tlvs[1].tag != crate::tags::WMI_TAG_ARRAY_BYTE.0
+                || tlvs[2].tag != crate::tags::WMI_TAG_ARRAY_BYTE.0
+                || tlvs[3].tag != crate::tags::WMI_TAG_VHT_RATE_SET.0
+                || tlvs[4].tag != crate::tags::WMI_TAG_ARRAY_STRUCT.0
+            {
+                return Err(WmiError::Malformed);
+            }
+            let fixed = words::<40>(&tlvs[0].value)?;
+            if fixed[15] != 0 || fixed[16] != 0 {
+                return Err(WmiError::Malformed);
+            }
+            let legacy_len = usize::try_from(fixed[17]).map_err(|_| WmiError::Malformed)?;
+            let ht_len = usize::try_from(fixed[18]).map_err(|_| WmiError::Malformed)?;
+            if legacy_len > tlvs[1].value.len() || ht_len > tlvs[2].value.len() {
+                return Err(WmiError::Malformed);
+            }
+            let vht = words::<5>(&tlvs[3].value)?;
+            if vht[4] != 0 || !tlvs[4].value.len().is_multiple_of(12) {
+                return Err(WmiError::Malformed);
+            }
+            let mut peer_he_mcs = Vec::new();
+            for rate in tlvs[4].value.chunks_exact(12) {
+                let header =
+                    u32::from_le_bytes(rate[..4].try_into().map_err(|_| WmiError::Malformed)?);
+                if header != (u32::from(crate::tags::WMI_TAG_HE_RATE_SET.0) << 16) | 8 {
+                    return Err(WmiError::Malformed);
+                }
+                let values = words::<2>(&rate[4..])?;
+                peer_he_mcs.push(super::PeerHeRateSet {
+                    rx_mcs_set: values[0],
+                    tx_mcs_set: values[1],
+                });
+            }
+            if peer_he_mcs.len() != usize::try_from(fixed[35]).map_err(|_| WmiError::Malformed)? {
+                return Err(WmiError::Malformed);
+            }
+            let flags = fixed[5];
+            let flag = |bit| flags & bit != 0;
+            SemanticRequest::PeerAssoc(super::PeerAssoc {
+                params: super::PeerAssocParams {
+                    vdev_id: fixed[2],
+                    peer_new_assoc: fixed[3],
+                    peer_associd: fixed[4],
+                    peer_mac: mac(&tlvs[0].value[..6])?,
+                    peer_rate_caps: fixed[11],
+                    peer_caps: fixed[6],
+                    peer_listen_intval: fixed[7],
+                    peer_ht_caps: fixed[8],
+                    peer_max_mpdu: fixed[9],
+                    peer_mpdu_density: fixed[10],
+                    peer_vht_caps: fixed[13],
+                    peer_phymode: fixed[14],
+                    peer_nss: fixed[12],
+                    peer_bw_rxnss_override: fixed[19],
+                    peer_legacy_rates: tlvs[1].value[..legacy_len].to_vec(),
+                    peer_ht_rates: tlvs[2].value[..ht_len].to_vec(),
+                    vht_capable: vht[..4] != [0; 4],
+                    rx_max_rate: vht[2],
+                    rx_mcs_set: vht[3],
+                    tx_max_rate: vht[0],
+                    tx_mcs_set: vht[1],
+                    peer_he_mcs,
+                    min_data_rate: u8::try_from(fixed[38]).map_err(|_| WmiError::Malformed)?,
+                    peer_he_cap_macinfo: [fixed[30], fixed[36]],
+                    peer_he_cap_macinfo_internal: fixed[37],
+                    peer_he_caps_6ghz: fixed[39],
+                    peer_he_ops: fixed[31],
+                    peer_he_cap_phyinfo: [fixed[32], fixed[33], fixed[34]],
+                    peer_ppet: super::PeerPpeThreshold {
+                        numss_m1: fixed[20],
+                        ru_bit_mask: fixed[21],
+                        ppet16_ppet8_ru3_ru0: fixed[22..30]
+                            .try_into()
+                            .map_err(|_| WmiError::Malformed)?,
+                    },
+                    is_pmf_enabled: flag(0x0800_0000),
+                    is_wme_set: true,
+                    qos_flag: flag(0x0000_0002),
+                    apsd_flag: flag(0x0000_0800),
+                    ht_flag: flag(0x0000_1000),
+                    bw_40: flag(0x0000_2000),
+                    bw_80: flag(0x0400_0000),
+                    bw_160: flag(0x4000_0000),
+                    stbc_flag: flag(0x0000_8000),
+                    ldpc_flag: flag(0x0001_0000),
+                    static_mimops_flag: flag(0x0004_0000),
+                    dynamic_mimops_flag: flag(0x0002_0000),
+                    spatial_mux_flag: flag(0x0020_0000),
+                    vht_flag: flag(0x0200_0000),
+                    he_flag: flag(0x0000_0400),
+                    twt_requester: flag(0x0040_0000),
+                    twt_responder: flag(0x0080_0000),
+                    auth_flag: flag(0x0000_0001),
+                    need_ptk_4_way: flag(0x0000_0004),
+                    need_gtk_2_way: flag(0x0000_0010),
+                    safe_mode_enabled: false,
+                    is_assoc: false,
+                },
+                hw_crypto_disabled: false,
             })
         }
         _ => return Ok(None),
