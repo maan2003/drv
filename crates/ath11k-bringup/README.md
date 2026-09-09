@@ -177,6 +177,26 @@ scp -rp PHONE:/sys/fs/pstore "$OUT/live-pstore"
 scp -rp PHONE:/var/lib/systemd/pstore "$OUT/archived-pstore"
 ```
 
+### Fast repeated Run B failures
+
+After one validated two-hop candidate boot, stage
+`scripts/redwood/redwood-runB-fast-cycle` and include its absolute destination
+in `stage12/SHA256SUMS`. Invoke it as the sole executable of a transient unit.
+It retains all VFIO mappings while `qcom_q6v5_pas` stops WPSS and verifies
+`remoteproc2` is `offline`; only then may the failed child return, the cdev be
+unbound, and WPSS be started for a fresh process. An independent systemd reboot
+deadline and the hardware watchdog remain armed throughout. If remoteproc stop
+or verification fails, the runner deliberately holds its VFIO owners until that
+fallback reboots the phone.
+
+This is evidence for repeated failure at the currently tested
+`DpHttConnect` boundary, not a universal reset proof for arbitrary later DMA
+states. The retained physical run
+`runB-fast-cycle-20260909T-current` completed two fresh-process cycles in
+20,209 ms and 20,155 ms from cycle start through verified WPSS offline, before
+successful VFIO unbind; the second full QMI handshake proves QRTR/WPSS service
+reappearance. The wrapper intentionally forces recovery after all cycles.
+
 The current physical proof is retained on np at
 `/var/lib/poco-linux/redwood/work/artifacts/runB-core-region1-qmi-match-20260909T043223Z`:
 WPSS reached `running`, VFIO region 1 was 2 MiB, QMI DeviceInfo returned BAR

@@ -1,0 +1,78 @@
+#!/bin/sh
+# Lab-only same-kernel Run B loop. The runner stops WPSS while it still owns
+# every VFIO mapping; this wrapper drops/rebinds VFIO only after `offline`.
+set -eu
+
+PATH=/run/current-system/sw/bin:/bin:/sbin
+export PATH
+
+LAB=${REDWOOD_LAB:-/var/lib/ath11k-redwood-lab}
+RUN=${REDWOOD_RUN_DIR:-$LAB/runs/runB-fast-cycle}
+RPROC=/sys/class/remoteproc/remoteproc2
+DEVICE=17a10040.wifi
+P=/sys/bus/platform/devices/$DEVICE
+RUNNER=$LAB/stage10/ath11k-bringup-runB
+TRANSACTION=$LAB/stage10/redwood-wifi-transaction
+CYCLES=${REDWOOD_FAST_CYCLES:-2}
+
+mkdir -p "$RUN"
+exec >>"$RUN/fast-cycle.log" 2>&1
+echo "FAST_BEGIN=$(date -u +%FT%TZ)"
+sha256sum -c "$LAB/stage12/SHA256SUMS"
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
+test "$(cat "$RPROC/state")" = offline
+test "$CYCLES" -ge 2
+
+"$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
+systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=120s \
+  "$TRANSACTION" --recover fast_cycle_deadline
+printf 1 >/sys/module/iommufd/parameters/allow_unsafe_interrupts
+test -d /sys/module/vfio_platform || \
+  insmod "$LAB/stage7/modules/vfio-platform-base.ko"
+test -d /sys/module/vfio_platform || \
+  insmod "$LAB/stage7/modules/vfio-platform.ko" reset_required=0
+printf %s vfio-platform >"$P/driver_override"
+
+i=1
+while test "$i" -le "$CYCLES"; do
+  start_ns=$(date +%s%N)
+  echo "CYCLE_${i}_START_NS=$start_ns"
+  test "$(cat "$RPROC/state")" = offline
+  printf start >"$RPROC/state"
+  test "$(cat "$RPROC/state")" = running
+  running_ns=$(date +%s%N)
+  echo "CYCLE_${i}_RPROC_RUNNING_NS=$running_ns"
+
+  printf %s "$DEVICE" >/sys/bus/platform/drivers/vfio-platform/bind
+  cdev_name=$(find "$P/vfio-dev" -maxdepth 1 -mindepth 1 -printf '%f\n' | head -n1)
+  cdev=/dev/vfio/devices/$cdev_name
+  test -c "$cdev"
+  "$RUNNER" preflight --vfio-device "$cdev" >"$RUN/preflight-$i.log" 2>&1
+  touch /run/redwood-lab-watchdog/run
+
+  set +e
+  "$RUNNER" --vfio-device "$cdev" --containment remoteproc:remoteproc2 \
+    --stop-remoteproc-on-error --register-region 1 --stop-after core \
+    --wmi-log "$RUN/runB-$i.wmi.jsonl" >"$RUN/runB-$i.log" 2>&1
+  rc=$?
+  set -e
+  offline_ns=$(date +%s%N)
+  echo "CYCLE_${i}_RUNNER_RC=$rc OFFLINE_NS=$offline_ns RUN_TO_OFFLINE_MS=$(((offline_ns-running_ns)/1000000))"
+  test "$rc" -ne 0
+  test "$(cat "$RPROC/state")" = offline
+
+  # The child has returned only after WPSS stopped; now require its VFIO cdev
+  # authority to be gone before detaching the platform device.
+  if find /proc/[0-9]*/fd -lname "$cdev" -print -quit 2>/dev/null | grep -q .; then
+    echo "CYCLE_${i}_LIVE_CDEV_FD=1"
+    exit 1
+  fi
+  printf %s "$DEVICE" >/sys/bus/platform/drivers/vfio-platform/unbind
+  test ! -e "$P/driver"
+  end_ns=$(date +%s%N)
+  echo "CYCLE_${i}_COMPLETE_NS=$end_ns TOTAL_MS=$(((end_ns-start_ns)/1000000))"
+  i=$((i + 1))
+done
+
+echo "FAST_COMPLETE=$(date -u +%FT%TZ)"
+"$TRANSACTION" --recover fast_cycle_complete

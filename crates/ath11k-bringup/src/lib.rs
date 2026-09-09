@@ -1278,19 +1278,19 @@ impl Host for RealHost {
             && let Some(name) = &self.stop_remoteproc_on_error
         {
             let state = Path::new(REMOTEPROC_CLASS).join(name).join("state");
-            fs::write(&state, "stop\n").map_err(|source| Error::Io {
-                action: "stop containment remoteproc while VFIO DMA remains owned",
-                source,
-            })?;
-            let observed = fs::read_to_string(&state).map_err(|source| Error::Io {
-                action: "verify stopped containment remoteproc",
-                source,
-            })?;
-            if observed.trim() != "offline" {
-                return Err(Error::Hardware(format!(
-                    "containment remoteproc {name} stop returned state {:?}",
-                    observed.trim()
-                )));
+            let stopped = fs::write(&state, "stop\n")
+                .and_then(|()| fs::read_to_string(&state))
+                .map(|observed| observed.trim() == "offline");
+            if !matches!(stopped, Ok(true)) {
+                eprintln!(
+                    "remoteproc_quiesce_failed_holding_vfio name={name:?} result={stopped:?}"
+                );
+                // Closing this process would revoke IOMMU mappings while WPSS
+                // might still DMA. Retain every owner until the independently
+                // armed lab watchdog reboots the machine.
+                loop {
+                    std::thread::park();
+                }
             }
             eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
         }
