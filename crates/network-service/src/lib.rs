@@ -60,7 +60,10 @@ struct BoundedNetstackProof {
 
 // Admission and staging are separate budgets: idle clients consume descriptors
 // but cannot reserve the aggregate relay-buffer budget. This supports ordinary
-// fan-out without allowing an unbounded accepted-fd or heap attack.
+// fan-out without allowing an unbounded accepted-fd or heap attack. Sixty-four
+// active clients is an explicit service resource policy, not a measured
+// hardware maximum; larger deployments require revisiting descriptor, kernel
+// socket-state, Netstack socket-state, and scheduler costs together.
 const MAX_SOCKS5_CLIENTS: usize = 64;
 const MAX_SOCKS5_PENDING_BYTES: usize = 256 * 1024;
 const MAX_SOCKS5_TOTAL_PENDING_BYTES: usize = 16 * 1024 * 1024;

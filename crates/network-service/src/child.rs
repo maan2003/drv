@@ -1081,6 +1081,7 @@ mod tests {
     fn epoll_scaling_idle_and_deadline_run_under_network_filter() {
         for test in [
             "integration_test::epoll_serves_more_than_twenty_four_clients_with_isolated_failures",
+            "integration_test::epoll_admission_resumes_queued_client_after_slot_frees",
             "integration_test::idle_epoll_waits_for_deadline_without_busy_polling",
         ] {
             let status = Command::new(std::env::current_exe().unwrap())

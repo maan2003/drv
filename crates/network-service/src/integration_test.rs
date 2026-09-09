@@ -26,6 +26,11 @@ use std::{
     io::{Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -156,6 +161,104 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
     }
     if filtered {
         drop((clients, service));
+        unsafe { libc::_exit(0) }
+    }
+}
+
+#[test]
+fn epoll_admission_resumes_queued_client_after_slot_frees() {
+    const ADMITTED: usize = MAX_SOCKS5_CLIENTS;
+    let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 256).unwrap();
+    let frame = device_capability.into_frame_fd();
+    let frame_fd = frame.as_raw_fd();
+    let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
+    let mut service = BoundedNetstackProof::new(
+        device,
+        NetstackProofConfig {
+            dns_name: "unused.invalid.".into(),
+            server_port: NonZeroU16::new(80).unwrap(),
+        },
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listen = listener.local_addr().unwrap();
+    let mut clients: Vec<_> = (0..=ADMITTED)
+        .map(|_| {
+            let mut client = TcpStream::connect(listen).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(&[5, 1, 0]).unwrap();
+            client
+        })
+        .collect();
+    let mut queued = clients.pop().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let helper_stop = Arc::clone(&stop);
+    let helper = thread::spawn(move || {
+        for client in &mut clients {
+            let mut greeting = [0; 2];
+            client.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 0]);
+        }
+
+        // All admission slots are occupied in the request phase. Keep them
+        // there long enough for the service to enter a blocking epoll wait,
+        // then release exactly one slot.
+        queued.set_nonblocking(true).unwrap();
+        let mut unexpected = [0; 2];
+        assert_eq!(
+            queued.read(&mut unexpected).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "queued client progressed before an admission slot was released"
+        );
+        thread::sleep(Duration::from_millis(80));
+        drop(clients.swap_remove(0));
+
+        queued.set_nonblocking(false).unwrap();
+        let mut greeting = [0; 2];
+        queued.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 0]);
+        drop((queued, clients));
+        helper_stop.store(true, Ordering::Release);
+    });
+    let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
+    if filtered {
+        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+            .unwrap();
+    }
+
+    let before_waits = service.poller_wait_counts();
+    let before_cpu = (!filtered).then(thread_cpu_time);
+    service
+        .serve_socks5_listener(
+            listener,
+            listen,
+            Some(std::time::Instant::now() + Duration::from_secs(2)),
+            || stop.load(Ordering::Acquire),
+        )
+        .unwrap();
+    helper.join().unwrap();
+    let waits = service.poller_wait_counts();
+    let total_waits = waits.0 - before_waits.0;
+    let blocking_waits = waits.1 - before_waits.1;
+    let cpu = before_cpu.map(|before| thread_cpu_time().saturating_sub(before));
+    eprintln!(
+        "admission_boundary clients={} cpu_us={} waits={total_waits} blocking_waits={blocking_waits}",
+        ADMITTED + 1,
+        cpu.unwrap_or_default().as_micros(),
+    );
+    assert!(blocking_waits >= 1, "admission never blocked in epoll");
+    assert!(total_waits <= 16, "admission wait loop spun: {total_waits}");
+    if let Some(cpu) = cpu {
+        assert!(
+            cpu < Duration::from_millis(50),
+            "admission CPU time: {cpu:?}"
+        );
+    }
+    if filtered {
+        drop(service);
         unsafe { libc::_exit(0) }
     }
 }
