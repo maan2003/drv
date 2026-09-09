@@ -32,6 +32,9 @@ fn status(error: ath11k_core::CoreError) -> zx::Status {
         ath11k_core::CoreError::NotFound => zx::Status::NOT_FOUND,
         ath11k_core::CoreError::Qmi(_) => zx::Status::IO,
         ath11k_core::CoreError::DpAllocation { .. } => zx::Status::IO,
+        ath11k_core::CoreError::HtcControlSend(_)
+        | ath11k_core::CoreError::HtcControlReceive(_)
+        | ath11k_core::CoreError::HtcControlTimeout => zx::Status::IO,
         ath11k_core::CoreError::Protocol => zx::Status::IO_INVALID,
         ath11k_core::CoreError::DeviceFault | ath11k_core::CoreError::DeviceFaultAt(_) => {
             zx::Status::IO

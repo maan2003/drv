@@ -443,8 +443,8 @@ where
         let deadline = (self.deadline)();
         let raw = Self::protocol(self.packet_io.as_mut())?
             .receive_htc(deadline)
-            .map_err(|_| CoreError::DeviceFault)?
-            .ok_or(CoreError::DeviceFault)?;
+            .map_err(CoreError::HtcControlReceive)?
+            .ok_or(CoreError::HtcControlTimeout)?;
         let frame = Self::protocol(self.htc.as_mut())?
             .receive(&raw)
             .map_err(|_| CoreError::Protocol)?
@@ -461,7 +461,7 @@ where
             .map_err(|_| CoreError::Protocol)?;
         Self::protocol(self.packet_io.as_mut())?
             .send_htc(0, 0, frame)
-            .map_err(|_| CoreError::DeviceFault)?;
+            .map_err(CoreError::HtcControlSend)?;
         let response = self.receive_control()?;
         Self::protocol(self.htc.as_mut())?
             .connect_service(service, &response)
