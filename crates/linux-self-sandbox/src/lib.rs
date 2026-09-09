@@ -557,7 +557,12 @@ fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     const READ_FLAGS: u32 =
         (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u32;
     const CREATE_FLAGS: u32 =
-        (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u32;
+        (libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK) as u32;
     f.push(jump(libc::SYS_openat as u32, 0, 7));
     f.push(arg(0));
     f.push(jump(fd as u32, 0, 4));
@@ -732,7 +737,8 @@ mod filter_tests {
                     | libc::O_CREAT
                     | libc::O_EXCL
                     | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW;
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK;
                 assert_errno(
                     unsafe { libc::openat(libc::AT_FDCWD, temporary.as_ptr(), read_flags) } as i64,
                     libc::EPERM,
@@ -756,6 +762,7 @@ mod filter_tests {
                     unsafe { libc::renameat(fd, temporary.as_ptr(), fd, installed.as_ptr()) },
                     0
                 );
+                assert_eq!(unsafe { libc::fsync(fd) }, 0);
                 assert_errno(
                     unsafe { libc::unlinkat(fd, installed.as_ptr(), libc::AT_REMOVEDIR) } as i64,
                     libc::EPERM,
