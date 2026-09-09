@@ -31,6 +31,13 @@ ioctl, mapping, address, or MMIO operation in a safe function does not satisfy
 this requirement. Language safety does not replace process confinement or the
 IOMMU. Wasm is not the production containment mechanism.
 
+After Linux lockdown, an unapproved syscall or an approved syscall with
+unapproved arguments must terminate the entire service process with seccomp's
+kill-process action. It must not return an errno and continue. Ordinary kernel
+errors from approved operations remain recoverable program results. Failure to
+establish namespaces, capability limits, or the fatal seccomp policy rejects
+service startup rather than falling back to weaker confinement.
+
 The assigned hardware and network availability need not be protected from their
 driver. Side channels, physical attacks, broken isolation hardware, platform
 firmware, and denial of service within configured limits are outside scope.
