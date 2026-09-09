@@ -119,7 +119,7 @@ impl HostControlClient {
 
     fn start(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
 
-        let (wake_read, wake_write) = pipe()?;
+        let (wake_read, wake_write) = wake_event()?;
         let (command_tx, command_rx) = sync_mpsc::sync_channel(QUEUE_PACKETS);
         // futures mpsc reserves one slot per sender in addition to this
         // buffer; there is exactly one owner-side sender.
@@ -514,16 +514,32 @@ fn set_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pipe() -> anyhow::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(io::Error::last_os_error()).context("create control wake pipe");
+fn wake_event() -> anyhow::Result<(OwnedFd, OwnedFd)> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("create control wake event");
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error).context("duplicate control wake event");
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fd), OwnedFd::from_raw_fd(duplicate)) })
 }
 
-fn wake(fd: RawFd) { let byte = 1u8; unsafe { libc::write(fd, (&byte as *const u8).cast(), 1); } }
-fn drain_wake(fd: RawFd) { let mut bytes = [0u8; 64]; while unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) } > 0 {} }
+fn wake(fd: RawFd) {
+    let value = 1u64.to_ne_bytes();
+    unsafe {
+        libc::write(fd, value.as_ptr().cast(), value.len());
+    }
+}
+fn drain_wake(fd: RawFd) {
+    let mut value = [0u8; std::mem::size_of::<u64>()];
+    while unsafe { libc::read(fd, value.as_mut_ptr().cast(), value.len()) } > 0 {}
+}
 
 #[cfg(test)]
 mod tests {
