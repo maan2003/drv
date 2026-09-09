@@ -36,9 +36,6 @@ pub enum ConnectReply {
     /// SME completed the attempt. `result` preserves its exact status and
     /// credential/reconnect classification (including non-success statuses).
     Completed(sme::ConnectResult),
-    Timeout,
-    DriverFault,
-    ContainmentFault,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,9 +43,6 @@ pub enum CommandReply {
     Success,
     Busy,
     NotConnected,
-    Timeout,
-    DriverFault,
-    ContainmentFault,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +74,10 @@ pub enum Message {
     Roam(sme::RoamRequest),
     RoamReply(Reply<CommandReply>),
     Event(sme::ConnectTransactionEvent),
+    /// Terminal for the entire Wi-Fi service generation. On receipt, a
+    /// transport must fail all pending requests, close every event stream, and
+    /// reject further sends; runtime-terminal failures are never command
+    /// replies.
     GenerationEnd(GenerationEndReason),
 }
 
@@ -704,17 +702,11 @@ fn enc_connect_reply(w: &mut Vec<u8>, v: &ConnectReply) {
             w.push(1);
             enc_connect_result(w, *r);
         }
-        ConnectReply::Timeout => w.push(2),
-        ConnectReply::DriverFault => w.push(3),
-        ConnectReply::ContainmentFault => w.push(4),
     }
 }
 fn dec_connect_reply(r: &mut Reader<'_>) -> Result<ConnectReply, Error> {
     Ok(match r.u8()? {
         1 => ConnectReply::Completed(dec_connect_result(r)?),
-        2 => ConnectReply::Timeout,
-        3 => ConnectReply::DriverFault,
-        4 => ConnectReply::ContainmentFault,
         n => return Err(Error::UnknownDiscriminant("ConnectReply", n.into())),
     })
 }
@@ -928,9 +920,6 @@ fn command_reply(v: CommandReply) -> u8 {
         CommandReply::Success => 1,
         CommandReply::Busy => 2,
         CommandReply::NotConnected => 3,
-        CommandReply::Timeout => 4,
-        CommandReply::DriverFault => 5,
-        CommandReply::ContainmentFault => 6,
     }
 }
 fn dec_command_reply(n: u8) -> Result<CommandReply, Error> {
@@ -938,9 +927,6 @@ fn dec_command_reply(n: u8) -> Result<CommandReply, Error> {
         1 => CommandReply::Success,
         2 => CommandReply::Busy,
         3 => CommandReply::NotConnected,
-        4 => CommandReply::Timeout,
-        5 => CommandReply::DriverFault,
-        6 => CommandReply::ContainmentFault,
         _ => return Err(Error::UnknownDiscriminant("CommandReply", n.into())),
     })
 }
@@ -1137,9 +1123,6 @@ mod tests {
                 is_credential_rejected: true,
                 is_reconnect: false,
             }))),
-            Message::ConnectReply(reply(ConnectReply::Timeout)),
-            Message::ConnectReply(reply(ConnectReply::DriverFault)),
-            Message::ConnectReply(reply(ConnectReply::ContainmentFault)),
             Message::Disconnect(sme::UserDisconnectReason::ProactiveNetworkSwitch),
             Message::DisconnectReply(reply(CommandReply::Success)),
             Message::Roam(sme::RoamRequest {
@@ -1384,9 +1367,6 @@ mod tests {
             CommandReply::Success,
             CommandReply::Busy,
             CommandReply::NotConnected,
-            CommandReply::Timeout,
-            CommandReply::DriverFault,
-            CommandReply::ContainmentFault,
         ] {
             roundtrip(Message::DisconnectReply(self::reply(reply)));
             roundtrip(Message::RoamReply(self::reply(reply)));
