@@ -26,6 +26,7 @@ futures = "=0.3.32"
 netstack3-port-spike = { path = "../netstack3-port-spike" }
 tokio = { version = "=1.52.3", features = ["rt", "time"] }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
+wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/common/rust" }
 wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme" }
 zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 

@@ -1,0 +1,79 @@
+diff -ruN a/src/connectivity/wlan/lib/sme/src/client/mod.rs b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+--- a/src/connectivity/wlan/lib/sme/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+@@ -450,6 +450,31 @@
+     }
+ }
+ 
++/// Convert the transport-independent SME scan result to its public FIDL value.
++///
++/// Fuchsia and host transports share this mapping so policy observes identical
++/// scan error classification.
++pub fn convert_scan_result(
++    result: Result<Vec<ScanResult>, fidl_mlme::ScanResultCode>,
++) -> Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode> {
++    match result {
++        Ok(results) => Ok(results.into_iter().map(Into::into).collect()),
++        Err(code) => Err(match code {
++            fidl_mlme::ScanResultCode::Success | fidl_mlme::ScanResultCode::InvalidArgs => {
++                fidl_sme::ScanErrorCode::InternalError
++            }
++            fidl_mlme::ScanResultCode::NotSupported => fidl_sme::ScanErrorCode::NotSupported,
++            fidl_mlme::ScanResultCode::InternalError => {
++                fidl_sme::ScanErrorCode::InternalMlmeError
++            }
++            fidl_mlme::ScanResultCode::ShouldWait => fidl_sme::ScanErrorCode::ShouldWait,
++            fidl_mlme::ScanResultCode::CanceledByDriverOrFirmware => {
++                fidl_sme::ScanErrorCode::CanceledByDriverOrFirmware
++            }
++        }),
++    }
++}
++
+ #[derive(Debug, PartialEq)]
+ pub enum ConnectFailure {
+     SelectNetworkFailure(SelectNetworkFailure),
+diff -ruN a/src/connectivity/wlan/lib/sme/src/serve/client.rs b/src/connectivity/wlan/lib/sme/src/serve/client.rs
+--- a/src/connectivity/wlan/lib/sme/src/serve/client.rs
++++ b/src/connectivity/wlan/lib/sme/src/serve/client.rs
+@@ -4,7 +4,8 @@
+ 
+ use crate::client::{
+     self as client_sme, ConnectResult, ConnectTransactionEvent, ConnectTransactionStream,
+-    RoamResult, ScheduledScanReceiver, convert_connect_result, convert_roam_result,
++    RoamResult, ScheduledScanReceiver, convert_connect_result, convert_roam_result,
++    convert_scan_result,
+ };
+ use crate::{MlmeEventStream, MlmeSink, MlmeStream};
+ use fidl::endpoints::{RequestStream, ServerEnd};
+@@ -234,29 +235,7 @@
+         }
+     };
+ 
+-    match receive_result {
+-        Ok(scan_results) => {
+-            let results = scan_results.into_iter().map(Into::into).collect::<Vec<_>>();
+-            responder(Ok(results))
+-        }
+-        Err(mlme_scan_result_code) => {
+-            let scan_error_code = match mlme_scan_result_code {
+-                fidl_mlme::ScanResultCode::Success | fidl_mlme::ScanResultCode::InvalidArgs => {
+-                    error!("Internal scan error: {:?}", mlme_scan_result_code);
+-                    fidl_sme::ScanErrorCode::InternalError
+-                }
+-                fidl_mlme::ScanResultCode::NotSupported => fidl_sme::ScanErrorCode::NotSupported,
+-                fidl_mlme::ScanResultCode::InternalError => {
+-                    fidl_sme::ScanErrorCode::InternalMlmeError
+-                }
+-                fidl_mlme::ScanResultCode::ShouldWait => fidl_sme::ScanErrorCode::ShouldWait,
+-                fidl_mlme::ScanResultCode::CanceledByDriverOrFirmware => {
+-                    fidl_sme::ScanErrorCode::CanceledByDriverOrFirmware
+-                }
+-            };
+-            responder(Err(scan_error_code))
+-        }
+-    }?;
++    responder(convert_scan_result(receive_result))?;
+     Ok(())
+ }
+ 

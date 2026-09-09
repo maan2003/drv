@@ -54,6 +54,7 @@ let
     "wlan-rsn-rsnxe-m2-host.patch"
     "wlan-sme-rsnxe-m2-host.patch"
     "wlan-sme-connect-event-conversion-host.patch"
+    "wlan-sme-scan-conversion-host.patch"
     "wlan-mlme-connection-monitor-offload-host.patch"
   ];
   patchRows = map (file: {

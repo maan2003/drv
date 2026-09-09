@@ -13,7 +13,7 @@ use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
 use fidl_fuchsia_wlan_mlme as fidl_mlme;
 use fidl_fuchsia_wlan_sme as fidl_sme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, Stream, StreamExt};
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -397,6 +397,9 @@ pub enum DriverError {
     NotConnected,
     ConnectInProgress,
     NoConnectInProgress,
+    ScanInProgress,
+    NoScanInProgress,
+    ScanTransactionClosed,
     RetryCleanup,
     ControlBudgetExhausted,
     Stopped,
@@ -405,6 +408,12 @@ pub enum DriverError {
 
 struct ConnectAttempt {
     transaction: wlan_sme::client::ConnectTransactionStream,
+    deadline: std::time::Instant,
+}
+
+struct ScanAttempt {
+    receiver:
+        oneshot::Receiver<Result<Vec<wlan_common::scan::ScanResult>, fidl_mlme::ScanResultCode>>,
     deadline: std::time::Instant,
 }
 
@@ -422,6 +431,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
     timer_runtime: tokio::runtime::Runtime,
     connect_attempt: Option<ConnectAttempt>,
+    scan_attempt: Option<ScanAttempt>,
     connection: Option<wlan_sme::client::ConnectTransactionStream>,
     revoked: bool,
 }
@@ -529,6 +539,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             mlme_timers,
             timer_runtime,
             connect_attempt: None,
+            scan_attempt: None,
             connection: None,
             revoked: false,
         })
@@ -551,6 +562,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     pub fn stop(&mut self) -> Result<(), zx::Status> {
         self.revoked = true;
         self.connect_attempt = None;
+        self.scan_attempt = None;
         self.connection = None;
         revoke_and_drain(&self.upcalls);
         self.io.lock().unwrap().ethernet.teardown();
@@ -870,6 +882,66 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         Ok(())
     }
 
+    /// Start one SME discovery scan while retaining its response in the
+    /// runtime for a nonblocking service loop.
+    pub fn begin_scan(
+        &mut self,
+        request: fidl_sme::ScanRequest,
+        deadline: std::time::Instant,
+    ) -> Result<(), ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.scan_attempt.is_some() {
+            return Err(ConnectError::Driver(DriverError::ScanInProgress));
+        }
+        self.scan_attempt = Some(ScanAttempt {
+            receiver: self.sme.on_scan_command(request),
+            deadline,
+        });
+        Ok(())
+    }
+
+    /// Advance a retained discovery scan once. SME scan failures are policy
+    /// results; runtime/driver failures remain terminal errors.
+    pub async fn drive_scan_once(
+        &mut self,
+    ) -> Result<Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>, ConnectError>
+    {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        let Some(attempt) = self.scan_attempt.as_ref() else {
+            return Err(ConnectError::Driver(DriverError::NoScanInProgress));
+        };
+        if std::time::Instant::now() >= attempt.deadline {
+            return Err(self.contain_error(ConnectError::Timeout));
+        }
+        if let Err(error) = self.pump_once().await {
+            return Err(if self.revoked {
+                error
+            } else {
+                self.contain_error(error)
+            });
+        }
+        match self
+            .scan_attempt
+            .as_mut()
+            .expect("scan attempt checked above")
+            .receiver
+            .try_recv()
+        {
+            Ok(Some(result)) => {
+                self.scan_attempt = None;
+                Ok(Some(wlan_sme::client::convert_scan_result(result)))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                Err(self.contain_error(ConnectError::Driver(DriverError::ScanTransactionClosed)))
+            }
+        }
+    }
+
     /// Request a policy-owned disconnect and drive the pinned SME/MLME until
     /// it reaches Idle. The retained transaction still carries the resulting
     /// `OnDisconnect` event for the policy service to consume.
@@ -981,6 +1053,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             });
         }
         self.connect_attempt = None;
+        self.scan_attempt = None;
         self.io.lock().unwrap().ethernet.set_link(false);
         if !self.finish_failed_attempt_cleanup() {
             return Err(self.contain_error(ConnectError::Driver(DriverError::RetryCleanup)));
@@ -1168,6 +1241,7 @@ mod tests {
         retry_cleanup: bool,
         stale_callback_during_cleanup: bool,
         link_failure: bool,
+        scan_id: u64,
     }
 
     #[derive(Clone)]
@@ -1284,7 +1358,17 @@ mod tests {
         fn query_discovery_support(
             &mut self,
         ) -> Result<fidl_softmac::DiscoverySupport, zx::Status> {
-            record!(self, "discovery", Default::default())
+            record!(
+                self,
+                "discovery",
+                fidl_softmac::DiscoverySupport {
+                    scan_offload: Some(fidl_softmac::ScanOffloadExtension {
+                        supported: Some(true),
+                        scan_cancel_supported: Some(true),
+                    }),
+                    ..Default::default()
+                }
+            )
         }
         fn query_mac_sublayer_support(
             &mut self,
@@ -1327,7 +1411,12 @@ mod tests {
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
         ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-            record!(self, "passive", Default::default())
+            let mut effects = self.0.lock().unwrap();
+            effects.calls.push("passive");
+            effects.scan_id = effects.scan_id.checked_add(1).unwrap();
+            Ok(fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse {
+                scan_id: Some(effects.scan_id),
+            })
         }
         fn start_active_scan(
             &mut self,
@@ -2030,6 +2119,48 @@ mod tests {
             wlan_sme::client::ClientSmeStatus::Roaming(_)
         ));
         assert!(runtime.connection.is_some());
+    }
+
+    #[test]
+    fn discovery_scan_result_is_retained_for_service_driving() {
+        let (fake, effects) = Fake::new(0);
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        runtime
+            .begin_scan(
+                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.begin_scan(
+                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(ConnectError::Driver(DriverError::ScanInProgress))
+        );
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
+            None
+        );
+        let scan_id = effects.lock().unwrap().scan_id;
+        effects
+            .lock()
+            .unwrap()
+            .upcalls
+            .as_mut()
+            .unwrap()
+            .notify_scan_complete(zx::Status::OK, scan_id);
+
+        let result = loop {
+            if let Some(result) = futures::executor::block_on(runtime.drive_scan_once()).unwrap() {
+                break result;
+            }
+        };
+        assert_eq!(result, Ok(vec![]));
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_scan_once()),
+            Err(ConnectError::Driver(DriverError::NoScanInProgress))
+        );
     }
 
     #[test]

@@ -32,6 +32,23 @@ trait RuntimeOwner {
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>;
     fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError>;
+    fn begin_scan(
+        &mut self,
+        request: fidl_sme::ScanRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError>;
+    fn drive_scan_once(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>,
+                        PinnedConnectError,
+                    >,
+                > + '_,
+        >,
+    >;
     fn connect<'a>(
         &'a mut self,
         request: fidl_sme::ConnectRequest,
@@ -87,6 +104,29 @@ where
 
     fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError> {
         self.roam(request)
+    }
+
+    fn begin_scan(
+        &mut self,
+        request: fidl_sme::ScanRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError> {
+        self.begin_scan(request, deadline)
+    }
+
+    fn drive_scan_once(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>,
+                        PinnedConnectError,
+                    >,
+                > + '_,
+        >,
+    > {
+        Box::pin(self.drive_scan_once())
     }
 
     fn next_connection_event(
@@ -228,6 +268,23 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
         self.runtime.roam(request)
     }
 
+    pub fn begin_scan(
+        &mut self,
+        request: fidl_sme::ScanRequest,
+        deadline: Instant,
+    ) -> Result<(), PinnedConnectError> {
+        self.runtime.begin_scan(request, deadline)
+    }
+
+    pub async fn drive_scan_once(
+        &mut self,
+    ) -> Result<
+        Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>,
+        PinnedConnectError,
+    > {
+        self.runtime.drive_scan_once().await
+    }
+
     pub async fn drive_once(&mut self) -> Result<bool, PinnedConnectError> {
         self.runtime.drive_once().await
     }
@@ -306,6 +363,29 @@ mod tests {
         fn roam(&mut self, _: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError> {
             self.calls.push("roam");
             Ok(())
+        }
+        fn begin_scan(
+            &mut self,
+            _: fidl_sme::ScanRequest,
+            _: Instant,
+        ) -> Result<(), PinnedConnectError> {
+            self.calls.push("begin_scan");
+            Ok(())
+        }
+        fn drive_scan_once(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>,
+                            PinnedConnectError,
+                        >,
+                    > + '_,
+            >,
+        > {
+            self.calls.push("drive_scan");
+            Box::pin(async { Ok(None) })
         }
         fn connect<'a>(
             &'a mut self,

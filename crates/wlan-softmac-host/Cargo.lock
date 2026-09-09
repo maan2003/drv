@@ -1127,6 +1127,7 @@ dependencies = [
  "futures",
  "netstack3-port-spike",
  "tokio",
+ "wlan-common",
  "wlan-mlme",
  "wlan-sme",
  "zx",
